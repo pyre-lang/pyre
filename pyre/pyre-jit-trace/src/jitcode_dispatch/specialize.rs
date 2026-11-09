@@ -16480,7 +16480,7 @@ impl HelperEntry {
 /// The [`HelperEntry`] for a helper call at `op_pc` of the current walk.
 /// `ret` says whether the helper's return is that call's result.
 /// An `Err` is a decline: nothing has been recorded.
-fn orthodox_helper_nested_entry<Sym: WalkSym>(
+pub(crate) fn orthodox_helper_nested_entry<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     ret: HelperReturn,

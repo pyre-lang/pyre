@@ -3194,26 +3194,72 @@ impl majit_backend::Backend for CallTraceFieldLoadCpu {
     }
 }
 
-/// Unarmed `executioncontext.py call_trace` at an inlined callee entry
-/// (`pyframe.py execute_frame` after `enter`): record `GUARD_VALUE` of
-/// NULL `w_tracefunc` (`gettrace` / `jit.promote`) plus the
-/// `profilefunc is not None` null check, and emit no residual call.
-#[test]
-fn unarmed_inlined_callee_entry_walks_call_trace() {
+fn call_trace_generated_layout() -> (usize, String, char, Vec<String>) {
+    let jitcode_index = crate::jitcode_runtime::call_trace_jitcode_index()
+        .expect("generated `call_trace` jitcode must be in the build-time table");
+    assert!(
+        crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index).is_some(),
+        "call_trace body must resolve by index"
+    );
+    let jc = crate::jitcode_runtime::get_jitcode_by_index(jitcode_index)
+        .expect("call_trace jitcode must load");
+    let generated: Vec<String> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.key.to_string())
+        .collect();
+    (
+        jitcode_index,
+        jc.calldescr().arg_classes.clone(),
+        jc.calldescr().result_type,
+        generated,
+    )
+}
+
+fn residual_call_in_opcodes(ops: &[majit_ir::OpCode]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            *op,
+            majit_ir::OpCode::CallI
+                | majit_ir::OpCode::CallR
+                | majit_ir::OpCode::CallF
+                | majit_ir::OpCode::CallN
+                | majit_ir::OpCode::CallPureI
+                | majit_ir::OpCode::CallPureR
+                | majit_ir::OpCode::CallPureF
+                | majit_ir::OpCode::CallPureN
+                | majit_ir::OpCode::CallMayForceI
+                | majit_ir::OpCode::CallMayForceR
+                | majit_ir::OpCode::CallMayForceF
+                | majit_ir::OpCode::CallMayForceN
+                | majit_ir::OpCode::CallReleaseGilI
+                | majit_ir::OpCode::CallReleaseGilF
+                | majit_ir::OpCode::CallReleaseGilN
+                | majit_ir::OpCode::CallAssemblerI
+                | majit_ir::OpCode::CallAssemblerR
+                | majit_ir::OpCode::CallAssemblerF
+                | majit_ir::OpCode::CallAssemblerN
+                | majit_ir::OpCode::CondCallN
+                | majit_ir::OpCode::CondCallValueI
+                | majit_ir::OpCode::CondCallValueR
+        )
+    })
+}
+
+fn with_unarmed_call_trace_walk<R>(
+    run: impl FnOnce(
+        &mut WalkContext<'_, '_, crate::state::PyreSym>,
+        OpRef,
+        OpRef,
+        *mut pyre_interpreter::PyExecutionContext,
+        *mut pyre_interpreter::PyFrame,
+        &std::cell::RefCell<WalkSession>,
+    ) -> R,
+) -> R {
     use crate::state::PyreSym;
     use pyre_interpreter::compile_exec;
 
     let _hook_guard = WalkerQmutHookGuard::install();
     let _pair = crate::state::ensure_trace_test_driver();
     let cpu = CallTraceFieldLoadCpu;
-    let Some(jitcode_index) = crate::jitcode_runtime::call_trace_jitcode_index() else {
-        panic!("generated `call_trace` jitcode must be in the build-time table");
-    };
-    assert!(
-        crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index).is_some(),
-        "call_trace body must resolve by index"
-    );
-
     let raw_code = compile_exec("None").expect("test code should compile");
     let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
@@ -3267,6 +3313,7 @@ fn unarmed_inlined_callee_entry_walks_call_trace() {
 
     let mut snapshot_sym = PyreSym::new_uninit(callee_frame);
     snapshot_sym.jitcode = installed;
+    snapshot_sym.set_execution_context(callee_ec);
     let mut mode = test_fbw_mode();
     mode.snapshot_sym = &snapshot_sym;
 
@@ -3305,53 +3352,37 @@ fn unarmed_inlined_callee_entry_walks_call_trace() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
+    let result = run(&mut wc, callee_ec, callee_frame, ec, frame_ptr, &session);
+    let _ = (frame, snapshot_sym, cpu);
+    result
+}
 
-    let walk = super::inline_call::walker_inline_execute_frame_call_trace(
-        &mut wc,
-        0,
-        callee_ec,
-        callee_frame,
-        ec,
-        frame_ptr,
-    );
+fn quasi_immut_field_descr(op: &majit_ir::OpRc) -> Option<majit_ir::DescrRef> {
+    if op.opcode != majit_ir::OpCode::QuasiimmutField {
+        return None;
+    }
+    let d = op.getdescr()?;
+    Some(
+        d.as_quasi_immut_descr()
+            .map(|qd| qd.fielddescr().clone())
+            .unwrap_or_else(|| d.clone()),
+    )
+}
+
+fn assert_unarmed_call_trace_recorded(
+    wc: &mut WalkContext<'_, '_, crate::state::PyreSym>,
+    session: &std::cell::RefCell<WalkSession>,
+    r_before: &[OpRef],
+    i_before: &[OpRef],
+    f_before: &[OpRef],
+    generated: &[String],
+) {
     let ops: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
-    let dump = format!("{ops:?}");
-    walk.unwrap_or_else(|err| {
-        panic!("unarmed call_trace walk must Ok, got {err:?}; recorded {dump}");
-    });
-
-    let residual = ops.iter().any(|op| {
-        matches!(
-            *op,
-            majit_ir::OpCode::CallI
-                | majit_ir::OpCode::CallR
-                | majit_ir::OpCode::CallF
-                | majit_ir::OpCode::CallN
-                | majit_ir::OpCode::CallPureI
-                | majit_ir::OpCode::CallPureR
-                | majit_ir::OpCode::CallPureF
-                | majit_ir::OpCode::CallPureN
-                | majit_ir::OpCode::CallMayForceI
-                | majit_ir::OpCode::CallMayForceR
-                | majit_ir::OpCode::CallMayForceF
-                | majit_ir::OpCode::CallMayForceN
-                | majit_ir::OpCode::CallReleaseGilI
-                | majit_ir::OpCode::CallReleaseGilF
-                | majit_ir::OpCode::CallReleaseGilN
-                | majit_ir::OpCode::CallAssemblerI
-                | majit_ir::OpCode::CallAssemblerR
-                | majit_ir::OpCode::CallAssemblerF
-                | majit_ir::OpCode::CallAssemblerN
-                | majit_ir::OpCode::CondCallN
-                | majit_ir::OpCode::CondCallValueI
-                | majit_ir::OpCode::CondCallValueR
-        )
-    });
+    let dump = format!("recorded={ops:?} generated={generated:?}");
     assert!(
-        !residual,
+        !residual_call_in_opcodes(&ops),
         "unarmed call_trace must not residualize a helper call: {dump}"
     );
-
     let guard_value_consts: Vec<OpRef> = wc
         .trace_ctx
         .ops()
@@ -3383,7 +3414,533 @@ fn unarmed_inlined_callee_entry_walks_call_trace() {
         )),
         "profilefunc is not None must record the null check: {dump}"
     );
-    let _ = (frame, snapshot_sym);
+    assert_eq!(
+        wc.registers_r.to_vec(),
+        r_before,
+        "callee-prologue void return writes no caller Ref register: {dump}"
+    );
+    assert_eq!(
+        wc.registers_i.to_vec(),
+        i_before,
+        "callee-prologue void return writes no caller Int register: {dump}"
+    );
+    assert_eq!(
+        wc.registers_f.to_vec(),
+        f_before,
+        "callee-prologue void return writes no caller Float register: {dump}"
+    );
+    assert!(
+        wc.fbw_mode.transparent_helper_jitcode_index.is_none(),
+        "call_trace walk must restore transparent_helper_jitcode_index: {dump}"
+    );
+    assert!(
+        session
+            .borrow()
+            .framestack
+            .iter()
+            .all(|frame| !frame.is_helper_level()),
+        "call_trace CalleePrologue helper must not remain on framestack: {dump}"
+    );
+    assert!(
+        session.borrow().pending_helper_level.is_none(),
+        "call_trace CalleePrologue helper must not leave a pending level: {dump}"
+    );
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // for `w_tracefunc?` and `profilefunc?`. `opimpl_record_quasiimmut_field`
+    // then `generate_guard(GUARD_NOT_INVALIDATED)` on the first pin
+    // (`walker_flush_guard_not_invalidated` drains the pending flag right
+    // after that marker, before the field's `GetfieldGc*`).
+    let w_tracefunc = crate::descr::ec_w_tracefunc_descr();
+    let profilefunc = crate::descr::ec_profilefunc_descr();
+    let mut saw_tracefunc_qmut = false;
+    let mut saw_profilefunc_qmut = false;
+    let mut seen_gni = false;
+    let mut seen_hook_getfield = false;
+    let mut gni_before_first_hook_getfield = false;
+    for op in wc.trace_ctx.ops() {
+        if let Some(field) = quasi_immut_field_descr(op) {
+            if std::sync::Arc::ptr_eq(&field, &w_tracefunc) {
+                saw_tracefunc_qmut = true;
+            }
+            if std::sync::Arc::ptr_eq(&field, &profilefunc) {
+                saw_profilefunc_qmut = true;
+            }
+        }
+        if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
+            seen_gni = true;
+        }
+        let is_hook_getfield = matches!(
+            op.opcode,
+            majit_ir::OpCode::GetfieldGcR | majit_ir::OpCode::GetfieldGcI
+        ) && op.getdescr().is_some_and(|d| {
+            std::sync::Arc::ptr_eq(&d, &w_tracefunc) || std::sync::Arc::ptr_eq(&d, &profilefunc)
+        });
+        if is_hook_getfield && !seen_hook_getfield {
+            gni_before_first_hook_getfield = seen_gni;
+            seen_hook_getfield = true;
+        }
+    }
+    assert!(
+        saw_tracefunc_qmut,
+        "call_trace records QuasiimmutField for w_tracefunc?: {dump}"
+    );
+    assert!(
+        saw_profilefunc_qmut,
+        "call_trace records QuasiimmutField for profilefunc?: {dump}"
+    );
+    assert!(
+        seen_hook_getfield && gni_before_first_hook_getfield,
+        "GuardNotInvalidated precedes the first GetfieldGc* of w_tracefunc/profilefunc: {dump}"
+    );
+}
+
+/// Unarmed `executioncontext.py call_trace` at an inlined callee entry
+/// (`pyframe.py execute_frame`; pyre walks it before `enter`): walk the
+/// generated body so `GUARD_VALUE` of NULL `w_tracefunc` (`gettrace` /
+/// `jit.promote`) plus the `profilefunc is not None` null check land in
+/// this walk, with no residual call.
+#[test]
+fn unarmed_inlined_callee_entry_walks_call_trace() {
+    let (_idx, arg_classes, result_type, generated) = call_trace_generated_layout();
+    assert_eq!(
+        arg_classes, "rr",
+        "call_trace ABI is (ec, frame); generated={generated:?}"
+    );
+    assert_eq!(
+        result_type, 'v',
+        "call_trace returns void; generated={generated:?}"
+    );
+
+    with_unarmed_call_trace_walk(|wc, callee_ec, callee_frame, ec, frame_ptr, session| {
+        let level =
+            super::resume_snapshot::helper_subwalk_level(wc, 0, HelperReturn::CalleePrologue)
+                .expect("portal call_trace helper level");
+        assert!(
+            level.is_none(),
+            "portal CalleePrologue pushes no helper level"
+        );
+        assert_eq!(
+            HelperReturn::CalleePrologue.child_helper_return(),
+            HelperReturn::CalleePrologue,
+            "nested gettrace under call_trace keeps CalleePrologue"
+        );
+        let r_before = wc.registers_r.to_vec();
+        let i_before = wc.registers_i.to_vec();
+        let f_before = wc.registers_f.to_vec();
+        let walk = super::inline_call::walker_inline_execute_frame_call_trace(
+            wc,
+            0,
+            callee_ec,
+            callee_frame,
+            ec,
+            frame_ptr,
+        );
+        let ops: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+        let dump = format!("recorded={ops:?} generated={generated:?}");
+        walk.unwrap_or_else(|err| {
+            panic!("unarmed call_trace walk must Ok, got {err:?}; {dump}");
+        });
+        assert_unarmed_call_trace_recorded(
+            wc, session, &r_before, &i_before, &f_before, &generated,
+        );
+    });
+}
+
+/// Inlined Python caller whose `pycode` owns a populated `-live-`-anchored
+/// JitCode, plus a dummy parent so `walker_inline_guard_resumes_in_callee`
+/// sees a complete chain. `helper_subwalk_level` with
+/// `HelperReturn::CalleePrologue` then returns `HelperResume::CallEntry`
+/// (`compute_inline_helper_call_entry_frame`).
+fn enter_inline_converted_call_trace_caller<'a>(
+    session: &'a std::cell::RefCell<WalkSession>,
+    frame_ptr: *mut pyre_interpreter::PyFrame,
+) -> (u32, InlineFrameGuard<'a>) {
+    use pyre_interpreter::w_code_get_ptr;
+
+    let w_code = unsafe { (*frame_ptr).pycode };
+    assert!(!w_code.is_null(), "fixture frame holds a PyCode");
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("inline_converted_call_trace_caller");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![crate::state::op_live(), 0, 0],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut insns = indexmap::IndexMap::new();
+    insns.insert(
+        "live/".to_string(),
+        majit_metainterp::jitcode::insns::BC_LIVE,
+    );
+    crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 1;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0))];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+    let jitcode_index = unsafe { (*installed).index as u32 };
+    let pc_word = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .and_then(|payload| payload.resolve_resume_pc_with_jitcode_pc(0, crate::state::op_live()))
+        .expect("inlined caller resume pc");
+    let boxes = vec![
+        OpRef::const_ptr(majit_ir::GcRef(0));
+        crate::state::frame_value_count_at(jitcode_index as i32, pc_word as i32)
+    ];
+    let guard = InlineFrameGuard::enter(
+        session,
+        w_code as usize,
+        false,
+        false,
+        vec![InlineParentFrame {
+            jitcode_index,
+            call_jitcode_pc: None,
+            call_pc: Some(0),
+            resume_pc: Some(0),
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes,
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Unknown,
+        }],
+        0,
+    );
+    (jitcode_index, guard)
+}
+
+/// Callee-prologue `call_trace` under an inlined Python caller
+/// (`inline_subwalk`) pushes `HelperResume::CallEntry`. A guard inside
+/// the body resumes at that CALL entry: `capture_resumedata` does not
+/// number a helper section or a call-result slot. After return the helper
+/// is popped and `finish_inline_callee_return` writes no dest.
+#[test]
+fn call_trace_callee_prologue_walk_does_not_leave_helper_as_call_result() {
+    let (call_trace_idx, _arg_classes, _result_type, generated) = call_trace_generated_layout();
+    with_unarmed_call_trace_walk(|wc, callee_ec, callee_frame, ec, frame_ptr, session| {
+        let (_caller_index, _inline) = enter_inline_converted_call_trace_caller(session, frame_ptr);
+        wc.fbw_mode.inline_subwalk = true;
+        let level =
+            super::resume_snapshot::helper_subwalk_level(wc, 0, HelperReturn::CalleePrologue)
+                .expect("inline call_trace helper level")
+                .expect("inline_subwalk CalleePrologue pushes a helper level");
+        assert_eq!(
+            level.resume,
+            HelperResume::CallEntry,
+            "CalleePrologue call_trace helper resumes at the caller's CALL entry"
+        );
+        assert!(
+            level
+                .parents
+                .iter()
+                .all(|parent| !matches!(parent.result_slot, CallResultSlot::At(_))),
+            "CallEntry parents carry no call-result slot"
+        );
+        let call_entry = level
+            .parents
+            .last()
+            .expect("CallEntry names the inlined caller");
+        let call_entry_index = call_entry.jitcode_index;
+        let call_entry_pc = call_entry.resume_marker_jit_pc.unwrap_or(0) as u32;
+        assert_ne!(
+            call_entry_index, call_trace_idx as u32,
+            "CallEntry is the Python caller, not the call_trace jitcode"
+        );
+        assert_eq!(
+            HelperReturn::CalleePrologue.child_helper_return(),
+            HelperReturn::CalleePrologue,
+            "nested gettrace under inline call_trace keeps CalleePrologue"
+        );
+
+        let r_before = wc.registers_r.to_vec();
+        let i_before = wc.registers_i.to_vec();
+        let f_before = wc.registers_f.to_vec();
+        super::inline_call::walker_inline_execute_frame_call_trace(
+            wc,
+            0,
+            callee_ec,
+            callee_frame,
+            ec,
+            frame_ptr,
+        )
+        .expect("unarmed call_trace walk must Ok");
+        let ops: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+        let dump = format!("recorded={ops:?} generated={generated:?}");
+        let guard_positions: Vec<(majit_ir::OpCode, i32)> = wc
+            .trace_ctx
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    majit_ir::OpCode::GuardValue
+                        | majit_ir::OpCode::GuardFalse
+                        | majit_ir::OpCode::GuardNotInvalidated
+                )
+            })
+            .map(|op| (op.opcode, op.rd_resume_position()))
+            .collect();
+        assert!(
+            !guard_positions.is_empty(),
+            "call_trace body records gettrace/profilefunc guards: {dump}"
+        );
+        let mut saw_call_entry_guard = false;
+        for (opcode, resume_pos) in guard_positions {
+            assert!(
+                resume_pos >= 0,
+                "{opcode:?} inside call_trace must carry a snapshot: {dump}"
+            );
+            let snapshot = wc
+                .trace_ctx
+                .get_snapshot(resume_pos)
+                .unwrap_or_else(|| panic!("{opcode:?} snapshot missing: {dump}"));
+            assert!(
+                snapshot
+                    .frames
+                    .iter()
+                    .all(|frame| frame.jitcode_index != call_trace_idx as u32),
+                "{opcode:?} must not number a call_trace helper section: frames={:?} {dump}",
+                snapshot
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.jitcode_index, frame.pc))
+                    .collect::<Vec<_>>()
+            );
+            let innermost = snapshot
+                .frames
+                .last()
+                .unwrap_or_else(|| panic!("{opcode:?} snapshot has no frames: {dump}"));
+            assert_eq!(
+                innermost.jitcode_index, call_entry_index,
+                "{opcode:?} innermost frame is the caller's CALL entry: {dump}"
+            );
+            assert_eq!(
+                innermost.pc, call_entry_pc,
+                "{opcode:?} innermost pc is the CALL-entry marker: {dump}"
+            );
+            saw_call_entry_guard = true;
+        }
+        assert!(
+            saw_call_entry_guard,
+            "at least one call_trace guard resumes at the CallEntry parent: {dump}"
+        );
+        assert!(
+            session
+                .borrow()
+                .framestack
+                .iter()
+                .all(|frame| !frame.is_helper_level()),
+            "CalleePrologue call_trace must pop its helper level: {dump}"
+        );
+        assert_eq!(
+            wc.registers_r.to_vec(),
+            r_before,
+            "CalleePrologue call_trace must not fill a call-result register: {dump}"
+        );
+        assert_eq!(
+            wc.registers_i.to_vec(),
+            i_before,
+            "CalleePrologue void return writes no caller Int register: {dump}"
+        );
+        assert_eq!(
+            wc.registers_f.to_vec(),
+            f_before,
+            "CalleePrologue void return writes no caller Float register: {dump}"
+        );
+    });
+}
+
+/// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) resumes the Python CALL
+/// (`pyframe.py execute_frame`). Latching the void helper as innermost
+/// dest-writes a generic object into that CALL. A `Converted` helper's
+/// child starts from `CallResult` and still latches; an unrelated
+/// Collapsed helper (`HelperResume::Unresumable`) still latches.
+#[test]
+fn callee_prologue_helper_does_not_latch_abort_blackhole() {
+    #[derive(Clone, Copy)]
+    enum HelperOnStack {
+        None,
+        CallEntry,
+        Unresumable,
+    }
+    fn try_latch(
+        helper_return: HelperReturn,
+        on_stack: HelperOnStack,
+    ) -> (bool, HelperTooLongDecision) {
+        fbw_store_journal_reset();
+        reset_single_frame_blackhole();
+        let mut tc = fresh_trace_ctx();
+        dummy_ptr_eq_box(&mut tc);
+        let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let lookup = { move |_idx: usize| None };
+        let resume = match on_stack {
+            HelperOnStack::None => None,
+            HelperOnStack::CallEntry => Some(HelperResume::CallEntry),
+            HelperOnStack::Unresumable => Some(HelperResume::Unresumable),
+        };
+        let _helper = resume.map(|resume| {
+            InlineFrameGuard::enter_helper(
+                &session,
+                HelperLevel {
+                    parents: Vec::new(),
+                    resume,
+                    call_entry: HelperCallEntry::Unavailable,
+                    entry_array_len: None,
+                    entry_trace_index: 0,
+                },
+            )
+        });
+        let wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode {
+                transparent_helper_subwalk: true,
+                // Latch-image fixture only (`latch_test_helper_without_snapshot`).
+                // Skip keys off CalleePrologue, not this index.
+                transparent_helper_jitcode_index: Some(test_outer_resume_jitcode_index() as usize),
+                helper_return,
+                ..test_fbw_mode()
+            },
+            session: &session,
+            registers_r: &RegisterBank::default(),
+            registers_i: &RegisterBank::default(),
+            registers_f: &RegisterBank::default(),
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            is_top_level: false,
+            sub_jitcode_lookup: &lookup,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        let latched = latch_abort_blackhole(&wc, 0, "test-converted-call-entry");
+        let too_long = helper_too_long_walk_decision(&wc, true, false, 0);
+        drop(wc);
+        drop(_helper);
+        let names = latched_multi_frame_names();
+        reset_single_frame_blackhole();
+        fbw_store_journal_reset();
+        (latched && !names.is_empty(), too_long)
+    }
+
+    let (call_result_latched, call_result_too_long) =
+        try_latch(HelperReturn::CallResult, HelperOnStack::None);
+    assert!(
+        call_result_latched,
+        "CallResult helper still latches via the test-helper convert path"
+    );
+    assert_eq!(
+        call_result_too_long,
+        HelperTooLongDecision::Abort,
+        "CallResult 0-effect still aborts so the enclosing CALL can latch"
+    );
+    assert_eq!(
+        HelperReturn::Converted.child_helper_return(),
+        HelperReturn::CallResult,
+        "a Converted helper's child starts from CallResult"
+    );
+    let (converted_latched, converted_too_long) =
+        try_latch(HelperReturn::Converted, HelperOnStack::None);
+    assert!(
+        converted_latched,
+        "Converted helper still latches as innermost"
+    );
+    assert_eq!(
+        converted_too_long,
+        HelperTooLongDecision::Abort,
+        "Converted 0-effect still aborts"
+    );
+    let (converted_child_latched, converted_child_too_long) = try_latch(
+        HelperReturn::Converted.child_helper_return(),
+        HelperOnStack::None,
+    );
+    assert!(
+        converted_child_latched,
+        "Converted helper's CallResult child still latches"
+    );
+    assert_eq!(
+        converted_child_too_long,
+        HelperTooLongDecision::Abort,
+        "Converted helper's CallResult child 0-effect still aborts"
+    );
+    let (prologue_latched, prologue_too_long) =
+        try_latch(HelperReturn::CalleePrologue, HelperOnStack::None);
+    assert!(
+        !prologue_latched,
+        "CalleePrologue helper must not latch as innermost"
+    );
+    assert_eq!(
+        prologue_too_long,
+        HelperTooLongDecision::DeliverOutcome,
+        "CalleePrologue must finish so the callee body can run"
+    );
+    let (call_entry_latched, call_entry_too_long) =
+        try_latch(HelperReturn::CallResult, HelperOnStack::CallEntry);
+    assert!(
+        call_entry_latched,
+        "CallResult under HelperResume::CallEntry still latches when the walk is not CalleePrologue"
+    );
+    assert_eq!(
+        call_entry_too_long,
+        HelperTooLongDecision::Abort,
+        "CallResult 0-effect under CallEntry still aborts"
+    );
+    let (converted_call_entry_latched, converted_call_entry_too_long) =
+        try_latch(HelperReturn::Converted, HelperOnStack::CallEntry);
+    assert!(
+        converted_call_entry_latched,
+        "Converted walk still latches with CallEntry on the stack"
+    );
+    assert_eq!(
+        converted_call_entry_too_long,
+        HelperTooLongDecision::Abort,
+        "Converted 0-effect under CallEntry still aborts"
+    );
+    let (prologue_call_entry_latched, prologue_call_entry_too_long) =
+        try_latch(HelperReturn::CalleePrologue, HelperOnStack::CallEntry);
+    assert!(
+        !prologue_call_entry_latched,
+        "CalleePrologue walk skips latch even with CallEntry on the stack"
+    );
+    assert_eq!(
+        prologue_call_entry_too_long,
+        HelperTooLongDecision::DeliverOutcome,
+        "CalleePrologue walk delivers even with CallEntry on the stack"
+    );
+    let (unrelated_latched, unrelated_too_long) =
+        try_latch(HelperReturn::CallResult, HelperOnStack::Unresumable);
+    assert!(
+        unrelated_latched,
+        "unrelated Collapsed Unresumable helper still latches"
+    );
+    assert_eq!(
+        unrelated_too_long,
+        HelperTooLongDecision::Abort,
+        "unrelated Collapsed 0-effect still aborts"
+    );
 }
 
 /// `typeobject.py W_TypeObject.descr_call` raises `TypeError` after
@@ -9944,82 +10501,112 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
     // `executioncontext.py ExecutionContext.call_trace`:
     // `self.gettrace() is not None or self.profilefunc is not None`,
     // with `gettrace = jit.promote(self.w_tracefunc)`.
-    let _hook_guard = WalkerQmutHookGuard::install();
-    let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
-    let _tls = LastExecCtxGuard::install(ec);
-    let mut tc = fresh_trace_ctx();
-    let mut regs_r: [OpRef; 0] = [];
-    let mut concrete_r: [crate::state::ConcreteValue; 0] = [];
-    let mut regs_i: [OpRef; 0] = [];
-    let mut concrete_i: [crate::state::ConcreteValue; 0] = [];
-    let mut regs_f: [OpRef; 0] = [];
-    let descr_pool: [DescrRef; 0] = [];
+    let (_idx, arg_classes, result_type, generated) = call_trace_generated_layout();
+    assert_eq!(
+        arg_classes, "rr",
+        "call_trace ABI is (ec, frame); generated={generated:?}"
+    );
+    assert_eq!(
+        result_type, 'v',
+        "call_trace returns void; generated={generated:?}"
+    );
     let w_tracefunc = crate::descr::ec_w_tracefunc_descr();
     let profilefunc = crate::descr::ec_profilefunc_descr();
-    with_hint_walk_context(
-        &mut tc,
-        &mut regs_r,
-        &mut concrete_r,
-        &mut regs_i,
-        &mut concrete_i,
-        &mut regs_f,
-        &descr_pool,
-        |wc| {
-            let mut snapshot_sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
-            // `new_uninit` plants `null_jitcode()` (index -1 skeleton). Capture
-            // treats a non-null pointer as a full-body walk and aborts
-            // (`GuardResumeCoordinateUnavailable`). The EC box is all
-            // `walker_ensure_execution_context` needs; the arm path then uses
-            // `with_hint_walk_context`'s `-live-` coordinate.
-            snapshot_sym.jitcode = std::ptr::null();
-            let ec_box = wc.trace_ctx.const_ref(ec as i64);
-            snapshot_sym.set_execution_context(ec_box);
-            wc.fbw_mode.snapshot_sym = &snapshot_sym;
-            walker_call_trace_hook_reads(wc, 0).expect("null hooks record call_trace reads");
-            let n = wc.trace_ctx.num_ops();
-            walker_call_trace_hook_reads(wc, 0).expect("cached");
-            assert_eq!(
-                wc.trace_ctx.num_ops(),
-                n,
-                "a second call_trace read in the same trace is a heapcache hit"
-            );
-            std::hint::black_box(&mut snapshot_sym);
-        },
-    );
-    let mut saw_tracefunc_getfield = false;
-    let mut saw_tracefunc_isnull = false;
-    let mut saw_profilefunc_getfield = false;
-    let mut saw_profilefunc_false = false;
-    for op in tc.ops() {
-        if op.opcode == majit_ir::OpCode::GetfieldGcR
-            && op
-                .getdescr()
-                .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &w_tracefunc))
-        {
-            saw_tracefunc_getfield = true;
+    with_unarmed_call_trace_walk(|wc, _callee_ec, callee_frame, _ec, frame_ptr, session| {
+        let r_before = wc.registers_r.to_vec();
+        let i_before = wc.registers_i.to_vec();
+        let f_before = wc.registers_f.to_vec();
+        walker_call_trace_hook_reads(wc, 0, callee_frame, frame_ptr)
+            .expect("null hooks record call_trace reads");
+        let n_after_first = wc.trace_ctx.num_ops();
+        let first_ops: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+        walker_call_trace_hook_reads(wc, 0, callee_frame, frame_ptr)
+            .expect("a second generated walk must still Ok");
+        let leftover: Vec<_> = wc
+            .trace_ctx
+            .ops()
+            .iter()
+            .skip(n_after_first)
+            .map(|op| op.opcode)
+            .collect();
+        // `opimpl_record_quasiimmut_field` (`is_quasi_immut_known`),
+        // `_opimpl_getfield_gc_any_pureornot` (heapcache field box), and
+        // `implement_guard_value` (Const after the first promote) record
+        // nothing on the second walk. `profilefunc is not None` is
+        // `unop_int_record` (`int_is_zero/i>i`) of that cached GetfieldGcI
+        // FrontendOp plus `fused_goto_if_not_int_unary`
+        // (`goto_if_not_int_is_zero/iL` → `opimpl_goto_if_not_int_is_zero`:
+        // `execute(INT_IS_ZERO)` then `opimpl_goto_if_not(..., replace=False)`).
+        // `execute_and_record` folds only `_all_constants`, so a non-Const
+        // field box re-records INT_IS_ZERO and GuardFalse.
+        assert!(
+            !leftover.iter().any(|op| matches!(
+                *op,
+                majit_ir::OpCode::QuasiimmutField
+                    | majit_ir::OpCode::GuardNotInvalidated
+                    | majit_ir::OpCode::GetfieldGcR
+                    | majit_ir::OpCode::GetfieldGcI
+                    | majit_ir::OpCode::GuardValue
+            )),
+            "second call_trace on the same EC is a heapcache hit for \
+             quasi-immut / getfield / GUARD_VALUE: leftover={leftover:?} first={first_ops:?}"
+        );
+        assert_eq!(
+            leftover,
+            vec![
+                majit_ir::OpCode::IntIsZero,
+                majit_ir::OpCode::IntIsZero,
+                majit_ir::OpCode::GuardFalse,
+            ],
+            "second walk re-records the generated profilefunc is-not-None \
+             INT_IS_ZERO / GuardFalse: leftover={leftover:?} first={first_ops:?}"
+        );
+        assert_unarmed_call_trace_recorded(
+            wc, session, &r_before, &i_before, &f_before, &generated,
+        );
+        let mut saw_tracefunc_getfield = false;
+        let mut saw_tracefunc_isnull = false;
+        let mut saw_profilefunc_getfield = false;
+        let mut saw_profilefunc_false = false;
+        for op in wc.trace_ctx.ops() {
+            if op.opcode == majit_ir::OpCode::GetfieldGcR
+                && op
+                    .getdescr()
+                    .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &w_tracefunc))
+            {
+                saw_tracefunc_getfield = true;
+            }
+            if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardValue {
+                saw_tracefunc_isnull = true;
+            }
+            if op.opcode == majit_ir::OpCode::GetfieldGcI
+                && op
+                    .getdescr()
+                    .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &profilefunc))
+            {
+                saw_profilefunc_getfield = true;
+            }
+            if saw_profilefunc_getfield && op.opcode == majit_ir::OpCode::GuardFalse {
+                saw_profilefunc_false = true;
+            }
         }
-        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardValue {
-            saw_tracefunc_isnull = true;
-        }
-        if op.opcode == majit_ir::OpCode::GetfieldGcI
-            && op
-                .getdescr()
-                .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &profilefunc))
-        {
-            saw_profilefunc_getfield = true;
-        }
-        if saw_profilefunc_getfield && op.opcode == majit_ir::OpCode::GuardFalse {
-            saw_profilefunc_false = true;
-        }
-    }
-    assert!(
-        saw_tracefunc_getfield && saw_tracefunc_isnull,
-        "gettrace() promote(None) is GetfieldGcR + GuardValue"
-    );
-    assert!(
-        saw_profilefunc_getfield && saw_profilefunc_false,
-        "profilefunc is not None is GetfieldGcI + GuardFalse"
-    );
+        let dump = format!(
+            "recorded={:?} generated={generated:?}",
+            wc.trace_ctx
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            saw_tracefunc_getfield && saw_tracefunc_isnull,
+            "gettrace() promote(None) is GetfieldGcR + GuardValue: {dump}"
+        );
+        assert!(
+            saw_profilefunc_getfield && saw_profilefunc_false,
+            "profilefunc is not None is GetfieldGcI + GuardFalse: {dump}"
+        );
+    });
 }
 
 #[test]
@@ -10040,31 +10627,6 @@ fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
         },
         "ExecutionContext.profilefunc?",
     );
-}
-
-/// Save and restore `LAST_EXEC_CTX` so a dummy ExecutionContext cannot leak
-/// into a sibling test on the same thread.
-struct LastExecCtxGuard {
-    saved: *const pyre_interpreter::PyExecutionContext,
-    _root: pyre_object::gc_roots::RootScope,
-}
-
-impl LastExecCtxGuard {
-    fn install(ec: *const pyre_interpreter::PyExecutionContext) -> Self {
-        let saved = pyre_interpreter::call::take_last_exec_ctx();
-        let _root = pyre_object::gc_roots::push_roots();
-        if !saved.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(saved as pyre_object::PyObjectRef);
-        }
-        pyre_interpreter::call::set_last_exec_ctx(ec);
-        Self { saved, _root }
-    }
-}
-
-impl Drop for LastExecCtxGuard {
-    fn drop(&mut self) {
-        pyre_interpreter::call::set_last_exec_ctx(self.saved);
-    }
 }
 
 fn portal_ops_have_no_ec_qmut_or_gni(ops: &[majit_ir::OpRc]) {

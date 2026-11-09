@@ -871,8 +871,8 @@ pub fn bytecode_only_trace_access_directly_jitcode_index() -> Option<usize> {
 /// after `enter`). Resolved by the graph key `CallPath::canonical_key()`
 /// the codewriter allocated (`call.py get_jitcode`) and cached
 /// process-wide. `None` if that graph is absent from the build-time
-/// pipeline. The inline walker records `gettrace`'s promote on the
-/// callee EC in the parent walk.
+/// pipeline. The inline walker walks this body as a Converted helper
+/// (`pyjitpl.py _opimpl_inline_call1`).
 pub fn call_trace_jitcode_index() -> Option<usize> {
     *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("executioncontext::ExecutionContext::call_trace")

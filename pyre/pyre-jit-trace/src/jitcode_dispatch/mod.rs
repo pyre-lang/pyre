@@ -708,6 +708,32 @@ pub enum HelperReturn {
     /// The walk converts the return, or runs more code after the helper,
     /// before the call's result exists. The caller resumes at the CALL entry.
     Converted,
+    /// The helper is the callee's `call_trace` prologue, run by
+    /// `pyframe.py execute_frame` before the body (`pyjitpl.py
+    /// _opimpl_inline_call1` makes it an `MIFrame` under `execute_frame`).
+    /// Its void return is not the CALL's result. pyre has no `execute_frame`
+    /// JitCode, so a blackhole/abort inside it (or inside nested `gettrace`)
+    /// resumes at the Python CALL entry and is never adopted as a blackhole
+    /// frame.
+    CalleePrologue,
+}
+
+impl HelperReturn {
+    /// The helper's return is not the CALL's result, so a guard resumes at
+    /// the CALL entry (`HelperResume::CallEntry`).
+    pub(crate) fn resumes_at_call_entry(self) -> bool {
+        matches!(self, Self::Converted | Self::CalleePrologue)
+    }
+
+    /// Nested helper under a callee-prologue walk keeps this tag
+    /// (`gettrace` under `call_trace`); every other child starts as
+    /// [`Self::CallResult`].
+    pub(crate) fn child_helper_return(self) -> Self {
+        match self {
+            Self::CalleePrologue => Self::CalleePrologue,
+            Self::CallResult | Self::Converted => Self::CallResult,
+        }
+    }
 }
 
 /// The shape of the transparent helper levels above the innermost Python
@@ -2325,8 +2351,12 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     pub transparent_helper_jitcode_index: Option<usize>,
     /// Whether the helper this walk is entering returns the result of the
     /// call op that enters it. A nested helper level built while the
-    /// explicit driver runs reads it (`helper_subwalk_level`); a helper
-    /// sub-walk starts from [`HelperReturn::CallResult`].
+    /// explicit driver runs reads it (`helper_subwalk_level`). A helper
+    /// sub-walk starts from [`HelperReturn::CallResult`], except a
+    /// [`HelperReturn::CalleePrologue`] walk (`call_trace`) and helpers
+    /// nested under it (`gettrace`), which keep CalleePrologue so
+    /// `latch_abort_blackhole` resumes at the Python CALL
+    /// (`pyframe.py execute_frame`).
     pub helper_return: HelperReturn,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
@@ -5892,7 +5922,8 @@ pub fn walk<Sym: WalkSym>(
             let abort_safe =
                 trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count());
             if ctx.fbw_mode.transparent_helper_subwalk {
-                match helper_too_long_decision(
+                match helper_too_long_walk_decision(
+                    ctx,
                     snapshot_safe,
                     blackhole_latched,
                     fbw_executed_effect_count(),
@@ -13618,8 +13649,8 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
 }
 
 /// Pin one `executioncontext.py` `?` field on a boxed EC.
-/// [`walker_call_trace_hook_reads`] looks the mutate descr up the same way;
-/// this helper exists so tests can record without a live call-site snapshot.
+/// Tests use this to record a quasi-immut watcher without walking
+/// `call_trace`.
 #[cfg(test)]
 pub(crate) fn walker_pin_ec_quasi_field<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14770,7 +14801,7 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is `gettrace()`'s `jit.promote` recorded at an inlined
+/// was recorded — is `gettrace()`'s `jit.promote` walked at an inlined
 /// callee entry (`walker_inline_execute_frame_call_trace`), the
 /// [`walker_call_trace_hook_reads`] pins on `CALL_ASSEMBLER` and generator
 /// resume, and the `is_being_profiled` green / back-edge read for a profiler.
@@ -15180,94 +15211,118 @@ pub(crate) fn inlined_loop_header_call_assembler(
     }
 }
 
-/// Guard condition of `executioncontext.py ExecutionContext.call_trace`:
-/// `if self.gettrace() is not None or self.profilefunc is not None`, with
-/// `gettrace = jit.promote(self.w_tracefunc)`.
+/// Walk the generated `executioncontext.py call_trace` JitCode as a
+/// callee-prologue helper (`pyjitpl.py _opimpl_inline_call1`). The helper's
+/// void return is not the enclosing CALL's result, so a guard inside it
+/// resumes at that CALL (`HelperReturn::CalleePrologue` /
+/// `HelperResume::CallEntry`).
 ///
-/// Recorded on `ec_box` in the current walk. `call_trace` is a small method
-/// the translator inlines into `execute_frame`, so these reads stay on this
-/// walk's MIFrame.
-pub(super) fn walker_record_unarmed_call_trace<Sym: WalkSym>(
+/// `pyframe.py execute_frame` runs `call_trace` after `enter`. Doors walk it
+/// just before `enter` because those prologue guards resume at the CALL
+/// entry (no `execute_frame` frame to pause past `call_trace`). The order is
+/// unobservable on the unarmed path: `enter` writes only `topframeref` /
+/// `f_backref`, which that path does not read.
+pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     ec_box: OpRef,
+    frame_box: OpRef,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
 ) -> Result<(), DispatchError> {
     stamp_live_execution_context(ctx.trace_ctx, ec_box);
 
-    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
-    // on a `w_tracefunc?` slot. Consult the cache before the marker. The
-    // getfield below publishes the loaded constant; the marker is only the
-    // invalidation half. A cached getfield still falls through to the
-    // `profilefunc` half: `call_trace` tests both.
-    let descr = crate::descr::ec_w_tracefunc_descr();
-    let descr_index = descr.index();
-    let already = ctx
-        .trace_ctx
-        .heapcache_getfield_cached(ec_box, descr_index)
-        .is_some();
-    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
-        .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), Some(&mutate));
-    if !already {
-        walker_flush_guard_not_invalidated(ctx, op_pc)?;
-        let read = ctx
-            .trace_ctx
-            .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
-        ctx.trace_ctx
-            .heapcache_getfield_now_known(ec_box, descr_index, read);
-        ctx.trace_ctx
-            .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
-        let expected = ctx.trace_ctx.const_ref(0);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[read, expected])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(read, expected);
-        ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
+    let Some(jitcode_index) = crate::jitcode_runtime::call_trace_jitcode_index() else {
+        return Err(DispatchError::SubJitCodeNotFound {
+            pc: op_pc,
+            jitcode_index: usize::MAX,
+        });
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jitcode_index) else {
+        return Err(DispatchError::SubJitCodeNotFound {
+            pc: op_pc,
+            jitcode_index,
+        });
+    };
+    let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return Err(DispatchError::SubJitCodeNotFound {
+            pc: op_pc,
+            jitcode_index,
+        });
+    };
+    // `call_trace_jit_abi(ec, frame)` / `ExecutionContext::call_trace(&mut self, frame)`.
+    let arg_classes = jc.calldescr().arg_classes.as_str();
+    if arg_classes != "rr" || sub_body.num_regs_r < 2 {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    if crate::state::ensure_build_time_jitcode_at(jitcode_index).is_none() {
+        return Err(DispatchError::SubJitCodeNotFound {
+            pc: op_pc,
+            jitcode_index,
+        });
     }
 
-    // `self.profilefunc is not None` on `profilefunc?`. The descr is an Int
-    // field (`Option<ProfileFunc>` stored as a nullable function pointer),
-    // so the promote-None half is `GetfieldGcI` + `GuardFalse` on the word.
-    let descr = crate::descr::ec_profilefunc_descr();
-    let descr_index = descr.index();
-    let already = ctx
-        .trace_ctx
-        .heapcache_getfield_cached(ec_box, descr_index)
-        .is_some();
-    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
-        .expect("ExecutionContext.profilefunc has mutate_profilefunc");
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), Some(&mutate));
-    if !already {
-        walker_flush_guard_not_invalidated(ctx, op_pc)?;
-        let is_int_field = descr
-            .as_field_descr()
-            .is_some_and(|fd| fd.field_type() == Type::Int);
-        if is_int_field {
-            let read = ctx
-                .trace_ctx
-                .record_op_with_descr(OpCode::GetfieldGcI, &[ec_box], descr);
-            ctx.trace_ctx
-                .heapcache_getfield_now_known(ec_box, descr_index, read);
-            ctx.trace_ctx.set_opref_concrete(read, Value::Int(0));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[read])?;
-        } else {
-            let read = ctx
-                .trace_ctx
-                .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
-            ctx.trace_ctx
-                .heapcache_getfield_now_known(ec_box, descr_index, read);
-            ctx.trace_ctx
-                .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
-            ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
-        }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
-    Ok(())
+    let nested_entry =
+        specialize::orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CalleePrologue)
+            .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+
+    ctx.trace_ctx.set_opref_concrete(
+        ec_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_ec as usize)),
+    );
+    if !concrete_frame.is_null() {
+        ctx.trace_ctx.set_opref_concrete(
+            frame_box,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame as usize)),
+        );
+    }
+
+    let ref_args = [ec_box, frame_box];
+    let ref_concretes = [
+        crate::state::ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef),
+        crate::state::ConcreteValue::Ref(concrete_frame as pyre_object::PyObjectRef),
+    ];
+    let sym = unsafe { &*sym_ptr };
+    let (walk_outcome, _walk_start) = specialize::run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "call_trace_commit",
+        "call_trace_call_site",
+        &[],
+        &[],
+        &ref_args,
+        &ref_concretes,
+        &[],
+    )?;
+    match walk_outcome {
+        DispatchOutcome::SubReturn { result: None } => {
+            let _ = inline_call::finish_inline_callee_return(ctx, None);
+            Ok(())
+        }
+        DispatchOutcome::SubRaise { .. } | DispatchOutcome::SubReturn { result: Some(_) } => {
+            Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })
+        }
+        // `walk` consumes `Continue` as next-pc (`mod.rs` Continue arm);
+        // a finished helper's `void_return/` is `SubReturn { None }`.
+        DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+        _ => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
 }
 
 /// `CALL_ASSEMBLER` and generator-resume door: the running ExecutionContext
-/// box, then [`walker_record_unarmed_call_trace`].
+/// box plus the callee frame the door holds, then [`walker_walk_call_trace`].
 pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    frame_box: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
 ) -> Result<(), DispatchError> {
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
@@ -15278,9 +15333,16 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
         "walker_call_trace_hook_reads: every caller declines on ec_hook_installed() first",
     );
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
-        return Ok(());
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
-    walker_record_unarmed_call_trace(ctx, op_pc, ec_box)
+    walker_walk_call_trace(
+        ctx,
+        op_pc,
+        ec_box,
+        frame_box,
+        ec as *mut pyre_interpreter::PyExecutionContext,
+        concrete_frame,
+    )
 }
 
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared

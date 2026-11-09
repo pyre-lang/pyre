@@ -939,6 +939,28 @@ pub(crate) fn helper_too_long_decision(
     }
 }
 
+/// `blackhole_if_trace_too_long` (`pyjitpl.py` `_interpret`) for the
+/// helper walk currently on top.
+///
+/// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
+/// aborting the helper walk returns `TraceTooLong` to the enclosing CALL
+/// and never enters the callee; `_interpret` would still be inside
+/// `execute_frame` and continue past the helper. Deliver the step so the
+/// helper can finish; the Python walk checks the limit after that CALL.
+/// Every other helper uses [`helper_too_long_decision`].
+pub(crate) fn helper_too_long_walk_decision<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    snapshot_safe: bool,
+    latched_complete: bool,
+    executed_effects: usize,
+) -> HelperTooLongDecision {
+    if helper_blackhole_resumes_at_call(ctx) {
+        HelperTooLongDecision::DeliverOutcome
+    } else {
+        helper_too_long_decision(snapshot_safe, latched_complete, executed_effects)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn stage_test_helper_abort_image() {
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
@@ -1675,6 +1697,21 @@ pub(crate) fn abort_latch_resume_pc<Sym: WalkSym>(
     }
 }
 
+/// Whether a helper abort / `blackhole_if_trace_too_long` (`pyjitpl.py`)
+/// must resume the enclosing Python CALL instead of this helper.
+///
+/// `HelperReturn::CalleePrologue` (`call_trace` / nested `gettrace`):
+/// `pyframe.py execute_frame` runs the helper before the body; its void
+/// return is not the CALL's result. Finishing it as innermost dest-writes
+/// a generic object into the CALL. Converted helpers latch as their own
+/// frames (`blackhole.py convert_and_run_from_pyjitpl`).
+pub(crate) fn helper_blackhole_resumes_at_call<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> bool {
+    ctx.fbw_mode.transparent_helper_subwalk
+        && ctx.fbw_mode.helper_return == HelperReturn::CalleePrologue
+}
+
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -1682,6 +1719,10 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
 ) -> bool {
     if !ctx.is_authoritative_executor {
         latchdbg!("origin={origin} not-authoritative");
+        return false;
+    }
+    if helper_blackhole_resumes_at_call(ctx) {
+        latchdbg!("origin={origin} converted-call-entry");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {

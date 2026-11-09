@@ -3943,11 +3943,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
 
-    // `execute_frame` `ec.call_trace` reads, before the first recorded op of
-    // this `CALL_ASSEMBLER` sequence so a failing hook guard resumes at the
-    // caller's CALL with nothing entered.
-    super::walker_call_trace_hook_reads(ctx, op.pc)?;
-
     // emission
     // The token is the callee this callable resolved to. A loop-carried
     // callable (`op` in `op(value)`) is not pinned by LOAD_GLOBAL, so a later
@@ -4086,6 +4081,18 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
+
+    // `pyframe.py execute_frame`: `executioncontext.call_trace(self)` after
+    // the callee frame exists. Callee-prologue resume stays at this CALL
+    // (`HelperReturn::CalleePrologue`); the frame box is the generated body's
+    // second red (`call_trace_jit_abi(ec, frame)`).
+    let concrete_frame = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+        Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
+            gcref.0 as *mut pyre_interpreter::PyFrame
+        }
+        _ => std::ptr::null_mut(),
+    };
+    super::walker_call_trace_hook_reads(ctx, op.pc, callee_frame, concrete_frame)?;
 
     // `pyframe.py execute_frame`'s `ec.enter(self)`, which upstream records
     // ahead of the callee's `jit_merge_point` and this fold otherwise jumps
@@ -6818,24 +6825,35 @@ fn walker_ec_enter(
     vref
 }
 
-/// `pyframe.py execute_frame`: after `enter`, `executioncontext.call_trace(self)`.
+/// Walk the generated `call_trace` JitCode as a callee-prologue helper
+/// (`pyjitpl.py _opimpl_inline_call1`) so `gettrace()`'s `jit.promote` and
+/// the `profilefunc is not None` test land in this walk.
 ///
-/// Records `gettrace()`'s `jit.promote(self.w_tracefunc)` and the
-/// `profilefunc is not None` test on `callee_ec` in this walk, the same
-/// reads `call_trace` leaves in `execute_frame`. Compact tests that omit
-/// `snapshot_sym` skip. A walk `Err` still `leave()`s.
+/// `pyframe.py execute_frame` runs `call_trace` after `enter`. This walk
+/// records just before `enter`: prologue guards resume at the CALL entry
+/// (pyre has no `execute_frame` frame to pause past `call_trace`). The
+/// order is unobservable on the unarmed path because `enter` writes only
+/// `topframeref`/`f_backref`, which that path does not read. Compact tests
+/// that omit `snapshot_sym` skip.
 pub(crate) fn walker_inline_execute_frame_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     callee_ec: OpRef,
-    _callee_frame: OpRef,
+    callee_frame: OpRef,
     concrete_ec: *mut pyre_interpreter::PyExecutionContext,
-    _concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
 ) -> Result<(), DispatchError> {
     if ctx.fbw_mode.snapshot_sym.is_null() || concrete_ec.is_null() {
         return Ok(());
     }
-    super::walker_record_unarmed_call_trace(ctx, op_pc, callee_ec)
+    super::walker_walk_call_trace(
+        ctx,
+        op_pc,
+        callee_ec,
+        callee_frame,
+        concrete_ec,
+        concrete_frame,
+    )
 }
 
 /// The box this walk holds for the frame at `frame_ptr`: the virtual of a
@@ -9853,8 +9871,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half; `walker_inline_execute_frame_call_trace` records
-    // `gettrace`'s promote at the callee entry.  The walker has no route to
+    // frame-chain half; `walker_inline_execute_frame_call_trace` walks the
+    // generated `call_trace` JitCode at the callee entry.  The walker has no route to
     // record `_trace` — it calls back into app-level Python with the callee
     // frame as an argument.  So while a hook is installed there is no shape
     // of this inline that can report what the callee owes, and the answer is
@@ -11234,11 +11252,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         }
 
-        // `execute_frame` `ec.call_trace` reads, before the callee frame's
-        // `NewWithVtable` so a failing hook guard resumes at this CALL with
-        // nothing entered.
-        super::walker_call_trace_hook_reads(ctx, op.pc)?;
-
         // Copy before each call: a `borrow()` temporary lives until the end of
         // the statement, and later `FrameBox::new` collects.
         let inline_w_code = callee_state.borrow().inline_w_code;
@@ -11593,6 +11606,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if concrete_ec.is_null() {
             None
         } else {
+            // `pyframe.py execute_frame` runs `call_trace` after `enter`.
+            // Converted guards resume at this CALL entry (no `execute_frame`
+            // MIFrame to pause past `call_trace`), so the walk records here —
+            // callee frame seeded, nothing entered. `enter` writes only
+            // `topframeref`/`f_backref`, which the unarmed `call_trace` path
+            // does not read.
+            walker_inline_execute_frame_call_trace(
+                ctx,
+                op.pc,
+                ca_callee_ec,
+                ca_callee_frame,
+                concrete_ec,
+                ca_concrete_frame,
+            )?;
             walker_ec_enter(
                 ctx.trace_ctx,
                 ca_callee_frame,
@@ -11600,29 +11627,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
-            // `pyframe.py execute_frame`: `executioncontext.call_trace(self)`
-            // after `enter`. Unarmed recording puts `gettrace()`'s promote
-            // on `callee_ec` so a later-armed hook fails that guard.
-            if let Err(err) = walker_inline_execute_frame_call_trace(
-                ctx,
-                op.pc,
-                ca_callee_ec,
-                ca_callee_frame,
-                concrete_ec,
-                ca_concrete_frame,
-            ) {
-                // `execute_frame`'s `finally` still runs `leave` when
-                // `call_trace` fails after `enter`.
-                walker_ec_leave(
-                    ctx.trace_ctx,
-                    ca_callee_frame,
-                    ca_callee_ec,
-                    ca_concrete_frame,
-                    concrete_ec,
-                    false,
-                );
-                return Err(err);
-            }
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a
@@ -18874,9 +18878,10 @@ fn walk_generator_resume<Sym: WalkSym>(
     }
 
     // `pyframe.py execute_frame` runs `ec.call_trace(self)` before
-    // `resume_execute_frame`; tracing through the resumed body records its
-    // `gettrace()` / `profilefunc` reads here, as on the inline door.
-    super::walker_call_trace_hook_reads(ctx, op.pc)?;
+    // `resume_execute_frame`; tracing through the resumed body walks the
+    // generated `call_trace` JitCode here, as on the inline door.
+    let gen_frame = live_generator_frame(frame_root);
+    super::walker_call_trace_hook_reads(ctx, op.pc, frame_box, gen_frame)?;
 
     // `resume_execute_frame`: push the sent `None` and start at
     // `next_instr()`.  Arm the durable undo first so a declined walk
@@ -23509,6 +23514,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // `transparent_helper_subwalk` keeps the walk on this body's
             // jitcode so a guard numbers this section at its own pc; a
             // nested suspend publishes the pending helper level in `push_frame`.
+            let helper_index = helper_index_for_sub_body(sub_body);
             let fbw_mode = FbwWalkMode {
                 inline_subwalk: true,
                 transparent_helper_subwalk: true,
@@ -23521,10 +23527,13 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 transparent_helper_trace_at_entry: Some(ctx.trace_ctx.get_trace_position()),
                 // Overwrite the parent's index: a nested helper is a different
                 // `MIFrame.jitcode`.
-                transparent_helper_jitcode_index: helper_index_for_sub_body(sub_body),
-                // Describes the call this frame is entered through, not the calls
-                // its own body makes.
-                helper_return: HelperReturn::CallResult,
+                transparent_helper_jitcode_index: helper_index,
+                // Nested helpers start from CallResult (`helper_subwalk_level`
+                // under an already-transparent helper). A callee-prologue
+                // walk (`call_trace`) keeps CalleePrologue so nested
+                // `gettrace` resumes at the Python CALL (`pyframe.py
+                // execute_frame`); every other child is CallResult.
+                helper_return: ctx.fbw_mode.helper_return.child_helper_return(),
                 // A helper has no Python PC. Residual last_instr publication
                 // reads this field when `current_inline_concrete_frame()==0`.
                 inline_caller_py_pc: ctx
