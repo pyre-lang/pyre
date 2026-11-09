@@ -151,4 +151,7 @@ What's next, roughly in priority order:
 
 ## License
 
-MIT — same as [PyPy](https://github.com/pypy/pypy/blob/main/LICENSE).
+MIT — see [LICENSE](/LICENSE). This repository bundles the PyPy source tree
+(`pypy/`, `rpython/`, `lib_pypy/`, `lib-python/`, …) for development convenience,
+and Pyre's code is ported from it. PyPy's copyright notice, license and list of
+copyright holders are in [LICENSE-PyPy](/LICENSE-PyPy).
