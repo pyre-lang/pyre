@@ -3761,9 +3761,11 @@ fn call_trace_callee_prologue_walk_does_not_leave_helper_as_call_result() {
 }
 
 /// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
-/// `blackhole_if_trace_too_long` (`pyjitpl.py`) resumes the Python CALL
-/// (`pyframe.py execute_frame`). Latching the void helper as innermost
-/// dest-writes a generic object into that CALL. A `Converted` helper's
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) uses the ordinary
+/// [`helper_too_long_decision`] table. The helper is not latched as
+/// innermost (dest-write); a 0-effect declined latch Aborts so the
+/// enclosing Python CALL latches the CALL-entry image
+/// (`blackhole.py convert_and_run_from_pyjitpl`). A `Converted` helper's
 /// child starts from `CallResult` and still latches; an unrelated
 /// Collapsed helper (`HelperResume::Unresumable`) still latches.
 #[test]
@@ -3836,8 +3838,8 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
-        let latched = latch_abort_blackhole(&wc, 0, "test-converted-call-entry");
-        let too_long = helper_too_long_walk_decision(&wc, true, false, 0);
+        let latched = latch_abort_blackhole(&wc, 0, "test-callee-prologue-call-entry");
+        let too_long = helper_too_long_decision(true, latched, 0);
         drop(wc);
         drop(_helper);
         let names = latched_multi_frame_names();
@@ -3894,8 +3896,8 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
     );
     assert_eq!(
         prologue_too_long,
-        HelperTooLongDecision::DeliverOutcome,
-        "CalleePrologue must finish so the callee body can run"
+        HelperTooLongDecision::Abort,
+        "CalleePrologue 0-effect declined latch Aborts so the enclosing CALL can latch"
     );
     let (call_entry_latched, call_entry_too_long) =
         try_latch(HelperReturn::CallResult, HelperOnStack::CallEntry);
@@ -3927,8 +3929,8 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
     );
     assert_eq!(
         prologue_call_entry_too_long,
-        HelperTooLongDecision::DeliverOutcome,
-        "CalleePrologue walk delivers even with CallEntry on the stack"
+        HelperTooLongDecision::Abort,
+        "CalleePrologue 0-effect under CallEntry still Aborts at the CALL entry"
     );
     let (unrelated_latched, unrelated_too_long) =
         try_latch(HelperReturn::CallResult, HelperOnStack::Unresumable);
@@ -3941,6 +3943,88 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         HelperTooLongDecision::Abort,
         "unrelated Collapsed 0-effect still aborts"
     );
+}
+
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) inside a CalleePrologue
+/// helper uses the ordinary [`helper_too_long_decision`] table. A 0-effect
+/// declined latch Aborts; the enclosing Python CALL latches the CALL-entry
+/// image (`blackhole.py convert_and_run_from_pyjitpl`) with no helper frame.
+#[test]
+fn callee_prologue_trace_too_long_aborts_at_call_entry() {
+    let (call_trace_idx, _arg_classes, _result_type, _generated) = call_trace_generated_layout();
+    let call_trace_name = crate::jitcode_runtime::get_jitcode_by_index(call_trace_idx)
+        .expect("call_trace jitcode must load")
+        .name
+        .clone();
+    with_unarmed_call_trace_walk(|wc, callee_ec, callee_frame, ec, frame_ptr, session| {
+        let (_caller_index, _inline) = enter_inline_converted_call_trace_caller(session, frame_ptr);
+        wc.fbw_mode.inline_subwalk = true;
+        wc.trace_ctx.clear_merge_points();
+        wc.trace_ctx.set_trace_limit(0);
+        fbw_store_journal_reset();
+        reset_single_frame_blackhole();
+        assert_eq!(
+            helper_too_long_decision(true, false, 0),
+            HelperTooLongDecision::Abort,
+            "ordinary 0-effect declined latch Aborts"
+        );
+        let result = super::inline_call::walker_inline_execute_frame_call_trace(
+            wc,
+            0,
+            callee_ec,
+            callee_frame,
+            ec,
+            frame_ptr,
+        );
+        assert!(
+            matches!(result, Err(DispatchError::TraceTooLong { .. })),
+            "CalleePrologue too-long must Abort, got {result:?}"
+        );
+        assert!(
+            !abort_blackhole_latched(),
+            "CalleePrologue helper must not latch as innermost"
+        );
+        assert!(
+            !latched_multi_frame_names()
+                .iter()
+                .any(|name| name == &call_trace_name),
+            "call_trace helper must not be adopted: {:?}",
+            latched_multi_frame_names()
+        );
+        assert!(
+            session
+                .borrow()
+                .framestack
+                .iter()
+                .all(|frame| !frame.is_helper_level()),
+            "CalleePrologue helper must be unwound before the enclosing CALL latches"
+        );
+        assert!(
+            !helper_blackhole_resumes_at_call(wc),
+            "enclosing Python CALL is not a CalleePrologue walk"
+        );
+        let resume_pc = abort_latch_resume_pc(wc, 0);
+        assert_eq!(
+            resume_pc, 0,
+            "dest is not written; enclosing CALL latches at the CALL entry"
+        );
+        let _ = latch_abort_blackhole(wc, resume_pc, "mod2730-too-long");
+        let names = latched_multi_frame_names();
+        assert!(
+            !names.iter().any(|name| name == &call_trace_name),
+            "enclosing CALL-entry image must not adopt the helper: {names:?}"
+        );
+        if let Some((_origin, frames)) = latched_multi_frame_view() {
+            let innermost = frames.last().expect("latched image has a frame");
+            assert_ne!(
+                innermost.0, call_trace_name,
+                "innermost frame is the Python caller, not call_trace"
+            );
+            assert_eq!(innermost.1, 0, "innermost pc is the CALL entry: {frames:?}");
+        }
+        reset_single_frame_blackhole();
+        fbw_store_journal_reset();
+    });
 }
 
 /// `typeobject.py W_TypeObject.descr_call` raises `TypeError` after

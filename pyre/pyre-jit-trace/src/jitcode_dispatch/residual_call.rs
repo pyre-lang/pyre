@@ -918,6 +918,9 @@ pub(crate) fn finish_helper_abort_latch(
 /// `SwitchToBlackhole(ABORT_TOO_LONG)`. A declined latch with nothing
 /// executed lets the enclosing Python CALL latch. An effectful walk without
 /// an image keeps executing (`execute_varargs`).
+///
+/// `HelperReturn::CalleePrologue` uses this same table: there is no
+/// helper-identity exemption from the trace limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelperTooLongDecision {
     DeliverOutcome,
@@ -936,28 +939,6 @@ pub(crate) fn helper_too_long_decision(
         HelperTooLongDecision::Abort
     } else {
         HelperTooLongDecision::KeepExecuting
-    }
-}
-
-/// `blackhole_if_trace_too_long` (`pyjitpl.py` `_interpret`) for the
-/// helper walk currently on top.
-///
-/// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
-/// aborting the helper walk returns `TraceTooLong` to the enclosing CALL
-/// and never enters the callee; `_interpret` would still be inside
-/// `execute_frame` and continue past the helper. Deliver the step so the
-/// helper can finish; the Python walk checks the limit after that CALL.
-/// Every other helper uses [`helper_too_long_decision`].
-pub(crate) fn helper_too_long_walk_decision<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    snapshot_safe: bool,
-    latched_complete: bool,
-    executed_effects: usize,
-) -> HelperTooLongDecision {
-    if helper_blackhole_resumes_at_call(ctx) {
-        HelperTooLongDecision::DeliverOutcome
-    } else {
-        helper_too_long_decision(snapshot_safe, latched_complete, executed_effects)
     }
 }
 
@@ -1702,9 +1683,12 @@ pub(crate) fn abort_latch_resume_pc<Sym: WalkSym>(
 ///
 /// `HelperReturn::CalleePrologue` (`call_trace` / nested `gettrace`):
 /// `pyframe.py execute_frame` runs the helper before the body; its void
-/// return is not the CALL's result. Finishing it as innermost dest-writes
-/// a generic object into the CALL. Converted helpers latch as their own
-/// frames (`blackhole.py convert_and_run_from_pyjitpl`).
+/// return is not the CALL's result. The helper is not latched as innermost
+/// (`blackhole.py convert_and_run_from_pyjitpl` would dest-write a generic
+/// object into the CALL). Too-long still uses [`helper_too_long_decision`];
+/// a declined latch with nothing executed Aborts so the enclosing Python
+/// CALL latches the CALL-entry image. Converted helpers latch as their own
+/// frames.
 pub(crate) fn helper_blackhole_resumes_at_call<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
@@ -1722,7 +1706,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         return false;
     }
     if helper_blackhole_resumes_at_call(ctx) {
-        latchdbg!("origin={origin} converted-call-entry");
+        latchdbg!("origin={origin} callee-prologue-call-entry");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {

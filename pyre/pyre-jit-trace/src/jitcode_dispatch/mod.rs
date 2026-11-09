@@ -714,7 +714,9 @@ pub enum HelperReturn {
     /// Its void return is not the CALL's result. pyre has no `execute_frame`
     /// JitCode, so a blackhole/abort inside it (or inside nested `gettrace`)
     /// resumes at the Python CALL entry and is never adopted as a blackhole
-    /// frame.
+    /// frame. `blackhole_if_trace_too_long` (`pyjitpl.py`) still fires after
+    /// every helper step; the CALL-entry image is the one a guard inside
+    /// this walk already resumes to.
     CalleePrologue,
 }
 
@@ -2355,8 +2357,9 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// sub-walk starts from [`HelperReturn::CallResult`], except a
     /// [`HelperReturn::CalleePrologue`] walk (`call_trace`) and helpers
     /// nested under it (`gettrace`), which keep CalleePrologue so
-    /// `latch_abort_blackhole` resumes at the Python CALL
-    /// (`pyframe.py execute_frame`).
+    /// `latch_abort_blackhole` declines the helper and the enclosing
+    /// Python CALL latches the CALL-entry image (`pyframe.py
+    /// execute_frame` / `blackhole.py convert_and_run_from_pyjitpl`).
     pub helper_return: HelperReturn,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
@@ -5922,8 +5925,7 @@ pub fn walk<Sym: WalkSym>(
             let abort_safe =
                 trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count());
             if ctx.fbw_mode.transparent_helper_subwalk {
-                match helper_too_long_walk_decision(
-                    ctx,
+                match helper_too_long_decision(
                     snapshot_safe,
                     blackhole_latched,
                     fbw_executed_effect_count(),
@@ -15213,9 +15215,9 @@ pub(crate) fn inlined_loop_header_call_assembler(
 
 /// Walk the generated `executioncontext.py call_trace` JitCode as a
 /// callee-prologue helper (`pyjitpl.py _opimpl_inline_call1`). The helper's
-/// void return is not the enclosing CALL's result, so a guard inside it
-/// resumes at that CALL (`HelperReturn::CalleePrologue` /
-/// `HelperResume::CallEntry`).
+/// void return is not the enclosing CALL's result, so a guard or
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) inside it resumes at that
+/// CALL (`HelperReturn::CalleePrologue` / `HelperResume::CallEntry`).
 ///
 /// `pyframe.py execute_frame` runs `call_trace` after `enter`. Doors walk it
 /// just before `enter` because those prologue guards resume at the CALL
