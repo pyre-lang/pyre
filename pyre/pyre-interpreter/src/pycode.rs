@@ -3906,13 +3906,18 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
     unsafe { w_code_set_hidden_applevel(w_code, true) };
 }
 
-/// Extract the opaque code pointer from a known PyCode.
+/// The leaked `CodeObject` address stored on a known `PyCode`.
+///
+/// `CodeObject` is raw (`_alloc_flavor_ = raw`); the result is an Address,
+/// the same kind `history.py getkind` gives a `Ptr` whose `TO._gckind ==
+/// 'raw'`. Erasing to `*const ()` banks the result as a GC ref and makes
+/// callers emit `inline_call_*_r` against a callee that `int_return`s.
 ///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
-pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
-    unsafe { (*(obj as *const PyCode)).code_ptr as *const () }
+pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const crate::CodeObject {
+    unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
 /// `Constants<ConstantData>` is a single-field tuple wrapping `Box<[ConstantData]>`.

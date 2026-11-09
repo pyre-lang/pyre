@@ -7721,6 +7721,24 @@ impl<M: Clone> MetaInterp<M> {
             .expect("MetaInterp.interpret requires an active trace");
         self.last_exc_box = last_exc_box;
         self.last_exc_value = last_exc_value;
+        // pyjitpl.py `_interpret`:
+        //
+        //     self.framestack[-1].run_one_step()
+        //     self.blackhole_if_trace_too_long()
+        //
+        // `run_to_end` stops after the overflowing step with `Abort`.
+        // `blackhole_if_trace_too_long` is the raise
+        // `SwitchToBlackhole(ABORT_TOO_LONG)` (`prepare_trace_segmenting` /
+        // `disable_noninlinable_function`). `_compile_and_run_once` then
+        // `except SwitchToBlackhole`.
+        let action = if matches!(action, crate::TraceAction::Abort) {
+            match self.blackhole_if_trace_too_long() {
+                Some(_) => crate::TraceAction::SwitchToBlackhole(SwitchToBlackhole::too_long()),
+                None => action,
+            }
+        } else {
+            action
+        };
         // pyjitpl.py `_compile_and_run_once` `except SwitchToBlackhole`:
         // `run_blackhole_interp_to_cancel_tracing` reads `self.framestack`.
         // Stamp `MIFrame.pc` so `copy_data_from_miframe` resumes where the
@@ -21451,6 +21469,14 @@ impl SwitchToBlackhole {
             raising_exception: false,
         }
     }
+
+    /// pyjitpl.py `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+    pub fn too_long() -> Self {
+        Self {
+            reason: counters::ABORT_TOO_LONG,
+            raising_exception: false,
+        }
+    }
 }
 
 impl std::fmt::Display for SwitchToBlackhole {
@@ -24731,7 +24757,8 @@ mod metainterp_static_data_tests {
         }
         assert!(matches!(
             meta.interpret(&mut Sym, 0),
-            crate::TraceAction::Abort
+            crate::TraceAction::SwitchToBlackhole(stb)
+                if stb.reason == counters::ABORT_TOO_LONG && !stb.raising_exception
         ));
         assert_eq!(meta.framestack.len(), 2);
         let i0 = meta.framestack.frames.last().unwrap().int_regs[0].unwrap();
@@ -24802,7 +24829,8 @@ mod metainterp_static_data_tests {
             }
             assert!(matches!(
                 meta.interpret(&mut Sym, 0),
-                crate::TraceAction::Abort
+                crate::TraceAction::SwitchToBlackhole(stb)
+                    if stb.reason == counters::ABORT_TOO_LONG && !stb.raising_exception
             ));
             let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
                 "recursive_call_v/iIRFIRF",
@@ -24880,7 +24908,8 @@ mod metainterp_static_data_tests {
         }
         assert!(matches!(
             meta.interpret(&mut Sym, 0),
-            crate::TraceAction::Abort
+            crate::TraceAction::SwitchToBlackhole(stb)
+                if stb.reason == counters::ABORT_TOO_LONG && !stb.raising_exception
         ));
         assert_eq!(meta.framestack.len(), 2);
 
@@ -25107,8 +25136,84 @@ mod metainterp_static_data_tests {
             action,
             crate::TraceAction::Continue
                 | crate::TraceAction::Abort
+                | crate::TraceAction::SwitchToBlackhole(_)
                 | crate::TraceAction::Finish { .. }
         ));
+    }
+
+    #[test]
+    fn interpret_too_long_raises_switch_to_blackhole_and_prepares_segmenting() {
+        // pyjitpl.py `_interpret` `blackhole_if_trace_too_long` raises
+        // `SwitchToBlackhole(ABORT_TOO_LONG)`. No inlined portal frame, so
+        // that is `prepare_trace_segmenting` (`JC_FORCE_FINISH`).
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        use crate::warmstate::JcFlags;
+
+        let mut portal = JitCodeBuilder::new();
+        portal.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        portal.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        portal.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        portal.int_return(0);
+        let portal = portal.finish();
+        portal.set_index(0);
+        portal.set_jitdriver_sd(0);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let key = gk(0);
+        let action = meta.force_start_tracing(
+            key.get_uhash(),
+            (0, 0),
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Int(40), Value::Int(2)],
+        );
+        assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
+        meta.initialize_state_from_start(
+            std::sync::Arc::new(portal),
+            &[
+                (JitArgKind::Int, OpRef::input_arg_int(0), 40),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+            ],
+        );
+        meta.trace_ctx().unwrap().set_trace_limit(0);
+
+        struct NoopSym;
+        impl crate::JitCodeSym for NoopSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+        }
+        let mut sym = NoopSym;
+        let action = meta.interpret(&mut sym, 0);
+        assert!(
+            matches!(
+                action,
+                crate::TraceAction::SwitchToBlackhole(stb)
+                    if stb.reason == counters::ABORT_TOO_LONG && !stb.raising_exception
+            ),
+            "got {action:?}"
+        );
+        assert!(
+            meta.warm_state_for_driver(0)
+                .should_force_finish_tracing(key.get_uhash()),
+            "prepare_trace_segmenting marks JC_FORCE_FINISH on the loop cell"
+        );
+        let cell = meta
+            .warm_state_for_driver(0)
+            .lookup_chain_with_key(&key)
+            .expect("loop cell");
+        assert!(
+            cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
+            "JC_FORCE_FINISH"
+        );
+        assert!(
+            cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
+            "dont_trace_here on the overflowing loop key"
+        );
     }
 
     #[test]

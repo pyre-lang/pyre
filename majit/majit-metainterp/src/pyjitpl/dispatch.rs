@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use majit_ir::{GreenKey, GreenType, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, FieldDescr, GreenKey, GreenType, OpCode, OpRef, SizeDescr, Type, Value};
 use smallvec::SmallVec;
 
 use super::{MIFrame, MIFrameStack};
@@ -167,6 +167,39 @@ fn field_spec_from_bh(
     }
 }
 
+/// Whether `_cache_size[STRUCT]` may skip the group builder.
+///
+/// `register_keyed_size` recognizes a fieldless `get_size_descr` shell by
+/// an empty `all_fielddescrs` and completes that same Arc. Upstream
+/// `descr.py get_size_descr` fills `heaptracker.all_fielddescrs` before
+/// the entry is ever returned, so a complete list is a hit. pyre permits
+/// a partially published group (`published_declared_group` may list only
+/// a subset); a nonempty list is complete only when it covers every
+/// incoming field. Coverage uses the group builder's merge identity:
+/// `make_simple_descr_group_keyed_with_headerless` interns through
+/// `get_field_descr`, and `find_index_in_parent` locates a listed field
+/// by `field_key`. Several classes share one layout
+/// (`W_ExceptionExtended`); the builder keeps the requested allocation
+/// vtable so `pyjitpl.py execute_new_with_vtable` executes and records
+/// the same descr. Incoming vtable 0 is first-write wins: a later
+/// jitcode parent must not remint a complete raw entry as GC.
+fn cached_size_descr_is_complete_hit(
+    existing: &majit_ir::DescrRef,
+    incoming_vtable: usize,
+    incoming_fields: &[majit_ir::descr::SimpleFieldDescrSpec],
+) -> bool {
+    existing.as_size_descr().is_some_and(|sd| {
+        let cached = sd.all_fielddescrs();
+        !cached.is_empty()
+            && (sd.vtable() == incoming_vtable || incoming_vtable == 0)
+            && incoming_fields.iter().all(|spec| {
+                cached
+                    .iter()
+                    .any(|field| field.field_key() == spec.field_key)
+            })
+    })
+}
+
 /// Convert a canonical `Size` blackhole descr (from the per-jitcode
 /// descr pool) into the optimizer-facing `DescrRef` that `New` /
 /// `NewWithVtable` carry.  Mirrors `descr.py get_size_descr` +
@@ -190,6 +223,29 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         && !all_fielddescrs.is_empty()
     {
         let specs: Vec<_> = all_fielddescrs.iter().map(field_spec_from_bh).collect();
+        // descr.py get_size_descr: cache[STRUCT] is first-write-wins
+        // for a *complete* entry. A fieldless shell still needs the
+        // group builder (`register_keyed_size`) to receive its field
+        // list, a cached list that does not cover every incoming field
+        // is a partial publish and takes the same path, and a nonzero
+        // incoming vtable that disagrees with the cached one must keep
+        // the allocation's typeptr (`pyjitpl.py execute_new_with_vtable`).
+        // type_id 0 is the no-STRUCT-identity sentinel; publishing or
+        // hitting under `LLType::Struct(0)` would collapse distinct
+        // parents onto one slot (field_descr_ref_from_bh carves the
+        // same input out of the keyed path).
+        if *type_id != 0 {
+            let struct_key = majit_ir::descr::LLType::Struct(*type_id);
+            if let Some(existing) = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_size
+                .get(&struct_key)
+                .cloned()
+                && cached_size_descr_is_complete_hit(&existing, *vtable as usize, &specs)
+            {
+                return existing;
+            }
+        }
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             *size,
@@ -432,26 +488,39 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let fd = group.field_descrs[selected].clone();
                         return (*offset, fd as majit_ir::DescrRef);
                     }
-                    // descr.py get_field_descr: populate the
-                    // gccache (first-write-wins, idempotent across the
-                    // matching `new`) then return the *cached*
-                    // Arc<FieldDescr>.  The cache (`_cache_size`) keeps the
-                    // parent SizeDescr alive process-wide, so the field's
-                    // Weak parent back-reference upgrades — a freshly built
-                    // group would drop its size descr here (the op only
-                    // carries the field) and dangle the parent.
-                    majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
-                        u32::MAX,
-                        p.size,
-                        p.type_id as u32,
-                        p.type_id,
-                        p.vtable as usize,
-                        p.is_gc_managed,
-                        p.headerless,
-                        &specs,
-                        &[],
-                    );
+                    // descr.py get_size_descr / get_field_descr: cache[STRUCT]
+                    // is first-write-wins for a complete entry.
+                    // `EC_DESCR_GROUP` already published
+                    // `executioncontext::ExecutionContext` as a raw parent
+                    // (no GC header on the Rc-owned struct). Reminting that
+                    // key from a jitcode parent that still carries
+                    // `is_gc_managed = true` is two producers for one STRUCT.
+                    // A fieldless shell, a cached list that does not cover
+                    // every incoming field, or a cached vtable that disagrees
+                    // with a nonzero incoming one, still goes through the
+                    // group builder (`descr.py get_size_descr`,
+                    // `pyjitpl.py execute_new_with_vtable`).
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
+                    let size_cached = majit_ir::descr::gc_cache()
+                        .lock()
+                        ._cache_size
+                        .get(&struct_key)
+                        .is_some_and(|existing| {
+                            cached_size_descr_is_complete_hit(existing, p.vtable as usize, &specs)
+                        });
+                    if !size_cached {
+                        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+                            u32::MAX,
+                            p.size,
+                            p.type_id as u32,
+                            p.type_id,
+                            p.vtable as usize,
+                            p.is_gc_managed,
+                            p.headerless,
+                            &specs,
+                            &[],
+                        );
+                    }
                     let cached = majit_ir::descr::gc_cache()
                         .lock()
                         ._cache_field
@@ -3542,13 +3611,14 @@ where
             //         self.framestack[-1].run_one_step()
             //         self.blackhole_if_trace_too_long()
             //
-            // The overflow is answered right here — `pyjitpl.py raise
-            // SwitchToBlackhole(ABORT_TOO_LONG)` — even though a source opcode
-            // may be half-executed, because its handler (pyjitpl.py
-            // `run_blackhole_interp_to_cancel_tracing` → blackhole.py
-            // `convert_and_run_from_pyjitpl`) finishes the current jitcode
-            // frames in the blackhole before control returns to the
-            // interpreter, so the opcode's remaining effects still run.
+            // Overflow is detected here after a continued step, the same
+            // place `_interpret` checks. `run_to_end` returns `Abort`;
+            // `MetaInterp::interpret` turns that into
+            // `SwitchToBlackhole(ABORT_TOO_LONG)` via
+            // `blackhole_if_trace_too_long`. A source opcode may be
+            // half-executed: `run_blackhole_interp_to_cancel_tracing` →
+            // `convert_and_run_from_pyjitpl` finishes the live jitcode
+            // frames before control returns to the interpreter.
             //
             // The check sits below the action test for the same reason it sits
             // after `run_one_step()` upstream: a step that raises its own
@@ -6390,7 +6460,7 @@ mod tests {
     use super::*;
     use crate::jitcode::JitCodeBuilder;
     use crate::virtualizable::VirtualizableInfo;
-    use majit_ir::Type;
+    use majit_ir::{SizeDescr, Type};
 
     extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
         x * k as f64
@@ -6720,6 +6790,233 @@ mod tests {
         );
         assert!(!std::sync::Arc::ptr_eq(&a, &other));
         assert_eq!(parent_size_of(&other), 48);
+    }
+
+    /// `descr.py get_size_descr` returns `cache[STRUCT]` on hit. A later
+    /// jitcode parent that disagrees on `is_gc_managed` is not a second STRUCT.
+    #[test]
+    fn a_cached_raw_parent_is_not_reminted_as_gc() {
+        const TID: u64 = 0xEC01_0A00_0C01_0001;
+        let spec = majit_ir::descr::SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "slot".to_string(),
+            name: "RawParent.slot".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::descr::ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let raw = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            16,
+            0,
+            TID,
+            0,
+            false,
+            false,
+            &[spec],
+            &[],
+        );
+        assert!(!raw.size_descr.is_gc_managed());
+
+        let descr = field_descr_with_parent("slot", TID, 16, 0);
+        let fd = field_descr_ref_from_bh(&descr).1;
+        let parent = fd
+            .as_field_descr()
+            .expect("field descr")
+            .get_parent_descr()
+            .expect("parent SizeDescr");
+        assert!(
+            !parent.as_size_descr().expect("SizeDescr").is_gc_managed(),
+            "cache[STRUCT] keeps the raw parent"
+        );
+        let raw_parent: majit_ir::DescrRef = raw.size_descr.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&raw_parent, &parent),
+            "the jitcode reconstruction must keep the cached SizeDescr Arc"
+        );
+    }
+
+    /// `descr.py get_size_descr` fills `all_fielddescrs` before the entry
+    /// is returned. A fieldless `get_size_descr` shell in `_cache_size`
+    /// must still go through the group builder so `register_keyed_size`
+    /// can assign the incoming field list.
+    #[test]
+    fn a_cached_fieldless_shell_is_completed_by_incoming_fields() {
+        const TID: u64 = 0xEC01_0A00_0C01_0002;
+        const SIZE: usize = 16;
+        let key = majit_ir::descr::LLType::Struct(TID);
+        let shell = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_size_descr(key, SIZE, 0, false)
+        };
+        assert!(
+            shell
+                .as_size_descr()
+                .expect("SizeDescr")
+                .all_fielddescrs()
+                .is_empty(),
+            "get_size_descr mints a fieldless shell"
+        );
+
+        let spec = majit_jitcode::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: "slot".to_string(),
+            name: "slot".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let size = crate::blackhole::BhDescr::Size {
+            size: SIZE,
+            type_id: TID,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: vec![spec],
+            is_gc_managed: true,
+        };
+        let sd = size_descr_ref_from_bh(&size);
+        assert_eq!(
+            sd.as_size_descr()
+                .expect("SizeDescr")
+                .all_fielddescrs()
+                .len(),
+            1,
+            "the group builder completes the shell's field list"
+        );
+    }
+
+    /// A nonempty cached list that names only a subset of the incoming
+    /// fields is not a complete `get_size_descr` hit. pyre publishes
+    /// partial groups (`published_declared_group`); `register_keyed_size`
+    /// installs the longer list onto `cache[STRUCT]`.
+    #[test]
+    fn a_cached_one_field_group_is_completed_by_too_long_incoming_spec() {
+        const TID: u64 = 0xEC01_0A00_0C01_0004;
+        const VTABLE: u64 = 0x4444;
+        const SIZE: usize = 16;
+        let one = majit_ir::descr::SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "a".to_string(),
+            name: "a".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::descr::ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let cached = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            SIZE,
+            0,
+            TID,
+            VTABLE as usize,
+            true,
+            false,
+            &[one],
+            &[],
+        );
+        assert_eq!(
+            cached.size_descr.all_fielddescrs().len(),
+            1,
+            "the first producer publishes one field"
+        );
+
+        let spec = |field: &str, offset: usize, index: u32| majit_jitcode::jitcode::BhFieldSpec {
+            index,
+            field_key: field.to_string(),
+            name: field.to_string(),
+            offset,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: index as usize,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let size = crate::blackhole::BhDescr::Size {
+            size: SIZE,
+            type_id: TID,
+            vtable: VTABLE,
+            owner: String::new(),
+            all_fielddescrs: vec![spec("a", 0, 0), spec("b", 8, 1)],
+            is_gc_managed: true,
+        };
+        let sd = size_descr_ref_from_bh(&size);
+        assert_eq!(
+            sd.as_size_descr()
+                .expect("SizeDescr")
+                .all_fielddescrs()
+                .len(),
+            2,
+            "the group builder installs both incoming fields"
+        );
+    }
+
+    /// Several classes share one layout (`W_ExceptionExtended`) and one
+    /// STRUCT key. The group builder keeps the requested allocation
+    /// vtable so `pyjitpl.py execute_new_with_vtable` executes and
+    /// records the same descr.
+    #[test]
+    fn a_second_vtable_on_one_type_id_keeps_the_requested_vtable() {
+        const TID: u64 = 0xEC01_0A00_0C01_0003;
+        let spec = |field: &str| majit_jitcode::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: field.to_string(),
+            name: field.to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let size_at = |vtable: u64| crate::blackhole::BhDescr::Size {
+            size: 16,
+            type_id: TID,
+            vtable,
+            owner: String::new(),
+            all_fielddescrs: vec![spec("slot")],
+            is_gc_managed: true,
+        };
+        let first = size_descr_ref_from_bh(&size_at(0x1111));
+        let second = size_descr_ref_from_bh(&size_at(0x2222));
+        assert_eq!(first.as_size_descr().expect("SizeDescr").vtable(), 0x1111);
+        assert_eq!(
+            second.as_size_descr().expect("SizeDescr").vtable(),
+            0x2222,
+            "the group builder preserves the second allocation vtable"
+        );
     }
 
     /// Flatten stores `BhDescr::Field.name` as the printable display

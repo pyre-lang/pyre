@@ -1127,6 +1127,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_load_const(self, constant)
     }
 
+    /// pyopcode.py `getname_u`: `space.text_w(self.getname_w(index))`.
+    /// `getname_w` is `self.getcode().co_names_w[index]`.
+    fn getname_u(&self, index: usize) -> Result<&'static str, PyError>;
+
     /// No default: the trait-default `small_int_constant` → `int_constant`
     /// → `w_int_new` walk writes a translator-local `&INT_TYPE`. `PyFrame`
     /// returns the interned `w_small_int_const` box.
@@ -3543,7 +3547,7 @@ where
 
 pub fn execute_load_name<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
@@ -3554,8 +3558,9 @@ where
         unreachable!()
     };
     let idx = u32_as_usize(namei.get(op_arg));
-    // pyopcode.py LOAD_NAME: `getname_w` then `space.finditem_str`.
-    executor.load_name(code.names[idx].as_ref(), idx)?;
+    // pyopcode.py LOAD_NAME: `getname_u` then `space.finditem_str`.
+    let name = executor.getname_u(idx)?;
+    executor.load_name(name, idx)?;
     Ok(StepResult::Continue)
 }
 

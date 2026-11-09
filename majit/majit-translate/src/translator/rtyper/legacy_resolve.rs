@@ -790,9 +790,10 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
 /// A FieldRead of a raw pointer is often `Ref(None)`; the following
 /// `__cast_instance_intrinsic` carries `Ref(Some(intern_key))`.
 /// `history.py getkind` of that raw `Ptr` is `'int'`. An untyped
-/// source shares the dest bank. A GC source (`*const ()` from
-/// `w_code_get_ptr`) stays Ref: `rewrite_op_direct_call` emits
-/// `cast_ptr_to_int` for that crossing (`lltype.py`).
+/// source shares the dest bank. A leftover `*const ()` GC source
+/// stays Ref: `rewrite_op_direct_call` emits `cast_ptr_to_int` for
+/// that crossing (`lltype.py`). `w_code_get_ptr` returns
+/// `*const CodeObject` (raw Address) so it does not take that arm.
 fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<String>) {
     let OpKind::Call {
         target,
