@@ -714,9 +714,9 @@ pub enum HelperReturn {
     /// Its void return is not the CALL's result. pyre has no `execute_frame`
     /// JitCode, so a blackhole/abort inside it (or inside nested `gettrace`)
     /// resumes at the Python CALL entry and is never adopted as a blackhole
-    /// frame. `blackhole_if_trace_too_long` (`pyjitpl.py`) still fires after
-    /// every helper step; the CALL-entry image is the one a guard inside
-    /// this walk already resumes to.
+    /// frame. `blackhole_if_trace_too_long` (`pyjitpl.py`) fires after
+    /// `MIFrame.run_one_step` returns (`ChangeFrame`); the CALL-entry image
+    /// is the one a guard inside this walk already resumes to.
     CalleePrologue,
 }
 
@@ -2357,9 +2357,11 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// sub-walk starts from [`HelperReturn::CallResult`], except a
     /// [`HelperReturn::CalleePrologue`] walk (`call_trace`) and helpers
     /// nested under it (`gettrace`), which keep CalleePrologue so
-    /// `latch_abort_blackhole` declines the helper and the enclosing
-    /// Python CALL latches the CALL-entry image (`pyframe.py
+    /// `latch_abort_blackhole` declines the helper and a `ChangeFrame`
+    /// inside the prologue latches the CALL-entry image (`pyframe.py
     /// execute_frame` / `blackhole.py convert_and_run_from_pyjitpl`).
+    /// When the prologue itself returns, the Python walk's check at the
+    /// callee's first step latches the callee-entry multi-frame image.
     pub helper_return: HelperReturn,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
@@ -4023,9 +4025,10 @@ pub enum DispatchError {
     /// return is `finishframe`'s ordinary case, `pyjitpl.py`).
     ExcEdgeNoInFrameCatch { pc: usize },
     /// The recorded trace passed `warmstate.trace_limit` (`rlib/jit.py:592`
-    /// default 6000). RPython checks this after every traced step —
-    /// `pyjitpl.py _interpret` calls `blackhole_if_trace_too_long()` right
-    /// after `run_one_step()` — and raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
+    /// default 6000). `pyjitpl.py` `MetaInterp._interpret` calls
+    /// `blackhole_if_trace_too_long()` after `MIFrame.run_one_step` returns
+    /// (`ChangeFrame`: a call or a return) and raises
+    /// `SwitchToBlackhole(ABORT_TOO_LONG)`.
     TraceTooLong { pc: usize, ops: usize },
     /// A segmented-trace cut had already latched its complete forward
     /// blackhole image, but the always-failing guard's resume snapshot could
@@ -5554,6 +5557,50 @@ fn walk_err_coordinate_belongs_to_this_frame<Sym: WalkSym>(
             .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk)
 }
 
+/// `pyjitpl.py` `MIFrame.run_one_step` leaves only on `ChangeFrame` (a call
+/// or a return). These opcodes are the call half; the return half is
+/// `SubReturn` / `SubRaise` (`finishframe` / `finishframe_exception`).
+fn helper_opcode_changes_frame(code: &[u8], pc: usize) -> bool {
+    decode_op_at(code, pc).is_some_and(|op| {
+        op.opname.starts_with("inline_call_") || op.opname.starts_with("residual_call_")
+    })
+}
+
+/// `pyjitpl.py` `MetaInterp._interpret` after `MIFrame.run_one_step` returns.
+/// Helper sub-walks evaluate `blackhole_if_trace_too_long` here rather than
+/// after every walker instruction. `latch_pc` is the live `MIFrame.pc`
+/// (`_get_opimpl_method` has already advanced it); `error_pc` is the
+/// instruction that produced this `ChangeFrame`.
+fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    latch_pc: usize,
+    error_pc: usize,
+) -> Result<(), DispatchError> {
+    if !ctx.fbw_mode.transparent_helper_subwalk || !ctx.trace_ctx.is_too_long() {
+        return Ok(());
+    }
+    reconcile_vstack_to_resume_pc(ctx, latch_pc);
+    let mut blackhole_latched = latch_abort_blackhole(ctx, latch_pc, "run_one_step");
+    if blackhole_latched {
+        let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+        blackhole_latched = finish_helper_abort_latch(ctx.session, splice_ok);
+    }
+    match helper_too_long_decision(true, blackhole_latched, fbw_executed_effect_count()) {
+        HelperTooLongDecision::DeliverOutcome => Ok(()),
+        HelperTooLongDecision::Abort => Err(helper_too_long_result(ctx, error_pc)),
+        HelperTooLongDecision::KeepExecuting => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[keep-recording] helper effects={}",
+                    fbw_executed_effect_count(),
+                );
+            }
+            bump_keep_recording_too_long_once(ctx.session);
+            Ok(())
+        }
+    }
+}
+
 /// Walk the code from `start_pc` until a terminating opcode fires.
 /// Returns the terminating outcome plus the pc immediately after the
 /// terminator. Top-level callers expect `DispatchOutcome::Terminate`
@@ -5578,6 +5625,11 @@ pub fn walk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
+    // `pyjitpl.py` `MetaInterp._interpret` checks after the caller's
+    // `run_one_step` that `newframe`d this helper (`ChangeFrame`), before
+    // the helper's first instruction. `SubWalkDriver` dest-write resume
+    // is the same check after a nested child returns.
+    helper_blackhole_after_run_one_step(ctx, start_pc, start_pc)?;
     loop {
         // A sub-walk error recovered inside an earlier opcode must not make a
         // later abort of this frame decline. The flag is raised again only
@@ -5816,14 +5868,13 @@ pub fn walk<Sym: WalkSym>(
         };
         pc = next_pc;
         // pyjitpl.py `_interpret`: `blackhole_if_trace_too_long()` runs
-        // after every `run_one_step()`. This loop is that loop's counterpart —
-        // `step` is `run_one_step` — and it is the only place the check runs:
-        // the concrete bytecode dispatch loop it replaced deliberately dropped
-        // it (`pyre-jit/src/eval.rs`, whose comment records why), so nothing
-        // else bounds a walk that keeps recording without reaching a close.
-        // `TraceCtx::is_too_long` is the `history.length() >
-        // warmrunnerstate.trace_limit` test and `num_ops` is a `Vec::len`, so
-        // this is one comparison per step.
+        // after every `run_one_step()`. `MIFrame.run_one_step` loops until
+        // `ChangeFrame` (a call or a return); this loop's `step` is one
+        // instruction of that inner loop. Python-level walks keep the
+        // per-instruction check. Helper sub-walks evaluate the same
+        // `helper_too_long_decision` only at `ChangeFrame`: entering this
+        // frame (`walk` start), a nested `inline_call_*` / `residual_call_*`
+        // that returned, and the helper's own return (the caller's check).
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
@@ -5858,15 +5909,16 @@ pub fn walk<Sym: WalkSym>(
         if let DispatchOutcome::SegmentTrace { .. } = outcome {
             return Ok((outcome, pc));
         }
-        // pyjitpl.py `_interpret` calls `blackhole_if_trace_too_long` after
-        // every `run_one_step` of whichever MIFrame is on top. Inlined helper
-        // frames are ordinary MIFrames, so a transparent helper subwalk runs
-        // this same post-step check. Deferring it to the enclosing Python
-        // walk never comes back when the helper keeps descending (nested-tuple
-        // `isinstance` via `walk_translated_builtin_wrapper`). The abort below
-        // is the same `note_root_trace_too_long` + `TraceTooLong` path the
-        // enclosing frame already takes.
-        if ctx.trace_ctx.is_too_long() {
+        if ctx.fbw_mode.transparent_helper_subwalk {
+            // Ordinary instructions stay inside `MIFrame.run_one_step`. A
+            // nested call that returned is `ChangeFrame`; `SubReturn` /
+            // `SubRaise` is `finishframe` first and the caller checks.
+            if matches!(outcome, DispatchOutcome::Continue)
+                && helper_opcode_changes_frame(code, opcode_position)
+            {
+                helper_blackhole_after_run_one_step(ctx, pc, opcode_position)?;
+            }
+        } else if ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
@@ -5910,41 +5962,13 @@ pub fn walk<Sym: WalkSym>(
                 discard_staged_abort(ctx.session);
                 blackhole_latched = false;
             }
-            // One MIFrame per live helper (`convert_and_run_from_pyjitpl` /
-            // `_copy_data_from_miframe` / `MetaInterp.newframe`). The splice
-            // skips activations `build_multi_frame_miframe` already copied
-            // from `session.framestack`.
-            if blackhole_latched && ctx.fbw_mode.transparent_helper_subwalk {
-                let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
-                blackhole_latched = finish_helper_abort_latch(ctx.session, splice_ok);
-            }
             // `SwitchToBlackhole(ABORT_TOO_LONG)` always has a blackhole
             // resume upstream.  Abort only once `trace_too_long_abort_safe`
             // holds: a complete image, or a zero-effect walk that may still
             // take entry replay.
             let abort_safe =
                 trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count());
-            if ctx.fbw_mode.transparent_helper_subwalk {
-                match helper_too_long_decision(
-                    snapshot_safe,
-                    blackhole_latched,
-                    fbw_executed_effect_count(),
-                ) {
-                    HelperTooLongDecision::DeliverOutcome => {}
-                    HelperTooLongDecision::Abort => {
-                        return Err(helper_too_long_result(ctx, opcode_position));
-                    }
-                    HelperTooLongDecision::KeepExecuting => {
-                        if fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[keep-recording] helper effects={}",
-                                fbw_executed_effect_count(),
-                            );
-                        }
-                        bump_keep_recording_too_long_once(ctx.session);
-                    }
-                }
-            } else if abort_safe {
+            if abort_safe {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
                     ctx.trace_ctx.current_merge_points_first_green_key_pair(),

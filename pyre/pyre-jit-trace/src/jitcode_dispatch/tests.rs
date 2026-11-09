@@ -21688,13 +21688,14 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
-/// pyjitpl.py `_interpret` runs `blackhole_if_trace_too_long` after every
-/// jitcode step of whichever MIFrame is on top, including inlined helper
-/// frames. The caller here is one `inline_call_r_v/dR` followed by its
-/// terminator, already over the limit: both a Python enclosing walk and a
-/// transparent helper walk abort through `DispatchError::TraceTooLong`.
+/// pyjitpl.py `_interpret` runs `blackhole_if_trace_too_long` after
+/// `MIFrame.run_one_step` (`ChangeFrame`). A helper walk already over
+/// the limit aborts at frame entry, before its first instruction. The
+/// caller here is one `inline_call_r_v/dR` followed by its terminator:
+/// both a Python enclosing walk and a transparent helper walk abort
+/// through `DispatchError::TraceTooLong`.
 #[test]
-fn helper_descent_runs_the_limit_check_per_step() {
+fn helper_descent_runs_the_limit_check_at_frame_entry() {
     fn walk_past_the_limit(
         transparent_helper_subwalk: bool,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
@@ -21790,8 +21791,9 @@ fn helper_descent_runs_the_limit_check_per_step() {
 
     // The helper body's `void_return/` is a terminator, so the too-long arm
     // (Continue-only, same as the enclosing Python walk) does not fire there.
-    // After the `inline_call` returns Continue, both a Python enclosing walk
-    // and a transparent helper walk take the shared `TraceTooLong` path.
+    // After the `inline_call` returns Continue, a Python enclosing walk
+    // takes the shared `TraceTooLong` path. A transparent helper already
+    // over budget aborts at `walk` entry (`run_one_step` of the caller).
     let enclosing = walk_past_the_limit(false);
     assert!(
         matches!(enclosing, Err(DispatchError::TraceTooLong { pc: 0, .. })),
@@ -21800,7 +21802,7 @@ fn helper_descent_runs_the_limit_check_per_step() {
     let helper = walk_past_the_limit(true);
     assert!(
         matches!(helper, Err(DispatchError::TraceTooLong { pc: 0, .. })),
-        "a transparent helper aborts on its own too-long step: {helper:?}"
+        "a transparent helper aborts at frame entry: {helper:?}"
     );
 }
 
@@ -21849,11 +21851,13 @@ fn paused_parent_resume_pc_prefers_the_call_next_pc_over_the_python_marker() {
     );
 }
 
-/// `_interpret` (`pyjitpl.py`) delivers `finishframe` / `finishframe_exception`
-/// and only then `blackhole_if_trace_too_long`. A helper `void_return/` that
-/// is already over budget is `SubReturn`, not `TraceTooLong`.
+/// `_interpret` (`pyjitpl.py`) checks after the `run_one_step` that
+/// `newframe`d this helper, before the helper's first instruction. A
+/// helper already over budget whose body is only `void_return/` therefore
+/// aborts at frame entry; `finishframe` itself is
+/// `helper_ordinary_steps_that_cross_the_limit_still_finishframe`.
 #[test]
-fn helper_void_return_delivers_before_too_long_abort() {
+fn helper_void_return_already_over_budget_aborts_at_frame_entry() {
     let void_ret = *insns_opname_to_byte()
         .get("void_return/")
         .expect("`void_return/` must be in insns table");
@@ -21906,18 +21910,18 @@ fn helper_void_return_delivers_before_too_long_abort() {
     };
     let result = walk(&code, 0, &mut wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
-        "finishframe runs before blackhole_if_trace_too_long: {result:?}"
+        matches!(result, Err(DispatchError::TraceTooLong { pc: 0, .. })),
+        "a helper already over budget aborts at frame entry: {result:?}"
     );
 }
 
-/// CHANGE 3 (b): declined latch + zero walk effects returns `TraceTooLong`
-/// so the enclosing Python CALL can latch (`helper_too_long_result`).
-/// `convert_and_run_from_pyjitpl` (`blackhole.py`) would already have the
-/// helper frame; unit tests cannot fill it, so the leftover is the
-/// zero-effect enclosing latch.
+/// Ordinary helper instructions that cross `trace_limit` stay inside
+/// `MIFrame.run_one_step`. `blackhole_if_trace_too_long` (`pyjitpl.py`
+/// `_interpret`) waits for `ChangeFrame`; `void_return/` is `finishframe`
+/// first. The enclosing Python CALL's post-step check is
+/// `python_walk_notes_root_when_a_helper_crosses_the_limit`.
 #[test]
-fn declined_latch_with_zero_walk_effects_returns_trace_too_long() {
+fn helper_ordinary_steps_that_cross_the_limit_still_finishframe() {
     let int_add = *insns_opname_to_byte()
         .get("int_add/ii>i")
         .expect("`int_add/ii>i` must be in insns table");
@@ -21977,7 +21981,7 @@ fn declined_latch_with_zero_walk_effects_returns_trace_too_long() {
         raw_descrs: RawDescrPool::Global,
         is_authoritative_executor: true,
         trace_ctx: &mut tc,
-        is_top_level: true,
+        is_top_level: false,
         sub_jitcode_lookup: &lookup,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
@@ -21993,12 +21997,12 @@ fn declined_latch_with_zero_walk_effects_returns_trace_too_long() {
     };
     let result = walk(&code, 0, &mut wc);
     assert!(
-        matches!(result, Err(DispatchError::TraceTooLong { .. })),
-        "zero walk effects and no latch must TraceTooLong: {result:?}"
+        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        "ordinary helper steps that cross the limit still finishframe: {result:?}"
     );
     assert!(
         !abort_blackhole_latched(),
-        "a declined latch must not leave a staged image"
+        "finishframe must not leave a staged image"
     );
     fbw_store_journal_reset();
     reset_single_frame_blackhole();

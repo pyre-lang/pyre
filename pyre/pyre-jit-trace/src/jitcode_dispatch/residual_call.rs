@@ -912,15 +912,17 @@ pub(crate) fn finish_helper_abort_latch(
     false
 }
 
-/// After `run_one_step`, `blackhole_if_trace_too_long` (`pyjitpl.py`
-/// `_interpret`). A SubReturn / SubRaise is `finishframe` /
+/// After `MIFrame.run_one_step` returns, `blackhole_if_trace_too_long`
+/// (`pyjitpl.py` `_interpret`). A SubReturn / SubRaise is `finishframe` /
 /// `finishframe_exception` first. A complete helper+ancestor image raises
 /// `SwitchToBlackhole(ABORT_TOO_LONG)`. A declined latch with nothing
 /// executed lets the enclosing Python CALL latch. An effectful walk without
 /// an image keeps executing (`execute_varargs`).
 ///
 /// `HelperReturn::CalleePrologue` uses this same table: there is no
-/// helper-identity exemption from the trace limit.
+/// helper-identity exemption from the trace limit. Helper sub-walks
+/// consult it at `ChangeFrame` (a nested call or a return), not after
+/// every walker instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelperTooLongDecision {
     DeliverOutcome,
