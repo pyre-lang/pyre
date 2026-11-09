@@ -322,6 +322,7 @@ two-phase-annotate-skipped	pyre_interpreter::builtins::w_memoryview_cast_1d
 two-phase-annotate-skipped	pyre_interpreter::builtins::w_memoryview_new_raw_window
 two-phase-annotate-skipped	pyre_interpreter::builtins::w_memoryview_new_restricted_snapshot
 two-phase-annotate-skipped	pyre_interpreter::builtins::w_memoryview_new_simple_with_owner
+two-phase-annotate-skipped	pyre_interpreter::call::__majit_wrap_type_descr_call
 two-phase-annotate-skipped	pyre_interpreter::call::call_args_in_frame__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::call::call_callable
 two-phase-annotate-skipped	pyre_interpreter::call::call_callable__AccessDirect_None
@@ -339,12 +340,15 @@ two-phase-annotate-skipped	pyre_interpreter::call::call_kw_in_ctx_impl__AccessDi
 two-phase-annotate-skipped	pyre_interpreter::call::call_user_function_plain_with_ctx
 two-phase-annotate-skipped	pyre_interpreter::call::call_user_function_resolved
 two-phase-annotate-skipped	pyre_interpreter::call::call_user_function_with_ctx
+two-phase-annotate-skipped	pyre_interpreter::call::descr_call_get
+two-phase-annotate-skipped	pyre_interpreter::call::descr_call_get_and_call_args
 two-phase-annotate-skipped	pyre_interpreter::call::eval_current_frame_raw
 two-phase-annotate-skipped	pyre_interpreter::call::fill_user_function_args
 two-phase-annotate-skipped	pyre_interpreter::call::frame_into_generator_for_function
 two-phase-annotate-skipped	pyre_interpreter::call::function_call_args
 two-phase-annotate-skipped	pyre_interpreter::call::make_user_call_frame
 two-phase-annotate-skipped	pyre_interpreter::call::prepare_user_call
+two-phase-annotate-skipped	pyre_interpreter::call::type_descr_call_impl
 two-phase-annotate-skipped	pyre_interpreter::call::unpack_portal_runner
 two-phase-annotate-skipped	pyre_interpreter::codec_engine::<Impl>::pinned
 two-phase-annotate-skipped	pyre_interpreter::codec_engine::decode_ascii
@@ -425,6 +429,7 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_anext__AccessDire
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_awaitable__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_len__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_yield_from_iter__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::getname_u__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::import_from__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::import_module__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::import_name__AccessDirect_None
