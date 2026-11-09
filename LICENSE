@@ -19,3 +19,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This repository bundles the PyPy source tree ('pypy', 'rpython', 'lib_pypy',
+'lib-python', 'py', '_pytest' and the other PyPy directories) for development
+convenience, and Pyre's code is ported from it. That code is distributed under
+PyPy's license; its copyright notice and the list of PyPy copyright holders are
+in LICENSE-PyPy.
