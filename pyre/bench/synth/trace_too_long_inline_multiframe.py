@@ -3,6 +3,9 @@
 # three independently observable containers before the limit lands; replaying
 # from the caller's CALL applies an iteration twice, while collapsing the
 # callee onto the caller loses its locals/operand stack.
+# The limit is chosen so the cut lands inside leaf after its three mutations,
+# past the zero-effect call_trace prologue walk; counters are flat for
+# limits 134-146.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The
@@ -17,7 +20,7 @@ except ImportError:
 
 
 if pypyjit is not None:
-    pypyjit.set_param("trace_limit=70,threshold=1,function_threshold=1")
+    pypyjit.set_param("trace_limit=140,threshold=1,function_threshold=1")
 
 
 def leaf(box, mapping, values, x):
