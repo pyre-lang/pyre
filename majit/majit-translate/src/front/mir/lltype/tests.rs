@@ -16,7 +16,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{Locals, NameSeg, TyRef, TypeDeclKind},
+    ullbc::{Locals, NameSeg, RegularCall, TyRef, TypeDeclKind},
 };
 
 use crate::front::mir::tests::{
@@ -9895,6 +9895,161 @@ fn with_fixture_lowering(llbc: &Llbc, f: impl FnOnce(&super::Lowering<'_>)) {
     )
     .unwrap();
     f(&lowering);
+}
+
+/// `deref_cast_root` reinterprets only a one-word handle (`Box<T>`,
+/// `repr(transparent)` one-pointer wrappers). A three-field
+/// non-transparent handle is `PtrRepr.rtype_getattr` field access.
+#[test]
+fn deref_cast_root_is_one_word_handle_only() {
+    let payload_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let three_field_adt = serde_json::json!({
+        "Adt": {"id": 1, "generics": {"types": []}}
+    });
+    let word_adt = serde_json::json!({
+        "Adt": {"id": 2, "generics": {"types": []}}
+    });
+    let opaque_word_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": {"types": []}}
+    });
+    let box_adt = serde_json::json!({
+        "Adt": {
+            "id": 99,
+            "builtin": "Box",
+            "generics": {"types": [payload_adt.clone()]}
+        }
+    });
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let payload = struct_decl(
+        0,
+        ident_path(&["fixture", "Payload"]),
+        serde_json::json!([{
+            "name": "n",
+            "ty": i64_ty.clone(),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let mut payload = payload;
+    payload["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let three_field = struct_decl(
+        1,
+        ident_path(&["fixture", "Handle"]),
+        serde_json::json!([
+            {"name": "value", "ty": i64_ty.clone(), "attr_info": null},
+            {"name": "slot", "ty": i64_ty.clone(), "attr_info": null},
+            {"name": "_not_send", "ty": i64_ty, "attr_info": null}
+        ]),
+        false,
+    );
+    let mut three_field = three_field;
+    three_field["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 24,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8, 16]}],
+            "repr": {"repr_algo": "Rust", "transparent": false}
+        }
+    }]);
+    let word = opaque_handle_decl(2, ident_path(&["fixture", "Word"]), 8);
+    let mut opaque_word = opaque_handle_decl(3, ident_path(&["fixture", "Guard"]), 8);
+    opaque_word["layout"][0]["value"]["repr"]["transparent"] = serde_json::json!(false);
+    let dest_ty = TyRef::Other(serde_json::json!({
+        "Ref": [null, payload_adt.clone(), "Shared"]
+    }));
+    let deref_fun = |def_id: u64, handle: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["Handle", 0]},
+                    {"Impl": {"Ty": {"skip_binder": {"Value": [0, handle.clone()]}}}},
+                    {"Ident": ["deref", 0]}
+                ],
+                "span": fixture_span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Ref": [null, handle, "Shared"]}],
+                "output": {"Ref": [null, payload_adt.clone(), "Shared"]}
+            },
+            "body": "Opaque"
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "target_information": [{
+                "key": "fixture-target",
+                "value": {
+                    "target_pointer_size": 8,
+                    "is_little_endian": true
+                }
+            }],
+            "type_decls": [payload, three_field, word, opaque_word],
+            "fun_decls": [
+                deref_fun(0, three_field_adt),
+                deref_fun(1, box_adt),
+                deref_fun(2, word_adt),
+                deref_fun(3, opaque_word_adt)
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let call = |id: u64| {
+        serde_json::from_value::<RegularCall>(serde_json::json!({
+            "kind": {"Fun": id},
+            "generics": {}
+        }))
+        .expect("RegularCall parses")
+    };
+    with_fixture_lowering(&llbc, |lowering| {
+        assert_eq!(
+            lowering.deref_cast_root(&call(0), &dest_ty),
+            None,
+            "a three-field non-transparent handle is not a one-word reinterpret"
+        );
+        assert_eq!(
+            lowering.deref_cast_root(&call(1), &dest_ty).as_deref(),
+            Some("Payload"),
+            "Box<T> keeps the one-word cast"
+        );
+        assert_eq!(
+            lowering.deref_cast_root(&call(2), &dest_ty).as_deref(),
+            Some("Payload"),
+            "a transparent one-word handle keeps the one-word cast"
+        );
+        assert_eq!(
+            lowering.deref_cast_root(&call(3), &dest_ty).as_deref(),
+            Some("Payload"),
+            "an opaque one-word guard (MutexGuard-shaped) keeps the one-word cast"
+        );
+    });
 }
 
 #[test]

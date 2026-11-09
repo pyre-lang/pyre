@@ -4764,6 +4764,10 @@ fn derive_program_metadata(
         if td.published_struct_copy {
             continue;
         }
+        // The handle is the `RBigInt` it roots; it is not a ClassDef.
+        if rbigint_gc_root::is_root_path(&td.item_meta.name_path()) {
+            continue;
+        }
         if matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
             note_raw_word_owner(
                 &mut struct_fields,
@@ -7005,6 +7009,9 @@ pub use shadow_stack_erase::{
 #[path = "owner_root_guard.rs"]
 mod owner_root_guard;
 
+#[path = "rbigint_gc_root.rs"]
+mod rbigint_gc_root;
+
 mod address;
 mod consteval;
 mod desugar;
@@ -7089,6 +7096,14 @@ pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_le
 /// `(graph path, callee path)`.
 pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
     owner_root_guard::residual_escape_census(llbc)
+}
+
+/// Graphs that pass `RBigIntGcRoot` (or an aggregate that contains one)
+/// by value or through a pointer into a callee that stays residual, or
+/// receive one as the call destination. Each row is
+/// `(graph path, callee path)`.
+pub fn residual_rbigint_gc_root_escapes(llbc: &Llbc) -> Vec<(String, String)> {
+    rbigint_gc_root::residual_escape_census(llbc)
 }
 
 /// Definitions of each MIR local: an `Assign` into the bare local, or a
