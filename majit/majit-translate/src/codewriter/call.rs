@@ -8787,14 +8787,16 @@ impl CallControl {
                 // `annrpython.py consider_op` never `recursivecall`s a
                 // helper whose Call `translate_op` rewrites to a
                 // high-level op (`rlist.py rtype_newlist` lowers to
-                // `gendirectcall` at rtyping). Empty callees is the
+                // `gendirectcall` at rtyping) or to `str.join`
+                // (`rstr.py rtype_method_join`) when the receiver is a
+                // list of str. Empty callees is the
                 // existing no-graph path: no block, no notify, no
                 // AccessDirect copy. `find_all_graphs` still follows
                 // the graph (`call.py guess_call_kind`).
                 if !bfs_phase
-                    && crate::translator::rtyper::flowspace_adapter::function_path_is_high_level_op(
+                    && crate::translator::rtyper::flowspace_adapter::call_rewritten_before_recursivecall(
                         target,
-                        args.len(),
+                        args,
                     )
                 {
                     return Vec::new();
@@ -16577,34 +16579,22 @@ pub(crate) fn array_type_id_of_lltype(
         .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {:?}", arr.OF))
 }
 
-/// `GCREF = Ptr(GcOpaqueType('GCREF'))` (`llmemory.py`). A gc struct
-/// pointer is `OBJECTPTR` and stays `LIST_OBJ_ITEMS_ARRAY`.
-fn ptr_to_is_gc_gcref(p: &crate::translator::rtyper::lltypesystem::lltype::Ptr) -> bool {
-    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
-    match &p.TO {
-        PtrTarget::Opaque(op) => op.tag == "GCREF" && op._gckind == GcKind::Gc,
-        _ => false,
-    }
-}
-
 fn try_array_type_id_of_lltype(
     arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
 ) -> Option<String> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     use majit_jitcode::codewriter::jtransform::{
-        LIST_FLOAT_ITEMS_ARRAY, LIST_GCREF_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+        LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
     };
     let of = array_of_lltype_identity(&arr.OF);
     if arr._gckind == GcKind::Gc {
         match &of {
             LowLevelType::Signed => Some(LIST_INT_ITEMS_ARRAY.to_string()),
             LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-            // Before the gc-pointer arm: `try_array_item_spelling` names
-            // every gc pointer `GCREF`, and that arm is `GcArray(OBJECTPTR)`.
-            // `GcArray(GCREF)` is its own ARRAY (`init_array_descr`).
-            LowLevelType::Ptr(p) if ptr_to_is_gc_gcref(p) => {
-                Some(LIST_GCREF_ITEMS_ARRAY.to_string())
-            }
+            // `GCREF` is `Ptr(GcOpaqueType('GCREF'))` (`llmemory.py`), so
+            // `_needsgc()` is true. `externalvsinternal(..., gcref=True)`
+            // stores every gc pointer item as that `GCREF`, and
+            // `get_array_descr` keys the resulting ARRAY once.
             LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
             of => Some(format!("GcArray<{}>", try_array_item_spelling(of)?)),
         }
@@ -18281,17 +18271,19 @@ mod tests {
         );
     }
 
-    /// `GcArray(GCREF)` is `LIST_GCREF_ITEMS_ARRAY`. A gc struct pointer
-    /// stays `LIST_OBJ_ITEMS_ARRAY` (`GcArray(OBJECTPTR)`).
+    /// `GcArray(GCREF)` and a `GcArray` of gc struct pointers are one ARRAY.
+    /// `externalvsinternal(..., gcref=True)` (`rmodel.py`) wraps both items
+    /// as gc pointers, and `get_array_descr` caches on that ARRAY
+    /// (`LIST_OBJ_ITEMS_ARRAY`).
     #[test]
-    fn array_type_id_gc_gcref_opaque_is_its_own_array() {
+    fn array_type_id_gc_pointer_items_share_list_obj_items_array() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
         };
-        use majit_jitcode::codewriter::jtransform::{LIST_GCREF_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY};
+        use majit_jitcode::codewriter::jtransform::LIST_OBJ_ITEMS_ARRAY;
         assert_eq!(
             array_type_id_of_lltype(&Array::gc(GCREF.clone())),
-            LIST_GCREF_ITEMS_ARRAY
+            LIST_OBJ_ITEMS_ARRAY
         );
         let point = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(Struct::gc(

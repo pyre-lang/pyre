@@ -15977,38 +15977,37 @@ mod tests {
         }
     }
 
-    /// `gcref_gcarray_descr` is `cpu.arraydescrof(GcArray(GCREF))`. The
-    /// pool key is `LIST_GCREF_ITEMS_ARRAY`, and items are GC pointers.
+    /// `[str]` is `GcArray(GCREF)` after `externalvsinternal(..., gcref=True)`
+    /// (`rmodel.py`). `get_array_descr` keys that ARRAY once, so
+    /// `runtime_gcarray_descr("[str]")` is `pyobject_gcarray_descr`
+    /// (`OBJECT_REF_GCARRAY_TYPE_ID`, tid [`PY_OBJECT_ARRAY_GC_TYPE_ID`],
+    /// [`ITEMS_BLOCK_TOKEN`]). Items are GC pointers.
     #[test]
-    fn gcref_gcarray_descr_publishes_under_the_codewriter_array_identity() {
-        // Publish the object-ref array first so this test owns the
-        // `OBJECT_REF` slot. The GCREF publication must leave tid 9 there.
-        let _pyobj = crate::state::pyobject_gcarray_descr();
-        crate::state::publish_typed_items_gcarray_descrs();
-        let descr = crate::state::gcref_gcarray_descr();
+    fn str_list_gcarray_descr_shares_the_object_items_array() {
+        let descr = crate::state::runtime_gcarray_descr("[str]")
+            .expect("[str] must resolve through the object-items ARRAY");
         let array = descr
             .as_array_descr()
-            .expect("gcref gcarray descr must be an ArrayDescr");
-        let token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
-        let atid = majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY;
-        let cache_key = majit_ir::descr::path_hash(atid);
+            .expect("str-list gcarray descr must be an ArrayDescr");
+        let token = &pyre_object::ITEMS_BLOCK_TOKEN;
+        let atid = majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
         assert_eq!(array.base_size(), token.base_size);
         assert_eq!(array.item_size(), token.item_size);
+        assert_eq!(array.item_type(), Type::Ref);
         assert!(array.is_array_of_pointers());
         assert!(!array.is_array_of_structs());
+        assert_eq!(array.type_id(), PY_OBJECT_ARRAY_GC_TYPE_ID);
         assert_eq!(
             majit_ir::descr::gc_cache()
                 .lock()
-                .resolve_array_tid(cache_key),
-            Some(array.type_id()),
-        );
-        assert_eq!(
-            majit_ir::descr::gc_cache()
-                .lock()
-                .resolve_array_tid(majit_ir::descr::path_hash(
-                    majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID,
-                )),
+                .resolve_array_tid(majit_ir::descr::path_hash(atid)),
             Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
+        );
+        let via_object =
+            crate::state::runtime_gcarray_descr(atid).expect("object-items ARRAY identity");
+        assert_eq!(
+            via_object.as_array_descr().unwrap().type_id(),
+            PY_OBJECT_ARRAY_GC_TYPE_ID
         );
     }
 }

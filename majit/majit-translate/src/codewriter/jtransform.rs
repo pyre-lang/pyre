@@ -911,7 +911,7 @@ pub(crate) enum JitMarkerKey {
 }
 
 pub use majit_jitcode::codewriter::jtransform::{
-    LIST_FLOAT_ITEMS_ARRAY, LIST_GCREF_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+    LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
 };
 
 /// Leaf of a type path, ignoring a generic argument list and a turbofish `::`.
@@ -42129,11 +42129,12 @@ mod tests {
     }
 
     /// `do_fixed_newlist` (jtransform.py): `Ptr(GcArray(GCREF))` emits
-    /// `new_array_clear` with `LIST_GCREF_ITEMS_ARRAY`. Items are GC
-    /// pointers (`ValueType::Ref`), so the opcode is the clearing one.
-    /// `GcArray(OBJECTPTR)` stays `LIST_OBJ_ITEMS_ARRAY`.
+    /// `new_array_clear`. `externalvsinternal(..., gcref=True)` makes that
+    /// the same ARRAY as every other gc-pointer `GcArray`, so the identity
+    /// is `LIST_OBJ_ITEMS_ARRAY`. Items are GC pointers (`ValueType::Ref`),
+    /// so the opcode is the clearing one.
     #[test]
-    fn handle_list_call_newlist_fixed_gcref_assigns_gcref_array_id() {
+    fn handle_list_call_newlist_fixed_gcref_assigns_object_items_array_id() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, GCREF, LowLevelType, Ptr, PtrTarget,
         };
@@ -42179,8 +42180,8 @@ mod tests {
                 );
                 assert_eq!(
                     array_type_id.as_deref(),
-                    Some(LIST_GCREF_ITEMS_ARRAY),
-                    "fixed GCREF array must name GcArray<GCREF>"
+                    Some(LIST_OBJ_ITEMS_ARRAY),
+                    "fixed GCREF array shares the object-items ARRAY"
                 );
             }
             other => panic!("expected NewArrayClear, got {other:?}"),

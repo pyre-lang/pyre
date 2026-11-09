@@ -1855,6 +1855,275 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// `core::option::<Impl>::is_some` / `is_none` on a niche `Option<fn>`.
+    ///
+    /// `rnone.py` `rtype_is_None` compares the word with `lltype.nullptr`
+    /// of its `FuncType` (`null_fn`). `is_none` is `flowcontext.py`
+    /// `cmp_is`: the `is_` op left as a value. `is_some` is `cmp_is_not`,
+    /// which is `not_` of that `is_`. `not_` runs `guessbool` on the
+    /// `is_` result, so the result is this block's exitswitch and each
+    /// exit continues with a constant (`False` on the is-None exit,
+    /// `True` on the other). Nothing computes `not` as a value. A
+    /// non-fn niche stays a call: `Option<PyObjectRef>::is_some` is
+    /// still the tagged discriminant (`callable_w`).
+    pub(in crate::front::mir) fn lower_fn_niche_option_predicate(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(name) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        let is_some = matches!(
+            name.as_str(),
+            "core::option::<Impl>::is_some"
+                | "core::option::Option::is_some"
+                | "option::Option::is_some"
+        );
+        let is_none = matches!(
+            name.as_str(),
+            "core::option::<Impl>::is_none"
+                | "core::option::Option::is_none"
+                | "option::Option::is_none"
+        );
+        if (!is_some && !is_none) || call.args.len() != 1 {
+            return Ok(false);
+        }
+        let Some(arg_ty) = operand_tyref(&call.args[0]) else {
+            return Ok(false);
+        };
+        let owned = tyref_shared_borrow_option_pointee(arg_ty, self.llbc);
+        let option_ty = owned.as_ref().unwrap_or(arg_ty);
+        if !tyref_option_payload_is_fn_ptr(option_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(int_null) = self.option_niche_int_null(option_ty) else {
+            return Ok(false);
+        };
+        if !matches!(int_null, crate::model::NicheIntNull::FnPtr(_)) {
+            return Ok(false);
+        }
+        let recv = self.resolve_operand(mir_bb, call.args[0].clone())?;
+        let bb_id = self.emit_bb(mir_bb);
+        let nullc = int_null.push(&mut self.graph, bb_id);
+        let v_is = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_is.clone()),
+            kind: OpKind::BinOp {
+                op: "is_".to_string(),
+                lhs: recv,
+                rhs: nullc,
+                result_ty: ValueType::Int,
+            },
+        });
+        if is_some {
+            // `cmp_is_not` / `not_` / `guessbool`: the `is_` is the
+            // exitswitch. The True exit (word is None) carries
+            // `Const(false)`; the False exit carries `Const(true)`.
+            self.close_fn_niche_is_some_fork(mir_bb, bb_id, dest_local, target, v_is)?;
+        } else {
+            // `cmp_is`: the `is_` itself is the value that flows out.
+            self.local_var[dest_local] = Some(LocalValue::One(v_is));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+        }
+        Ok(true)
+    }
+
+    /// `Constant(bool, lltype.Bool)` for one `is_some` link slot.
+    fn fn_niche_is_some_link_const(is_some: bool) -> crate::model::LinkArg {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        crate::model::LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+            crate::flowspace::model::ConstValue::Bool(is_some),
+            LowLevelType::Bool,
+        ))
+    }
+
+    /// Close `is_some` the way `flowcontext.py` `guessbool` closes the
+    /// block inside `not_` (`cmp_is_not`).
+    ///
+    /// False link first, then True, matching `guessbool`'s
+    /// `[False, True]` eggs and [`FunctionGraph::set_branch`]. The
+    /// constant on `dest_local` is `not` of that exit
+    /// (`Constant(..., lltype.Bool)`, the same concretetype
+    /// `optimize_goto_if_not` stamps). Every other edge arg is shared.
+    /// `set_branch` cannot express a per-link constant and always wraps
+    /// `bool()`, so the links are [`Link::new_mixed`].
+    ///
+    /// When `dest_local` is not one word of the target's inputargs, two
+    /// intermediate blocks each `ConstBool` the dest and `set_goto` the
+    /// target — the graph `guessbool` produces before `join_blocks`.
+    fn close_fn_niche_is_some_fork(
+        &mut self,
+        mir_bb: usize,
+        bb_id: crate::model::BlockId,
+        dest_local: usize,
+        target: usize,
+        v_is: Variable,
+    ) -> Result<(), LowerError> {
+        let inputs = self.target_input_locals(target)?;
+        let slot = inputs.iter().position(|local| *local == dest_local);
+        let view = self.string_byte_view_locals.contains(&dest_local)
+            || self.list_view_locals.contains(&dest_local);
+        if slot.is_none() || view {
+            return self.close_fn_niche_is_some_eggs(mir_bb, bb_id, dest_local, target, v_is);
+        }
+        let slot = slot.expect("dest_local is a target input");
+        // `edge_args` reads `local_var`. The placeholder only reserves
+        // the dest slot; the links below replace it and the variable
+        // is not an operation result, so it is not a flowing value.
+        let placeholder = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+        let link_vars = self.edge_args(mir_bb, target)?;
+        if link_vars.get(slot) != Some(&placeholder) {
+            return Err(LowerError::Unsupported(
+                "Option<fn>::is_some dest is not one link word".to_string(),
+            ));
+        }
+        let target_bb = self.block_id[target];
+        let mut false_args: Vec<crate::model::LinkArg> = link_vars
+            .iter()
+            .cloned()
+            .map(crate::model::LinkArg::Value)
+            .collect();
+        let mut true_args = false_args.clone();
+        for (index, var) in link_vars.iter().enumerate() {
+            if var == &placeholder {
+                // False exit of `is_`: the word is not None, so `is_some`.
+                false_args[index] = Self::fn_niche_is_some_link_const(true);
+                // True exit of `is_`: the word is None, so not `is_some`.
+                true_args[index] = Self::fn_niche_is_some_link_const(false);
+            }
+        }
+        assert_eq!(
+            false_args.len(),
+            self.graph.block(target_bb).inputargs.len(),
+            "is_some fork args must match the target inputargs"
+        );
+        let false_link = crate::model::Link::new_mixed(
+            false_args,
+            target_bb,
+            Some(crate::model::ExitCase::Bool(false)),
+        )
+        .with_llexitcase_from_exitcase();
+        let true_link = crate::model::Link::new_mixed(
+            true_args,
+            target_bb,
+            Some(crate::model::ExitCase::Bool(true)),
+        )
+        .with_llexitcase_from_exitcase();
+        self.graph.set_control_flow_metadata(
+            bb_id,
+            Some(crate::model::ExitSwitch::Value(v_is)),
+            vec![false_link, true_link],
+        );
+        Ok(())
+    }
+
+    /// Two `guessbool` eggs. Each binds `dest_local` to its own
+    /// `ConstBool` and gotos the call target. Other edge args are
+    /// threaded as egg inputargs so the goto's operands are defined
+    /// in the egg (`close_call_diamond`).
+    ///
+    /// The eggs are recorded on `exception_cascade_blocks` so
+    /// `lower_framestate` walks through them to the MIR target
+    /// (`framestate_mir_successors`) and does not rewrite their links
+    /// in pass 2. Otherwise pass 1 would `stub_dead_block` the target.
+    fn close_fn_niche_is_some_eggs(
+        &mut self,
+        mir_bb: usize,
+        bb_id: crate::model::BlockId,
+        dest_local: usize,
+        target: usize,
+        v_is: Variable,
+    ) -> Result<(), LowerError> {
+        let placeholder = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+        let link_vars = self.edge_args(mir_bb, target)?;
+        let target_bb = self.block_id[target];
+        let mut carried: Vec<Variable> = Vec::new();
+        for var in &link_vars {
+            if var != &placeholder && !carried.contains(var) {
+                carried.push(var.clone());
+            }
+        }
+        let (false_egg, false_inputs) = self.graph.create_block_with_arg_vars(carried.len());
+        let (true_egg, true_inputs) = self.graph.create_block_with_arg_vars(carried.len());
+        self.emit_fn_niche_is_some_egg(
+            false_egg,
+            &false_inputs,
+            true,
+            &link_vars,
+            &placeholder,
+            &carried,
+            target_bb,
+        );
+        self.emit_fn_niche_is_some_egg(
+            true_egg,
+            &true_inputs,
+            false,
+            &link_vars,
+            &placeholder,
+            &carried,
+            target_bb,
+        );
+        let false_link = crate::model::Link::from_variables(
+            &self.graph,
+            carried.clone(),
+            false_egg,
+            Some(crate::model::ExitCase::Bool(false)),
+        )
+        .with_llexitcase_from_exitcase();
+        let true_link = crate::model::Link::from_variables(
+            &self.graph,
+            carried,
+            true_egg,
+            Some(crate::model::ExitCase::Bool(true)),
+        )
+        .with_llexitcase_from_exitcase();
+        self.graph.set_control_flow_metadata(
+            bb_id,
+            Some(crate::model::ExitSwitch::Value(v_is)),
+            vec![false_link, true_link],
+        );
+        self.exception_cascade_blocks.push(false_egg);
+        self.exception_cascade_blocks.push(true_egg);
+        Ok(())
+    }
+
+    fn emit_fn_niche_is_some_egg(
+        &mut self,
+        egg: crate::model::BlockId,
+        inputs: &[Variable],
+        is_some_value: bool,
+        link_vars: &[Variable],
+        placeholder: &Variable,
+        carried: &[Variable],
+        target_bb: crate::model::BlockId,
+    ) {
+        let produced = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(egg).operations.push(SpaceOperation {
+            result: Some(produced.clone()),
+            kind: OpKind::ConstBool(is_some_value),
+        });
+        let args = remap_diamond_goto_args(link_vars, placeholder, &produced, carried, inputs);
+        self.graph.set_goto(egg, target_bb, args);
+    }
+
     /// `true` when `ty` is represented as a one-word nullable `Option` in
     /// the translated RPython model:
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,

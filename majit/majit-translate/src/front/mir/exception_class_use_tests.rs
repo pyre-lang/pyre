@@ -2613,6 +2613,145 @@ fn exception_class_vec_string_len_is_fixed_list_length() {
     );
 }
 
+fn slice_join_fun(id: u64) -> Value {
+    super::window_opaque_fun(
+        id,
+        &["alloc", "slice", "<Impl>", "join"],
+        vec![vec_adt_of(1, 2), str_ref_ty()],
+        str_ref_ty(),
+    )
+}
+
+fn vec_string_join_reader(enum_leaf: &str, fun_id: u64, join_fun_id: u64) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let vec_ty = vec_adt_of(1, 2);
+    let out = str_ref_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &vec_ty);
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    let sep = json!({"Const": [{"Str": ", "}, str_ref_ty()]});
+    fun(
+        fun_id,
+        &["fixture", enum_leaf, "getmsg"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(
+                    vec![],
+                    json!({"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": join_fun_id},
+                            "generics": super::window_empty_generics()
+                        }},
+                        "args": [{"Read": field}, sep]
+                    }, "dest": ret, "target": 3, "on_unwind": 2}}),
+                ),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+/// `posonly_kwds.join(", ")` on a marked exception's `Vec<String>` attr
+/// is `<[S]>::join`. The list word stays `list_of_str`, and the adapter
+/// rewrites that call to `str.join` (`rtype_method_join`).
+#[test]
+fn exception_class_vec_string_join_lowers_to_str_join() {
+    use crate::flowspace::model::Hlvalue;
+    let list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let join_fun = slice_join_fun(0);
+    let reader = vec_string_join_reader("BadVec", 1, 0);
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![join_fun, reader]);
+    let graph = lower(&llbc, "getmsg");
+    let join_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let n = segments.len();
+                n >= 3
+                    && segments[n - 3] == "slice"
+                    && segments[n - 2] == "<Impl>"
+                    && segments[n - 1] == "join"
+            }
+            _ => false,
+        })
+        .collect();
+    assert_eq!(join_calls.len(), 1, "{}", graph.dump());
+    let OpKind::Call { args, .. } = &join_calls[0].kind else {
+        unreachable!("filtered to Call");
+    };
+    let Some(LinkArg::Value(receiver)) = args.first() else {
+        panic!("join receiver is the list word; graph={}", graph.dump());
+    };
+    assert_eq!(
+        receiver.concretetype().as_ref(),
+        Some(&list_ll),
+        "join receiver concretetype {}; graph={}",
+        receiver
+            .concretetype()
+            .map(|ty| format!("{ty:?}"))
+            .unwrap_or_else(|| "none".to_string()),
+        graph.dump()
+    );
+
+    let registry = crate::translator::rtyper::call_registry::CallRegistry::new(std::rc::Rc::new(
+        crate::annotator::bookkeeper::Bookkeeper::new(),
+    ));
+    let mut value_map = std::collections::HashMap::new();
+    let result = join_calls[0].result.clone().expect("join result");
+    let result_hl = Hlvalue::Variable(Variable::new());
+    value_map.insert(result, result_hl.clone());
+    let mut arg_hls = Vec::new();
+    for arg in args {
+        match arg {
+            LinkArg::Value(var) => {
+                let hl = Hlvalue::Variable(Variable::new());
+                value_map.insert(var.clone(), hl.clone());
+                arg_hls.push(hl);
+            }
+            LinkArg::Const(constant) => arg_hls.push(Hlvalue::Constant(constant.clone())),
+        }
+    }
+    let translated = crate::translator::rtyper::flowspace_adapter::translate_op(
+        join_calls[0],
+        &value_map,
+        &registry,
+    )
+    .unwrap_or_else(|err| panic!("{err}; graph={}", graph.dump()));
+    assert_eq!(translated.len(), 2, "{}", graph.dump());
+    assert_eq!(translated[0].opname, "getattr");
+    assert_eq!(translated[0].args[0], arg_hls[1]);
+    let Hlvalue::Constant(method) = &translated[0].args[1] else {
+        panic!("method name is a Constant");
+    };
+    assert_eq!(method.value.as_text(), Some("join"));
+    assert_eq!(translated[1].opname, "simple_call");
+    assert_eq!(translated[1].args[0], translated[0].result);
+    assert_eq!(translated[1].args[1], arg_hls[0]);
+    assert_eq!(translated[1].result, result_hl);
+}
+
 #[test]
 fn exception_class_unmarked_vec_string_field_stays_three_words() {
     let vec_ty = vec_adt_of(1, 2);

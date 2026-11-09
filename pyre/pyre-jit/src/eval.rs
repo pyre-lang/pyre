@@ -2193,6 +2193,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         Vec::new(),
     ));
     debug_assert_eq!(py_object_array_tid, PY_OBJECT_ARRAY_GC_TYPE_ID);
+    // majit-rlib stamps this host's slot into the list-of-str header.
+    pyre_object::object_array::set_gc_object_items_array_gc_type_id(py_object_array_tid);
     // `pypy/objspace/std/specialisedtupleobject.py` `Cls_ii / Cls_ff
     // / Cls_oo` — three subclasses of `W_AbstractTupleObject` with
     // inline `value0` / `value1` fields. Each gets a distinct
@@ -5515,24 +5517,6 @@ fn build_gc() -> Box<MiniMarkGC> {
             .map(|alias| alias.pytype),
         |classptr| gc.subclass_range(classptr),
     );
-    // `GcArray(GCREF)`, the unresized list of str (`FixedSizeListRepr`).
-    // `TypeInfo::varsize` has no subclass range, so `register` accepts it
-    // after `assign_inheritance_ids_now`, and `assert_subclass_ranges` has
-    // already run. Nothing below reads a fixed tid. Inserting it beside
-    // the Signed/Float arrays would move PyCode (43), the `types.len() == 170`
-    // snapshot, `MODULE_FIRST_TYPE_ID`, and the minted exception rows.
-    let list_token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
-    let gc_list_of_str_tid = gc.register_type(TypeInfo::varsize(
-        list_token.base_size,
-        list_token.item_size,
-        list_token.len_offset,
-        true,
-        Vec::new(),
-    ));
-    pyre_object::object_array::set_gc_list_of_str_gc_type_id(gc_list_of_str_tid);
-    // The call next to the Signed/Float registration ran while this cell
-    // was still unset. Publish again so the live tid owns the descr.
-    pyre_jit_trace::state::publish_typed_items_gcarray_descrs();
     Box::new(gc)
 }
 
@@ -19755,20 +19739,29 @@ mod tests {
         assert_matches_gc();
     }
 
-    /// `GcArray(GCREF)` is registered after every fixed tid. The slot is
-    /// declared, and the varsize row traces its items as GC pointers.
+    /// A list of str and a list of instances are one `GcArray` of gc
+    /// pointers (`externalvsinternal(..., gcref=True)`, `rmodel.py`).
+    /// `get_type_id` / `get_array_descr` share the object-items
+    /// registration: tid [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`],
+    /// token [`pyre_object::ITEMS_BLOCK_TOKEN`], descr key
+    /// `OBJECT_REF_GCARRAY_TYPE_ID`. The varsize row traces item slots
+    /// as GC pointers.
     #[test]
-    fn gc_list_of_str_tid_is_declared_and_traces_items() {
+    fn gc_object_items_array_traces_pointer_items() {
         let gc = build_gc();
-        let tid = pyre_object::gc_list_of_str_gc_type_id();
-        assert_ne!(tid, majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID);
+        assert_eq!(
+            pyre_object::object_array::gc_object_items_array_gc_type_id(),
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID
+        );
+        let _descr = pyre_jit_trace::state::pyobject_gcarray_descr();
+        let tid = pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID;
         assert!(
             (tid as usize) < gc.types.len(),
-            "declared tid {tid} is outside the registry ({})",
+            "object-items tid {tid} is outside the registry ({})",
             gc.types.len()
         );
         let info = gc.types.get(tid);
-        let token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
+        let token = &pyre_object::ITEMS_BLOCK_TOKEN;
         assert_eq!(info.size, token.base_size);
         assert_eq!(info.item_size, token.item_size);
         assert_eq!(info.length_offset, token.len_offset);
@@ -19777,7 +19770,7 @@ mod tests {
         assert!(info.has_gc_ptrs);
         assert!(!info.has_subclass_range);
         let key = majit_ir::descr::path_hash(
-            majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY,
+            majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID,
         );
         assert_eq!(
             majit_ir::descr::gc_cache().lock().resolve_array_tid(key),

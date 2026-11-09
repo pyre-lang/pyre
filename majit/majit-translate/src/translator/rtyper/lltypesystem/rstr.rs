@@ -54,8 +54,8 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
-    MallocFlavor, Ptr, PtrTarget, Struct, functionptr_for_graph_with_type, malloc,
+    _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GCREF, GcKind, LowLevelType,
+    LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, functionptr_for_graph_with_type, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{
@@ -480,8 +480,18 @@ pub(crate) fn temp_ptr_lltype() -> LowLevelType {
 }
 
 /// RPython `ll_join = LLHelpers.ll_join`.
+///
+/// The items pointer is `Ptr(GcArray(GCREF))`, the list-of-str shape
+/// `externalvsinternal(..., gcref=True)` stores. `LLHelpers.ll_join`
+/// carries no `@jit.look_inside_iff` and no `@signature`.
 pub fn ll_join() -> Result<(), TyperError> {
-    Err(rstr_deferred("ll_join"))
+    build_ll_join_helper_graph("ll_join", gcref_items_ptr_lltype()).map(|_| ())
+}
+
+fn gcref_items_ptr_lltype() -> LowLevelType {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+    }))
 }
 
 /// RPython `parse_fmt_string` (`rstr.py` `AbstractLLHelpers.parse_fmt_string`).
@@ -2565,8 +2575,16 @@ pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
 /// `mallocstr` is inlined as `malloc_varsize(STR)` plus `setfield(hash, 0)`.
 /// `copy_string_contents` is the `copystrcontent` oopspec. `ovfcheck` is
 /// trailing `int_add_ovf` of its block; OverflowError raises MemoryError.
-pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
-    let items_ptr_lltype = temp_ptr_lltype();
+///
+/// `items_ptr_lltype` specializes the items pointer. `TEMP`
+/// (`GcArray(Ptr(STR))`) indexes straight to `Ptr(STR)`. A list of str is
+/// `GcArray(GCREF)`, so each `items[i]` is `cast_any_ptr(Ptr(STR), ...)`
+/// (`llmemory.py`).
+pub(crate) fn build_ll_join_strs_helper_graph_for(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let element_lltype = gcarray_ptr_element_lltype(&items_ptr_lltype)?;
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
     let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
 
@@ -2689,19 +2707,14 @@ pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, Typ
         .into_ref(),
     ]);
 
-    let item0 = variable_with_lltype("item", STRPTR.clone());
-    block_len1.borrow_mut().operations.push(SpaceOperation::new(
-        "getarrayitem",
-        vec![Hlvalue::Variable(items_for_len1), signed_const(0)],
-        Hlvalue::Variable(item0.clone()),
-    ));
+    let item0 = emit_array_item_as_strptr(
+        &block_len1,
+        Hlvalue::Variable(items_for_len1),
+        signed_const(0),
+        &element_lltype,
+    )?;
     block_len1.closeblock(vec![
-        Link::new(
-            vec![Hlvalue::Variable(item0)],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref(),
+        Link::new(vec![item0], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
     let keep_summing = variable_with_lltype("keep_summing", LowLevelType::Bool);
@@ -2741,23 +2754,14 @@ pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, Typ
         .into_ref(),
     ]);
 
-    let item_for_sum = variable_with_lltype("item", STRPTR.clone());
-    block_sum_ovf
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getarrayitem",
-            vec![
-                Hlvalue::Variable(items_for_sum_ovf.clone()),
-                Hlvalue::Variable(i_for_sum_ovf.clone()),
-            ],
-            Hlvalue::Variable(item_for_sum.clone()),
-        ));
-    let item_len_for_sum = emit_chars_length_ops(
+    let item_for_sum = emit_array_item_as_strptr(
         &block_sum_ovf,
-        Hlvalue::Variable(item_for_sum),
-        chars_array_ptr_lltype.clone(),
-    );
+        Hlvalue::Variable(items_for_sum_ovf.clone()),
+        Hlvalue::Variable(i_for_sum_ovf.clone()),
+        &element_lltype,
+    )?;
+    let item_len_for_sum =
+        emit_chars_length_ops(&block_sum_ovf, item_for_sum, chars_array_ptr_lltype.clone());
     let newlen = variable_with_lltype("itemslen", LowLevelType::Signed);
     block_sum_ovf
         .borrow_mut()
@@ -2897,21 +2901,15 @@ pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, Typ
         .into_ref(),
     ]);
 
-    let item_for_copy = variable_with_lltype("item", STRPTR.clone());
-    block_copy_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getarrayitem",
-            vec![
-                Hlvalue::Variable(items_for_copy_body.clone()),
-                Hlvalue::Variable(i_for_copy_body.clone()),
-            ],
-            Hlvalue::Variable(item_for_copy.clone()),
-        ));
+    let item_for_copy = emit_array_item_as_strptr(
+        &block_copy_body,
+        Hlvalue::Variable(items_for_copy_body.clone()),
+        Hlvalue::Variable(i_for_copy_body.clone()),
+        &element_lltype,
+    )?;
     let item_len_for_copy = emit_chars_length_ops(
         &block_copy_body,
-        Hlvalue::Variable(item_for_copy.clone()),
+        item_for_copy.clone(),
         chars_array_ptr_lltype,
     );
     let void_copy = variable_with_lltype("copy", LowLevelType::Void);
@@ -2921,7 +2919,7 @@ pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, Typ
         .push(SpaceOperation::new(
             "copystrcontent",
             vec![
-                Hlvalue::Variable(item_for_copy),
+                item_for_copy,
                 Hlvalue::Variable(result_for_copy_body.clone()),
                 signed_const(0),
                 Hlvalue::Variable(res_index_for_copy_body.clone()),
@@ -2983,11 +2981,13 @@ pub(crate) fn build_ll_join_strs_helper_graph(name: &str) -> Result<PyGraph, Typ
 
 /// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
 /// of the original `ll_join_strs` (`rlib/jit.py` `look_inside_iff`).
-pub(crate) fn build_ll_join_strs_trampoline_helper_graph(
+/// `items_ptr_lltype` is the caller's items pointer (`TEMP` or the list
+/// repr's `ll_items` result).
+pub(crate) fn build_ll_join_strs_trampoline_helper_graph_for(
     name: &str,
     orig_fn: Constant,
+    items_ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let items_ptr_lltype = temp_ptr_lltype();
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let items_arg = variable_with_lltype("items", items_ptr_lltype);
     let startblock = Block::shared(vec![
@@ -3050,14 +3050,16 @@ pub(crate) fn build_ll_join_strs_trampoline_helper_graph(
 /// `we_are_jitted` is the `SpecTag` exitswitch (true link first). The heuristic
 /// short-circuits: `length == 0` calls orig; else `isconstant` false goes
 /// to the trampoline; true checks `isvirtual(items)` then `length <= 2`.
-pub(crate) fn build_ll_join_strs_look_inside_iff_helper_graph(
+/// `items_ptr_lltype` is the same specialization as
+/// [`build_ll_join_strs_helper_graph_for`].
+pub(crate) fn build_ll_join_strs_look_inside_iff_helper_graph_for(
     name: &str,
     orig_fn: Constant,
     trampoline_fn: Constant,
     isconstant_fn: Constant,
     isvirtual_fn: Constant,
+    items_ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let items_ptr_lltype = temp_ptr_lltype();
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let items_arg = variable_with_lltype("items", items_ptr_lltype.clone());
     let startblock = Block::shared(vec![
@@ -3280,6 +3282,672 @@ pub(crate) fn build_ll_join_strs_look_inside_iff_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["length".to_string(), "items".to_string()],
+        func,
+    ))
+}
+
+fn gcarray_ptr_element_lltype(items_ptr: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    let LowLevelType::Ptr(ptr) = items_ptr else {
+        return Err(TyperError::message(format!(
+            "list items pointer expected Ptr(GcArray), got {items_ptr:?}"
+        )));
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        return Err(TyperError::message(format!(
+            "list items pointer expected Ptr(GcArray), got {items_ptr:?}"
+        )));
+    };
+    Ok(arr.OF.clone())
+}
+
+fn ptr_to_is_opaque(lltype: &LowLevelType) -> bool {
+    matches!(
+        lltype,
+        LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Opaque(_))
+    )
+}
+
+/// `llmemory.cast_any_ptr(Ptr(STR), items[index])` (`llmemory.py`).
+/// Identity when the element is already `Ptr(STR)` (`TEMP`). A `GCREF`
+/// element takes `cast_opaque_ptr` because `GCREF.TO` is an `OpaqueType`.
+fn emit_array_item_as_strptr(
+    block: &BlockRef,
+    items: Hlvalue,
+    index: Hlvalue,
+    element_lltype: &LowLevelType,
+) -> Result<Hlvalue, TyperError> {
+    let raw = variable_with_lltype("item", element_lltype.clone());
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "getarrayitem",
+        vec![items, index],
+        Hlvalue::Variable(raw.clone()),
+    ));
+    if element_lltype == &STRPTR.clone() {
+        return Ok(Hlvalue::Variable(raw));
+    }
+    let opname = if ptr_to_is_opaque(element_lltype) || ptr_to_is_opaque(&STRPTR) {
+        "cast_opaque_ptr"
+    } else {
+        "cast_pointer"
+    };
+    let casted = variable_with_lltype("item", STRPTR.clone());
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        opname,
+        vec![Hlvalue::Variable(raw)],
+        Hlvalue::Variable(casted.clone()),
+    ));
+    Ok(Hlvalue::Variable(casted))
+}
+
+/// Synthesise `LLHelpers.ll_join` (`lltypesystem/rstr.py`). The method is
+/// a bare `@staticmethod`: no `@jit.look_inside_iff`, no `@signature`.
+///
+/// ```python
+/// def ll_join(s, length, items):
+///     s_len = len(s.chars)
+///     if length == 0:
+///         return s.empty()
+///     # sum len(cast_any_ptr(TYP, items[i]).chars) under ovfcheck
+///     seplen = ovfcheck(s_len * (length - 1))
+///     result = s.malloc(itemslen + seplen)  # the final '+' may overflow
+///     # copy items[0], then separator+item for i in 1..length
+/// ```
+///
+/// `s.empty()` is `emptystrfun` (`@specialize.memo` of `convert_const("")`).
+/// `mallocstr` is inlined as `malloc_varsize(STR)` plus `setfield(hash, 0)`.
+/// `copy_string_contents` is the `copystrcontent` oopspec. Each overflow
+/// raises `MemoryError`.
+pub(crate) fn build_ll_join_helper_graph(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let element_lltype = gcarray_ptr_element_lltype(&items_ptr_lltype)?;
+    let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+    let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
+    let empty_ptr = emptystrfun().map_err(TyperError::message)?;
+    let empty_const = constant_with_lltype(ConstValue::LLPtr(Box::new(empty_ptr)), STRPTR.clone());
+
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let hash_field_const =
+        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
+
+    let s_arg = variable_with_lltype("s", STRPTR.clone());
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let items_arg = variable_with_lltype("items", items_ptr_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(s_arg.clone()),
+        Hlvalue::Variable(length_arg.clone()),
+        Hlvalue::Variable(items_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let sum_inputs = |prefix: &str| {
+        (
+            variable_with_lltype("s", STRPTR.clone()),
+            variable_with_lltype(&format!("{prefix}s_len"), LowLevelType::Signed),
+            variable_with_lltype("items", items_ptr_lltype.clone()),
+            variable_with_lltype("length", LowLevelType::Signed),
+            variable_with_lltype("i", LowLevelType::Signed),
+            variable_with_lltype("itemslen", LowLevelType::Signed),
+        )
+    };
+    let (s_sum_cond, slen_sum_cond, items_sum_cond, len_sum_cond, i_sum_cond, itemslen_sum_cond) =
+        sum_inputs("cond_");
+    let block_sum_cond = Block::shared(vec![
+        Hlvalue::Variable(s_sum_cond.clone()),
+        Hlvalue::Variable(slen_sum_cond.clone()),
+        Hlvalue::Variable(items_sum_cond.clone()),
+        Hlvalue::Variable(len_sum_cond.clone()),
+        Hlvalue::Variable(i_sum_cond.clone()),
+        Hlvalue::Variable(itemslen_sum_cond.clone()),
+    ]);
+    let (s_sum_ovf, slen_sum_ovf, items_sum_ovf, len_sum_ovf, i_sum_ovf, itemslen_sum_ovf) =
+        sum_inputs("ovf_");
+    let block_sum_ovf = Block::shared(vec![
+        Hlvalue::Variable(s_sum_ovf.clone()),
+        Hlvalue::Variable(slen_sum_ovf.clone()),
+        Hlvalue::Variable(items_sum_ovf.clone()),
+        Hlvalue::Variable(len_sum_ovf.clone()),
+        Hlvalue::Variable(i_sum_ovf.clone()),
+        Hlvalue::Variable(itemslen_sum_ovf.clone()),
+    ]);
+    let (s_sum_inc, slen_sum_inc, items_sum_inc, len_sum_inc, i_sum_inc, itemslen_sum_inc) =
+        sum_inputs("inc_");
+    let block_sum_inc = Block::shared(vec![
+        Hlvalue::Variable(s_sum_inc.clone()),
+        Hlvalue::Variable(slen_sum_inc.clone()),
+        Hlvalue::Variable(items_sum_inc.clone()),
+        Hlvalue::Variable(len_sum_inc.clone()),
+        Hlvalue::Variable(i_sum_inc.clone()),
+        Hlvalue::Variable(itemslen_sum_inc.clone()),
+    ]);
+    let block_raise_memory_error = Block::shared(vec![]);
+
+    let s_seplen = variable_with_lltype("s", STRPTR.clone());
+    let slen_seplen = variable_with_lltype("s_len", LowLevelType::Signed);
+    let items_seplen = variable_with_lltype("items", items_ptr_lltype.clone());
+    let len_seplen = variable_with_lltype("length", LowLevelType::Signed);
+    let itemslen_seplen = variable_with_lltype("itemslen", LowLevelType::Signed);
+    let block_seplen = Block::shared(vec![
+        Hlvalue::Variable(s_seplen.clone()),
+        Hlvalue::Variable(slen_seplen.clone()),
+        Hlvalue::Variable(items_seplen.clone()),
+        Hlvalue::Variable(len_seplen.clone()),
+        Hlvalue::Variable(itemslen_seplen.clone()),
+    ]);
+
+    let s_malloc = variable_with_lltype("s", STRPTR.clone());
+    let slen_malloc = variable_with_lltype("s_len", LowLevelType::Signed);
+    let items_malloc = variable_with_lltype("items", items_ptr_lltype.clone());
+    let len_malloc = variable_with_lltype("length", LowLevelType::Signed);
+    let itemslen_malloc = variable_with_lltype("itemslen", LowLevelType::Signed);
+    let seplen_malloc = variable_with_lltype("seplen", LowLevelType::Signed);
+    let block_malloc = Block::shared(vec![
+        Hlvalue::Variable(s_malloc.clone()),
+        Hlvalue::Variable(slen_malloc.clone()),
+        Hlvalue::Variable(items_malloc.clone()),
+        Hlvalue::Variable(len_malloc.clone()),
+        Hlvalue::Variable(itemslen_malloc.clone()),
+        Hlvalue::Variable(seplen_malloc.clone()),
+    ]);
+
+    let s_item0 = variable_with_lltype("s", STRPTR.clone());
+    let slen_item0 = variable_with_lltype("s_len", LowLevelType::Signed);
+    let items_item0 = variable_with_lltype("items", items_ptr_lltype.clone());
+    let len_item0 = variable_with_lltype("length", LowLevelType::Signed);
+    let result_item0 = variable_with_lltype("result", STRPTR.clone());
+    let block_copy_item0 = Block::shared(vec![
+        Hlvalue::Variable(s_item0.clone()),
+        Hlvalue::Variable(slen_item0.clone()),
+        Hlvalue::Variable(items_item0.clone()),
+        Hlvalue::Variable(len_item0.clone()),
+        Hlvalue::Variable(result_item0.clone()),
+    ]);
+
+    let copy_inputs = || {
+        (
+            variable_with_lltype("s", STRPTR.clone()),
+            variable_with_lltype("s_len", LowLevelType::Signed),
+            variable_with_lltype("items", items_ptr_lltype.clone()),
+            variable_with_lltype("length", LowLevelType::Signed),
+            variable_with_lltype("result", STRPTR.clone()),
+            variable_with_lltype("i", LowLevelType::Signed),
+            variable_with_lltype("res_index", LowLevelType::Signed),
+        )
+    };
+    let (
+        s_copy_cond,
+        slen_copy_cond,
+        items_copy_cond,
+        len_copy_cond,
+        result_copy_cond,
+        i_copy_cond,
+        res_copy_cond,
+    ) = copy_inputs();
+    let block_copy_cond = Block::shared(vec![
+        Hlvalue::Variable(s_copy_cond.clone()),
+        Hlvalue::Variable(slen_copy_cond.clone()),
+        Hlvalue::Variable(items_copy_cond.clone()),
+        Hlvalue::Variable(len_copy_cond.clone()),
+        Hlvalue::Variable(result_copy_cond.clone()),
+        Hlvalue::Variable(i_copy_cond.clone()),
+        Hlvalue::Variable(res_copy_cond.clone()),
+    ]);
+    let (
+        s_copy_body,
+        slen_copy_body,
+        items_copy_body,
+        len_copy_body,
+        result_copy_body,
+        i_copy_body,
+        res_copy_body,
+    ) = copy_inputs();
+    let block_copy_body = Block::shared(vec![
+        Hlvalue::Variable(s_copy_body.clone()),
+        Hlvalue::Variable(slen_copy_body.clone()),
+        Hlvalue::Variable(items_copy_body.clone()),
+        Hlvalue::Variable(len_copy_body.clone()),
+        Hlvalue::Variable(result_copy_body.clone()),
+        Hlvalue::Variable(i_copy_body.clone()),
+        Hlvalue::Variable(res_copy_body.clone()),
+    ]);
+
+    // `s_len = len(s.chars)` is computed before the zero check.
+    let s_len = emit_chars_length_ops(
+        &startblock,
+        Hlvalue::Variable(s_arg.clone()),
+        chars_array_ptr_lltype.clone(),
+    );
+    let is_zero = variable_with_lltype("is_zero", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![Hlvalue::Variable(length_arg.clone()), signed_const(0)],
+        Hlvalue::Variable(is_zero.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_zero));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![empty_const],
+            Some(graph.returnblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_arg),
+                s_len,
+                Hlvalue::Variable(items_arg),
+                Hlvalue::Variable(length_arg),
+                signed_const(0),
+                signed_const(0),
+            ],
+            Some(block_sum_cond.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let keep_summing = variable_with_lltype("keep_summing", LowLevelType::Bool);
+    block_sum_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_sum_cond.clone()),
+                Hlvalue::Variable(len_sum_cond.clone()),
+            ],
+            Hlvalue::Variable(keep_summing.clone()),
+        ));
+    block_sum_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(keep_summing));
+    let sum_cond_live = vec![
+        Hlvalue::Variable(s_sum_cond.clone()),
+        Hlvalue::Variable(slen_sum_cond.clone()),
+        Hlvalue::Variable(items_sum_cond.clone()),
+        Hlvalue::Variable(len_sum_cond.clone()),
+        Hlvalue::Variable(i_sum_cond.clone()),
+        Hlvalue::Variable(itemslen_sum_cond.clone()),
+    ];
+    block_sum_cond.closeblock(vec![
+        Link::new(
+            sum_cond_live,
+            Some(block_sum_ovf.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_sum_cond),
+                Hlvalue::Variable(slen_sum_cond),
+                Hlvalue::Variable(items_sum_cond),
+                Hlvalue::Variable(len_sum_cond),
+                Hlvalue::Variable(itemslen_sum_cond),
+            ],
+            Some(block_seplen.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let item_for_sum = emit_array_item_as_strptr(
+        &block_sum_ovf,
+        Hlvalue::Variable(items_sum_ovf.clone()),
+        Hlvalue::Variable(i_sum_ovf.clone()),
+        &element_lltype,
+    )?;
+    let item_len_for_sum =
+        emit_chars_length_ops(&block_sum_ovf, item_for_sum, chars_array_ptr_lltype.clone());
+    let newlen = variable_with_lltype("itemslen", LowLevelType::Signed);
+    block_sum_ovf
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add_ovf",
+            vec![Hlvalue::Variable(itemslen_sum_ovf), item_len_for_sum],
+            Hlvalue::Variable(newlen.clone()),
+        ));
+    block_raise_memory_error.closeblock(vec![
+        Link::new(
+            exception_args("MemoryError")?,
+            Some(graph.exceptblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let overflow_error = exception_args("OverflowError")?;
+    block_sum_ovf.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+    let sum_ovf_normal = Link::new(
+        vec![
+            Hlvalue::Variable(s_sum_ovf),
+            Hlvalue::Variable(slen_sum_ovf),
+            Hlvalue::Variable(items_sum_ovf),
+            Hlvalue::Variable(len_sum_ovf),
+            Hlvalue::Variable(i_sum_ovf),
+            Hlvalue::Variable(newlen),
+        ],
+        Some(block_sum_inc.clone()),
+        None,
+    )
+    .into_ref();
+    let mut sum_ovf_exc = Link::new(
+        vec![],
+        Some(block_raise_memory_error.clone()),
+        Some(overflow_error[0].clone()),
+    );
+    sum_ovf_exc.extravars(
+        Some(overflow_error[0].clone()),
+        Some(overflow_error[1].clone()),
+    );
+    block_sum_ovf.closeblock(vec![sum_ovf_normal, sum_ovf_exc.into_ref()]);
+
+    let i_next_sum = variable_with_lltype("i_next", LowLevelType::Signed);
+    block_sum_inc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_sum_inc), signed_const(1)],
+            Hlvalue::Variable(i_next_sum.clone()),
+        ));
+    block_sum_inc.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_sum_inc),
+                Hlvalue::Variable(slen_sum_inc),
+                Hlvalue::Variable(items_sum_inc),
+                Hlvalue::Variable(len_sum_inc),
+                Hlvalue::Variable(i_next_sum),
+                Hlvalue::Variable(itemslen_sum_inc),
+            ],
+            Some(block_sum_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let n_seps = variable_with_lltype("n_seps", LowLevelType::Signed);
+    block_seplen
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(len_seplen.clone()), signed_const(1)],
+            Hlvalue::Variable(n_seps.clone()),
+        ));
+    let seplen = variable_with_lltype("seplen", LowLevelType::Signed);
+    block_seplen
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_mul_ovf",
+            vec![
+                Hlvalue::Variable(slen_seplen.clone()),
+                Hlvalue::Variable(n_seps),
+            ],
+            Hlvalue::Variable(seplen.clone()),
+        ));
+    block_seplen.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+    let seplen_normal = Link::new(
+        vec![
+            Hlvalue::Variable(s_seplen),
+            Hlvalue::Variable(slen_seplen),
+            Hlvalue::Variable(items_seplen),
+            Hlvalue::Variable(len_seplen),
+            Hlvalue::Variable(itemslen_seplen),
+            Hlvalue::Variable(seplen),
+        ],
+        Some(block_malloc.clone()),
+        None,
+    )
+    .into_ref();
+    let mut seplen_exc = Link::new(
+        vec![],
+        Some(block_raise_memory_error),
+        Some(overflow_error[0].clone()),
+    );
+    seplen_exc.extravars(
+        Some(overflow_error[0].clone()),
+        Some(overflow_error[1].clone()),
+    );
+    block_seplen.closeblock(vec![seplen_normal, seplen_exc.into_ref()]);
+
+    // A single '+' at the end is allowed to overflow (`ll_join`).
+    let total = variable_with_lltype("total", LowLevelType::Signed);
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(itemslen_malloc),
+                Hlvalue::Variable(seplen_malloc),
+            ],
+            Hlvalue::Variable(total.clone()),
+        ));
+    let result = variable_with_lltype("result", STRPTR.clone());
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(str_struct_lltype),
+                gc_flavor_const()?,
+                Hlvalue::Variable(total),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(result.clone()),
+                hash_field_const(),
+                signed_const(0),
+            ],
+            Hlvalue::Variable(set_hash),
+        ));
+    block_malloc.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_malloc),
+                Hlvalue::Variable(slen_malloc),
+                Hlvalue::Variable(items_malloc),
+                Hlvalue::Variable(len_malloc),
+                Hlvalue::Variable(result),
+            ],
+            Some(block_copy_item0.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let item0 = emit_array_item_as_strptr(
+        &block_copy_item0,
+        Hlvalue::Variable(items_item0.clone()),
+        signed_const(0),
+        &element_lltype,
+    )?;
+    let res_index0 = emit_chars_length_ops(
+        &block_copy_item0,
+        item0.clone(),
+        chars_array_ptr_lltype.clone(),
+    );
+    let void_copy0 = variable_with_lltype("copy", LowLevelType::Void);
+    block_copy_item0
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "copystrcontent",
+            vec![
+                item0,
+                Hlvalue::Variable(result_item0.clone()),
+                signed_const(0),
+                signed_const(0),
+                res_index0.clone(),
+            ],
+            Hlvalue::Variable(void_copy0),
+        ));
+    block_copy_item0.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_item0),
+                Hlvalue::Variable(slen_item0),
+                Hlvalue::Variable(items_item0),
+                Hlvalue::Variable(len_item0),
+                Hlvalue::Variable(result_item0),
+                signed_const(1),
+                res_index0,
+            ],
+            Some(block_copy_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let keep_copying = variable_with_lltype("keep_copying", LowLevelType::Bool);
+    block_copy_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_copy_cond.clone()),
+                Hlvalue::Variable(len_copy_cond.clone()),
+            ],
+            Hlvalue::Variable(keep_copying.clone()),
+        ));
+    block_copy_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(keep_copying));
+    let copy_cond_live = vec![
+        Hlvalue::Variable(s_copy_cond.clone()),
+        Hlvalue::Variable(slen_copy_cond.clone()),
+        Hlvalue::Variable(items_copy_cond.clone()),
+        Hlvalue::Variable(len_copy_cond.clone()),
+        Hlvalue::Variable(result_copy_cond.clone()),
+        Hlvalue::Variable(i_copy_cond.clone()),
+        Hlvalue::Variable(res_copy_cond.clone()),
+    ];
+    block_copy_cond.closeblock(vec![
+        Link::new(
+            copy_cond_live,
+            Some(block_copy_body.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(result_copy_cond)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let void_sep = variable_with_lltype("copy", LowLevelType::Void);
+    block_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "copystrcontent",
+            vec![
+                Hlvalue::Variable(s_copy_body.clone()),
+                Hlvalue::Variable(result_copy_body.clone()),
+                signed_const(0),
+                Hlvalue::Variable(res_copy_body.clone()),
+                Hlvalue::Variable(slen_copy_body.clone()),
+            ],
+            Hlvalue::Variable(void_sep),
+        ));
+    let res_after_sep = variable_with_lltype("res_index", LowLevelType::Signed);
+    block_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(res_copy_body),
+                Hlvalue::Variable(slen_copy_body.clone()),
+            ],
+            Hlvalue::Variable(res_after_sep.clone()),
+        ));
+    let item_for_copy = emit_array_item_as_strptr(
+        &block_copy_body,
+        Hlvalue::Variable(items_copy_body.clone()),
+        Hlvalue::Variable(i_copy_body.clone()),
+        &element_lltype,
+    )?;
+    let item_len_for_copy = emit_chars_length_ops(
+        &block_copy_body,
+        item_for_copy.clone(),
+        chars_array_ptr_lltype,
+    );
+    let void_item = variable_with_lltype("copy", LowLevelType::Void);
+    block_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "copystrcontent",
+            vec![
+                item_for_copy,
+                Hlvalue::Variable(result_copy_body.clone()),
+                signed_const(0),
+                Hlvalue::Variable(res_after_sep.clone()),
+                item_len_for_copy.clone(),
+            ],
+            Hlvalue::Variable(void_item),
+        ));
+    let res_next = variable_with_lltype("res_index_next", LowLevelType::Signed);
+    block_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(res_after_sep), item_len_for_copy],
+            Hlvalue::Variable(res_next.clone()),
+        ));
+    let i_next_copy = variable_with_lltype("i_next", LowLevelType::Signed);
+    block_copy_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_copy_body), signed_const(1)],
+            Hlvalue::Variable(i_next_copy.clone()),
+        ));
+    block_copy_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_copy_body),
+                Hlvalue::Variable(slen_copy_body),
+                Hlvalue::Variable(items_copy_body),
+                Hlvalue::Variable(len_copy_body),
+                Hlvalue::Variable(result_copy_body),
+                Hlvalue::Variable(i_next_copy),
+                Hlvalue::Variable(res_next),
+            ],
+            Some(block_copy_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string(), "length".to_string(), "items".to_string()],
         func,
     ))
 }
@@ -16994,8 +17662,8 @@ mod tests {
     /// `unroll_safe` (`look_inside_iff`).
     #[test]
     fn build_ll_join_strs_synthesizes_malloc_varsize_and_copy_helper() {
-        let helper = build_ll_join_strs_helper_graph("ll_join_strs__orig")
-            .expect("build_ll_join_strs_helper_graph");
+        let helper = build_ll_join_strs_helper_graph_for("ll_join_strs__orig", temp_ptr_lltype())
+            .expect("build_ll_join_strs_helper_graph_for");
         assert!(
             helper.func._jit_unroll_safe_,
             "look_inside_iff marks the original unroll_safe"
@@ -17040,14 +17708,15 @@ mod tests {
     fn build_ll_join_strs_look_inside_iff_wrapper_calls_orig_or_trampoline() {
         let orig_fn = dummy_fn(1);
         let trampoline_fn = dummy_fn(2);
-        let helper = build_ll_join_strs_look_inside_iff_helper_graph(
+        let helper = build_ll_join_strs_look_inside_iff_helper_graph_for(
             "ll_join_strs",
             orig_fn,
             trampoline_fn,
             dummy_fn(3),
             dummy_fn(4),
+            temp_ptr_lltype(),
         )
-        .expect("build_ll_join_strs_look_inside_iff_helper_graph");
+        .expect("build_ll_join_strs_look_inside_iff_helper_graph_for");
         assert_eq!(
             helper.func.annspecialcase, None,
             "look_inside_iff wrapper f does not get call_location"
@@ -17154,15 +17823,91 @@ mod tests {
         assert!(saw_trampoline, "wrapper must call ll_join_strs_trampoline");
     }
 
+    /// `LLHelpers.ll_join` (`lltypesystem/rstr.py`) is a bare static
+    /// method: no `@jit.look_inside_iff`, no `@signature`. Length sum
+    /// under `ovfcheck`, separator product under `ovfcheck`, then a
+    /// plain `itemslen + seplen` malloc and three `copy_string_contents`.
+    #[test]
+    fn build_ll_join_synthesizes_separator_copy_helper() {
+        let items = super::gcref_items_ptr_lltype();
+        let helper = super::build_ll_join_helper_graph("ll_join", items)
+            .expect("build_ll_join_helper_graph");
+        assert!(
+            !helper.func._jit_unroll_safe_,
+            "ll_join has no unroll_safe hint"
+        );
+        assert_eq!(helper.func.annspecialcase, None);
+        crate::flowspace::model::checkgraph(&helper.graph.borrow());
+        let inner = helper.graph.borrow();
+        let false_target = {
+            let start = inner.startblock.borrow();
+            let start_ops: Vec<_> = start
+                .operations
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect();
+            assert_eq!(start_ops, ["getsubstruct", "getarraysize", "int_eq"]);
+            assert!(matches!(
+                &start.operations[2].args[1],
+                Hlvalue::Constant(c) if c.value == ConstValue::Int(0)
+            ));
+            let true_link = start.exits[0].borrow();
+            let Some(Hlvalue::Constant(empty)) = true_link.args[0].as_ref() else {
+                panic!(
+                    "zero-length join returns emptystr, got {:?}",
+                    true_link.args
+                );
+            };
+            let ConstValue::LLPtr(ptr) = &empty.value else {
+                panic!("emptystr is an LLPtr, got {:?}", empty.value);
+            };
+            let (bytes, _) = prebuilt_str_bytes_and_hash(ptr).expect("emptystr ptr");
+            assert_eq!(bytes, b"");
+            start.exits[1]
+                .borrow()
+                .target
+                .clone()
+                .expect("nonzero length continues")
+        };
+        assert_eq!(
+            false_target.borrow().operations[0].opname,
+            "int_lt",
+            "there is no length==1 fast path"
+        );
+        drop(false_target);
+
+        let blocks = collect_reachable_blocks(&inner.startblock);
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        let mut malloc_prev = None;
+        for block in &blocks {
+            let borrowed = block.borrow();
+            for (index, op) in borrowed.operations.iter().enumerate() {
+                *counts.entry(op.opname.clone()).or_insert(0) += 1;
+                if op.opname == "malloc_varsize" {
+                    malloc_prev = Some(borrowed.operations[index - 1].opname.clone());
+                }
+            }
+        }
+        assert_eq!(counts.get("int_eq").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("int_add_ovf").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("int_mul_ovf").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("int_sub").copied().unwrap_or(0), 1);
+        assert!(counts.get("int_add").copied().unwrap_or(0) >= 1);
+        assert_eq!(counts.get("malloc_varsize").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("setfield").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("copystrcontent").copied().unwrap_or(0), 3);
+        assert_eq!(counts.get("getarrayitem").copied().unwrap_or(0), 3);
+        assert_eq!(counts.get("cast_opaque_ptr").copied().unwrap_or(0), 3);
+        assert_eq!(malloc_prev.as_deref(), Some("int_add"));
+    }
+
     #[test]
     fn top_level_parity_helpers_expose_original_names() {
         let err = new_malloc().expect_err("new_malloc factory is deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("new_malloc"));
 
-        let err = ll_join().expect_err("ll_join is deferred");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_join"));
+        ll_join().expect("ll_join");
 
         let err = ll_striter().expect_err("iterator helper is deferred");
         assert!(err.is_missing_rtype_operation());

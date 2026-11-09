@@ -13076,8 +13076,13 @@ fn render_adt_suffix_type_args(
 
 /// Spelling of one Result/Option type argument for the intern suffix and
 /// the substituted variant payload row. A tombstoned-leaf ADT with no
-/// type arguments (`Layout`) uses [`class_identity_spelling`]; every
-/// other shape reuses the field-type printer.
+/// type arguments (`Layout`) uses [`class_identity_spelling`]. A marked
+/// exception class uses [`marked_exception_ast_name`]
+/// ([`crate::front::llbc_hints::exception_class_key`]), the same
+/// declaration [`charon_adt_to_ast_string`] stamps: `ClassDesc.getuniqueclassdef`
+/// (`classdesc.py`) is that class, not the `__name__` leaf, so
+/// `Result<_, synth::E>` must not intern `E`. Every other monomorphic
+/// ADT keeps the TypeDecl leaf so existing intern keys stay put.
 fn charon_type_value_to_enum_arg(
     v: &serde_json::Value,
     llbc: &Llbc,
@@ -13132,6 +13137,12 @@ fn charon_type_value_to_enum_arg(
     } else {
         return charon_type_value_to_ast_string(v, llbc, depth);
     };
+    // Declaration key, before the unique-leaf spelling. A marked enum's
+    // type argument has to name the minted class (`exception_class_key`),
+    // or `From` lookup and `getuniqueclassdef` see the bare leaf.
+    if let Some(key) = marked_exception_ast_name(llbc, &name) {
+        return key;
+    }
     let leaf = name.rsplit("::").next().unwrap_or(&name);
     if tombstoned.contains(leaf) && !intern_suffix_keeps_cast_leaf(llbc, leaf) {
         super::class_identity_spelling(&name, tombstoned)

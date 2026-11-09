@@ -56,12 +56,11 @@ pub(crate) fn ll_chars_strcmp(left: &[u8], right: &[u8]) -> isize {
 // them from its own `gc.register_type` results (`pyre-jit/src/eval.rs`) instead
 // of majit-rlib carrying pyre's numbering.
 pub use majit_rlib::lltypesystem::rlist::{
-    LIST_OF_STR_GCARRAY_ITEM_SIZE, LIST_OF_STR_GCARRAY_ITEMS_OFFSET,
-    LIST_OF_STR_GCARRAY_LEN_OFFSET, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TYPED_ITEMS_BLOCK_LEN_OFFSET,
-    TypedItemsBlock, alloc_typed_items_block_immortal, alloc_typed_items_block_nursery,
-    gc_float_array_gc_type_id, gc_int_array_gc_type_id, gc_list_of_str_gc_type_id,
-    itemsblock_gc_enabled, set_gc_float_array_gc_type_id, set_gc_int_array_gc_type_id,
-    set_gc_list_of_str_gc_type_id, try_alloc_typed_items_block_nursery,
+    TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock,
+    alloc_typed_items_block_immortal, alloc_typed_items_block_nursery, gc_float_array_gc_type_id,
+    gc_int_array_gc_type_id, gc_object_items_array_gc_type_id, itemsblock_gc_enabled,
+    set_gc_float_array_gc_type_id, set_gc_int_array_gc_type_id,
+    set_gc_object_items_array_gc_type_id, try_alloc_typed_items_block_nursery,
     try_typed_items_block_layout, typed_items_block_capacity, typed_items_block_clear,
     typed_items_block_items_base, typed_items_block_layout,
 };
@@ -193,6 +192,17 @@ pub const ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
 // `majit_ir::helper_fnaddr::object_gcarray_slice` reads this layout.
 const _: () = assert!(
     ITEMS_BLOCK_LEN_OFFSET == 0 && ITEMS_BLOCK_ITEMS_OFFSET == std::mem::size_of::<usize>()
+);
+
+// The list-of-str payload is this block: length word, then pointer items
+// (`ll_fixed_length` / `getarraysize` at `len_offset`, `getarrayitem` at
+// `base_size + index * item_size`). `ItemsBlock` and the majit-rlib
+// object-items constants are that one shape.
+const _: () = assert!(
+    ITEMS_BLOCK_LEN_OFFSET == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_LEN_OFFSET
+        && ITEMS_BLOCK_ITEMS_OFFSET == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_OFFSET
+        && std::mem::size_of::<PyObjectRef>()
+            == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_ITEM_SIZE
 );
 
 /// Return the items base pointer (i.e. `&items[0]`) of an
@@ -1460,16 +1470,6 @@ pub const TYPED_ITEMS_BLOCK_FLOAT_TOKEN: ArrayToken = ArrayToken {
     base_size: TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
     item_size: std::mem::size_of::<f64>(),
     len_offset: TYPED_ITEMS_BLOCK_LEN_OFFSET,
-};
-
-/// `get_array_token(GcArray(GCREF))` — [`gc_list_of_str_gc_type_id`].
-/// `FixedSizeListRepr` of str writes this shape (`alloc_list_of_str_payload`):
-/// a length word, then pointer-sized GC-pointer items. Same triple
-/// `encode_type_shape` reads off that one ARRAY.
-pub const LIST_OF_STR_GCARRAY_TOKEN: ArrayToken = ArrayToken {
-    base_size: LIST_OF_STR_GCARRAY_ITEMS_OFFSET,
-    item_size: LIST_OF_STR_GCARRAY_ITEM_SIZE,
-    len_offset: LIST_OF_STR_GCARRAY_LEN_OFFSET,
 };
 
 /// The items are `u64` words, so an element type wider or narrower than the

@@ -111,10 +111,7 @@ pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
 /// (`rstr.py` `mallocstr` is `malloc(STR, length)`, not a prebuilt).
 /// A hook that answers null is [`crate::rffi::MemoryError`].
 pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryError> {
-    let size = STR_CHARS_OFFSET
-        .checked_add(length)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(crate::rffi::MemoryError)?;
+    let size = mallocstr_size(length)?;
     let tid = majit_gc::lowlevel_str_type_id();
     let gcref = if tid == 0 || !majit_gc::gc_allocator_installed() {
         let ptr = majit_gc::header::alloc_varsize_with_gc_header(size, tid);
@@ -129,13 +126,67 @@ pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryEr
         }
         gcref
     };
-    let ptr = gcref.0 as *mut u8;
+    init_mallocstr_header(gcref.0 as *mut u8, length);
+    Ok(gcref)
+}
+
+/// `mallocstr` bracketed by `framework.py` `gct_fv_gc_malloc` `push_roots` /
+/// `pop_roots`. With a collector installed this is
+/// `alloc_fast_nursery_collecting_typed_roots`, the same livevars span as
+/// `try_alloc_typed_items_block_nursery_rooted`. Callers reload `roots`
+/// before using any pointer copied from before the call. No collector, or
+/// an unpublished str tid (`lowlevel_str_type_id` 0), takes [`mallocstr`]'s
+/// non-collecting path.
+///
+/// # Safety
+/// Every entry of `roots` is a valid GC pointer or null. The slice stays
+/// address-stable for the call.
+pub unsafe fn mallocstr_rooted(
+    length: usize,
+    roots: &mut [majit_ir::GcRef],
+) -> Result<majit_ir::GcRef, crate::rffi::MemoryError> {
+    let tid = majit_gc::lowlevel_str_type_id();
+    if tid == 0 || !majit_gc::gc_allocator_installed() {
+        return mallocstr(length);
+    }
+    let size = mallocstr_size(length)?;
+    // The flag describes the new string. The caller's store into an older
+    // array has its own `write_barrier_from_array`.
+    let mut needs_write_barrier = false;
+    let gcref = unsafe {
+        majit_gc::alloc_fast_nursery_collecting_typed_roots(
+            tid,
+            size,
+            roots.as_mut_ptr(),
+            roots.len(),
+            &mut needs_write_barrier,
+        )
+    };
+    if gcref.is_null() {
+        return Err(crate::rffi::MemoryError);
+    }
+    init_mallocstr_header(gcref.0 as *mut u8, length);
+    Ok(gcref)
+}
+
+/// Byte size of a `mallocstr` block: `STR_CHARS_OFFSET + length + 1`
+/// (trailing NUL). Overflow is [`crate::rffi::MemoryError`]
+/// (`_ll_compute_size`).
+fn mallocstr_size(length: usize) -> Result<usize, crate::rffi::MemoryError> {
+    STR_CHARS_OFFSET
+        .checked_add(length)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(crate::rffi::MemoryError)
+}
+
+/// `mallocstr` header: `hash` 0, `length`, NUL at `chars[length]`.
+/// `chars` stay uninitialized (`malloc_zero_filled` is false).
+fn init_mallocstr_header(ptr: *mut u8, length: usize) {
     unsafe {
         (ptr as *mut isize).write(0);
         ptr.add(STR_LEN_OFFSET).cast::<usize>().write(length);
         ptr.add(STR_CHARS_OFFSET + length).write(0);
     }
-    Ok(gcref)
 }
 
 /// The `chars` payload of a live `Ptr(STR)`.
