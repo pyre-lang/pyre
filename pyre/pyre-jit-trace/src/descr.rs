@@ -16643,39 +16643,28 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
 
 /// The [`DECLARED_GROUPS`] rows by the `GcCache` key each one owns.
 ///
-/// `descr.py get_size_descr` keys `cache[STRUCT]`. A raw STRUCT is interned
-/// under `path_hash_for_gc_kind(path, false)` and a GcStruct under the bare
-/// path hash, so the map key is the identity that row's SizeDescr actually
-/// occupies rather than a uniform `path_hash(name)`.
+/// `descr.py get_size_descr` keys `cache[STRUCT]`; a raw STRUCT is interned
+/// under `path_hash_for_gc_kind(path, false)` and a GcStruct under
+/// `path_hash_for_gc_kind(path, true)`; each row is reachable under both, so a
+/// lookup forces only the requested STRUCT's group.
 static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
     LazyLock::new(|| {
         DECLARED_GROUPS
             .iter()
-            .map(|(def_path, force)| {
-                force();
-                (interned_declared_group_key(def_path), *force)
+            .flat_map(|(def_path, force)| {
+                [
+                    (
+                        majit_ir::descr::path_hash_for_gc_kind(def_path, false),
+                        *force,
+                    ),
+                    (
+                        majit_ir::descr::path_hash_for_gc_kind(def_path, true),
+                        *force,
+                    ),
+                ]
             })
             .collect()
     });
-
-/// STRUCT identity [`DECLARED_GROUP_BY_KEY`] uses for `def_path`.
-///
-/// After the row's group is forced, the interned SizeDescr lives under either
-/// the raw discriminator or the GcStruct hash of the same path
-/// (`path_hash_for_gc_kind`). Prefer the key that `_cache_size` actually holds.
-fn interned_declared_group_key(def_path: &str) -> u64 {
-    let gc_key = majit_ir::descr::path_hash_for_gc_kind(def_path, true);
-    let raw_key = majit_ir::descr::path_hash_for_gc_kind(def_path, false);
-    let cache = majit_ir::descr::gc_cache().lock();
-    if cache
-        ._cache_size
-        .contains_key(&majit_ir::descr::LLType::Struct(raw_key))
-    {
-        raw_key
-    } else {
-        gc_key
-    }
-}
 
 /// `heaptracker.py` `setup_cache_gcstruct2vtable`.
 ///
@@ -16728,9 +16717,8 @@ fn publish_pyre_class_vtables_inner() {
 /// declaration takes the STRUCT's `(STRUCT, fieldname)` slots before a
 /// serialized `BhDescr` can.
 ///
-/// The first call forces every declared group, because a row's map key is
-/// the STRUCT key its group actually interned (raw or GcStruct). Later calls
-/// are a lookup and a `LazyLock` load. A key this module does not
+/// Idempotent and cheap after the first call for a STRUCT: the group is a
+/// `LazyLock` and the second force is a load. A key this module does not
 /// declare still forces [`MODULE_USER_LAYOUT_DESCR_GROUPS`] once. Its
 /// constructor publishes every `def_path` (`descr.py` `get_size_descr`).
 /// Matching `path_hash` on each miss does not select a row.
