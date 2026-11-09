@@ -27396,8 +27396,9 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
 /// replace / U+FFFD (`typedef::decode_utf8_with_errors`), never a Cow.
 /// The Result Err arm is `RaiseImplicit(AssertionError)`
 /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+/// `decode_utf8_with_errors`'s `&[u8]` is a CCHARP window, so the call
+/// takes `{data, len, "replace"}` (`rutf8.py check_utf8` ABI).
 #[test]
-#[ignore]
 fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
@@ -27416,6 +27417,27 @@ fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
             segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
         }),
         "decode_utf8_with_errors must remain in the caller: {paths:#?}"
+    );
+    let decode_argc = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments
+                .ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()]) =>
+            {
+                Some(args.len())
+            }
+            _ => None,
+        });
+    assert_eq!(
+        decode_argc,
+        Some(3),
+        "decode_utf8_with_errors takes the window pair plus \"replace\": {graph:#?}"
     );
     assert!(
         !oefmt_mentions_cow(&graph),

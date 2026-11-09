@@ -4655,9 +4655,17 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(bytes, "replace")`
+    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(data, len, "replace")`
     /// then Ok payload as a plain string (`unicodehelper.py str_decode_utf8`
     /// replace / U+FFFD). Dest is not a Cow ADT.
+    ///
+    /// `decode_utf8_with_errors`'s `&[u8]` is a window
+    /// (`pair_or_window_fun_inputs`: fat `&[u8]` → `CCHARP` + Signed;
+    /// str only via `rffi.charpsize2str` when a copy is needed). The
+    /// decoder consumes the window, so the emitted call is
+    /// `{data, len, "replace"}` — the same ABI as `rutf8.py check_utf8`.
+    /// A one-word STR owner is split (`get_raw_address_of_string` /
+    /// `__strlen`) the way other `&[u8]` callees are.
     pub(in crate::front::mir) fn try_lower_from_utf8_lossy(
         &mut self,
         mir_bb: usize,
@@ -4667,9 +4675,24 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        if args.len() != 1 || !self.is_string_from_utf8_lossy(reg, dest_ty) {
+        if !self.is_string_from_utf8_lossy(reg, dest_ty) {
             return Ok(false);
         }
+        let (data, len) = match args {
+            [bytes] => {
+                if let Some(len) = self.window_len_companion(bytes) {
+                    (self.ensure_window_ccharp(mir_bb, bytes.clone()), len)
+                } else if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
+                    let (data, len, owner) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    self.capture_window_owner_of_var(bytes, Some(owner));
+                    (data, len)
+                } else {
+                    return Ok(false);
+                }
+            }
+            [data, len] => (self.ensure_window_ccharp(mir_bb, data.clone()), len.clone()),
+            _ => return Ok(false),
+        };
         let Some(decode_id) = self.decode_utf8_with_errors_fun_decl_id() else {
             return Ok(false);
         };
@@ -4682,14 +4705,13 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(false);
         };
-        let bytes = args[0].clone();
         let bb_id = self.emit_bb(mir_bb);
         let replace = emit_str_const(&mut self.graph, bb_id, "replace");
         let result_var = self.emit_fun_decl_call(
             bb_id,
             decode_id,
             segments,
-            vec![bytes, replace],
+            vec![data, len, replace],
             ValueType::Ref(Some(result_owner.clone())),
         );
         let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var.clone(), &result_owner);
