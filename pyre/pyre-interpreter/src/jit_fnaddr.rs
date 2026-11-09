@@ -5556,8 +5556,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cp0!(
         &mut entries,
-        "pyre_interpreter::module::signal::signalstate::pypysig_getaddr_occurred",
-        crate::module::signal::signalstate::pypysig_getaddr_occurred_jit_abi,
+        "majit_rlib::rsignal::pypysig_getaddr_occurred",
+        majit_rlib::rsignal::pypysig_getaddr_occurred_jit_abi,
     );
     // The `anchor` handler graph residualizes `FrameAnchor::new` itself
     // (its aggregate return keeps it out of inlining), and `push_anchored`

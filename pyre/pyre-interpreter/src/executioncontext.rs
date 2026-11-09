@@ -3150,7 +3150,7 @@ impl ActionFlag {
     /// signal-driving ticker; the cell is process-global and stable
     /// for the process lifetime.
     pub fn ticker_addr(&mut self) -> *mut isize {
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         unsafe { (*p).c_value.as_ptr() }
     }
 
@@ -3159,7 +3159,7 @@ impl ActionFlag {
     /// GIL-side copy for a bit armed without that store.
     pub(crate) fn sync_async_ticker(&mut self) {
         if self.is_registered_ticker() {
-            let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+            let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
             unsafe { (*p).c_value.store(-1, std::sync::atomic::Ordering::Relaxed) };
         }
     }
@@ -3176,7 +3176,7 @@ impl ActionFlag {
             return;
         }
         self.base.has_bytecode_counter = true;
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
         if value == 0 {
             let interval = self.base.checkinterval_scaled as isize;
@@ -3196,7 +3196,7 @@ impl ActionFlag {
     /// `int_eq/ir>i` kind shape that has no blackhole handler; casting both
     /// addresses to `usize` keeps the comparison an int/int equality.
     fn is_registered_ticker(&self) -> bool {
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         let here = unsafe { (*p).c_value.as_ptr() } as usize;
         let registered = crate::module::signal::signalstate::registered_ticker_ptr() as usize;
         here == registered
@@ -3218,14 +3218,14 @@ impl ActionFlagOps for ActionFlag {
     /// The safe-checkpoint synchronization above is the Rust equivalent of
     /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) }
     }
 
     /// interp_signal.py `SignalActionFlag.reset_ticker` —
     /// `pypysig_getaddr_occurred` then `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         unsafe {
             (*p).c_value
                 .store(value, std::sync::atomic::Ordering::Relaxed)
@@ -3280,7 +3280,7 @@ impl ActionFlagOps for ActionFlag {
         // a lost `-1` delays delivery by at most one ticker period, or until
         // `CheckSignalAction::after_thread_switch` re-arms from the pending
         // signal bits when a blocked thread resumes.
-        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
         let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
         if self.base.has_bytecode_counter {
             if by == 0 {
@@ -3336,7 +3336,7 @@ impl SpaceActionFlag {
             let ptr = Box::into_raw(Box::new(ActionFlag::new()));
             // Armers store into `signals.c pypysig_counter`.
             majit_ir::eval_breaker_word::publish_action_ticker(unsafe {
-                &raw mut (*crate::module::signal::signalstate::pypysig_getaddr_occurred()).c_value
+                &raw mut (*majit_rlib::rsignal::pypysig_getaddr_occurred()).c_value
             });
             ptr as usize
         }) as *mut ActionFlag;

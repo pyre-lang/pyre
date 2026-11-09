@@ -7,7 +7,7 @@
 //! wakeup fd.  The actual app-level handler and the ticker update happen
 //! later, from a safe interpreter checkpoint.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
 #[cfg(all(windows, not(feature = "host_env")))]
 use libc::SIG_ERR;
@@ -50,30 +50,6 @@ pub const NSIG: i32 = 64;
 /// width wherever `_NSIG` is 65.
 const N_LONGBITS: i32 = i64::BITS as i32;
 const N_LONGSIG: usize = ((NSIG - 1) / N_LONGBITS + 1) as usize;
-
-/// `rsignal.py STRUCT_ONEFIELD` (`pypysig_long_struct_inner`): the one-field view of
-/// `signals.c pypysig_counter`. `c_value` is the action ticker.
-#[repr(C)]
-pub struct PypysigLongStructInner {
-    pub c_value: AtomicIsize,
-}
-
-/// `signals.c pypysig_counter`.
-static PYPYSIG_COUNTER: PypysigLongStructInner = PypysigLongStructInner {
-    c_value: AtomicIsize::new(0),
-};
-
-/// `rsignal.py pypysig_getaddr_occurred` (`_nowrapper=True, elidable_function=True`).
-#[majit_macros::elidable]
-pub fn pypysig_getaddr_occurred() -> *mut PypysigLongStructInner {
-    &PYPYSIG_COUNTER as *const PypysigLongStructInner as *mut PypysigLongStructInner
-}
-
-/// One-word residual-call ABI for [`pypysig_getaddr_occurred`].
-pub extern "C" fn pypysig_getaddr_occurred_jit_abi() -> i64 {
-    majit_ir::icf_identity!("signalstate::pypysig_getaddr_occurred_jit_abi");
-    pypysig_getaddr_occurred() as i64
-}
 
 /// Identity of the signal-driving `ActionFlag` ticker cell (`signals.c:45-49
 /// pypysig_counter`).  The pointer is compared by the interpreter but never
@@ -357,7 +333,7 @@ mod tests {
             pypysig_default(libc::SIGINT);
             while signal_poll() >= 0 {}
             majit_ir::eval_breaker_word::clear_async();
-            let p = pypysig_getaddr_occurred();
+            let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
             unsafe { (*p).c_value.store(0, Ordering::Relaxed) };
         }
     }
