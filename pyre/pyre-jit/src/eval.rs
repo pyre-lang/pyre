@@ -16561,7 +16561,10 @@ fn replay_pending_fields(
         // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
         // every ref is GC-tracked so ordering does not matter. `setfield`
         // / `setarrayitem` then decode the value again from the tag
-        // (`ResumeDataDirectReader.decode_ref`).
+        // (`ResumeDataDirectReader.decode_ref`). The decoded struct is
+        // the SETFIELD_GC / SETARRAYITEM_GC target
+        // (`heap.py force_lazy_sets_for_guard`, `_add_pending_fields`)
+        // and is never NULL.
         let (addr, value_type, value_size, target_ptr, value_raw) = if pf.item_index < 0 {
             let fd = field_descr.as_field_descr().expect(
                 "resume.py `_prepare_pendingfields`: setfield pending field \
@@ -16586,9 +16589,14 @@ fn replay_pending_fields(
                 virtuals_cache,
                 Some(&failarg_refs),
             );
-            if struct_ptr.is_null() {
-                continue;
-            }
+            assert!(
+                !struct_ptr.is_null(),
+                "resume.py `_prepare_pendingfields`: pending-field target \
+                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+                pf.target_tagged,
+                pf.item_index,
+                field_descr,
+            );
             let value_raw = decode_pending_value(
                 pf.value_tagged,
                 fd.field_type(),
@@ -16631,9 +16639,14 @@ fn replay_pending_fields(
                 virtuals_cache,
                 Some(&failarg_refs),
             );
-            if struct_ptr.is_null() {
-                continue;
-            }
+            assert!(
+                !struct_ptr.is_null(),
+                "resume.py `_prepare_pendingfields`: pending-field target \
+                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+                pf.target_tagged,
+                pf.item_index,
+                field_descr,
+            );
             let value_raw = decode_pending_value(
                 pf.value_tagged,
                 ad.item_type(),
