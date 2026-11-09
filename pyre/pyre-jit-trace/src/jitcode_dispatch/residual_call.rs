@@ -10731,6 +10731,33 @@ fn try_load_global_descent<Sym: WalkSym>(
     )
 }
 
+/// Write a finished `perform_call` outcome into the residual dest.
+/// `finishframe` / `make_result_of_lastop` deliver the value before
+/// `_interpret` checks the trace limit.
+fn deliver_perform_call_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    next_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    outcome: DispatchOutcome,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    match outcome {
+        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+            let _ = finish_inline_callee_return(ctx, None);
+            Ok(Some((DispatchOutcome::Continue, next_pc)))
+        }
+        DispatchOutcome::SubReturn { result } => {
+            let result = finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+            Ok(Some((DispatchOutcome::Continue, next_pc)))
+        }
+        DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+        other => Ok(Some((other, next_pc))),
+    }
+}
+
 /// `pyjitpl.py MIFrame.perform_call`: enter one generated helper body with
 /// its own typed register banks. Shared by address-resolved calls and the
 /// interpreter-source body selected by an opcode lowering.
@@ -10799,20 +10826,15 @@ fn try_perform_call<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before)? {
-        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
-            let _ = finish_inline_callee_return(ctx, None);
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::SubReturn { result } => {
-            let result = finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-        other => Ok(Some((other, next_pc))),
+    let walk_outcome = promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before)?;
+    let delivered = deliver_perform_call_result(ctx, op_pc, next_pc, dst, dst_bank, walk_outcome)?;
+    // `finishframe` / `make_result_of_lastop` wrote the dest; `_interpret`
+    // then checks. Residual replay consumes the parked child in
+    // `run_sub_jitcode_walk_from` and lands here after that write.
+    if matches!(delivered, Some((DispatchOutcome::Continue, _))) {
+        helper_blackhole_after_run_one_step(ctx, next_pc, op_pc)?;
     }
+    Ok(delivered)
 }
 
 struct RecordedResidual {

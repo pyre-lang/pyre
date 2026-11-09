@@ -21767,9 +21767,13 @@ struct PendingSubReturn {
 }
 
 impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
+    /// `residual_replay` is true when `SubWalkDriver` has parked a child at
+    /// this frame's CALL (`replay_log` was non-empty). That re-entry is not
+    /// `newframe`; the CALL opcode still has to consume the parked result.
     fn drive(
         &mut self,
         trace_ctx: &mut TraceCtx,
+        residual_replay: bool,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
         let mut walk_ctx = WalkContext {
             frame_state: self.frame_state.clone(),
@@ -21816,6 +21820,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // the opcode after the CALL.  The first CALL step already ran
         // vstack/live bookkeeping before it suspended.
         let mut published_raise = None;
+        let mut finishframe_error_pc = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
             if let DispatchOutcome::SubRaise { exc, exc_concrete } =
                 promote_published_null_return_since(
@@ -21843,6 +21848,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 };
                 if applied {
                     SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    finishframe_error_pc = Some(pending.caller_pc);
                     None
                 } else {
                     Some(DispatchError::UnexpectedVoidSubReturn {
@@ -21862,6 +21868,15 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         } else {
             #[cfg(test)]
             maybe_test_helper_before_walk_bump(self.body.jitcode_index);
+            if let Some(error_pc) = finishframe_error_pc {
+                // `MetaInterp.finishframe` / `make_result_of_lastop` delivered
+                // the dest; `_interpret` then checks before the next opcode.
+                helper_blackhole_after_run_one_step(&mut walk_ctx, self.pc, error_pc)?;
+            } else if !residual_replay {
+                // `MetaInterp.newframe` / `perform_call` raise ChangeFrame
+                // before the helper's first instruction; `_interpret` checks.
+                helper_blackhole_after_run_one_step(&mut walk_ctx, self.pc, self.pc)?;
+            }
             walk(self.body.code, self.pc, &mut walk_ctx)
         };
 
@@ -22055,9 +22070,10 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 self.exchange.ancestor_len = ancestors.len();
                 self.exchange.active_caller_pc = frame.caller_pc;
                 self.exchange.active_frame_id = frame.id;
+                let residual_replay = !frame.replay_log.is_empty();
                 self.exchange.completed = std::mem::take(&mut frame.replay_log);
                 self.exchange.completed_cursor = 0;
-                let driven = frame.drive(trace_ctx);
+                let driven = frame.drive(trace_ctx, residual_replay);
                 self.exchange.ancestor_len = 0;
                 self.exchange.ancestor_frames = std::ptr::null();
                 driven

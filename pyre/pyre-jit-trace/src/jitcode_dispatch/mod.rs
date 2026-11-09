@@ -5560,10 +5560,12 @@ fn walk_err_coordinate_belongs_to_this_frame<Sym: WalkSym>(
 /// `pyjitpl.py` `MIFrame.run_one_step` leaves only on `ChangeFrame` (a call
 /// or a return). These opcodes are the call half; the return half is
 /// `SubReturn` / `SubRaise` (`finishframe` / `finishframe_exception`).
+///
+/// `inline_call_*` always `perform_call`s. A residual that
+/// `perform_call`s checks after dest write in `try_perform_call`; an
+/// ordinary residual stays in the same `run_one_step`.
 fn helper_opcode_changes_frame(code: &[u8], pc: usize) -> bool {
-    decode_op_at(code, pc).is_some_and(|op| {
-        op.opname.starts_with("inline_call_") || op.opname.starts_with("residual_call_")
-    })
+    decode_op_at(code, pc).is_some_and(|op| op.opname.starts_with("inline_call_"))
 }
 
 /// `pyjitpl.py` `MetaInterp._interpret` after `MIFrame.run_one_step` returns.
@@ -5571,7 +5573,7 @@ fn helper_opcode_changes_frame(code: &[u8], pc: usize) -> bool {
 /// after every walker instruction. `latch_pc` is the live `MIFrame.pc`
 /// (`_get_opimpl_method` has already advanced it); `error_pc` is the
 /// instruction that produced this `ChangeFrame`.
-fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
+pub(crate) fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     latch_pc: usize,
     error_pc: usize,
@@ -5625,11 +5627,6 @@ pub fn walk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
-    // `pyjitpl.py` `MetaInterp._interpret` checks after the caller's
-    // `run_one_step` that `newframe`d this helper (`ChangeFrame`), before
-    // the helper's first instruction. `SubWalkDriver` dest-write resume
-    // is the same check after a nested child returns.
-    helper_blackhole_after_run_one_step(ctx, start_pc, start_pc)?;
     loop {
         // A sub-walk error recovered inside an earlier opcode must not make a
         // later abort of this frame decline. The flag is raised again only
@@ -6126,6 +6123,13 @@ node,
                     // back safely (per-slot NONE hole / `vstack_valid = false`)
                     // for the coordinates it cannot reconstruct.
                     vstack_enter_exception_handler(ctx, target, exc);
+                    // `finishframe_exception` sets the handler pc and raises
+                    // ChangeFrame; `_interpret` checks before the handler's
+                    // first instruction. Latch at the handler, error at the
+                    // raising CALL / `raise`.
+                    if ctx.fbw_mode.transparent_helper_subwalk {
+                        helper_blackhole_after_run_one_step(ctx, target, opcode_position)?;
+                    }
                     pc = target;
                     continue;
                 }
