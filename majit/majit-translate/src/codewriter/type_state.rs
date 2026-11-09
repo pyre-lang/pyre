@@ -148,10 +148,13 @@ pub(crate) fn valuetype_to_concrete_for_legacy(
     vt: &ValueType,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> ConcreteType {
-    if let ValueType::Ref(Some(name)) = vt
-        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
-    {
-        return ConcreteType::Signed;
+    if let ValueType::Ref(Some(name)) = vt {
+        // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
+        if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
+            || crate::front::mir::is_root_scope_class_root(name)
+        {
+            return ConcreteType::Signed;
+        }
     }
     valuetype_to_concrete(vt)
 }
@@ -1488,6 +1491,18 @@ mod tests {
     /// `RustVecRepr.lowleveltype` (`rrustvec.rs` `rust_vec_lltype`).
     /// `apply_from_flowspace_variables` copies that lltype.
     /// `history.getkind` of the raw header stays int.
+    #[test]
+    fn valuetype_to_concrete_for_legacy_int_banks_rootscope() {
+        let empty = HashSet::new();
+        assert_eq!(
+            valuetype_to_concrete_for_legacy(
+                &ValueType::Ref(Some("gc_roots::RootScope".into())),
+                &empty
+            ),
+            ConcreteType::Signed
+        );
+    }
+
     #[test]
     fn apply_from_flowspace_variables_copies_signed_over_a_rust_vec_stamp() {
         use crate::model::getkind;

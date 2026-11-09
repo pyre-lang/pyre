@@ -4402,6 +4402,7 @@ fn active_runtime_alloc_oldgen_typed(type_id: u32, payload_size: usize) -> u64 {
 /// The `malloc_big_fixedsize` twin of `active_runtime_alloc_oldgen_typed`:
 /// same OOM contract, but the collecting `malloc_fixedsize` entry point rather
 /// than the direct old-generation one.
+#[allow(dead_code)]
 fn active_runtime_alloc_fixedsize_typed(type_id: u32, payload_size: usize) -> u64 {
     match with_cranelift_gc_collecting(|gc| gc.alloc_nursery_typed(type_id, payload_size).0 as u64)
     {
@@ -4410,26 +4411,33 @@ fn active_runtime_alloc_fixedsize_typed(type_id: u32, payload_size: usize) -> u6
     }
 }
 
+fn active_runtime_alloc_young_nonmoving_typed(type_id: u32, payload_size: usize) -> u64 {
+    match with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, payload_size).0 as u64) {
+        None => raw_fixedsize_alloc_typed(type_id, payload_size),
+        Some(v) => v,
+    }
+}
+
 /// gc.py `malloc_big_fixedsize(size, tid)` — fixed-size object
-/// large enough to skip the nursery.
+/// large enough to skip the nursery, or a `young_nonmoving` descr of any
+/// size.
 ///
-/// Upstream calls `do_malloc_fixedsize_clear`, which is the ordinary
-/// `malloc_fixedsize`, so the size decides the arm: over `nonlarge_max` it
-/// takes `external_malloc(typeid, 0, alloc_young=True)`.  `alloc_nursery_typed`
-/// is that entry point here — it dispatches on size, and only its small arm is
-/// the nursery — so the object is born *young* raw-malloced and can die at the
-/// next minor.  Header is stamped with the type id so callers MUST
+/// Upstream calls `do_malloc_fixedsize_clear`, whose large arm is
+/// `external_malloc(typeid, 0, alloc_young=True)`.  Rewrite reaches this
+/// helper only after declining `gen_malloc_nursery`, so the birth is always
+/// that large arm — never the nursery bump `alloc_nursery_typed` would take
+/// at a small size.  Header is stamped with the type id so callers MUST
 /// NOT emit a separate `gen_initialize_tid`.
 extern "C" fn gc_malloc_big_fixedsize_helper(size: u64, type_id: u64) -> u64 {
     // The CALL_R arg is `total = payload + GcHeader::SIZE` (built by
     // `handle_new` in rewrite.rs to include the GC header).  The
-    // runtime allocators (`alloc_with_type`, `alloc_nursery_typed`)
+    // runtime allocators (`alloc_young_nonmoving_typed`)
     // and the raw fallback both prepend the GC header themselves and
     // expect a payload-only size, so subtract `HDR` here once —
     // mirroring the existing CALL_MALLOC_NURSERY slowpath at
     // runner.rs (`alloc_nursery(total_size - gc_hdr)`).
     let payload = (size as usize).saturating_sub(GcHeader::SIZE);
-    oom_signal_if_zero(active_runtime_alloc_fixedsize_typed(
+    oom_signal_if_zero(active_runtime_alloc_young_nonmoving_typed(
         type_id as u32,
         payload,
     ))
