@@ -3922,6 +3922,14 @@ fn record_struct_id(
     identity_spelling: &str,
 ) {
     record_layout_struct_id(table, name.clone(), id);
+    // rlist.py ListRepr / listdef.py ListDef: field rows of the `{buf,len}`
+    // layout stay; class identity does not. `Bookkeeper.getdesc` never
+    // keys a list as a class object.
+    if crate::front::semantic::is_list_family_spelling(&name)
+        || crate::front::semantic::is_list_family_spelling(identity_spelling)
+    {
+        return;
+    }
     // One producer: the same harvest spelling `class_identity_spelling` /
     // `enum_ctor_class_identity` uses as the declaration's `struct_fields`
     // key. Two ids for one spelling collapse to `None`, matching
@@ -5194,7 +5202,9 @@ fn derive_program_metadata(
     // reads of `buf` / `len` name the Vec value; `fielddescrof` then adds
     // the component offset (`vec_part`). Record both names at byte 0 so
     // the layout lookup hits before `getattr` panics, matching the
-    // previous Unresolved mint of offset 0 plus `vec_part`.
+    // previous Unresolved mint of offset 0 plus `vec_part`. Field rows
+    // stay; `record_struct_id` skips class identity (`rlist.py`
+    // `ListRepr` / `listdef.py` `ListDef`).
     let alloc_vec_path = "alloc::vec::Vec";
     if llbc
         .iter_type_decls()

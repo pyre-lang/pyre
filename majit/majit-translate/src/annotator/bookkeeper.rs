@@ -1700,6 +1700,13 @@ impl Bookkeeper {
             .trim_start_matches("*mut ")
             .trim();
         let named_root = majit_ir::descr::strip_generic_args(stripped);
+        if crate::front::semantic::is_list_family_spelling(stripped)
+            || crate::front::semantic::is_list_family_spelling(named_root.as_ref())
+        {
+            // rlist.py ListRepr / listdef.py ListDef: a list is not a
+            // class instance (`bookkeeper.py` `getdesc`).
+            return None;
+        }
         let registered = {
             let guard = self.struct_fields.borrow();
             guard
@@ -1887,7 +1894,9 @@ impl Bookkeeper {
     /// `bookkeeper.py` `Bookkeeper.getdesc` keys a class by the class object
     /// and `getuniqueclassdef(cls)` is one `ClassDef` per class, so a
     /// bare-leaf registry alias of a qualified declaration is a lookup
-    /// spelling, not a class to pre-mint. The session-prologue inheritance-id
+    /// spelling, not a class to pre-mint. A Vec list-family key
+    /// (`rlist.py` `ListRepr` / `listdef.py` `ListDef`) is also not a
+    /// class. The session-prologue inheritance-id
     /// pass (`CallRegistry::ensure_session`) iterates these to eagerly
     /// pre-register the build-time-closed `W_*` struct hierarchy before
     /// running [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`].
@@ -1905,7 +1914,10 @@ impl Bookkeeper {
                 let index = QualifiedKeys::new(&reg.fields, &reg.class_identity);
                 reg.fields
                     .keys()
-                    .filter(|k| !is_bare_leaf_alias(k, &index))
+                    .filter(|k| {
+                        !is_bare_leaf_alias(k, &index)
+                            && !crate::front::semantic::is_list_family_spelling(k)
+                    })
                     .cloned()
                     .collect()
             })
@@ -2719,6 +2731,13 @@ impl Bookkeeper {
             // isn't reachable. `object` identity isn't materialised
             // either.
             let name = pyobj.qualname().to_string();
+            // rlist.py ListRepr / listdef.py ListDef: a list is not a
+            // class object (`bookkeeper.py` `getdesc`).
+            if crate::front::semantic::is_list_family_spelling(&name) {
+                return Err(AnnotatorError::new(format!(
+                    "Bookkeeper.getdesc({name:?}): list is not a class"
+                )));
+            }
             let desc_rc = ClassDesc::new(self, pyobj.clone(), Some(name), None, None)?;
             DescEntry::Class(desc_rc)
         } else if pyobj.is_bound_method() {
@@ -3209,6 +3228,13 @@ impl Bookkeeper {
                 "lltype.GcOpaqueType has no ClassDef: {root}"
             )));
         }
+        // rlist.py ListRepr / listdef.py ListDef: a list is not a
+        // class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
+        if crate::front::semantic::is_list_family_spelling(root) {
+            return Err(AnnotatorError::new(format!(
+                "listdef.py ListDef has no ClassDef: {root}"
+            )));
+        }
         let determinism_trace = crate::determinism_trace_enabled();
         if determinism_trace {
             eprintln!("[DTRACE-CLASS] struct_root root={root}");
@@ -3236,6 +3262,9 @@ impl Bookkeeper {
                 continue;
             }
             if is_gcref_type_spelling(&n) {
+                continue;
+            }
+            if crate::front::semantic::is_list_family_spelling(&n) {
                 continue;
             }
             // Register the node's identity ClassDef in `descs` (RPython's
@@ -4018,6 +4047,14 @@ impl Bookkeeper {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
         let mut cur = self.intern_class_key(name);
+        // rlist.py ListRepr / listdef.py ListDef: a list is not a class
+        // object (`bookkeeper.py` `getdesc` / `getuniqueclassdef`). Do
+        // not mint; callers project SomeList.
+        if crate::front::semantic::is_list_family_spelling(name)
+            || crate::front::semantic::is_list_family_spelling(&cur)
+        {
+            return crate::flowspace::model::HostObject::new_opaque(cur);
+        }
         loop {
             let key = cur.clone();
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
@@ -4241,6 +4278,9 @@ impl Bookkeeper {
             match next {
                 Some(n) => {
                     cur = self.intern_class_key(&n);
+                    if crate::front::semantic::is_list_family_spelling(&cur) {
+                        break;
+                    }
                     if seen.contains(&cur) {
                         break;
                     }
@@ -4290,6 +4330,13 @@ impl Bookkeeper {
         // sibling-classdef split `intern_enum_variant_host`'s contract
         // forbids.
         let key = self.intern_class_key(name);
+        // rlist.py ListRepr / listdef.py ListDef: a list is not a class
+        // object (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
+        if crate::front::semantic::is_list_family_spelling(name)
+            || crate::front::semantic::is_list_family_spelling(&key)
+        {
+            return crate::flowspace::model::HostObject::new_opaque(key);
+        }
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
@@ -4749,6 +4796,14 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // rlist.py ListRepr / listdef.py ListDef: every Vec spelling
+        // (bare `Vec<…>` and `vec::Vec<…>` / `alloc::vec::Vec<…>`) is
+        // one list projector. Rewrite the qualified template onto the
+        // bare `Vec` spelling the `Vec<` branch below already handles
+        // (`bookkeeper.py` `getlistdef` / `newlist`). One-word items
+        // share `project_rust_vec` the same way.
+        let list_family_owned = crate::front::semantic::list_family_bare_vec_spelling(t);
+        let t = list_family_owned.as_deref().unwrap_or(t);
         // Fat `&dyn Trait` is `two_word_fat_struct` (`{data, len}`), not a
         // classdef-less instance. `getitem` of that pair is FatData / FatLen.
         if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(t) {
@@ -4985,6 +5040,12 @@ impl Bookkeeper {
             let s_inner = self.project_struct_field_type(inner);
             let listdef = super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
             return SomeValue::List(super::model::SomeList::new(listdef));
+        }
+        if crate::front::semantic::is_list_family_spelling(stripped) {
+            // Template without `<…>`: the `Vec<` arm is the list
+            // projector. Do not intern a ClassDef
+            // (`bookkeeper.py` `getdesc`).
+            return SomeValue::Impossible;
         }
         if let Some(inner) = strip_generic_one(stripped, "Option<") {
             // `Option<fn>` is the nullable `Ptr(FuncType)`, not
@@ -6422,6 +6483,11 @@ impl Bookkeeper {
 
     /// Insert into [`Self::struct_root_classes`].
     fn insert_struct_root_class(&self, key: String, host: HostObject) {
+        // rlist.py ListRepr / listdef.py ListDef: a list is not a class
+        // (`bookkeeper.py` `getdesc`). This is the struct-root intern funnel.
+        if crate::front::semantic::is_list_family_spelling(&key) {
+            return;
+        }
         self.struct_root_classes.borrow_mut().insert(key, host);
     }
 
@@ -6450,6 +6516,13 @@ fn intern_class_key_from_registry(
     lookup: &str,
     allow_crate_strip: bool,
 ) -> String {
+    // rlist.py ListRepr / listdef.py ListDef: a Vec spelling is a list,
+    // not a class object. Return the lookup unchanged so harvest
+    // class_identity of template Vec cannot rewrite it (`getdesc` /
+    // `getuniqueclassdef`).
+    if crate::front::semantic::is_list_family_spelling(lookup) {
+        return lookup.to_string();
+    }
     if let Some(Some(ci)) = reg.class_identity.get(lookup) {
         return ci.spelling.clone();
     }
@@ -6634,6 +6707,8 @@ fn collect_referenced_struct_names(
         .trim_start_matches("*const ")
         .trim_start_matches("*mut ")
         .trim();
+    let list_family_owned = crate::front::semantic::list_family_bare_vec_spelling(stripped);
+    let stripped = list_family_owned.as_deref().unwrap_or(stripped);
     match stripped {
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "f32"
         | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
@@ -6688,6 +6763,11 @@ fn collect_referenced_struct_names(
             None => rest.trim(),
         };
         collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    // rlist.py ListRepr / listdef.py ListDef: a list template is not a
+    // class to intern (`bookkeeper.py` `getdesc`).
+    if crate::front::semantic::is_list_family_spelling(stripped) {
         return;
     }
     if reg.fields.contains_key(stripped) {
@@ -7552,6 +7632,44 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    /// `listdef.py` `ListDef` / `bookkeeper.py` `getlistdef`: every Vec
+    /// spelling projects as SomeList with the same item, and none mints
+    /// a ClassDef (`getdesc` / `getuniqueclassdef`).
+    fn assert_vec_u8_spellings_share_somelist(bk: &Rc<Bookkeeper>) {
+        let spellings = ["Vec<u8>", "vec::Vec<u8>", "alloc::vec::Vec<u8>"];
+        let items: Vec<SomeValue> = spellings
+            .iter()
+            .map(|spelling| match bk.project_struct_field_type(spelling) {
+                SomeValue::List(list) => list.listdef.s_value(),
+                other => panic!("{spelling} is SomeList (rlist ListDef), got {other:?}"),
+            })
+            .collect();
+        assert!(
+            matches!(&items[0], SomeValue::Integer(i) if i.unsigned),
+            "Vec<u8> item is unsigned"
+        );
+        assert_eq!(items[0], items[1], "vec::Vec<u8> item matches Vec<u8>");
+        assert_eq!(
+            items[0], items[2],
+            "alloc::vec::Vec<u8> item matches Vec<u8>"
+        );
+        for spelling in spellings {
+            let _ = bk.intern_class_by_qualname(spelling);
+        }
+        assert!(
+            bk.struct_root_classes()
+                .keys()
+                .all(|k| !crate::front::semantic::is_list_family_spelling(k)),
+            "no interned class for a Vec list-family spelling"
+        );
+        assert!(
+            bk.classdef_snapshot()
+                .iter()
+                .all(|cd| !crate::front::semantic::is_list_family_spelling(&cd.borrow().name)),
+            "no ClassDef for a Vec list-family spelling (bookkeeper.py getdesc)"
+        );
     }
 
     fn note_declared_gc(reg: &mut crate::front::StructFieldRegistry, names: &[&str]) {
@@ -10398,6 +10516,60 @@ mod tests {
     }
 
     #[test]
+    fn intern_class_key_does_not_rewrite_list_container_to_harvest_class() {
+        // harvest as intern_alloc_prefixed_and_crate_relative_vec_instantiation_share_one_key
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("alloc".to_string());
+        let rows = vec![
+            ("buf".to_string(), "*mut u8".to_string()),
+            ("len".to_string(), "usize".to_string()),
+        ];
+        reg.fields
+            .insert("alloc::vec::Vec".to_string(), rows.clone());
+        reg.fields.insert("vec::Vec".to_string(), rows);
+        harvest_class_identity(
+            &mut reg,
+            "vec::Vec",
+            &["alloc::vec::Vec", "vec::Vec", "Vec"],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        // rlist.py ListRepr / listdef.py ListDef: a Vec spelling is not a ClassDef.
+        // intern_class_key must not consult class_identity of template Vec.
+        assert_eq!(bk.intern_class_key("Vec<u8>"), "Vec<u8>");
+        assert_eq!(
+            bk.intern_class_key("alloc::vec::Vec<u8>"),
+            "alloc::vec::Vec<u8>"
+        );
+        assert_eq!(bk.intern_class_key("vec::Vec<u8>"), "vec::Vec<u8>");
+        assert!(majit_ir::descr::is_list_container_spelling("Vec<u8>"));
+        assert!(
+            !majit_ir::descr::is_list_container_spelling("vec::Vec<u8>"),
+            "harvest class identity is not a list spelling"
+        );
+        assert!(crate::front::semantic::is_list_family_spelling("Vec<u8>"));
+        assert!(crate::front::semantic::is_list_family_spelling(
+            "vec::Vec<u8>"
+        ));
+        assert!(crate::front::semantic::is_list_family_spelling(
+            "alloc::vec::Vec<u8>"
+        ));
+        assert!(!crate::front::semantic::is_list_family_spelling(
+            "rlist::TypedItemsBlock"
+        ));
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Vec<u8>"),
+                crate::annotator::model::SomeValue::List(_)
+            ),
+            "uninterned Vec<u8> is SomeList (rlist ListDef)"
+        );
+        assert_vec_u8_spellings_share_somelist(&bk);
+    }
+
+    #[test]
     fn intern_alloc_prefixed_and_crate_relative_vec_instantiation_share_one_key() {
         use crate::front::StructFieldRegistry;
         let bk = bk();
@@ -10416,10 +10588,15 @@ mod tests {
             &["alloc::vec::Vec", "vec::Vec", "Vec"],
         );
         bk.set_struct_fields(Rc::new(reg));
-        let alloc = bk.intern_class_key("alloc::vec::Vec<u8>");
-        let rel = bk.intern_class_key("vec::Vec<u8>");
-        assert_eq!(alloc, rel);
-        assert_eq!(alloc, "vec::Vec<u8>");
+        // rlist.py ListRepr / listdef.py ListDef: list spellings are not
+        // class intern keys (`Bookkeeper.getdesc` / `getuniqueclassdef`).
+        assert_eq!(bk.intern_class_key("Vec<u8>"), "Vec<u8>");
+        assert_eq!(
+            bk.intern_class_key("alloc::vec::Vec<u8>"),
+            "alloc::vec::Vec<u8>"
+        );
+        assert_eq!(bk.intern_class_key("vec::Vec<u8>"), "vec::Vec<u8>");
+        assert_vec_u8_spellings_share_somelist(&bk);
     }
 
     #[test]

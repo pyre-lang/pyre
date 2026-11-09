@@ -345,6 +345,61 @@ pub(crate) fn instantiation_has_scalar_layout_arg(name: &str) -> bool {
         .any(|arg| type_arg_is_scalar_layout(arg))
 }
 
+/// Peel `&` / `&mut` / `*const` / `*mut` the same way
+/// [`majit_ir::descr::is_list_container_spelling`] does.
+fn peel_list_family_prefix(spelling: &str) -> &str {
+    spelling
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim()
+}
+
+/// True when `spelling` names the Vec list family (`rlist.py` `ListRepr`,
+/// `listdef.py` `ListDef` / `SomeList`) rather than a class
+/// (`bookkeeper.py` `Bookkeeper.getdesc` / `getuniqueclassdef`).
+///
+/// Template `Vec` / `vec::Vec` / `alloc::vec::Vec`, bare or with `<…>`
+/// arguments, after the same `&` / `&mut` / `*const` / `*mut` peel
+/// [`majit_ir::descr::is_list_container_spelling`] uses. That projector
+/// still matches only uninterned `Vec<` / `VecDeque<` / `[` / `Slice<`
+/// leaves; intern exclusion uses this predicate, and
+/// [`list_family_bare_vec_spelling`] rewrites a qualified template onto
+/// that existing `Vec<` projector.
+pub(crate) fn is_list_family_spelling(spelling: &str) -> bool {
+    if majit_ir::descr::is_shared_u8_slice_spelling(spelling) {
+        return false;
+    }
+    let template = majit_ir::descr::strip_generic_args(peel_list_family_prefix(spelling));
+    matches!(template.as_ref(), "Vec" | "vec::Vec" | "alloc::vec::Vec")
+}
+
+/// Rewrite `vec::Vec` / `alloc::vec::Vec` (bare or `<…>`) to the bare
+/// `Vec` / `Vec<…>` spelling `Bookkeeper::project_struct_field_type`
+/// already projects as `SomeList` (`listdef.py` `ListDef` /
+/// `bookkeeper.py` `getlistdef` / `newlist`). `None` when `spelling` is
+/// not that family, or is already the bare `Vec` template.
+pub(crate) fn list_family_bare_vec_spelling(spelling: &str) -> Option<String> {
+    if !is_list_family_spelling(spelling) {
+        return None;
+    }
+    let original = spelling.trim();
+    let stripped = peel_list_family_prefix(original);
+    let template = majit_ir::descr::strip_generic_args(stripped);
+    if template.as_ref() == "Vec" {
+        return None;
+    }
+    debug_assert!(matches!(template.as_ref(), "vec::Vec" | "alloc::vec::Vec"));
+    let prefix = match original.rfind(stripped) {
+        Some(i) => &original[..i],
+        None => "",
+    };
+    let args = &stripped[template.len()..];
+    Some(format!("{prefix}Vec{args}"))
+}
+
 /// Declaration identity for one harvested class spelling.
 ///
 /// `id` is the `StructId` of the type declaration (`lltype.Struct` analog).
@@ -1314,6 +1369,36 @@ impl<'a> MirGraphLookup<'a> {
 mod tests {
     use super::*;
     use crate::model::FunctionGraph;
+
+    #[test]
+    fn list_family_bare_vec_spelling_rewrites_qualified_templates() {
+        assert_eq!(list_family_bare_vec_spelling("Vec<u8>"), None);
+        assert_eq!(list_family_bare_vec_spelling("Vec"), None);
+        assert_eq!(
+            list_family_bare_vec_spelling("vec::Vec<u8>").as_deref(),
+            Some("Vec<u8>")
+        );
+        assert_eq!(
+            list_family_bare_vec_spelling("alloc::vec::Vec<u8>").as_deref(),
+            Some("Vec<u8>")
+        );
+        assert_eq!(
+            list_family_bare_vec_spelling("&vec::Vec<u8>").as_deref(),
+            Some("&Vec<u8>")
+        );
+        assert_eq!(
+            list_family_bare_vec_spelling("&mut alloc::vec::Vec<u8>").as_deref(),
+            Some("&mut Vec<u8>")
+        );
+        assert_eq!(
+            list_family_bare_vec_spelling("vec::Vec").as_deref(),
+            Some("Vec")
+        );
+        assert_eq!(
+            list_family_bare_vec_spelling("rlist::TypedItemsBlock"),
+            None
+        );
+    }
 
     /// `remove` then `insert` of a different key restores `len`. The suffix
     /// lookup has to observe the new row.
