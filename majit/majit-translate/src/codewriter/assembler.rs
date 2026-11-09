@@ -5642,10 +5642,11 @@ fn align_up_pow2(offset: usize, align: usize) -> usize {
 ///
 /// `InstanceRepr._setup_repr` embeds the parent struct as `super`. The
 /// base class is the root and contributes no variant fields: its chain
-/// is empty and the instance is `OBJECT`'s `typeptr` word. A variant
-/// walks `parse_exception_class_overrides` to the base, then reverses so
-/// the farthest ancestor is laid out first. A cycle uses the same panic
-/// as `exception_class_field_owner`.
+/// is empty and the instance is the host object header
+/// ([`host_object_header_layout`]). A variant walks
+/// `parse_exception_class_overrides` to the base, then reverses so the
+/// farthest ancestor is laid out first. A cycle uses the same panic as
+/// `exception_class_field_owner`.
 fn minted_exception_variant_chain(
     hint: &crate::front::llbc_hints::ExceptionClassHint,
     key: &str,
@@ -5697,14 +5698,137 @@ fn minted_exception_chain_for_key(cc: &CallControl, key: &str) -> Vec<String> {
     panic!("marked exception class `{key}` has no minted class");
 }
 
+/// Size, alignment, and owner of the host object header.
+///
+/// `InstanceRepr._setup_repr` roots every instance at `OBJECT`. The
+/// header is the field-registry owner whose first field is the typeptr
+/// (`heaptracker::is_typeptr_field`). Its size and alignment are that
+/// owner's `StructLayout`, the same record `CallControl::struct_layout_for`
+/// already stores for a host class. Every spelling that resolves must
+/// agree. A missing layout is skipped; none resolved, a zero size, or
+/// two shapes is a closed failure.
+///
+/// The owner is the first resolved spelling in name order. The field
+/// map does not iterate stably, and the spec rows come from that
+/// owner's own list ([`host_object_header_gc_field_specs`]).
+/// `NewWithVtable` still stamps the typeptr through `fielddescr_vtable`.
+fn host_object_header_layout(cc: &CallControl) -> (usize, usize, String) {
+    // Collect owners before `struct_layout_for`: the field map borrow
+    // cannot overlap that lookup.
+    let mut owners: Vec<String> = cc
+        .struct_fields()
+        .fields
+        .iter()
+        .filter_map(|(owner, rows)| {
+            let first = rows.first()?;
+            let field = crate::model::FieldDescriptor::new(first.name.clone(), Some(owner.clone()));
+            crate::codewriter::heaptracker::is_typeptr_field(&field).then(|| owner.clone())
+        })
+        .collect();
+    owners.sort();
+    let mut found: Option<(usize, usize, String)> = None;
+    for owner in owners {
+        let Some(layout) = cc.struct_layout_for(&owner) else {
+            continue;
+        };
+        if layout.size == 0 || layout.align == 0 {
+            panic!(
+                "minted exception instance: object header `{owner}` has size {} align {}",
+                layout.size, layout.align
+            );
+        }
+        let shape = (layout.size, layout.align);
+        match &found {
+            None => found = Some((shape.0, shape.1, owner)),
+            Some((prev_size, prev_align, _)) if (*prev_size, *prev_align) == shape => {}
+            Some((prev_size, prev_align, _)) => panic!(
+                "minted exception instance: object header layouts disagree: ({prev_size}, {prev_align}) vs {shape:?} (`{owner}`)"
+            ),
+        }
+    }
+    found.unwrap_or_else(|| {
+        panic!(
+            "minted exception instance: no StructLayout for the object header whose first field is the typeptr (heaptracker::is_typeptr_field)"
+        )
+    })
+}
+
+/// GC-pointer words of the host object header, typeptr omitted.
+///
+/// `heaptracker.py all_fielddescrs` walks the header STRUCT, skips
+/// `typeptr`, and keeps every other field. A host class reaches that
+/// list by inlining the header (`bh_all_field_specs_for_struct` on the
+/// outer struct, which recurses and prefixes the header field). A
+/// minted class has no such field: the same walk starts at the owner
+/// [`host_object_header_layout`] resolved. Only `ArrayFlag::Pointer`
+/// rows are specs. `rewrite.py clear_gc_fields` zeroes each of them
+/// when `malloc_zero_filled` is false.
+///
+/// The blackhole does not consult this list. `llmodel.py
+/// bh_new_with_vtable` calls `gc_malloc`, and framework `_bh_malloc`
+/// is `do_malloc_fixedsize_clear`. The typed path is
+/// `alloc_oldgen_typed`, which `raw_memclear`s the payload before
+/// `write_new_with_vtable_header` stores a class word only when
+/// `resolve_w_class_obj` is nonzero. The nursery bump does not clear.
+///
+/// Indices are the dense prefix of the instance list. `sort_key` stays
+/// the field offset, which the walk already took from the layout.
+fn host_object_header_gc_field_specs(
+    cc: &CallControl,
+    owner: &str,
+) -> Vec<crate::jitcode::BhFieldSpec> {
+    let mut specs: Vec<_> = bh_all_field_specs_for_struct(cc, owner)
+        .into_iter()
+        .filter(|spec| spec.field_flag == majit_ir::descr::ArrayFlag::Pointer)
+        .collect();
+    for (index, spec) in specs.iter_mut().enumerate() {
+        spec.index = index as u32;
+        spec.index_in_parent = index;
+    }
+    specs
+}
+
+/// One own or `mutate_<name>` row while `minted_exception_instance_layout`
+/// places a class. `name` is borrowed for a harvested field and owned for
+/// the mutation slot `InstanceRepr._setup_repr` appends.
+struct MintedLayoutField<'a> {
+    name: std::borrow::Cow<'a, str>,
+    size: usize,
+    flag: majit_ir::descr::ArrayFlag,
+    ty: majit_ir::value::Type,
+    raw_owned: Option<&'a crate::front::semantic::RawOwnedField>,
+    is_immutable: bool,
+    is_quasi: bool,
+    is_atomic: bool,
+}
+
 /// Field rows of one minted class, embedded the way `InstanceRepr`
 /// embeds `super`.
 ///
-/// The root word is `OBJECT`'s `typeptr` (`rclass.py`). Each class then
-/// places only the fields it declares, after the previous class's
-/// aligned size. Alignment carries forward: a subclass whose own field
-/// is a byte still rounds with an ancestor `i64`'s alignment, because
-/// the outer struct's alignment includes the nested `super`.
+/// The root is the host object header ([`host_object_header_layout`]),
+/// not a one-word `typeptr`. That header's GC-pointer words, typeptr
+/// omitted, are the first `BhFieldSpec`s
+/// ([`host_object_header_gc_field_specs`]). Each class then places only
+/// the fields it declares, after the previous class's aligned size.
+/// Alignment carries forward: a subclass whose own field is a byte
+/// still rounds with an ancestor `i64`'s alignment, because the outer
+/// struct's alignment includes the nested `super`. Payload offsets do
+/// not move when the header specs are prepended.
+///
+/// Own rows, after the `__discriminant` / header-word / `Void` / size-0
+/// filter, follow `InstanceRepr._setup_repr`: name order, then a stable
+/// decreasing-size order (`attr_reverse_size`, the comparator
+/// `sort_llfields` uses). Each quasi-immutable own field then appends
+/// `mutate_<name>` as `OBJECTPTR` after those sorted fields, in that
+/// same name order. The slot is pointer-sized, `ArrayFlag::Pointer`,
+/// `Type::Ref`, traced, and not itself quasi-immutable.
+///
+/// The fourth value is the payload GC-pointer offsets, in layout order:
+/// `ArrayFlag::Pointer` fields that are not raw-owned, including each
+/// `mutate_<name>` slot. The header's class word is a field spec but is
+/// absent here. `TypeRegistry::register` merges the parent's offsets,
+/// and the object root already lists that edge. A raw-owned `*mut T`
+/// is an integer word the destructor frees.
 fn minted_exception_instance_layout(
     cc: &CallControl,
     chain: &[String],
@@ -5712,14 +5836,19 @@ fn minted_exception_instance_layout(
     usize,
     Vec<crate::jitcode::BhFieldSpec>,
     Vec<crate::front::llbc_hints::MintedRawOwnedDrop>,
+    Vec<usize>,
 ) {
-    let word = crate::layout::target_word_size();
-    let mut super_size = word;
-    let mut super_align = word.max(1);
-    let mut specs = Vec::new();
+    let (mut super_size, mut super_align, header_owner) = host_object_header_layout(cc);
+    let mut specs = host_object_header_gc_field_specs(cc, &header_owner);
     let mut drops = Vec::new();
+    let mut gc_ptr_offsets = Vec::new();
     if chain.is_empty() {
-        return (align_up_pow2(super_size, super_align), specs, drops);
+        return (
+            align_up_pow2(super_size, super_align),
+            specs,
+            drops,
+            gc_ptr_offsets,
+        );
     }
     for class_key in chain {
         let mut offset = super_size;
@@ -5728,6 +5857,7 @@ fn minted_exception_instance_layout(
             .struct_field_entries(class_key)
             .map(|rows| rows.to_vec())
             .unwrap_or_default();
+        let mut own: Vec<MintedLayoutField<'_>> = Vec::new();
         for row in &rows {
             if row.name == "__discriminant"
                 || crate::codewriter::heaptracker::is_header_word(class_key, &row.name)
@@ -5738,54 +5868,120 @@ fn minted_exception_instance_layout(
             if ty == majit_ir::value::Type::Void || size == 0 {
                 continue;
             }
-            let align = scalar_align(size).max(1);
+            let rank = cc.field_immutability(Some(class_key), &row.name);
+            let is_quasi = rank.is_some_and(|rank| rank.is_quasi_immutable());
+            own.push(MintedLayoutField {
+                name: std::borrow::Cow::Borrowed(row.name.as_str()),
+                size,
+                flag,
+                ty,
+                raw_owned: row.raw_owned.as_ref(),
+                is_immutable: rank.is_some(),
+                is_quasi,
+                is_atomic: row.is_atomic,
+            });
+        }
+        own.sort_by(|left, right| {
+            crate::translator::rtyper::rclass::cmp_llfields_name_then_reverse_size(
+                left.name.as_ref(),
+                Some(left.size),
+                right.name.as_ref(),
+                Some(right.size),
+            )
+        });
+        // `InstanceRepr._setup_repr` walks the name-sorted attrs again,
+        // not the size-sorted `myllfields`, when it appends `mutate_<name>`.
+        let mut quasi_names: Vec<&str> = own
+            .iter()
+            .filter(|field| field.is_quasi)
+            .map(|field| field.name.as_ref())
+            .collect();
+        quasi_names.sort();
+        let mutate_names: Vec<String> = quasi_names
+            .into_iter()
+            .map(|name| format!("mutate_{name}"))
+            .collect();
+        let word = crate::layout::target_word_size();
+        for name in mutate_names {
+            own.push(MintedLayoutField {
+                name: std::borrow::Cow::Owned(name),
+                size: word,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                ty: majit_ir::value::Type::Ref,
+                raw_owned: None,
+                is_immutable: false,
+                is_quasi: false,
+                is_atomic: false,
+            });
+        }
+        for field in &own {
+            let align = scalar_align(field.size).max(1);
             class_align = class_align.max(align);
             offset = align_up_pow2(offset, align);
-            if let Some(raw) = &row.raw_owned {
+            if let Some(raw) = field.raw_owned {
                 drops.push(crate::front::llbc_hints::MintedRawOwnedDrop {
                     offset,
                     type_path: raw.type_path.clone(),
                 });
             }
+            if field.flag == majit_ir::descr::ArrayFlag::Pointer && field.raw_owned.is_none() {
+                gc_ptr_offsets.push(offset);
+            }
+            // `get_type_flag`'s unknown-type arm banks `*mut T` as a GC
+            // pointer. A raw pointee is `FLAG_UNSIGNED` (`descr.py
+            // get_type_flag`). Keep the word's size so later offsets do
+            // not move; `gc_fielddescrs` then omits a slot the collector
+            // does not trace. The payload offset list above already
+            // excluded it.
+            let (flag, ty) = if field.raw_owned.is_some() {
+                (
+                    majit_ir::descr::ArrayFlag::Unsigned,
+                    majit_ir::value::Type::Int,
+                )
+            } else {
+                (field.flag, field.ty)
+            };
             let index = specs.len();
-            let rank = cc.field_immutability(Some(class_key), &row.name);
-            let is_quasi = rank.map(|rank| rank.is_quasi_immutable()).unwrap_or(false);
             specs.push(bh_field_spec_from_parts(
                 index as u32,
                 class_key,
-                &row.name,
+                field.name.as_ref(),
                 offset,
-                size,
+                field.size,
                 ty,
                 flag,
-                rank.is_some(),
-                is_quasi,
+                field.is_immutable,
+                field.is_quasi,
                 index,
-                is_quasi && row.is_atomic,
-                is_quasi && row.is_atomic,
+                field.is_quasi && field.is_atomic,
+                field.is_quasi && field.is_atomic,
             ));
-            offset += size;
+            offset += field.size;
         }
         offset = align_up_pow2(offset, class_align);
         super_size = offset;
         super_align = class_align;
     }
-    (super_size, specs, drops)
+    (super_size, specs, drops, gc_ptr_offsets)
 }
 
-/// Fill `raw_owned` from the instance layout of each minted class.
+/// Fill `size`, `gc_ptr_offsets`, and `raw_owned` from one instance layout.
 ///
 /// The field row stays on the declaring class. A subclass instance is
 /// allocated with the subclass tid, so its destructor repeats every
 /// ancestor's raw-owned attr at the offset `super` embedding gives that
 /// field. A class whose chain has no such attr keeps an empty list.
+/// `size` is the same byte count `minted_exception_instance_size_spec`
+/// publishes, and `gc_ptr_offsets` are that layout's payload GC edges.
 pub(crate) fn attach_minted_exception_raw_owned_drops(
     cc: &CallControl,
     rows: &mut [crate::front::llbc_hints::MintedExceptionClassEmit],
 ) {
     for row in rows {
         let chain = minted_exception_chain_for_key(cc, &row.name);
-        let (_size, _specs, drops) = minted_exception_instance_layout(cc, &chain);
+        let (size, _specs, drops, gc_ptr_offsets) = minted_exception_instance_layout(cc, &chain);
+        row.size = size;
+        row.gc_ptr_offsets = gc_ptr_offsets;
         row.raw_owned = drops;
     }
 }
@@ -5796,15 +5992,18 @@ pub(crate) fn attach_minted_exception_raw_owned_drops(
 /// `minted_exception_size_owner` is the host walk. A match always yields
 /// a spec: the chain is that host's ancestors, and a missing chain is
 /// the same missing-class panic as the constructor arm. `vtable` stays
-/// 0 and `owner` stays empty here; `OpKind::NewWithVtable` overwrites
-/// both with the type-static sentinel and the class key.
+/// 0. `owner` is the class key so `GcLLDescr_framework.init_size_descr`
+/// can stamp `TypeLayoutBuilder.get_type_id` for that TYPE.
+/// `OpKind::NewWithVtable` still overwrites the opcode `BhDescr.owner`
+/// with that same key and replaces `vtable` with the type-static sentinel.
 fn minted_exception_instance_size_spec(
     cc: &CallControl,
     owner: &str,
 ) -> Option<crate::jitcode::BhSizeSpec> {
     let key = minted_exception_size_owner(cc, owner, 0)?;
     let chain = minted_exception_chain_for_key(cc, &key);
-    let (size, all_fielddescrs, _drops) = minted_exception_instance_layout(cc, &chain);
+    let (size, all_fielddescrs, _drops, _gc_ptr_offsets) =
+        minted_exception_instance_layout(cc, &chain);
     let (is_gc_managed, headerless) = cc.struct_storage_for(owner).unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
@@ -5812,7 +6011,7 @@ fn minted_exception_instance_size_spec(
         headerless,
         type_id: bh_size_type_id(owner, owner, is_gc_managed),
         vtable: 0,
-        owner: String::new(),
+        owner: key,
         all_fielddescrs,
     })
 }
@@ -5827,10 +6026,10 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
     let owner = canonical_owner.as_str();
     // `rclass.py` `InstanceRepr._setup_repr` embeds the parent struct as
-    // `super`, rooted at `OBJECT`'s `typeptr` word. A minted class always
-    // has that size, including a variant that declares no fields. This
-    // wins over a registered empty `StructLayout` and over a missing row
-    // list: neither is the instance struct.
+    // `super`, rooted at the host object header (`host_object_header_layout`).
+    // A minted class always has that size, including a variant that
+    // declares no fields. This wins over a registered empty `StructLayout`
+    // and over a missing row list: neither is the instance struct.
     if let Some(spec) = minted_exception_instance_size_spec(cc, owner) {
         return Some(spec);
     }
@@ -7500,6 +7699,44 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
 }
 
 pub use majit_ir::CallInfoCollection;
+
+/// Owner spelling tests use for the host object header.
+///
+/// The string is the leaf `heaptracker::is_typeptr_field` matches. The
+/// layout is two pointer words built by `StructLayout::from_type_strings`,
+/// not a literal `2 * word` inside the production layout.
+#[cfg(test)]
+pub(crate) fn host_header_owner() -> &'static str {
+    "PyObject"
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_field_pairs() -> Vec<(String, String)> {
+    vec![
+        ("ob_type".to_string(), "*mut HeaderClass".to_string()),
+        ("w_class".to_string(), "*mut HeaderClass".to_string()),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_rows() -> Vec<crate::front::semantic::FieldRow> {
+    host_header_field_pairs()
+        .into_iter()
+        .map(|(name, ty)| crate::front::semantic::FieldRow::named(name, ty))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_layout() -> crate::call::StructLayout {
+    crate::call::StructLayout::from_type_strings(
+        &host_header_field_pairs(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -12277,7 +12514,19 @@ mod tests {
                 },
             );
         }
+        // The size-0 loop must not own the header: a later
+        // `set_struct_layout` would have to overwrite a zero size, and a
+        // test that replaces the field registry has to put these rows
+        // back or `host_object_header_layout` fails closed.
+        let header_id = majit_ir::descr::StructId::from_canonical(host_header_owner());
+        ids.insert(host_header_owner().to_string(), Some(header_id));
+        cc.set_struct_layout(header_id, host_header_layout());
         let guard = crate::test_support::register_struct_ids_serialized(ids);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        cc.set_struct_fields(fields);
         (cc, guard)
     }
 
@@ -12412,7 +12661,7 @@ mod tests {
     }
 
     /// A size-0 layout does not describe a minted class. The size is the
-    /// `typeptr` word plus ancestor fields (`InstanceRepr._setup_repr`),
+    /// host object header plus ancestor fields (`InstanceRepr._setup_repr`),
     /// and `new_with_vtable` still carries the type-static sentinel.
     #[test]
     fn new_with_vtable_minted_class_embeds_ancestor_fields() {
@@ -12426,6 +12675,9 @@ mod tests {
         let (mut cc, _guard) =
             layout_cc_for_owners(&["synth::E", "synth::E::A", "synth::E::B", "synth::E::D"]);
         let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
         fields.fields.insert(
             "synth::E::A".to_string(),
             vec![("n".to_string(), "i64".to_string())],
@@ -12438,36 +12690,58 @@ mod tests {
         cc.exception_class_hints = vec![hint];
 
         let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let header_size = header.size;
+        let header_align = header.align;
+        assert_eq!(header_size, 2 * word);
         let n_align = 8usize;
-        let n_offset = (word + n_align - 1) & !(n_align - 1);
-        let class_align = word.max(n_align);
-        let a_size = (n_offset + 8 + class_align - 1) & !(class_align - 1);
+        let n_offset = align_up_pow2(header_size, n_align);
+        let class_align = header_align.max(n_align);
+        let a_size = align_up_pow2(n_offset + 8, class_align);
         let flag_offset = a_size;
-        let b_size = (flag_offset + 1 + class_align - 1) & !(class_align - 1);
+        let b_size = align_up_pow2(flag_offset + 1, class_align);
+        let root_size = align_up_pow2(header_size, header_align);
 
         let b_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::B").expect("B");
         let d_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::D").expect("D");
         let base_spec = bh_size_spec_from_callcontrol(&cc, "synth::E").expect("base");
         assert_eq!(b_spec.size, b_size);
-        assert_eq!(d_spec.size, word);
-        assert_eq!(base_spec.size, word);
-        assert!(d_spec.all_fielddescrs.is_empty());
-        assert!(base_spec.all_fielddescrs.is_empty());
-        assert!(b_spec.owner.is_empty());
+        assert_eq!(d_spec.size, root_size);
+        assert_eq!(base_spec.size, root_size);
+        let header_name = format!("{}.w_class", host_header_owner());
+        for spec in [&d_spec, &base_spec] {
+            assert_eq!(spec.all_fielddescrs.len(), 1);
+            assert_eq!(spec.all_fielddescrs[0].field_key(), "w_class");
+            assert_eq!(spec.all_fielddescrs[0].name, header_name);
+            assert_eq!(spec.all_fielddescrs[0].offset, word);
+            assert_eq!(spec.all_fielddescrs[0].index, 0);
+            assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+            assert!(spec.all_fielddescrs[0].is_class_word.is_none());
+            assert!(spec.all_fielddescrs[0].effective_class_word());
+        }
+        assert_eq!(b_spec.owner, "synth::E::B");
         assert_eq!(b_spec.vtable, 0);
-        assert_eq!(b_spec.all_fielddescrs.len(), 2);
-        assert_eq!(b_spec.all_fielddescrs[0].field_key(), "n");
-        assert_eq!(b_spec.all_fielddescrs[0].name, "synth::E::A.n");
-        assert_eq!(b_spec.all_fielddescrs[0].offset, n_offset);
-        assert_ne!(n_offset, 0);
-        assert_eq!(b_spec.all_fielddescrs[1].field_key(), "flag");
-        assert_eq!(b_spec.all_fielddescrs[1].name, "synth::E::B.flag");
-        assert_eq!(b_spec.all_fielddescrs[1].offset, flag_offset);
+        assert_eq!(b_spec.all_fielddescrs.len(), 3);
+        assert_eq!(b_spec.all_fielddescrs[0].field_key(), "w_class");
+        assert_eq!(b_spec.all_fielddescrs[0].name, header_name);
+        assert_eq!(b_spec.all_fielddescrs[0].offset, word);
+        assert_eq!(b_spec.all_fielddescrs[0].index, 0);
+        assert_eq!(b_spec.all_fielddescrs[1].field_key(), "n");
+        assert_eq!(b_spec.all_fielddescrs[1].name, "synth::E::A.n");
+        assert_eq!(b_spec.all_fielddescrs[1].offset, n_offset);
+        assert_eq!(b_spec.all_fielddescrs[1].index, 1);
+        assert_eq!(b_spec.all_fielddescrs[1].index_in_parent, 1);
+        assert_eq!(n_offset, header_size);
+        assert_eq!(b_spec.all_fielddescrs[2].field_key(), "flag");
+        assert_eq!(b_spec.all_fielddescrs[2].name, "synth::E::B.flag");
+        assert_eq!(b_spec.all_fielddescrs[2].offset, flag_offset);
+        assert_eq!(b_spec.all_fielddescrs[2].index, 2);
         if word >= 8 {
-            assert_eq!(n_offset, word);
-            assert_eq!(flag_offset, word + 8);
-            assert_eq!(a_size, 16);
-            assert_eq!(b_size, 24);
+            assert_eq!(flag_offset, header_size + 8);
+            assert_eq!(a_size, header_size + 8);
+            assert_eq!(b_size, header_size + 16);
         }
         assert_eq!(
             cc.struct_layout_for("synth::E::B")
@@ -12488,11 +12762,13 @@ mod tests {
                 assert!(is_type_static_const_sentinel(vtable));
                 assert_eq!(owner, "synth::E::B");
                 assert_eq!(size, b_size);
-                assert_eq!(all_fielddescrs.len(), 2);
-                assert_eq!(all_fielddescrs[0].name, "synth::E::A.n");
-                assert_eq!(all_fielddescrs[0].offset, n_offset);
-                assert_eq!(all_fielddescrs[1].name, "synth::E::B.flag");
-                assert_eq!(all_fielddescrs[1].offset, flag_offset);
+                assert_eq!(all_fielddescrs.len(), 3);
+                assert_eq!(all_fielddescrs[0].name, header_name);
+                assert_eq!(all_fielddescrs[0].offset, word);
+                assert_eq!(all_fielddescrs[1].name, "synth::E::A.n");
+                assert_eq!(all_fielddescrs[1].offset, n_offset);
+                assert_eq!(all_fielddescrs[2].name, "synth::E::B.flag");
+                assert_eq!(all_fielddescrs[2].offset, flag_offset);
             }
             other => panic!("assembled B: {other:?}"),
         }
@@ -12507,10 +12783,434 @@ mod tests {
             } => {
                 assert!(is_type_static_const_sentinel(vtable));
                 assert_eq!(owner, "synth::E::D");
-                assert_eq!(size, word);
-                assert!(all_fielddescrs.is_empty());
+                assert_eq!(size, root_size);
+                assert_eq!(all_fielddescrs.len(), 1);
+                assert_eq!(all_fielddescrs[0].name, header_name);
+                assert_eq!(all_fielddescrs[0].offset, word);
             }
             other => panic!("assembled D: {other:?}"),
+        }
+    }
+
+    /// A minted class with `String`, `i64`, `Vec<String>`, and a raw-owned
+    /// struct starts its first payload field at the host header. `String`
+    /// is harvested as `"str"` and `Vec<String>` as
+    /// [`crate::front::mir::RPY_LIST_OF_STR`]. Own fields follow
+    /// `InstanceRepr._setup_repr`: `count` is the wide field, then the
+    /// word-sized names stay in name order (`missing`, `msg`,
+    /// `signature`). The `SizeDescr` size is the rendered row size.
+    /// `gc_fielddescrs` is the header class word plus the list word and
+    /// the str word, in that layout order. The rendered `gc_ptr_offsets`
+    /// omit the header edge: `TypeRegistry::register` merges the object
+    /// root. The `i64` and the raw-owned word are in neither list. A
+    /// subclass keeps the inherited offsets.
+    #[test]
+    fn minted_class_layout_starts_at_host_header_and_traces_gc_pointers() {
+        use crate::front::llbc_hints::{
+            minted_exception_class_rows, render_minted_exception_classes_rs,
+        };
+        use crate::front::semantic::{FieldRow, RawOwnedField};
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Mix",
+            "Child(Parent)",
+            vec!["Parent".into(), "Child".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::Mix", "synth::Mix::Parent", "synth::Mix::Child"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Mix::Parent".to_string(),
+            vec![
+                FieldRow::named("msg", "str"),
+                FieldRow::named("count", "i64"),
+                FieldRow::named("missing", crate::front::mir::RPY_LIST_OF_STR),
+                FieldRow::named("signature", "*mut fixture::Signature").with_raw_owned(
+                    RawOwnedField {
+                        type_path: "fixture::Signature".into(),
+                        size: 8,
+                        align: 8,
+                    },
+                ),
+            ],
+        );
+        fields.fields.insert(
+            "synth::Mix::Child".to_string(),
+            vec![FieldRow::named("extra", "i64")],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint.clone()];
+
+        let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        assert_eq!(header.fields.len(), 2);
+        assert_eq!(header.fields[0].name, "ob_type");
+        assert_eq!(header.fields[0].offset, 0);
+        assert_eq!(header.fields[1].name, "w_class");
+        assert_eq!(header.fields[1].offset, word);
+        assert_eq!(header.size, 2 * word);
+        let header_size = header.size;
+
+        let parent_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix::Parent").expect("parent");
+        let child_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix::Child").expect("child");
+        let base_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix").expect("base");
+        assert_eq!(base_spec.size, header_size);
+
+        let field = |spec: &crate::jitcode::BhSizeSpec, key: &str| {
+            spec.all_fielddescrs
+                .iter()
+                .find(|row| row.field_key() == key)
+                .unwrap_or_else(|| panic!("{key} missing from {spec:?}"))
+                .clone()
+        };
+        let header_name = format!("{}.w_class", host_header_owner());
+        let class_word = field(&parent_spec, "w_class");
+        let msg = field(&parent_spec, "msg");
+        let count = field(&parent_spec, "count");
+        let missing = field(&parent_spec, "missing");
+        let signature = field(&parent_spec, "signature");
+        assert_eq!(class_word.offset, word);
+        assert_eq!(class_word.name, header_name);
+        assert_eq!(class_word.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+        assert!(class_word.is_class_word.is_none());
+        assert!(class_word.effective_class_word());
+        assert_eq!(class_word.index, 0);
+        assert_eq!(class_word.index_in_parent, 0);
+        let parent_keys: Vec<_> = parent_spec
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(
+            parent_keys,
+            vec!["w_class", "count", "missing", "msg", "signature"]
+        );
+        assert_eq!(count.offset, header_size);
+        assert_eq!(count.index, 1);
+        assert_eq!(count.index_in_parent, 1);
+        assert_eq!(missing.offset, count.offset + count.field_size);
+        assert_eq!(msg.offset, missing.offset + missing.field_size);
+        assert_eq!(signature.offset, msg.offset + msg.field_size);
+        assert_eq!(signature.field_flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(signature.field_type, majit_ir::value::Type::Int);
+        assert_eq!(signature.field_size, word);
+        for (index, row) in parent_spec.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        for spec in [&parent_spec, &child_spec, &base_spec] {
+            assert!(
+                spec.all_fielddescrs.iter().all(|row| {
+                    let key = row.field_key();
+                    key != "ob_type" && key != "typeptr"
+                }),
+                "the typeptr is not a field spec: {:?}",
+                spec.all_fielddescrs
+            );
+            let class_rows: Vec<_> = spec
+                .all_fielddescrs
+                .iter()
+                .filter(|row| row.field_key() == "w_class")
+                .collect();
+            assert_eq!(class_rows.len(), 1);
+            assert_eq!(class_rows[0].offset, word);
+            assert_eq!(class_rows[0].name, header_name);
+        }
+        assert_eq!(base_spec.all_fielddescrs.len(), 1);
+        for key in ["msg", "count", "missing", "signature"] {
+            assert_eq!(
+                field(&parent_spec, key).offset,
+                field(&child_spec, key).offset,
+                "{key}"
+            );
+        }
+        let extra = field(&child_spec, "extra");
+        assert!(extra.offset >= parent_spec.size);
+
+        let mut rows = minted_exception_class_rows(std::slice::from_ref(&hint));
+        attach_minted_exception_raw_owned_drops(&cc, &mut rows);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+        };
+        let parent_row = row("synth::Mix::Parent");
+        let child_row = row("synth::Mix::Child");
+        let base_row = row("synth::Mix");
+        assert_eq!(parent_spec.size, parent_row.size);
+        assert_eq!(child_spec.size, child_row.size);
+        assert_eq!(base_row.size, header_size);
+        assert_eq!(parent_row.gc_ptr_offsets, vec![missing.offset, msg.offset]);
+        assert_eq!(child_row.gc_ptr_offsets, parent_row.gc_ptr_offsets);
+        assert!(base_row.gc_ptr_offsets.is_empty());
+        // `descr.py get_size_descr`: `gc_fielddescrs` is the pointer
+        // subset of `all_fielddescrs`. The class word is that subset's
+        // header row. `w_class_obj()` is absent because the minted
+        // vtable carries no app-level class (`resolve_w_class_obj(0)`).
+        let gc_field_offsets = |spec: &crate::jitcode::BhSizeSpec| -> Vec<usize> {
+            use majit_ir::descr::SizeDescr;
+            let fields: Vec<_> = spec
+                .all_fielddescrs
+                .iter()
+                .map(|row| majit_ir::descr::SimpleFieldDescrSpec {
+                    index: row.index,
+                    field_key: row.field_key().to_string(),
+                    name: row.name.clone(),
+                    offset: row.offset,
+                    field_size: row.field_size,
+                    field_type: row.field_type,
+                    is_immutable: row.is_immutable,
+                    is_quasi_immutable: row.is_quasi_immutable,
+                    flag: row.field_flag,
+                    virtualizable: false,
+                    is_class_word: row.is_class_word,
+                    index_in_parent: row.index_in_parent,
+                    load_is_acquire: row.load_is_acquire,
+                    store_is_release: row.store_is_release,
+                })
+                .collect();
+            let group = majit_ir::descr::make_simple_descr_group(
+                0,
+                spec.size,
+                spec.type_id as u32,
+                0,
+                &fields,
+            );
+            let size_descr = group.size_descr.as_ref();
+            let class_word = size_descr.class_word_field().expect("class word");
+            assert_eq!(class_word.offset(), word);
+            assert_eq!(class_word.sort_key(), word);
+            assert!(class_word.is_w_class());
+            assert_eq!(size_descr.w_class_obj(), None);
+            size_descr
+                .gc_fielddescrs()
+                .iter()
+                .map(|field| field.offset())
+                .collect()
+        };
+        let parent_gc = gc_field_offsets(&parent_spec);
+        let child_gc = gc_field_offsets(&child_spec);
+        assert_eq!(parent_gc, vec![word, missing.offset, msg.offset]);
+        assert_eq!(child_gc, parent_gc);
+        assert_eq!(gc_field_offsets(&base_spec), vec![word]);
+        for offsets in [&parent_gc, &child_gc] {
+            assert!(!offsets.contains(&count.offset));
+            assert!(!offsets.contains(&signature.offset));
+            assert!(!offsets.contains(&extra.offset));
+            assert!(!offsets.contains(&0));
+        }
+        for offsets in [&parent_row.gc_ptr_offsets, &child_row.gc_ptr_offsets] {
+            assert!(offsets.iter().all(|offset| *offset >= header_size));
+            assert!(!offsets.contains(&0));
+            assert!(!offsets.contains(&word));
+            assert!(!offsets.contains(&count.offset));
+            assert!(!offsets.contains(&signature.offset));
+            assert!(!offsets.contains(&extra.offset));
+        }
+        assert_eq!(parent_row.raw_owned.len(), 1);
+        assert_eq!(parent_row.raw_owned[0].offset, signature.offset);
+        assert_eq!(child_row.raw_owned[0].offset, signature.offset);
+
+        let src = render_minted_exception_classes_rs(&rows);
+        assert!(src.contains(&format!(
+            "size: {}, gc_ptr_offsets: &[{}, {}]",
+            parent_row.size, missing.offset, msg.offset
+        )));
+        assert!(src.contains(&format!(
+            "size: {}, gc_ptr_offsets: &[{}, {}]",
+            child_row.size, missing.offset, msg.offset
+        )));
+        assert!(src.contains(&format!("size: {header_size}, gc_ptr_offsets: &[]")));
+    }
+
+    /// Declared `b: u8`, `a: i64`, `c: i64`. `InstanceRepr._setup_repr`
+    /// sorts by name, then stably by decreasing size (`attr_reverse_size`),
+    /// so the own fields are `a`, `c`, `b`.
+    #[test]
+    fn minted_class_own_fields_sort_like_setup_repr() {
+        use crate::front::semantic::FieldRow;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Order",
+            "",
+            vec!["Leaf".into()],
+        );
+        let (mut cc, _guard) = layout_cc_for_owners(&["synth::Order", "synth::Order::Leaf"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Order::Leaf".to_string(),
+            vec![
+                FieldRow::named("b", "u8"),
+                FieldRow::named("a", "i64"),
+                FieldRow::named("c", "i64"),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint];
+
+        let spec = bh_size_spec_from_callcontrol(&cc, "synth::Order::Leaf").expect("leaf");
+        let keys: Vec<_> = spec
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(keys, vec!["w_class", "a", "c", "b"]);
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let a = &spec.all_fielddescrs[1];
+        let c = &spec.all_fielddescrs[2];
+        let b = &spec.all_fielddescrs[3];
+        assert_eq!(a.field_size, 8);
+        assert_eq!(c.field_size, 8);
+        assert_eq!(b.field_size, 1);
+        assert_eq!(
+            a.offset,
+            align_up_pow2(header.size, scalar_align(a.field_size))
+        );
+        assert_eq!(c.offset, a.offset + a.field_size);
+        assert_eq!(b.offset, c.offset + c.field_size);
+        for (index, row) in spec.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        assert!(
+            spec.all_fielddescrs
+                .iter()
+                .all(|row| !row.field_key().starts_with("mutate_"))
+        );
+    }
+
+    /// Quasi `b: i64` and `a: u8`. Own fields follow decreasing size (`b`,
+    /// `a`). `InstanceRepr._setup_repr` then appends `mutate_<name>` in
+    /// name order (`mutate_a`, `mutate_b`): `OBJECTPTR`, so `Type::Ref`,
+    /// traced, and found by `bh_field_lookup`. The subclass field sits
+    /// after those slots because `super` embeds them.
+    #[test]
+    fn minted_class_quasi_immutable_field_appends_mutate_slot() {
+        use crate::front::semantic::FieldRow;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Q",
+            "Sub(Leaf)",
+            vec!["Leaf".into(), "Sub".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::Q", "synth::Q::Leaf", "synth::Q::Sub"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Q::Leaf".to_string(),
+            vec![FieldRow::named("b", "i64"), FieldRow::named("a", "u8")],
+        );
+        fields.fields.insert(
+            "synth::Q::Sub".to_string(),
+            vec![FieldRow::named("z", "u8")],
+        );
+        cc.set_struct_fields(fields);
+        cc.immutable_fields_by_struct.insert(
+            "synth::Q::Leaf".to_string(),
+            vec![
+                ("b".to_string(), ImmutableRank::QuasiImmutable),
+                ("a".to_string(), ImmutableRank::QuasiImmutable),
+            ],
+        );
+        cc.exception_class_hints = vec![hint];
+
+        let leaf = bh_size_spec_from_callcontrol(&cc, "synth::Q::Leaf").expect("leaf");
+        let sub = bh_size_spec_from_callcontrol(&cc, "synth::Q::Sub").expect("sub");
+        let leaf_keys: Vec<_> = leaf
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(leaf_keys, vec!["w_class", "b", "a", "mutate_a", "mutate_b"]);
+        let sub_keys: Vec<_> = sub
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(
+            sub_keys,
+            vec!["w_class", "b", "a", "mutate_a", "mutate_b", "z"]
+        );
+        let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let b = &leaf.all_fielddescrs[1];
+        let a = &leaf.all_fielddescrs[2];
+        let mutate_a = &leaf.all_fielddescrs[3];
+        let mutate_b = &leaf.all_fielddescrs[4];
+        assert!(b.is_quasi_immutable && b.is_immutable);
+        assert!(a.is_quasi_immutable && a.is_immutable);
+        assert_eq!(b.field_size, 8);
+        assert_eq!(a.field_size, 1);
+        assert_eq!(
+            b.offset,
+            align_up_pow2(header.size, scalar_align(b.field_size))
+        );
+        assert_eq!(a.offset, b.offset + b.field_size);
+        for mutate in [mutate_a, mutate_b] {
+            assert_eq!(mutate.field_type, majit_ir::value::Type::Ref);
+            assert_eq!(mutate.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+            assert_eq!(mutate.field_size, word);
+            assert!(!mutate.is_quasi_immutable);
+            assert!(!mutate.is_immutable);
+            assert!(!mutate.load_is_acquire);
+            assert!(!mutate.store_is_release);
+        }
+        assert_eq!(
+            mutate_a.offset,
+            align_up_pow2(a.offset + a.field_size, scalar_align(word))
+        );
+        assert_eq!(mutate_b.offset, mutate_a.offset + word);
+        assert_eq!(mutate_a.name, "synth::Q::Leaf.mutate_a");
+        assert_eq!(mutate_b.name, "synth::Q::Leaf.mutate_b");
+        for (index, row) in leaf.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        let z = sub
+            .all_fielddescrs
+            .iter()
+            .find(|row| row.field_key() == "z")
+            .expect("z");
+        assert_eq!(z.offset, leaf.size);
+        assert!(z.offset >= mutate_b.offset + word);
+
+        let chain = minted_exception_chain_for_key(&cc, "synth::Q::Leaf");
+        let (_size, _specs, _drops, gc_ptr_offsets) = minted_exception_instance_layout(&cc, &chain);
+        assert_eq!(gc_ptr_offsets, vec![mutate_a.offset, mutate_b.offset]);
+        let sub_chain = minted_exception_chain_for_key(&cc, "synth::Q::Sub");
+        let (_size, _specs, _drops, sub_gc) = minted_exception_instance_layout(&cc, &sub_chain);
+        assert_eq!(sub_gc, gc_ptr_offsets);
+
+        for owner in ["synth::Q::Leaf", "synth::Q::Sub"] {
+            for (name, offset) in [("mutate_a", mutate_a.offset), ("mutate_b", mutate_b.offset)] {
+                let field = FieldDescriptor::new(name, Some(owner.to_string()));
+                match bh_field_lookup(&cc, &field) {
+                    BhFieldLookup::Parent(spec) => {
+                        assert_eq!(spec.field_key(), name);
+                        assert_eq!(spec.offset, offset);
+                        assert_eq!(spec.field_type, majit_ir::value::Type::Ref);
+                        assert_eq!(spec.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+                    }
+                    BhFieldLookup::Layout(_) => panic!("{owner}.{name} resolved via layout row"),
+                    BhFieldLookup::Missing => panic!("{owner}.{name} is missing"),
+                }
+            }
         }
     }
 

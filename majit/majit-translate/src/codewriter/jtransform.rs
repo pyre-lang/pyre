@@ -33732,7 +33732,16 @@ mod tests {
             "B(A)",
             vec!["A".into(), "B".into(), "D".into()],
         );
+        let header_owner = crate::codewriter::assembler::host_header_owner();
+        let header_id = majit_ir::descr::StructId::from_canonical(header_owner);
+        let mut ids = std::collections::HashMap::new();
+        ids.insert(header_owner.to_string(), Some(header_id));
+        let _header_ids = crate::test_support::register_struct_ids_serialized(ids);
         let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            header_owner.to_string(),
+            crate::codewriter::assembler::host_header_rows(),
+        );
         struct_fields.fields.insert(
             "synth::E::A".to_string(),
             vec![("n".to_string(), "i64".to_string())],
@@ -33742,13 +33751,21 @@ mod tests {
             vec![("flag".to_string(), "bool".to_string())],
         );
         let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            header_id,
+            crate::codewriter::assembler::host_header_layout(),
+        );
         cc.set_struct_fields(struct_fields);
         cc.exception_class_hints = vec![hint];
 
         let word = crate::layout::target_word_size();
+        let header = cc.struct_layout_for(header_owner).expect("host header");
+        let header_size = header.size;
+        let header_align = header.align;
+        assert_eq!(header_size, 2 * word);
         let n_align = 8usize;
-        let n_offset = (word + n_align - 1) & !(n_align - 1);
-        let a_align = word.max(n_align);
+        let n_offset = (header_size + n_align - 1) & !(n_align - 1);
+        let a_align = header_align.max(n_align);
         let a_size = (n_offset + 8 + a_align - 1) & !(a_align - 1);
         let flag_offset = a_size;
         let b_size = (flag_offset + 1 + a_align - 1) & !(a_align - 1);
@@ -33759,9 +33776,18 @@ mod tests {
             crate::codewriter::assembler::bh_size_spec_from_callcontrol(&cc, "synth::E::D")
                 .expect("D size");
         assert_eq!(b_spec.size, b_size);
-        assert_eq!(d_spec.size, word);
-        assert!(d_spec.all_fielddescrs.is_empty());
-        assert!(b_spec.owner.is_empty());
+        assert_eq!(d_spec.size, header_size);
+        assert_eq!(d_spec.all_fielddescrs.len(), 1);
+        assert_eq!(d_spec.all_fielddescrs[0].field_key(), "w_class");
+        assert_eq!(d_spec.all_fielddescrs[0].offset, word);
+        assert_eq!(d_spec.all_fielddescrs[0].index, 0);
+        assert_eq!(d_spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(
+            d_spec.all_fielddescrs[0].name,
+            format!("{}.w_class", header_owner)
+        );
+        assert!(d_spec.all_fielddescrs[0].is_class_word.is_none());
+        assert_eq!(b_spec.owner, "synth::E::B");
         assert_eq!(b_spec.vtable, 0);
         let n_spec = b_spec
             .all_fielddescrs
@@ -33776,15 +33802,25 @@ mod tests {
         assert_eq!(n_spec.name, "synth::E::A.n");
         assert_eq!(n_spec.field_key(), "n");
         assert_eq!(n_spec.offset, n_offset);
-        assert_ne!(n_spec.offset, 0);
+        assert_eq!(n_spec.offset, header_size);
+        assert_eq!(n_spec.index, 1);
+        assert_eq!(n_spec.index_in_parent, 1);
         assert_eq!(flag_spec.name, "synth::E::B.flag");
         assert_eq!(flag_spec.field_key(), "flag");
         assert_eq!(flag_spec.offset, flag_offset);
+        assert_eq!(flag_spec.index, 2);
+        assert_eq!(flag_spec.index_in_parent, 2);
+        let class_word = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "w_class")
+            .expect("w_class");
+        assert_eq!(class_word.offset, word);
+        assert_eq!(class_word.index, 0);
         if word >= 8 {
-            assert_eq!(n_offset, word);
-            assert_eq!(flag_offset, word + 8);
-            assert_eq!(a_size, 16);
-            assert_eq!(b_size, 24);
+            assert_eq!(flag_offset, header_size + 8);
+            assert_eq!(a_size, header_size + 8);
+            assert_eq!(b_size, header_size + 16);
         }
 
         let config = GraphTransformConfig::default();

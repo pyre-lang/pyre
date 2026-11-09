@@ -2538,7 +2538,7 @@ impl BhSizeSpec {
                 store_is_release,
             });
         }
-        let _owner = cursor.str_ref();
+        let owner = cursor.str_ref();
         (
             StaticParentLayout {
                 size,
@@ -2546,6 +2546,7 @@ impl BhSizeSpec {
                 vtable,
                 is_gc_managed: flags & 1 != 0,
                 headerless: flags & 2 != 0,
+                owner,
                 fields,
             },
             {
@@ -2564,6 +2565,10 @@ pub struct StaticParentLayout {
     pub vtable: u64,
     pub is_gc_managed: bool,
     pub headerless: bool,
+    /// `BhSizeSpec.owner`. `get_field_descr` keeps the STRUCT name the
+    /// translator stored so `init_size_descr` can stamp
+    /// `TypeLayoutBuilder.get_type_id` for that TYPE.
+    pub owner: &'static str,
     pub fields: Vec<StaticParentField>,
 }
 
@@ -2736,6 +2741,7 @@ mod layout_pack_tests {
             let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
             assert_eq!(static_consumed, leaked.len());
             assert_eq!(decoded.owner, spec.owner);
+            assert_eq!(layout.owner, "");
             assert_eq!(layout.fields[0].name, "W_IntObject.intval");
             assert!(
                 leaked
@@ -2762,6 +2768,10 @@ mod layout_pack_tests {
             let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
             assert_eq!(type_id, spec.type_id);
             assert_eq!(nfields, 0);
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
+            assert_eq!(static_consumed, leaked.len());
+            assert_eq!(layout.owner, "INT_TYPE");
         }
     }
 }

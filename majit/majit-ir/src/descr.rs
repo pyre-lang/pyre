@@ -492,6 +492,7 @@ fn simple_size_needs_mint_tid(sd: &SimpleSizeDescr) -> bool {
     sd.is_gc_managed()
         && !sd.headerless()
         && sd.cache_key() != 0
+        && !sd.collector_tid_is_fixed()
         && !simple_size_carries_collector_tid(sd)
         && !(sd.fieldless_shell_mint && sd.all_fielddescrs().is_empty())
 }
@@ -1941,7 +1942,13 @@ impl GcCache {
             else {
                 continue;
             };
-            if !sd.is_gc_managed()
+            // `get_type_id` memoizes one id (`id_of_type`). A fixed tid is
+            // that id, including when its low bits equal the truncated cache
+            // key and `descr_carries_collector_tid` would not see it.
+            // Re-registering would attach a second shape that does not carry
+            // the destructor `encode_type_shape` recorded.
+            if sd.collector_tid_is_fixed()
+                || !sd.is_gc_managed()
                 || sd.headerless()
                 || sd.cache_key() == 0
                 || descr_carries_collector_tid(descr)
@@ -1992,7 +1999,14 @@ impl GcCache {
             else {
                 continue;
             };
-            if !sd.is_gc_managed() || sd.headerless() || sd.cache_key() <= u32::MAX as u64 {
+            // A fixed tid is `id_of_type` for that TYPE. A replacement
+            // collector re-registers the TYPE itself; this walk must not
+            // assign a second id. Other synthetic structs still replay.
+            if sd.collector_tid_is_fixed()
+                || !sd.is_gc_managed()
+                || sd.headerless()
+                || sd.cache_key() <= u32::MAX as u64
+            {
                 continue;
             }
             let ref_offsets = sd
@@ -3845,7 +3859,15 @@ impl GcCache {
                 let new_collector = descr_carries_collector_tid(&descr);
                 let existing_unresolved = descr_tid_unresolved(existing);
                 let new_unresolved = descr_tid_unresolved(&descr);
-                if existing_collector && new_unresolved {
+                // `get_type_id` / `id_of_type` already chose this TYPE's id.
+                // A later producer must not replace that SizeDescr.
+                let existing_fixed = existing
+                    .as_any()
+                    .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
+                    .is_some_and(SimpleSizeDescr::collector_tid_is_fixed);
+                if existing_fixed {
+                    false
+                } else if existing_collector && new_unresolved {
                     false
                 } else if existing_unresolved && new_collector {
                     true
@@ -7461,6 +7483,10 @@ pub struct SimpleSizeDescr {
     /// [`SizeDescr::non_moving`].  Atomic so a frontend can stamp it onto
     /// an already-shared descr, the way `descr_index` is stamped.
     non_moving: AtomicBool,
+    /// `TypeLayoutBuilder.get_type_id` memoizes one id per TYPE
+    /// (`id_of_type`). Set once that id is this descr's tid so
+    /// `replay_synthetic_struct_tids` does not assign a new one.
+    collector_tid_fixed: AtomicBool,
     /// descr.py `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py `self.gc_fielddescrs = gc_fielddescrs`.
@@ -7493,6 +7519,7 @@ impl Clone for SimpleSizeDescr {
             is_gc_managed: self.is_gc_managed,
             headerless: self.headerless,
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
+            collector_tid_fixed: AtomicBool::new(self.collector_tid_fixed.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
             assigned_all_fielddescrs: {
@@ -7534,6 +7561,7 @@ impl SimpleSizeDescr {
             is_gc_managed: true,
             headerless: false,
             non_moving: AtomicBool::new(false),
+            collector_tid_fixed: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7555,6 +7583,7 @@ impl SimpleSizeDescr {
             is_gc_managed: true,
             headerless: false,
             non_moving: AtomicBool::new(false),
+            collector_tid_fixed: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7658,6 +7687,17 @@ impl SimpleSizeDescr {
     /// collector id after the baked descriptor table has shared the Arc.
     pub fn set_type_id(&self, type_id: u32) {
         self.type_id.store(type_id, Ordering::Relaxed);
+    }
+
+    /// `get_type_id` / `id_of_type`: this SizeDescr's tid is the TYPE's id.
+    /// `register_unresolved_struct_tids` and `replay_synthetic_struct_tids`
+    /// leave it in place.
+    pub fn fix_collector_tid(&self) {
+        self.collector_tid_fixed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn collector_tid_is_fixed(&self) -> bool {
+        self.collector_tid_fixed.load(Ordering::Relaxed)
     }
 
     /// Stamp the intern_node `map` word so `clear_gc_fields` delayed-zeros
@@ -7856,6 +7896,31 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     )
 }
 
+/// `init_size_descr` stores one `get_type_id` on every SizeDescr of that
+/// TYPE. A vtable-mismatch clone is still that STRUCT (`descr.py
+/// get_size_descr`); when it was born with `0` or the truncated cache
+/// key, it adopts the cached collector tid. A tid fixed on the cached
+/// descr (`id_of_type`) stays fixed on that clone so
+/// `replay_synthetic_struct_tids` does not assign a new id to either.
+fn share_struct_collector_tid(cached: &SimpleSizeDescr, built: &SimpleSizeDescr) {
+    if cached.cache_key() == 0 || cached.cache_key() != built.cache_key() {
+        return;
+    }
+    let cached_fixed = cached.collector_tid_is_fixed();
+    let cached_tid = cached.type_id();
+    if !cached_fixed && !simple_size_carries_collector_tid(cached) {
+        return;
+    }
+    let built_tid = built.type_id();
+    let unresolved = built_tid == 0 || struct_tid_is_unresolved(built.cache_key(), built_tid);
+    if unresolved {
+        built.set_type_id(cached_tid);
+    }
+    if cached_fixed && (unresolved || built.type_id() == cached_tid) {
+        built.fix_collector_tid();
+    }
+}
+
 /// [`make_simple_descr_group_keyed_with_headerless`] for a STRUCT whose first
 /// field is an inlined parent STRUCT.
 ///
@@ -8027,11 +8092,17 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
                 && size_descr_same_struct_layout(&*cached, size, &incoming_offsets) =>
         {
             let fields = cached.all_fielddescrs().to_vec();
-            if fields.is_empty() {
+            // `init_size_descr` stores one `get_type_id` on every SizeDescr
+            // of that TYPE. This clone keeps the allocation's typeptr, but
+            // it is still that STRUCT, so it carries the cached collector
+            // tid rather than the truncated cache key it was minted with.
+            let built = if fields.is_empty() {
                 built
             } else {
                 Arc::new((*built).clone().with_all_fielddescrs(fields))
-            }
+            };
+            share_struct_collector_tid(&cached, &built);
+            built
         }
         // `size_descr_agrees_with_spec` is true for two different class
         // typeptrs of the same size (`W_ExceptionExtended` shares one

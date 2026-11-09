@@ -613,7 +613,13 @@ static TYPE_STATIC_RUNTIME_MAP: LazyLock<HashMap<&'static str, i64>> = LazyLock:
 pub fn rebind_type_static_size_vtable(descr: &mut majit_jitcode::jitcode::BhDescr) {
     use majit_jitcode::codewriter::assembler::is_type_static_const_sentinel;
     use majit_jitcode::jitcode::BhDescr;
-    let BhDescr::Size { vtable, owner, .. } = descr else {
+    let BhDescr::Size {
+        vtable,
+        owner,
+        type_id,
+        ..
+    } = descr
+    else {
         return;
     };
     if !is_type_static_const_sentinel(*vtable) {
@@ -624,6 +630,14 @@ pub fn rebind_type_static_size_vtable(descr: &mut majit_jitcode::jitcode::BhDesc
         .unwrap_or_else(|| {
             panic!("type-static size descr '{owner}' has no published runtime address")
         });
+    // `init_size_descr` / `get_type_id`: the typeptr and the collector tid
+    // belong to the same TYPE. A later mint whose tid is still the
+    // truncated cache key adopts this id through `object_shape_for_struct`.
+    if let Some(tid) = crate::minted_exception_classes::minted_exception_collector_tid(owner, 0) {
+        majit_ir::descr::gc_cache()
+            .lock()
+            .register_gcstruct_vtable(*type_id, addr as usize, tid);
+    }
     *vtable = addr as u64;
     owner.clear();
 }

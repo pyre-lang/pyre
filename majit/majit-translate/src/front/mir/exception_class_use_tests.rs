@@ -3269,12 +3269,33 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
     );
     let mut rows =
         crate::front::llbc_hints::minted_exception_class_rows(std::slice::from_ref(&hint));
+    let header_id = majit_ir::descr::StructId::from_canonical(
+        crate::codewriter::assembler::host_header_owner(),
+    );
+    let mut ids = std::collections::HashMap::new();
+    ids.insert(
+        crate::codewriter::assembler::host_header_owner().to_string(),
+        Some(header_id),
+    );
+    let _registry = crate::test_support::register_struct_ids_serialized(ids);
+    registry.fields.insert(
+        crate::codewriter::assembler::host_header_owner().to_string(),
+        crate::codewriter::assembler::host_header_rows(),
+    );
     let mut cc = crate::call::CallControl::new();
+    cc.set_struct_layout(
+        header_id,
+        crate::codewriter::assembler::host_header_layout(),
+    );
     cc.set_struct_fields(registry);
     cc.exception_class_hints = vec![hint];
     crate::codewriter::assembler::attach_minted_exception_raw_owned_drops(&cc, &mut rows);
 
     let word = crate::layout::target_word_size();
+    let header = cc
+        .struct_layout_for(crate::codewriter::assembler::host_header_owner())
+        .expect("host header");
+    assert_eq!(header.size, 2 * word);
     let row = |name: &str| {
         rows.iter()
             .find(|row| row.name == name)
@@ -3286,8 +3307,13 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
     assert!(base.raw_owned.is_empty(), "{:?}", base.raw_owned);
     assert_eq!(parent.raw_owned.len(), 1);
     assert_eq!(child.raw_owned.len(), 1);
-    assert_eq!(parent.raw_owned[0].offset, word);
-    assert_eq!(child.raw_owned[0].offset, word);
+    assert_eq!(parent.raw_owned[0].offset, header.size);
+    assert_eq!(child.raw_owned[0].offset, header.size);
+    assert_eq!(base.size, header.size);
+    assert_eq!(parent.size, header.size + word);
+    assert!(base.gc_ptr_offsets.is_empty());
+    assert!(parent.gc_ptr_offsets.is_empty());
+    assert!(child.gc_ptr_offsets.is_empty());
     assert_eq!(parent.raw_owned[0].type_path, "fixture::Signature");
     assert_eq!(child.raw_owned[0].type_path, "fixture::Signature");
 
@@ -3299,15 +3325,17 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
         "{src}"
     );
     assert!(src.contains(&format!(
-        "drop_raw_owned_attr::<fixture::Signature>(obj_addr, {word})"
+        "drop_raw_owned_attr::<fixture::Signature>(obj_addr, {})",
+        header.size
     )));
     assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooMany_destructor"));
     assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooManyMethod_destructor"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooManyMethod_destructor)"));
-    assert!(src.contains(
-        "MintedExceptionClass { name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, destructor: None }"
-    ));
+    assert!(src.contains(&format!(
+        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None }}",
+        base.size
+    )));
     assert!(
         !src.contains("fn MINTED_EXC_Arg_destructor"),
         "the base owns no raw attr; src={src}"

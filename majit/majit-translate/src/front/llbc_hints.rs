@@ -889,8 +889,8 @@ pub(crate) fn push_program_exception_class_hint(
 
 /// One raw-owned attribute the minted class's light destructor frees.
 ///
-/// `offset` is the pointer slot in the instance (`OBJECT` typeptr, then
-/// each ancestor's declared fields). `type_path` is the TypeDecl
+/// `offset` is the pointer slot in the instance (the host object
+/// header, then each ancestor's declared fields). `type_path` is the TypeDecl
 /// `name_path` the slot boxes. A subclass repeats an inherited attr at
 /// the embedded-super offset: the field row stays on the declaring
 /// class, and the subclass instance has its own tid.
@@ -904,13 +904,17 @@ pub struct MintedRawOwnedDrop {
 ///
 /// `parent` is an index into the same list. `None` is a hierarchy base:
 /// its RPython parent is host `Exception`, which is not a row.
-/// `raw_owned` is empty until the instance layout fills it. A class
-/// with no raw-owned attr, including one that only inherits none, stays
-/// empty and gets no destructor.
+/// `size` and `gc_ptr_offsets` stay zero and empty until
+/// `attach_minted_exception_raw_owned_drops` fills them from
+/// `minted_exception_instance_layout`. `raw_owned` is filled by that
+/// same call. A class with no raw-owned attr, including one that only
+/// inherits none, stays empty and gets no destructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintedExceptionClassEmit {
     pub name: String,
     pub parent: Option<usize>,
+    pub size: usize,
+    pub gc_ptr_offsets: Vec<usize>,
     pub raw_owned: Vec<MintedRawOwnedDrop>,
 }
 
@@ -963,6 +967,8 @@ fn push_minted_exception_row(
     rows.push(MintedExceptionClassEmit {
         name,
         parent,
+        size: 0,
+        gc_ptr_offsets: Vec::new(),
         raw_owned: Vec::new(),
     });
     hosts.push(host.clone());
@@ -1034,13 +1040,29 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
         } else {
             format!("Some({ident}_destructor)")
         };
+        let offsets = render_gc_ptr_offsets(&row.gc_ptr_offsets);
         out.push_str(&format!(
-            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, destructor: {destructor} }},\n",
-            escape_rust_string(&row.name)
+            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor} }},\n",
+            escape_rust_string(&row.name),
+            size = row.size,
         ));
     }
     out.push_str("];\n");
     out
+}
+
+/// `&[]` or `&[16, 32]`. The slice is a static promotion inside the
+/// emitted `static` item.
+fn render_gc_ptr_offsets(offsets: &[usize]) -> String {
+    if offsets.is_empty() {
+        return "&[]".to_string();
+    }
+    let body = offsets
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("&[{body}]")
 }
 
 /// `MINTED_EXC_` plus the intern key, with every non-alphanumeric byte
