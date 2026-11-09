@@ -29691,92 +29691,6 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     );
 }
 
-/// A helper resume-image publishes `valuestackdepth` through
-/// `mirror_vable_static_to_boxes` (box + `synchronize_virtualizable_at`).
-/// Restore must pair that write: a boxes-only restore leaves the heap at
-/// the helper's on-entry depth, a heap reload (`load_fields_from_virtualizable`) then replaces the restored
-/// `ConstInt`.
-#[test]
-fn restored_valuestackdepth_survives_helper_publish() {
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let slot_count = info.num_static_extra_boxes;
-
-    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
-    let mut array_block =
-        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
-    let frame_ptr = frame.as_mut_ptr() as *mut u8;
-    let array_ptr = array_block.as_mut_ptr() as *mut u8;
-    unsafe {
-        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
-        *len_ptr = 0;
-        let slot =
-            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
-        *slot = array_ptr;
-        let last_instr =
-            frame_ptr.add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
-        *last_instr = 11;
-    }
-
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let vable = tc.const_ref(frame_ptr as i64);
-    let initial_boxes = vec![tc.const_null(); slot_count];
-    let initial_values = vec![Value::Int(0); slot_count];
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable,
-        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
-        &initial_boxes,
-        &initial_values,
-        &[0],
-    );
-    tc.set_virtualizable_heap_ptr(frame_ptr);
-
-    let vsd_idx = info
-        .static_field_index_by_name("valuestackdepth")
-        .expect("valuestackdepth is a declared static vable field");
-    let last_instr = tc.const_int(11);
-    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-        &mut tc,
-        "last_instr",
-        last_instr,
-        Value::Int(11),
-    );
-
-    const SAVED_DEPTH: i64 = 17;
-    let saved_op = tc.const_int(SAVED_DEPTH);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        &mut tc,
-        "valuestackdepth",
-        saved_op,
-        Value::Int(SAVED_DEPTH),
-    );
-    let saved = crate::trace_opcode::save_vable_resume_scalars(&tc);
-
-    let helper_op = tc.const_int(SAVED_DEPTH + 1);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        &mut tc,
-        "valuestackdepth",
-        helper_op,
-        Value::Int(SAVED_DEPTH + 1),
-    );
-    crate::trace_opcode::restore_vable_resume_scalars(&mut tc, saved);
-    tc.load_fields_from_virtualizable(&info, frame_ptr);
-
-    assert_eq!(
-        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
-        Some(Value::Int(SAVED_DEPTH)),
-        "restored valuestackdepth must reach the heap (load_fields_from_virtualizable)",
-    );
-    assert_eq!(
-        unsafe {
-            *(frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
-        },
-        SAVED_DEPTH as usize,
-        "restore_vable_resume_scalars must flush the saved valuestackdepth to the live frame",
-    );
-}
-
 /// Bridge setup seeds STANDARD `valuestackdepth` as the resume `ConstInt`
 /// (`setup_bridge_sym` / `consume_vable_info`). `rebuild_state_after_failure`
 /// then writes those boxes to the heap (`synchronize_virtualizable`);
@@ -30917,6 +30831,267 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         snapshot_tagged_int(&tc, last_instr_tag),
         BOX_LAST_INSTR,
         "helper-walk snapshot last_instr must stay the last setfield_vable_i, \
+         not call_site_py_pc-1"
+    );
+    std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
+}
+
+/// A builtin-wrapper descent entered after the opcode's own
+/// `setfield_vable_i` of `valuestackdepth` / `last_instr` keeps those
+/// boxes. `_opimpl_setfield_vable` (`pyjitpl.py`) updates
+/// `virtualizable_boxes` immediately; an inlined/helper call does not
+/// rewrite them. A wrapper-entry START stamp would put the opcode START
+/// trivia depth into the boxes a guard snapshot copies.
+#[test]
+fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
+    use crate::state::PyreSym;
+    use majit_ir::Value;
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    const NLOCALS: usize = 0;
+    const BOX_VSD: i64 = 0;
+    const BOX_LAST_INSTR: i64 = 174;
+    const START_TRIVIA_DEPTH: i64 = 3;
+    const CALL_PY_PC: u32 = 174;
+    const CALL_JIT_PC: usize = 0;
+    const LIVE_PC: usize = 7;
+    const CAST_BITS: [i64; 1] = [0x1000];
+
+    let _ = test_outer_resume_jitcode_index();
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in the insns table");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("wrapper_subwalk_vable_scalars");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![
+            residual_byte,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            live,
+            (live_off & 0xff) as u8,
+            (live_off >> 8) as u8,
+        ],
+        startpoints: Some([CALL_JIT_PC, LIVE_PC].into_iter().collect()),
+        ..Default::default()
+    });
+
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 200;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc =
+        vec![(CALL_JIT_PC, CALL_PY_PC), (LIVE_PC, CALL_PY_PC)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc =
+        vec![(CALL_JIT_PC, CALL_PY_PC), (LIVE_PC, CALL_PY_PC)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(CALL_JIT_PC, Some(LIVE_PC))];
+    pyjit.metadata.depth_trivia_marker_by_jit_pc =
+        vec![(CALL_JIT_PC, Some(START_TRIVIA_DEPTH as u16))];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let jitcode_index = unsafe { (*installed).index as u32 };
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let last_instr_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a declared static vable field");
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a declared static vable field");
+
+    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let mut array_block =
+        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
+    let frame_ptr = frame.as_mut_ptr() as *mut u8;
+    let array_ptr = array_block.as_mut_ptr() as *mut u8;
+    unsafe {
+        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
+        *len_ptr = 0;
+        let slot =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
+        *slot = array_ptr;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let last_instr_box = tc.const_int(BOX_LAST_INSTR);
+    let pycode_box = tc.const_null();
+    let vsd_box = tc.const_int(BOX_VSD);
+    let debug_box = tc.const_null();
+    let initial_boxes = vec![last_instr_box, pycode_box, vsd_box, debug_box];
+    let initial_values = vec![
+        Value::Int(BOX_LAST_INSTR),
+        Value::Ref(majit_ir::GcRef::NULL),
+        Value::Int(BOX_VSD),
+        Value::Ref(majit_ir::GcRef::NULL),
+    ];
+    assert_eq!(initial_boxes.len(), info.num_static_extra_boxes);
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    tc.set_virtualizable_heap_ptr(frame_ptr);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        &mut tc,
+        "last_instr",
+        last_instr_box,
+        Value::Int(BOX_LAST_INSTR),
+    );
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        &mut tc,
+        "valuestackdepth",
+        vsd_box,
+        Value::Int(BOX_VSD),
+    );
+    assert!(
+        tc.vable_snapshot_buildable(),
+        "typed vable boxes are required before capture"
+    );
+
+    let mut snapshot_sym = PyreSym::new_uninit(vable);
+    snapshot_sym.jitcode = installed;
+    snapshot_sym.nlocals = NLOCALS;
+    snapshot_sym.valuestackdepth = BOX_VSD as usize;
+    snapshot_sym.become_active_vable_owner();
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = false;
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0, r0, r0, r0];
+    let regs_i = vec![i0, i0, i0, i0];
+    let regs_f = vec![f0, f0, f0, f0];
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(CALL_PY_PC),
+        outer_resume_marker_jit_pc: Some(LIVE_PC),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: LIVE_PC,
+    };
+
+    let cast_byte = *insns_opname_to_byte()
+        .get("cast_int_to_ptr/i>r")
+        .expect("`cast_int_to_ptr/i>r` must be in the insns table");
+    let guard_byte = *insns_opname_to_byte()
+        .get("ref_guard_value/r")
+        .expect("`ref_guard_value/r` must be in the insns table");
+    let ret_byte = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in the insns table");
+    let helper_code: &'static [u8] =
+        Box::leak(Box::new([cast_byte, 0, 1, guard_byte, 1, ret_byte, 1]));
+    let sub_body = SubJitCodeBody {
+        code: helper_code,
+        num_regs_r: 2,
+        num_regs_i: 0,
+        num_regs_f: 0,
+        constants_i: &CAST_BITS,
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: None,
+    };
+    let wrapper_jc = majit_metainterp::jitcode::JitCode::new("wrapper_vable_helper");
+    wrapper_jc.set_index(jitcode_index as usize);
+    let op = crate::jitcode_runtime::DecodedOp {
+        key: "residual_call_r_r/iRd>r",
+        opname: "residual_call_r_r",
+        argcodes: "iRd>r",
+        pc: CALL_JIT_PC,
+        next_pc: LIVE_PC,
+    };
+    let site = super::inline_call::BuiltinWrapperCallSite {
+        helper_return: HelperReturn::Converted,
+        nested_helper_entry: None,
+        call_site_py_pc: CALL_PY_PC,
+        outer_jitcode_index: jitcode_index,
+        call_site_marker: Some(LIVE_PC),
+        call_site_active: Vec::new(),
+    };
+    let pre_fold_pos = wc.trace_ctx.get_trace_position();
+    let _ = super::inline_call::walk_translated_builtin_wrapper(
+        &mut wc,
+        &op,
+        &[],
+        &wrapper_jc,
+        &sub_body,
+        &[],
+        &[],
+        0,
+        std::ptr::null_mut(),
+        pre_fold_pos,
+        site,
+        None,
+    );
+    drop(wc);
+
+    let guard = tc
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::GuardValue)
+        .expect("ref_guard_value records GuardValue during the wrapper walk");
+    let resume_pos = guard.rd_resume_position();
+    assert!(resume_pos >= 0, "the wrapper guard must carry a snapshot");
+    let snap = tc
+        .get_snapshot(resume_pos)
+        .expect("captured snapshot must exist")
+        .clone();
+    let vsd_tag = snap
+        .vable_boxes
+        .get(1 + vsd_idx)
+        .expect("snapshot carries valuestackdepth");
+    let last_instr_tag = snap
+        .vable_boxes
+        .get(1 + last_instr_idx)
+        .expect("snapshot carries last_instr");
+    assert_eq!(
+        snapshot_tagged_int(&tc, vsd_tag),
+        BOX_VSD,
+        "wrapper-walk snapshot valuestackdepth must stay the last setfield_vable_i, \
+         not the opcode START trivia depth"
+    );
+    assert_eq!(
+        snapshot_tagged_int(&tc, last_instr_tag),
+        BOX_LAST_INSTR,
+        "wrapper-walk snapshot last_instr must stay the last setfield_vable_i, \
          not call_site_py_pc-1"
     );
     std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
