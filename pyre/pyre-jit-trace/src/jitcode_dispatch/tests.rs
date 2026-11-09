@@ -11896,6 +11896,69 @@ fn pop_end_journal_rollback_restores_item_and_length() {
 }
 
 #[test]
+fn pop_end_journal_rollback_grows_shrunken_integer_backing() {
+    // `ll_pop_default` ends in `_ll_resize_le`. A 1-element Integer list
+    // whose backing is at least 4 slots shrinks to the prebuilt empty array
+    // (`capacity 0`). Rollback must `_ll_resize_ge` before the fast store
+    // (`rlist.py ll_append`).
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
+        w_list_new_with_sizehint,
+    };
+    use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new_with_sizehint(4);
+    unsafe { w_list_append(list, w_int_new(7)) };
+    assert!(
+        unsafe { w_list_allocated(list) } >= 4,
+        "sizehint-4 Integer list must start with backing capacity >= 4"
+    );
+    let w_item = unsafe { w_list_pop_end(list) }.unwrap();
+    assert!(
+        unsafe { w_list_allocated(list) } < 1,
+        "shrinking last-item pop must drop the backing below length_before"
+    );
+    super::fbw_list_journal_push_pop_end(list, 1, w_item);
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, 1);
+    assert_eq!(
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), 0) },
+        7
+    );
+}
+
+#[test]
+fn pop_end_journal_rollback_grows_shrunken_object_backing() {
+    // Same shrink-then-reappend contract for Object storage: a 1-element
+    // Object list with capacity >= 4 is left on the prebuilt empty items
+    // block, so rollback must `_ll_resize_ge` before `ll_setitem_fast`.
+    use pyre_object::listobject::{w_list_allocated, w_list_len, w_list_new_object_with_sizehint};
+    use pyre_object::{w_list_append, w_list_getitem, w_list_pop_end, w_str_new};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new_object_with_sizehint(4);
+    unsafe { w_list_append(list, w_str_new("item")) };
+    assert!(
+        unsafe { w_list_allocated(list) } >= 4,
+        "sizehint-4 Object list must start with backing capacity >= 4"
+    );
+    let w_item = unsafe { w_list_pop_end(list) }.unwrap();
+    assert!(
+        unsafe { w_list_allocated(list) } < 1,
+        "shrinking last-item pop must drop the backing below length_before"
+    );
+    super::fbw_list_journal_push_pop_end(list, 1, w_item);
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, 1);
+    let restored = unsafe { w_list_getitem(list, 0) }.unwrap();
+    assert_eq!(
+        unsafe { pyre_object::w_str_get_value_opt(restored) },
+        Some("item")
+    );
+}
+
+#[test]
 fn pop_end_journal_rollback_after_strategy_switch() {
     use pyre_object::listobject::{
         ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new_with_strategy,

@@ -3266,39 +3266,31 @@ fn undo_list_effect_entry(entry: FbwListEffect) {
                 length_before,
                 w_item,
             } => {
-                let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
-                match list_ref.strategy {
-                    pyre_object::listobject::ListStrategy::Integer => {
-                        pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
-                        pyre_object::listobject::ll_list_int_setitem_fast(
-                            list_ref,
-                            length_before - 1,
-                            pyre_object::w_int_get_value(w_item),
+                // Undoing a pop is a re-append (`rlist.py ll_append`):
+                // `_ll_resize_ge(length_before)` then `ll_setitem_fast` at
+                // `length_before - 1`. `ll_pop_default` ends in `_ll_resize_le`,
+                // which can drop the backing below `length_before`.
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(list);
+                let _ = roots.pin_root(w_item);
+                let strategy =
+                    (*(roots.get(base) as *const pyre_object::listobject::W_ListObject)).strategy;
+                match strategy {
+                    pyre_object::listobject::ListStrategy::Integer
+                    | pyre_object::listobject::ListStrategy::IntOrFloat => {
+                        // `w_list_append` grows IntOrFloat through
+                        // `ll_list_int_resize_ge` (`rlist.py _ll_resize_ge`).
+                        pyre_object::listobject::ll_list_int_resize_ge(
+                            roots.get(base),
+                            length_before,
                         );
                     }
                     pyre_object::listobject::ListStrategy::Object => {
-                        // A later ordinary append of a non-int can switch
-                        // the popped Integer list to Object storage, seeded
-                        // only from the post-pop prefix. Restore into that
-                        // live block rather than the discarded int block.
-                        pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
-                        pyre_object::listobject::ll_list_obj_setitem_fast(
-                            list_ref,
-                            length_before - 1,
-                            w_item,
+                        pyre_object::listobject::ll_list_obj_resize_ge(
+                            roots.get(base),
+                            length_before,
                         );
-                    }
-                    pyre_object::listobject::ListStrategy::IntOrFloat => {
-                        pyre_object::listobject::w_list_int_or_float_set_len(list, length_before);
-                        if !pyre_object::listobject::w_list_int_or_float_setitem(
-                            list,
-                            length_before - 1,
-                            w_item,
-                        ) {
-                            crate::trace::fbw_diag::bump(
-                                crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
-                            );
-                        }
                     }
                     pyre_object::listobject::ListStrategy::Float
                     | pyre_object::listobject::ListStrategy::Empty
@@ -3315,7 +3307,44 @@ fn undo_list_effect_entry(entry: FbwListEffect) {
                                 "[fbw-list-effect-journal] PopEnd rollback failed (invalid strategy)"
                             );
                         }
+                        return;
                     }
+                }
+                let list = roots.get(base);
+                let w_item = roots.get(base + 1);
+                match strategy {
+                    pyre_object::listobject::ListStrategy::Integer => {
+                        let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+                        pyre_object::listobject::ll_list_int_setitem_fast(
+                            list_ref,
+                            length_before - 1,
+                            pyre_object::w_int_get_value(w_item),
+                        );
+                    }
+                    pyre_object::listobject::ListStrategy::Object => {
+                        // A later ordinary append of a non-int can switch
+                        // the popped Integer list to Object storage, seeded
+                        // only from the post-pop prefix. Restore into that
+                        // live block rather than the discarded int block.
+                        let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+                        pyre_object::listobject::ll_list_obj_setitem_fast(
+                            list_ref,
+                            length_before - 1,
+                            w_item,
+                        );
+                    }
+                    pyre_object::listobject::ListStrategy::IntOrFloat => {
+                        if !pyre_object::listobject::w_list_int_or_float_setitem(
+                            list,
+                            length_before - 1,
+                            w_item,
+                        ) {
+                            crate::trace::fbw_diag::bump(
+                                crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
                 return;
             }
