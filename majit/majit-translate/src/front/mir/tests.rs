@@ -1613,22 +1613,27 @@ fn unsigned_cast_to_utf8str_emits_cast_instance_str() {
 }
 
 /// A genuine `usize` (`ValueType::Unsigned`) cast onto rstr `STR` is
-/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`), not the
-/// pointer-only dest-Str restore. UnaryOp Cast and Rvalue RawPtr both
-/// skip `__cast_instance_intrinsic`.
-#[test]
-fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
+/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`) then dest-Str
+/// restore (`op_gc_restore_root`). UnaryOp Cast and Rvalue RawPtr both
+/// emit that pair: dest-Str restore is not a substitute for `gen_cast`.
+/// Restore root is the destination layout, not a hardcoded Utf8Str.
+fn assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+    module: &str,
+    leaf: &str,
+    expected_root: &str,
+) {
+    use crate::model::{CallTarget, OpKind, ValueType};
     let span = fixture_span();
     let empty_g = empty_generics();
-    let utf8_adt = serde_json::json!({
+    let dest_adt = serde_json::json!({
         "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
     });
     let src_ty = usize_ty();
-    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [dest_adt, "Mut"]});
     let n = usize_ty();
-    let utf8 = serde_json::json!({
+    let dest_decl = serde_json::json!({
         "def_id": 0,
-        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "item_meta": window_meta(&["pyre_object", module, leaf], true),
         "kind": {"Struct": [
             {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
             {"name": "length", "ty": n, "attr_info": null}
@@ -1685,7 +1690,7 @@ fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [utf8],
+            "type_decls": [dest_decl],
             "fun_decls": [unary, rvalue],
             "global_decls": [],
             "trait_decls": [gctype_trait_decl()],
@@ -1693,26 +1698,76 @@ fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let has_cast_instance = |graph: &crate::model::FunctionGraph| {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| crate::model::cast_instance_root(&op.kind).is_some())
+    let has_cast_int_to_ptr = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+                _ => false,
+            })
+        })
     };
+    let dest_str_restore_root = |graph: &crate::model::FunctionGraph| -> Option<String> {
+        graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                )
+                .then(|| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+                .flatten()
+            })
+        })
+    };
+    let dest_label = format!("*mut {module}::{leaf}");
     let unary_graph = crate::test_support::lower_function(&llbc, "unary_usize_str_cast")
-        .expect("lower UnaryOp Cast usize to *mut Utf8Str");
+        .unwrap_or_else(|_| panic!("lower UnaryOp Cast usize to {dest_label}"));
     assert!(
-        !has_cast_instance(&unary_graph),
-        "UnaryOp Cast usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        has_cast_int_to_ptr(&unary_graph),
+        "UnaryOp Cast usize as {dest_label} emits gen_cast Primitive→Ptr; graph={}",
+        unary_graph.dump()
+    );
+    assert_eq!(
+        dest_str_restore_root(&unary_graph).as_deref(),
+        Some(expected_root),
+        "UnaryOp Cast usize as {dest_label} dest-Str restores with dest root; graph={}",
         unary_graph.dump()
     );
     let rvalue_graph = crate::test_support::lower_function(&llbc, "rvalue_usize_str_cast")
-        .expect("lower Rvalue RawPtr Cast usize to *mut Utf8Str");
+        .unwrap_or_else(|_| panic!("lower Rvalue RawPtr Cast usize to {dest_label}"));
     assert!(
-        !has_cast_instance(&rvalue_graph),
-        "Rvalue::Cast RawPtr usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        has_cast_int_to_ptr(&rvalue_graph),
+        "Rvalue::Cast RawPtr usize as {dest_label} emits gen_cast Primitive→Ptr; graph={}",
         rvalue_graph.dump()
+    );
+    assert_eq!(
+        dest_str_restore_root(&rvalue_graph).as_deref(),
+        Some(expected_root),
+        "Rvalue::Cast RawPtr usize as {dest_label} dest-Str restores with dest root; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+#[test]
+fn usize_cast_to_utf8str_emits_cast_int_to_ptr_then_dest_str() {
+    assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+        "unicodeobject",
+        "Utf8Str",
+        "unicodeobject::Utf8Str",
+    );
+}
+
+#[test]
+fn usize_cast_to_bytesblock_emits_cast_int_to_ptr_then_dest_str() {
+    assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+        "bytesobject",
+        "BytesBlock",
+        "bytesobject::BytesBlock",
     );
 }
 

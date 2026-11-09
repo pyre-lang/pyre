@@ -2566,7 +2566,13 @@ impl<'a> Lowering<'a> {
                         && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
                     {
                         let bb_id = self.emit_bb(mir_bb);
-                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, arg);
+                        let dest_root = self.dest_rstr_str_layout_root(dest_ty);
+                        let raw = emit_cast_int_to_strptr(
+                            &mut self.graph,
+                            bb_id,
+                            arg,
+                            dest_root.as_deref(),
+                        );
                         return Ok((None, raw));
                     }
                     // An address word cast to a raw-flavored instance pointer is
@@ -3080,7 +3086,9 @@ impl<'a> Lowering<'a> {
                     && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
                 {
                     let bb_id = self.emit_bb(mir_bb);
-                    let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, v);
+                    let dest_root = self.dest_rstr_str_layout_root(&ty);
+                    let raw =
+                        emit_cast_int_to_strptr(&mut self.graph, bb_id, v, dest_root.as_deref());
                     return Ok((None, raw));
                 }
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
@@ -4842,10 +4850,21 @@ impl<'a> Lowering<'a> {
     /// `SomeInstance(PyObject)`; the dest of this cast is still
     /// `Ptr(STR)` / `SomeString`.
     pub(in crate::front::mir) fn dest_ty_is_rstr_str(&self, dest_ty: &TyRef) -> bool {
-        tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
-            .is_some_and(|root| is_rstr_str_layout_declaration(&root))
+        self.dest_rstr_str_layout_root(dest_ty).is_some()
             || tyref_is_string_value(dest_ty, self.llbc)
             || tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
+    }
+
+    /// Dest class root when dest is an rstr `STR` layout
+    /// (`ptr_cast_marker` dest-Str first arm: `tyref_class_root_with`
+    /// + `is_rstr_str_layout_declaration`). Wrappers (`StrKey`) and
+    /// string-valued dests without that layout yield `None`.
+    pub(in crate::front::mir) fn dest_rstr_str_layout_root(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<String> {
+        tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+            .filter(|root| is_rstr_str_layout_declaration(root))
     }
 
     /// Pointer-ness of a dest-STR restore source (`rbuiltin.py` `gen_cast`:
@@ -10471,16 +10490,24 @@ pub(in crate::front::mir) fn overlay_field_lltype(
     tyref_to_external_lltype(ty, llbc)
 }
 
-/// `lltype.cast_int_to_ptr(Ptr(STR), int)` for an integer word that is
-/// already an rstr `STR` (`alloc_utf8_payload` / `bh_alloc_str_nofill`).
-/// The 1-arg form annotates as `SomePtr(MAJIT_REF_OPAQUE)` and unions
-/// with a field-load `SomeString` (`w_str_storage`) at
-/// `module_dict_key_block`. `ann_cast_int_to_ptr` of `Ptr(STR)` is the
-/// string itself (`node_is_string_value`).
+/// `lltype.cast_int_to_ptr(Ptr(STR), int)` then dest-Str restore for an
+/// integer word that is already an rstr `STR` (`alloc_utf8_payload` /
+/// `bh_alloc_str_nofill`).
+///
+/// `rbuiltin.py` `gen_cast` Primitive→Ptr is the 2-arg form. The 1-arg
+/// form annotates as `SomePtr(MAJIT_REF_OPAQUE)`. `ann_cast_int_to_ptr`
+/// of `Ptr(STR)` is still `SomePtr` (`lltype.py`); a field-load of the
+/// same payload is `SomeString` (`w_str_storage`). Dest-Str restore
+/// (`op_gc_restore_root` / `GCRefRepr.convert_from_to`) recasts that
+/// `SomePtr` onto the destination rstr layout so `mergeinputargs` at
+/// `module_dict_key_block` sees one string. `dest_root` is that layout
+/// (`tyref_class_root_with` + `is_rstr_str_layout_declaration`); a
+/// missing or non-rstr dest keeps the plain `cast_int_to_ptr` result.
 pub(in crate::front::mir) fn emit_cast_int_to_strptr(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     addr: Variable,
+    dest_root: Option<&str>,
 ) -> Variable {
     use crate::flowspace::model::ConstValue;
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
@@ -10504,7 +10531,18 @@ pub(in crate::front::mir) fn emit_cast_int_to_strptr(
             result_ty: ValueType::Str,
         },
     });
-    raw
+    let Some(root) = dest_root.filter(|root| is_rstr_str_layout_declaration(root)) else {
+        return raw;
+    };
+    // `cast_instance_intrinsic` of the dest rstr layout projects
+    // `SomePtr` onto `SomeString` (`lltype.py` `ann_cast_opaque_ptr`
+    // / `rgcref.py` `GCRefRepr.convert_from_to`).
+    let restored = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(restored.clone()),
+        kind: crate::model::cast_instance_call_result(root, raw, ValueType::Str),
+    });
+    restored
 }
 
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).

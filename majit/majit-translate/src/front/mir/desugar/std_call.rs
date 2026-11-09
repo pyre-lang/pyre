@@ -8016,6 +8016,10 @@ impl<'a> Lowering<'a> {
     /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host call
     /// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` accept.
     /// `normalize_unary_op_name` rejects a unary op of either name.
+    /// `dest_ty` is the call dest; dest-Str restore after Primitive→Ptr
+    /// uses that dest's rstr layout, or keeps the plain `cast_int_to_ptr`
+    /// when dest has none.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::front::mir) fn emit_host_cast_llop(
         &mut self,
         mir_bb: usize,
@@ -8024,10 +8028,13 @@ impl<'a> Lowering<'a> {
         operand: crate::flowspace::model::Variable,
         op: &str,
         result_ty: ValueType,
+        dest_ty: Option<&TyRef>,
     ) -> Result<(), LowerError> {
         let bb_id = self.emit_bb(mir_bb);
         if op == "cast_int_to_ptr" && matches!(result_ty, ValueType::Str) {
-            let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, operand);
+            let dest_root = dest_ty.and_then(|ty| self.dest_rstr_str_layout_root(ty));
+            let raw =
+                emit_cast_int_to_strptr(&mut self.graph, bb_id, operand, dest_root.as_deref());
             self.local_var[dest_local] = Some(LocalValue::One(raw));
             let target_bb = self.block_id[target];
             let link_args = self.edge_args(mir_bb, target)?;

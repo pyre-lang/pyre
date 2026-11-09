@@ -1191,6 +1191,7 @@ impl<'a> Lowering<'a> {
                             args[0].clone(),
                             op,
                             result_ty,
+                            Some(&call.dest.ty),
                         );
                     }
                 }
@@ -3606,7 +3607,13 @@ impl<'a> Lowering<'a> {
                         && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && tyref_raw_ptr_pointee_is_string_value(&call.dest.ty, self.llbc)
                     {
-                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, args[0].clone());
+                        let dest_root = self.dest_rstr_str_layout_root(&call.dest.ty);
+                        let raw = emit_cast_int_to_strptr(
+                            &mut self.graph,
+                            bb_id,
+                            args[0].clone(),
+                            dest_root.as_deref(),
+                        );
                         self.local_var[dest_local] = Some(LocalValue::One(raw));
                     } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
@@ -4424,6 +4431,7 @@ impl<'a> Lowering<'a> {
                             args[0].clone(),
                             op,
                             result_ty,
+                            Some(&call.dest.ty),
                         );
                     }
                 }
