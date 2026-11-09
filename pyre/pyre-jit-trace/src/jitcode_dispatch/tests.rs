@@ -33057,9 +33057,9 @@ fn rooted_code_slot_forwards_across_collection() {
 /// `pyopcode.py PUSH_EXC_INFO` always saves `prev`; `POP_EXCEPT` always
 /// restores it (`pyframe.py _restore_exc_info` → `set_sys_exc_info3`).
 /// A residual-caught handler lands on PUSH_EXC_INFO with no later `-live-`
-/// to carry the nullity guard.  Completing the prev-save anyway arms the
-/// PUSH store / POP restore pair so `sys.exc_info()` is empty after the
-/// handler; declining left the caught exception visible.  The fold of
+/// to carry the nullity guard.  Completing the prev-save records the
+/// GETFIELD so the prev read can flow through the frame value stack;
+/// `POP_EXCEPT` reads that slot back.  The fold of
 /// `w_prev` to `const w_None` is skipped, but dst is bound to the GETFIELD
 /// (`Some`): a residual `current_exception_or_none` Call beside it is a
 /// second live prev box and scrambles blackhole resume failargs.
@@ -33137,16 +33137,13 @@ fn push_exc_info_prev_save_completes_without_an_anchored_nullity_guard() {
     assert_eq!(
         lowered,
         Some(()),
-        "no-anchor prev-save arms the pair and binds dst to the GETFIELD"
+        "no-anchor prev-save binds dst to the GETFIELD"
     );
-    assert!(
-        FBW_EXC_PENDING_PUSH_SET.with(|c| c.get()),
-        "the following SetCurrentException is the PUSH store"
-    );
+    let dst_post = wc.registers_r.get(0).expect("ref register in range");
     assert_eq!(
-        FBW_EXC_PREV.with(|s| s.borrow().len()),
-        1,
-        "POP_EXCEPT restores this saved prev, not the caught exception"
+        wc.trace_ctx.opcode_of(dst_post),
+        Some(majit_ir::OpCode::GetfieldGcR),
+        "dst is the recorded GETFIELD"
     );
 
     super::fbw_store_journal_reset();
@@ -33157,8 +33154,7 @@ fn push_exc_info_prev_save_completes_without_an_anchored_nullity_guard() {
 /// no later `-live-` to carry the nullity guard.  Completing the prev-save
 /// must not bake `w_prev` from this run's nullity (`pyjitpl.py` records a
 /// guard at every branch it specializes).  dst is the GETFIELD itself, not
-/// `const w_None` and not a second residual Call; `FBW_EXC_PREV` is the
-/// same OpRef so resume has one prev box.
+/// `const w_None` and not a second residual Call, so resume has one prev box.
 #[test]
 fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
     use crate::jitcode_runtime::DecodedOp;
@@ -33244,19 +33240,10 @@ fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
         !dst_post.is_constant(),
         "w_prev is not a baked constant when no nullity guard was emitted"
     );
-    let saved_prev = FBW_EXC_PREV.with(|s| {
-        let stack = s.borrow();
-        assert_eq!(stack.len(), 1, "prev stack is armed");
-        stack[0].0
-    });
     assert_eq!(
-        dst_post, saved_prev,
-        "dst and FBW_EXC_PREV are one prev box, not GETFIELD plus a residual Call"
-    );
-    assert_eq!(
-        wc.trace_ctx.opcode_of(saved_prev),
+        wc.trace_ctx.opcode_of(dst_post),
         Some(majit_ir::OpCode::GetfieldGcR),
-        "saved prev is the recorded GETFIELD, not a baked constant"
+        "dst is the recorded GETFIELD, not a baked constant"
     );
     assert!(
         !wc.trace_ctx.ops().iter().any(|op| matches!(
@@ -33264,10 +33251,6 @@ fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
             majit_ir::OpCode::GuardIsnull | majit_ir::OpCode::GuardNonnull
         )),
         "unanchored PUSH_EXC_INFO prev-save does not emit a nullity guard"
-    );
-    assert!(
-        FBW_EXC_PENDING_PUSH_SET.with(|c| c.get()),
-        "the following SetCurrentException is the PUSH store"
     );
 
     super::fbw_store_journal_reset();

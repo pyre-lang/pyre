@@ -12070,27 +12070,29 @@ impl CodeWriter {
                         }
 
                         Instruction::PopExcept => {
-                            // `eval.rs`'s `pop_except` / pyopcode.py:778 parity:
-                            //   prev = pop()
-                            //   CURRENT_EXCEPTION = prev
-                            //
-                            // Previously the arm just popped and left TLS stale,
-                            // which silently broke nested `except` blocks: after
-                            // `POP_EXCEPT` the outer handler's exception must be
-                            // reinstated as the "current" one so a bare `raise`
-                            // re-propagates it.
+                            // `pyopcode.py POP_EXCEPT`: `popvalue_maybe_none` reads
+                            // `locals_cells_stack_w[depth - 1]` before clearing it;
+                            // read that authoritative slot rather than the handler-entry
+                            // shadow Variable (same as `RERAISE`), then `_restore_exc_info`
+                            // it.
+                            let prev_depth = current_depth.saturating_sub(1);
+                            let prev_slot = stack_base_absolute + prev_depth as usize;
+                            let prev_slot_value: super::flow::FlowValue =
+                                super::flow::Constant::signed(prev_slot as i64).into();
+                            let prev_value =
+                                super::flow::FlowValue::from(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        prev_slot_value.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ));
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let prev_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            // set_current_exception is a TLS write — EF_CANNOT_RAISE.
-                            // PopExcept
-                            // set_current_exception factor refactor.
-                            // PlainCannotRaise TLS write `(prev:Ref) → Void`.
-                            // Graph dual-write below unchanged.
-                            // Walker-orthodoxy: set_current_exception
-                            // `(prev:Ref)→Void` shape residual_call_r_v.
-                            // TLS write, no GC heap touched,
-                            // `PlainCannotRaiseNoHeap` (`effectinfo.py:281-283`
-                            // analyzer output).
+                            let _ = current_state.stack.pop();
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
@@ -18903,6 +18905,86 @@ mod tests {
                     op.pc > prev_save.pc && op.opname.starts_with("setarrayitem_vable")
                 }),
                 "the runtime pop still happens after the prev-save"
+            );
+        }
+    }
+
+    #[test]
+    fn pop_except_restores_the_slot_it_reads_before_the_clear() {
+        // `pyopcode.py POP_EXCEPT`: `popvalue_maybe_none` reads
+        // `locals_cells_stack_w[depth - 1]` before clearing it, then
+        // `_restore_exc_info`s that value.  The SetCurrentException residual's
+        // Ref argument is that `getarrayitem_vable_r` result, not a
+        // handler-entry shadow Variable (same as `RERAISE`).
+        let sources = [
+            "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
+            "def f():\n    for i in range(3):\n        try:\n            {}[i]\n        except KeyError:\n            pass\n",
+        ];
+        for source in sources {
+            let code = first_nested_function_code(source);
+            let w_code = pyre_interpreter::box_code_constant(&code);
+            let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
+            let writer = CodeWriter::new();
+            let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+            assert!(!pyjit.has_abort, "try/except handler must lower");
+            let ops: Vec<_> =
+                pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+            let mut found_pop_restore = false;
+            for residual in ops.iter().filter(|op| {
+                op.key == "residual_call_r_v/iRd" && pyjit.jitcode.code.get(op.pc + 2) == Some(&1)
+            }) {
+                let Some(getitem) = ops
+                    .iter()
+                    .rev()
+                    .find(|op| op.pc < residual.pc && op.opname.starts_with("getarrayitem_vable"))
+                else {
+                    continue;
+                };
+                // PUSH_EXC_INFO's SetCurrentException is the same residual
+                // shape, but `current_exception_or_none` sits between its
+                // caught-exc getarrayitem and the store.  POP_EXCEPT has no
+                // residual between the slot read and the restore.
+                let residual_between = ops.iter().any(|op| {
+                    op.pc > getitem.pc
+                        && op.pc < residual.pc
+                        && op.opname.starts_with("residual_call")
+                });
+                if residual_between {
+                    continue;
+                }
+                assert_eq!(
+                    getitem.key, "getarrayitem_vable_r/ridd>r",
+                    "POP_EXCEPT prev read is getarrayitem_vable_r; source={source:?}"
+                );
+                let dest = pyjit.jitcode.code[getitem.next_pc - 1];
+                let ref_arg = pyjit.jitcode.code[residual.pc + 3];
+                assert_eq!(
+                    dest, ref_arg,
+                    "SetCurrentException Ref arg is the getarrayitem_vable_r result; \
+                     source={source:?}"
+                );
+                let clear = ops.iter().find(|op| {
+                    op.pc > getitem.pc
+                        && op.pc < residual.pc
+                        && op.opname.starts_with("setarrayitem_vable")
+                });
+                let Some(clear) = clear else {
+                    panic!(
+                        "slot-clear setarrayitem_vable_r must follow the prev read \
+                         and precede SetCurrentException; source={source:?}"
+                    );
+                };
+                assert!(
+                    getitem.pc < clear.pc && clear.pc < residual.pc,
+                    "getarrayitem_vable -> setarrayitem_vable -> SetCurrentException; \
+                     source={source:?}"
+                );
+                found_pop_restore = true;
+            }
+            assert!(
+                found_pop_restore,
+                "POP_EXCEPT SetCurrentException must read the slot before clearing it; \
+                 source={source:?}"
             );
         }
     }

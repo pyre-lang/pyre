@@ -10166,27 +10166,6 @@ thread_local! {
     /// stamp the field a second time.  Reset with the other walk state.
     static FBW_CONTEXT_CHAINED: std::cell::RefCell<std::collections::HashSet<OpRef>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
-
-    /// LIFO stack of the previous-exception slot value
-    /// saved by each lowered `PUSH_EXC_INFO` (`get_current_exception` arm),
-    /// paired with its live concrete.  `POP_EXCEPT`'s restore consumes the top
-    /// entry, so the slot is set back to the TRUE saved prev (None for an outer
-    /// handler, the outer exception for a nested one) instead of the operand-
-    /// stack value the codewriter threads into the `set_current_exception`
-    /// residual — which the walker resolves to the just-caught exception, not
-    /// the saved prev.  Restoring the saved prev is what lets the balanced
-    /// save/restore cancel (the locally-caught exception de-escapes and DCEs)
-    /// and keeps `sys.exc_info()` correct after the handler unwinds.  Reset per
-    /// walk via `fbw_store_journal_reset`.
-    static FBW_EXC_PREV: std::cell::RefCell<Vec<(OpRef, pyre_object::PyObjectRef)>> =
-        std::cell::RefCell::new(Vec::new());
-
-    /// Set when a `PUSH_EXC_INFO` prev save (`get_current_exception`) is
-    /// lowered; the immediately-following `set_current_exception` is then that
-    /// PUSH's slot store (it stores the EXC and leaves the saved prev on
-    /// [`FBW_EXC_PREV`]) rather than a `POP_EXCEPT` restore (which pops it).
-    /// The two `SetCurrentException` shapes are otherwise identical.
-    static FBW_EXC_PENDING_PUSH_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 enum FbwListEffect {
