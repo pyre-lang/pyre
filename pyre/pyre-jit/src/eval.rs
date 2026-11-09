@@ -804,6 +804,10 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let w_dict = obj_addr as pyre_object::PyObjectRef;
     let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
     f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // Grey `dstrategy`. Upstream `W_DictObject.dstrategy` is a GC pointer
+    // (`dictmultiobject.py set_strategy`); `module_dict_object_custom_trace`
+    // greys `mstrategy` the same way.
+    f(std::ptr::addr_of_mut!(dict.dstrategy) as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     // Keep the storage box alive by forwarding its owning `dstorage` field
     // slot. The box's own custom_trace (`object_dict_storage_custom_trace`)
@@ -5113,6 +5117,26 @@ fn build_gc() -> Box<MiniMarkGC> {
         >,
         pyre_object::dictmultiobject::set_dict_strategy_ref_gc_type_id,
     );
+    // GCTypeLayoutBuilder.consider_constant visits prebuilt constants after
+    // type ids are assigned. Accessors may have allocated at tid 0; restamp
+    // the live tid on every holder.
+    {
+        let tid = pyre_object::dictmultiobject::dict_strategy_ref_gc_type_id();
+        for holder in [
+            pyre_object::dictmultiobject::object_dict_strategy_ref(),
+            pyre_object::dictmultiobject::empty_dict_strategy_ref(),
+            pyre_object::dictmultiobject::empty_kwargs_dict_strategy_ref(),
+            pyre_object::dictmultiobject::bytes_dict_strategy_ref(),
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
+            pyre_object::dictmultiobject::int_dict_strategy_ref(),
+            pyre_object::identitydict::identity_dict_strategy_ref(),
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
+            pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref(),
+            pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref(),
+        ] {
+            pyre_object::dictmultiobject::stamp_prebuilt_dict_strategy_ref(holder, tid);
+        }
+    }
     // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
     // refs); `bytearray_object_custom_trace` greys it through the `data` field
     // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this

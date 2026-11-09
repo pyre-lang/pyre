@@ -1299,6 +1299,21 @@ dict_storage_gc_type_id!(
     "Runtime-assigned GC type id for a `DictStrategyRef` holder."
 );
 
+/// Rewrite a prebuilt holder's GC header type id, keeping its immortal flags.
+///
+/// `define_prebuilt_dict_strategy_ref!` accessors allocate through
+/// `malloc_typed_immortal`, which stamps tid 0 when no collector has
+/// registered `DictStrategyRef` yet. `build_gc` restamps the live tid
+/// after `register_leaf_storage_box` publishes it, the way
+/// `GCTypeLayoutBuilder.consider_constant` visits prebuilts after type
+/// ids are assigned.
+pub fn stamp_prebuilt_dict_strategy_ref(holder: &'static DictStrategyRef, tid: u32) {
+    unsafe {
+        let hdr = majit_gc::header::header_of(holder as *const DictStrategyRef as usize);
+        *hdr = majit_gc::header::GcHeader::with_flags(tid, (*hdr).flags());
+    }
+}
+
 /// Reclaim an off-GC `ObjectDictStorage` box that is NOT collector-owned.
 ///
 /// After the storage-box migration, a regular dict's `dstorage` is a
@@ -9402,6 +9417,29 @@ mod tests {
             object_dict_strategy_ref(),
             object_dict_strategy_ref()
         ));
+    }
+
+    #[test]
+    fn prebuilt_dict_strategy_holders_carry_immortal_gc_header() {
+        assert_eq!(dict_strategy_ref_gc_type_id(), 0);
+        let holder: &'static DictStrategyRef = unsafe {
+            &*majit_gc::header::alloc_with_gc_header_immortal(
+                DictStrategyRef {
+                    kind: StrategyKind::Object,
+                    imp: &OBJECT_DICT_STRATEGY,
+                    owner: std::ptr::null_mut(),
+                },
+                dict_strategy_ref_gc_type_id(),
+            )
+        };
+        const T: u32 = 7;
+        stamp_prebuilt_dict_strategy_ref(holder, T);
+        unsafe {
+            let hdr = majit_gc::header::header_of(holder as *const DictStrategyRef as usize);
+            assert_eq!((*hdr).type_id(), T);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
     }
 
     #[test]
