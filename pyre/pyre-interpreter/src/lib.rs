@@ -1425,6 +1425,16 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         crate::pyopcode::s_application_exception_gc_type_id(),
         &crate::pyopcode::S_APPLICATION_EXCEPTION_TYPE,
     ));
+    // Minted RPython exception classes follow `SApplicationException`.
+    // Row `i` is `minted_exception_first_gc_type_id() + i`. An empty
+    // table adds no alias.
+    let minted_first = crate::pyopcode::minted_exception_first_gc_type_id();
+    for (index, row) in crate::error::minted_exception_classes().iter().enumerate() {
+        aliases.push(pyre_object::pyobject::subclass_range_alias(
+            minted_first + index as u32,
+            row.pytype,
+        ));
+    }
     aliases
 }
 
@@ -1530,6 +1540,16 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
         crate::pyopcode::s_application_exception_gc_type_id(),
         Some(0),
     ));
+    // Same table, parent before child. `None` parents on
+    // `HOST_EXCEPTION_TYPE`; `Some(p)` parents on row `p`.
+    let minted_first = crate::pyopcode::minted_exception_first_gc_type_id();
+    for (index, row) in crate::error::minted_exception_classes().iter().enumerate() {
+        let parent = match row.parent {
+            None => crate::error::host_exception_gc_type_id(),
+            Some(parent) => minted_first + parent as u32,
+        };
+        active.push((minted_first + index as u32, Some(parent)));
+    }
     active
 }
 

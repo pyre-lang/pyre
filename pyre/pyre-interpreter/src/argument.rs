@@ -1919,6 +1919,15 @@ fn mapping_contains(mapping: &[isize], target: isize) -> bool {
     mapping.contains(&target)
 }
 
+/// `pypy/interpreter/argument.py` `class ArgErr(Exception)` and its
+/// subclasses (`ArgErrMissing`, `ArgErrTooMany`,
+/// `ArgErrTooManyMethod`, `ArgErrMultipleValues`, `ArgErrUnknownKwds`,
+/// `ArgErrPosonlyAsKwds`). `class ArgErrTooManyMethod(ArgErrTooMany)`
+/// is the one nesting override; every other variant's parent is the
+/// base `ArgErr`.
+#[allow(non_upper_case_globals)]
+pub const _exception_class_ArgErr: &str = "TooManyMethod(TooMany)";
+
 /// pypy/interpreter/argument.py — `ArgErr` exception hierarchy.
 ///
 /// PyPy declares `class ArgErr(Exception)` with abstract `getmsg()`

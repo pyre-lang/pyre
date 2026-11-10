@@ -158,7 +158,8 @@ impl GraphBodyProvider {
         raw_alloc_flavor_structs: &HashSet<String>,
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
-        let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
+        let paint_tombstones =
+            mir::prelink_crate(&llbc, cross_tombstoned_leaves, raw_alloc_flavor_structs);
         let mut state = CrateLoweringState::new(
             &llbc,
             &paint_tombstones,
@@ -195,7 +196,7 @@ impl GraphBodyProvider {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new());
+        let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new(), &HashSet::new());
         let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let mut state = CrateLoweringState::new(
             &llbc,

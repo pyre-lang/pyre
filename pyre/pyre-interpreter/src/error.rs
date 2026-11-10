@@ -573,6 +573,91 @@ impl pyre_object::lltype::GcType for PyErrorObject {
     const SIZE: usize = PYERROR_OBJECT_SIZE;
 }
 
+/// One row of the minted RPython exception-class table.
+///
+/// `parent` indexes an earlier row. `None` is a hierarchy base, whose
+/// RPython parent is [`HOST_EXCEPTION_TYPE`]. `size` is the instance
+/// payload in bytes. `gc_ptr_offsets` are the payload GC-pointer fields
+/// at those bytes. The object root's `w_class` edge is not repeated.
+/// `destructor` frees that class's raw-owned attribute boxes. `None`
+/// means the class owns none.
+///
+/// The generated table lives in `pyre-jit-trace`. This struct is the
+/// element type the subclass-range census can name.
+pub struct MintedExceptionClass {
+    pub name: &'static str,
+    pub pytype: &'static pyre_object::PyType,
+    pub parent: Option<usize>,
+    pub size: usize,
+    pub gc_ptr_offsets: &'static [usize],
+    pub destructor: Option<majit_gc::trace::DestructorFn>,
+}
+
+/// Link-time registry of the minted exception-class table.
+///
+/// `pyre-jit-trace` appends one element: the whole generated
+/// `&'static [MintedExceptionClass]`, parent before child. This crate
+/// cannot name that generated static. `distributed_slice` rejects
+/// `wasm32`, which carries the same element in
+/// [`WASM_MINTED_EXCEPTION_CLASS_TABLES`]. An empty table (placeholder
+/// extraction, or no marker) is an empty slice and adds no census row.
+/// A binary that does not link the table has no element.
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice]
+pub static MINTED_EXCEPTION_CLASS_TABLES: [&'static [MintedExceptionClass]] = [..];
+
+/// The same registry on wasm32, populated at constructor time.
+///
+/// `linkme` has no wasm32 arm: a static with a custom `link_section`
+/// must be a plain list of bytes there, with no relocation for a
+/// pointer field. A constructor runs before any exported function, so
+/// the table is present before `init_subclass_ranges`.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_MINTED_EXCEPTION_CLASS_TABLES: std::sync::Mutex<
+    Vec<&'static [MintedExceptionClass]>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Append the generated minted-exception table to
+/// [`WASM_MINTED_EXCEPTION_CLASS_TABLES`].
+///
+/// Called only from the constructor beside that table.
+#[cfg(target_arch = "wasm32")]
+pub fn register_minted_exception_class_table(table: &'static [MintedExceptionClass]) {
+    WASM_MINTED_EXCEPTION_CLASS_TABLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(table);
+}
+
+/// The one generated minted-exception table, or an empty slice when
+/// none is linked or the linked table has no rows.
+pub fn minted_exception_classes() -> &'static [MintedExceptionClass] {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut found: Option<&'static [MintedExceptionClass]> = None;
+        for table in MINTED_EXCEPTION_CLASS_TABLES {
+            assert!(
+                found.is_none(),
+                "minted exception classes register one table"
+            );
+            found = Some(table);
+        }
+        found.unwrap_or(&[])
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let tables = WASM_MINTED_EXCEPTION_CLASS_TABLES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            tables.len() <= 1,
+            "minted exception classes register one table, found {}",
+            tables.len()
+        );
+        tables.first().copied().unwrap_or(&[])
+    }
+}
+
 /// One-word handle to [`PyErrorObject`]. `Clone` aliases the pointer, which is
 /// `OperationError` semantics.
 #[repr(transparent)]

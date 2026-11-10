@@ -326,13 +326,20 @@ fn build_semantic_program_via_active_frontend(
                 published_structs.extend(front::mir::harvest_published_structs(&llbc));
                 root_stack_crates.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
-                duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
-                declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
+                // `_alloc_flavor_` is program-wide (`rclass.py` `getgcflavor`).
+                // Discovery registers marked exception classes, so this
+                // artefact's markers join the set first. A later type-decl
+                // layout copy then sees the defining artefact's harvest.
                 raw_alloc_flavor_structs.extend(
                     front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                         &llbc,
                     )),
                 );
+                duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(
+                    &llbc,
+                    &raw_alloc_flavor_structs,
+                ));
+                declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
                 let mut impl_folds = Vec::new();
                 for (path, op) in front::mir::discover_foldable_const_lits(&llbc) {
                     if path.contains('<') {

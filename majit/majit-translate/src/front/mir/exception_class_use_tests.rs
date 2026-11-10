@@ -3480,3 +3480,115 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
         "the base owns no raw attr; src={src}"
     );
 }
+
+/// A layout sidecar is the same crate's type decls with no function or
+/// global bodies. The defining artefact's `_alloc_flavor_` marker is the
+/// program-wide set `DuplicateLeafFacts::discover` and `prelink_crate`
+/// register exception classes with (`rclass.py` `getgcflavor`).
+#[test]
+fn layout_sidecar_raw_flavor_attr_uses_the_program_set() {
+    let wide = super::interior_struct(
+        1,
+        &["fixture", "WideSig"],
+        &[
+            ("a", usize_ty()),
+            ("b", usize_ty()),
+            ("c", usize_ty()),
+            ("d", usize_ty()),
+        ],
+        32,
+        &[0, 8, 16, 24],
+        false,
+    );
+    let enum_ty = enum_decl(
+        0,
+        &["fixture", "WideErr"],
+        vec![variant("Too", vec![named_field("signature", &adt(1))], 0)],
+    );
+    let types = vec![enum_ty, wide];
+    let host = super::window_llbc_with_globals(
+        types.clone(),
+        Vec::new(),
+        vec![
+            marker(0, &["fixture", "_exception_class_WideErr"], ""),
+            marker(1, &["fixture", "_alloc_flavor_WideSig"], "raw"),
+        ],
+    );
+    let sidecar = || super::window_llbc_with_globals(types.clone(), Vec::new(), Vec::new());
+    let program_raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&host));
+    assert!(
+        program_raw.contains("WideSig"),
+        "defining artefact harvest: {program_raw:?}"
+    );
+    assert!(
+        32 > crate::layout::target_word_size() as u64,
+        "the fixture struct has to miss the one-word size fallback"
+    );
+
+    let (_, host_fields, _, _, _) = program_metadata(&host);
+    let host_row = host_fields
+        .fields
+        .get("WideErr::Too")
+        .and_then(|rows| rows.iter().find(|row| row.name == "signature"))
+        .unwrap_or_else(|| {
+            panic!(
+                "defining artefact registers WideErr::Too.signature, keys {:?}",
+                host_fields.fields.keys().collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(host_row.ty, "*mut WideSig");
+    let host_owned = host_row
+        .raw_owned
+        .as_ref()
+        .expect("defining artefact stores the moved struct");
+    assert_eq!(host_owned.type_path, "fixture::WideSig");
+    assert_eq!(host_owned.size, 32);
+    assert_eq!(host_owned.align, 8);
+
+    let bare = sidecar();
+    assert_eq!(bare.iter_fun_decls().count(), 0);
+    assert_eq!(bare.iter_global_decls().count(), 0);
+    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(&host),
+    );
+    super::super::seed_program_exception_class_hints(&bare, hints.clone());
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ =
+            super::super::DuplicateLeafFacts::discover(&bare, &std::collections::HashSet::new());
+    }));
+    let Err(payload) = caught else {
+        panic!("a layout copy with an empty raw set must fail the one-word check");
+    };
+    let message = panic_text(payload);
+    let expected =
+        "exception class WideErr::Too.signature: field type WideSig is not a one-word attr";
+    assert!(
+        message.contains(expected),
+        "panic `{message}` must contain `{expected}`"
+    );
+
+    let copied = sidecar();
+    super::super::seed_program_exception_class_hints(&copied, hints);
+    let facts = super::super::DuplicateLeafFacts::discover(&copied, &program_raw);
+    let row = facts
+        .struct_fields
+        .fields
+        .get("WideErr::Too")
+        .and_then(|rows| rows.iter().find(|row| row.name == "signature"))
+        .unwrap_or_else(|| {
+            panic!(
+                "layout copy registers WideErr::Too.signature from the program set, keys {:?}",
+                facts.struct_fields.fields.keys().collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(row.ty, "*mut WideSig");
+    let owned = row
+        .raw_owned
+        .as_ref()
+        .expect("layout copy stores the moved struct");
+    assert_eq!(owned.type_path, "fixture::WideSig");
+    assert_eq!(owned.size, 32);
+    assert_eq!(owned.align, 8);
+    let _ = super::super::prelink_crate(&copied, &std::collections::HashSet::new(), &program_raw);
+}

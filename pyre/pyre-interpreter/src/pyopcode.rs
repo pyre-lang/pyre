@@ -94,6 +94,12 @@ pub fn s_application_exception_gc_type_id() -> u32 {
     crate::error::pyerror_gc_type_id() + 1
 }
 
+/// First GC type id of the minted RPython exception classes: one past
+/// [`s_application_exception_gc_type_id`]. Row `i` is this plus `i`.
+pub fn minted_exception_first_gc_type_id() -> u32 {
+    s_application_exception_gc_type_id() + 1
+}
+
 impl pyre_object::lltype::GcType for SApplicationException {
     #[inline]
     fn type_id() -> u32 {

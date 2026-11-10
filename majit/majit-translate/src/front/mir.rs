@@ -250,13 +250,21 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
 /// tombstones to paint (this artefact's and `cross_tombstoned_leaves`),
 /// its named-const folds merged into the invocation table, and its
 /// eval-hook graph list. Returns the tombstones.
+///
+/// `program_raw_alloc_flavor_structs` is the program-wide
+/// `_alloc_flavor_ = raw` set (`rclass.py` `getgcflavor`). Discovery
+/// registers marked exception classes and reads that set.
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn prelink_crate(
     llbc: &Llbc,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
+    program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
     let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
-    duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+    duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(
+        llbc,
+        program_raw_alloc_flavor_structs,
+    ));
     let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
     paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
     merge_named_const_folds(llbc.crate_name(), harvest_named_const_folds(llbc));
@@ -481,9 +489,23 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     // body is painted. A leaf unique inside each artefact (the two
     // `FrameBlock`s) is still withdrawn once the artefacts are merged, and
     // the per-file lowering has to paint that qualified root up front.
+    // The raw-flavor set is the same program-wide harvest the lowering
+    // uses (`rclass.py` `getgcflavor`): a type-decl layout copy carries
+    // the class and none of the marker globals.
+    let mut program_raw_alloc_flavor_structs = std::collections::HashSet::new();
+    for llbc in llbcs {
+        program_raw_alloc_flavor_structs.extend(
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                *llbc,
+            )),
+        );
+    }
     let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
     for llbc in llbcs {
-        duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+        duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(
+            llbc,
+            &program_raw_alloc_flavor_structs,
+        ));
     }
     let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
     paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
@@ -5985,15 +6007,26 @@ pub(crate) struct DuplicateLeafFacts {
 }
 
 impl DuplicateLeafFacts {
-    pub(crate) fn discover(llbc: &Llbc) -> Self {
+    pub(crate) fn discover(
+        llbc: &Llbc,
+        program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut raw_alloc_flavor_structs =
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                llbc,
+            ));
+        // `_alloc_flavor_` is a class property (`rclass.py` `getgcflavor`,
+        // `ClassDesc.get_param`), one set for the program. This artefact's
+        // markers are harvested above; callers pass the same set
+        // `CrateLoweringState` lowers with, which already holds markers
+        // from the defining artefact when this one is a layout copy.
+        raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, enum_variant_by_discriminant, struct_origins, _, _, struct_ids) =
             derive_program_metadata(
                 llbc,
                 &harvest_declared_gc_facts(llbc).gc_struct_ids(),
                 no_immutable_fields(),
-                &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-                    std::slice::from_ref(llbc),
-                ),
+                &raw_alloc_flavor_structs,
                 llbc_exception_class_hints(llbc),
             );
         let crate_name = llbc.crate_name().to_string();
@@ -6321,7 +6354,7 @@ pub(crate) fn enum_ctor_class_identity(
 
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
-    DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
+    DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
 }
 
 /// Withdraw the bare-leaf convenience aliases for struct leaves shared

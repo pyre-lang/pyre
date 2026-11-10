@@ -9672,8 +9672,14 @@ fn cross_llbc_duplicate_leaf_is_tombstoned_before_lowering() {
     );
     assert!(!super::tombstoned_leaves_of(&jit).contains("FrameBlock"));
     let mut facts = super::DuplicateLeafFacts::default();
-    facts.absorb(super::DuplicateLeafFacts::discover(&interpreter));
-    facts.absorb(super::DuplicateLeafFacts::discover(&jit));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &interpreter,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &jit,
+        &std::collections::HashSet::new(),
+    ));
     let cross = facts.tombstoned_leaves();
     assert!(
         cross.contains("FrameBlock"),
@@ -9695,8 +9701,14 @@ fn cross_llbc_crate_root_leaf_is_tombstoned_when_crates_differ() {
     assert!(!super::tombstoned_leaves_of(&a).contains("Foo"));
     assert!(!super::tombstoned_leaves_of(&b).contains("Foo"));
     let mut facts = super::DuplicateLeafFacts::default();
-    facts.absorb(super::DuplicateLeafFacts::discover(&a));
-    facts.absorb(super::DuplicateLeafFacts::discover(&b));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &a,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &b,
+        &std::collections::HashSet::new(),
+    ));
     let cross = facts.tombstoned_leaves();
     assert!(
         cross.contains("Foo"),
@@ -9734,8 +9746,14 @@ fn opaque_and_struct_same_leaf_are_tombstoned_across_llbc() {
     );
     assert!(!super::tombstoned_leaves_of(&obj).contains("Layout"));
     let mut facts = super::DuplicateLeafFacts::default();
-    facts.absorb(super::DuplicateLeafFacts::discover(&alloc));
-    facts.absorb(super::DuplicateLeafFacts::discover(&obj));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &alloc,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &obj,
+        &std::collections::HashSet::new(),
+    ));
     let cross = facts.tombstoned_leaves();
     assert!(
         cross.contains("Layout"),
@@ -9768,8 +9786,14 @@ fn foreign_struct_copy_does_not_tombstone_pytype() {
         vec![],
     );
     let mut facts = super::DuplicateLeafFacts::default();
-    facts.absorb(super::DuplicateLeafFacts::discover(&obj));
-    facts.absorb(super::DuplicateLeafFacts::discover(&interp));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &obj,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &interp,
+        &std::collections::HashSet::new(),
+    ));
     let cross = facts.tombstoned_leaves();
     assert!(
         !cross.contains("PyType"),

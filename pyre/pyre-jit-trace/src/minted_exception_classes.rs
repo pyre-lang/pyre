@@ -3,28 +3,13 @@
 //! The build script writes `$OUT_DIR/minted_exception_classes.rs` from
 //! the harvested hierarchies. Placeholder extraction
 //! (`MAJIT_LLBC_EXTRACTION=1`) and a program that minted nothing both
-//! emit an empty table, so every build compiles. The table is a plain
-//! static array: wasm does not use `linkme` for these rows.
+//! emit an empty table, so every build compiles. The row type lives in
+//! `pyre_interpreter::error`. This module registers that one table
+//! into the interpreter's subclass-range census: a `linkme` element
+//! off wasm32, a constructor on wasm32.
 
 use majit_gc::collector::MiniMarkGC;
-
-/// One row of [`MINTED_EXCEPTION_CLASSES`].
-///
-/// `parent` indexes the parent row. `None` is a hierarchy base, whose
-/// RPython parent is `HOST_EXCEPTION_TYPE`. `size` is the instance
-/// payload in bytes. `gc_ptr_offsets` are the payload GC-pointer
-/// fields at those bytes. The object root's `w_class` edge is not
-/// repeated: `TypeRegistry::register` merges the parent list.
-/// `destructor` frees that class's raw-owned attribute boxes. `None`
-/// means the class owns none.
-pub struct MintedExceptionClass {
-    pub name: &'static str,
-    pub pytype: &'static pyre_object::PyType,
-    pub parent: Option<usize>,
-    pub size: usize,
-    pub gc_ptr_offsets: &'static [usize],
-    pub destructor: Option<majit_gc::trace::DestructorFn>,
-}
+use pyre_interpreter::error::MintedExceptionClass;
 
 /// Drop one raw-owned attribute of a minted exception instance.
 ///
@@ -44,6 +29,19 @@ pub unsafe fn drop_raw_owned_attr<T>(obj_addr: usize, offset: usize) {
 }
 
 include!(concat!(env!("OUT_DIR"), "/minted_exception_classes.rs"));
+
+/// One census element: the whole generated table, row order preserved.
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice(pyre_interpreter::error::MINTED_EXCEPTION_CLASS_TABLES)]
+static MINTED_EXCEPTION_CLASS_TABLE: &'static [MintedExceptionClass] = MINTED_EXCEPTION_CLASSES;
+
+/// wasm32 has no `linkme` slice. The constructor publishes the same table
+/// before any exported function, so `init_subclass_ranges` sees it.
+#[cfg(target_arch = "wasm32")]
+#[::ctor::ctor(unsafe)]
+fn register_generated_minted_exception_class_table() {
+    pyre_interpreter::error::register_minted_exception_class_table(MINTED_EXCEPTION_CLASSES);
+}
 
 /// Register `rows` in parent-before-child order.
 ///
