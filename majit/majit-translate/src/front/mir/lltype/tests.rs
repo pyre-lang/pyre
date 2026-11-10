@@ -10092,6 +10092,93 @@ fn opaque_transparent_gc_handle_keeps_the_wrapper_class() {
     assert_handle_class(&llbc, &ty, Some("Word"));
 }
 
+/// An imported Opaque pointer handle is a GC `&mut T` cell. The
+/// defining crate sees a transparent struct; the importer sees
+/// `TypeDeclKind::Opaque` (`opaque_pointer_handle`).
+#[test]
+fn opaque_imported_handle_mut_ref_is_a_cell() {
+    let mut decls = pointer_handle_decls();
+    decls[2] = (
+        3,
+        opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+    );
+    let (llbc, ty) = load_handle_with_width(
+        decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Opaque PyError is a MutRef payload"
+    );
+    let mut_ty: TyRef = serde_json::from_value(serde_json::json!({
+        "Ref": ["Erased", {"Value": [9003, adt_body(3)]}, "Mut"]
+    }))
+    .unwrap();
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut Opaque PyError occupies a MutRef cell"
+    );
+}
+
+/// `apply_published_structs` fills the Opaque import; the word is
+/// still a MutRef cell (`published_struct_copy`).
+#[test]
+fn published_imported_handle_mut_ref_is_a_cell() {
+    let defining_decls = pointer_handle_decls();
+    let (defining, _) = load_handle_with_width(
+        defining_decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    let rows = crate::front::mir::harvest_published_structs(&defining);
+    let mut dest_decls = pointer_handle_decls();
+    dest_decls[2] = (
+        3,
+        opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+    );
+    let (mut llbc, ty) = load_handle_with_width(
+        dest_decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    crate::front::mir::apply_published_structs(&mut llbc, &rows);
+    assert!(
+        llbc.type_by_id(3)
+            .is_some_and(|td| td.published_struct_copy),
+        "PyError import is a published struct copy"
+    );
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "published PyError is a MutRef payload"
+    );
+    let mut_ty: TyRef = serde_json::from_value(serde_json::json!({
+        "Ref": ["Erased", {"Value": [9003, adt_body(3)]}, "Mut"]
+    }))
+    .unwrap();
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut published PyError occupies a MutRef cell"
+    );
+}
+
 /// `celldict.py` `erase({})`: a by-value transparent newtype intern's
 /// as the inner struct, so unique-graph `mergeinputargs` unifies the
 /// wrapper with that operand (`rordereddict.rtype_len`).
@@ -12151,6 +12238,7 @@ fn stamp_option_method_inputs(
         None,
         &empty_s,
         &empty_u,
+        &empty_u,
         &gc_struct_ids,
         false,
         &empty_s,
@@ -13975,6 +14063,302 @@ fn option_of_mut_object_pointer_slice_is_not_gcarray_list() {
     );
 }
 
+/// `None` of `Option<&mut H>` for a GC handle is the nullable MutRef cell
+/// (`gc_mut_ref_input_stamp`), not payload `H`. `Option<&H>` and
+/// `Option<*mut H>` keep the payload class
+/// (`option_payload_instance_class_root`).
+#[test]
+fn option_gc_mut_ref_none_is_mut_ref_cell_null() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let handle_ty = adt_node(0);
+    let payload_ty = adt_node(1);
+    let mut_ref = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let shared_ref = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Shared"]});
+    let raw_ptr = serde_json::json!({"RawPtr": [handle_ty.clone(), "Mut"]});
+    let option_mut = option_adt_node(2, mut_ref);
+    let option_shared = option_adt_node(2, shared_ref);
+    let option_raw = option_adt_node(2, raw_ptr);
+    let unit = serde_json::json!({"Tuple": []});
+    let layout = |transparent: bool, size: u64| {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": transparent}
+            }
+        }])
+    };
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let takes = |id: u64, leaf: &str, opt_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(vec![ident("fixture"), ident(leaf)], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [opt_ty.clone()],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("opt"), opt_ty)
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let caller = |id: u64, leaf: &str, callee: u64, opt_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(vec![ident("fixture"), ident(leaf)], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("none"), opt_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span,
+                            "kind": {"Assign": [
+                                place(1, opt_ty),
+                                {"Aggregate": [
+                                    {"Adt": [2, 0, null]},
+                                    []
+                                ]}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": callee},
+                                                "generics": empty_generics()
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, opt_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty, "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": layout(true, 8)
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []},
+                    "layout": layout(false, 0)
+                },
+                option_enum(2)
+            ],
+            "fun_decls": [
+                caller(0, "call_mut_none", 1, &option_mut),
+                takes(1, "takes_mut", &option_mut),
+                caller(2, "call_shared_none", 3, &option_shared),
+                takes(3, "takes_shared", &option_shared),
+                caller(4, "call_raw_none", 5, &option_raw),
+                takes(5, "takes_raw", &option_raw)
+            ],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let option_mut_ty: TyRef = serde_json::from_value(option_mut.clone()).unwrap();
+    let option_shared_ty: TyRef = serde_json::from_value(option_shared.clone()).unwrap();
+    let option_raw_ty: TyRef = serde_json::from_value(option_raw.clone()).unwrap();
+    let tomb = no_tombstoned_leaves();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_mut_ty, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Option<&mut Handle> occupies a MutRef cell"
+    );
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_shared_ty, &llbc, tomb, &gc, &raw)
+            .is_none(),
+        "Option<&Handle> is not a MutRef cell"
+    );
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_raw_ty, &llbc, tomb, &gc, &raw).is_none(),
+        "Option<*mut Handle> is not a MutRef cell"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        let mut_cast = lowering.option_niche_null_cast(&option_mut_ty);
+        assert!(
+            matches!(
+                &mut_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<&mut Handle> is MutRef, got {mut_cast:?}"
+        );
+        let shared_cast = lowering.option_niche_null_cast(&option_shared_ty);
+        assert!(
+            matches!(
+                &shared_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && !root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<&Handle> is payload Handle, got {shared_cast:?}"
+        );
+        let raw_cast = lowering.option_niche_null_cast(&option_raw_ty);
+        assert!(
+            matches!(
+                &raw_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && !root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<*mut Handle> is payload Handle, got {raw_cast:?}"
+        );
+    });
+    let cast_roots = |name: &str| {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let mut_roots = cast_roots("call_mut_none");
+    assert!(
+        mut_roots
+            .iter()
+            .any(|root| root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_mut_none lowers None as MutRef, got {mut_roots:?}"
+    );
+    assert!(
+        mut_roots
+            .iter()
+            .all(|root| root.starts_with("MutRef<") || !root.contains("Handle")),
+        "call_mut_none must not cast None to payload Handle, got {mut_roots:?}"
+    );
+    let shared_roots = cast_roots("call_shared_none");
+    assert!(
+        shared_roots
+            .iter()
+            .any(|root| !root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_shared_none lowers None as payload Handle, got {shared_roots:?}"
+    );
+    let raw_roots = cast_roots("call_raw_none");
+    assert!(
+        raw_roots
+            .iter()
+            .any(|root| !root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_raw_none lowers None as payload Handle, got {raw_roots:?}"
+    );
+    let takes_mut =
+        crate::test_support::lower_function(&llbc, "takes_mut").expect("lower takes_mut");
+    let opt_input = takes_mut
+        .block(takes_mut.startblock)
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "opt"))
+        .expect("opt input");
+    let OpKind::Input { ty, class_root, .. } = &opt_input.kind else {
+        panic!("opt is an input");
+    };
+    let class_root = class_root
+        .as_deref()
+        .expect("Option<&mut Handle> Input carries a class_root");
+    assert!(
+        class_root.starts_with("Option<MutRef<"),
+        "takes_mut Input is nullable MutRef, got {class_root}"
+    );
+    match ty {
+        ValueType::Ref(Some(root)) => assert!(
+            root.starts_with("MutRef<"),
+            "takes_mut value root is MutRef, got {root}"
+        ),
+        other => panic!("takes_mut Input is Ref(MutRef), got {other:?}"),
+    }
+}
+
 #[test]
 fn mut_ref_cell_root_names_a_gc_pointer_only() {
     let llbc = fixture_llbc();
@@ -14355,6 +14739,915 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
             } if name == "get_flag"
         )),
         "get_flag stays CallTarget::Method"
+    );
+}
+
+/// Result Err peel of a GC handle: the Place arm wraps the payload as
+/// a MutRef cell before the `&mut self` call (`install_gc_mut_ref_call`).
+#[test]
+fn result_err_peel_wraps_gc_handle_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let result_ty = result_adt_node(2, unit.clone(), handle_ty.clone());
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let err_place = serde_json::json!({
+        "kind": {"Projection": [place(1, &result_ty), {"Field": [1, 0]}]},
+        "ty": handle_ty
+    });
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [result_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("res"), &result_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": err_place}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                },
+                result_enum(2)
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Result Err peel emits a MutRef constructor before set_flag"
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "Result Err peel writes FieldWrite value on the cell"
+    );
+}
+
+/// `&mut Result<P, H>` Err peel of a transparent one-field GC handle:
+/// wrap copy-out writes the Err payload field (`Err.__pos_0`), the handle
+/// word `expand_pop_roots` reloads. A leaf-copy through the handle's
+/// inner field would getattr `Err.__pos_0.__pos_0`.
+#[test]
+fn result_err_peel_mut_ref_copy_out_writes_err_pos0() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let result_ty = result_adt_node(2, unit.clone(), handle_ty.clone());
+    let mut_result = serde_json::json!({"Ref": ["Erased", result_ty.clone(), "Mut"]});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let deref_result = serde_json::json!({
+        "kind": {"Projection": [place(1, &mut_result), "Deref"]},
+        "ty": result_ty
+    });
+    let err_place = serde_json::json!({
+        "kind": {"Projection": [deref_result, {"Field": [1, 0]}]},
+        "ty": handle_ty
+    });
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_result.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("res"), &mut_result)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": err_place}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                },
+                result_enum(2)
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Err peel of &mut Result wraps a MutRef cell before set_flag; graph={}",
+        graph.dump()
+    );
+    let copy_out: Vec<_> = ops[call_idx + 1..]
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } if !mut_ref_value_field(field) => {
+                Some((field.owner_root.clone(), field.name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copy_out.len(),
+        1,
+        "wrap copy-out is one FieldWrite of the Err payload; got {copy_out:?}; graph={}",
+        graph.dump()
+    );
+    let (owner, name) = &copy_out[0];
+    assert_eq!(
+        name,
+        "__pos_0",
+        "copy-out writes Err.__pos_0, the handle word; got {owner:?}.{name}; graph={}",
+        graph.dump()
+    );
+    assert!(
+        owner
+            .as_deref()
+            .is_some_and(|owner| owner.ends_with("::Err")),
+        "copy-out owner is the Err variant; got {owner:?}.{name}; graph={}",
+        graph.dump()
+    );
+}
+
+/// By-value GC handle auto-ref: WholeLocal wraps the payload as a
+/// MutRef cell (`emit_gc_mut_ref_cell`).
+#[test]
+fn by_value_gc_handle_auto_ref_wraps_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [handle_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("h"), &handle_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, &handle_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty, "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                }
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "by-value handle auto-ref emits a MutRef constructor before set_flag"
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "by-value handle auto-ref writes FieldWrite value on the cell"
+    );
+}
+
+/// Imported Opaque handle + Opaque method FunDecl: wrap from the
+/// signature (`gc_mut_ref_signature` does not skip a body-less
+/// `&mut T` GC formal).
+#[test]
+fn opaque_gc_handle_auto_ref_wraps_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let handle_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], false),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": "Opaque"
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [handle_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("context"), &handle_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, &handle_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let handle_decl = opaque_handle_decl(0, ident_path(&["fixture", "Handle"]), 8);
+    let payload_decl = struct_decl(
+        1,
+        ident_path(&["fixture", "Payload"]),
+        empty_fields(),
+        false,
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "target_information": [{
+                "key": "fixture-target",
+                "value": {
+                    "target_pointer_size": 8,
+                    "is_little_endian": true
+                }
+            }],
+            "type_decls": [handle_decl, payload_decl],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [
+                gctype_impl_for_adt(1),
+                deref_impl(
+                    1,
+                    serde_json::json!({"Value": [0, adt_body(0)]}),
+                    vec![serde_json::json!({"Value": [1, adt_body(1)]})],
+                    vec![
+                        serde_json::json!({"Value": [0, adt_body(0)]}),
+                        serde_json::json!({"Value": [1, adt_body(1)]}),
+                    ],
+                )
+            ]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let handle: TyRef = serde_json::from_value(handle_ty.clone()).unwrap();
+    let mut_ty: TyRef = serde_json::from_value(mut_self.clone()).unwrap();
+    let tomb = no_tombstoned_leaves();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Opaque Handle is a MutRef payload, ty={:?}",
+        super::tyref_to_value_type(&handle, &llbc)
+    );
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut Opaque Handle occupies a MutRef cell"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Opaque handle auto-ref emits a MutRef constructor before set_flag, graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "Opaque handle auto-ref writes FieldWrite value on the cell"
     );
 }
 

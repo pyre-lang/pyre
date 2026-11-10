@@ -6744,6 +6744,25 @@ impl<'a> Lowering<'a> {
                     // payload is `rffi.py` `CCHARP`, not `Ref(None)`.
                     let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
                     let place_ty = tyref_subst_bound_typevar(&place_ty, &inner.ty, self.llbc);
+                    // `Option<&mut T>` of a GC handle is already the MutRef
+                    // cell (`gc_mut_ref_input_stamp`). Some.`__pos_0` / `_0`
+                    // is that word; peeling it as a transparent handle
+                    // field would recast the cell to `T` and
+                    // `inherit_gc_mut_ref_provenance` would still mark the
+                    // dest a cell (`expand_pop_roots`).
+                    if matches!(field_name.as_str(), "__pos_0" | "_0" | "0") {
+                        let niche = self.tyref_is_niche_option_ptr(&inner.ty);
+                        let cell = tyref_option_gc_mut_ref_cell_root(
+                            &inner.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        if niche && cell.is_some() {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                    }
                     // Projecting the sized field of a `repr(transparent)`
                     // wrapper is the identity on its low-level value, including
                     // through a borrow: the borrow carries no representation of
@@ -6866,6 +6885,21 @@ impl<'a> Lowering<'a> {
                             ));
                         }
                         if self.option_niche_is_int_bank(&option_ty) {
+                            return Ok(base);
+                        }
+                        // `Option<&mut T>` of a GC handle is already the
+                        // MutRef cell (`gc_mut_ref_input_stamp`). Recasting
+                        // `__pos_0` to `T` would make the Some dest the
+                        // payload while inherit still marks it a cell.
+                        if tyref_option_gc_mut_ref_cell_root(
+                            &option_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                        .is_some()
+                        {
                             return Ok(base);
                         }
                         if let Some(root) = self.option_niche_payload_class_root(&option_ty) {

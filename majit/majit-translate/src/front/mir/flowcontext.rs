@@ -387,11 +387,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     ///
     /// `_trace` unwraps `operr: Option<&mut OperationError>` then
     /// reborrows it for `reload` / `normalize_exception`
-    /// (`executioncontext.py` `_trace`).
+    /// (`executioncontext.py` `_trace`). The Option formal is the
+    /// same cell, nullable (`gc_mut_ref_input_stamp`).
     pub(in crate::front::mir) gc_mut_ref_params: std::collections::HashSet<usize>,
-    /// Parameter locals declared `Option<&mut T>` whose payload would
-    /// occupy a MutRef cell. Members stay Option-typed so
-    /// [`Lowering::gc_mut_ref_param_root`] keeps naming only `&mut T`.
+    /// Parameter locals declared `Option<&mut T>` whose payload occupies
+    /// a MutRef cell. The Option word is that cell, nullable; members
+    /// are not `&mut T`, so [`Lowering::gc_mut_ref_param_root`] keeps
+    /// naming only `&mut T`.
     pub(in crate::front::mir) gc_mut_ref_option_params: std::collections::HashSet<usize>,
     /// MIR locals whose value is the address of a primitive, produced by a
     /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
@@ -731,6 +733,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     generics: Option<&FunGenerics>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_mut_ref_params: &std::collections::HashSet<usize>,
+    gc_mut_ref_option_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
@@ -835,20 +838,21 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             i == 1,
             tombstoned_leaves,
         );
-        // Same membership as [`gc_mut_ref_param_locals`], including the
-        // residual exclusion: a cell parameter is the `MutRef<T>` the
-        // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
-        let cell_root = if gc_mut_ref_params.contains(&i) {
-            tyref_gc_mut_ref_cell_root(
-                &local.ty,
-                llbc,
-                tombstoned_leaves,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        } else {
-            None
-        };
+        // Same membership as [`gc_mut_ref_param_locals`] /
+        // [`gc_mut_ref_option_param_locals`], including the residual
+        // exclusion: a cell parameter is the `MutRef<T>` the caller
+        // passes, not `T`. An `Option<&mut T>` formal is that cell,
+        // nullable. Seeding `T` hoists `value` onto `T`'s class.
+        let cell_stamp = gc_mut_ref_input_stamp(
+            &local.ty,
+            i,
+            gc_mut_ref_params,
+            gc_mut_ref_option_params,
+            llbc,
+            tombstoned_leaves,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         // `class_root` carries the param's named-ADT leaf so
         // `derive_subject_inputcells` can seed the receiver's
         // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -871,8 +875,8 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
-        let class_root = if let Some(root) = &cell_root {
-            Some(root.clone())
+        let class_root = if let Some((_, class_root)) = &cell_stamp {
+            Some(class_root.clone())
         } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
         } else {
@@ -960,7 +964,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 }),
             }
         };
-        if let Some(root) = cell_root {
+        if let Some((root, _)) = cell_stamp {
             ty = ValueType::Ref(Some(root));
         }
         let len_slot = len_shadow[i];
@@ -1626,21 +1630,22 @@ impl<'a> Lowering<'a> {
             // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
             // `RootScope` method form puts `&self` first, so stamping index 1
             // there annotates the receiver and leaves the GC pointer untouched.
-            // Same membership as [`gc_mut_ref_param_locals`]: a cell
-            // parameter is the `MutRef<T>` the caller passes, not `T`.
-            let cell_root = if gc_mut_ref_params.contains(&i) {
-                tyref_gc_mut_ref_cell_root(
-                    &local.ty,
-                    llbc,
-                    tombstoned_leaves,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            } else {
-                None
-            };
-            let class_root = if let Some(root) = &cell_root {
-                Some(root.clone())
+            // Same membership as [`gc_mut_ref_param_locals`] /
+            // [`gc_mut_ref_option_param_locals`]: a cell parameter is
+            // the `MutRef<T>` the caller passes, not `T`. An
+            // `Option<&mut T>` formal is that cell, nullable.
+            let cell_stamp = gc_mut_ref_input_stamp(
+                &local.ty,
+                i,
+                &gc_mut_ref_params,
+                &gc_mut_ref_option_params,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            let class_root = if let Some((_, class_root)) = &cell_stamp {
+                Some(class_root.clone())
             } else if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
             } else {
@@ -1711,7 +1716,7 @@ impl<'a> Lowering<'a> {
                     }),
                 }
             };
-            if let Some(root) = cell_root {
+            if let Some((root, _)) = cell_stamp {
                 ty = ValueType::Ref(Some(root));
             }
             let len_slot = len_shadow[i];

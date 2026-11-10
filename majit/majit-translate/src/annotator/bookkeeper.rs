@@ -7563,27 +7563,6 @@ fn intern_class_key_from_registry(
     lookup.to_string()
 }
 
-/// Inner type of a GC `MutRef<T>` cell, when `T` itself is a class.
-///
-/// A raw / borrowed spelling (`*mut PyObject`, `&T`) occupies the cell
-/// as a pointer payload and is not a ClassDef parent. Scalar payloads
-/// never mint a cell class.
-pub(crate) fn mut_ref_gc_payload_name(name: &str) -> Option<&str> {
-    let inner = name.strip_prefix("MutRef<")?.strip_suffix('>')?;
-    if inner.is_empty()
-        || inner.starts_with('*')
-        || inner.starts_with('&')
-        || inner.starts_with("fn(")
-    {
-        return None;
-    }
-    match inner {
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
-        | "usize" | "bool" | "f32" | "f64" | "char" | "str" | "()" => None,
-        _ => Some(inner),
-    }
-}
-
 fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
     if registered_key.contains('<') || !spelled.contains('<') {
         return registered_key.to_string();
@@ -17534,13 +17513,12 @@ mod tests {
             false,
             Default::default(),
         ));
-        let merged = union(&s_cell, &s_payload).expect("interned MutRef<T> ∪ T");
-        let SomeValue::Instance(inst) = merged else {
-            panic!("expected SomeInstance, got {merged:?}");
-        };
-        assert_eq!(
-            inst.classdef.as_ref().expect("classdef").borrow().name,
-            "MutRef<error::PyError>"
+        let err = union(&s_cell, &s_payload).expect_err("interned MutRef<T> ∪ T");
+        assert!(
+            err.msg
+                .contains("cannot unify instances with no common base class"),
+            "union error: {}",
+            err.msg
         );
     }
 

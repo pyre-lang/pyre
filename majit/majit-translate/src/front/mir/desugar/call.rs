@@ -278,12 +278,19 @@ impl<'a> Lowering<'a> {
                 // residual host call as a classdef-less instance, and
                 // `if let Some(s)` then could not return a `SomeString`.
                 if self.tyref_is_niche_option_ptr(dest_class_ty) {
-                    self.option_niche_payload_class_root(dest_class_ty)
-                        .or_else(|| {
-                            self.option_niche_null_cast(dest_class_ty)
-                                .is_some()
-                                .then(|| root.clone())
-                        })
+                    tyref_option_gc_mut_ref_cell_root(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                    .or_else(|| {
+                        self.option_niche_null_cast(dest_class_ty)
+                            .is_some()
+                            .then(|| root.clone())
+                    })
                 } else if crate::front::result_exc::tyref_lowers_as_result_exc(
                     &call.dest.ty,
                     self.llbc,
@@ -310,7 +317,17 @@ impl<'a> Lowering<'a> {
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
-                .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                // A GC `&mut T` payload is the MutRef cell, not `T`.
+                .or_else(|| {
+                    tyref_option_gc_mut_ref_cell_root(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                })
                 // A `dont_look_inside` residual returning `Option<*mut T>`
                 // whose dest type is the `Option<…>` ADT, not a bare raw
                 // pointer, misses `raw_ptr_pointee_class_root`. Narrow it
@@ -9890,6 +9907,7 @@ impl<'a> Lowering<'a> {
     /// Class root of an inherent `&self` method whose owner ADT is opaque
     /// in this crate. `dont_look_inside` callees stay residual and are
     /// not painted. `core`/`std`/`alloc` owners are not struct classes.
+    /// `&mut self` of a GC handle is a MutRef cell, not this payload class.
     pub(in crate::front::mir) fn opaque_traced_method_self_root(
         &self,
         reg: &RegularCall,
@@ -9924,6 +9942,23 @@ impl<'a> Lowering<'a> {
         }
         let td = self.llbc.type_by_id(adt_def_id)?;
         if !matches!(td.kind, TypeDeclKind::Opaque) && !td.published_struct_copy {
+            return None;
+        }
+        // `&mut self` of a GC handle occupies a MutRef cell
+        // (`mut_ref_cell_root_of`). Painting the payload class here
+        // replaces that cell with `T`, and `install_gc_mut_ref_call`
+        // then skips wrap because args[0] is no longer the resolved
+        // operand (`expand_pop_roots`).
+        if fd.signature.inputs.first().is_some_and(|ty| {
+            tyref_gc_mut_ref_cell_root(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+            .is_some()
+        }) {
             return None;
         }
         // A fieldless enum is an int. Painting `self` as an instance

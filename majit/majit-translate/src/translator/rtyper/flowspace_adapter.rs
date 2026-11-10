@@ -6277,8 +6277,20 @@ pub(crate) fn derive_subject_inputcells(
                     // `"PyError"` and would seed the payload. getattr of
                     // `.value` then lands on the handle
                     // (`alias_exception_carrier_handle`).
-                    if majit_ir::descr::strip_instantiation_suffix(root) == "MutRef" {
-                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                    // `Option<MutRef<T>>` is the nullable formal of
+                    // `Option<&mut T>` (`SomeInstance.__init__(can_be_None)`,
+                    // `model.py`).
+                    let mutref_seed =
+                        if majit_ir::descr::strip_instantiation_suffix(root) == "MutRef" {
+                            Some((root.as_str(), false))
+                        } else if let Some(inner) = majit_ir::descr::option_payload_spelling(root) {
+                            (majit_ir::descr::strip_instantiation_suffix(inner) == "MutRef")
+                                .then_some((inner, true))
+                        } else {
+                            None
+                        };
+                    if let Some((cell, can_be_none)) = mutref_seed {
+                        let cd = bk.getuniqueclassdef_for_struct_root(cell).map_err(|e| {
                             TyperError::message(format!(
                                 "derive_subject_inputcells: startblock.inputargs[{idx}] \
                                  ({var:?}) `Ref` receiver root {root:?} failed struct-root \
@@ -6288,7 +6300,7 @@ pub(crate) fn derive_subject_inputcells(
                         cells.push(crate::annotator::model::SomeValue::Instance(
                             crate::annotator::model::SomeInstance::new(
                                 Some(cd),
-                                false,
+                                can_be_none,
                                 std::collections::BTreeMap::new(),
                             ),
                         ));
@@ -13573,6 +13585,58 @@ mod tests {
         };
         let cd = inst.classdef.as_ref().expect("classdef").clone();
         assert_eq!(cd.borrow().name, name);
+        assert!(
+            cd.borrow().attrs.contains_key("value"),
+            "MutRef<PyError> must project value, attrs={:?}",
+            cd.borrow().attrs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `Option<&mut PyError>` stamps `Option<MutRef<PyError>>`. The seed
+    /// peels to the cell and noneifies (`SomeInstance.__init__(can_be_None)`).
+    #[test]
+    fn option_mut_ref_pyerror_input_seeds_nullable_cell() {
+        let name = "MutRef<PyError>";
+        let registry = empty_call_registry();
+        let bk = registry.bookkeeper().clone();
+        bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
+        let _ = bk.intern_class_by_qualname("pyre_interpreter::error::PyError");
+        bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "PyError".to_string(),
+            overrides: String::new(),
+            variants: vec!["X".to_string()],
+        }]);
+        assert!(bk.exception_class_base("PyError").is_some());
+
+        let mut graph = LegacyGraph::new("_trace");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "operr".to_string(),
+                    ty: ValueType::Ref(Some(name.to_string())),
+                    class_root: Some(format!("Option<{name}>")),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cell);
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("Option<MutRef<PyError>> input must seed a classdef");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!(
+                "Option<MutRef> input must be SomeInstance, got {:?}",
+                cells[0]
+            );
+        };
+        let cd = inst.classdef.as_ref().expect("classdef").clone();
+        assert_eq!(cd.borrow().name, name);
+        assert!(
+            inst.can_be_none,
+            "Option<&mut T> is SomeInstance(MutRef, can_be_None)"
+        );
         assert!(
             cd.borrow().attrs.contains_key("value"),
             "MutRef<PyError> must project value, attrs={:?}",

@@ -4710,20 +4710,6 @@ fn init_someinstance_overrides(
                 if attr == "__class__" {
                     return super::classdesc::ClassDef::read_attr__class__(classdef);
                 }
-                // `MutRef<PyError>.value` is this handle. A pycall that
-                // already holds the payload (`_trace` unwrap of
-                // `Option<&mut PyError>`) reads the same word. Do not
-                // `record_getattr` here: that would hoist `value` onto
-                // the handle (`alias_exception_carrier_handle`).
-                if attr == "value" {
-                    let name = classdef.borrow().name.clone();
-                    if !name.starts_with("MutRef<")
-                        && name.rsplit("::").next() == Some("PyError")
-                        && !classdef.borrow().attrs.contains_key("value")
-                    {
-                        return s_self;
-                    }
-                }
                 // unaryop.py:840 — `getbookkeeper().record_getattr(
                 //                       self.classdef.classdesc, attr)`.
                 let classdesc = classdef.borrow().classdesc.clone();
@@ -7366,10 +7352,10 @@ mod tests {
     }
 
     #[test]
-    fn pyerror_handle_getattr_value_is_the_handle() {
-        // `MutRef<PyError>.value` is this handle. A pycall that already
-        // holds the payload reads the same word
-        // (`alias_exception_carrier_handle`).
+    fn pyerror_handle_getattr_value_follows_s_getattr() {
+        // `unaryop.py` `SomeInstance.getattr` special-cases only
+        // `__class__`. A missing `value` on the handle is
+        // `ClassDef.s_getattr` → `SomeImpossibleValue`.
         use super::super::classdesc::ClassDef;
         use super::super::model::SomeInstance;
         let ann = mk_ann();
@@ -7392,18 +7378,11 @@ mod tests {
         );
         let result = hl
             .consider(&ann)
-            .expect("getattr value must succeed")
+            .expect("getattr of a missing attr follows s_getattr")
             .unwrap();
-        let SomeValue::Instance(inst) = result else {
-            panic!("expected the handle, got {result:?}");
-        };
-        assert_eq!(
-            inst.classdef.as_ref().expect("classdef").borrow().name,
-            "pyre_interpreter::error::PyError"
-        );
         assert!(
-            !handle.borrow().attrs.contains_key("value"),
-            "getattr value must not hoist the cell field onto the handle"
+            matches!(result, SomeValue::Impossible),
+            "expected Impossible, got {result:?}"
         );
     }
 
