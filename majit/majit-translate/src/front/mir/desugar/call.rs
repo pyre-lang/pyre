@@ -8216,6 +8216,62 @@ impl<'a> Lowering<'a> {
                     });
             }
         }
+        // Capture `Iterator::any(it, f)` at the construction site, where
+        // the closure env is a concrete ADT.  The default body is
+        // polymorphic (Charon does not monomorphise per iterator item);
+        // the caller is not.  A miss — non-bool dest, or env that does
+        // not resolve to a closure ADT — leaves the residual.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && crate::front::iter_adapter::is_iterator_any_target(target)
+            && tyref_to_value_type_with(
+                &call.dest.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ) == ValueType::Bool
+            && let Some(recv_ty) = first_arg_ty.as_ref()
+            && let Some(pred_ty) = second_arg_ty.as_ref()
+            && let Some(env_def_id) = self
+                .tyref_adt_def_id(pred_ty)
+                .or_else(|| self.tyref_ref_adt_def_id(pred_ty))
+            && let Some(env_td) = self.llbc.type_by_id(env_def_id)
+            && type_decl_is_closure_env(env_td)
+        {
+            let call_once_owner = closure_env_call_once_owner(env_td);
+            if !call_once_owner.is_empty() {
+                let iter_ty = match self.tyref_peel_ref_to_pointee(recv_ty) {
+                    Some(ty) => ty,
+                    None => recv_ty.clone(),
+                };
+                let item_tyref = self
+                    .tyref_adt_type_arg(&iter_ty, 0)
+                    .unwrap_or_else(|| clone_tyref(&iter_ty));
+                let payload_ty = tyref_to_value_type_with(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                let payload_class_root = enum_payload_instance_class_root(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                );
+                let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
+                self.iterator_any_sites
+                    .push(crate::front::iter_adapter::IteratorAnySite {
+                        result_var: result_var.clone(),
+                        call_once_owner,
+                        payload_ty: payload_ty.clone(),
+                        payload_class_root,
+                        args_tuple_suffix,
+                        inner_item_ty: payload_ty,
+                    });
+            }
+        }
         // Transparent std wrappers (`Cell::{new,get}`, `Atomic*::new`,
         // `Box::as_ref`, `Ref`/`MutexGuard` deref) are operations, not
         // residual calls.  Rewrite the Call before the capture gates

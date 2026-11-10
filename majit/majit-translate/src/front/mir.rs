@@ -7842,6 +7842,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             Vec::new()
         };
+        let iterator_any_synthesized = if !lo.iterator_any_sites.is_empty() {
+            crate::front::iter_adapter::rewire_iterator_any_sites(
+                &mut lo.graph,
+                &lo.iterator_any_sites,
+            )
+        } else {
+            Vec::new()
+        };
         let residual_slice_iter_next =
             crate::front::iter_next::graph_has_residual_slice_iter_next(&lo.graph);
         if !lo.result_exc_call_results.is_empty()
@@ -7878,6 +7886,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             )?;
         }
         lo.next_call_results.extend(map_collect_synthesized);
+        lo.next_call_results.extend(iterator_any_synthesized);
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangefrom_sites(
