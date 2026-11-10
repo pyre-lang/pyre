@@ -6624,7 +6624,14 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        boxed,
+    )?;
     Ok(Some(()))
 }
 
@@ -8132,6 +8139,11 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             // register; `write_residual_call_result_to_dst` no-ops `'v'`.
             DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
                 let _ = finish_inline_callee_return(ctx, None);
+                helper_blackhole_after_no_driver_finishframe(
+                    ctx,
+                    no_driver_finishframe_latch(ctx, op_pc),
+                    op_pc,
+                )?;
                 return Ok(Some(DispatchOutcome::Continue));
             }
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
@@ -8145,7 +8157,14 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             raised @ DispatchOutcome::SubRaise { .. } => return Ok(Some(raised)),
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        result,
+    )?;
     if let Some(slot) = boxed_out {
         *slot = Some(result);
     }
@@ -10085,7 +10104,14 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        result,
+    )?;
     Ok(Some(()))
 }
 
@@ -10200,7 +10226,14 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        result,
+    )?;
     Ok(Some(()))
 }
 
@@ -10324,7 +10357,14 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         _ => return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before),
     };
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        result,
+    )?;
     Ok(Some(()))
 }
 
@@ -19881,6 +19921,8 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     iter_op: OpRef,
     iter_obj: pyre_object::PyObjectRef,
     shape: RangeStepOneShape,
+    dst: usize,
+    dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(shape.next_path()) else {
         return Ok(None);
@@ -19983,9 +20025,25 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         }
     }
     let Some(concrete_item_ptr) = walker_concrete_ref_object(ctx, item) else {
+        write_no_driver_finishframe_dest(
+            ctx,
+            op_pc,
+            no_driver_finishframe_latch(ctx, op_pc),
+            dst,
+            dst_bank,
+            item,
+        )?;
         return Ok(Some(item));
     };
     if !concrete_continues {
+        write_no_driver_finishframe_dest(
+            ctx,
+            op_pc,
+            no_driver_finishframe_latch(ctx, op_pc),
+            dst,
+            dst_bank,
+            item,
+        )?;
         return Ok(Some(item));
     }
 
@@ -20006,6 +20064,14 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
+    write_no_driver_finishframe_dest(
+        ctx,
+        op_pc,
+        no_driver_finishframe_latch(ctx, op_pc),
+        dst,
+        dst_bank,
+        item,
+    )?;
     Ok(Some(item))
 }
 
@@ -20013,7 +20079,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
-    _dst: usize,
+    dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
@@ -20037,6 +20103,8 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
                 iter_op,
                 iter_obj,
                 RangeStepOneShape::OneArg,
+                dst,
+                dst_bank,
             )
         });
     }
@@ -20048,6 +20116,8 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
                 iter_op,
                 iter_obj,
                 RangeStepOneShape::StepOne,
+                dst,
+                dst_bank,
             )
         });
     }

@@ -5157,6 +5157,7 @@ fn finish_recursive_inline<Sym: WalkSym>(
             if let Some(result) = result {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
             }
+            helper_blackhole_after_no_driver_finishframe(ctx, op.next_pc, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -5378,7 +5379,6 @@ pub fn step<Sym: WalkSym>(
     ctx.live_after_jit_pc = usize::MAX;
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     residual_call::clear_residual_pc_advanced(ctx);
-    inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
     #[cfg(test)]
     if let Some(error) = inline_call::maybe_test_helper_step_abort(
         ctx.fbw_mode.transparent_helper_jitcode_index,
@@ -5557,17 +5557,6 @@ fn walk_err_coordinate_belongs_to_this_frame<Sym: WalkSym>(
             .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk)
 }
 
-/// `pyjitpl.py` `MIFrame.run_one_step` leaves only on `ChangeFrame` (a call
-/// or a return). These opcodes are the call half; the return half is
-/// `SubReturn` / `SubRaise` (`finishframe` / `finishframe_exception`).
-///
-/// `inline_call_*` always `perform_call`s. A residual that
-/// `perform_call`s checks after dest write in `try_perform_call`; an
-/// ordinary residual stays in the same `run_one_step`.
-fn helper_opcode_changes_frame(code: &[u8], pc: usize) -> bool {
-    decode_op_at(code, pc).is_some_and(|op| op.opname.starts_with("inline_call_"))
-}
-
 /// `pyjitpl.py` `MetaInterp._interpret` after `MIFrame.run_one_step` returns.
 /// Helper sub-walks evaluate `blackhole_if_trace_too_long` here rather than
 /// after every walker instruction. `latch_pc` is the live `MIFrame.pc`
@@ -5601,6 +5590,61 @@ pub(crate) fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
             Ok(())
         }
     }
+}
+
+/// `finishframe` dest-write under a helper `walk()` with no `SubWalkDriver`
+/// (`bridge_subwalk` when `jitcode_is_transparent_helper`). The child
+/// completed inside `run_sub_jitcode_walk_from`'s own `SubWalkDriverGuard`
+/// (`drive` Ok); that guard has dropped, so parked-completed at step start
+/// was false. Skip when a parent driver is still live: residual replay and
+/// `pending_subreturn` dest-write already check.
+pub(crate) fn helper_blackhole_after_no_driver_finishframe<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    latch_pc: usize,
+    error_pc: usize,
+) -> Result<(), DispatchError> {
+    if inline_call::subwalk_driver_is_active() {
+        return Ok(());
+    }
+    helper_blackhole_after_run_one_step(ctx, latch_pc, error_pc)
+}
+
+/// Latch pc the caller resumes at after a residual dest-write (`MIFrame.pc`
+/// after `_get_opimpl_method`). Missing `residual_call_next_pc` is the CALL
+/// itself (`inline_call_*` dest-write notes it before the orthodox fold).
+pub(crate) fn no_driver_finishframe_latch<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> usize {
+    ctx.frame_state
+        .borrow()
+        .residual_call_next_pc
+        .unwrap_or(op_pc)
+}
+
+/// Dest-write of a completed helper child (`finishframe` /
+/// `make_result_of_lastop`) then `_interpret` / `blackhole_if_trace_too_long`.
+pub(crate) fn write_no_driver_finishframe_dest<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    latch_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    result: OpRef,
+) -> Result<(), DispatchError> {
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    helper_blackhole_after_no_driver_finishframe(ctx, latch_pc, op_pc)
+}
+
+/// Continue after a no-driver `finishframe` dest-write or caught-handler
+/// selection (`finishframe_exception` then `_interpret`).
+pub(crate) fn continue_after_no_driver_finishframe<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    latch_pc: usize,
+    error_pc: usize,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    helper_blackhole_after_no_driver_finishframe(ctx, latch_pc, error_pc)?;
+    Ok((DispatchOutcome::Continue, latch_pc))
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
@@ -5643,6 +5687,19 @@ pub fn walk<Sym: WalkSym>(
         ctx.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
             pc: opcode_position,
             effects_at_step,
+        });
+        // `note_subwalk_driver_step` is the per-step driver mark
+        // (`MetaInterp.perform_call` heap-cache checkpoint). A no-op
+        // without a driver. It reads neither `live_after_jit_pc` nor
+        // `clear_residual_pc_advanced`. Parked-completed after the pc
+        // filter is residual replay of a child that `finishframe`d.
+        let helper_child_returned = decode_op_at(code, pc).is_some_and(|op| {
+            let parked_completed = inline_call::note_subwalk_driver_step::<Sym>(
+                op.opname,
+                pc,
+                ctx.trace_ctx.get_trace_position(),
+            );
+            ctx.fbw_mode.transparent_helper_subwalk && parked_completed
         });
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => {
@@ -5870,8 +5927,10 @@ pub fn walk<Sym: WalkSym>(
         // instruction of that inner loop. Python-level walks keep the
         // per-instruction check. Helper sub-walks evaluate the same
         // `helper_too_long_decision` only at `ChangeFrame`: entering this
-        // frame (`walk` start), a nested `inline_call_*` / `residual_call_*`
-        // that returned, and the helper's own return (the caller's check).
+        // frame (`SubWalkFrame::drive` newframe), a nested call that
+        // `finishframe`d (parked-completed residual replay, dest-write, or
+        // no-driver dest-write after `run_sub_jitcode_walk_from` Ok),
+        // and `finishframe_exception` (caught `SubRaise`).
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
@@ -5908,11 +5967,9 @@ pub fn walk<Sym: WalkSym>(
         }
         if ctx.fbw_mode.transparent_helper_subwalk {
             // Ordinary instructions stay inside `MIFrame.run_one_step`. A
-            // nested call that returned is `ChangeFrame`; `SubReturn` /
-            // `SubRaise` is `finishframe` first and the caller checks.
-            if matches!(outcome, DispatchOutcome::Continue)
-                && helper_opcode_changes_frame(code, opcode_position)
-            {
+            // nested call that `finishframe`d is `ChangeFrame`; dest-write
+            // `inline_call_*` and `newframe` stay on `SubWalkFrame::drive`.
+            if matches!(outcome, DispatchOutcome::Continue) && helper_child_returned {
                 helper_blackhole_after_run_one_step(ctx, pc, opcode_position)?;
             }
         } else if ctx.trace_ctx.is_too_long() {
@@ -15334,6 +15391,7 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     match walk_outcome {
         DispatchOutcome::SubReturn { result: None } => {
             let _ = inline_call::finish_inline_callee_return(ctx, None);
+            helper_blackhole_after_no_driver_finishframe(ctx, op_pc, op_pc)?;
             Ok(())
         }
         DispatchOutcome::SubRaise { .. } | DispatchOutcome::SubReturn { result: Some(_) } => {
