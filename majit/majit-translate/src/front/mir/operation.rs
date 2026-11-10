@@ -7012,14 +7012,27 @@ impl<'a> Lowering<'a> {
                             }
                             return Ok(res);
                         }
-                        let narrowed = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(narrowed.clone()),
-                            kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, res),
-                        });
-                        return Ok(narrowed);
+                        // An instance pointer keeps that class's classdef
+                        // (`bookkeeper.py` `getuniqueclassdef`; `rclass.py`
+                        // `InstanceRepr`). Only an explicit upcast goes to
+                        // the base (`annlowlevel.py`
+                        // `cast_base_ptr_to_instance`). The payload type is
+                        // the post-projection place, then the substituted
+                        // declared field.
+                        let dest_root = self
+                            .nullable_instance_payload_class_root(&place_ty)
+                            .or_else(|| self.nullable_instance_payload_class_root(&field_ty));
+                        if let Some(dest_root) = dest_root {
+                            let narrowed = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(narrowed.clone()),
+                                kind: crate::model::cast_instance_call(dest_root, res),
+                            });
+                            return Ok(narrowed);
+                        }
+                        return Ok(res);
                     }
                     // `W_BytesObject.data` is the `rstr.py` `STR` owner.
                     // `SomePtr.getattr` (`lltype.py`) of a pointer field stays

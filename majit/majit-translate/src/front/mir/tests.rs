@@ -17963,6 +17963,170 @@ fn map_or_reference_payload_class_is_narrowed() {
     );
 }
 
+/// `ControlFlow<B, C>` with Continue = `C` (types[1]) and Break = `B`
+/// (types[0]), matching `core::ops::control_flow::ControlFlow`.
+fn control_flow_bc_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["ops", 0]},
+                {"Ident": ["control_flow", 0]},
+                {"Ident": ["ControlFlow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Continue",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Break",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+fn interior_mut_ref(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, inner, "Mut"]})
+}
+
+/// `?` on `Option<&mut T>` is `Try::branch` plus a ControlFlow switch;
+/// the Continue arm is `Field[0, 0]` of that ControlFlow (`Continue.__pos_0`).
+fn lower_control_flow_continue_mut_payload(payload_id: u64) -> FunctionGraph {
+    let payload = interior_mut_ref(interior_adt(payload_id));
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_i64(), payload.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cf_place = interior_place(1, &cf_ty);
+    let payload_place = serde_json::json!({
+        "kind": {"Projection": [cf_place, {"Field": [0, 0]}]},
+        "ty": payload
+    });
+    let caller = interior_caller(
+        "read_continue",
+        1,
+        vec![cf_ty.clone()],
+        payload.clone(),
+        vec![
+            interior_local(0, None, &payload),
+            interior_local(1, Some("cf"), &cf_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &payload),
+                interior_use(payload_place),
+            )],
+            interior_return(),
+        )],
+    );
+    let base = interior_struct(
+        1,
+        &["fixture", "Base"],
+        &[("word", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let sub = interior_struct(
+        2,
+        &["fixture", "Sub"],
+        &[("ob", interior_adt(1)), ("slot", interior_i64())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![control_flow_bc_enum(0), base, sub],
+        vec![caller],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+        })],
+        vec![serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{"Value": [0, interior_adt(1)]}]}
+            }
+        })],
+    );
+    lower_interior(&llbc, "read_continue")
+}
+
+fn continue_pos0_cast_roots(graph: &FunctionGraph) -> Vec<&str> {
+    use crate::model::OpKind;
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.windows(2))
+        .filter_map(|ops| {
+            let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                return None;
+            };
+            if field.name != "__pos_0" {
+                return None;
+            }
+            if !field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.contains("ControlFlow"))
+            {
+                return None;
+            }
+            crate::model::cast_instance_root(&ops[1].kind)
+        })
+        .collect()
+}
+
+/// `?` on `Option<&mut Sub>`: Continue's payload is `&mut Sub`. Sub's first
+/// field is the GcType base; the `__pos_0` recast keeps Sub's class root.
+#[test]
+fn control_flow_continue_mut_subclass_payload_keeps_subclass_class_root() {
+    let graph = lower_control_flow_continue_mut_payload(2);
+    let roots = continue_pos0_cast_roots(&graph);
+    assert_eq!(
+        roots,
+        vec!["Sub"],
+        "Continue.__pos_0 of `&mut Sub` must recast to Sub, not the base; ops={:?} graph={}",
+        graph_ops(&graph),
+        graph.dump()
+    );
+}
+
+/// An explicit `&mut Base` Continue payload stays the base class root.
+#[test]
+fn control_flow_continue_mut_base_payload_stays_base_class_root() {
+    let graph = lower_control_flow_continue_mut_payload(1);
+    let roots = continue_pos0_cast_roots(&graph);
+    assert_eq!(
+        roots,
+        vec!["Base"],
+        "Continue.__pos_0 of `&mut Base` must recast to Base; ops={:?} graph={}",
+        graph_ops(&graph),
+        graph.dump()
+    );
+}
+
 fn is_option_core_leaf_call(op: &crate::model::SpaceOperation, leaf: &str) -> bool {
     use crate::model::{CallTarget, OpKind};
     match &op.kind {

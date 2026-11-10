@@ -460,6 +460,30 @@ impl<'a> Lowering<'a> {
         .is_some()
     }
 
+    /// Class of a nullable instance-pointer payload (`&mut T`, `*mut T`,
+    /// niche `Option<&mut T>`). An instance pointer keeps that class's
+    /// classdef (`bookkeeper.py` `getuniqueclassdef`; `rclass.py`
+    /// `InstanceRepr`); only an explicit upcast goes to the base
+    /// (`annlowlevel.py` `cast_base_ptr_to_instance`).
+    pub(in crate::front::mir) fn nullable_instance_payload_class_root(
+        &self,
+        payload_ty: &TyRef,
+    ) -> Option<String> {
+        self.option_niche_payload_class_root(payload_ty)
+            .or_else(|| {
+                registered_gc_ptr_class_root_with(
+                    payload_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+            })
+            .or_else(|| {
+                enum_payload_instance_class_root(payload_ty, self.llbc, self.tombstoned_leaves)
+            })
+    }
+
     /// Resolve a destination `Option` into its `(option_owner, some_owner,
     /// payload_ty)` — the enum root ctor owner, the `Some` variant
     /// payload-field owner, and the payload `ValueType`.  `None` when the
