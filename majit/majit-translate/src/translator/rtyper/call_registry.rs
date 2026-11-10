@@ -826,6 +826,11 @@ impl CallRegistry {
             if reg.fields.contains_key(&qualified_owner)
                 && !reg.owner_or_variant_has_field(&qualified_owner, method)
             {
+                // rlist.py ListRepr / listdef.py ListDef: Vec methods are
+                // not class attributes (`newlist` / residual HostObject).
+                if crate::front::semantic::is_list_family_spelling(&qualified_owner) {
+                    continue;
+                }
                 let class_host = self.bookkeeper.intern_class_by_qualname(&qualified_owner);
                 class_host.class_set(
                     method.clone(),

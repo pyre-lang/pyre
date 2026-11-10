@@ -4531,6 +4531,11 @@ pub fn load_super_attr_value(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn getname_u(&self, index: usize) -> Result<&'static str, PyError> {
+        let w_name = unsafe { crate::pycode::w_code_getname_w(self.getcode_w(), index) };
+        crate::baseobjspace::text_w(w_name)
+    }
+
     /// The generic default walks `small_int_constant` → `int_constant`
     /// → `w_int_new` and writes a translator-local `&INT_TYPE`.
     fn load_small_int(&mut self, value: i64) -> Result<(), PyError> {

@@ -1704,7 +1704,7 @@ pub unsafe fn function_get_code(obj: PyObjectRef) -> *const () {
 /// `obj` must point to a valid `Function` whose `code` field is a `PyCode`
 /// (i.e., NOT a BuiltinCode). Only call on user-defined functions.
 #[inline]
-pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
+pub unsafe fn get_pycode(obj: PyObjectRef) -> *const crate::CodeObject {
     unsafe {
         let code = getcode(obj);
         debug_assert!(

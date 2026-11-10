@@ -1224,7 +1224,10 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 ///   annotates `SomeString` (`annotator/model.py` `SomeString`,
 ///   `no_nul=False`). Dropping that root minted the classdef-less Instance
 ///   `pairtype(SomeObject, SomeObject).union` cannot join with
-///   `String::new()` (`binaryop.py`);
+///   `String::new()` (`binaryop.py`). An Opaque Vec leaf
+///   (`is_list_container_spelling` / `is_list_family_spelling`) keeps
+///   `Ref(Some("Vec<…>"))` so the residual is `SomeList` (`rlist.py`
+///   `ListRepr`, `listdef.py` `ListDef`);
 /// - output is a payload-carrying enum (`GcAllocOutcome`) →
 ///   `Ref(Some(root))`, the intern key a caller `match` on
 ///   `Allocated`/`Failed`/`NoRoute` getattr's `__discriminant` through;
@@ -1467,7 +1470,9 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   (`no_nul=False`). Dropping it to
         //   `Ref(None)` minted the classdef-less Instance
         //   `pairtype(SomeObject, SomeObject).union` cannot join with
-        //   `String::new()` (`binaryop.py`);
+        //   `String::new()` (`binaryop.py`). An Opaque Vec leaf keeps
+        //   the uninterned spelling so the shell projects SomeList
+        //   (`rlist.py` `ListRepr`);
         // - the result is a payload-carrying enum (`GcAllocOutcome`)
         //   whose class root `tyref_to_value_type` already painted →
         //   keep `Ref(Some(root))` so registration intern's the
@@ -1488,7 +1493,20 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                     })
                 });
             match &td.kind {
-                TypeDeclKind::Opaque => Some(ValueType::Ref(str_family_root)),
+                TypeDeclKind::Opaque => {
+                    // rlist.py ListRepr / listdef.py ListDef: an Opaque Vec
+                    // residual is a list, not an opaque GcRef. Keep the
+                    // uninterned leaf so `foreign_opaque_method_return_shell`
+                    // / `declared_return_annotation` project SomeList.
+                    let ast = tyref_to_ast_string(output, llbc);
+                    if majit_ir::descr::is_list_container_spelling(&ast)
+                        || crate::front::semantic::is_list_family_spelling(&ast)
+                    {
+                        Some(ValueType::Ref(Some(ast)))
+                    } else {
+                        Some(ValueType::Ref(str_family_root))
+                    }
+                }
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
                     root.map(|r| ValueType::Ref(Some(r)))
                 }
@@ -12967,6 +12985,12 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     llbc: &Llbc,
     layout: &str,
 ) -> Option<String> {
+    // rlist.py ListRepr / listdef.py ListDef: a list-container layout
+    // keeps the uninterned leaf (`Vec<u8>`). Rewriting it to a harvest
+    // class identity would mint a ClassDef.
+    if crate::front::semantic::is_list_family_spelling(layout) {
+        return None;
+    }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     if adt.get("builtin").is_some_and(|b| !b.is_null()) {
@@ -12978,6 +13002,9 @@ pub(in crate::front::mir) fn field_row_struct_identity(
         return None;
     }
     let name_path = td.item_meta.name_path();
+    if crate::front::semantic::is_list_family_spelling(&name_path) {
+        return None;
+    }
     let leaf = name_path.rsplit("::").next().unwrap_or(&name_path);
     let layout_base = layout.split('<').next().unwrap_or(layout);
     if layout_base != leaf {

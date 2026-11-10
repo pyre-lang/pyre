@@ -3869,6 +3869,14 @@ fn declared_return_annotation(
         if matches!(projected, crate::annotator::model::SomeValue::RustVec(_)) {
             return Some(projected);
         }
+        // rlist.py ListRepr / listdef.py ListDef: a list-family
+        // `return_container_root` is SomeList, not the opaque `Ref(None)`
+        // shell `foreign_opaque_method_return_shell` would mint.
+        if crate::front::semantic::is_list_family_spelling(spelling)
+            && matches!(projected, crate::annotator::model::SomeValue::List(_))
+        {
+            return Some(projected);
+        }
     }
     // An unsafe `*mut` registered-GC-struct declaration can leave
     // `return_type` unstamped (`stamp_return_token` is false) while
@@ -3950,6 +3958,9 @@ fn declared_return_annotation(
         projected,
         crate::annotator::model::SomeValue::Ptr(_) | crate::annotator::model::SomeValue::List(_)
     ) {
+        return Some(projected);
+    }
+    if crate::front::semantic::is_list_family_spelling(root) {
         return Some(projected);
     }
     let classdef = bk
@@ -5161,6 +5172,19 @@ fn foreign_opaque_method_return_shell(
             return Some(crate::annotator::model::s_str());
         }
         let bk = registry.bookkeeper();
+        // rlist.py ListRepr / listdef.py ListDef: project a list-family
+        // root as SomeList. Interning it would mint a ClassDef.
+        let projected = bk.project_struct_field_type(root);
+        if matches!(
+            projected,
+            crate::annotator::model::SomeValue::List(_)
+                | crate::annotator::model::SomeValue::RustVec(_)
+        ) {
+            return Some(projected);
+        }
+        if crate::front::semantic::is_list_family_spelling(root) {
+            return Some(projected);
+        }
         let host = bk.intern_class_by_qualname(root);
         if let Ok(classdef) = bk.getuniqueclassdef(&host) {
             return Some(crate::annotator::model::SomeValue::Instance(

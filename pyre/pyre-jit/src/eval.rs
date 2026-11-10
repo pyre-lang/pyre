@@ -8248,6 +8248,8 @@ fn drive_portal_metatrace(
             let stb = interpret_abort_switch_to_blackhole(meta);
             run_blackhole_interp_to_cancel_tracing(meta, stb)
         }
+        // `_compile_and_run_once` `except SwitchToBlackhole as stb: self.run_blackhole_interp_to_cancel_tracing(stb)`
+        TraceAction::SwitchToBlackhole(stb) => run_blackhole_interp_to_cancel_tracing(meta, stb),
         other => panic!("unexpected portal tracing action: {other:?}"),
     };
     eprintln!("[jd0-mt] blackhole outcome={outcome:?}");
@@ -13347,10 +13349,13 @@ fn compile_and_run_once(
         target_pc,
         "target_pc must already be skip_caches-normalized at the green-key hash site"
     );
-    // A body that stopped lowering at an `abort_permanent` carries no entry for
-    // the greens behind the abort, so the hot loop header has none.  There is
-    // no coordinate to start the walk from; interpret instead.
+    // pyjitpl.py `_compile_and_run_once` walks `mainjitcode` from pc 0
+    // (`initialize_state_from_start` / `setup_call`). `target_pc` is the
+    // portal green `next_instr`, not a JitCode offset.
     //
+    // The walker arm still needs a per-function PyJitCode `-live-`. A body
+    // that stopped lowering at an `abort_permanent` carries no entry for
+    // the greens behind the abort, so the hot loop header has none.
     // Function-entry is the live `next_instr` of `interp_jit.py` `dispatch`.
     // `warmstate.py` `maybe_compile_and_run` (`increment_function_threshold`)
     // starts `pyjitpl.py` `compile_and_run_once` there, and a resumed
@@ -13360,13 +13365,19 @@ fn compile_and_run_once(
     // the inlined generator resume already uses (`derive_resume_marker`);
     // bump 21 only when that also fails. Do not publish resume pcs into
     // `merge_entry_by_green` — the inlined FOR_ITER path must not see them.
-    let entry = match start {
-        CompileOnceStart::BackEdge => pjc.merge_entry_for(target_pc),
-        CompileOnceStart::FunctionEntry => pjc.function_entry_for(target_pc),
-    };
-    let Some(entry) = entry else {
-        majit_metainterp::mc_diag_bump(21);
-        return None;
+    let interpret = portal_interpret_enabled();
+    let entry = if interpret {
+        None
+    } else {
+        let entry = match start {
+            CompileOnceStart::BackEdge => pjc.merge_entry_for(target_pc),
+            CompileOnceStart::FunctionEntry => pjc.function_entry_for(target_pc),
+        };
+        let Some(entry) = entry else {
+            majit_metainterp::mc_diag_bump(21);
+            return None;
+        };
+        Some(entry)
     };
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
@@ -13390,14 +13401,12 @@ fn compile_and_run_once(
     // Virtualizable boxes were already seeded by `setup_tracing`.
     // The `trace_bytecode` arm keeps the previous seed: one root frame
     // and no `setup_call` (`rebuild_portal_framestack_from_resume`).
-    let interpret = portal_interpret_enabled();
     if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
         let meta = driver.meta_interp_mut();
         if interpret {
             let boxes = portal_original_boxes(meta, frame_root.frame(), target_pc, &portal);
             meta.seed_root_portal_frame(portal, &boxes);
-            meta.seat_root_portal_at(entry);
-        } else {
+        } else if let Some(entry) = entry {
             meta.rebuild_portal_framestack_from_resume(portal, &[entry as i32]);
         }
     }
@@ -16552,7 +16561,10 @@ fn replay_pending_fields(
         // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
         // every ref is GC-tracked so ordering does not matter. `setfield`
         // / `setarrayitem` then decode the value again from the tag
-        // (`ResumeDataDirectReader.decode_ref`).
+        // (`ResumeDataDirectReader.decode_ref`). The decoded struct is
+        // the SETFIELD_GC / SETARRAYITEM_GC target
+        // (`heap.py force_lazy_sets_for_guard`, `_add_pending_fields`)
+        // and is never NULL.
         let (addr, value_type, value_size, target_ptr, value_raw) = if pf.item_index < 0 {
             let fd = field_descr.as_field_descr().expect(
                 "resume.py `_prepare_pendingfields`: setfield pending field \
@@ -16577,9 +16589,14 @@ fn replay_pending_fields(
                 virtuals_cache,
                 Some(&failarg_refs),
             );
-            if struct_ptr.is_null() {
-                continue;
-            }
+            assert!(
+                !struct_ptr.is_null(),
+                "resume.py `_prepare_pendingfields`: pending-field target \
+                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+                pf.target_tagged,
+                pf.item_index,
+                field_descr,
+            );
             let value_raw = decode_pending_value(
                 pf.value_tagged,
                 fd.field_type(),
@@ -16622,9 +16639,14 @@ fn replay_pending_fields(
                 virtuals_cache,
                 Some(&failarg_refs),
             );
-            if struct_ptr.is_null() {
-                continue;
-            }
+            assert!(
+                !struct_ptr.is_null(),
+                "resume.py `_prepare_pendingfields`: pending-field target \
+                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+                pf.target_tagged,
+                pf.item_index,
+                field_descr,
+            );
             let value_raw = decode_pending_value(
                 pf.value_tagged,
                 ad.item_type(),
