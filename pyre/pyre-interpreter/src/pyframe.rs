@@ -2165,9 +2165,10 @@ impl FrameBox {
         // `w_generator_new` allocates and may trigger a collection. Until the
         // generator owns `frame_ptr` (and its custom trace greys the frame
         // block), the frame is an RPython allocation result still live in the
-        // translated caller.  Publish both the managed frame itself and the
-        // locals slot (the latter also covers the std::alloc fallback frame)
-        // across that allocation.
+        // translated caller (`pyframe.py` `initialize_as_generator`;
+        // `shadowstack.py` `push_roots` / `pop_roots`). Pin the frame object;
+        // `pyframe_object_custom_trace` visits `locals_cells_stack_w`. An
+        // unmanaged fallback keeps the interior locals slot.
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
@@ -2348,42 +2349,73 @@ impl Drop for FrameBox {
     }
 }
 
-/// RAII guard registering a frame's `locals_cells_stack_w` slot as a GC root
-/// for the duration of an allocating frame-setup step. Mirrors the callee-locals
-/// root the eval path holds in `call.rs`: during setup the freshly-installed
-/// locals/cells live only in that array, so an intervening collection would
-/// drop or mis-forward them unless the slot is rooted.
+/// RAII pin of a `PyFrame` across an allocating setup / eval step.
 ///
-/// The guard stores the frame, not the field address. `jtransform.py`
-/// `rewrite_op_getsubstruct` refuses a GC interior in the Ref bank — the
-/// gcmap would treat `frame+offset` as its own object. Computing the slot
-/// only inside residual helpers keeps that address out of compiled slots.
+/// `pyframe.py` `locals_cells_stack_w` is an ordinary list field of `PyFrame`;
+/// `pyframe_object_custom_trace` visits it. Upstream keeps the frame as a
+/// GCREF local (`shadowstack.py` `push_roots` / `pop_roots`); this guard is
+/// that livevar. `jtransform.py` `rewrite_op_getsubstruct` refuses a GC
+/// interior in the Ref bank, so a collector-owned frame never registers
+/// `frame+offset` as a root.
+///
+/// An unmanaged frame (`FrameBox::new_boxed`, a stack `PyFrame`) is not a
+/// GCREF. Its locals array is then rooted through the field slot until those
+/// frames become managed.
 pub struct FrameLocalsRoot {
     frame: *mut PyFrame,
+    /// Shadow-stack livevar of the frame object (`OwnerRootGuard` /
+    /// `shadowstack.py` `push_roots`). Set for a collector-owned frame.
+    pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// Interior `locals_cells_stack_w` root for an unmanaged frame only.
     registered: bool,
 }
 
 impl FrameLocalsRoot {
     #[majit_macros::dont_look_inside]
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
-        let registered = unsafe { register_frame_locals_slot(frame_ptr) };
-        Self {
-            frame: frame_ptr,
-            registered,
+        if frame_ptr.is_null() {
+            return Self {
+                frame: frame_ptr,
+                pin: None,
+                registered: false,
+            };
+        }
+        // `try_gc_owns_object` is an address-range check (`gc_owns_object`),
+        // not a collection. A collector-owned frame is pinned as the GCREF
+        // local; an unmanaged frame keeps the interior locals slot.
+        if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF) {
+            Self {
+                frame: frame_ptr,
+                pin: Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                    majit_ir::GcRef(frame_ptr as usize),
+                )),
+                registered: false,
+            }
+        } else {
+            let registered = unsafe { register_frame_locals_slot(frame_ptr) };
+            Self {
+                frame: frame_ptr,
+                pin: None,
+                registered,
+            }
         }
     }
 }
 
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
+        // `OwnerRootGuard` Drop releases the livevar (`shadowstack.py` `pop_roots`).
+        self.pin.take();
         if self.registered {
             unregister_frame_locals_slot(self.frame);
         }
     }
 }
 
-/// `addr_of_mut!(locals_cells_stack_w)` is an interior address. Residual so a
-/// compiled gcmap cannot mark it as a GCREF (`rewrite_op_getsubstruct`).
+/// Interior `locals_cells_stack_w` root for an unmanaged frame. Residual so a
+/// compiled gcmap cannot mark `frame+offset` as a GCREF
+/// (`jtransform.py` `rewrite_op_getsubstruct`). Collector-owned frames use
+/// [`FrameLocalsRoot`]'s object pin instead.
 #[majit_macros::dont_look_inside]
 pub unsafe fn register_frame_locals_slot(frame_ptr: *mut PyFrame) -> bool {
     let slot = unsafe {
@@ -6758,10 +6790,11 @@ impl PyFrame {
             majit_metainterp::jit::hint_access_directly(frame),
         );
         {
-            // The globals store and the scope binding allocate. A collection
-            // forwards the pin slot, not the field of this unboxed frame, so
-            // register the field's slot for the span, as `createframe_obj` does
-            // around `initialize_frame_scopes`.
+            // This constructor still holds an unboxed stack `PyFrame`, not a
+            // GCREF. A collection forwards `_roots`, not the native field, so
+            // `FrameLocalsRoot` keeps the interior `locals_cells_stack_w` slot
+            // (`register_frame_locals_slot`) for the span; the frame object
+            // cannot be pinned until `FrameBox::new`.
             let _locals_root = FrameLocalsRoot::new(&mut frame);
             if frame_stores_global {
                 if let Err(err) = frame.set_w_globals(_roots.get(root_base + 1)) {
@@ -7262,13 +7295,13 @@ pub fn createframe_obj(
     // arm and binds `w_locals = w_globals` per pyframe.py.
     let outer_ref = _roots.get(root_base + 2);
     // initialize_frame_scopes allocates (the locals dict and `w_cell_new`
-    // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
-    // a collection mid-init can't drop the cells already written there.
+    // cells) and stores the cells into `locals_cells_stack_w`.
     {
-        // The owned Rust `FrameBox` is not itself visible to the collector.
-        // RPython keeps the freshly allocated frame as a livevar across these
-        // initialization allocations, so expose the frame object alongside
-        // the separately registered locals-array field.
+        // `pyframe.py` `__init__` / `initialize_frame_scopes` keep `self` as a
+        // GCREF local (`shadowstack.py` `push_roots` / `pop_roots`).
+        // `FrameBox::owner_root` is that livevar; `FrameLocalsRoot` pins the
+        // same frame object. `pyframe_object_custom_trace` visits
+        // `locals_cells_stack_w`.
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());

@@ -942,6 +942,9 @@ fn try_commit_midbody_abort_inner(
         }
     };
     frame.fix_array_ptrs();
+    // `FrameBox::owner_root` already keeps the frame; this pin is the
+    // `shadowstack.py` `push_roots` livevar `Function.call_args` holds.
+    // `pyframe_object_custom_trace` visits `locals_cells_stack_w`.
     let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
 
     let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =
