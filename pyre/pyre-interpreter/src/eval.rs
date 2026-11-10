@@ -2741,9 +2741,9 @@ pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
 }
 
 /// The frame passed here is a `FrameBox` frame that a minor collection does
-/// not move. A JIT nursery frame is resumed through `eval_loop_jit`, which
-/// reloads it from the top shadow-stack root after a collecting call
-/// (`shadowstack.py` `ShadowStackFrameworkGCTransformer.pop_roots`).
+/// not move. After every collecting call the loop still re-reads it from its
+/// `FrameAnchor` slot (`shadowstack.py` `pop_roots`), matching
+/// `eval_loop_jit`. A JIT nursery frame is resumed through `eval_loop_jit`.
 fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
@@ -2756,12 +2756,10 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
     // handler runs at depth 2 with that handler suspended. Operands stay on
     // the frame value stack or are pinned (`with_roots!`), the interpreter
     // frame is a `FrameBox` (young-nonmoving), and the result push goes
-    // through `FrameAnchor`; a handler that writes the frame after a
-    // collecting call through the pre-call `&mut` relies on the frame not
-    // moving. Upstream roots every live variable around a collecting call
-    // and reloads it (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
-    // `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
-    // `pop_roots`). No-op when the flag is off.
+    // through `FrameAnchor`. This loop reloads the frame from its
+    // `FrameAnchor` slot after each collecting call (`framework.py`
+    // `gct_direct_call`, `shadowstack.py` `push_roots` / `pop_roots`).
+    // No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     if _eval_activation.armed() {
         // Publish the process-stable configuration in the breaker word once
@@ -2781,14 +2779,19 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
     } else {
         install_current_frame_tls_only(frame)
     };
+    // Publish the running frame as the top shadow-stack root so collecting
+    // calls rewrite it in place (`framework.py` `gct_direct_call`). Nested
+    // opcode `FrameAnchor`s pop before this loop reads the slot.
+    let frame_anchor = FrameAnchor::new(frame);
+    let mut f = frame as *mut PyFrame;
     // `pyframe.py execute_frame` passes `self.pycode` into `dispatch`;
     // this loop fuses that field with `co_code = pycode.co_code`.
     // `getcode` is `hint(self.pycode, promote=True)` so the instruction
     // stream is green, the way the portal takes `pycode` as a green.
     // The compiler `CodeObject` is not a GC object; take a pointer so
     // the borrow does not keep `frame` frozen across the dispatch loop.
-    let code = unsafe { &*(frame.getcode() as *const crate::CodeObject) };
-    let mut next_instr = frame.next_instr();
+    let code = unsafe { &*((*f).getcode() as *const crate::CodeObject) };
+    let mut next_instr = unsafe { &*f }.next_instr();
 
     loop {
         if next_instr >= code.instructions.len() {
@@ -2796,15 +2799,16 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
         }
 
         let mut pc = next_instr;
-        frame.last_instr = pc as isize;
+        unsafe { &mut *f }.last_instr = pc as isize;
         // pypy/interpreter/pyopcode.py dispatch_bytecode, non-jitted arm:
         //   self.last_instr = intmask(next_instr)
         //   bytecode_only_trace only when a tracer (or reverse debugging) is
         //   installed; otherwise decrement_ticker, and action_dispatcher only
         //   once that goes negative. next_instr is reloaded only after those.
         if !ec.is_null() {
-            if frame.take_failed_attr_before_opcode() {
+            if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec).run_failed_attr_finalizers() };
+                f = frame_anchor.live();
             }
             // `pyopcode.py` `dispatch_bytecode` calls `bytecode_only_trace`
             // only when a tracer is installed, and reloads `next_instr` from
@@ -2812,29 +2816,28 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
             // `get_w_f_trace` stays off the no-tracer path.
             let needs_trace = unsafe { !(*ec).w_tracefunc().is_null() };
             if needs_trace {
-                let trace_result = unsafe {
-                    (*ec).bytecode_trace(
-                        frame as *mut PyFrame,
-                        crate::executioncontext::TICK_COUNTER_STEP,
-                    )
-                };
+                let trace_result =
+                    unsafe { (*ec).bytecode_trace(f, crate::executioncontext::TICK_COUNTER_STEP) };
                 // `handle_bytecode` wraps `dispatch_bytecode` in the same
                 // `except OperationError` that routes an opcode error through
                 // `handle_operation_error`. A signal delivered from
                 // `bytecode_trace` must search this frame's exception blocks
                 // at `last_instr`.
                 if let Err(mut err) = trace_result {
-                    if handle_exception(frame, &mut err, &mut next_instr) {
+                    f = frame_anchor.live();
+                    if handle_exception(unsafe { &mut *f }, &mut err, &mut next_instr) {
+                        f = frame_anchor.live();
                         continue;
                     }
                     return Err(err);
                 }
+                f = frame_anchor.live();
                 // `pyopcode.py dispatch_bytecode`: `next_instr = r_uint(self.last_instr)`
                 // then dispatch that opcode in this iteration. A line callback
                 // that jumped via `f_lineno` must not re-enter `bytecode_trace`
                 // for the landing instruction.
-                if frame.last_instr as usize != pc {
-                    next_instr = frame.last_instr as usize;
+                if unsafe { &*f }.last_instr as usize != pc {
+                    next_instr = unsafe { &*f }.last_instr as usize;
                     pc = next_instr;
                 }
             } else {
@@ -2843,14 +2846,17 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
                     crate::executioncontext::TICK_COUNTER_STEP as isize,
                 );
                 if ticker < 0 {
-                    if let Err(mut err) = unsafe { (*ec).perform_actions(frame) } {
-                        if handle_exception(frame, &mut err, &mut next_instr) {
+                    if let Err(mut err) = unsafe { (*ec).perform_actions(f) } {
+                        f = frame_anchor.live();
+                        if handle_exception(unsafe { &mut *f }, &mut err, &mut next_instr) {
+                            f = frame_anchor.live();
                             continue;
                         }
                         return Err(err);
                     }
-                    if frame.last_instr as usize != pc {
-                        next_instr = frame.last_instr as usize;
+                    f = frame_anchor.live();
+                    if unsafe { &*f }.last_instr as usize != pc {
+                        next_instr = unsafe { &*f }.last_instr as usize;
                         pc = next_instr;
                     }
                 }
@@ -2858,16 +2864,18 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
         } else {
             // No EC means no ticker, so this frame polls the breaker word
             // itself, the interpreter GC poll included.
-            if let Err(mut err) = crate::executioncontext::service_eval_breaker(
-                std::ptr::null_mut(),
-                frame as *mut PyFrame,
-            ) {
-                if handle_exception(frame, &mut err, &mut next_instr) {
+            if let Err(mut err) =
+                crate::executioncontext::service_eval_breaker(std::ptr::null_mut(), f)
+            {
+                f = frame_anchor.live();
+                if handle_exception(unsafe { &mut *f }, &mut err, &mut next_instr) {
+                    f = frame_anchor.live();
                     continue;
                 }
                 return Err(err);
             }
             pyre_object::gc_interp::dispatch_safepoint(majit_ir::eval_breaker_word::load());
+            f = frame_anchor.live();
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_forward(code, pc)?;
         let fallthrough = opcode_pc + 1;
@@ -2877,10 +2885,16 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
         // `next_instr()` (= last_instr + 1) lands at `fallthrough` rather than
         // re-dispatching the opcode unit that trailed an EXTENDED_ARG.
         // Mirrors interp_jit.py dispatch (`set_last_instr_from_next_instr`).
-        frame.set_last_instr_from_next_instr(fallthrough);
-        match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
+        unsafe { &mut *f }.set_last_instr_from_next_instr(fallthrough);
+        let step_result =
+            execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, fallthrough);
+        // `execute_opcode_step` is a collecting call (`framework.py`
+        // `gct_direct_call`); `shadowstack.py` `pop_roots` rewrites the
+        // frame before the next use.
+        f = frame_anchor.live();
+        match step_result {
             Ok(StepResult::Continue) | Ok(StepResult::CloseLoop { loop_header_pc: _ }) => {
-                next_instr = frame.next_instr();
+                next_instr = unsafe { &*f }.next_instr();
             }
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => {
@@ -2888,11 +2902,12 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
                 // frame outlives this portal invocation, so eagerly publish
                 // its redirected fields. Ordinary Return deliberately keeps
                 // the FORCE_TOKEN/GUARD_NOT_FORCED_2 lazy protocol.
-                let _ = majit_metainterp::jit::hint_force_virtualizable(frame as *mut PyFrame);
+                let _ = majit_metainterp::jit::hint_force_virtualizable(f);
                 return Ok(result);
             }
             Err(mut err) => {
-                if handle_exception(frame, &mut err, &mut next_instr) {
+                if handle_exception(unsafe { &mut *f }, &mut err, &mut next_instr) {
+                    f = frame_anchor.live();
                     continue;
                 }
                 return Err(err);
@@ -4072,7 +4087,10 @@ impl IterOpcodeHandler for PyFrame {
         // self.space.next(w_iterator)`); the JIT specialises range/long-range/
         // seq by inlining this dispatch during tracing (trace_opcode.rs
         // iter_next), not by branching the interpreter opcode implementation.
-        match pyre_object::with_roots!(iter => crate::baseobjspace::next(iter)) {
+        // `self` is a translated livevar across that collecting call
+        // (`framework.py` `gct_direct_call`, `shadowstack.py` `pop_roots`).
+        let mut self_ref = self as *mut PyFrame as PyObjectRef;
+        match pyre_object::with_roots!(iter, self_ref => crate::baseobjspace::next(iter)) {
             Ok(result) => Ok(Some(result)),
             Err(e) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
@@ -4080,7 +4098,7 @@ impl IterOpcodeHandler for PyFrame {
                 let _ = pyre_object::gc_roots::pin_root(iter);
                 let (stop, mut e) = e.matches_stop_iteration_keep();
                 if stop {
-                    self._report_stopiteration_sometimes(
+                    unsafe { &mut *(self_ref as *mut PyFrame) }._report_stopiteration_sometimes(
                         pyre_object::gc_roots::shadow_stack_get(iter_slot),
                         &mut e,
                     )?;

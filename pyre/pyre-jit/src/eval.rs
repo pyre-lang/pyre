@@ -11955,6 +11955,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
+        // `execute_opcode_step` is a collecting call (`framework.py`
+        // `gct_direct_call`); `shadowstack.py` `pop_roots` rewrites the red
+        // frame before the next use of `f`.
+        f = reload_loop_frame!(f, root_slot);
         match step_result {
             // `blackhole_if_trace_too_long` belongs to the tracer's own
             // stepping loop (`pyjitpl.py _interpret`, which drives
