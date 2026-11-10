@@ -5708,7 +5708,10 @@ impl Bookkeeper {
         // the whole block as `SomeList` made `getattr` of the length
         // header die and shared one `ListDef` of the storage word
         // (`index_at` Integer∪PyObject, `float_array` Float vs Signed).
-        // Object/struct-item tails (`ItemsBlock` / `GcEntries`) keep the
+        // A raw STRUCT ITEM is `GcArray(DICTENTRY)`: intern is
+        // `SomePtr(Ptr(GcArray(ITEM_STRUCT)))` so getattr, setattr, and
+        // rtype_getattr share one annotation (`llannotation.py` `SomePtr`).
+        // Object-item tails (`ItemsBlock` `[PyObjectRef; 0]`) keep the
         // `FixedSizeListRepr` list whose `ll_items` is identity. That
         // list identity is `ClassDef.attrs[items_field].s_value`; a
         // SomePtr owner must not reuse it.
@@ -5727,6 +5730,16 @@ impl Bookkeeper {
         });
         if let Some((items_field, items_ty)) = items_field {
             if let Some(s_ptr) = flexible_gcarray_block_annotation(&items_ty) {
+                return s_ptr;
+            }
+            if let Some(s_ptr) = {
+                let guard = self.struct_fields.borrow();
+                guard.as_ref().and_then(|reg| {
+                    crate::front::mir::struct_item_flexible_gcarray_block_annotation(
+                        reg, stripped, &items_ty,
+                    )
+                })
+            } {
                 return s_ptr;
             }
             // A byte tail is not `FixedSizeListRepr` of Unsigned: ITEM
@@ -9969,12 +9982,63 @@ mod tests {
         );
     }
 
+    fn assert_struct_item_gcarray_ptr(s: &SomeValue, spelling: &str) {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let SomeValue::Ptr(ptr) = s else {
+            panic!("{spelling} must project to SomePtr(GcArray(STRUCT)), got {s:?}")
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Array(arr) => match &arr.OF {
+                LowLevelType::Struct(st) => assert!(
+                    st.getattr_field_type("f_valid").is_some(),
+                    "{spelling} ITEM STRUCT must have f_valid"
+                ),
+                other => panic!("{spelling} ITEM must be STRUCT, got {other:?}"),
+            },
+            other => panic!("{spelling} must be Ptr(GcArray), got {other:?}"),
+        }
+    }
+
     #[test]
-    fn gc_entries_projects_to_dictentryarray_list() {
+    fn project_struct_field_type_struct_item_flexible_gcarray_is_ptr() {
         // `DICTENTRYARRAY = GcArray(DICTENTRY)` (`rordereddict.py`).
-        // `entry_valid` is `entries[i].f_valid`; a SomeInstance receiver
-        // rewrites that index to getattr `__getitem__` and Blocks.
-        use crate::annotator::model::SomeValue;
+        // A declared two-field `{integer, [STRUCT; 0]}` intern is
+        // `SomePtr`, so `entries[i].f_valid` is SomePtr getitem then
+        // getinteriorfield (`ll_valid_from_flag`).
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::SlotBlock".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                ("items".to_string(), "[storage::Slot; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Slot".to_string(),
+            vec![
+                ("f_valid".to_string(), "bool".to_string()),
+                ("key".to_string(), "i64".to_string()),
+                ("value".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["storage::SlotBlock", "SlotBlock"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in [
+            "storage::SlotBlock",
+            "*mut storage::SlotBlock",
+            "SlotBlock",
+            "*mut SlotBlock",
+        ] {
+            assert_struct_item_gcarray_ptr(&bk.project_struct_field_type(spelling), spelling);
+        }
+    }
+
+    #[test]
+    fn gc_entries_projects_to_dictentryarray_ptr() {
         use crate::front::StructFieldRegistry;
 
         let bk = bk();
@@ -9999,6 +10063,7 @@ mod tests {
             ],
         );
         note_declared_gc(&mut reg, &["rordereddict_entries::GcEntries", "GcEntries"]);
+        harvest_class_identity(&mut reg, "PyObject", &["PyObject"]);
         bk.set_struct_fields(Rc::new(reg));
 
         for spelling in [
@@ -10006,17 +10071,321 @@ mod tests {
             "*mut GcEntries<i64, *mut PyObject>",
             "rordereddict_entries::GcEntries<i64, *mut PyObject>",
             "*mut rordereddict_entries::GcEntries<i64, *mut PyObject>",
+            "*mut rordereddict_entries::GcEntries",
         ] {
-            let SomeValue::List(_) = bk.project_struct_field_type(spelling) else {
-                panic!("{spelling} must project to the DICTENTRYARRAY list")
+            assert_struct_item_gcarray_ptr(&bk.project_struct_field_type(spelling), spelling);
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_object_item_flexible_gcarray_stays_list() {
+        // `GcArray(ITEM)` of a GC object pointer (`rlist.py`
+        // `FixedSizeListRepr`) stays a list. A primitive-item wrapper
+        // stays `SomePtr` (`typed_items_block_projects_to_gcarray_ptr`).
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::ObjBlock".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        note_declared_gc(&mut reg, &["storage::ObjBlock", "ObjBlock"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in ["storage::ObjBlock", "*mut storage::ObjBlock"] {
+            let got = bk.project_struct_field_type(spelling);
+            let SomeValue::List(list) = got else {
+                panic!("{spelling} must stay SomeList, got {got:?}")
             };
+            assert!(
+                matches!(list.listdef.s_value(), SomeValue::Instance(_)),
+                "{spelling} object-item list must keep the instance item, got {:?}",
+                list.listdef.s_value()
+            );
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_struct_item_gcarray_uses_qualified_item_rows() {
+        // Harvest stores `[module::Entry<…>;0]`. Intern looks up that
+        // path; a second same-leaf `Entry` does not steal the rows.
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        reg.fields.insert(
+            "rordereddict_entries::GcEntries".to_string(),
+            gc_entries_rows.clone(),
+        );
+        reg.fields.insert("GcEntries".to_string(), gc_entries_rows);
+        reg.fields.insert(
+            "rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar#0".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "??TypeVar#1".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "counter::Entry".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        note_declared_gc(&mut reg, &["rordereddict_entries::GcEntries", "GcEntries"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in [
+            "GcEntries<i64, *mut u8>",
+            "*mut GcEntries<i64, *mut u8>",
+            "rordereddict_entries::GcEntries<i64, *mut u8>",
+        ] {
+            let got = bk.project_struct_field_type(spelling);
+            assert_struct_item_gcarray_ptr(&got, spelling);
+            match &got {
+                SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                    crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Array(arr) => {
+                        match &arr.OF {
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(
+                                st,
+                            ) => assert_eq!(
+                                st._name, "rordereddict_entries::Entry",
+                                "{spelling} ARRAY.OF must keep the harvest TypeDecl path"
+                            ),
+                            other => panic!("{spelling} ITEM must be STRUCT, got {other:?}"),
+                        }
+                    }
+                    other => panic!("{spelling} must be Ptr(GcArray), got {other:?}"),
+                },
+                other => panic!("{spelling} must be SomePtr, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_struct_item_gcarray_undecidable_field_declines() {
+        // A leftover `??` field cannot be guessed as a GC pointer. The
+        // arm returns None and intern stays the wrapping instance.
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::SlotBlock".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                ("items".to_string(), "[storage::Slot; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Slot".to_string(),
+            vec![
+                ("f_valid".to_string(), "bool".to_string()),
+                ("payload".to_string(), "??unresolved".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["storage::SlotBlock", "SlotBlock"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in ["storage::SlotBlock", "*mut storage::SlotBlock"] {
+            let got = bk.project_struct_field_type(spelling);
+            if let SomeValue::Ptr(ptr) = &got {
+                assert!(
+                    !matches!(ptr.ll_ptrtype.TO, PtrTarget::Array(_)),
+                    "{spelling} undecidable ITEM field must decline GcArray intern, got {got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_entries_getitem_rtypes_interior_field() {
+        // Intern, getattr, and rtype_getattr of the array field are the
+        // same `Ptr(GcArray(STRUCT))`. getitem is `SomeInteriorPtr`;
+        // `.f_valid` rtypes as `getinteriorfield` (`rptr.py`
+        // `InteriorPtrRepr.rtype_getattr`, `ll_valid_from_flag`).
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeInteger, SomeString};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::rmodel::{InteriorPtrRepr, Repr};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::DictTable".to_string(),
+            vec![("entries".to_string(), "*mut storage::SlotBlock".to_string())],
+        );
+        reg.fields.insert(
+            "storage::SlotBlock".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                ("items".to_string(), "[storage::Slot; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Slot".to_string(),
+            vec![
+                ("f_valid".to_string(), "bool".to_string()),
+                ("key".to_string(), "i64".to_string()),
+                ("value".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["storage::SlotBlock"]);
+        ann.bookkeeper.set_struct_fields(Rc::new(reg));
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root("storage::DictTable")
+            .expect("DictTable intern");
+        let interned = ClassDef::about_attribute(&classdef, "entries").expect("entries intern");
+        assert_struct_item_gcarray_ptr(&interned, "DictTable.entries intern");
+
+        let mut table = Variable::named("table");
+        ann.setbinding(
+            &mut table,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl_get = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(table),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("entries"))),
+            ],
+        );
+        let s_entries = hl_get.consider(&ann).expect("getattr entries").unwrap();
+        match (&interned, &s_entries) {
+            (SomeValue::Ptr(intern_ptr), SomeValue::Ptr(get_ptr)) => {
+                assert_eq!(
+                    intern_ptr.ll_ptrtype, get_ptr.ll_ptrtype,
+                    "getattr of the interned field must be the interned SomePtr"
+                );
+            }
+            _ => panic!(
+                "intern and getattr must both be SomePtr, intern={interned:?} getattr={s_entries:?}"
+            ),
+        }
+        assert_struct_item_gcarray_ptr(&s_entries, "getattr entries");
+
+        let mut entries = Variable::named("entries");
+        ann.setbinding(&mut entries, s_entries.clone());
+        let mut idx = Variable::named("i");
+        ann.setbinding(&mut idx, SomeValue::Integer(SomeInteger::new(true, true)));
+        let hl_item = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(entries), Hlvalue::Variable(idx)],
+        );
+        let s_elem = hl_item.consider(&ann).expect("getitem entries").unwrap();
+        let SomeValue::InteriorPtr(iptr) = &s_elem else {
+            panic!("GcArray of STRUCT getitem must be SomeInteriorPtr, got {s_elem:?}");
+        };
+
+        let mut elem = Variable::named("elem");
+        ann.setbinding(&mut elem, s_elem.clone());
+        let hl_valid = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(elem),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("f_valid"))),
+            ],
+        );
+        let s_valid = hl_valid.consider(&ann).expect("getattr f_valid").unwrap();
+        assert!(
+            matches!(s_valid, SomeValue::Bool(_)),
+            "interior field f_valid must be SomeBool, got {s_valid:?}"
+        );
+
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let r_entries = rtyper
+            .getrepr(&s_entries)
+            .expect("rtype of interned entries");
+        assert_eq!(r_entries.class_name(), "PtrRepr");
+        match r_entries.lowleveltype() {
+            LowLevelType::Ptr(ptr) => match &ptr.TO {
+                PtrTarget::Array(arr) => match &arr.OF {
+                    LowLevelType::Struct(st) => assert!(
+                        st.getattr_field_type("f_valid").is_some(),
+                        "rtype_getattr of entries must be Ptr(GcArray(ENTRY))"
+                    ),
+                    other => panic!("rtype ITEM must be STRUCT, got {other:?}"),
+                },
+                other => panic!("rtype must be Ptr(GcArray), got {other:?}"),
+            },
+            other => panic!("rtype must be Ptr, got {other:?}"),
         }
 
-        let SomeValue::List(_) =
-            bk.project_struct_field_type("*mut rordereddict_entries::GcEntries")
-        else {
-            panic!("registry GcEntries pointer must project to its item list")
-        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.ll_ptrtype.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let r_bool = rtyper.getprimitiverepr(&LowLevelType::Bool).unwrap();
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "getattr".to_string(),
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f_valid")));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("f_valid"),
+                LowLevelType::Void,
+            )),
+        ]);
+        hop.args_s
+            .borrow_mut()
+            .extend([s_elem, SomeValue::String(s_attr)]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_iptr_dyn), Some(r_bool.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_bool);
+
+        let result = r_iptr
+            .rtype_getattr(&hop)
+            .expect("InteriorPtrRepr.rtype_getattr")
+            .expect("getinteriorfield result");
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "getinteriorfield"),
+            "entries[i].f_valid must rtype as getinteriorfield, ops={:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

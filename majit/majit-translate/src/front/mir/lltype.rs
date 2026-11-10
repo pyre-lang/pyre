@@ -13145,8 +13145,8 @@ fn unique_type_id_for_name_path(llbc: &Llbc, path: &str) -> Option<u64> {
 /// a substituted `__pos_0` hits a registry key that survives
 /// `harden_duplicate_leaf_metadata`: a fieldless enum is its discriminant
 /// integer, a transparent handle is `*mut` of its `Deref::Target`, a
-/// kept `&T` raw-storage argument is `*mut` of the pointee (interior
-/// `Ptr(T)`, `history.getkind` of `Ptr`), a pointer-niche Option is
+/// thin `Ref` onto a named ADT is `*mut` of the pointee (`descr.py`
+/// `get_type_flag` of a `Ptr`; fat `&str` / `&[T]` keep the CAST leaf), a pointer-niche Option is
 /// `*mut` of the payload pointee (the ROW is the nullable pointer word),
 /// a monomorphic named ADT is `strip_crate_prefix` of
 /// the TypeDecl path, and a generic instantiation keeps the CAST leaf render.
@@ -13173,27 +13173,38 @@ fn intern_type_arg_payload_spelling(
     let t = type_node_peel_aliases(t, llbc).unwrap_or(t);
     let numeric = intern_adt_node_with_numeric_id(t, llbc);
     let t = numeric.as_ref().unwrap_or(t);
-    // A kept `&T` raw-storage type argument is one interior pointer
-    // word (`history.getkind` of `Ptr`). Intern ROW is `*mut` of the
-    // pointee, the same lltype a first-struct / interior getattr of
-    // that field gives. A scalar / GC / str `&T` still strips.
-    // RawPtr already keeps `*mut` / `*const` in the leaf render.
-    if type_arg_referent_is_raw_storage(t, llbc, gc_struct_ids)
-        && let Some(pointee) = t
-            .as_object()
-            .and_then(|o| o.get("Ref"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.get(1))
+    // A thin `Ref` onto a named ADT is one pointer word (`descr.py`
+    // `get_type_flag` of a `Ptr`), including a declared-GC pointee.
+    // Intern ROW is `*mut` of the pointee so getattr of `__pos_0` is
+    // FLAG_POINTER / word-size, not FLAG_STRUCT of the TypeDecl path.
+    // Fat `&str` / `&[T]` / `&dyn` keep the CAST leaf (two words). A
+    // scalar or nested-pointer intern of the pointee keeps `&` so
+    // `&i32` is not `*mut i32` (FLAG_UNSIGNED) and `&&T` does not
+    // collapse. RawPtr already keeps `*mut` / `*const` in the leaf.
+    if let Some(pointee) = t
+        .as_object()
+        .and_then(|o| o.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
     {
-        let inner = intern_type_arg_payload_spelling(
-            pointee,
-            llbc,
-            depth,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-            tombstoned,
-        )?;
-        return Some(intern_pointer_payload_row(inner));
+        let fat = tyref_is_fat_ref(&TyRef::Other(t.clone()), llbc);
+        if !fat {
+            if let Some(inner) = intern_type_arg_payload_spelling(
+                pointee,
+                llbc,
+                depth,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                tombstoned,
+            ) {
+                let trimmed = inner.trim();
+                let nested_ptr = trimmed.starts_with('*') || trimmed.starts_with('&');
+                let scalar = crate::annotator::bookkeeper::scalar_lltype(trimmed).is_some();
+                if !nested_ptr && !scalar {
+                    return Some(intern_pointer_payload_row(inner));
+                }
+            }
+        }
     }
     let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
     if rendered == "Global" || rendered == "RandomState" {
@@ -14133,8 +14144,10 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
 /// leaf; two TypeDecls that share that leaf (`module::struct::Code`
 /// beside `eval::Code`) collide unless the row carries `name_path()`.
 /// `consider_struct` / `all_fielddescrs` / `get_field_descr` key on
-/// the STRUCT. Pointer, reference, array, and builtin layouts keep
-/// the spelling `tyref_to_field_layout_string` already produced.
+/// the STRUCT. An array-of-ADT layout qualifies the element the same
+/// way and reassembles `[path;N]`. Pointer, reference, and builtin
+/// layouts keep the spelling `tyref_to_field_layout_string` already
+/// produced.
 pub(in crate::front::mir) fn field_row_struct_identity(
     ty: &TyRef,
     llbc: &Llbc,
@@ -14145,6 +14158,17 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     // class identity would mint a ClassDef.
     if crate::front::semantic::is_list_family_spelling(layout) {
         return None;
+    }
+    if let Some((item, len)) = shaped_array_parts(layout) {
+        let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+        let elem = node.as_object()?.get("Array")?.as_array()?.first()?;
+        let elem_ty = TyRef::Other(elem.clone());
+        let qualified = field_row_struct_identity(&elem_ty, llbc, item)?;
+        return Some(if layout.trim_start().starts_with("Array<") {
+            format!("Array<{qualified};{len}>")
+        } else {
+            format!("[{qualified};{len}]")
+        });
     }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;
@@ -14185,6 +14209,232 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     Some(majit_ir::descr::canonical_struct_name(&format!(
         "{identity}{suffix}"
     )))
+}
+
+/// `SomePtr(GcArray(STRUCT))` for a declared two-field `{integer, [STRUCT; 0]}`
+/// wrapper (`rordereddict.py` `DICTENTRYARRAY = GcArray(DICTENTRY)`). A
+/// primitive ITEM is [`crate::annotator::bookkeeper::flexible_gcarray_block_annotation`].
+/// A pointer ITEM (`FixedSizeListRepr` of a W_Root / instance) stays the
+/// list path. `wrapper` supplies `??TypeVar#N` arguments for harvested
+/// generic rows; the array-of-ADT row already carries the TypeDecl path.
+pub(crate) fn struct_item_flexible_gcarray_block_annotation(
+    reg: &crate::front::StructFieldRegistry,
+    wrapper: &str,
+    items_ty: &str,
+) -> Option<crate::annotator::model::SomeValue> {
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
+
+    let items_ty = substitute_typevar_markers(items_ty, &spelling_type_args(wrapper));
+    if items_ty.contains("??") {
+        return None;
+    }
+    let (item, 0) = shaped_array_parts(&items_ty)? else {
+        return None;
+    };
+    if crate::front::typestr::peel_pointer_prefix(item).is_some() {
+        return None;
+    }
+    if spelling_is_declared_gc(&reg.gc_struct_ids, item) {
+        return None;
+    }
+    let mut visited = std::collections::HashSet::new();
+    let entry = raw_struct_array_item_lltype(reg, item, &mut visited)?;
+    Some(lltype_to_annotation(Ptr {
+        TO: PtrTarget::Array(Array::gc(entry)),
+    }))
+}
+
+fn spelling_type_args(spelling: &str) -> Vec<&str> {
+    let Some(start) = spelling.find('<') else {
+        return Vec::new();
+    };
+    let rest = &spelling[start + 1..];
+    let mut depth = 1i32;
+    for (i, &b) in rest.as_bytes().iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return split_top_level_type_args(rest[..i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest = spelling;
+    while let Some(idx) = rest.find("??TypeVar") {
+        out.push_str(&rest[..idx]);
+        rest = &rest[idx + "??TypeVar".len()..];
+        if let Some(digits) = rest.strip_prefix('#') {
+            let nlen = digits.chars().take_while(|c| c.is_ascii_digit()).count();
+            if nlen > 0 {
+                let n: usize = digits[..nlen].parse().unwrap_or(usize::MAX);
+                match args.get(n) {
+                    Some(arg) => out.push_str(arg),
+                    None => {
+                        out.push_str("??TypeVar#");
+                        out.push_str(&digits[..nlen]);
+                    }
+                }
+                rest = &digits[nlen..];
+                continue;
+            }
+        }
+        out.push_str("??TypeVar");
+    }
+    out.push_str(rest);
+    out
+}
+
+fn raw_struct_array_item_lltype(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+    let name = reg.resolved_owner_key(item)?;
+    if !visited.insert(name.clone()) {
+        return None;
+    }
+    let out = (|| {
+        let rows = reg.field_rows(item)?;
+        if rows.is_empty() {
+            return None;
+        }
+        let args = spelling_type_args(item);
+        let mut fields = Vec::with_capacity(rows.len());
+        for row in rows {
+            let ty = substitute_typevar_markers(&row.ty, &args);
+            fields.push((row.name.clone(), field_row_lltype(reg, &ty, visited)?));
+        }
+        // ARRAY.OF is the registry key `field_rows` already resolved for
+        // the harvest TypeDecl path stored on the `[ADT; N]` row
+        // (`field_row_struct_identity`). `get_array_descr` /
+        // `interiorfielddescrof` look that path up as `ARRAY.OF`, the same
+        // key a by-value ADT field uses.
+        Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
+            &name,
+            fields,
+            GcKind::Raw,
+        ))))
+    })();
+    visited.remove(&name);
+    out
+}
+
+fn field_row_lltype(
+    reg: &crate::front::StructFieldRegistry,
+    ty: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let t = ty.trim();
+    if t.starts_with("??") {
+        return None;
+    }
+    // Fat `&[T]` / `&str` / `&dyn Trait` (`fat_ptr_layout::spelling_is_fat_ptr`,
+    // the same unsized-pointee walk `tyref_is_fat_ref` uses on a TyRef).
+    if crate::fat_ptr_layout::spelling_is_fat_ptr(t) {
+        return None;
+    }
+    if let Some(ll) = crate::annotator::bookkeeper::scalar_lltype(t) {
+        return Some(ll);
+    }
+    if let Some(pointee) = crate::front::typestr::peel_pointer_prefix(t) {
+        let pointee = pointee.trim();
+        if pointee.starts_with("??") {
+            return None;
+        }
+        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
+            return Some((*GCREF).clone());
+        }
+        if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
+            return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
+        }
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
+            return Some((*GCREF).clone());
+        }
+        // Shared scalar mapping (`scalar_lltype`); a raw pointer to that
+        // scalar is the address word (`pointer_field_lltype`).
+        if crate::annotator::bookkeeper::scalar_lltype(pointee).is_some() {
+            return Some(LowLevelType::Address);
+        }
+        // List / fn-ptr already have their own seeds
+        // (`raw_ptr_pointee_is_non_adt_spelling`, a916).
+        if raw_ptr_pointee_is_non_adt_spelling(t, pointee) {
+            return None;
+        }
+        // Non-GC raw-storage ADT (`adt_def_is_raw_storage` /
+        // `raw_word_owners`, e9d3): `Ptr` of the harvested Raw struct.
+        if reg.raw_word_owner_contains(pointee) {
+            return pointer_to_raw_struct_lltype(reg, pointee, visited);
+        }
+        // Classed ADT / instance (`record_struct_id` `class_identity`,
+        // a916 `tyref_raw_ptr_to_classed_instance_spelling`): the
+        // instance pointer (`rclass.OBJECTPTR` / `fn_ptr_tyref_to_lltype`).
+        if spelling_has_class_identity(reg, pointee) {
+            return Some(OBJECTPTR.clone());
+        }
+        // Harvested rows without a class object (a fixture, or a
+        // declaration `record_struct_id` skipped): `Ptr` of that Raw
+        // struct (`llannotation.py` `lltype_to_annotation` of `Ptr`).
+        if reg.field_rows(pointee).is_some() {
+            return pointer_to_raw_struct_lltype(reg, pointee, visited);
+        }
+        return None;
+    }
+    if is_str_family_class_root(t) || is_rstr_str_layout_declaration(t) {
+        return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
+    }
+    if spelling_is_declared_gc(&reg.gc_struct_ids, t) {
+        return Some((*GCREF).clone());
+    }
+    if reg.field_rows(t).is_some() {
+        return raw_struct_array_item_lltype(reg, t, visited);
+    }
+    None
+}
+
+/// `Ptr` of the harvested Raw struct for `pointee`.
+fn pointer_to_raw_struct_lltype(
+    reg: &crate::front::StructFieldRegistry,
+    pointee: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    let container = raw_struct_array_item_lltype(reg, pointee, visited)?;
+    let to = match container {
+        LowLevelType::Struct(st) => PtrTarget::Struct(*st),
+        _ => return None,
+    };
+    Some(LowLevelType::Ptr(Box::new(Ptr { TO: to })))
+}
+
+/// Harvest wrote a class object for `pointee` (`record_struct_id` /
+/// `class_identity`). `Some(None)` is two declarations sharing a
+/// spelling (`Bookkeeper.getdesc` refuses to merge) — not classed.
+fn spelling_has_class_identity(reg: &crate::front::StructFieldRegistry, pointee: &str) -> bool {
+    let template = majit_ir::descr::strip_generic_args(pointee.trim());
+    let template = template.as_ref();
+    if template.is_empty() {
+        return false;
+    }
+    let canon = majit_ir::descr::canonical_struct_name(template);
+    let leaf = template.rsplit("::").next().unwrap_or(template);
+    let resolved = reg.resolved_owner_key(template);
+    [template, canon.as_str(), leaf]
+        .into_iter()
+        .chain(resolved.as_deref())
+        .any(|key| matches!(reg.class_identity.get(key), Some(Some(_))))
 }
 
 /// Format a Charon builtin ADT id (`Box`/`Slice`/`Str`/`Array`).

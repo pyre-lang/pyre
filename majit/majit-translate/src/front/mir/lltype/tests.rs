@@ -5148,6 +5148,65 @@ fn fixed_array_suffix_separates_item_type_and_length() {
 }
 
 #[test]
+fn field_row_struct_identity_qualifies_array_of_adt_element() {
+    // `charon_adt_to_ast_string` renders the ADT leaf, so a harvested
+    // `[Entry;0]` would collide with a second TypeDecl of the same leaf.
+    // The array-of-ADT row carries the TypeDecl path, the same way a
+    // by-value ADT field does.
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(0, &["host", "rordereddict_entries", "Entry"], vec![]),
+            type_decl_struct(1, &["host", "counter", "Entry"], vec![]),
+        ],
+        vec![],
+    );
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = TyRef::Other(serde_json::json!({
+        "Array": [
+            named_adt(
+                0,
+                vec![
+                    serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+                    serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+                ],
+            ),
+            array_len,
+            null
+        ]
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let layout = super::tyref_to_field_layout_string(&array_ty, &llbc, &gc, &raw);
+    assert_eq!(layout, "[Entry<??TypeVar#0,??TypeVar#1>;0]");
+    assert_eq!(
+        super::field_row_struct_identity(&array_ty, &llbc, &layout).as_deref(),
+        Some("[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]")
+    );
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let primitive = TyRef::Other(serde_json::json!({
+        "Array": [
+            i64_ty,
+            [
+                {"Integer": {"Unsigned": ["Usize", "0"]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ],
+            null
+        ]
+    }));
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    assert_eq!(primitive_layout, "[i64;0]");
+    assert_eq!(
+        super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
 fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
     let llbc = llbc_with_trait_impls(serde_json::json!([]));
     let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
@@ -13099,5 +13158,152 @@ fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
         token("f2"),
         Some("ref"),
         "Rust's erased managed-byte pointer is unchanged"
+    );
+}
+
+fn field_row_visited() -> std::collections::HashSet<String> {
+    std::collections::HashSet::new()
+}
+
+fn note_class_identity(reg: &mut crate::front::StructFieldRegistry, spelling: &str) {
+    let id = majit_ir::descr::StructId::from_canonical(spelling);
+    reg.class_identity.insert(
+        spelling.to_string(),
+        Some(crate::front::semantic::ClassIdentity {
+            id,
+            spelling: spelling.to_string(),
+        }),
+    );
+}
+
+fn slot_block_registry(value_ty: &str) -> crate::front::StructFieldRegistry {
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "storage::SlotBlock".to_string(),
+        vec![
+            ("length".to_string(), "usize".to_string()),
+            ("items".to_string(), "[storage::Slot; 0]".to_string()),
+        ],
+    );
+    reg.fields.insert(
+        "storage::Slot".to_string(),
+        vec![
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), value_ty.to_string()),
+        ],
+    );
+    reg.note_declared_gc_name("storage::SlotBlock");
+    reg
+}
+
+#[test]
+fn field_row_classed_pointer_is_objectptr() {
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    note_class_identity(&mut reg, "owner::Inst");
+    let got = super::field_row_lltype(&reg, "*mut owner::Inst", &mut field_row_visited())
+        .expect("classed pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+}
+
+#[test]
+fn field_row_unknown_pointer_declines() {
+    let reg = crate::front::StructFieldRegistry::default();
+    assert!(super::field_row_lltype(&reg, "*mut owner::Inst", &mut field_row_visited()).is_none());
+    assert!(
+        super::field_row_lltype(&reg, "*const owner::Inst", &mut field_row_visited()).is_none()
+    );
+    assert!(super::field_row_lltype(&reg, "&mut owner::Inst", &mut field_row_visited()).is_none());
+}
+
+#[test]
+fn field_row_fat_pointer_declines() {
+    let reg = crate::front::StructFieldRegistry::default();
+    assert!(super::field_row_lltype(&reg, "&[u8]", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "&dyn Trait", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "&str", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "*mut [u8]", &mut field_row_visited()).is_none());
+}
+
+#[test]
+fn field_row_scalar_pointer_is_address() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let reg = crate::front::StructFieldRegistry::default();
+    let got = super::field_row_lltype(&reg, "*mut u8", &mut field_row_visited())
+        .expect("scalar pointer field");
+    assert_eq!(got, LowLevelType::Address);
+}
+
+#[test]
+fn field_row_declared_gc_pointer_is_gcref() {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("owner::GcAdt");
+    let got = super::field_row_lltype(&reg, "*mut owner::GcAdt", &mut field_row_visited())
+        .expect("declared-GC pointer field");
+    assert_eq!(got, (*GCREF).clone());
+}
+
+#[test]
+fn field_row_raw_word_pointer_is_ptr_struct() {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "host::RawWord".to_string(),
+        vec![("save_point".to_string(), "usize".to_string())],
+    );
+    reg.raw_word_owners.insert("host::RawWord".to_string());
+    let got = super::field_row_lltype(&reg, "*mut host::RawWord", &mut field_row_visited())
+        .expect("raw-word pointer field");
+    match got {
+        LowLevelType::Ptr(p) => match p.TO {
+            PtrTarget::Struct(_) => {}
+            other => panic!("raw-word pointer must be Ptr(Struct), got {other:?}"),
+        },
+        other => panic!("raw-word pointer must be Ptr, got {other:?}"),
+    }
+}
+
+#[test]
+fn struct_item_gcarray_classed_pointer_field_interns_objectptr() {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let mut reg = slot_block_registry("*mut owner::Inst");
+    note_class_identity(&mut reg, "owner::Inst");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("classed pointer ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let PtrTarget::Array(arr) = &ptr.ll_ptrtype.TO else {
+        panic!("must intern Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+    };
+    let LowLevelType::Struct(st) = &arr.OF else {
+        panic!("ITEM must be STRUCT, got {:?}", arr.OF)
+    };
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(OBJECTPTR.clone()),
+        "classed pointer field is the instance pointer"
+    );
+}
+
+#[test]
+fn struct_item_gcarray_unknown_pointer_field_declines() {
+    let reg = slot_block_registry("*mut owner::Inst");
+    assert!(
+        super::struct_item_flexible_gcarray_block_annotation(
+            &reg,
+            "storage::SlotBlock",
+            "[storage::Slot; 0]",
+        )
+        .is_none(),
+        "undecidable pointer ITEM field must decline"
     );
 }

@@ -16699,6 +16699,80 @@ fn interned_result_of_mut_ref_payload_is_pointer() {
     );
 }
 
+/// Intern ROW of `Result<&mut T, E>::Ok.__pos_0` is the pointer word even
+/// when T is a declared-GC ADT (`descr.py` `get_type_flag` of a Ptr).
+#[test]
+fn interned_result_of_mut_ref_declared_gc_payload_is_pointer() {
+    let w = interior_struct(
+        1,
+        &["module", "ctypeobj", "W"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        )],
+        200,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        2,
+        &["error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let mut_ref = serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]});
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [{"Value": [1, adt_node(1)]}]
+            }
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![result_enum(0), w, pyerror],
+        vec![
+            intern_map_caller(0, "call_unwrap", 1, vec![mut_ref, adt_node(2)]),
+            generic_result_unwrap_decl(1, 0),
+        ],
+        vec![gctype],
+        vec![impl_row],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc).expect(
+        "build semantic program for interned Result<&mut W, PyError> with declared-GC pointee",
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<&mut W,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut ctypeobj::W"),
+        "declared-GC mut-ref intern ROW is the pointer word; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<&mut W,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut ctypeobj::W"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
 /// Intern of `Result<G<u8>, PyError>` keeps the CAST leaf render
 /// (`G<u8>`) as `Ok.__pos_0`. Identity-with-args (`g::G<u8>`) would be a
 /// different `struct_fields` key than CAST's `<G<u8>>` suffix.
