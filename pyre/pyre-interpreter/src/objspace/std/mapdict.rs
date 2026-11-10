@@ -209,72 +209,56 @@ pub fn attrkind_name(attrkind: u16) -> String {
 /// default 11).
 pub const METHODCACHESIZEEXP: u32 = 11;
 
-fn intern_node(mut p: PlainAttribute) -> MapRef {
-    // `lltype.malloc(..., flavor='gc')` / `gct_fv_gc_malloc`. GC fields
-    // that live across the malloc are pinned (`framework.py`
-    // `get_livevars_for_roots`) and written back after allocation:
-    // `malloc_typed_managed` collects before `ptr::write`.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[
-        p.back as PyObjectRef,
-        p.base.terminator as PyObjectRef,
-    ]);
-    p.back = std::ptr::null();
-    p.base.terminator = std::ptr::null();
+fn intern_node(p: PlainAttribute) -> MapRef {
+    // `gct_fv_gc_malloc` on the host is `malloc_typed_managed` /
+    // `try_gc_alloc`: old-gen fallback, no collection. GC fields stay in
+    // the payload `ptr::write` copies; the allocator write-barriers an
+    // old-gen birth that already holds nursery references.
+    // mapdict.py `PlainAttribute.__init__`: `lltype.malloc` failure raises
+    // MemoryError (`incminimark.py` `external_malloc`) before field stores.
     let raw = pyre_object::lltype::malloc_typed_managed(p);
-    unsafe {
-        (*raw).back = pyre_object::gc_roots::shadow_stack_get(base) as MapRef;
-        (*raw).base.terminator = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
+    if raw.is_null() {
+        return std::ptr::null();
     }
-    pyre_object::gc_hook::try_gc_write_barrier_managed(raw as pyre_object::gc_hook::GCREF);
     raw as MapRef
 }
 
-fn intern_unboxed_node(mut p: UnboxedPlainAttribute) -> MapRef {
-    // `lltype.malloc(..., flavor='gc')` / `gct_fv_gc_malloc`. GC fields
-    // that live across the malloc are pinned (`framework.py`
-    // `get_livevars_for_roots`) and written back after allocation:
-    // `malloc_typed_managed` collects before `ptr::write`.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[
-        p.base.back as PyObjectRef,
-        p.base.base.terminator as PyObjectRef,
-    ]);
-    p.base.back = std::ptr::null();
-    p.base.base.terminator = std::ptr::null();
+fn intern_unboxed_node(p: UnboxedPlainAttribute) -> MapRef {
+    // mapdict.py `UnboxedPlainAttribute.__init__`: `lltype.malloc` failure
+    // raises MemoryError (`incminimark.py` `external_malloc`) before field
+    // stores.
     let raw = pyre_object::lltype::malloc_typed_managed(p);
-    unsafe {
-        (*raw).base.back = pyre_object::gc_roots::shadow_stack_get(base) as MapRef;
-        (*raw).base.base.terminator = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
+    if raw.is_null() {
+        return std::ptr::null();
     }
-    pyre_object::gc_hook::try_gc_write_barrier_managed(raw as pyre_object::gc_hook::GCREF);
     raw as MapRef
 }
 
 /// mapdict.py `Terminator.__init__`. `AbstractAttribute.__init__(space,
 /// self)` makes the terminator its own `terminator`.
 pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::pin_roots(&[w_cls]);
+    // mapdict.py `Terminator.__init__`: `AbstractAttribute.__init__(space, self)`
+    // stores the object as its own terminator once the address is known.
     let raw = pyre_object::lltype::malloc_typed_managed(Terminator {
         base: AbstractAttribute {
             class: MapClass::Terminator,
             terminator: std::ptr::null(),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         },
-        w_cls: std::ptr::null_mut(),
+        w_cls,
         allow_unboxing: Cell::new(true),
         mutate_allow_unboxing: null_mutate_word(),
         mutate_allow_unboxing_lock: null_mutate_lock(),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
     });
-    // Patch the self-referential terminator now that the address is known
-    // (still uniquely owned here, before it is shared). Restore `w_cls`
-    // after the malloc; the value written into the nursery was nulled.
+    // mapdict.py `Terminator.__init__`: `lltype.malloc` failure raises
+    // MemoryError (`incminimark.py` `external_malloc`) before field stores.
+    if raw.is_null() {
+        return std::ptr::null();
+    }
     unsafe {
         (*raw).base.terminator = raw as MapRef;
-        (*raw).w_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     }
     pyre_object::gc_hook::try_gc_write_barrier_managed(raw as pyre_object::gc_hook::GCREF);
     raw as MapRef
@@ -283,22 +267,16 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
 /// mapdict.py `DictTerminator.__init__` — also builds the paired
 /// `DevolvedDictTerminator` and links it.
 pub fn new_dict_terminator(w_cls: PyObjectRef) -> MapRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::pin_roots(&[w_cls]);
-    let devolved = new_terminator(
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        TerminatorKind::Devolved,
-    );
-    let devolved_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(devolved as PyObjectRef);
-    let t = new_terminator(
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        TerminatorKind::Dict,
-    );
-    let t_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(t as PyObjectRef);
-    let t = pyre_object::gc_roots::shadow_stack_get(t_slot) as MapRef;
-    let devolved = pyre_object::gc_roots::shadow_stack_get(devolved_slot) as MapRef;
+    // mapdict.py `DictTerminator.__init__` constructs the paired
+    // `DevolvedDictTerminator` first; a failed malloc raises MemoryError.
+    let devolved = new_terminator(w_cls, TerminatorKind::Devolved);
+    if devolved.is_null() {
+        return std::ptr::null();
+    }
+    let t = new_terminator(w_cls, TerminatorKind::Dict);
+    if t.is_null() {
+        return std::ptr::null();
+    }
     unsafe {
         (*t).as_terminator().devolved_dict_terminator.set(devolved);
     }
@@ -348,25 +326,19 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// `w_type` must be a live `W_TypeObject`.
 pub unsafe fn install_type_terminator(w_type: PyObjectRef) {
     debug_assert!(!w_type.is_null());
-    let _roots = pyre_object::gc_roots::push_roots();
-    let type_slot = pyre_object::gc_roots::pin_roots(&[w_type]);
-    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
-    let existing = unsafe { pyre_object::w_type_get_terminator(w_type) };
     let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
     let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
     let term = new_instance_terminator(w_type, hasdict, typedef_hasdict);
-    let term_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(term as PyObjectRef);
-    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
-    let term = pyre_object::gc_roots::shadow_stack_get(term_slot) as MapRef;
-    if existing.is_null() {
-        unsafe { pyre_object::w_type_set_terminator(w_type, term) };
+    // mapdict.py `Terminator.__init__` / `DictTerminator.__init__`: a failed
+    // malloc raises MemoryError before the type stores `self.terminator`.
+    if term.is_null() {
         return;
     }
-    // Second install: `set_type_hasdict` after the constructor. Instances
-    // must not have copied the old word yet (`_getusercls` stamps a null map
-    // until [`ensure_mapdict_initialized`]; `alloc_instance_object` copies
-    // at alloc, after this flip).
+    // First install is construction; a second run is `set_type_hasdict`
+    // after the constructor (`py_class!`, `init_typeobjects`, cpyext
+    // `tp_dictoffset`). Instances must not have copied the old word yet
+    // (`_getusercls` stamps a null map until [`ensure_mapdict_initialized`];
+    // `alloc_instance_object` copies at alloc, after this flip).
     unsafe { pyre_object::w_type_set_terminator(w_type, term) };
 }
 
@@ -1002,24 +974,20 @@ pub unsafe fn new_plain_attribute(
     back: MapRef,
     order: usize,
 ) -> MapRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let back_slot = pyre_object::gc_roots::pin_roots(&[back as PyObjectRef]);
-    let back = pyre_object::gc_roots::shadow_stack_get(back_slot) as MapRef;
+    // mapdict.py `PlainAttribute.__init__`: `AbstractAttribute.__init__(self,
+    // back.space, back.terminator)` then `storageindex = back.storage_needed()`.
     let back_node = unsafe { &*back };
-    let terminator = back_node.terminator;
-    let term_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(terminator as PyObjectRef);
     intern_node(PlainAttribute {
         base: AbstractAttribute {
             class: MapClass::PlainAttribute,
-            terminator: pyre_object::gc_roots::shadow_stack_get(term_slot) as MapRef,
+            terminator: back_node.terminator,
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         },
         name,
         attrkind,
         storageindex: back_node.storage_needed(),
         num_attributes: back_node.num_attributes() + 1,
-        back: pyre_object::gc_roots::shadow_stack_get(back_slot) as MapRef,
+        back,
         ever_mutated: Cell::new(false),
         mutate_ever_mutated: null_mutate_word(),
         mutate_ever_mutated_lock: null_mutate_lock(),
@@ -1044,9 +1012,6 @@ pub unsafe fn new_unboxed_plain_attribute(
     order: usize,
     typ: UnboxType,
 ) -> MapRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let back_slot = pyre_object::gc_roots::pin_roots(&[back as PyObjectRef]);
-    let back = pyre_object::gc_roots::shadow_stack_get(back_slot) as MapRef;
     let back_node = unsafe { &*back };
     // _compute_storageindex_listindex (mapdict.py): walk up looking for
     // an existing UnboxedPlainAttribute to share a storage slot with.
@@ -1067,21 +1032,18 @@ pub unsafe fn new_unboxed_plain_attribute(
         Some((storageindex, listindex)) => (storageindex, listindex, false),
         None => (back_node.storage_needed(), 0, true),
     };
-    let terminator = back_node.terminator;
-    let term_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(terminator as PyObjectRef);
     intern_unboxed_node(UnboxedPlainAttribute {
         base: PlainAttribute {
             base: AbstractAttribute {
                 class: MapClass::UnboxedPlainAttribute,
-                terminator: pyre_object::gc_roots::shadow_stack_get(term_slot) as MapRef,
+                terminator: back_node.terminator,
                 cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
             },
             name,
             attrkind,
             storageindex,
             num_attributes: back_node.num_attributes() + 1,
-            back: pyre_object::gc_roots::shadow_stack_get(back_slot) as MapRef,
+            back,
             ever_mutated: Cell::new(false),
             mutate_ever_mutated: null_mutate_word(),
             mutate_ever_mutated_lock: null_mutate_lock(),
@@ -3417,6 +3379,15 @@ pub unsafe fn store_attr_add_fast_path(
     // reference loads. An unboxed attribute already in the chain is fine: its
     // slot holds the longlong list's GcArray, which is a reference like any
     // other (mapdict.py `_prim_direct_read`).
+    // Pin `map` across `_find_branch_to_move_into` (`framework.py` push/pop
+    // roots). mapdict.py `AbstractAttribute.add_attr` keeps `self` live across
+    // that intern and `CachedAttributeHolder.pick_attr`; reload it for the
+    // `p.back` identity check and `storage_needed`. Dropping `_roots` pops
+    // the slots (`framework.py` `pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let map_slot = pyre_object::gc_roots::pin_roots(&[map as PyObjectRef, w_obj]);
+    let obj_slot = map_slot + 1;
+    let map = pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef;
     // mapdict.py — `number_to_readd != 0` is `_reorder_and_add`, which
     // pops and re-adds intermediate attributes.
     let (number_to_readd, holder) =
@@ -3424,14 +3395,33 @@ pub unsafe fn store_attr_add_fast_path(
     if number_to_readd != 0 {
         return None;
     }
-    let new_map = unsafe { holder_pick_attr(holder, unbox) };
+    if holder.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return None;
+    }
+    let holder_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(holder as PyObjectRef);
+    let new_map = unsafe {
+        holder_pick_attr(
+            pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder,
+            unbox,
+        )
+    };
+    if new_map.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return None;
+    }
+    let new_map_slot = pyre_object::gc_roots::shadow_stack_len();
+    let new_map = pyre_object::gc_roots::pin_root(new_map as PyObjectRef) as MapRef;
     if !unsafe { (*new_map).is_plain() } {
         return None;
     }
+    let map = pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef;
     let p = unsafe { (*new_map).as_plain() };
     if !std::ptr::eq(p.back, map) {
         return None;
     }
+    // Capture `storageindex` before later residuals (`try_gc_owns_object`).
+    // mapdict.py `PlainAttribute.storageindex` is a scalar.
+    let storageindex = p.storageindex;
     let unbox_type = if unsafe { (*new_map).is_unboxed_plain() } {
         // Only the fresh-slot shape grows storage by one; a shared-slot add
         // rewrites an existing slot's list in place.
@@ -3454,7 +3444,7 @@ pub unsafe fn store_attr_add_fast_path(
     // The grow-by-one shape `_set_mapdict_increase_storage1` implements: the
     // new slot is appended at the current length.
     let storage_needed = unsafe { (*map).storage_needed() };
-    if p.storageindex != storage_needed
+    if storageindex != storage_needed
         || unsafe { (*new_map).storage_needed() } != storage_needed + 1
     {
         return None;
@@ -3462,7 +3452,7 @@ pub unsafe fn store_attr_add_fast_path(
     // `grow_instance_items_block` frees the block it replaces, which is a no-op
     // only for a collector-owned block.  A `std::alloc` fallback block (no GC
     // hook) would leak once the emitted allocation replaces it without a free.
-    let inst = unsafe { mapdict_carrier(w_obj) };
+    let inst = unsafe { mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot)) };
     let storage = unsafe { inst.storage() };
     if !storage.is_null()
         && !pyre_object::gc_hook::try_gc_owns_object(storage as pyre_object::gc_hook::GCREF)
@@ -3478,21 +3468,12 @@ pub unsafe fn store_attr_add_fast_path(
     {
         return None;
     }
-    let storageindex = p.storageindex;
-    // Pin `map` / `holder` / `new_map` for the life of `StoreAttrAdd`.
-    // Dropping `_roots` pops the slots (`framework.py` `pop_roots`).
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[
-        map as PyObjectRef,
-        holder as PyObjectRef,
-        new_map as PyObjectRef,
-    ]);
     Some(StoreAttrAdd {
         w_type,
         version_tag,
-        map_slot: base,
-        holder_slot: base + 1,
-        new_map_slot: base + 2,
+        map_slot,
+        holder_slot,
+        new_map_slot,
         storageindex,
         unbox_type,
         picked_unbox: unbox,
@@ -4100,15 +4081,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         majit_ir::jit::promote(self.map)
     }
     fn _set_mapdict_map(&mut self, map: MapRef) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[
-            self as *const Self as PyObjectRef,
-            map as PyObjectRef,
-        ]);
-        instance_write_barrier(pyre_object::gc_roots::shadow_stack_get(base));
-        let owner = pyre_object::gc_roots::shadow_stack_get(base);
-        let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
-        unsafe { (*(owner as *mut Self)).map = map };
+        // mapdict.py `MapdictStorageMixin._set_mapdict_map`. The host
+        // write barrier records the container; it does not collect.
+        instance_write_barrier(self as *const Self as PyObjectRef);
+        self.map = map;
     }
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
         // mapdict.py. A read is always preceded by the
@@ -4121,33 +4097,14 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
     }
     fn _mapdict_write_storage(&mut self, storageindex: usize, value: PyObjectRef) {
-        // mapdict.py. The instance is the remembered-set root: the
-        // collector reaches the storage block (nursery-born by
-        // `alloc_mapdict_storage_block`) only through this instance's
-        // `object_object_custom_trace`, which forwards the `storage` word and
-        // walks the block's boxed slots in place, so remembering the instance
-        // keeps a young value stored into an old-gen instance's block
-        // forwarded on a minor GC.
-        //
-        // RPython's GC transform emits the barrier before the pointer store.
-        // Publish both operands first because a foreign mutator's collection
-        // can make the barrier wait; storing first would leave the new value
-        // invisible until after that collection had swept it.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let livevars = vec![self as *const Self as PyObjectRef, value];
-        let self_slot = pyre_object::gc_roots::pin_roots(&livevars);
-        let value_slot = self_slot + 1;
-        let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        instance_write_barrier(owner);
-        let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+        // mapdict.py `MapdictStorageMixin._mapdict_write_storage`. The
+        // instance is the remembered-set root: the collector reaches the
+        // storage block only through `object_object_custom_trace`. RPython's
+        // GC transform emits `gc_write_barrier` before the pointer store.
+        instance_write_barrier(self as *const Self as PyObjectRef);
+        mapdict_storage_write_barrier(self.storage);
         unsafe {
-            let owner = &mut *(owner as *mut Self);
-            mapdict_storage_write_barrier(owner.storage);
-            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            let owner = &mut *(owner as *mut Self);
-            let base = pyre_object::object_array::items_block_items_base(owner.storage);
+            let base = pyre_object::object_array::items_block_items_base(self.storage);
             *base.add(storageindex) = value;
         }
     }
@@ -4156,21 +4113,9 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         unsafe { (*self.map).storage_needed() }
     }
     fn _mapdict_pop_attribute(&mut self, map: MapRef) -> bool {
-        // mapdict.py _mapdict_pop_attribute; structure mirrors the MockObj test impl.
-        // Both arms can collect — the unboxed one through
-        // `_mapdict_write_storage`, the other through the storage shrink — so
-        // the receiver is published for the whole function and every write
-        // goes through the reloaded address, as in
-        // `_set_mapdict_increase_storage1` and `_set_mapdict_storage_and_map`.
-        // `&mut self` is a bare address that a moving collection invalidates;
-        // writing `map` through it would leave the live instance on its old
-        // map, claiming a storage slot the shrunk block no longer has.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let self_slot = pyre_object::gc_roots::pin_roots(&[
-            self as *const Self as PyObjectRef,
-            map as PyObjectRef,
-        ]);
-        let map_slot = self_slot + 1;
+        // mapdict.py `MapdictStorageMixin._mapdict_pop_attribute`.
+        // `erase_unboxed` uses `try_gc_alloc_stable` (no collection); the
+        // boxed arm NULLs spare slots without reallocating.
         let current_map = self.map;
         let unboxed_slot: Option<(usize, usize)> = unsafe {
             if (*current_map).is_unboxed_plain() {
@@ -4184,28 +4129,22 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             }
         };
         match unboxed_slot {
-            // mapdict.py:931-934: drop the last entry of the shared
-            // longlong list (the slot itself stays).
+            // mapdict.py: drop the last entry of the shared longlong list
+            // (the slot itself stays).
             Some((storageindex, listindex)) => {
                 let slot = self._mapdict_read_storage(storageindex);
                 let new_list: Vec<i64> = unsafe { unboxed_items(slot)[..listindex].to_vec() };
-                // `erase_unboxed` allocates the replacement bank, so reload the
-                // receiver after it rather than before.
                 let unboxed = erase_unboxed(&new_list);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return false;
                 }
-                let owner = unsafe {
-                    &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self)
-                };
-                owner._mapdict_write_storage(storageindex, unboxed);
+                self._mapdict_write_storage(storageindex, unboxed);
             }
-            // mapdict.py:935-938: truncate storage to the parent map's size.
+            // mapdict.py: truncate storage to the parent map's size.
             // The block itself keeps its capacity (see
             // `_set_mapdict_storage_and_map`); NULL the slots the parent map no
             // longer names so their values are released.
             None => {
-                let map = pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef;
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
                     let cap = pyre_object::object_array::items_block_capacity(self.storage);
@@ -4218,11 +4157,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 }
             }
         }
-        unsafe {
-            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
-            let map = pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef;
-            owner._set_mapdict_map(map);
-        }
+        self._set_mapdict_map(map);
         true
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool {
@@ -4384,15 +4319,10 @@ impl MapdictObject for MapdictCarrier {
     }
 
     fn _set_mapdict_map(&mut self, map: MapRef) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[self.obj, map as PyObjectRef]);
-        instance_write_barrier(pyre_object::gc_roots::shadow_stack_get(base));
-        let owner = pyre_object::gc_roots::shadow_stack_get(base);
-        let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
+        instance_write_barrier(self.obj);
         unsafe {
-            pyre_object::mapdict::mapdict_typed_store_map(owner, map);
+            pyre_object::mapdict::mapdict_typed_store_map(self.obj, map);
         }
-        self.obj = owner;
     }
 
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
@@ -4403,19 +4333,11 @@ impl MapdictObject for MapdictCarrier {
     }
 
     fn _mapdict_write_storage(&mut self, storageindex: usize, value: PyObjectRef) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let self_slot = pyre_object::gc_roots::pin_roots(&[self.obj, value]);
-        let value_slot = self_slot + 1;
-        instance_write_barrier(pyre_object::gc_roots::shadow_stack_get(self_slot));
+        instance_write_barrier(self.obj);
         unsafe {
-            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-            let carrier = mapdict_carrier(owner);
-            mapdict_storage_write_barrier(carrier.storage());
-            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-            let carrier = mapdict_carrier(owner);
-            let base = pyre_object::object_array::items_block_items_base(carrier.storage());
-            *base.add(storageindex) = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            self.obj = owner;
+            mapdict_storage_write_barrier(self.storage());
+            let base = pyre_object::object_array::items_block_items_base(self.storage());
+            *base.add(storageindex) = value;
         }
     }
 
@@ -4424,9 +4346,6 @@ impl MapdictObject for MapdictCarrier {
     }
 
     fn _mapdict_pop_attribute(&mut self, map: MapRef) -> bool {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let self_slot = pyre_object::gc_roots::pin_roots(&[self.obj, map as PyObjectRef]);
-        let map_slot = self_slot + 1;
         let current_map = self._get_mapdict_map();
         let unboxed_slot: Option<(usize, usize)> = unsafe {
             if (*current_map).is_unboxed_plain() {
@@ -4447,17 +4366,11 @@ impl MapdictObject for MapdictCarrier {
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return false;
                 }
-                let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-                let mut carrier = unsafe { mapdict_carrier(owner) };
-                carrier._mapdict_write_storage(storageindex, unboxed);
+                self._mapdict_write_storage(storageindex, unboxed);
             }
             None => unsafe {
-                let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
-                let carrier = mapdict_carrier(owner);
-                let storage = carrier.storage();
-                let storage_needed = (*(pyre_object::gc_roots::shadow_stack_get(map_slot)
-                    as MapRef))
-                    .storage_needed();
+                let storage = self.storage();
+                let storage_needed = (*map).storage_needed();
                 let cap = pyre_object::object_array::items_block_capacity(storage);
                 if cap > storage_needed {
                     let base = pyre_object::object_array::items_block_items_base(storage);
@@ -4467,8 +4380,7 @@ impl MapdictObject for MapdictCarrier {
                 }
             },
         }
-        self.obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        self._set_mapdict_map(pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef);
+        self._set_mapdict_map(map);
         true
     }
 
@@ -4620,10 +4532,8 @@ impl MapdictObject for Object {
         // mapdict.py. `current_map` is the PlainAttribute being popped;
         // `map` is its parent. The unboxed-non-firstunwrapped slot to shrink is
         // a `match` on `firstunwrapped` (not `!firstunwrapped`) so the source
-        // walker can lower it. `erase_unboxed` allocates; pin both maps.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[self.map as PyObjectRef, map as PyObjectRef]);
-        let current_map = pyre_object::gc_roots::shadow_stack_get(base) as MapRef;
+        // walker can lower it.
+        let current_map = self.map;
         let unboxed_slot: Option<(usize, usize)> = unsafe {
             if (*current_map).is_unboxed_plain() {
                 let u = (*current_map).as_unboxed_plain();
@@ -4646,12 +4556,11 @@ impl MapdictObject for Object {
                 self._mapdict_write_storage(storageindex, unboxed);
             }
             None => {
-                let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
                 let storage_needed = unsafe { (*map).storage_needed() };
                 self.storage.truncate(storage_needed);
             }
         }
-        self.map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
+        self.map = map;
         true
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool {
@@ -4836,12 +4745,19 @@ unsafe fn convert_to_boxed<O: MapdictObject>(obj: &mut O) -> MapRef {
         Ok(new_obj) => new_obj,
         Err(()) => return map,
     };
-    let new_map = new_obj.map;
-    obj._set_mapdict_storage_and_map(new_obj.storage, new_map);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let map_slot = pyre_object::gc_roots::pin_roots(&[new_obj.map as PyObjectRef]);
+    obj._set_mapdict_storage_and_map(
+        new_obj.storage,
+        pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef,
+    );
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
         return map;
     }
-    new_map
+    // `_set_mapdict_storage_and_map` allocates (`framework.py` push/pop roots).
+    // mapdict.py `UnboxedPlainAttribute._convert_to_boxed` returns `map` after
+    // that call; reload it from the rooted slot.
+    pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef
 }
 
 /// mapdict.py `UnboxedPlainAttribute._direct_write` type-change tail —
@@ -4864,9 +4780,14 @@ unsafe fn convert_to_boxed_and_write<O: MapdictObject>(
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
         return;
     }
+    let map_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(map as PyObjectRef);
+    // `convert_to_boxed` (`UnboxedPlainAttribute._convert_to_boxed`) may
+    // collect; its returned map lives in this frame's rooted slot for
+    // `node_write`.
     let _ = unsafe {
         node_write(
-            map,
+            pyre_object::gc_roots::shadow_stack_get(map_slot) as MapRef,
             obj,
             name,
             attrkind,
@@ -5493,30 +5414,30 @@ unsafe fn new_cached_attribute_holder(
     unbox_type: Option<UnboxType>,
     order: usize,
 ) -> *const CachedAttributeHolder {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let back_slot = pyre_object::gc_roots::pin_roots(&[back as PyObjectRef]);
-    let back = pyre_object::gc_roots::shadow_stack_get(back_slot) as MapRef;
     let attr = match unbox_type {
         None => unsafe { new_plain_attribute(name, attrkind, back, order) },
         Some(typ) => unsafe { new_unboxed_plain_attribute(name, attrkind, back, order, typ) },
     };
-    let attr_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(attr as PyObjectRef);
+    // mapdict.py `CachedAttributeHolder.__init__` constructs `PlainAttribute`
+    // / `UnboxedPlainAttribute` first; a failed malloc raises MemoryError.
+    if attr.is_null() {
+        return std::ptr::null();
+    }
     let raw = pyre_object::lltype::malloc_typed_managed(CachedAttributeHolder {
         order,
-        attr: Cell::new(std::ptr::null()),
+        attr: Cell::new(attr),
         mutate_attr: null_mutate_word(),
         mutate_attr_lock: null_mutate_lock(),
         typ: Cell::new(unbox_type),
         mutate_typ: null_mutate_word(),
         mutate_typ_lock: null_mutate_lock(),
     });
-    unsafe {
-        (*raw)
-            .attr
-            .set(pyre_object::gc_roots::shadow_stack_get(attr_slot) as MapRef);
+    // mapdict.py `CachedAttributeHolder.__init__`: `lltype.malloc` failure
+    // raises MemoryError (`incminimark.py` `external_malloc`) before field
+    // stores.
+    if raw.is_null() {
+        return std::ptr::null();
     }
-    pyre_object::gc_hook::try_gc_write_barrier_managed(raw as pyre_object::gc_hook::GCREF);
     raw
 }
 
@@ -5541,18 +5462,28 @@ unsafe fn holder_pick_attr(
         &*(pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder)
     };
     h.set_typ(None);
+    // `set_typ` may sweep a quasi-immut field and park. Reload the holder
+    // before reading `order` / `attr` (`mapdict.py CachedAttributeHolder.pick_attr`).
+    let h = unsafe {
+        &*(pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder)
+    };
+    let order = h.order;
     let attr = h.attr.get();
     let attr_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(attr as PyObjectRef);
     let attr = pyre_object::gc_roots::shadow_stack_get(attr_slot) as MapRef;
     let p = unsafe { (*attr).as_plain() };
-    let back_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(p.back as PyObjectRef);
-    let term_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(p.base.terminator as PyObjectRef);
-    let name = p.name.clone();
     let attrkind = p.attrkind;
-    let order = h.order;
+    let back_slot = pyre_object::gc_roots::pin_roots(&[
+        p.back as PyObjectRef,
+        p.base.terminator as PyObjectRef,
+    ]);
+    let term_slot = back_slot + 1;
+    // `pin_roots` is a safepoint (`framework.py` `get_livevars_for_roots`).
+    // mapdict.py `CachedAttributeHolder.pick_attr` reads `self.attr.name`
+    // after taking `self.attr.back`; reload `attr` from the rooted slot.
+    let attr = pyre_object::gc_roots::shadow_stack_get(attr_slot) as MapRef;
+    let name = unsafe { (*attr).as_plain() }.name.clone();
     unsafe { (*(pyre_object::gc_roots::shadow_stack_get(term_slot) as MapRef)).as_terminator() }
         .set_allow_unboxing(false);
     let new_attr = unsafe {
@@ -5563,11 +5494,21 @@ unsafe fn holder_pick_attr(
             order,
         )
     };
+    // mapdict.py `CachedAttributeHolder.pick_attr` constructs a boxed
+    // `PlainAttribute`; a failed malloc raises MemoryError.
+    if new_attr.is_null() {
+        return std::ptr::null();
+    }
+    let new_attr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let new_attr = pyre_object::gc_roots::pin_root(new_attr as PyObjectRef) as MapRef;
     let h = unsafe {
         &*(pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder)
     };
     h.set_attr(new_attr);
-    h.attr.get()
+    // `set_attr` write-barriers the holder (`CachedAttributeHolder.set_attr`).
+    // mapdict.py `pick_attr` returns the newly assigned `attr`; it does not
+    // reread `self.attr` through the pre-barrier holder address.
+    pyre_object::gc_roots::shadow_stack_get(new_attr_slot) as MapRef
 }
 
 /// mapdict.py `AbstractAttribute._get_new_attr`.
@@ -5587,9 +5528,6 @@ unsafe fn get_new_attr(
     // object (`mapdict.py CachedAttributeHolder`); drop the lock before
     // `malloc_typed_managed` so the node's custom tracer, which also
     // takes `cache_attrs`, cannot deadlock.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::pin_roots(&[self_node as PyObjectRef]);
-    let self_node = pyre_object::gc_roots::shadow_stack_get(self_slot) as MapRef;
     let cache = intern_cache_attrs(unsafe { &(*self_node).cache_attrs });
     {
         let guard = cache.lock();
@@ -5597,19 +5535,18 @@ unsafe fn get_new_attr(
             return holder;
         }
     }
-    let self_node = pyre_object::gc_roots::shadow_stack_get(self_slot) as MapRef;
     let holder =
         unsafe { new_cached_attribute_holder(name.to_owned(), attrkind, self_node, unbox_type, 0) };
-    let holder_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(holder as PyObjectRef);
-    let self_node = pyre_object::gc_roots::shadow_stack_get(self_slot) as MapRef;
+    // mapdict.py `AbstractAttribute._get_new_attr`: `CachedAttributeHolder`
+    // construction raises MemoryError.
+    if holder.is_null() {
+        return std::ptr::null();
+    }
     let cache = intern_cache_attrs(unsafe { &(*self_node).cache_attrs });
     let mut guard = cache.lock();
     if let Some(&existing) = guard.get(&key) {
         return existing;
     }
-    let holder =
-        pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder;
     let order = guard.len();
     unsafe {
         (*(holder as *mut CachedAttributeHolder)).order = order;
@@ -5622,10 +5559,8 @@ unsafe fn get_new_attr(
     drop(guard);
     // The interned table is raw memory inside a GC node; barrier the
     // node so a remembered-set scan finds the new holder.
-    pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(self_slot) as pyre_object::gc_hook::GCREF
-    );
-    pyre_object::gc_roots::shadow_stack_get(holder_slot) as *const CachedAttributeHolder
+    pyre_object::gc_hook::try_gc_write_barrier(self_node as pyre_object::gc_hook::GCREF);
+    holder
 }
 
 /// mapdict.py `AbstractAttribute._find_branch_to_move_into`.
@@ -5638,15 +5573,11 @@ unsafe fn find_branch_to_move_into(
     attrkind: u16,
     unbox_type: Option<UnboxType>,
 ) -> (usize, *const CachedAttributeHolder) {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::pin_roots(&[self_node as PyObjectRef]);
-    let current_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let mut current = self_node;
     let mut current_order = usize::MAX; // sys.maxint
     let mut number_to_readd = 0usize;
     let key = (name.to_owned(), attrkind);
     loop {
-        let current = pyre_object::gc_roots::shadow_stack_get(current_slot) as MapRef;
         // `_find_branch_to_move_into`: `if current.cache_attrs is not None`.
         let holder = unsafe { map_node_cache_attrs(&*current) }
             .and_then(|cache| cache.lock().get(&key).copied());
@@ -5661,28 +5592,17 @@ unsafe fn find_branch_to_move_into(
                 // keep walking up
             } else {
                 return (0, unsafe {
-                    get_new_attr(
-                        pyre_object::gc_roots::shadow_stack_get(self_slot) as MapRef,
-                        name,
-                        attrkind,
-                        unbox_type,
-                    )
+                    get_new_attr(self_node, name, attrkind, unbox_type)
                 });
             }
         } else {
-            let holder_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(holder.unwrap() as PyObjectRef);
-            return (
-                number_to_readd,
-                pyre_object::gc_roots::shadow_stack_get(holder_slot)
-                    as *const CachedAttributeHolder,
-            );
+            return (number_to_readd, holder.unwrap());
         }
         // not found here, try the parent
         number_to_readd += 1;
         let p = unsafe { (*current).as_plain() };
         current_order = p.order;
-        pyre_object::gc_roots::shadow_stack_set(current_slot, p.back as PyObjectRef);
+        current = p.back;
     }
 }
 
@@ -5978,12 +5898,15 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
         let attr = pyre_object::gc_roots::shadow_stack_get(attr_slot) as MapRef;
         let u = unsafe { (*attr).as_unboxed_plain() };
         debug_assert_eq!(new_list.len(), u.listindex);
+        // `erase_unboxed` can collect; capture the scalar index first
+        // (`UnboxedPlainAttribute._switch_map_and_write_increase_storage1`).
+        let storageindex = u.base.storageindex;
         new_list.push(val);
         let unboxed = erase_unboxed(&new_list);
         if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
             return false;
         }
-        obj._mapdict_write_storage(u.base.storageindex, unboxed);
+        obj._mapdict_write_storage(storageindex, unboxed);
         true
     }
 }
@@ -6112,6 +6035,11 @@ unsafe fn reorder_and_add<O: MapdictObject>(
                     )
                 };
                 number_to_readd = n;
+                // mapdict.py `AbstractAttribute._reorder_and_add` intern via
+                // `_get_new_attr`; a failed malloc raises MemoryError.
+                if holder.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return false;
+                }
                 let holder_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(holder as PyObjectRef);
                 let next_attr = unsafe {
@@ -6121,6 +6049,9 @@ unsafe fn reorder_and_add<O: MapdictObject>(
                         unbox_type,
                     )
                 };
+                if next_attr.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return false;
+                }
                 pyre_object::gc_roots::shadow_stack_set(attr_slot, next_attr as PyObjectRef);
             }
         }
@@ -6145,6 +6076,11 @@ pub unsafe fn add_attr<O: MapdictObject>(
         unsafe { pick_unbox_type(self_node, pyre_object::gc_roots::shadow_stack_get(base + 1)) };
     let (number_to_readd, holder) =
         unsafe { find_branch_to_move_into(self_node, name, attrkind, unbox_type) };
+    // mapdict.py `AbstractAttribute.add_attr` intern via `_get_new_attr`;
+    // a failed malloc raises MemoryError.
+    if holder.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return false;
+    }
     let holder_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(holder as PyObjectRef);
     let attr = unsafe {
@@ -6153,6 +6089,9 @@ pub unsafe fn add_attr<O: MapdictObject>(
             unbox_type,
         )
     };
+    if attr.is_null() || pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return false;
+    }
     if number_to_readd == 0 {
         unsafe {
             switch_map_and_write_increase_storage1(
@@ -6344,6 +6283,19 @@ unsafe fn dict_nodes_in_order<O: MapdictObject>(inst: &O) -> Vec<MapRef> {
     ordered
 }
 
+/// Publish a `dict_nodes_in_order` snapshot as one root run, then normalize.
+///
+/// Sequential `pin_root` would query after the first write and leave later
+/// entries unrooted while they move (`framework.py` `push_roots`). mapdict.py
+/// `IteratorMixin._init` keeps this snapshot in a GC list (`attrs`).
+fn pin_dict_node_snapshot(nodes: &[MapRef]) -> usize {
+    // SAFETY: MapRef and PyObjectRef are pointer-sized GC object words;
+    // `pin_roots` only copies the bits onto the shadow stack.
+    pyre_object::gc_roots::pin_roots(unsafe {
+        std::slice::from_raw_parts(nodes.as_ptr().cast(), nodes.len())
+    })
+}
+
 /// `MapDictStrategy.iterkeys` materialised (mapdict.py / w_keys) —
 /// the DICT attribute names wrapped as str keys, in insertion order.
 /// `dont_look_inside` (same rationale).
@@ -6359,16 +6311,14 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
-    let mut node_slots: Vec<usize> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(node as PyObjectRef);
-        node_slots.push(slot);
-    }
+    // mapdict.py `MapDictIteratorKeys.next_key_entry`: reload each node from
+    // the published run after `IteratorMixin._init`.
+    let node_count = nodes.len();
+    let node_base = pin_dict_node_snapshot(&nodes);
     let mut keys: Vec<PyObjectRef> = Vec::new();
     let mut i: usize = 0;
-    while i < node_slots.len() {
-        let node = pyre_object::gc_roots::shadow_stack_get(node_slots[i]) as MapRef;
+    while i < node_count {
+        let node = pyre_object::gc_roots::shadow_stack_get(node_base + i) as MapRef;
         let name = (*node).as_plain().name.clone();
         // baseobjspace.py:new_interned_str / mapdict.py attribute names:
         // materialising an instance dictionary must return the canonical
@@ -6404,12 +6354,10 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
-    let mut node_slots: Vec<usize> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(node as PyObjectRef);
-        node_slots.push(slot);
-    }
+    // mapdict.py `MapDictIteratorValues.next_value_entry`: reload each node
+    // from the published run after `IteratorMixin._init`.
+    let node_count = nodes.len();
+    let node_base = pin_dict_node_snapshot(&nodes);
     // A value the read had to box is named by nothing the collector walks
     // until this `Vec` is handed on, and old-gen birth buys immobility rather
     // than survival, so the walk's own allocations can sweep one collected
@@ -6417,8 +6365,8 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut vals: Vec<PyObjectRef> = Vec::new();
     let mut i: usize = 0;
-    while i < node_slots.len() {
-        let node = pyre_object::gc_roots::shadow_stack_get(node_slots[i]) as MapRef;
+    while i < node_count {
+        let node = pyre_object::gc_roots::shadow_stack_get(node_base + i) as MapRef;
         let w_value = plain_direct_read(node, &inst);
         let w_value = roots.pin_root(w_value);
         vals.push(w_value);
@@ -6447,12 +6395,10 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
-    let mut node_slots: Vec<usize> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(node as PyObjectRef);
-        node_slots.push(slot);
-    }
+    // mapdict.py `MapDictIteratorItems.next_item_entry`: reload each node from
+    // the published run after `IteratorMixin._init`.
+    let node_count = nodes.len();
+    let node_base = pin_dict_node_snapshot(&nodes);
     // A value the read had to box is named by nothing the collector walks
     // until this `Vec` is handed on, and old-gen birth buys immobility rather
     // than survival, so the walk's own allocations can sweep one collected
@@ -6461,11 +6407,11 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut i: usize = 0;
-    while i < node_slots.len() {
-        let node = pyre_object::gc_roots::shadow_stack_get(node_slots[i]) as MapRef;
+    while i < node_count {
+        let node = pyre_object::gc_roots::shadow_stack_get(node_base + i) as MapRef;
         let name = (*node).as_plain().name.clone();
         let w_key = pyre_object::unicodeobject::box_str_constant(&name);
-        let node = pyre_object::gc_roots::shadow_stack_get(node_slots[i]) as MapRef;
+        let node = pyre_object::gc_roots::shadow_stack_get(node_base + i) as MapRef;
         let w_value = plain_direct_read(node, &inst);
         let w_value = roots.pin_root(w_value);
         out.push((w_key, w_value));
