@@ -23825,6 +23825,37 @@ fn generator_send_error(
     )
 }
 
+/// `_send_ex` after `_invoke_execute_frame` when that call already ran
+/// (compiled `jit_merge_point` / walk abort). A RETURN sets
+/// `frame_finished_execution`; that is StopIteration, not a yielded None.
+pub fn genentry_send_ex_after_portal_result(gen_obj: PyObjectRef, result: PyResult) -> PyResult {
+    use pyre_object::generator::*;
+    let Ok(value) = result else {
+        return result;
+    };
+    if gen_obj.is_null() {
+        return Ok(value);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::pin_roots(&[gen_obj, value]);
+    unsafe {
+        let generator = pyre_object::gc_roots::shadow_stack_get(gen_slot);
+        let frame = w_generator_get_frame(generator) as *mut crate::pyframe::PyFrame;
+        if frame.is_null() {
+            return genentry_raise_finished(generator, pyre_object::w_none());
+        }
+        if (*frame).frame_finished_execution() {
+            // generator.py `_send_ex`: `self.frame_is_finished()` then raise.
+            generator_frame_is_finished(generator, &mut *frame);
+            return genentry_raise_returned(
+                pyre_object::gc_roots::shadow_stack_get(gen_slot),
+                pyre_object::gc_roots::shadow_stack_get(gen_slot + 1),
+            );
+        }
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(gen_slot + 1))
+}
+
 /// Portal graph of `generatorentry_driver`.
 ///
 /// `split_before_jit_merge_point` starts the portal at the merge point.
@@ -23835,7 +23866,9 @@ pub fn generatorentry_portal(
     w_arg: PyObjectRef,
 ) -> PyResult {
     if let Some(result) = generatorentry_driver.jit_merge_point(pycode, gen_obj, w_arg) {
-        return result;
+        // The merge-point Some is `_invoke_execute_frame`'s result.
+        // `_send_ex` still tests `frame.frame_finished_execution`.
+        return genentry_send_ex_after_portal_result(gen_obj, result);
     }
     generator_send_ex_body(gen_obj, w_arg)
 }
@@ -23856,7 +23889,17 @@ pub extern "C" fn generatorentry_portal_c(
 ) -> PyObjectRef {
     match generatorentry_portal(pycode, w_gen, w_arg) {
         Ok(result) => result,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+        Err(err) => {
+            // Same ABI as `jit_next`: StopIteration is a null ref so
+            // `FOR_ITER`'s GuardNonnull exits the loop. Any other error
+            // is published for GuardNoException.
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop {
+                pyre_object::PY_NULL
+            } else {
+                crate::runtime_ops::jit_publish_residual_error_ref(err)
+            }
+        }
     }
 }
 

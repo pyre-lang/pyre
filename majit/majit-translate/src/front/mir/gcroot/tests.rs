@@ -1314,7 +1314,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -1333,9 +1333,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -2036,7 +2034,7 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -2053,9 +2051,7 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})

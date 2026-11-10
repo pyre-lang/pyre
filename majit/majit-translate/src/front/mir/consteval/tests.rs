@@ -2269,6 +2269,7 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
         true,
         None,
         None,
+        None,
         Some((types.as_slice(), [].as_slice())),
     )
     .expect("lower spec body");
@@ -2615,6 +2616,7 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
         None,
         None,
         None,
+        None,
     )
     .expect("lower caller");
     let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
@@ -2648,6 +2650,80 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
         )),
         "unspecialized generic must not remain the Regular callee, ops={ops:?}"
     );
+}
+
+/// Loaded artefacts of one program, the same shape `GraphBodyProvider`'s
+/// `CrossCrateSpec` feeds `enqueue_cross_crate_spec`. Tests that name an
+/// Opaque import share the caller's `SpecQueue` with the defining crate
+/// (`CrateView.spec`), so a pop of that queue is the defining crate's
+/// `cachedgraph` enqueue.
+struct TestCross<'a> {
+    crates: Vec<crate::front::clause_spec::CrateView<'a>>,
+}
+
+impl crate::front::clause_spec::CrossCrateLookup for TestCross<'_> {
+    fn with_crates(&self, f: &mut dyn FnMut(&[crate::front::clause_spec::CrateView<'_>])) {
+        f(&self.crates);
+    }
+}
+
+/// Defining-crate LLBC for `owner::alloc_like`: a local `Unstructured`
+/// body `unique_local_unstructured` can name. The caller fixture keeps
+/// the Opaque import of the same `name_path`.
+fn owner_alloc_like_defining_llbc() -> Llbc {
+    let alloc_like = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["owner", "alloc_like"], "", true),
+        "generics": {
+            "regions": [],
+            "types": [{"index": 0, "name": "T", "variance": "Invariant"}],
+            "const_generics": [],
+            "trait_clauses": []
+        },
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let doc = serde_json::json!({
+        "charon_version": "t",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "owner",
+            "fun_decls": [alloc_like],
+            "type_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(doc.to_string().as_bytes()).expect("owner crate parses")
+}
+
+fn owner_cross<'a>(
+    caller: &'a Llbc,
+    owner: &'a Llbc,
+    queue: &'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+) -> TestCross<'a> {
+    TestCross {
+        crates: vec![
+            crate::front::clause_spec::CrateView {
+                llbc: caller,
+                spec: queue,
+            },
+            crate::front::clause_spec::CrateView {
+                llbc: owner,
+                spec: queue,
+            },
+        ],
+    }
 }
 
 #[test]
@@ -2717,6 +2793,7 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
         }
     });
     let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+    let owner = owner_alloc_like_defining_llbc();
     let fd = llbc.fn_by_id(0).expect("caller");
     let body = fd.unstructured().expect("caller unstructured");
     let accum = super::AccumulatorFacts::build(&llbc, &body);
@@ -2726,7 +2803,8 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
     let empty_map = std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
-    let lower = |queue: &std::cell::RefCell<SpecQueue>| {
+    let lower = |queue: &std::cell::RefCell<SpecQueue>,
+                 cross: Option<&dyn crate::front::clause_spec::CrossCrateLookup>| {
         super::lower_unstructured_with_static_addrs_and_attrs(
             &llbc,
             fd,
@@ -2748,12 +2826,13 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
             false,
             None,
             None,
+            cross,
             None,
         )
         .expect("lower caller")
     };
     let foreign = std::cell::RefCell::new(SpecQueue::new());
-    let graph = lower(&foreign);
+    let graph = lower(&foreign, None);
     assert!(
         foreign.borrow_mut().pop().is_none(),
         "a foreign opaque generic stays the template path"
@@ -2775,14 +2854,14 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
     );
     crate::local_crates::with_local_crate_root("owner", || {
         let queue = std::cell::RefCell::new(SpecQueue::new());
-        let graph = lower(&queue);
+        let cross = owner_cross(&llbc, &owner, &queue);
+        let graph = lower(&queue, Some(&cross));
         let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
         assert!(
             req.leaf.starts_with("alloc_like__spec_"),
             "spec leaf, got {}",
             req.leaf
         );
-        assert_eq!(req.fn_path, "owner::alloc_like");
         let ops: Vec<_> = graph
             .blocks
             .iter()
@@ -2911,6 +2990,8 @@ fn leftover_clause_trait_ref_still_enqueues_cachedgraph() {
         false,
         None,
         None,
+        None,
+        None,
     )
     .expect("lower caller");
     let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
@@ -3015,6 +3096,7 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
         }
     });
     let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+    let owner = owner_alloc_like_defining_llbc();
     let fd = llbc.fn_by_id(0).expect("caller");
     let body = fd.unstructured().expect("caller unstructured");
     let accum = super::AccumulatorFacts::build(&llbc, &body);
@@ -3024,7 +3106,8 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
     let empty_map = std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
-    let lower = |queue: &std::cell::RefCell<SpecQueue>| {
+    let lower = |queue: &std::cell::RefCell<SpecQueue>,
+                 cross: Option<&dyn crate::front::clause_spec::CrossCrateLookup>| {
         super::lower_unstructured_with_static_addrs_and_attrs(
             &llbc,
             fd,
@@ -3046,12 +3129,15 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
             false,
             None,
             None,
+            cross,
+            None,
         )
         .expect("lower caller")
     };
     crate::local_crates::with_local_crate_root("owner", || {
         let queue = std::cell::RefCell::new(SpecQueue::new());
-        let graph = lower(&queue);
+        let cross = owner_cross(&llbc, &owner, &queue);
+        let graph = lower(&queue, Some(&cross));
         let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
         assert!(
             req.leaf.starts_with("alloc_like__spec_"),
@@ -3207,6 +3293,7 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
         &root_stack,
         Some(&queue),
         false,
+        None,
         None,
         None,
         None,
@@ -3408,6 +3495,7 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
         &root_stack,
         Some(&queue),
         false,
+        None,
         None,
         None,
         None,

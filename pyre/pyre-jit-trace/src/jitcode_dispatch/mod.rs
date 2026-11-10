@@ -4898,7 +4898,46 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .iter()
                     .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
                     .collect();
+                let inline_w_code = green_types
+                    .iter()
+                    .zip(green_values.iter())
+                    .find_map(|(spec, value)| {
+                        matches!(majit_ir::green_type_to_ir(*spec), Type::Ref)
+                            .then_some(*value as usize)
+                            .filter(|&v| v != 0)
+                    })
+                    .unwrap_or(0);
+                let callee_frame = red_ops.first().copied().unwrap_or(OpRef::NONE);
+                let callee_ec = red_ops.get(1).copied().unwrap_or(OpRef::NONE);
+                let is_being_profiled = greens_i.get(1).is_some_and(|opref| {
+                    matches!(
+                        ctx.trace_ctx.concrete_of_opref(*opref),
+                        Some(Value::Int(n)) if n != 0
+                    )
+                });
+                // Replay: `ChangeFrame` left the child MIFrame. Pop it
+                // instead of `perform_call` a second time.
+                if let Some(replayed) = inline_call::take_replayed_subwalk(ctx, op.pc) {
+                    crate::state::note_inline_subwalk_end();
+                    return Ok(Some(finish_recursive_inline(
+                        ctx,
+                        op,
+                        dst,
+                        dst_bank,
+                        replayed?,
+                        callee_frame,
+                        callee_ec,
+                        inline_w_code as *const (),
+                        is_being_profiled,
+                        None,
+                    )?));
+                }
                 // pyjitpl.py `_opimpl_recursive_call`: `perform_call(portal_code, allboxes, greenkey=greenboxes)`.
+                // `newframe(portal_code, greenkey)` is a Python portal
+                // MIFrame (`walk_generator_resume`), not a transparent
+                // helper. Helper kind leaves `inline_w_code == 0`, so a
+                // nested eval-loop merge reads the caller's pycode and can
+                // CloseLoop the outer drain at the inner CALL.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), green_key.clone()),
                     Some(index),
@@ -4913,27 +4952,69 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     ctx.walk_jitcode_index(),
                     op.next_pc,
                 );
-                let walked = match inline_call::run_sub_jitcode_walk(
+                let portal_site = inline_call::python_portal_subwalk_site(
                     ctx,
                     op.pc,
+                    ctx.fbw_mode.inline_subwalk,
+                );
+                let walked = match inline_call::run_sub_jitcode_walk_from(
+                    ctx,
+                    op.pc,
+                    0,
                     &body,
                     &int_args,
                     &int_concretes,
                     &ref_args,
                     &ref_concretes,
                     &float_args,
+                    &[],
+                    inline_w_code,
+                    inline_call::SubwalkFrameKind::PythonPortal(portal_site),
                 ) {
                     // `popframe` records `LEAVE_PORTAL_FRAME`. The raise has
                     // already left `_interpret`, so the close must not run.
                     Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+                    // `ChangeFrame`: the child MIFrame stays until the
+                    // driver finishes it (`pyjitpl.py` `perform_call`).
+                    Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
                     other => other,
                 };
-                if subwalk_jd.is_some() {
-                    crate::state::note_inline_subwalk_end();
-                }
+                // `opimpl_jit_merge_point` depth>0: `finishframe` then
+                // `do_recursive_call(assembler_call=True)` then
+                // `leave_portal_frame`. Defer the leave until the
+                // CALL_ASSEMBLER is recorded (`walk_generator_resume`).
+                let deferred_portal_leave = if let Some(jd_no) = subwalk_jd {
+                    match &walked {
+                        Ok(DispatchOutcome::SubLoopCalleeCallAssembler { .. }) => {
+                            if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                                let meta = driver.meta_interp_mut();
+                                if meta.framestack.frames.len() >= 2 {
+                                    let _ = meta.finishframe(None, false);
+                                }
+                            }
+                            ctx.clear_last_exc_value();
+                            Some(jd_no)
+                        }
+                        _ => {
+                            crate::state::note_inline_subwalk_end();
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let walked = walked?;
                 return Ok(Some(finish_recursive_inline(
-                    ctx, op, dst, dst_bank, walked,
+                    ctx,
+                    op,
+                    dst,
+                    dst_bank,
+                    walked,
+                    callee_frame,
+                    callee_ec,
+                    inline_w_code as *const (),
+                    is_being_profiled,
+                    deferred_portal_leave,
                 )?));
             }
         }
@@ -5174,6 +5255,11 @@ fn finish_recursive_inline<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
     walked: DispatchOutcome,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    w_code: *const (),
+    is_being_profiled: bool,
+    deferred_portal_leave: Option<usize>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     match walked {
         DispatchOutcome::SubReturn { result } => {
@@ -5186,6 +5272,41 @@ fn finish_recursive_inline<Sym: WalkSym>(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             ctx.set_last_exc_value(exc, exc_concrete);
             Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
+        }
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: `do_recursive_call(
+            // assembler_call=True)` records CALL_ASSEMBLER in the caller
+            // (`walk_generator_resume`) and continues that caller. Passing
+            // the outcome out of a helper residualizes the whole CALL.
+            if callee_frame == OpRef::NONE || callee_ec == OpRef::NONE || w_code.is_null() {
+                inline_call::record_deferred_portal_leave(deferred_portal_leave);
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            let token = match token {
+                Some(token) => Some(token),
+                None => portal_assembler_token(w_code, target_pc, is_being_profiled),
+            };
+            let emitted = inline_call::emit_walker_loop_callee_call_assembler(
+                ctx,
+                op,
+                dst_bank,
+                dst,
+                callee_frame,
+                callee_ec,
+                0,
+                token,
+                target_pc,
+                w_code,
+                is_being_profiled,
+                None,
+                None,
+                None,
+            );
+            inline_call::record_deferred_portal_leave(deferred_portal_leave);
+            match emitted? {
+                Some(outcome) => Ok(outcome),
+                None => Err(DispatchError::callee_inline_unsupported(op.pc)),
+            }
         }
         other => Ok((other, op.next_pc)),
     }
@@ -10366,6 +10487,220 @@ pub fn foriter_body_pc_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
     let unit = foriter_unit_at(frame, resume_py_pc)?;
     let code = unsafe { &*frame_raw_code(frame)? };
     Some(crate::pyjitpl::semantic_fallthrough_pc(code, unit))
+}
+
+/// True when the code unit at `pc` is an inline-cache pad.
+pub fn py_unit_is_cache(frame: usize, pc: usize) -> bool {
+    let Some(raw_code) = frame_raw_code(frame) else {
+        return false;
+    };
+    matches!(
+        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, pc),
+        Some((pyre_interpreter::Instruction::Cache, _))
+    )
+}
+
+/// Park a live frame that is sitting on a `CACHE` unit of a header `FOR_ITER`,
+/// on that `FOR_ITER`'s semantic fallthrough (`STORE_FAST` / `STORE_NAME`),
+/// or on the `LOAD_FAST` / `LOAD_FAST_BORROW` that reads the stored name,
+/// back at the `FOR_ITER`.
+///
+/// `close_loop_restart_pc` uses `loop_header_pc + 1` when the merge marker's
+/// Python pc equals the header. That +1 assumes the walk already advanced
+/// `valuestackdepth` through a super-instruction. A virtualized `FOR_ITER`
+/// leaves the GET_ITER index-or-NULL slot on TOS, so dispatch then no-ops
+/// `CACHE` onto the fallthrough store and writes that NULL.
+///
+/// A generator `FOR_ITER` has a one-unit `CACHE` pad. GuardNonnull of the
+/// dest is recorded after the store/load DebugMergePoints (`pyjitpl.py`
+/// `_establish_nullity` / `opimpl_goto_if_not_ptr_nonzero` resumepc is the
+/// goto, but the compiled loop's last DMP before that guard is already the
+/// load). CRN then parks on `LOAD_FAST_BORROW` with the GET_ITER
+/// index-or-NULL still on TOS. Dispatch would load the name the store
+/// either wrote as NULL or never wrote.
+///
+/// The success-path push of that dest sits above GET_ITER's two slots; pop
+/// it so the rewound `FOR_ITER` still peeks the iterator.
+pub fn rewind_foriter_cache_park(frame: &mut pyre_interpreter::pyframe::PyFrame) -> bool {
+    let next = frame.next_instr();
+    let extra = frame.valuestackdepth.saturating_sub(frame.stack_base());
+    // `valuestackdepth` is absolute (`stack_base + extra`). GET_ITER
+    // leaves iterator + index-or-NULL (`extra >= 2`). `extra < 2` is
+    // either empty (`peek` would read a local) or a single leftover
+    // null, not that pair.
+    if next == 0 || extra < 2 || !frame.peek().is_null() {
+        return false;
+    }
+    let frame_addr = frame as *const pyre_interpreter::pyframe::PyFrame as usize;
+    let Some(raw_code) = frame_raw_code(frame_addr) else {
+        return false;
+    };
+    let code = unsafe { &*raw_code };
+    let Some(owner) = foriter_header_for_null_tos_park(code, next) else {
+        return false;
+    };
+    let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, owner);
+    if next == fallthrough && extra > 2 {
+        let _ = frame.popvalue_maybe_none();
+    }
+    frame.set_last_instr_from_next_instr(owner);
+    true
+}
+
+/// `FOR_ITER` that owns a null-TOS park at `next`: the `CACHE` pad of that
+/// header, its `semantic_fallthrough_pc` (the store of the item), or the
+/// load of that stored name.
+fn foriter_header_for_null_tos_park(
+    code: &pyre_interpreter::CodeObject,
+    next: usize,
+) -> Option<usize> {
+    let owner = pyre_interpreter::pyopcode::owning_instruction(&code.instructions, next - 1);
+    let owner_is_foriter = matches!(
+        pyre_interpreter::decode_instruction_at(code, owner).map(|pair| pair.0),
+        Some(pyre_interpreter::Instruction::ForIter { .. })
+    );
+    if owner_is_foriter {
+        let next_is_cache = matches!(
+            pyre_interpreter::decode_instruction_at(code, next).map(|pair| pair.0),
+            Some(pyre_interpreter::Instruction::Cache)
+        );
+        let next_is_fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, owner) == next;
+        if next_is_cache || next_is_fallthrough {
+            return Some(owner);
+        }
+    }
+    let mut pc = 0;
+    while pc < next {
+        if matches!(
+            pyre_interpreter::decode_instruction_at(code, pc).map(|pair| pair.0),
+            Some(pyre_interpreter::Instruction::ForIter { .. })
+        ) && crate::pyjitpl::semantic_fallthrough_pc(code, pc) == next
+        {
+            return Some(pc);
+        }
+        pc += 1;
+    }
+    foriter_header_for_load_after_store(code, next)
+}
+
+/// `resume_execute_frame` for a CRN that parked after `YIELD_VALUE`
+/// without pushing the sent value. `next()` sends `w_None`; GET_ITER's
+/// index-or-NULL is still TOS. Rewinding that park to `FOR_ITER` re-runs
+/// the iterator and can yield a RETURN's implicit None. Push the sent
+/// value so `POP_TOP` consumes it and the GET_ITER slot stays.
+///
+/// `YIELD_VALUE` has a one-unit CACHE pad. Compiled-loop CRN parks on
+/// that CACHE (`next` is not `RESUME`); `owning_instruction` walks it
+/// back to the yield. A specialised `RESUME_CHECK` is the same park.
+pub fn push_resume_send_none_if_parked(frame: &mut pyre_interpreter::pyframe::PyFrame) -> bool {
+    let next = frame.next_instr();
+    let extra = frame.valuestackdepth.saturating_sub(frame.stack_base());
+    if next == 0 || extra < 2 || !frame.peek().is_null() {
+        return false;
+    }
+    let frame_addr = frame as *const pyre_interpreter::pyframe::PyFrame as usize;
+    let Some(raw_code) = frame_raw_code(frame_addr) else {
+        return false;
+    };
+    let code = unsafe { &*raw_code };
+    if !resume_send_park_after_yield(code, next) {
+        return false;
+    }
+    frame.pushvalue(pyre_object::w_none());
+    true
+}
+
+/// GuardNonnull of a generator `FOR_ITER` dest can sit after the store and
+/// the load DebugMergePoints. CRN then parks on `LOAD_FAST` /
+/// `LOAD_FAST_BORROW` of the name that store wrote. The GET_ITER
+/// index-or-NULL is still TOS (the store already popped the dest).
+fn foriter_header_for_load_after_store(
+    code: &pyre_interpreter::CodeObject,
+    next: usize,
+) -> Option<usize> {
+    let next_is_load = matches!(
+        pyre_interpreter::decode_instruction_at(code, next).map(|pair| pair.0),
+        Some(
+            pyre_interpreter::Instruction::LoadFast { .. }
+                | pyre_interpreter::Instruction::LoadFastBorrow { .. }
+        )
+    );
+    if !next_is_load {
+        return None;
+    }
+    let store = pyre_interpreter::pyopcode::owning_instruction(&code.instructions, next - 1);
+    let store_is_store = matches!(
+        pyre_interpreter::decode_instruction_at(code, store).map(|pair| pair.0),
+        Some(
+            pyre_interpreter::Instruction::StoreFast { .. }
+                | pyre_interpreter::Instruction::StoreName { .. }
+        )
+    );
+    if !store_is_store {
+        return None;
+    }
+    foriter_whose_store_is(code, store)
+}
+
+/// CRN after `YIELD_VALUE` with the sent value not yet pushed: the
+/// yield's CACHE pad, the following `RESUME` / `RESUME_CHECK`, or a
+/// CACHE of that resume. The FOR_ITER/STORE/LOAD chain is not required;
+/// `POP_TOP` of the sent `None` is what keeps GET_ITER's index-or-NULL.
+fn resume_send_park_after_yield(code: &pyre_interpreter::CodeObject, next: usize) -> bool {
+    let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, next) else {
+        return false;
+    };
+    if instruction_is_resume(&instr) {
+        return next > 0 && owning_is_yield_value(code, next - 1);
+    }
+    if !matches!(instr, pyre_interpreter::Instruction::Cache) || next == 0 {
+        return false;
+    }
+    let owner = pyre_interpreter::pyopcode::owning_instruction(&code.instructions, next - 1);
+    if owning_is_yield_value(code, owner) {
+        return true;
+    }
+    matches!(
+        pyre_interpreter::decode_instruction_at(code, owner).map(|pair| pair.0),
+        Some(instr) if instruction_is_resume(&instr)
+    ) && owner > 0
+        && owning_is_yield_value(code, owner - 1)
+}
+
+fn instruction_is_resume(instr: &pyre_interpreter::Instruction) -> bool {
+    matches!(
+        instr,
+        pyre_interpreter::Instruction::Resume { .. }
+            | pyre_interpreter::Instruction::ResumeCheck
+            | pyre_interpreter::Instruction::ResumeCheckJit
+            | pyre_interpreter::Instruction::InstrumentedResume
+    )
+}
+
+fn owning_is_yield_value(code: &pyre_interpreter::CodeObject, pos: usize) -> bool {
+    let owner = pyre_interpreter::pyopcode::owning_instruction(&code.instructions, pos);
+    matches!(
+        pyre_interpreter::decode_instruction_at(code, owner).map(|pair| pair.0),
+        Some(
+            pyre_interpreter::Instruction::YieldValue { .. }
+                | pyre_interpreter::Instruction::InstrumentedYieldValue
+        )
+    )
+}
+
+fn foriter_whose_store_is(code: &pyre_interpreter::CodeObject, store: usize) -> Option<usize> {
+    let mut pc = 0;
+    while pc < store {
+        if matches!(
+            pyre_interpreter::decode_instruction_at(code, pc).map(|pair| pair.0),
+            Some(pyre_interpreter::Instruction::ForIter { .. })
+        ) && crate::pyjitpl::semantic_fallthrough_pc(code, pc) == store
+        {
+            return Some(pc);
+        }
+        pc += 1;
+    }
+    None
 }
 
 /// Whether an in-flight FOR_ITER continuation belongs to `frame` at this

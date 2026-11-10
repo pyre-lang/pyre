@@ -3374,6 +3374,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -3394,6 +3395,7 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -3425,6 +3427,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -3610,6 +3613,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),

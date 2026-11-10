@@ -139,10 +139,9 @@ fn static_atomic_bool_load_llbc() -> Llbc {
                         ], "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [
-                                    {"Copy": place(1, &receiver)},
-                                    {"Copy": place(2, &ordering)}
-                                ],
-                                "dest": place(0, &bool_ty)}, "target": 1, "on_unwind": 2
+                                    {"Read": place(1, &receiver)},
+                                    {"Read": place(2, &ordering)}
+                                ]}, "dest": place(0, &bool_ty), "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}

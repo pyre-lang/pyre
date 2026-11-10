@@ -7013,6 +7013,7 @@ fn filter_liveness_in_place(
     Vec<Option<usize>>,
     Vec<Option<usize>>,
     Vec<Vec<(u8, u16, u16)>>,
+    Vec<Vec<(u8, u16, u16)>>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
@@ -7183,6 +7184,13 @@ fn filter_liveness_in_place(
     // and publish it to EVERY member PC — exactly the conservative-superset
     // semantics a per-program-point coloring guarantees.
     let mut marker_pcdep: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); walker_tracked.len()];
+    // After-residual-call maps keyed by the CALL py_pc. Both markers of
+    // one PC share `marker_pcdep[py_pc]`, so the after-call group cannot
+    // publish there without overwriting the CALL-entry coloring.
+    // `get_list_of_active_boxes` (`pyjitpl.py`) inverts trailing `-live-`
+    // colors through the post-call (fallthrough) slots; this table is
+    // that coloring, baked at the trailing-live jitcode offset.
+    let mut after_call_pcdep: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); walker_tracked.len()];
 
     let all_groups = groups
         .into_iter()
@@ -7264,15 +7272,30 @@ fn filter_liveness_in_place(
             //
             // `lv_live` below is the converse set — colors that are
             // frame-live but SSA-DEAD, which backward liveness cannot
-            // supply.  It feeds the portal reds and the FOR_ITER re-add.
+            // supply.  It feeds the portal reds and the FOR_ITER /
+            // after-residual-call re-add.
             let lv_live: std::collections::BTreeSet<u16> = {
                 // #348 Part (2): the per-PC map's entries at this PC are the
                 // live frame colors — each slot's TRUE per-program-point SSA
                 // color, already gated to live + restorable. This is the same
                 // color space the runtime encode/decode invert through, so the
                 // `-live-` markers stay consistent with the inversion.
+                //
+                // `get_list_of_active_boxes` (`pyjitpl.py`) reads the
+                // marker AFTER the call when `after_residual_call`. The
+                // surviving operand-stack slots live at
+                // `semantic_fallthrough_pc` (CALL pops args then pushes
+                // the result); the runtime inverts through
+                // `after_residual_fallthrough_py_pc` at that same
+                // coordinate. Call-entry slots would restore the popped
+                // args.
+                let slot_pc = if after_residual_call {
+                    pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py_pc)
+                } else {
+                    py_pc
+                };
                 let mut s: std::collections::BTreeSet<u16> = pcdep_color_slots
-                    .get(py_pc)
+                    .get(slot_pc)
                     .map(|entries| {
                         entries
                             .iter()
@@ -7321,15 +7344,16 @@ fn filter_liveness_in_place(
                 s
             };
             // Re-add the per-PC frame-live colors backward liveness
-            // omitted — FOR_ITER body PCs only.  A loop-carried operand-
-            // stack value (the iterator) is frame-live at a body PC but
-            // SSA-backward-DEAD there, so `pc_live_r` omits it and the
-            // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
-            // `lv_live` names the full restorable set for FOR_ITER body
-            // guards.  While-loop body PCs are excluded: widening their
-            // liveness changes the resume layout and causes perf
-            // regressions (int_loop/float_loop/nested_loop).
-            if foriter_body_pcs.contains(py_pc) {
+            // omitted — FOR_ITER body PCs and after-residual-call
+            // markers.  A loop-carried operand-stack value (the
+            // iterator, or CALL's leftover append/self) is frame-live
+            // at that PC but SSA-backward-DEAD there, so `pc_live_r`
+            // omits it and the guard snapshot leaves the slot
+            // `OpRef::NONE`.  Re-adding `lv_live` names the full
+            // restorable set.  Other while-loop leading markers stay
+            // excluded: widening those changes the resume layout
+            // (int_loop/float_loop/nested_loop).
+            if after_residual_call || foriter_body_pcs.contains(py_pc) {
                 for &idx in lv_live.iter() {
                     if !pc_live_r.contains(&idx) {
                         pc_live_r.push(idx);
@@ -7463,7 +7487,30 @@ fn filter_liveness_in_place(
         // Only the per-PC marker owns a Python PC's published map: both markers
         // of one PC share the single `marker_pcdep[py_pc]` entry, and the
         // runtime inverts a resume color through the PC's own coloring.
-        if !after_residual_call {
+        if after_residual_call {
+            // Trailing `-live-` colors are the fallthrough slots
+            // (`semantic_fallthrough_pc`); invert through that coloring,
+            // not the CALL-entry map. Publish beside `marker_pcdep` so
+            // CALL-entry inversion stays on the leading marker.
+            for &py_pc in &py_pcs {
+                let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py_pc);
+                let mut pc_entries: Vec<(u8, u16, u16)> = Vec::new();
+                if let Some(entries) = pcdep_color_slots.get(ft) {
+                    for &(bank, color, slot) in entries {
+                        if bank == 1 && (union_r.contains(&color) || (slot as usize) < nlocals) {
+                            pc_entries.push((bank, color, slot));
+                        } else if bank != 1 {
+                            pc_entries.push((bank, color, slot));
+                        }
+                    }
+                }
+                pc_entries.sort_unstable();
+                pc_entries.dedup();
+                if let Some(slot_out) = after_call_pcdep.get_mut(py_pc) {
+                    *slot_out = pc_entries;
+                }
+            }
+        } else {
             let pcdep = pcdep_color_slots;
             // Publish each member PC's OWN per-PC color→slot entry, NOT
             // the cross-PC union. The folded `-live-` marker's `union_r` makes
@@ -7547,6 +7594,7 @@ fn filter_liveness_in_place(
         after_call_post_merge,
         first_insn_post_merge,
         marker_pcdep,
+        after_call_pcdep,
     )
 }
 
@@ -11053,7 +11101,6 @@ impl CodeWriter {
                             vec![profiled_var.into()],
                             py_pc as i64,
                         );
-                        emit_live_placeholder!(py_pc);
                         let scratch_profiled_reg = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                         // The `next_instr` green differs at every
                         // instruction start.  As a list constant it would
@@ -11063,7 +11110,10 @@ impl CodeWriter {
                         // the u16-immediate `int_copy/d>i`, the way
                         // `last_instr` uses `setfield_vable_i_imm`.  Its
                         // source is the constant, so `promote_greens`
-                        // still has nothing to guard for it.
+                        // still has nothing to guard for it. The copy is
+                        // still a producer in `ops` and must precede op3:
+                        // `get_list_of_active_boxes` reads the `-live-`
+                        // immediately before `jit_merge_point`.
                         let scratch_next_instr_reg =
                             ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                         let next_instr_var = emit_graph_op_with_result(
@@ -11074,6 +11124,7 @@ impl CodeWriter {
                             Kind::Int,
                             -1,
                         );
+                        emit_live_placeholder!(py_pc);
                         let graph_args = portal_jit_merge_point_graph_args(
                             &graph,
                             next_instr_var,
@@ -17768,6 +17819,7 @@ impl CodeWriter {
             after_call_post_merge,
             first_insn_post_merge,
             marker_pcdep_color_slots,
+            after_call_pcdep_color_slots,
         ) = filter_liveness_in_place(
             &mut ssarepr,
             code,
@@ -17787,6 +17839,21 @@ impl CodeWriter {
         // only at this publication boundary so register allocation stays in
         // its compact space while every frame slot in metadata is physical.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> = marker_pcdep_color_slots
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(bank, color, slot)| {
+                        (
+                            bank,
+                            color,
+                            frame_layout_slot(slot, nlocals, stack_base_absolute),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let after_residual_pcdep: Vec<Vec<(u8, u16, u16)>> = after_call_pcdep_color_slots
             .into_iter()
             .map(|entries| {
                 entries
@@ -17848,6 +17915,7 @@ impl CodeWriter {
             num_regs,
             result_color_at_pc,
             pcdep_color_slots,
+            after_residual_pcdep,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
             &resume_entries,
@@ -17928,6 +17996,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
+        after_residual_pcdep: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
         resume_entries: &[(usize, super::flow::BlockRef)],
@@ -18935,6 +19004,47 @@ impl CodeWriter {
                     resolve_marker(skipped)
                 },
             );
+            // Trailing `-live-` of a residual CALL is the
+            // `get_list_of_active_boxes(after_residual_call=True)` resume
+            // coordinate (`pyjitpl.py`). Predecessor twins keyed only at
+            // op-start floor that offset onto the CALL-entry coloring, whose
+            // extra slots are the consumed operands. The trailing-live byte
+            // can share a block-head / first-offset with the CALL; overwrite
+            // that exact offset with the fallthrough coloring (leftover stack
+            // plus call result). Folded-onto-per-PC after-call markers leave
+            // `after_residual_pcdep` empty and stay on the leading map.
+            for &(py, _) in &after_call_some {
+                let Some(off) = after_residual_call_resume_for_py(py) else {
+                    continue;
+                };
+                let pcdep = match after_residual_pcdep.get(py) {
+                    Some(entries) if !entries.is_empty() => entries.clone(),
+                    _ => continue,
+                };
+                let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
+                Self::upsert_predecessor_twin(&mut pcdep_by_jit_pc, off, pcdep.clone());
+                Self::upsert_predecessor_twin(
+                    &mut depth_pred_by_jit_pc,
+                    off,
+                    depth_at_pc.get(ft).copied().unwrap_or(0),
+                );
+                Self::upsert_predecessor_twin(
+                    &mut const_ref_slots_by_jit_pc,
+                    off,
+                    const_ref_slots_at_pc.get(ft).cloned().unwrap_or_default(),
+                );
+                Self::upsert_predecessor_twin(&mut pcdep_trivia_pred_by_jit_pc, off, pcdep);
+                Self::upsert_predecessor_twin(
+                    &mut depth_trivia_pred_by_jit_pc,
+                    off,
+                    static_depth.get(ft).copied(),
+                );
+                Self::upsert_predecessor_twin(
+                    &mut const_ref_trivia_pred_by_jit_pc,
+                    off,
+                    const_ref_slots_at_pc.get(ft).cloned().unwrap_or_default(),
+                );
+            }
         }
 
         // call.py `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -21371,7 +21481,7 @@ mod tests {
         // maps to nothing, so it stands in for an SSA-live scratch temp.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
@@ -21410,6 +21520,110 @@ mod tests {
             ints,
             std::collections::BTreeSet::from([3]),
             "Int bank must be untouched by the Ref-only filter",
+        );
+    }
+
+    /// After a residual CALL, `get_list_of_active_boxes` (`pyjitpl.py`)
+    /// reads the trailing `-live-`. Frame-live leftover stack slots
+    /// (append/self plus the call result) sit at
+    /// `semantic_fallthrough_pc`; SSA-backward liveness keeps only the
+    /// result. Re-add the fallthrough colors, not the call-entry ones.
+    #[test]
+    fn filter_liveness_after_call_readds_fallthrough_stack_colors() {
+        let code = compile_exec("a(next(it))\n").expect("source must compile");
+        let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        let call_pc = (0..code.instructions.len())
+            .find(|&py_pc| {
+                let (instr, _) = scan_state.get(code.instructions[py_pc]);
+                matches!(instr, Instruction::Call { .. }) && live_vars.is_reachable(py_pc)
+            })
+            .expect("snippet must contain a reachable CALL");
+        let fallthrough = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(&code, call_pc);
+        assert!(
+            fallthrough < code.instructions.len(),
+            "CALL must fall through to another opcode"
+        );
+
+        let mut ssarepr = SSARepr::new("after_call_fallthrough");
+        let mut walker_tracked_pc_live_indices: Vec<usize> =
+            Vec::with_capacity(code.instructions.len());
+        for _py_pc in 0..code.instructions.len() {
+            walker_tracked_pc_live_indices.push(ssarepr.insns.len());
+            ssarepr
+                .insns
+                .push(Insn::live(vec![Operand::Register(Register::new(
+                    Kind::Ref,
+                    12,
+                ))]));
+        }
+        ssarepr.insns.push(Insn::op_with_result(
+            "residual_call_r_r",
+            vec![Operand::Register(Register::new(Kind::Ref, 12))],
+            Register::new(Kind::Ref, 12),
+        ));
+        let after_call_idx = ssarepr.insns.len();
+        ssarepr.insns.push(Insn::live(Vec::new()));
+        ssarepr.insns.push(Insn::op(
+            "int_is_true",
+            vec![Operand::Register(Register::new(Kind::Int, 0))],
+        ));
+
+        let mut walker_after_call_pc_indices: Vec<Option<usize>> =
+            vec![None; code.instructions.len()];
+        walker_after_call_pc_indices[call_pc] = Some(after_call_idx);
+
+        let mut pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
+            vec![Vec::new(); code.instructions.len()];
+        pcdep_color_slots[call_pc] = vec![(1, 1, 0), (1, 2, 1), (1, 3, 2), (1, 4, 3), (1, 5, 4)];
+        pcdep_color_slots[fallthrough] = vec![(1, 10, 0), (1, 11, 1), (1, 12, 2)];
+
+        let (_live_markers, after_call_post_merge, _first_insn, _, after_call_pcdep) =
+            filter_liveness_in_place(
+                &mut ssarepr,
+                &code,
+                &pcdep_color_slots,
+                u16::MAX,
+                u16::MAX,
+                Some(&walker_tracked_pc_live_indices),
+                Some(&walker_after_call_pc_indices),
+                false,
+            );
+
+        let live_idx = after_call_post_merge[call_pc].expect("CALL must keep an after-call marker");
+        let live_args = ssarepr.insns[live_idx]
+            .live_args()
+            .expect("after-call marker must remain -live-");
+        let refs: std::collections::BTreeSet<u16> = live_args
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Ref => Some(reg.index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            refs.is_superset(&std::collections::BTreeSet::from([10, 11, 12])),
+            "after-call Ref bank must name fallthrough stack colors, got {refs:?}"
+        );
+        assert!(
+            refs.is_disjoint(&std::collections::BTreeSet::from([1, 2, 3, 4, 5])),
+            "after-call Ref bank must not restore call-entry extra slots, got {refs:?}"
+        );
+        let after_map: std::collections::BTreeSet<(u8, u16, u16)> =
+            after_call_pcdep[call_pc].iter().copied().collect();
+        assert!(
+            after_map.is_superset(&std::collections::BTreeSet::from([
+                (1, 10, 0),
+                (1, 11, 1),
+                (1, 12, 2),
+            ])),
+            "after-call pcdep must invert through fallthrough slots, got {after_map:?}"
+        );
+        assert!(
+            after_map
+                .iter()
+                .all(|&(bank, color, _)| bank != 1 || ![1, 2, 3, 4, 5].contains(&color)),
+            "after-call pcdep must not publish call-entry extra colors, got {after_map:?}"
         );
     }
 
@@ -21596,7 +21810,7 @@ mod tests {
         // assert the splice path keeps the live Int/Float registers.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
@@ -22034,6 +22248,10 @@ mod tests {
         assert!(
             guard_pos < merge_pos,
             "promote_greens must precede jit_merge_point, got {opnames:?}"
+        );
+        assert!(
+            merge_pos > 0 && opnames[merge_pos - 1] == "live",
+            "op3 -live- must immediately precede jit_merge_point, got {opnames:?}"
         );
         assert!(
             !opnames[..merge_pos].contains(&"ref_guard_value"),

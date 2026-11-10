@@ -1723,7 +1723,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const crate::CodeObject {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
+        crate::w_code_get_ptr(code as PyObjectRef)
     }
 }
 

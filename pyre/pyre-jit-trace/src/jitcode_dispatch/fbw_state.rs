@@ -2775,6 +2775,58 @@ mod foriter_delivery_tests {
         lf
     }
 
+    /// `for y in xs: yield y` — FOR_ITER, STORE_FAST, LOAD_FAST_BORROW, YIELD, RESUME.
+    struct YieldLoopFrame {
+        frame: pyre_interpreter::pyframe::FrameBox,
+        header: usize,
+        store: usize,
+        load: usize,
+        yield_cache: Option<usize>,
+        resume: usize,
+    }
+
+    fn yield_loop_frame() -> YieldLoopFrame {
+        let code = function_code("def f(xs):\n    for y in xs:\n        yield y\n");
+        let units = foriter_units(&code);
+        assert_eq!(units.len(), 1);
+        let header = units[0];
+        let store = crate::pyjitpl::semantic_fallthrough_pc(&code, header);
+        let load = crate::pyjitpl::semantic_fallthrough_pc(&code, store);
+        assert!(matches!(
+            pyre_interpreter::decode_instruction_at(&code, store).map(|pair| pair.0),
+            Some(pyre_interpreter::Instruction::StoreFast { .. })
+        ));
+        assert!(matches!(
+            pyre_interpreter::decode_instruction_at(&code, load).map(|pair| pair.0),
+            Some(
+                pyre_interpreter::Instruction::LoadFast { .. }
+                    | pyre_interpreter::Instruction::LoadFastBorrow { .. }
+            )
+        ));
+        let resume = (load + 1..code.instructions.len())
+            .find(|&pc| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(&code, pc).map(|pair| pair.0),
+                    Some(pyre_interpreter::Instruction::Resume { .. })
+                )
+            })
+            .expect("yield y is followed by RESUME");
+        let yield_cache = resume.checked_sub(1).filter(|&pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(&code, pc).map(|pair| pair.0),
+                Some(pyre_interpreter::Instruction::Cache)
+            )
+        });
+        YieldLoopFrame {
+            frame: pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation"),
+            header,
+            store,
+            load,
+            yield_cache,
+            resume,
+        }
+    }
+
     /// A take that hands an item out has NOT delivered it: the deliver site
     /// still refuses on its header check.  Counting the take as the delivery
     /// is what made a refusal read as a success.
@@ -2968,6 +3020,203 @@ mod foriter_delivery_tests {
         );
 
         fbw_store_journal_reset();
+    }
+
+    /// A CloseLoop handback can park on the first CACHE of a header FOR_ITER
+    /// with the GET_ITER index-or-NULL slot still on TOS. Rewind to the
+    /// FOR_ITER so dispatch does not no-op CACHE onto STORE_NAME.
+    #[test]
+    fn rewind_from_foriter_cache_with_getiter_null_tos() {
+        let mut lf = loop_frame();
+        let header = lf.outer_header;
+        let cache_pc = header + 1;
+        assert!(
+            super::super::py_unit_is_cache(lf.addr(), cache_pc),
+            "FOR_ITER is followed by a CACHE unit"
+        );
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert!(super::super::rewind_foriter_cache_park(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), header);
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "a real TOS is the continue-arm item; leave the CACHE park"
+        );
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+    }
+
+    /// `valuestackdepth` starts at `stack_base`. An unbound last local is
+    /// NULL, but it is not GET_ITER's index-or-NULL. Leave the CACHE park.
+    #[test]
+    fn rewind_skips_empty_operand_stack_even_when_last_local_is_null() {
+        let mut lf = loop_frame();
+        let header = lf.outer_header;
+        let cache_pc = header + 1;
+        let base = lf.frame.stack_base();
+        assert_eq!(lf.frame.valuestackdepth, base);
+        if base > 0 {
+            lf.frame.set_locals_w(base - 1, pyre_object::PY_NULL);
+        }
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "empty operand stack is not a GET_ITER NULL park"
+        );
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert_eq!(lf.frame.valuestackdepth, base);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert_eq!(lf.frame.valuestackdepth, base + 1);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "a single leftover null is not GET_ITER's iterator + index-or-NULL"
+        );
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert_eq!(lf.frame.valuestackdepth, base + 1);
+    }
+
+    /// A GuardNonnull-fail CRN of a generator `FOR_ITER` parks on
+    /// `STORE_FAST` (no `CACHE` pad) with the GET_ITER index-or-NULL
+    /// still on TOS. Rewind to the `FOR_ITER` so dispatch does not store
+    /// that NULL.
+    #[test]
+    fn rewind_from_foriter_store_with_getiter_null_tos() {
+        let mut lf = loop_frame();
+        let header = lf.outer_header;
+        let body = lf.outer_body;
+        let base = lf.frame.stack_base();
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(body);
+        assert_eq!(lf.frame.next_instr(), body);
+        assert!(super::super::rewind_foriter_cache_park(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), header);
+        assert_eq!(lf.frame.valuestackdepth, base + 2);
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.set_last_instr_from_next_instr(body);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "a real TOS is the continue-arm item; leave the store park"
+        );
+        assert_eq!(lf.frame.next_instr(), body);
+    }
+
+    /// Opcode `FOR_ITER` already pushed the null dest before GuardNonnull
+    /// failed. Pop that extra slot so the rewound `FOR_ITER` still peeks
+    /// the iterator under GET_ITER's index-or-NULL.
+    #[test]
+    fn rewind_from_foriter_store_pops_the_null_dest() {
+        let mut lf = loop_frame();
+        let header = lf.outer_header;
+        let body = lf.outer_body;
+        let base = lf.frame.stack_base();
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(body);
+        assert_eq!(lf.frame.valuestackdepth, base + 3);
+        assert!(super::super::rewind_foriter_cache_park(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), header);
+        assert_eq!(lf.frame.valuestackdepth, base + 2);
+        assert!(lf.frame.peek().is_null());
+    }
+
+    /// GuardNonnull of the dest is recorded after the store/load
+    /// DebugMergePoints. CRN parks on `LOAD_FAST_BORROW` with GET_ITER's
+    /// index-or-NULL still on TOS. Rewind to the `FOR_ITER` so dispatch
+    /// does not load an unbound loop name.
+    #[test]
+    fn rewind_from_foriter_load_after_store_with_getiter_null_tos() {
+        let mut lf = yield_loop_frame();
+        let header = lf.header;
+        let store = lf.store;
+        let load = lf.load;
+        let base = lf.frame.stack_base();
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(load);
+        assert_eq!(lf.frame.next_instr(), load);
+        assert!(super::super::rewind_foriter_cache_park(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), header);
+        assert_eq!(lf.frame.valuestackdepth, base + 2);
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.set_last_instr_from_next_instr(load);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "a real TOS is the continue-arm item; leave the load park"
+        );
+        assert_eq!(lf.frame.next_instr(), load);
+        lf.frame.popvalue_maybe_none();
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(store);
+        assert!(super::super::rewind_foriter_cache_park(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), header);
+    }
+
+    /// Guard-fail CRN after `YIELD_VALUE` parks on `RESUME` with GET_ITER's
+    /// index-or-NULL on TOS. `resume_execute_frame` pushes the sent `w_None`
+    /// so `POP_TOP` consumes it; rewinding to `FOR_ITER` would re-run the
+    /// iterator.
+    #[test]
+    fn resume_after_yield_with_getiter_null_tos_pushes_send_none() {
+        let mut lf = yield_loop_frame();
+        let resume = lf.resume;
+        let base = lf.frame.stack_base();
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(resume);
+        assert_eq!(lf.frame.next_instr(), resume);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "RESUME with GET_ITER NULL is not a FOR_ITER cache park"
+        );
+        assert_eq!(lf.frame.next_instr(), resume);
+        assert!(super::super::push_resume_send_none_if_parked(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), resume);
+        assert_eq!(lf.frame.valuestackdepth, base + 3);
+        assert!(!lf.frame.peek().is_null());
+        lf.frame.set_last_instr_from_next_instr(resume);
+        assert!(
+            !super::super::push_resume_send_none_if_parked(&mut lf.frame),
+            "a real TOS is the sent resume value; leave the RESUME park"
+        );
+        assert_eq!(lf.frame.next_instr(), resume);
+    }
+
+    /// `YIELD_VALUE` has a one-unit CACHE pad. Compiled-loop CRN parks on
+    /// that CACHE with GET_ITER's index-or-NULL still TOS. Push the sent
+    /// `w_None` there; do not rewind to `FOR_ITER`.
+    #[test]
+    fn yield_cache_pad_with_getiter_null_tos_pushes_send_none() {
+        let mut lf = yield_loop_frame();
+        let Some(cache_pc) = lf.yield_cache else {
+            return;
+        };
+        let base = lf.frame.stack_base();
+        lf.frame.push_on_self(1usize as pyre_object::PyObjectRef);
+        lf.frame.push_on_self(pyre_object::PY_NULL);
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert!(
+            !super::super::rewind_foriter_cache_park(&mut lf.frame),
+            "YIELD_VALUE CACHE with GET_ITER NULL is not a FOR_ITER cache park"
+        );
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert!(super::super::push_resume_send_none_if_parked(&mut lf.frame));
+        assert_eq!(lf.frame.next_instr(), cache_pc);
+        assert_eq!(lf.frame.valuestackdepth, base + 3);
+        assert!(!lf.frame.peek().is_null());
+        lf.frame.set_last_instr_from_next_instr(cache_pc);
+        assert!(
+            !super::super::push_resume_send_none_if_parked(&mut lf.frame),
+            "a real TOS is the sent resume value; leave the CACHE park"
+        );
+        assert_eq!(lf.frame.next_instr(), cache_pc);
     }
 
     /// Two activations of one loop body are two `MIFrame`s

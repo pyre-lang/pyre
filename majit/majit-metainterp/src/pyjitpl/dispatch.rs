@@ -2627,6 +2627,17 @@ where
     /// * [`TraceAction::SegmentedBridge`] — `compile_trace(metainterp,
     ///   resumekey, [exception_box])` with the `target_token is not token`
     ///   give-up (pyjitpl.py).
+    /// `pyjitpl.py MIFrame.get_list_of_active_boxes`: a non-residual
+    /// `generate_guard` snapshot steps `SIZE_LIVE_OP` back from the
+    /// opcode and asserts that byte is `-live-`. Abort when the
+    /// marker is missing so `convert_and_run_from_pyjitpl` runs
+    /// instead of panicking in `get_list_of_active_boxes`.
+    fn opcode_preceded_by_live(&mut self, opcode_pc: usize) -> bool {
+        const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+        let live_pc = opcode_pc.saturating_sub(SIZE_LIVE_OP);
+        self.frames.current_mut().jitcode.code.get(live_pc) == Some(&crate::jitcode::insns::BC_LIVE)
+    }
+
     fn create_segmented_trace(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2634,6 +2645,9 @@ where
         mp_opcode_pc: usize,
         mp_green_pc: Option<i64>,
     ) -> TraceAction {
+        if !self.opcode_preceded_by_live(mp_opcode_pc) {
+            return TraceAction::Abort;
+        }
         // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`.  The
         // resume position is the merge-point op, whose preceding `-live-`
         // marker names the boxes the blackhole resumes with — the same
@@ -3995,6 +4009,7 @@ where
                 &reds_i,
                 &reds_r,
                 &reds_f,
+                None,
             );
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
@@ -4118,9 +4133,10 @@ where
                 &reds_i,
                 &reds_r,
                 &reds_f,
+                None,
             )
         } else {
-            refuse_unexecuted_recursive_call(ctx)
+            refuse_unexecuted_recursive_call(ctx, "no portal runner")
         }
     }
 
@@ -4157,6 +4173,13 @@ where
         reds_i: &[usize],
         reds_r: &[usize],
         reds_f: &[usize],
+        // `pyjitpl.py` `do_recursive_call(..., greenboxes + redboxes)`: the
+        // nested merge already holds the callee's merge-point boxes. Those
+        // live on the frame `finishframe` is about to pop, so the caller
+        // reads them first and passes them here. Empty `None` keeps the
+        // opcode path (`BC_RECURSIVE_CALL_*` register lists, or a
+        // `recursive_fresh_entry_reds` synthesiser).
+        prebuilt_reds: Option<(Vec<OpRef>, Vec<majit_ir::Value>, Vec<majit_ir::Type>)>,
     ) -> TraceAction {
         // Validate the (result_kind, result_dst) pairing: the three typed
         // kinds carry a destination register, `Void` carries none.  Any
@@ -4199,8 +4222,25 @@ where
         // synthesize a zeroed host state. `do_recursive_call` passes those
         // red boxes unchanged.
         let synthesized = sym.recursive_fresh_entry_reds();
+        let fresh_call_ei = majit_ir::EffectInfo {
+            can_collect: false,
+            ..majit_ir::EffectInfo::new(
+                majit_ir::descr::ExtraEffect::CannotRaise,
+                majit_ir::descr::OopSpecIndex::None,
+            )
+        };
         let (args, red_values, arg_types, alloc_results, fresh_call_ei, free_fp, _fresh_owner) =
-            if synthesized.is_none() {
+            if let Some((args, red_values, arg_types)) = prebuilt_reds {
+                (
+                    args,
+                    red_values,
+                    arg_types,
+                    Vec::new(),
+                    fresh_call_ei,
+                    std::ptr::null(),
+                    Box::new(()) as Box<dyn std::any::Any>,
+                )
+            } else if synthesized.is_none() {
                 let mut args = Vec::new();
                 let mut red_values = Vec::new();
                 let mut arg_types = Vec::new();
@@ -4222,13 +4262,6 @@ where
                     red_values.push(majit_ir::Value::Float(f64::from_bits(bits as u64)));
                     arg_types.push(majit_ir::Type::Float);
                 }
-                let fresh_call_ei = majit_ir::EffectInfo {
-                    can_collect: false,
-                    ..majit_ir::EffectInfo::new(
-                        majit_ir::descr::ExtraEffect::CannotRaise,
-                        majit_ir::descr::OopSpecIndex::None,
-                    )
-                };
                 (
                     args,
                     red_values,
@@ -5577,13 +5610,27 @@ where
 /// Return [`TraceAction::Abort`]: discard the trace and let the interpreter
 /// answer. `check.py` treats a default-hook `panicked at` on stderr as
 /// JIT-PANIC even when `run_to_end`'s `catch_unwind` would convert it.
-fn typed_return_without_caller_destination(insn: &str, argcode: char) -> TraceAction {
+fn typed_return_without_caller_destination(
+    insn: &str,
+    argcode: char,
+    frames: &MIFrameStack,
+) -> TraceAction {
     if crate::majit_log_enabled() {
+        let depth = frames.frames.len();
+        let callee = frames.frames.last();
+        let caller = frames.frames.get(depth.saturating_sub(2));
         eprintln!(
             "[jit] {insn} returned an `{argcode}` value into a non-empty framestack, \
              but the caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. \
-             The `inline_call_*_{argcode}` form and the callee's terminator are one \
-             decision (jtransform.py:434 `reskind`); aborting the trace"
+             callee={} pc={} last_op={} caller={} pc={} last_op={} depth={depth}. The \
+             `inline_call_*_{argcode}` form and the callee's terminator are one \
+             decision (jtransform.py:434 `reskind`); aborting the trace",
+            callee.map(|f| f.jitcode.name()).unwrap_or("-"),
+            callee.map(|f| f.code_cursor).unwrap_or(0),
+            callee.map(|f| f.last_opcode_position).unwrap_or(0),
+            caller.map(|f| f.jitcode.name()).unwrap_or("-"),
+            caller.map(|f| f.code_cursor).unwrap_or(0),
+            caller.map(|f| f.last_opcode_position).unwrap_or(0),
         );
     }
     TraceAction::Abort
@@ -5716,7 +5763,10 @@ pub fn publish_walk_abort_handoff(
 ) {
     if matches!(
         action,
-        TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
+        TraceAction::Abort
+            | TraceAction::SwitchToBlackhole(_)
+            | TraceAction::SegmentedLoop
+            | TraceAction::SegmentedBridge { .. }
     ) && !standalone.frames.is_empty()
     {
         // `None` is itself a resume choice: the generated dispatch loop falls
@@ -5754,15 +5804,27 @@ pub fn publish_walk_abort_handoff(
         {
             return;
         }
-        if let Some(pc) = standalone.frames.frames[0]
-            .int_regs
-            .first()
-            .copied()
-            .flatten()
-            .and_then(|op| ctx.box_bits(op))
-            .and_then(|pc| usize::try_from(pc).ok())
-        {
-            ctx.walk_final_pc = Some(pc);
+        // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` CRNs from
+        // the merge the blackhole reaches, not the aborted walk's root i0.
+        // A bridge whose portal frame is still sitting on the failing
+        // opcode (POP_JUMP extra already 0) would publish that opcode as
+        // next_instr. Prefer the last depth-0 merge; leave the field empty
+        // on a bridge with none so `stage_cancel` converts the framestack
+        // instead of ContinueRunningNormally.
+        if ctx.walk_final_pc.is_none() {
+            if let Some(pc) = ctx.last_mp_green_pc {
+                ctx.walk_final_pc = Some(pc);
+            } else if !ctx.is_bridge_trace
+                && let Some(pc) = standalone.frames.frames[0]
+                    .int_regs
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|op| ctx.box_bits(op))
+                    .and_then(|pc| usize::try_from(pc).ok())
+            {
+                ctx.walk_final_pc = Some(pc);
+            }
         }
         // An arm that failed to lower is emitted as a degraded stub: a
         // sub-JitCode whose entire body is the single `abort` byte, pushed by
@@ -5938,6 +6000,16 @@ where
     R: JitCodeRuntime,
 {
     let mut standalone = StandaloneFrameStack::new();
+    // pyjitpl.py `initialize_state_from_guard_failure`:
+    // `portal_call_depth = -1` then `newframe` per resume section
+    // (`jitcode.jitdriver_sd` increments). Unique interpret walks a
+    // StandaloneFrameStack; `portal_call_depth_fn` still samples
+    // MetaInterp.portal_call_depth, so seed it the same way. Depth 0 is
+    // the outermost portal; inner merges must not publish last_mp / CRN.
+    {
+        let current = ctx.portal_call_depth();
+        ctx.adjust_portal_call_depth(-1 - current);
+    }
     for (depth, resume_frame) in frames.iter().enumerate() {
         let mut frame = standalone.frames.take_frame(
             resume_frame.jitcode.clone(),
@@ -5945,6 +6017,14 @@ where
             None,
             Some(ctx),
         );
+        if let Some(jd) = resume_frame.jitcode.jitdriver_sd() {
+            ctx.adjust_portal_call_depth(1);
+            // Resume rebuild does not record ENTER_PORTAL_FRAME
+            // (`newframe` greenkey is None). `portal_entered` still
+            // pairs popframe's depth decrement.
+            frame.portal_entered = true;
+            frame.portal_jd = jd;
+        }
         // `resume.py rebuild_from_resumedata` does `newframe`, then
         // `setup_resume_at_op`, then `consume_boxes` into that frame's
         // registers. The resume list already holds the portal reds.

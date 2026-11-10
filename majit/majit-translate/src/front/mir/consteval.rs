@@ -73,12 +73,7 @@ impl<'a> Lowering<'a> {
     /// that global (`FunDecl::is_global_initializer` / PromotedConst).
     pub(in crate::front::mir) fn anon_const_copied_global(&self, def_id: u64) -> Option<Place> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("AnonConst")
-        {
+        if gd.global_kind_str() != Some("AnonConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -94,12 +89,7 @@ impl<'a> Lowering<'a> {
     /// (`_1 = const C; _0 = &_1`, a fieldless-enum `Aggregate`, a literal).
     pub(in crate::front::mir) fn anon_const_literal_op(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("AnonConst")
-        {
+        if gd.global_kind_str() != Some("AnonConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -882,16 +872,13 @@ pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> 
 }
 
 pub(in crate::front::mir) fn global_is_thread_local(g: &GlobalDecl) -> bool {
-    let Some(kind) = g.rest.get("global_kind") else {
-        return false;
-    };
-    if kind.as_str() == Some("ThreadLocal") {
-        return true;
+    match g.global_kind {
+        majit_charon_reader::GlobalKind::ThreadLocal => true,
+        majit_charon_reader::GlobalKind::Static {
+            is_thread_local, ..
+        } => is_thread_local,
+        _ => false,
     }
-    kind.get("Static")
-        .and_then(|st| st.get("is_thread_local"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
 }
 
 /// An immutable `static` binding: Charon's `Static { is_mut: false }`,
@@ -1197,7 +1184,7 @@ pub(in crate::front::mir) fn closed_fnptr_graphs_for(
 }
 
 pub(in crate::front::mir) fn global_tyref(g: &GlobalDecl) -> Option<TyRef> {
-    serde_json::from_value(g.rest.get("ty")?.clone()).ok()
+    g.tyref.clone()
 }
 
 pub(in crate::front::mir) fn global_decl_adt_id(llbc: &Llbc, g: &GlobalDecl) -> Option<u64> {
@@ -1426,6 +1413,30 @@ pub(in crate::front::mir) fn field_ty_is_prebuilt_immutable(ty: &TyRef, llbc: &L
     }
     node.get("Scalar")
         .is_some_and(|scalar| scalar_value_type(scalar).is_some())
+}
+
+/// The type *is* `Cell` / `UnsafeCell` / `Atomic*`, after peeling `Ref`
+/// / `RawPtr`. A class that merely *contains* one of those
+/// (`PyType` with an atomic field) is not this.
+pub(in crate::front::mir) fn tyref_is_interior_mut_constructor(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if let Some(arr) = node
+        .as_object()
+        .and_then(|obj| obj.get("RawPtr"))
+        .and_then(serde_json::Value::as_array)
+        && let Some(inner) = arr.first().and_then(|n| strip_ty_wrappers(n, llbc))
+    {
+        node = inner;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    adt_path_is_interior_mut_constructor(&td.item_meta.name_path(), &td.kind)
 }
 
 /// Declared interior mutability of a type: `UnsafeCell`, `Cell`, or a
@@ -1784,6 +1795,7 @@ pub(crate) fn discover_raw_struct_paths(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     let mut paths = Vec::new();
     for decl in llbc.iter_type_decls() {
@@ -1801,6 +1813,7 @@ pub(crate) fn discover_raw_struct_paths(
             llbc,
             gc_struct_ids,
             immutable_fields,
+            raw_alloc_flavor_structs,
             &mut stack,
         ) {
             paths.push(decl.item_meta.name_path());
@@ -1808,7 +1821,6 @@ pub(crate) fn discover_raw_struct_paths(
     }
     paths
 }
-
 
 /// Transparent scalars whose defining crate is not in the extraction set.
 ///
@@ -1836,16 +1848,26 @@ pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) 
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
-        discovered.extend(discover_transparent_scalar_kinds(llbc));
-        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
-            std::slice::from_ref(*llbc),
-        );
-        raw_structs.extend(discover_raw_struct_paths(llbc, &gc_struct_ids, &ranks));
         raw_alloc.extend(
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 *llbc,
             )),
         );
+    }
+    raw_alloc.sort();
+    raw_alloc.dedup();
+    let raw_alloc_set: std::collections::HashSet<String> = raw_alloc.iter().cloned().collect();
+    for llbc in llbcs {
+        discovered.extend(discover_transparent_scalar_kinds(llbc));
+        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(*llbc),
+        );
+        raw_structs.extend(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &ranks,
+            &raw_alloc_set,
+        ));
         let mut impl_folds = Vec::new();
         for (path, op) in discover_foldable_const_lits(llbc) {
             if path.contains('<') {
@@ -2250,6 +2272,23 @@ pub(in crate::front::mir) enum DecodedConst {
     FnPath(Vec<String>),
 }
 
+/// Unresolved `Opaque` / `VTableRef` / `TraitConst` share the
+/// `__str_const` path with a real string literal. `getkind` of that
+/// word is `'r'`, so `CallControl.getcalldescr` rejects a `usize`
+/// parameter and the template stays `dont_look_inside`. A real rstr
+/// piece stays `Str` (`emit_str_const` / `rstr.py` `StringRepr`).
+pub(in crate::front::mir) fn is_unresolved_const_sentinel(text: &str) -> bool {
+    text == "__trait_const" || text == "__vtable_ref" || text.starts_with("opaque:")
+}
+
+pub(in crate::front::mir) fn str_const_call_result_ty(text: &str) -> ValueType {
+    if is_unresolved_const_sentinel(text) {
+        ValueType::Ref(None)
+    } else {
+        ValueType::Str
+    }
+}
+
 /// The op `build_rvalue` emits for an `Operand::Const`. A PromotedConst
 /// body that copies that constant and returns a borrow of it folds to
 /// the same op (`flowspace` `Constant`). A Unicode scalar in a const
@@ -2271,17 +2310,21 @@ pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKin
         // `Ptr(STR)` (getkind `r`). The `__str_const` path is never
         // registered: the flowspace adapter pre-folds it to
         // `Constant('text')` (`flowspace_adapter.rs::is_str_const_define`).
-        // `emit_str_const` stamps the same `ValueType::Str` / `STRPTR`.
-        DecodedConst::Str(s) => OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-                generic_rust_args: Vec::new(),
-                specialization: crate::parse::GraphSpecialization::Regular,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Str,
-        },
+        // A real rstr piece stamps `ValueType::Str` / `STRPTR`; an
+        // unresolved sentinel stamps `Ref` (`CallControl.getcalldescr`).
+        DecodedConst::Str(s) => {
+            let result_ty = str_const_call_result_ty(&s);
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), s],
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty,
+            }
+        }
         // A function item used as a *value* rather than called. Upstream
         // materialises `Constant(funcptr)` of lltype `Ptr(FuncType)`
         // (`rtyper.getcallable`); `FuncType._gckind` is `raw`, so

@@ -7,6 +7,7 @@ mod common;
 
 use common::{
     CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named,
+    with_shared_lowering,
 };
 use common::{build_semantic_program_from_llbc, lower_function};
 use majit_charon_reader::Llbc;
@@ -4554,25 +4555,25 @@ fn object_key_field_read_narrows_to_object_key_class() {
 /// lowered body, not a `__cast_pointer` of the `FrameBox` onto `PyFrame`.
 #[test]
 fn flat_pycall_frame_comes_from_deref_mut() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
     use std::collections::HashSet;
 
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-    let context = LowerContext::new(&llbc);
-    let fd = llbc
-        .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::function::_flat_pycall")
-        .unwrap_or_else(|| {
-            let hits: Vec<_> = llbc
-                .iter_local_fns()
-                .filter(|fd| fd.item_meta.name_path().contains("_flat_pycall"))
-                .map(|fd| fd.item_meta.name_path())
-                .collect();
-            panic!("missing pyre_interpreter::function::_flat_pycall, hits: {hits:?}");
-        });
-    let graph =
-        lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower _flat_pycall: {err}"));
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = with_shared_lowering(llbc, |context| {
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::function::_flat_pycall")
+            .unwrap_or_else(|| {
+                let hits: Vec<_> = llbc
+                    .iter_local_fns()
+                    .filter(|fd| fd.item_meta.name_path().contains("_flat_pycall"))
+                    .map(|fd| fd.item_meta.name_path())
+                    .collect();
+                panic!("missing pyre_interpreter::function::_flat_pycall, hits: {hits:?}");
+            });
+        lower_fun_decl(context, fd).unwrap_or_else(|err| panic!("lower _flat_pycall: {err}"))
+    });
     let live = reachable_blocks(&graph);
 
     fn value_id(arg: &LinkArg) -> Option<u64> {
@@ -4780,45 +4781,78 @@ fn flat_pycall_frame_comes_from_deref_mut() {
         }
     }
 
+    /// 0 = no, 1 = cycle, 2 = yes. A loop-carried join of the inlined
+    /// `frame_ptr` body is yes when some source is grounded and none is a
+    /// different value (`frame_box_verdict`).
     fn from_deref_mut_or_body(
         graph: &FunctionGraph,
         id: u64,
         frame_boxes: &HashSet<u64>,
         live: &HashSet<majit_translate::model::BlockId>,
         seen: &mut HashSet<u64>,
-    ) -> bool {
-        if !seen.insert(id) {
-            return false;
+    ) -> u8 {
+        if frame_boxes.contains(&id) {
+            return 0;
         }
-        let ok = if frame_boxes.contains(&id) {
-            false
-        } else if let Some(op) = op_result(graph, id) {
+        if !seen.insert(id) {
+            return 1;
+        }
+        let verdict = if let Some(op) = op_result(graph, id) {
             if is_frame_box_pyframe_cast(&op.kind, frame_boxes) {
-                false
+                0
             } else if let OpKind::Call { target, .. } = &op.kind
-                && receiver_id(&op.kind).is_some_and(|recv| frame_boxes.contains(&recv))
                 && matches!(call_leaf(target), "deref_mut" | "frame_ptr")
+                && (target
+                    .receiver_root()
+                    .is_some_and(|root| root.ends_with("FrameBox"))
+                    || receiver_id(&op.kind).is_some_and(|recv| frame_boxes.contains(&recv)))
             {
-                true
+                2
             } else if let OpKind::FieldRead { field, base, .. } = &op.kind
                 && matches!(field.name.as_str(), "owner_root" | "ptr")
                 && frame_boxes.contains(&base.id())
             {
-                true
+                2
+            } else if let OpKind::FieldRead { base, .. } = &op.kind {
+                from_deref_mut_or_body(graph, base.id(), frame_boxes, live, seen)
+            } else if let OpKind::Call { target, .. } = &op.kind
+                && matches!(
+                    call_leaf(target),
+                    "get" | "unwrap" | "unwrap_unchecked" | "expect" | "as_ref" | "as_mut"
+                )
+                && let Some(recv) = receiver_id(&op.kind)
+            {
+                from_deref_mut_or_body(graph, recv, frame_boxes, live, seen)
             } else if let Some(next) = forward_id(&op.kind) {
                 from_deref_mut_or_body(graph, next, frame_boxes, live, seen)
             } else {
-                false
+                0
             }
         } else {
             let srcs = phi_sources(graph, id, live);
-            !srcs.is_empty()
-                && srcs
-                    .iter()
-                    .all(|src| from_deref_mut_or_body(graph, *src, frame_boxes, live, seen))
+            if srcs.is_empty() {
+                0
+            } else {
+                let mut any_yes = false;
+                let mut any_no = false;
+                for src in srcs {
+                    match from_deref_mut_or_body(graph, src, frame_boxes, live, seen) {
+                        2 => any_yes = true,
+                        0 => any_no = true,
+                        _ => {}
+                    }
+                }
+                if any_no {
+                    0
+                } else if any_yes {
+                    2
+                } else {
+                    1
+                }
+            }
         };
         seen.remove(&id);
-        ok
+        verdict
     }
 
     let mut eval_args = Vec::new();
@@ -4846,9 +4880,21 @@ fn flat_pycall_frame_comes_from_deref_mut() {
     );
     for arg in eval_args {
         let mut seen = HashSet::new();
-        assert!(
+        let producer = op_result(&graph, arg).map(|op| format!("{:?}", op.kind));
+        let srcs = phi_sources(&graph, arg, &live);
+        let src_dump: Vec<_> = srcs
+            .iter()
+            .map(|src| {
+                (
+                    *src,
+                    op_result(&graph, *src).map(|op| format!("{:?}", op.kind)),
+                )
+            })
+            .collect();
+        assert_eq!(
             from_deref_mut_or_body(&graph, arg, &frame_boxes, &live, &mut seen),
-            "eval_current_frame_raw argument v{arg} is not the deref_mut result or its lowered body"
+            2,
+            "eval_current_frame_raw argument v{arg} is not the deref_mut result or its lowered body; producer={producer:?} phi={src_dump:?}"
         );
     }
 }

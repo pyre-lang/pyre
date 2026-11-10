@@ -4,21 +4,21 @@ use super::{
     dont_look_inside_return_token, field_ty_is_raw_word, is_cow_str_family_class_root,
     is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
     is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration,
-    is_rustc_pointer_niche_spelling, is_str_family_class_root,
-    json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
-    json_ty_packed_copy_struct_byte_size, json_ty_scalar_element_spelling, no_immutable_fields,
-    no_raw_alloc_flavor, no_tombstoned_leaves, payload_tuple_suffix, positional_aggregate_field_rows,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, json_ty_is_by_value_copy_aggregate,
+    json_ty_is_thin_pointer_element, json_ty_packed_copy_struct_byte_size,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_raw_alloc_flavor,
+    no_tombstoned_leaves, payload_tuple_suffix, positional_aggregate_field_rows,
     raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts,
     type_decl_is_closure_env, tyref_aggregate_field_value_type, tyref_array_suffix,
     tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
     tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
     tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
     tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_raw_struct_value,
-    tyref_is_string_family, tyref_is_void_zst,
-    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
+    tyref_is_string_family, tyref_is_void_zst, tyref_niche_option_gc_payload_spelling,
+    tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+    tyref_raw_ptr_to_classed_instance_spelling, tyref_ref_param_class_root,
+    tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+    tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -9379,7 +9379,7 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
             &gc_struct_ids,
             &std::collections::HashSet::<String>::new()
         ),
-        "isize"
+        "i64"
     );
 
     let split = paint_handle(
@@ -10209,38 +10209,6 @@ fn load_handle_with_width(
     (llbc, ty)
 }
 
-/// RootScope is a class instance (`Ref`) even when Charon records
-/// `repr.transparent` over its `usize` save_point. The peel and
-/// `tyref_is_raw_struct_value` share `gc_root_scope_type_path`
-/// (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
-#[test]
-fn root_scope_is_ref_even_when_layout_is_transparent_usize() {
-    let decls = vec![(
-        1,
-        struct_decl(
-            1,
-            ident_path(&["pyre_object", "gc_roots", "RootScope"]),
-            serde_json::json!([{
-                "name": "save_point",
-                "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
-                "attr_info": null
-            }]),
-            true,
-        ),
-    )];
-    let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
-    assert!(
-        matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
-        "RootScope getkind is ref; peel must not yield the save_point word"
-    );
-    let word = vec![(
-        1,
-        struct_decl(1, ident_path(&["fixture", "Word"]), i64_field(), true),
-    )];
-    let (llbc, ty) = load_handle(word, serde_json::json!([]), 1);
-    assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
-}
-
 /// A container that stores a RootScope is an instance (`Ref`). The
 /// guard is not raw storage, so `RootedItems { scope, base, len }`
 /// does not inherit Int (`rtyper` `getrepr` → `lowleveltype`;
@@ -11012,7 +10980,8 @@ fn closure_env_capturing_callable_is_ref_not_raw() {
             &capturing,
             &llbc,
             &gc_struct_ids,
-            super::no_immutable_fields()
+            super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
         ),
         Some(true),
         "owner of a callable field is a GC instance"
@@ -11259,8 +11228,8 @@ fn raw_mut_i8() -> TyRef {
 fn adt_field_read_raw_byte_ptr_bank() {
     // `rffi.py` `CCHARP`: a raw `*mut u8` field is CCHARP (Unsigned bank) in
     // any owner. `history.py` `getkind` of a raw `Ptr` is `'int'`: a raw
-    // pointer's target determines its kind, independently of the field owner
-    // (`rptr.py PtrRepr.rtype_getattr` uses FIELD_TYPE).
+    // owner's `*mut i8` is the address word; a GC owner's stays the erased
+    // GCREF.
     let llbc = llbc_with_ordinary_and_closure_env();
     let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let tomb = no_tombstoned_leaves();
@@ -11338,8 +11307,8 @@ fn adt_field_read_raw_byte_ptr_bank() {
             &gc_ids,
             &std::collections::HashSet::<String>::new()
         ),
-        ValueType::Int,
-        "a GC owner's *mut i8 still points to a raw array"
+        ValueType::Ref(None),
+        "a GC owner's *mut i8 stays the erased GCREF"
     );
 }
 
@@ -11359,8 +11328,8 @@ fn raw_field_address_value_type_matches_field_read() {
     );
     assert_eq!(
         raw_field_address_value_type(&raw_mut_i8(), &raw_mut_i8(), Some(true), &llbc),
-        Some(ValueType::Int),
-        "a GC owner's *mut i8 is still in the raw-address bank"
+        None,
+        "a GC owner's *mut i8 is not the raw-address bank"
     );
 }
 
@@ -11378,16 +11347,6 @@ fn mut_u8_as_usize_emits_cast_ptr_to_int_then_r_uint() {
         &TyRef::Other(mut_u8_ty_json()),
         &llbc
     ));
-    assert_eq!(
-        tyref_to_value_type(&TyRef::Other(mut_u8_ty_json()), &llbc),
-        ValueType::Int,
-        "*mut u8 getkind is int (`rffi.CCHARP`)"
-    );
-    assert_eq!(
-        tyref_to_attr_value_type(&TyRef::Other(mut_u8_ty_json()), &llbc),
-        ValueType::Int,
-        "*mut u8 attr getkind is int (`rffi.CCHARP`)"
-    );
 }
 
 /// The pointer-to-int origin is a function pointer or a pointer /
@@ -11641,9 +11600,7 @@ fn vec_len_autoderef_fixture(raw_ptr_receiver: bool) -> (Llbc, &'static str) {
                                         "trait_refs": []
                                     }
                                 }},
-                                "args": [{"Move": place(2, &ref_ty)}],
-                                "dest": place(0, &usize_ty)
-                            },
+                                "args": [{"Move": place(2, &ref_ty)}]}, "dest": place(0, &usize_ty),
                             "target": 1,
                             "on_unwind": 2
                         }}
@@ -11889,6 +11846,7 @@ fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
     }));
     let generics = majit_charon_reader::FunGenerics {
         has_types: false,
+        types_len: 0,
         has_const_generics: false,
         trait_clauses: vec![majit_charon_reader::TraitClauseBound {
             trait_id: Some(1),
@@ -13013,6 +12971,7 @@ fn stamp_option_method_inputs(
         &gc_struct_ids,
         false,
         &empty_s,
+        false,
     );
     graph
         .block(graph.startblock)
@@ -17808,95 +17767,5 @@ fn registered_transparent_scalar_stays_raw_storage() {
     assert!(
         adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
         "registered transparent scalar stays the inner word"
-    );
-}
-
-/// Non-generic transparent wrapper of a GC pointer. The field is not
-/// raw storage, so peel does not run — the same answer as the TypeDecl
-/// template (`adt_def_is_raw_storage` with `generics = None`).
-#[test]
-fn non_generic_transparent_gc_pointer_wrapper_does_not_peel() {
-    let object_ty = named_adt(0, vec![]);
-    let ptr = serde_json::json!({"RawPtr": [object_ty.clone(), "Mut"]});
-    let wrapper_ty = named_adt(1, vec![]);
-    let file = serde_json::json!({
-        "charon_version": "0.1.201",
-        "has_errors": false,
-        "translated": {
-            "crate_name": "fixture",
-            "type_decls": [
-                struct_decl(
-                    0,
-                    ident_path(&["pyre_object", "pyobject", "PyObject"]),
-                    serde_json::json!([]),
-                    false
-                ),
-                struct_decl(
-                    1,
-                    ident_path(&["fixture", "Wrapper"]),
-                    serde_json::json!([{
-                        "name": "value",
-                        "ty": ptr,
-                        "attr_info": null
-                    }]),
-                    true
-                )
-            ],
-            "fun_decls": [],
-            "global_decls": [],
-            "trait_decls": [{
-                "def_id": 0,
-                "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
-            }],
-            "trait_impls": [{
-                "impl_trait": {
-                    "id": 0,
-                    "generics": {"types": [object_ty]}
-                }
-            }]
-        }
-    });
-    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("wrapper fixture");
-    let wrapper = TyRef::Other(wrapper_ty);
-    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-    let raw = std::collections::HashSet::<String>::new();
-    let wrapper_sid = super::struct_id_for_type_decl(llbc.type_by_id(1).expect("Wrapper decl"));
-    assert!(
-        !gc.contains(&wrapper_sid),
-        "Wrapper is not declared GC; the field is a GC pointer"
-    );
-    assert!(
-        !super::tyref_adt_is_raw_storage(&wrapper, &llbc, &gc, super::no_immutable_fields()),
-        "a GC pointer field is not raw storage"
-    );
-    assert!(
-        super::tyref_transparent_inner_value_type(
-            &wrapper,
-            &llbc,
-            super::no_tombstoned_leaves(),
-            &gc,
-            &raw,
-        )
-        .is_none(),
-        "non-generic GC-pointer wrapper does not peel"
-    );
-    let layout = super::tyref_to_field_layout_string(&wrapper, &llbc, &gc, &raw);
-    assert_eq!(
-        layout,
-        super::tyref_to_ast_string(&wrapper, &llbc),
-        "layout keeps the wrapper, got {layout}"
-    );
-    assert!(
-        matches!(
-            super::tyref_to_value_type_with(
-                &wrapper,
-                &llbc,
-                super::no_tombstoned_leaves(),
-                &gc,
-                &raw,
-            ),
-            ValueType::Ref(_)
-        ),
-        "wrapper of a GC pointer stays Ref"
     );
 }

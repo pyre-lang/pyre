@@ -4210,10 +4210,10 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
 /// codewriter/bridge read this to fold globals lookups without an off-GC
 /// proxy.
 ///
-/// `get_w_globals` promotes the code object first; with that constant
-/// argument this residual folds the same way `w_code_get_ptr` does.
-#[inline]
-#[majit_macros::elidable_cannot_raise]
+/// `pyframe.py get_w_globals` is `jit.promote(self.pycode).w_globals`.
+/// The field is `w_globals?`, so the looked-inside read is
+/// `record_quasiimmut_field` plus a pure getfield (`jtransform.py
+/// rewrite_op_getfield`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

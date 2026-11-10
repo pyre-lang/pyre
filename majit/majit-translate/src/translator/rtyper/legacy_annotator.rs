@@ -1079,19 +1079,6 @@ fn ccharp_someptr_incoming() -> Incoming {
     Incoming::Annotation(Rc::new(ccharp_someptr()))
 }
 
-fn voidp_someptr() -> SomeValue {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
-    let LowLevelType::Ptr(ptr_ty) = (*VOIDP).clone() else {
-        unreachable!("VOIDP is a pointer");
-    };
-    SomeValue::Ptr(SomePtr::new(*ptr_ty))
-}
-
-fn voidp_someptr_incoming() -> Incoming {
-    Incoming::Annotation(Rc::new(voidp_someptr()))
-}
-
 /// `lltype.py` `ann_malloc`: `SomePtr(Ptr(s_T.const))` when TYPE is the
 /// allocated Struct/Array (`Ptr::from_container_type`). `TYPE: None` is
 /// a front-end scalar spill / `std::alloc` byte buffer
@@ -1204,16 +1191,6 @@ fn someptr_from_voidp_concretetype(var: &Variable) -> Incoming {
 /// comparison matches this const, not a duplicate literal.
 pub(crate) const MULTIPLE_FROZEN_PBC_UNSUPPORTED: &str =
     "MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)";
-
-/// Production stamps `rffi.py` `VOIDP` / `CONST_VOIDP` on a declared
-/// `*mut c_void` / `*const c_void` (`stamp_raw_c_void_voidp`).
-fn var_concretetype_is_voidp(var: &Variable) -> bool {
-    use crate::translator::rtyper::lltypesystem::rffi::{CONST_VOIDP, VOIDP};
-    matches!(
-        var.concretetype().as_ref(),
-        Some(ct) if *ct == *VOIDP || *ct == *CONST_VOIDP
-    )
-}
 
 /// `getFrozenPBCRepr`: `follow_link` / `mergeinputargs` union incoming
 /// annotations (`bookkeeper.immutablevalue` for a constant, `annotation(v)`

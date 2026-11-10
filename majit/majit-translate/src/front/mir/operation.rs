@@ -3079,7 +3079,6 @@ impl<'a> Lowering<'a> {
                             ),
                             ValueType::Int
                         )
-                        && self.dest_is_plain_signed_int(dest_ty)
                     {
                         let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
                         return Ok((Some(kind), res));
@@ -3225,6 +3224,19 @@ impl<'a> Lowering<'a> {
                             arg,
                             dest_root.as_deref(),
                         );
+                        return Ok((None, raw));
+                    }
+                    // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
+                    // Overlay `as *const T` must not alias or fold back to
+                    // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
+                    // terminator / w_cls resolves on that SomePtr.
+                    let overlay_bb = self.emit_bb(mir_bb);
+                    if let Some(raw) = self.emit_dest_overlay_cast(
+                        overlay_bb,
+                        src_kind.as_ref(),
+                        arg.clone(),
+                        dest_ty,
+                    ) {
                         return Ok((None, raw));
                     }
                     // An address word cast to a raw-flavored instance pointer is
@@ -5280,15 +5292,6 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
-        // Flavor-raw class root (`rclass.py getgcflavor`) before the
-        // storage-raw overlay word, the same order [`ty_is_raw_address`]
-        // uses. A flavor-raw instance pointer stays the class instance;
-        // its cast is `cast_instance`.
-        if flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
-            .is_some()
-        {
-            return None;
-        }
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
         let node = declared_raw_adt_node(
@@ -5299,19 +5302,6 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         )?;
         let id = adt_node_def_id(node)?;
-        // Refusal guard, not a kind classifier: a declared-Raw struct
-        // that still holds a mutable GC pointer is not a raw `SomePtr`
-        // overlay (`jtransform.py rewrite_op_getfield` refuses
-        // `getfield_raw_r`). Answers "not an overlay", never "this is Gc".
-        if !adt_def_is_raw_storage(
-            id,
-            self.llbc,
-            self.gc_struct_ids,
-            self.immutable_fields,
-            &mut Vec::new(),
-        ) {
-            return None;
-        }
         let decl = self.llbc.type_by_id(id)?;
         let TypeDeclKind::Struct(_) = &decl.kind else {
             return None;
@@ -5615,11 +5605,18 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         ) {
             // Looked-inside by-value raw overlay (`DictOperationGuard::new1`):
             // `flatten.py` `make_return` reads getkind of the returnblock.
             // A payload-enum owner (`Fmt`) stays the interned instance.
-            raw_value_getkind(declared_ty, &[&local0.ty], self.llbc, self.gc_struct_ids)
+            raw_value_getkind(
+                declared_ty,
+                &[&local0.ty],
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
         } else {
             declared_ty
         };
@@ -5630,7 +5627,15 @@ impl<'a> Lowering<'a> {
             &declared_ty,
             &self.raw_alloc_flavor_structs,
         );
-        if concrete == crate::model::ConcreteType::Unknown {
+        // Looked-inside scalar FUNC.RESULT (`history.py` getkind int /
+        // float). A ConstRefAddr of a FnPtrCell / OnceLock<fn> is
+        // already Address; painting the declared ADT as GCREF would
+        // overwrite that (`bookkeeper.py` immutablevalue of a module
+        // object is the cell's address).
+        if !matches!(
+            concrete,
+            crate::model::ConcreteType::Signed | crate::model::ConcreteType::Float
+        ) {
             return;
         }
         FunctionGraph::set_concretetype_of_inline(ret, concrete);
@@ -8132,7 +8137,13 @@ impl<'a> Lowering<'a> {
                                  in reach"
                             )));
                         };
-                        if fat_item_is_one_word_gc_ref(&place_ty, self.llbc, self.gc_struct_ids) {
+                        if fat_item_is_one_word_gc_ref(
+                            &place_ty,
+                            self.llbc,
+                            self.gc_struct_ids,
+                            self.immutable_fields,
+                            &self.raw_alloc_flavor_structs,
+                        ) {
                             return Err(LowerError::Unsupported(format!(
                                 "bb{mir_bb}: raw items region of one-word GC \
                                  pointer {}; RPython has no \
@@ -8976,20 +8987,71 @@ impl<'a> Lowering<'a> {
                         result_ty: self.value_type_of(&place_ty),
                     }
                 });
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                let bb_id = self.emit_bb(mir_bb);
-                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                    result: Some(res.clone()),
-                    kind: op,
-                });
-                Ok(res)
+                Ok(self.emit_const_ref_addr_maybe_instance(mir_bb, id, op, &place_ty))
             }
             PlaceKind::Unknown => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Place::Unknown"
             ))),
         }
+    }
+
+    /// Extra ConstRefAddr lanes (`immutable_static_prebuilt_op` /
+    /// `immutable_static_addr_op`) must still stamp a class singleton the
+    /// way the pytype / `refs_static_struct_root` arms do
+    /// (`bookkeeper.py immutablevalue` `SomeInstance`). A bare ConstRefAddr
+    /// is `dest_ct=None` and `rewrite_op_ptr_eq_or_ne` panics on
+    /// `instance_getclass`'s `ptr::eq(tp, &INSTANCE_USER_TYPE)`.
+    /// A `Cell` / `UnsafeCell` / `Atomic*` binding stays the address word
+    /// (`rptr.py InteriorPtrRepr`); a class that merely contains one of
+    /// those (`PyType`) is still an instance. Prebuilt integer/fnptr
+    /// tables stay the address word.
+    pub(in crate::front::mir) fn emit_const_ref_addr_maybe_instance(
+        &mut self,
+        mir_bb: usize,
+        gid: u64,
+        op: OpKind,
+        place_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        if matches!(&op, OpKind::ConstRefAddr(_))
+            && !tyref_is_interior_mut_constructor(place_ty, self.llbc)
+            && !tyref_is_fnptrcell(place_ty, self.llbc)
+            && !tyref_is_oncelock_fn(place_ty, self.llbc)
+            && self
+                .llbc
+                .global_by_id(gid)
+                .is_some_and(|g| !immutable_static_is_prebuilt_table(self.llbc, g))
+            && let Some(root) = tyref_class_root_with(place_ty, self.llbc, self.tombstoned_leaves)
+                .or_else(|| self.refs_static_struct_root(place_ty))
+        {
+            let raw = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(raw.clone()),
+                kind: op,
+            });
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: crate::model::cast_instance_call(root, raw),
+            });
+            // `InstanceRepr.lowleveltype` (`rclass.py`): a GC class
+            // singleton is `OBJECTPTR`. `rewrite_op_ptr_eq_or_ne`
+            // `_is_rclass_instance` reads this cell.
+            res.set_concretetype(Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()));
+            return res;
+        }
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: op,
+        });
+        res
     }
 
     /// Resolve a Charon `Field` projection payload to the
@@ -9389,6 +9451,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         );
         let fields: Vec<AggregateField> = (0..n_operands)
             .map(|i| {
@@ -9709,7 +9772,6 @@ impl<'a> Lowering<'a> {
                 // `concrete_instantiation_adt` prefers a fully-substituted
                 // dest/head so a generic dest does not hide a concrete head.
                 let intern_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
-                let subst_owner = intern_adt.map(|h| serde_json::json!({ "Adt": h.clone() }));
                 let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
                     .enumerate()
@@ -9726,10 +9788,6 @@ impl<'a> Lowering<'a> {
                                 &self.raw_alloc_flavor_structs,
                             )
                         };
-                        let declared_ty = subst_owner
-                            .as_ref()
-                            .and_then(|owner| substitute_spill_typevars(&f.ty, owner, self.llbc))
-                            .unwrap_or_else(|| clone_tyref(&f.ty));
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)

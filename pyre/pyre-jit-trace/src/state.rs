@@ -12621,11 +12621,16 @@ impl JitState for PyreJitState {
         {
             return Some(portal);
         }
-        crate::jitcode_runtime::get_jitcode_by_index(index).map(|canonical| {
-            std::sync::Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                (*canonical).clone(),
-            ))
-        })
+        if let Some(canonical) = crate::jitcode_runtime::get_jitcode_by_index(index) {
+            return Some(std::sync::Arc::new(
+                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone()),
+            ));
+        }
+        // `resume.py jitcodes[jitcode_pos]`: function-entry traces number
+        // the per-CodeObject body (`run_perfn_walk`). Those live in
+        // `METAINTERP_SD.jitcodes` above the build-time table, which is
+        // also how `blackhole_from_resumedata` resolves the same index.
+        pyjitcode_for_jitcode_index(index as i32).map(|pjc| std::sync::Arc::clone(&pjc.jitcode))
     }
 
     /// pyjitpl.py `handle_guard_failure` → `_prepare_resume_from_failure` →
@@ -14353,7 +14358,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let marker = w_int_new(99);

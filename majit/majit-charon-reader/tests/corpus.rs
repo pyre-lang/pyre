@@ -122,7 +122,7 @@ fn loads_fixture_corpus() {
     // + 1 for `CastCcharpToVoidP::ccharp_to_voidp`, the `*const u8` to
     // VOIDP trait method (`cast_into_ccharp_to_voidp_stays_int`).
     //
-    // Measured on Charon 0.1.301 (nightly-2026.10.29) with
+    // Measured on Charon 0.1.315 (nightly-2026.11.09) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
     // longer its own local item, and this artefact holds 106.
     assert_eq!(local_count, 106, "106 local fns expected");

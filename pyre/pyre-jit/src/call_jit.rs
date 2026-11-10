@@ -87,28 +87,6 @@ impl Drop for FrameRoot {
     }
 }
 
-/// Host-side `PyreJitState.frame` after bridge resume decode.
-///
-/// `setup_bridge_sym` publishes the consume identity (`resume.py`
-/// `consume_vable_info` `next_ref()`, `virtualizable_boxes[-1]`) onto
-/// `TraceCtx`. Publish that rooted word so later host readers
-/// (`set_valuestackdepth` via `live_frame`) see the live frame.
-/// `FrameRoot` is the CA failarg 0 root, used only when the ctx has
-/// no identity yet.
-fn refresh_host_vable_frame(
-    jit_state: &mut pyre_jit_trace::state::PyreJitState,
-    bridge_frame_root: &mut FrameRoot,
-) {
-    let (driver, _) = crate::eval::driver_pair();
-    jit_state.set_frame(
-        driver
-            .meta_interp_mut()
-            .trace_ctx()
-            .and_then(|c| c.standard_virtualizable_ptr())
-            .unwrap_or_else(|| bridge_frame_root.frame() as *const PyFrame as usize),
-    );
-}
-
 // warmspot.py:449 portal result_type == REF: FINISH always boxes via
 // wrapint, so the force/resume paths always receive a boxed Ref.
 // FinishProtocol and normalize_direct_finish_result removed — they
@@ -1846,6 +1824,7 @@ pub(crate) fn finish_blackhole_level(
 /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` for the Python
 /// portal: convert the abort framestack with the recursive-portal runner
 /// and each level's own red frame.
+#[expect(dead_code)]
 fn run_python_portal_abort_blackhole(
     driver: &mut majit_metainterp::JitDriver<pyre_jit_trace::state::PyreJitState>,
     jit_state: &mut pyre_jit_trace::state::PyreJitState,
@@ -4342,20 +4321,26 @@ pub enum BridgeResolution {
     FinishedException(pyre_jit_trace::state::ConcreteValue),
 }
 
-/// Map the legacy bool bridge outcome (`true` = continue in compiled code,
-/// `false` = resume in the blackhole) onto [`BridgeResolution`].
-fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
-    if compiled_continue {
-        BridgeResolution::CompiledContinue
-    } else {
-        BridgeResolution::ResumeBlackhole
-    }
-}
-
 /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` →
 /// `convert_and_run_from_pyjitpl` on the live framestack. `compile.py
 /// handle_fail`'s `must_compile` arm never falls through to
 /// `resume_in_blackhole` from the deadframe; this mapping is that raise.
+/// True when `pc` is an instruction that pops TOS. ContinueRunningNormally
+/// at that pc with extra=0 cannot re-enter `eval_loop_jit`.
+fn crn_pc_is_tos_pop(frame: &PyFrame, pc: usize) -> bool {
+    let code = unsafe { &*pyre_interpreter::pyframe::pyframe_get_pycode(frame) };
+    matches!(
+        code.instructions.get(pc).map(|unit| unit.op),
+        Some(
+            Instruction::PopJumpIfFalse { .. }
+                | Instruction::PopJumpIfTrue { .. }
+                | Instruction::PopJumpIfNone { .. }
+                | Instruction::PopJumpIfNotNone { .. }
+                | Instruction::PopTop
+        )
+    )
+}
+
 fn bridge_resolution_from_abort_blackhole(
     resume: majit_metainterp::jitexc::PortalResume,
     driver: &mut majit_metainterp::JitDriver<pyre_jit_trace::state::PyreJitState>,
@@ -4377,7 +4362,15 @@ fn bridge_resolution_from_abort_blackhole(
             if let Some(&ni) = args.green_int.first()
                 && let Some(pc) = crate::eval::green_pc_position(ni)
             {
-                frame.set_last_instr_from_next_instr(pc);
+                // `eval_loop_jit` reads `last_instr`, so a portal next_instr
+                // green has to land there. A pop-jump with extra=0 is the
+                // compiled pop already consumed; rewriting last_instr onto
+                // that opcode underflows. Destination merges (RETURN extra=0)
+                // still rewrite.
+                let extra = frame.valuestackdepth.saturating_sub(frame.stack_base());
+                if extra > 0 || !crn_pc_is_tos_pop(frame, pc) {
+                    frame.set_last_instr_from_next_instr(pc);
+                }
             }
             BridgeResolution::CompiledContinue
         }
@@ -4580,34 +4573,6 @@ fn trace_and_compile_from_bridge_body(
         }
     }
 
-    /// Publish the live callee frame's address to the handshake cells the CA
-    /// slow path's back-to-back blackhole hook reads
-    /// (`jit_blackhole_resume_from_guard`). Always re-read through
-    /// `FrameRoot::frame`, i.e. off the shadow stack, and always at a return
-    /// site: the walk that decides these flags runs before the bridge is
-    /// optimised and compiled, and that work allocates, so an address copied
-    /// while the walk was still running can name a frame the collector has
-    /// since moved. The blackhole compares the adopted cell against the
-    /// deadframe's slot 0, which IS forwarded across the same region, so a
-    /// stale copy here misses the handshake and lets the guard-state resume
-    /// re-run a region the walk already executed.
-    fn stamp_ca_walk_frames(
-        bridge_frame_root: &mut FrameRoot,
-        stamp_resume_frame: bool,
-        stamp_adopted_frame: bool,
-    ) {
-        if !stamp_resume_frame && !stamp_adopted_frame {
-            return;
-        }
-        let frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-        if stamp_resume_frame {
-            CA_WALK_RESUME_FRAME.with(|c| c.set(frame));
-        }
-        if stamp_adopted_frame {
-            CA_WALK_ADOPTED_FRAME.with(|c| c.set(frame));
-        }
-    }
-
     // The live frame is a virtualizable GC object held by raw bridge-trace
     // locals while retracing can collect. RPython keeps the virtualizable
     // object GC-visible during retracing
@@ -4702,11 +4667,6 @@ fn trace_and_compile_from_bridge_body(
             "Resume::ForeignInnermostLastInstr",
         );
     }
-    // A helper innermost has no Python code object (`py_pc == usize::MAX`).
-    // The carrier drain walks that jitcode from the guard
-    // (`drive_helper_innermost_subwalk`). Reconstruct failure still
-    // leaves an empty carrier (`P2Drain::NoRecipes`) and blackholes.
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(bridge_frame_root.frame()) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(bridge_frame_root.frame(), &info);
 
@@ -4744,6 +4704,7 @@ fn trace_and_compile_from_bridge_body(
             raw_values,
             resume_pc,
             false,
+            &decoded_resume.all_virtuals(),
         ) {
             let pc = resume.resume_pc().unwrap_or(usize::MAX);
             // `assembler.py patch_jump_for_descr` marks the guard once a
@@ -4775,6 +4736,19 @@ fn trace_and_compile_from_bridge_body(
             // after `compile_done_with_this_frame`, and `ll_portal_runner`
             // (warmspot.py) returns `result` for the portal.
             // `BridgeResolution::Finished` is that return here.
+            // `jitexc.py ExitFrameWithExceptionRef` is not a portal return.
+            // Check it before the DoneWithThisFrame latch: the exception
+            // GCREF also sits in `single_pass_finish_values`.
+            if matches!(
+                resume,
+                majit_metainterp::jitexc::PortalResume::ExitFrameWithException { .. }
+            ) {
+                return bridge_resolution_from_abort_blackhole(
+                    resume,
+                    driver,
+                    bridge_frame_root.frame(),
+                );
+            }
             let done_with_this_frame = driver.take_done_with_this_frame_ref();
             if pc == usize::MAX
                 && allow_finish_direct_return
@@ -4784,687 +4758,26 @@ fn trace_and_compile_from_bridge_body(
                     result.as_usize() as pyre_object::PyObjectRef,
                 ));
             }
-            if compiled || pc != usize::MAX {
-                return BridgeResolution::CompiledContinue;
-            }
-            return BridgeResolution::ResumeBlackhole;
-        }
-    }
-    // compile.py:714: start_retrace_from_guard + set bridge_info.
-    // `build_meta` reads nlocals / valuestackdepth / slot types off this
-    // host word. It is not the bridge write-back dest: `setup_bridge_sym`
-    // uses `boxes.live_vable(0)` (`resume.py consume_vable_info`
-    // `next_ref()`). Re-read `FrameRoot` after `decode_and_restore`
-    // allocations so those field reads see a live object.
-    jit_state.set_frame(bridge_frame_root.frame() as *const PyFrame as usize);
-    let started = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.start_bridge_tracing(
-            descr_arc,
-            &mut jit_state,
-            &env,
-            raw_values,
-            resume_pc,
-            // `decode_and_restore_guard_failure` has already walked this
-            // guard's resume data applying every write — `replay_pending_fields`
-            // for the deferred stores, `ResumeVableMode::GuardFailureSync` for
-            // the virtualizable — so the replay owes recording only, seeded
-            // with the objects that reader allocated.
-            false,
-            &decoded_resume.all_virtuals(),
-        )
-    };
-    if !started {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] start_bridge_tracing failed key={} descr=0x{:x}",
-                green_key, descr_id
-            );
-        }
-        return BridgeResolution::ResumeBlackhole;
-    }
-    // `setup_bridge_sym` published the consume identity. Copy it onto the
-    // host state word so later readers during this function see the live
-    // frame, not the pre-`start_bridge_tracing` snapshot.
-    refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
-    // resume.py `rebuild_from_resumedata` ran once, inside
-    // `start_bridge_tracing` (`rebuild_state_after_failure`); the portal's
-    // `jd.mainjitcode` seats the frames (`call.py grab_initial_jitcodes`).
-    // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
-    // once, after `rebuild_from_resumedata`. The same call covers the path
-    // with no portal jitcode: there is no framestack to rebuild, and the
-    // exception resume still has to run before the walk.
-    // `finishframe_exception` drained the framestack.
-    // `compile_exit_frame_with_exception` either attached the
-    // exit-with-exception bridge or raised `SwitchToBlackhole` (that
-    // raise already ran `aborted_tracing`). `_handle_guard_failure`
-    // then calls `interpret`, which always raises
-    // `jitexc.ExitFrameWithExceptionRef` — the frame is not resumed.
-    // A still-open trace is the case whose cleanup stopped at
-    // `aborted_tracing`; `abort_trace` finishes it, and the exception
-    // still leaves.
-    let resume = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().prepare_resume_from_failure()
-    };
-    if let majit_metainterp::PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) = resume {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
-            exc.0 as PyObjectRef,
-        ));
-    }
-    // `_prepare_exception_resumption` (pyjitpl.py) +
-    // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
-    // guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION), SAVE_EXC_CLASS +
-    // SAVE_EXCEPTION at trace start, then RESTORE_EXCEPTION before the guard.
-    // The walker owns that whole sequence — it emits it at the bridge-entry
-    // frame state, which is where the guard can capture resume data — so this
-    // site only consumes the flag.
-    let last_bridge_is_exception_guard = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.last_bridge_is_exception_guard
-    };
-    if last_bridge_is_exception_guard {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.last_bridge_is_exception_guard = false;
-    }
-
-    // `pyjitpl.py _prepare_exception_resumption`: `exception` is
-    // `cpu.grab_exc_value(deadframe)`, and only a `ResumeGuardExcDescr` /
-    // `ResumeGuardCopiedExcDescr` failure may carry one (`assert not
-    // exception` otherwise). `prepare_resume_from_failure` then branches on
-    // that grab alone and records GUARD_NO_EXCEPTION when it is null, so a
-    // GUARD_EXCEPTION whose call did not raise is not a pending exception.
-    // The backend `pos_exception` cell is not consulted: the failure stub
-    // of every `must_save_exception` guard already moved it into
-    // `jf_guard_exc`, and a GUARD_NOT_FORCED failure returned above.
-    debug_assert!(last_bridge_is_exception_guard || guard_exc == 0);
-    let pending_exc = guard_exc != 0;
-    // A pending exception at an EXCEPTION guard (GUARD_NO_EXCEPTION /
-    // GUARD_EXCEPTION) whose raising op sits inside an in-frame try is the
-    // bridge-side analogue of the same fallthrough-not-catch resume gap.
-    // pyre encodes the guard's resume_pc as the no-exception semantic
-    // fallthrough (the next opcode after the call), NOT the `except`
-    // handler.  `finishframe_exception` (`pyjitpl.py`) looks up
-    // `catch_exception` on the resumed framestack innermost-first and
-    // jumps there; the walker's `find_catch_for_exc_resume` is that
-    // lookup.  Route any catching frame — live or inlined — onto that
-    // handler.  An uncaught raise closes with
-    // `compile_exit_frame_with_exception` (`last_exc_box` from
-    // `handle_possible_exception`).
-    /// The exception-table byte offset a `next_instr`-style resume coordinate
-    /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
-    /// `last_instr` is `next_instr - 1`).
-    fn exc_table_offset(py_pc: usize) -> u32 {
-        (py_pc.saturating_sub(1) as u32) * 2
-    }
-
-    /// Index of the resumed frame that catches, searched INNERMOST-first by
-    /// asking each frame's own exception table about its own resume pc.
-    /// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
-    /// out of every inlined callee into the live frame; `None` means it
-    /// escapes them all.
-    fn resumed_catch_level(coords: &[(usize, usize, i32, i32)]) -> Option<usize> {
-        for (level, &(w_code, py_pc, jitcode_index, jitcode_pc)) in coords.iter().enumerate().rev()
-        {
-            if w_code == 0 {
-                // Helper section: consult that jitcode's `catch_exception`
-                // at the section pc (`handle_exception_in_frame`). A
-                // continuation with no helper jitcode keeps walking to the
-                // Python ancestor (`finishframe_exception`).
-                if pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
-                    && pyre_jit_trace::jitcode_dispatch::helper_section_catch_target(
-                        jitcode_index,
-                        jitcode_pc,
-                    )
-                    .is_some()
-                {
-                    return Some(level);
-                }
-                continue;
-            }
-            let raw =
-                unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-            if raw.is_null() {
-                return None;
-            }
-            let code = unsafe { &*raw };
-            if pyre_interpreter::pycode::lookup_exceptiontable(
-                &code.exceptiontable,
-                exc_table_offset(py_pc),
-            )
-            .is_some()
-            {
-                return Some(level);
-            }
-        }
-        None
-    }
-
-    // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
-    // allocate. `set_valuestackdepth` writes through `live_frame()` (the
-    // identity `set_frame` / `publish_frame` plants on `frame` and
-    // `frame_root`).
-    refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
-    let catch_level = if pending_exc && last_bridge_is_exception_guard {
-        if is_multiframe_resume {
-            // `resume_pc` addresses the
-            // INNERMOST inlined frame while `code` is the live OUTER frame, so
-            // the single-frame lookup below would consult the wrong code object.
-            // Ask each resumed frame about its OWN pc instead.
-            // `finishframe_exception` walks `framestack` innermost-first and
-            // jumps to whichever frame's `catch_exception` answers; a catch
-            // inside an inlined callee is a real bridge, not a decline.
-            resumed_catch_level(&resume_coords)
-        } else {
-            let off = exc_table_offset(resume_pc);
-            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off)
-                .map(|_| 0usize)
-        }
-    } else {
-        None
-    };
-    let caught_in_frame = catch_level == Some(0);
-    // `finishframe_exception` (`pyjitpl.py`) jumps to the first catching
-    // frame, live or inlined.  Route whenever any resumed frame catches.
-    // An unwind that lands in the live frame discards the callee frames
-    // (no inlined framestack left).  A catch inside a callee keeps the
-    // carrier walk so the handler is recorded there.
-    let frame_pycode = bridge_frame_root.frame().pycode as usize;
-    let unwind_to_live_frame = is_multiframe_resume
-        && caught_in_frame
-        && resume_coords
-            .first()
-            .is_some_and(|&(outer_w_code, _, _, _)| outer_w_code == frame_pycode);
-    let route_exc_edge = catch_level.is_some();
-    // Discard inlined levels only when the raise unwinds *to* the live
-    // frame.  A catch inside a callee still needs those levels as the
-    // carrier recipes.
-    let discarded_levels: Vec<(usize, usize)> = if unwind_to_live_frame {
-        resume_coords
-            .iter()
-            .skip(1)
-            .map(|&(w_code, py_pc, _, _)| (w_code, py_pc))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(&discarded_levels);
-    if route_exc_edge && guard_exc != 0 {
-        // Residual-call cell starts as this failure's grab
-        // (`cpu.grab_exc_value`). Walker `last_exc_value` is seeded once
-        // from `GUARD_EXC_VALUE` (`prepare_resume_from_failure`); residuals
-        // write this cell during the trace.
-        // Re-read `GUARD_EXC_VALUE`: `guard_exc` is the pre-move copy, and
-        // resume rebuild above allocates.
-        let guard_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(guard_exc));
-    } else if !pending_exc {
-        // No standing exception at this bridge's source guard (e.g. a
-        // GUARD_NOT_FORCED that fails every iteration because the may-force
-        // residual forced the frame). A prior residual-call raise may have
-        // left a stale non-null value in `BH_LAST_EXC_VALUE`.
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    }
-    let exception_resume_prepared = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().exception_resume_was_prepared()
-    };
-    if pending_exc && !route_exc_edge && !exception_resume_prepared {
-        // Uncaught: `finishframe_exception` calls
-        // `compile_exit_frame_with_exception(self.last_exc_box)`.
-        // Record `GUARD_EXCEPTION` as `handle_possible_exception` does
-        // (`execute_ll_raised` with `constant=False` so `last_exc_box` is
-        // the guard result, not `ConstPtr` of this instance) and close
-        // with that symbolic box.
-        let live_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-        let exc_box = if live_exc != 0 {
-            let (driver, _) = crate::eval::driver_pair();
-            let meta = driver.meta_interp_mut();
-            meta.execute_ll_raised(live_exc, false);
-            let _ = meta.handle_possible_exception();
-            meta.last_exc_box.filter(|b| *b != majit_ir::OpRef::NONE)
-        } else {
-            None
-        };
-        if let Some(exc_box) = exc_box {
-            let (driver, _) = crate::eval::driver_pair();
-            let _ = driver
-                .meta_interp_mut()
-                .compile_exit_frame_with_exception(Some(exc_box));
-            if driver.is_tracing() {
-                driver.meta_interp_mut().abort_trace(false);
-            }
-            let live_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-            return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
-                live_exc as PyObjectRef,
-            ));
-        }
-        // No symbolic box (no live exception, or tracing already gone):
-        // `AbstractResumeGuardDescr.done_compiling` clears `ST_BUSY_FLAG`;
-        // `jitcounter.tick` already reset the counter, so the next failure
-        // ticks again.
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] uncaught pending exc → blackhole key={} descr=0x{:x} resume_pc={}",
-                green_key, descr_id, resume_pc
-            );
-        }
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        return BridgeResolution::ResumeBlackhole;
-    }
-
-    // The unwind discards every inlined callee, so the state the walk must
-    // start from is the LIVE frame at its own call site — not the innermost
-    // callee coordinate `decode_and_restore_guard_failure` installed for the
-    // blackhole (its `resume_pc` override plus the matching innermost
-    // `depth_based_vsd_for_wcode` correction).  Re-point the frame to the
-    // outermost section before anything below reads it: `PyreJitState` holds
-    // only the frame pointer, so the `jit_state` built above picks this up,
-    // and `snapshot_for_tracing` then captures the coordinate the post-bridge
-    // interpreter should resume at.  Only reachable where this function used
-    // to decline outright, so no existing resume changes shape.
-    let resume_pc = match resume_coords.first() {
-        Some(&(outer_w_code, outer_py_pc, _, _)) if unwind_to_live_frame => {
-            bridge_frame_root
-                .frame()
-                .set_last_instr_from_next_instr(outer_py_pc);
-            if let Some(vsd) =
-                pyre_jit_trace::state::depth_based_vsd_for_wcode(outer_w_code, outer_py_pc)
-            {
-                jit_state.set_valuestackdepth(vsd);
-                jit_state.clear_stack_above(vsd);
-            }
-            outer_py_pc
-        }
-        _ => resume_pc,
-    };
-
-    // pyjitpl.py interpret(): after start_retrace_from_guard, RPython
-    // runs a single interpret() over the resumed frame state until the
-    // bridge closes or aborts. `trace_bytecode` is the pyre equivalent of
-    // that whole-loop interpreter; calling it once preserves the concrete PC
-    // updates across branches/back-edges. Re-invoking it in a synthetic
-    // `pc + 1` loop diverges from RPython and corrupts nested-loop bridges.
-    // The bridge tracer must leave the real frame exactly at the guard
-    // resume state so that a `BridgeCompiled` outcome re-enters
-    // `eval_loop_jit` there — the `ContinueRunningNormally` arm does NOT
-    // reconstruct the frame, it runs the interpreter forward from the live
-    // frame's `last_instr` / value stack as-is. The full-body walker runs from
-    // a private `snapshot_for_tracing` copy, but may-force residual calls use
-    // the shared execution context during the walk, which advances the live frame's
-    // `last_instr` AND its locals (e.g. a loop counter) to the walked
-    // opcode's concrete state.  Snapshot the resume state here and restore it
-    // after the walk so the post-bridge interpreter resumes at the guard
-    // point rather than mid-body or past a dropped loop iteration (a
-    // value-stack underflow / off-by-one-iteration result otherwise).
-    let resume_state = match bridge_frame_root.frame().snapshot_for_tracing() {
-        Ok(frame) => frame,
-        Err(mut err) => {
-            return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
-                err.to_exc_object(),
-            ));
-        }
-    };
-    let mut adopted_walk_end_state = false;
-    // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
-    // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
-    // does a bridge `Terminate` walk keep its finish-concrete stash + commit
-    // the store journal, so the three decisions (epilogue predicate, journal
-    // commit, the `!allow_finish_direct_return` consume-vs-rewind branch
-    // below) stay in agreement and a committed journal never strands into a
-    // blackhole re-run.
-    //
-    // `pyjitpl.py` `interpret()` "should always raise": a resumed trace
-    // that runs its frames forward to a return raises `DoneWithThisFrame`
-    // from the POST-walk state, whatever the resume's frame count — there is
-    // no rewind-to-the-deadframe re-run upstream.  A multi-frame resume walks
-    // the inlined callees to `SubReturn` and only the LIVE frame's return
-    // raises `Terminate`, so its finish-concrete is that frame's result, the
-    // same value the blackhole rebuild would produce.  Replaying instead
-    // re-executes every residual the walk already ran concretely and
-    // double-applies its callee-internal side effects (`Counter.bump()`'s
-    // `self.pos += 1` counted twice in
-    // `bench/synth/nested_callee_chain_mutation_abort.py`).
-    //
-    // The CALL_ASSEMBLER callback (`allow_finish_direct_return == false`)
-    // cannot carry the concrete itself, so it hands a kept stash to its
-    // back-to-back blackhole hook through `CA_WALK_FINISHED_FRAME`.  That hook
-    // does not rebuild a framestack — it returns the stashed value as the CA
-    // callee's result once `ca_finished_frame == fail_values[0]` proves the
-    // walk's live frame IS the frame whose guard failed — so it takes the same
-    // any-frame-count arming.  Only the guard-state blackhole fallback below it
-    // rebuilds frames, and a kept stash never reaches that path.
-    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
-    // `pyjitpl.py handle_guard_failure` walks from the guard, so
-    // `SwitchToBlackhole` converts the live framestack
-    // (`run_blackhole_interp_to_cancel_tracing`). `start_bridge_tracing`
-    // does not raise this flag; raise it only for this walk.
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.set_bridge_entered_at_guard_resume(true);
-    }
-    let mut snapshot_error = None;
-    let first_segment = std::cell::Cell::new(true);
-    let outcome = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.jit_merge_point_keyed(
-            green_key,
-            resume_pc,
-            &mut jit_state,
-            &env,
-            || {},
-            |meta, sym| {
-                // pyjitpl.py:1571-1578: a merge point that only appends to
-                // `current_merge_points` restores `self.pc` and goes on
-                // interpreting, so the driver re-enters this walk instead of
-                // handing the guest back.  Each entry starts from the frame
-                // as the previous segment left it, so the snapshot is taken
-                // here rather than once outside — `FrameBox` owns a shadow
-                // stack root guard and cannot be cloned.
-                let trace_frame = match bridge_frame_root.frame().snapshot_for_tracing() {
-                    Ok(frame) => frame,
-                    Err(mut err) => {
-                        snapshot_error = Some(pyre_jit_trace::state::ConcreteValue::Ref(
-                            err.to_exc_object(),
-                        ));
-                        return majit_metainterp::TraceAction::Abort;
-                    }
-                };
-                // `sym.set_live_vable_frame_addr` records this word as the
-                // virtualizable the walk writes back through, so it has to be
-                // the frame's address as of this entry: the driver re-enters
-                // the closure per merge point and `snapshot_for_tracing`
-                // allocates, either of which can have moved the frame since the
-                // root was taken.  Read it back out of the root, the same way
-                // `trace_frame` above is.
-                let live_frame_addr = bridge_frame_root.frame() as *const PyFrame as usize;
-                let (action, executed, walk_end_flushed) = trace_bytecode(
-                    meta,
-                    sym,
-                    code,
-                    resume_pc,
-                    trace_frame,
-                    live_frame_addr,
-                    false,
-                    first_segment.replace(false),
-                );
-                // pyjitpl.py raise_continue_running_normally:
-                // a bridge walk that closed at a merge point and committed
-                // its end-of-walk state into the trace snapshot
-                // (`flush_walk_end_state_to_frame`) hands the LIVE frame
-                // that end state — the walked region's residual calls
-                // executed concretely, so resuming at the guard would
-                // re-apply every side effect.  Uncommitted → fall through
-                // to the guard-state restore below (legacy replay).
-                if walk_end_flushed {
-                    let frame = bridge_frame_root.frame();
-                    frame.restore_resume_state_from(&executed);
-                    adopted_walk_end_state = true;
-                }
-                action
-            },
-        )
-    };
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.set_bridge_entered_at_guard_resume(false);
-    }
-    // Disarm so the flag cannot leak into a later (non-bridge) walk on this
-    // thread; the epilogue has already consumed it.
-    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
-
-    if let Some(err) = snapshot_error {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        // `merge_point` stages `pending_abort_blackhole` on Abort
-        // (`run_blackhole_interp_to_cancel_tracing`). Snapshot failure
-        // returns before that convert, so drop the parked handoff.
-        driver.discard_pending_abort_blackhole();
-        return BridgeResolution::FinishedException(err);
-    }
-    if let Some(mut err) = pyre_jit_trace::trace::take_walk_end_propagated_exception() {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
-            err.to_exc_object(),
-        ));
-    }
-
-    // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
-    // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
-    // held AND the walk reached `Terminate` with a materialized concrete and
-    // no unjournaled effect — the epilogue then committed the store journal,
-    // so the walked region's eager side effects (including callee-internal
-    // `SetfieldGc`s like `self.pos += 1`) stand exactly once.  Rewinding the
-    // live frame to the guard pc and re-running the region — via the
-    // `ContinueRunningNormally` re-entry — would apply them a second time.
-    // Hand the concrete result forward as `DoneWithThisFrame` instead,
-    // mirroring the top-level portal (eval.rs `maybe_compile_and_run`) and
-    // `pyjitpl.py` `interpret()` raising `DoneWithThisFrame` from the
-    // post-walk state.  Always take (not peek) so a kept stash cannot leak
-    // into a later top-level portal `fbw_finish_concrete_take`.
-    //
-    // CALL_ASSEMBLER callback: this caller returns a bare bool and cannot
-    // carry the concrete result itself.  Leave the stash in its GC-rooted
-    // cell, record the callee frame in `CA_WALK_FINISHED_FRAME`, and let the
-    // CA slow path's back-to-back blackhole hook
-    // (`jit_blackhole_resume_from_guard`) take the stash and complete the
-    // callee with it — the finishframe `DoneWithThisFrame` /
-    // `ExitFrameWithExceptionRef` the assembler caller catches
-    // (pyjitpl.py, jitexc.py).  `Terminate` is the LIVE frame's
-    // return at any resume frame count, and the live frame here IS the CA
-    // callee, so the hook's `ca_finished_frame == fail_values[0]` handshake
-    // matches for a multi-frame resume exactly as for a single-frame one.
-    if !allow_finish_direct_return {
-        if pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
-            let finished_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-            CA_WALK_FINISHED_FRAME.with(|c| c.set(finished_frame));
-            // This return site predates the four below, so it needs the
-            // adopted stamp too: the finished cell only answers the hook's
-            // first question, and a walk that both committed its end state and
-            // kept a finish-concrete stash still has to answer the second one
-            // if the first handshake does not match.
-            stamp_ca_walk_frames(bridge_frame_root, false, adopted_walk_end_state);
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][bridge-trace] ca-finish-noreplay at resume_pc={} key={}",
-                    resume_pc, green_key
-                );
-            }
-            return BridgeResolution::ResumeBlackhole;
-        }
-    }
-    match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-        Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-            // `Terminate` is the LIVE frame's function return, about to be
-            // popped by its caller with `cv`; any inlined callee the resume
-            // reconstructed already returned inside the walk.  No rewind, no
-            // blackhole.
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][bridge-trace] finish-noreplay at resume_pc={} key={}",
-                    resume_pc, green_key
-                );
-            }
-            return BridgeResolution::Finished(cv);
-        }
-        Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-            // jitexc.py:44: hand the walk's uncaught exception to the
-            // guard's portal as ExitFrameWithExceptionRef.
-            return BridgeResolution::FinishedException(cv);
-        }
-        None => {}
-    }
-    // `pyjitpl.py handle_guard_failure` `except SwitchToBlackhole`:
-    // `run_blackhole_interp_to_cancel_tracing` then
-    // `convert_and_run_from_pyjitpl` on the live framestack. Restore
-    // would rewind `last_instr` to the guard (the snapshot taken
-    // before the walk) while residual calls have already mutated the
-    // failarg objects — `resume_in_blackhole` from that deadframe then
-    // rebuilds the innermost frame on the mutated heap. Convert first
-    // and skip the rewind; `compile.py handle_fail`'s must_compile arm
-    // never falls through to that deadframe path.
-    //
-    // A walk that already adopted (`try_adopt_blackhole`) ran that
-    // convert during the epilogue. Staging leftover portal frames
-    // and converting again would re-execute the abort chain.
-    // `pyjitpl.py handle_guard_failure` converts once; drop a pending
-    // convert when the live frame already holds the walk-end state.
-    if adopted_walk_end_state {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.discard_pending_abort_blackhole();
-    } else {
-        jit_state.set_frame(bridge_frame_root.frame() as *const PyFrame as usize);
-        let (driver, _) = crate::eval::driver_pair();
-        if let Some(resume) = run_python_portal_abort_blackhole(driver, &mut jit_state, &env) {
+            let _ = compiled;
+            // `pyjitpl.py handle_guard_failure` raises the walk's
+            // `ContinueRunningNormally` / `DoneWithThisFrame` /
+            // `ExitFrameWithExceptionRef`. Map that raise; do not flatten
+            // every non-MAX pc to `CompiledContinue` and drop the CRN
+            // greens (`warmspot.py handle_jitexception` `portal_ptr(*args)`).
             return bridge_resolution_from_abort_blackhole(
                 resume,
                 driver,
                 bridge_frame_root.frame(),
             );
         }
+        // `bridge_from_guard_resume_position` either declined before
+        // `start_bridge_tracing` or the walk aborted without a merge
+        // handoff. `compile.py ResumeGuardDescr.handle_fail` then
+        // `resume_in_blackhole`s from the deadframe. Starting FBW
+        // tracing here would `continue_tracing` virtualrefs a second
+        // time (`virtualref.py` `virtual_token != TOKEN_TRACING_RESCALL`).
+        return BridgeResolution::ResumeBlackhole;
     }
-    if !adopted_walk_end_state {
-        let frame = bridge_frame_root.frame();
-        frame.restore_resume_state_from(&resume_state);
-    }
-    // A multi-frame (inlined-callee) guard restored on the non-flush path
-    // leaves the live OUTER frame at the INNERMOST frame's resume pc with the
-    // inlined call's result unmaterialized — the inlined callee frame exists
-    // only in the bridge/blackhole reconstruction, never in the live frame's
-    // operand stack, so the live stack carries a stale NULL where the callee
-    // result belongs. `eval_loop_jit` cannot resume the live frame there
-    // (it would store the NULL through the post-call ops). The freshly
-    // compiled bridge stays attached for subsequent guard failures; complete
-    // THIS iteration through the blackhole, which rebuilds the full inlined
-    // framestack and runs it — exactly as a cold multi-frame guard does.
-    // Signalled by returning `false` (→ `handle_fail` ResumeInBlackhole) even
-    // though the bridge compiled. The walk took the non-flush path, so its
-    // store journal was rolled back; a residual it executed concretely is not
-    // in that journal, so the blackhole re-run applies such an effect twice —
-    // the `Terminate` no-replay shortcut above is what keeps a returning walk
-    // off this path.
-    // The non-flush path applies to single-frame guards too: without the
-    // committed walk-end state the live frame's last_instr / operand stack
-    // were never advanced through the guard's resume region (only the
-    // blackhole syncs them), so "continue running normally" resumes at the
-    // enclosing loop header and silently skips the region between the guard
-    // and the header — the deopt iteration's remaining inner-loop work.
-    // Complete this iteration through the blackhole exactly like the
-    // multi-frame case above; the compiled bridge stays attached for
-    // subsequent failures.
-    let resume_via_blackhole = !adopted_walk_end_state;
-
-    // merge_point handles Finish/CloseLoop via bridge_info.
-    if outcome.is_some() {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] compiled at resume_pc={} key={} blackhole_current={}",
-                resume_pc, green_key, resume_via_blackhole
-            );
-        }
-        stamp_ca_walk_frames(
-            bridge_frame_root,
-            !allow_finish_direct_return && resume_via_blackhole,
-            !allow_finish_direct_return && adopted_walk_end_state,
-        );
-        return bridge_resolution_from_bool(!resume_via_blackhole);
-    }
-
-    // compile_trace() "raises in case it works". In pyre the bridge can
-    // already be attached during this step even if jit_merge_point_keyed()
-    // did not surface DetailedDriverRunOutcome::Jump yet. Stop tracing as
-    // soon as `assembler.py patch_jump_for_descr` has marked the guard.
-    let compiled = {
-        let (driver, _) = crate::eval::driver_pair();
-        use majit_backend::Backend;
-        descr_arc
-            .as_fail_descr()
-            .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
-    };
-    if compiled {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] compiled at resume_pc={} key={} (attached) blackhole_current={}",
-                resume_pc, green_key, resume_via_blackhole
-            );
-        }
-        stamp_ca_walk_frames(
-            bridge_frame_root,
-            !allow_finish_direct_return && resume_via_blackhole,
-            !allow_finish_direct_return && adopted_walk_end_state,
-        );
-        return bridge_resolution_from_bool(!resume_via_blackhole);
-    }
-
-    // If the driver is no longer tracing, the bridge was compiled
-    // (or aborted) inside merge_point. Check whether a bridge was
-    // actually attached to distinguish success from abort.
-    //
-    // pyjitpl.py raise_continue_running_normally: a trace that
-    // reached a merge point exits with ContinueRunningNormally from the
-    // CURRENT state — never through the blackhole-from-guard path. A
-    // committed walk already executed the region and the live frame
-    // adopted its end state above, so the caller must continue running
-    // normally even when the trace closed as a new loop at an inner
-    // header instead of attaching a bridge to this guard; resuming in
-    // the blackhole would re-apply every walked side effect from the
-    // guard-time values.
-    let tracing_active = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.is_tracing()
-    };
-    if !tracing_active {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] trace ended at resume_pc={} key={} compiled={} adopted={}",
-                resume_pc, green_key, compiled, adopted_walk_end_state
-            );
-        }
-        let continue_compiled = compiled || adopted_walk_end_state;
-        stamp_ca_walk_frames(
-            bridge_frame_root,
-            !allow_finish_direct_return && !continue_compiled,
-            !allow_finish_direct_return && adopted_walk_end_state,
-        );
-        return bridge_resolution_from_bool(continue_compiled);
-    }
-
-    // Trace did not converge into a bridge. Abort like RPython's
-    // run_blackhole_interp_to_cancel_tracing fallback path.
-    if tracing_active {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] abort: no-bridge key={} descr=0x{:x} resume_pc={}",
-                green_key, descr_id, resume_pc
-            );
-        }
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().abort_trace(false);
-    }
-    // A committed walk has already executed the region into the live
-    // frame; the blackhole replay must not run even on this abort path.
-    stamp_ca_walk_frames(
-        bridge_frame_root,
-        !allow_finish_direct_return && !adopted_walk_end_state,
-        !allow_finish_direct_return && adopted_walk_end_state,
-    );
-    bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
 /// compile.py `ResumeGuardForcedDescr.handle_fail` / `giveup` / `no_bridge`

@@ -11,8 +11,7 @@ pub use dispatch::{
     recycle_framestack, recycle_standalone_frame, residual_write_effect_info,
     setup_frame_from_merge_point, take_standalone_frame, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_at_resume_framestack_allowing_residuals,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
@@ -17150,6 +17149,44 @@ impl<M: Clone> MetaInterp<M> {
             }
             PrepareResumeFromFailure::Continue => self.interpret(sym, portal_pc),
         }
+    }
+
+    /// Portal unique-path `_handle_guard_failure` after
+    /// `rebuild_portal_framestack_from_resumedata`.
+    ///
+    /// The merge-point `JitState::Sym` is a walk-sym, not a `JitCodeSym`.
+    /// This is the same red-box capture `trace_from_guard_resume_position`
+    /// uses for `reached_loop_header` JUMP args.
+    pub fn handle_guard_failure_interpret(&mut self, portal_pc: usize) -> crate::TraceAction {
+        struct PortalResumeSym {
+            header_pc: usize,
+            redboxes: Vec<(OpRef, Type)>,
+        }
+        impl crate::pyjitpl::JitCodeSym for PortalResumeSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                self.header_pc
+            }
+            fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+                self.redboxes = redboxes.to_vec();
+            }
+            fn loop_carried_boxes(
+                &self,
+                vable_boxes: &[(OpRef, Type)],
+            ) -> Option<Vec<(OpRef, Type)>> {
+                let mut boxes = self.redboxes.clone();
+                let n = vable_boxes.len().saturating_sub(1);
+                boxes.extend_from_slice(&vable_boxes[..n]);
+                if boxes.is_empty() { None } else { Some(boxes) }
+            }
+        }
+        let mut portal_sym = PortalResumeSym {
+            header_pc: portal_pc,
+            redboxes: Vec::new(),
+        };
+        self._handle_guard_failure(&mut portal_sym, portal_pc)
     }
 
     /// Start retracing from a guard failure point.

@@ -5481,7 +5481,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("returns-slot-index") => {}
+            Err(reason) if reason == "returns-slot-index" => {}
             Ok(Some(_)) => panic!("expected returns-slot-index, got accepted"),
             Ok(None) => panic!("expected returns-slot-index, got no bracket"),
             Err(reason) => panic!("expected returns-slot-index, got {reason}"),

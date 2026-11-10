@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 
 use majit_charon_reader::Llbc;
 
-use crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs;
 use crate::front::mir::{LowerContext, LowerError, lower_fun_decl_with_static_addrs};
 use crate::model::FunctionGraph;
 use crate::runtime_names::artifacts;
@@ -130,12 +129,7 @@ fn make_lower_context(llbc: &'static Llbc) -> LowerContext<'static> {
             return if path.ends_with("pyre-interpreter.ullbc")
                 || path.ends_with("pyre-module.ullbc")
             {
-                LowerContext::new_with_dependency_raw_flavors(
-                    llbc,
-                    &harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(load_ullbc(
-                        artifacts::OBJECT_ULLBC,
-                    ))),
-                )
+                LowerContext::new_with_dependency_llbc(llbc, load_ullbc(artifacts::OBJECT_ULLBC))
             } else {
                 LowerContext::new(llbc)
             };

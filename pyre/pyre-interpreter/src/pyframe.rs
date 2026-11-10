@@ -2494,17 +2494,8 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 /// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
-///
-/// The frame is the one its constructor is still building, so the store
-/// re-establishes the constructor's `hint(access_directly=True,
-/// fresh_virtualizable=True)` pair on the pointer, the way `pycode.py
-/// funcrun` re-hints the frame it just built; `pyframe.py __init__` stores
-/// `locals_cells_stack_w` under that hint.
 #[inline(never)]
 unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
-    let frame_ptr = majit_metainterp::jit::hint_fresh_virtualizable(
-        majit_metainterp::jit::hint_access_directly(frame_ptr),
-    );
     unsafe {
         (*frame_ptr).locals_cells_stack_w = array;
     }
@@ -6728,10 +6719,6 @@ impl PyFrame {
     /// `pick_builtin(w_globals)`, which raises a non-KeyError
     /// `OperationError` straight out of `__init__`.  Fallible frame builder
     /// mirroring that path.
-    ///
-    /// The argument loop is the positional copy of `function.py
-    /// _flat_pycall`, which is `@jit.unroll_safe`.
-    #[majit_macros::unroll_safe]
     pub fn try_new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6816,11 +6803,6 @@ impl PyFrame {
     /// Common tail of the frame builders: everything in `Frame.__init__`
     /// except the `pick_builtin` resolution, which is lifted to the callers
     /// so the fallible variant can propagate its error.
-    ///
-    /// Its loops are the positional copy of `function.py _flat_pycall` and
-    /// the cell/freevar setup of `pyframe.py initialize_frame_scopes`, both
-    /// `@jit.unroll_safe`.
-    #[majit_macros::unroll_safe]
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6853,18 +6835,15 @@ impl PyFrame {
         ]);
         let args_base = pyre_object::gc_roots::publish_roots(args);
         _roots.normalize(root_base, 4 + args.len());
-        // pyframe.py `__init__`: the sizes are the PyCode's own
-        // `co_nlocals` / `co_cellvars` / `co_freevars` / `co_stacksize`.
-        let pycode = _roots.get(root_base) as *const crate::pycode::PyCode;
-        let (num_locals, npure, nfreevars, max_stack) = unsafe {
-            (
-                (*pycode).co_nlocals as usize,
-                (*pycode).npure_cellvars as usize,
-                (*pycode).co_nfreevars as usize,
-                (*pycode).co_stacksize as usize,
-            )
-        };
-        let num_cells = npure + nfreevars;
+        // `w_code_get_ptr` yields the host `CodeObject`; sizes come from
+        // that body (`varnames` / `ncells` / `max_stackdepth`), which stays
+        // filled even when a looked-inside constructor sees a PyCode whose
+        // cached `co_nlocals` was never stored.
+        let code_ref =
+            unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
+        let num_locals = code_ref.varnames.len();
+        let num_cells = ncells(code_ref);
+        let max_stack = code_ref.max_stackdepth as usize;
 
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
@@ -6898,6 +6877,7 @@ impl PyFrame {
             // Allocating cells for the overlap would shift freevar
             // indices and break LOAD_DEREF on `def repeat(n): def
             // wrap(fn): def inner(): return (n, fn)` style closures.
+            let npure = npure_cellvars(code_ref);
             for i in 0..npure {
                 // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(None, self.pycode.cell_families[i])`.
                 let family = unsafe {
@@ -6912,6 +6892,7 @@ impl PyFrame {
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
+                let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
                     let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };

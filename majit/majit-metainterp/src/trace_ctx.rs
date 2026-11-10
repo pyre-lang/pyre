@@ -8521,7 +8521,11 @@ impl TraceCtx {
             Some(Value::Ref(r)) => live_gc_ptr(r).unwrap_or(0),
             _ => 0,
         };
-        self.array_store(array_ptr, index_runtime_value, &descr, concrete);
+        // A virtual `NewArrayClear` has no heap pointer. Recording the op and
+        // updating the heapcache is the store; writing address 0 is not.
+        if array_ptr != 0 {
+            self.array_store(array_ptr, index_runtime_value, &descr, concrete);
+        }
     }
 }
 

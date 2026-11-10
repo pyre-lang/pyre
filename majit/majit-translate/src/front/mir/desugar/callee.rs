@@ -1815,7 +1815,7 @@ pub(in crate::front::mir) fn is_string_identity_call(llbc: &Llbc, call: &CallPay
         Some("as_bytes") => true,
         Some("bytes") if np.contains("str") => true,
         Some(leaf @ ("as_ref" | "as_str" | "as_str_unchecked" | "borrow")) => {
-            (tyref_strips_to_str(&call.dest.ty, llbc) && !tyref_is_rust_heap_string(first_ty, llbc))
+            tyref_strips_to_str(&call.dest.ty, llbc)
                 || is_as_ref_byte_view(Some(leaf), &call.dest.ty, llbc)
         }
         Some("deref" | "deref_mut") => tyref_is_string_family(&call.dest.ty, llbc),
@@ -3798,11 +3798,11 @@ pub(crate) fn inherent_callable_rust_path(llbc: &Llbc, fd: &FunDecl) -> Option<S
     if last_idx == 0 {
         return None;
     }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let impl_seg = &segs[last_idx - 1];
+    if !impl_seg.is_impl() {
+        return None;
+    }
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_seg)?;
     let td = llbc.type_by_id(adt_def_id)?;
     let owner = td.item_meta.name_path();
     if owner.is_empty() {

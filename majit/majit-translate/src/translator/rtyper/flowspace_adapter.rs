@@ -11917,6 +11917,7 @@ mod tests {
                         segments,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -11952,6 +11953,7 @@ mod tests {
                     segments: vec!["__delslice_range".into()],
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![
                     vars[0].clone(),
@@ -14098,6 +14100,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
@@ -18541,6 +18544,7 @@ mod tests {
                     "hook_a".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),

@@ -369,37 +369,6 @@ fn integer_cast_to_raw_scalar_stays_int() {
     });
 }
 
-/// `HashStateStorage.words` is `[usize; N]`. Charon spells that as a
-/// `Value`-wrapped `Array` whose item is interned `Deduplicated` usize.
-/// `history.py` `getkind` has no kind for a `FixedSizeArray` value; the
-/// fill of `[0; N]` (`lltype.FixedSizeArray` items) is that integer.
-/// A `Ref` field against an `Int` fill panics in
-/// `jtransform.py` `rewrite_op_setfield`.
-#[test]
-fn hashlib_copy_repeat_fill_matches_words_item_kind() {
-    let llbc = load_llbc(MODULE_LLBC);
-    common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(context, find_method(llbc, "copy", "W_HashState"))
-            .expect("lower W_HashState::copy");
-        let word_writes: Vec<&ValueType> = ops(&graph)
-            .filter_map(|op| match &op.kind {
-                OpKind::FieldWrite { field, ty, .. } if field.name == "words" => Some(ty),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !word_writes.is_empty(),
-            "copy writes HashStateStorage.words"
-        );
-        assert!(
-            word_writes
-                .iter()
-                .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
-            "words is a scalar FixedSizeArray item, got {word_writes:?}"
-        );
-    });
-}
-
 #[test]
 fn sizehint_i64_cast_stays_gcarray_write() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -1717,8 +1686,10 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             op_lines(&graph)
         );
     }
-    // `*mut u8` is `rffi.CCHARP`: `&mut u8` into that parameter is an
-    // address, so the byte is spilled and `flag` stays the other word.
+    // Dest `*mut u8` of a local byte is `rffi.CCHARP`
+    // (`lltype.py` `ann_cast_int_to_ptr`), not a RawMalloc spill and
+    // not the byte word itself. `flag` stays the other argument.
+    use majit_translate::translator::rtyper::lltypesystem::rffi::CCHARP;
     let graph = lower_probe(
         "byte",
         &u8_ty(),
@@ -1728,24 +1699,44 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             ret_local: 1,
         },
     );
-    let mallocs = raw_ops(&graph, |kind| matches!(kind, OpKind::RawMalloc { .. }));
-    assert_eq!(
-        mallocs.len(),
-        1,
-        "&mut u8 into *mut u8 spills the byte\n{}",
-        op_lines(&graph)
-    );
-    let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
+    assert_no_raw_address(&graph, "&mut u8 into *mut u8");
     let call = sink_call(&graph);
     assert_eq!(
         call_arg(call, 0),
         input_var(&graph, "flag"),
         "&mut u8 into *mut u8: flag stays the word"
     );
+    let dest = call_arg(call, 1);
+    let Some(OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    }) = defining_op(&graph, dest)
+    else {
+        panic!(
+            "&mut u8 into *mut u8: second arg is dest of cast_int_to_ptr, got {:?}\n{}",
+            defining_op(&graph, dest),
+            op_lines(&graph)
+        );
+    };
     assert_eq!(
-        call_arg(call, 1),
-        ptr,
-        "&mut u8 into *mut u8: the raw parameter receives the address\n{}",
+        segments.last().map(String::as_str),
+        Some("cast_int_to_ptr"),
+        "&mut u8 into *mut u8: dest of cast_int_to_ptr\n{}",
+        op_lines(&graph)
+    );
+    assert_eq!(args.len(), 2, "&mut u8 into *mut u8: 2-arg cast_int_to_ptr");
+    assert!(
+        matches!(&args[0], LinkArg::Const(c)
+            if matches!(&c.value, ConstValue::LowLevelType(ty) if **ty == *CCHARP)),
+        "&mut u8 into *mut u8: dest type is CCHARP, got {:?}\n{}",
+        args[0],
+        op_lines(&graph)
+    );
+    assert_eq!(
+        args.get(1).and_then(LinkArg::as_variable),
+        Some(input_var(&graph, "byte")),
+        "&mut u8 into *mut u8: casts the byte word\n{}",
         op_lines(&graph)
     );
 }

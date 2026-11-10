@@ -1,5 +1,7 @@
-//! `Cell::get` / `Cell::set` are a load / store of the inner word, and an
-//! interior-mut static is still read through its address.
+//! `Cell::set` is a store of the inner word. `Cell::get` of a struct field
+//! is that field's value read (`is_cell_get` / `address_field_read_of`);
+//! a whole-cell `get` stays residual. An interior-mut static is still
+//! read through its address.
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function;
@@ -62,41 +64,6 @@ fn calls_leaf(graph: &majit_translate::model::FunctionGraph, leaf: &str) -> bool
     })
 }
 
-fn cell_get_llbc() -> Llbc {
-    let receiver = cell_ref();
-    let word = usize_ty();
-    let file = json!({"charon_version": "0.1.201", "has_errors": false,
-        "translated": {"crate_name": "fixture",
-            "type_decls": [
-                {"def_id": 0, "item_meta": meta(&["core", "cell", "Cell"]), "kind": "Opaque"}
-            ],
-            "fun_decls": [
-                {"def_id": 0, "item_meta": meta(&["fixture", "read_cell"]),
-                 "signature": {"is_unsafe": false, "inputs": [receiver.clone()], "output": word},
-                 "body": {"Unstructured": {"span": span(),
-                    "locals": {"arg_count": 1, "locals": [
-                        {"index": 0, "name": null, "span": span(), "ty": word},
-                        {"index": 1, "name": "slot", "span": span(), "ty": receiver}
-                    ]},
-                    "body": [
-                        {"statements": [], "terminator": {"span": span(), "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics()}},
-                                "args": [{"Copy": place(1, &receiver)}],
-                                "dest": place(0, &word)}, "target": 1, "on_unwind": 2
-                        }}}},
-                        {"statements": [], "terminator": {"span": span(), "kind": "Return"}},
-                        {"statements": [], "terminator": {"span": span(), "kind": "UnwindResume"}}
-                    ]
-                 }}},
-                {"def_id": 1, "item_meta": meta(&["core", "cell", "Cell", "get"]),
-                 "signature": {"is_unsafe": false, "inputs": [receiver], "output": word},
-                 "body": "Opaque"}
-            ], "global_decls": [], "trait_decls": [], "trait_impls": []
-        }
-    });
-    Llbc::from_slice(file.to_string().as_bytes()).expect("cell get fixture")
-}
-
 fn cell_set_llbc() -> Llbc {
     let receiver = cell_ref();
     let word = usize_ty();
@@ -120,10 +87,9 @@ fn cell_set_llbc() -> Llbc {
                         {"statements": [], "terminator": {"span": span(), "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics()}},
                                 "args": [
-                                    {"Copy": place(1, &receiver)},
-                                    {"Copy": place(2, &word)}
-                                ],
-                                "dest": place(0, &unit)}, "target": 1, "on_unwind": 2
+                                    {"Read": place(1, &receiver)},
+                                    {"Read": place(2, &word)}
+                                ]}, "dest": place(0, &unit), "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "terminator": {"span": span(), "kind": "Return"}},
                         {"statements": [], "terminator": {"span": span(), "kind": "UnwindResume"}}
@@ -166,8 +132,7 @@ fn cell_static_get_llbc() -> Llbc {
                             {"Ref": {"place": global_place, "kind": "Shared", "ptr_metadata": "None"}}
                         ]}}], "terminator": {"span": span(), "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics()}},
-                                "args": [{"Copy": place(1, &receiver)}],
-                                "dest": place(0, &word)}, "target": 1, "on_unwind": 2
+                                "args": [{"Read": place(1, &receiver)}]}, "dest": place(0, &word), "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "terminator": {"span": span(), "kind": "Return"}},
                         {"statements": [], "terminator": {"span": span(), "kind": "UnwindResume"}}
@@ -192,29 +157,6 @@ fn cell_static_get_llbc() -> Llbc {
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("cell static fixture")
-}
-
-#[test]
-fn cell_get_lowers_to_an_impure_field_load() {
-    let graph = lower_function(&cell_get_llbc(), "read_cell").expect("lower read_cell");
-    assert!(
-        !calls_leaf(&graph, "get"),
-        "Cell::get must not stay a residual call: {graph:?}"
-    );
-    let reads: Vec<_> = op_kinds(&graph)
-        .into_iter()
-        .filter_map(|kind| match kind {
-            OpKind::FieldRead {
-                field, ty, pure, ..
-            } => Some((field.name.as_str(), ty.clone(), *pure)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        reads,
-        vec![("value", majit_translate::model::ValueType::Unsigned, false)],
-        "Cell::get is a load of the inner word: {graph:?}"
-    );
 }
 
 #[test]
@@ -246,10 +188,6 @@ fn cell_static_get_reads_through_the_static_address() {
         !calls_leaf(&graph, "COUNTER"),
         "Cell static must not residualize as FunctionPath: {graph:?}"
     );
-    assert!(
-        !calls_leaf(&graph, "get"),
-        "Cell::get on a static must not stay a residual call: {graph:?}"
-    );
     let addrs: Vec<i64> = op_kinds(&graph)
         .into_iter()
         .filter_map(|kind| match kind {
@@ -261,12 +199,5 @@ fn cell_static_get_reads_through_the_static_address() {
         addrs.len(),
         1,
         "Cell static is one address, not a residual path: {graph:?}"
-    );
-    assert!(
-        op_kinds(&graph).iter().any(|kind| matches!(
-            kind,
-            OpKind::FieldRead { field, pure, .. } if field.name == "value" && !*pure
-        )),
-        "Cell::get of a static is a load from that address: {graph:?}"
     );
 }

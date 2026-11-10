@@ -421,6 +421,7 @@ fn build_semantic_program_via_active_frontend(
                     &llbc,
                     &gc_struct_ids,
                     &immutable_fields,
+                    &raw_alloc_flavor_structs,
                 ));
             }
             raw_structs.sort();
@@ -3487,7 +3488,6 @@ fn register_configured_jitdrivers(
             spec.portal.clone(),
         );
         call_control.set_jitdriver_portal_runner(index, spec.portal_runner.clone());
-        call_control.set_jitdriver_portal_enter(index, spec.portal_enter.clone());
         // `warmspot.py WarmRunnerDesc.rewrite_jit_merge_point` runs on
         // `_jit_merge_point_in`, the graph callers still name, after
         // `split_graph_and_record_jitdriver` has copied the loop into
@@ -4734,6 +4734,7 @@ mod portal_driver_tests {
                     "call_jit",
                     "ll_portal_runner_shim",
                 ])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),

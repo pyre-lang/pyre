@@ -1941,7 +1941,7 @@ pub unsafe fn raise_cause_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir
 fn alloc_raise_cause(w_cause: PyObjectRef, invalid: Option<PyError>) -> RaiseCauseRef {
     let invalid_word = invalid
         .as_ref()
-        .map(|err| err.0)
+        .map(|err| err.0.as_ptr())
         .unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
     let cause_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1956,7 +1956,7 @@ fn alloc_raise_cause(w_cause: PyObjectRef, invalid: Option<PyError>) -> RaiseCau
         (*ptr).w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
         let inv = pyre_object::gc_roots::shadow_stack_get(invalid_slot);
         if !inv.is_null() {
-            (*ptr).invalid = Some(PyError(inv));
+            (*ptr).invalid = Some(PyError::from_raw(inv));
         }
         pyre_object::gc_hook::try_gc_write_barrier_managed(ptr as pyre_object::gc_hook::GCREF);
     }
@@ -4394,6 +4394,11 @@ impl IterOpcodeHandler for PyFrame {
         // (`framework.py` `gct_direct_call`, `shadowstack.py` `pop_roots`).
         let mut self_ref = self as *mut PyFrame as PyObjectRef;
         match pyre_object::with_roots!(iter, self_ref => crate::baseobjspace::next(iter)) {
+            // `jit_next` / `list_iter_descr_next` signal exhaustion with a
+            // null ref so FOR_ITER's GuardNonnull is the loop exit. A
+            // residual CALL_ASSEMBLER that returns that null through
+            // `space.next` must not become a STORE of the dest.
+            Ok(result) if result.is_null() => Ok(None),
             Ok(result) => Ok(Some(result)),
             Err(e) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();

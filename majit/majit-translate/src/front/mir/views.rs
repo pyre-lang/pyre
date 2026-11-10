@@ -1133,6 +1133,58 @@ impl<'a> Lowering<'a> {
         local: Option<usize>,
         ty: Option<&TyRef>,
     ) -> Option<Variable> {
+        self.copy_nonoverlapping_items_block_addr(mir_bb, value.clone(), local)
+            .or_else(|| {
+                let ty = ty?;
+                raw_ptr_one_word_item_kind(ty, self.llbc)?;
+                let from = tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
+            })
+    }
+
+    /// `cast_ptr_to_adr` of a `copy_nonoverlapping` pointer
+    /// (`rtype_copy_nonoverlapping`). An items-block header is still
+    /// `itemoffsetof` to `items[0]`.
+    pub(in crate::front::mir) fn copy_nonoverlapping_raw_addr(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        local: Option<usize>,
+        ty: Option<&TyRef>,
+    ) -> Option<Variable> {
+        if let Some(addr) = self.copy_nonoverlapping_items_block_addr(mir_bb, value.clone(), local)
+        {
+            return Some(addr);
+        }
+        let from = ty.map(|ty| {
+            tyref_to_value_type_with(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        });
+        if matches!(from, Some(ValueType::Int | ValueType::Unsigned)) {
+            let from = from?;
+            return Some(self.retype_word(mir_bb, value, &from, &ValueType::Int));
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        Some(push_cast_ptr_to_int(&mut self.graph, bb_id, value))
+    }
+
+    fn copy_nonoverlapping_items_block_addr(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        local: Option<usize>,
+    ) -> Option<Variable> {
         if local.is_some_and(|base| {
             base_traces_to_typed_items_block_accessor(self.body, base, self.llbc)
         }) {
@@ -1155,10 +1207,72 @@ impl<'a> Lowering<'a> {
                 &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
             ));
         }
-        let ty = ty?;
-        raw_ptr_one_word_item_kind(ty, self.llbc)?;
-        let from = self.value_type_of(ty);
-        Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
+        None
+    }
+
+    /// `rgc.ll_arraycopy`: `raw_memcopy(..., sizeof(TP.OF) * length)`.
+    /// `count` is an element count; the llop takes a byte count.
+    pub(in crate::front::mir) fn scale_copy_count_to_nbytes(
+        &mut self,
+        mir_bb: usize,
+        count: Variable,
+        count_ty: Option<&TyRef>,
+        itemsize: u64,
+    ) -> Variable {
+        let count_from = count_ty
+            .map(|ty| {
+                tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+            })
+            .unwrap_or(ValueType::Unsigned);
+        let count = self.retype_word(mir_bb, count, &count_from, &ValueType::Int);
+        if itemsize == 1 {
+            return count;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let size = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(size.clone()),
+            kind: OpKind::ConstInt(itemsize as i64),
+        });
+        let nbytes = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(nbytes.clone()),
+            kind: OpKind::BinOp {
+                op: "mul".to_string(),
+                lhs: count,
+                rhs: size,
+                result_ty: ValueType::Int,
+            },
+        });
+        nbytes
+    }
+
+    /// Residual of `llmemory.raw_memcopy`. That llop is not a jitcode
+    /// op (`misc.py _raw_memcopy_opaque`); the helper is
+    /// `dont_look_inside_cannot_raise`.
+    pub(in crate::front::mir) fn emit_raw_memcopy(
+        &mut self,
+        mir_bb: usize,
+        src: Variable,
+        dst: Variable,
+        nbytes: Variable,
+    ) {
+        let _ = self.emit_path_call(
+            mir_bb,
+            "pyre_object::lowlevel_string::jit_raw_memcopy",
+            vec![src, dst, nbytes],
+            ValueType::Void,
+        );
     }
 
     /// Expand a length-prefixed object GcArray to the `(items, length)`
@@ -1178,6 +1292,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::ArrayLen {
                 base: gcarray.clone(),
                 array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -2189,20 +2304,26 @@ impl<'a> Lowering<'a> {
         // An immutable `static`'s accessor is the static's address, not a
         // residual call to the static's symbolic path. Interior-mut
         // (`Cell` / `UnsafeCell` / atomic) statics are not prebuilt
-        // values; they still have an address to load through.
+        // values; they still have an address to load through. A class
+        // singleton still goes through `__cast_instance_intrinsic`.
         if let Some(gid) = gid
             && let Some(op) = self
                 .immutable_static_prebuilt_op(gid)
                 .or_else(|| self.immutable_static_addr_op(gid))
         {
-            let bb_id = self.block_id[mir_bb];
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(res.clone()),
-                kind: op,
-            });
+            let res = if let Some(place_ty) = self.llbc.global_by_id(gid).and_then(global_tyref) {
+                self.emit_const_ref_addr_maybe_instance(mir_bb, gid, op, &place_ty)
+            } else {
+                let bb_id = self.emit_bb(mir_bb);
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind: op,
+                });
+                res
+            };
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
@@ -5400,6 +5521,16 @@ pub(in crate::front::mir) fn raw_ptr_one_word_item_kind(
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
     pair_item_kind_of_node(pointee, llbc)
+}
+
+/// `sizeof` of a `*const T` / `*mut T` pointee for `raw_memcopy` scaling.
+pub(in crate::front::mir) fn raw_ptr_pointee_byte_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
+    let size = json_ty_byte_size(pointee, llbc).or_else(|| json_ty_literal_byte_size(pointee))?;
+    if size <= 0 {
+        return None;
+    }
+    u64::try_from(size).ok()
 }
 
 /// The item kind of a `core::slice::iter::Iter<T>` / `IterMut<T>` over one-word

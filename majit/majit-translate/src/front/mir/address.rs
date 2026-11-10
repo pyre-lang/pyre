@@ -306,9 +306,16 @@ fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usi
             if let Some(descr) = residual_scalar_word_descr(&field.ty, llbc) {
                 return Some(descr);
             }
+            // A Charon `&` / `*const` is an address (`getkind` of a
+            // GCREF wrapper is `'ref'`). The outer gate already
+            // refuses those types; peeling them back into an int word
+            // would `raw_store` a GCREF.
+            if tyref_is_raw_pointer(&field.ty, llbc) || output_type_is_ref(&field.ty, llbc) {
+                return None;
+            }
             let field_node = tyref_node(&field.ty, llbc)?;
-            if json_ty_is_thin_pointer_element(field_node, llbc)
-                || json_ty_byte_size(field_node, llbc)
+            if json_ty_is_copy_scalar(field_node, llbc)
+                && json_ty_byte_size(field_node, llbc)
                     == Some(crate::layout::target_word_size() as i64)
             {
                 return Some((ValueType::Int, crate::layout::target_word_size(), false));
@@ -1924,7 +1931,20 @@ impl<'a> Lowering<'a> {
             let scope_group = groups
                 .iter()
                 .all(|group| self.group_spill_outlives_call(group));
-            let verdict = callee_returns_spill_address(self.llbc, fun_id, &tracked);
+            // A `dont_look_inside` body is residual: walking it classifies
+            // every unmodeled statement as a leak (`Unknown` → `escapes`).
+            // The stash rule for an opaque helper is `uninspectable` plus
+            // a cell that does not outlive the call, not that walk.
+            let verdict = match self.llbc.fn_by_id(fun_id) {
+                Some(fd) if fun_decl_is_dont_look_inside(fd, self.dont_look_inside) => {
+                    SpillAddressVerdict {
+                        returned: false,
+                        leaked: false,
+                        uninspectable: true,
+                    }
+                }
+                _ => callee_returns_spill_address(self.llbc, fun_id, &tracked),
+            };
             // Residual `&T` still uses the narrow dest-type walk
             // (`identity(&x)`). A raw `*const T` uses the full walk.
             // Uninspectable is a refusal only when no cell outlives

@@ -408,7 +408,7 @@ impl<'a> Lowering<'a> {
         // class; `rnone.py` `rtype_is_None` is `ptr_iszero` of that
         // pointer. Promoting the Address to Instance is the
         // `Ptr ∪ Instance` union (`project_struct_rows`).
-        if self.option_niche_is_int_bank(option_ty) {
+        if self.option_niche_word_is_int_bank(option_ty) {
             return None;
         }
         let payload = strip_ty_indirections(
@@ -687,7 +687,7 @@ impl<'a> Lowering<'a> {
         // `Int ∪ Ref(PyObject)` at the flatten return (`rnone.py`
         // `rtype_is_None` / `rclass.py` `convert_const(None)`: one None
         // per pointer, the outer tag cannot reuse it).
-        if self.option_niche_is_int_bank(place_ty) {
+        if self.option_niche_word_is_int_bank(place_ty) {
             return false;
         }
         if self
@@ -2018,6 +2018,18 @@ impl<'a> Lowering<'a> {
         self.tyref_ref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
+    }
+
+    /// The niche Option word itself is painted Int / Unsigned
+    /// (`history.py` `getkind` of the Option variable), as opposed to
+    /// [`Self::option_niche_is_int_bank`], which also accepts an
+    /// int-banked payload under a Ref-painted word.
+    pub(in crate::front::mir) fn option_niche_word_is_int_bank(&self, option_ty: &TyRef) -> bool {
+        self.tyref_is_niche_option_ptr(option_ty)
+            && matches!(
+                self.value_type_of(option_ty),
+                ValueType::Int | ValueType::Unsigned
+            )
     }
 
     /// Niche `Option` whose remaining word is an int-bank address.

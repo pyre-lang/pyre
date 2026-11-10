@@ -3284,13 +3284,21 @@ impl ResumeDataLoopMemo {
                 };
                 if num_idx < rd_virtuals.len() {
                     // resume.py: fieldnums = [self._gettagged(box) for box in fieldboxes]
+                    // Prefer the field descr's kind when the replacement Const
+                    // disagrees (`history.py` `getkind` of a raw Ptr is
+                    // `'int'`). `W_UnicodeObject.index_storage` is
+                    // `*mut Vec` (`rrustvec.rs` `rust_vec_lltype`); a
+                    // constructor nullptr numbered as NULLREF makes
+                    // `decode_int` index `consts[-1]`.
+                    let field_kinds = field_kinds_for_virtual(vf);
                     let mut fieldnums: Vec<i16> = Vec::with_capacity(vf.field_oprefs.len());
-                    for &opref in &vf.field_oprefs {
-                        fieldnums.push(self._gettagged(
+                    for (i, &opref) in vf.field_oprefs.iter().enumerate() {
+                        fieldnums.push(self._gettagged_kind(
                             opref,
                             env,
                             &numb_state.liveboxes,
                             new_liveboxes,
+                            field_kinds[i],
                         )?);
                     }
                     let reused = env.virtual_info_would_be_reused(opref_id, &fieldnums);
@@ -3407,16 +3415,32 @@ impl ResumeDataLoopMemo {
         liveboxes_from_env: &LiveboxMap,
         new_liveboxes: &LiveboxMap,
     ) -> Result<i16, TagOverflow> {
+        self._gettagged_kind(opref, env, liveboxes_from_env, new_liveboxes, None)
+    }
+
+    /// `_gettagged` with a field descr kind. A raw-Ptr Int field whose
+    /// replacement is `ConstPtr` still numbers as `ConstInt`
+    /// (`history.py` `getkind` `'int'`).
+    fn _gettagged_kind(
+        &mut self,
+        opref: majit_ir::OpRef,
+        env: &dyn majit_ir::BoxEnv,
+        liveboxes_from_env: &LiveboxMap,
+        new_liveboxes: &LiveboxMap,
+        kind: Option<majit_ir::Type>,
+    ) -> Result<i16, TagOverflow> {
         if opref.is_none() {
             return Ok(UNINITIALIZED_TAG);
         }
         // resume.py: isinstance(box, Const) → getconst
         if let Some(bits) = opref.inline_const_bits() {
-            return self.getconst(bits, opref.ty().unwrap());
+            let tp = kind.or_else(|| opref.ty()).unwrap();
+            return self.getconst(bits, tp);
         }
         let b = env.get_box_replacement_operand(opref);
         if env.is_const(&b) {
             let (val, tp) = env.get_const(&b);
+            let tp = kind.unwrap_or(tp);
             return self.getconst(val, tp);
         }
         // resume.py: liveboxes_from_env → existing tag
@@ -6550,6 +6574,35 @@ pub(crate) fn live_field_descr_for_resume(
                 && fd.is_float_field() == want_float
         })
         .map(|fd| std::sync::Arc::clone(fd) as majit_ir::DescrRef)
+}
+
+/// Field kinds aligned with `VirtualFieldsInfo.field_oprefs` when that
+/// list is `SizeDescr.all_fielddescrs()` order (`get_virtual_fields` /
+/// `virtual_field_oprefs_for_descrs`). Missing or length-mismatched
+/// descrs leave `None` so `_gettagged` keeps the Const's own type.
+fn field_kinds_for_virtual(vf: &majit_ir::VirtualFieldsInfo) -> Vec<Option<majit_ir::Type>> {
+    let n = vf.field_oprefs.len();
+    let Some(sd) = vf.descr.as_ref().and_then(|d| d.as_size_descr()) else {
+        return vec![None; n];
+    };
+    let fds = sd.all_fielddescrs();
+    if fds.len() != n {
+        return vec![None; n];
+    }
+    fds.iter()
+        .map(|fd| {
+            // Same split as `snapshot_field_descr_info`: pointer → Ref,
+            // float → Float, else the descr's own `field_type`. A
+            // `Type::Ref` leaf without FLAG_POINTER still encodes as Ref.
+            Some(if fd.is_pointer_field() {
+                majit_ir::Type::Ref
+            } else if fd.is_float_field() {
+                majit_ir::Type::Float
+            } else {
+                fd.field_type()
+            })
+        })
+        .collect()
 }
 
 /// `resume.py AbstractResumeDataReader.setfield` kind:

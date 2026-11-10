@@ -7434,6 +7434,18 @@ impl<'a> LowerContext<'a> {
         Self::new_with_dependency_raw_flavors(llbc, &std::collections::HashSet::new())
     }
 
+    /// `new` plus a dependency artefact's flavor-raw classes and
+    /// transparent-scalar kinds (the pair [`link_transparent_scalar_types`]
+    /// publishes). Interpreter/module tests that lower one artefact still
+    /// peel a defining-crate `RootScope`.
+    pub fn new_with_dependency_llbc(llbc: &'a Llbc, dependency: &Llbc) -> Self {
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(dependency));
+        let flavors = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(dependency),
+        );
+        Self::new_with_dependency_raw_flavors(llbc, &flavors)
+    }
+
     /// `new` plus the flavor-raw classes of the crates `llbc` links against (`lib.rs` passes the program-wide set to whole-crate lowering).
     pub fn new_with_dependency_raw_flavors(
         llbc: &'a Llbc,
@@ -7454,17 +7466,18 @@ impl<'a> LowerContext<'a> {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
-        llbc.register_raw_struct_paths(discover_raw_struct_paths(
-            llbc,
-            &gc_struct_ids,
-            &immutable_fields,
-        ));
         let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
+        llbc.register_raw_struct_paths(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &immutable_fields,
+            &raw_alloc_flavor_structs,
+        ));
         llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
@@ -7668,6 +7681,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -7845,28 +7859,27 @@ pub(crate) use self::gcroot::{
     is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
     is_slice_buffer_free_call,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::type_decl_nullable_str_enum;
 pub(crate) use self::lltype::{
     NullableStrEnum, RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS,
     ThreadLocalRefLlop, adt_head_instantiation_suffix, cached_global_marker_str,
     charon_array_len_to_string, charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fixed_array_lowers_to_gcarray, fixed_list_reader,
-    fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    fnptr_indirect_enabled, host_rthread_threadlocalref_llop, is_cow_str_family_class_root,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
+    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling,
-    resolve_trait_assoc_type, same_nominal_adt,
-    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_adt_tyref, type_decl_ref_adt_id,
-    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, tyref_nullable_str_enum,
-    tyref_to_value_type, unichr_call,
+    resolve_trait_assoc_type, same_nominal_adt, seed_program_exception_class_hints,
+    stamp_fn_ptr_spelling, strip_crate_prefix, struct_item_flexible_gcarray_block_annotation,
+    type_decl_adt_tyref, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
+    tyref_is_fat_dyn, tyref_nullable_str_enum, tyref_to_value_type, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
-#[cfg(test)]
-pub(crate) use self::lltype::{stamp_fn_ptr_spelling, type_decl_nullable_str_enum};
 pub(crate) use self::malloc::forward_identity;
 pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,

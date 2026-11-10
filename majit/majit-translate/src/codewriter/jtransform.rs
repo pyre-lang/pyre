@@ -2891,26 +2891,12 @@ fn inline_struct_field_offset(
     Some(row.offset)
 }
 
-/// Byte offset of a `taken_by_address` field on a raw owner, any flag.
-///
-/// `rewrite_op_getsubstruct` is `int_add(ptr, offsetof)` for `_gckind ==
-/// 'raw'`. `inline_aggregate_offset` / `inline_struct_field_offset` only
-/// name `FLAG_STRUCT` rows; a one-word pointer slot (`UnsafeCell.value`)
-/// is still that interior address, not `getfield_raw_r` of the word.
-fn raw_taken_field_offset(
-    field: &FieldDescriptor,
-    cc: Option<&crate::call::CallControl>,
-) -> Option<usize> {
-    if !field.taken_by_address || field.vec_part.is_some() {
-        return None;
-    }
-    let owner = field.owner_root.as_deref()?;
-    let layout = cc.and_then(|cc| cc.struct_layout_for(owner))?;
-    layout
-        .fields
-        .iter()
-        .find(|row| row.name == field.name)
-        .map(|row| row.offset)
+/// `cpu.fielddescrof(STRUCT, quasiimmut.get_mutate_field_name(name))`.
+/// Same STRUCT object as `field` (`descr.py get_field_descr`).
+fn mutate_field_descr(field: &FieldDescriptor) -> FieldDescriptor {
+    FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
+        .with_owner_id(field.owner_id)
+        .with_owner_declared_gc(field.owner_declared_gc)
 }
 
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
@@ -4134,8 +4120,7 @@ impl<'a> Transformer<'a> {
         // applied after rewrite. Resolve the same handle `hook_access_field`
         // keys flags on.
         let renamed_base = resolve_alias(renamed_base, &self.aliases);
-        let mutate_field =
-            FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone());
+        let mutate_field = mutate_field_descr(field);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!(
@@ -4522,6 +4507,7 @@ impl<'a> Transformer<'a> {
                 Some(ExtraEffect::CanRaise),
                 &mut self.analysis_cache,
                 None,
+                self.graph.as_deref(),
             )
         };
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -5058,15 +5044,31 @@ impl<'a> Transformer<'a> {
         self.stamp_value_kind(graph, value, ty);
     }
 
-    /// `jtransform.py handle_regular_call` goes through `rewrite_call`,
-    /// which sets `reskind = getkind(op.result.concretetype)[0]`.
-    /// `call.py getcalldescr` sets `RESULT = op.result.concretetype`.
-    /// Both read the rtyper cell; there is no second classification from
-    /// a front type.  `FunctionGraph::concretetype_of` is that cell.
+    /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
+    /// reads it directly. Pyre's front-end can leave a callee return type
+    /// as `ValueType::Unknown`, or `Ref` without its raw/GC distinction.
+    /// The rtyper's
+    /// backward-inference pass classifies `op.result` from its consumer-op
+    /// constraints, and that classification is stamped on the result
+    /// Variable's `concretetype` cell via `apply_to_graph` before this
+    /// pass runs.  Reading `FunctionGraph::concretetype_of(&v)` therefore
+    /// propagates the same `result_kind` the rtyper already chose,
+    /// instead of
+    /// falling back to `value_type_to_kind(Unknown) == 'r'`.
+    /// A concrete `result_ty` (`Void` after `effective_call_result_ty`,
+    /// `Int`/`Float`) is already `FUNC.RESULT`; skip the cell so a
+    /// leftover GcRef dest cannot disagree with that stamp.
     fn resolve_call_result_kind(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
+        result_ty: &ValueType,
     ) -> Option<char> {
+        if !matches!(result_ty, ValueType::Unknown | ValueType::Ref(_)) {
+            return None;
+        }
+        if self.flavor_raw_ref_is_int_banked(result_ty) {
+            return Some('i');
+        }
         let var = result?;
         match FunctionGraph::concretetype_of(var) {
             crate::codewriter::type_state::ConcreteType::Signed => Some('i'),
@@ -5077,11 +5079,11 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// `jtransform.py handle_regular_call` / `rewrite_call`
-    /// `reskind = getkind(op.result.concretetype)[0]`, and
-    /// `call.py getcalldescr` `RESULT = op.result.concretetype`.
-    /// One cell for the opcode suffix and the calldescr RESULT.
-    /// `ir_type` follows that same kind.
+    /// RPython uses one `op.result.concretetype` for both
+    /// `getkind(...)[0]` (opcode suffix) and `getcalldescr(..., RESULT)`.
+    /// Keep the Rust port on that same source of truth so `Unknown`
+    /// results resolved by `type_state` cannot produce `_i` opnames with
+    /// Ref-return calldescrs.
     fn resolve_call_result(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
@@ -5097,15 +5099,14 @@ impl<'a> Transformer<'a> {
         let kind = if result.is_none() {
             'v'
         } else {
-            self.resolve_call_result_kind(result).unwrap_or_else(|| {
-                // Pre-rtyper-cell path: the result Variable has no
-                // concretetype yet, so classify from the front type.
-                if self.flavor_raw_ref_is_int_banked(result_ty) {
-                    'i'
-                } else {
-                    value_type_to_kind(result_ty)
-                }
-            })
+            self.resolve_call_result_kind(result, result_ty)
+                .unwrap_or_else(|| {
+                    if self.flavor_raw_ref_is_int_banked(result_ty) {
+                        'i'
+                    } else {
+                        value_type_to_kind(result_ty)
+                    }
+                })
         };
         let ir_type = match kind {
             'i' => majit_ir::value::Type::Int,
@@ -5170,18 +5171,31 @@ impl<'a> Transformer<'a> {
             ValueType::Void
         } else if matches!(result_ty, ValueType::Ref(_))
             && target.is_some_and(|target| {
-                self.callcontrol
-                    .as_deref()
-                    .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+                self.callcontrol.as_deref().is_some_and(|cc| {
+                    cc.declared_raw_result_for_target(target)
+                        || cc.undeclared_cfg_result_kind_for_target(target) == Some('i')
+                })
             })
         {
             // `call.py getcalldescr` uses FUNC.RESULT, not the frontend's
-            // aggregate token. This also covers a caller whose annotation
-            // did not publish the raw result's concrete Ptr.
+            // aggregate token. Ordinary fns leave `return_type` empty
+            // (`mir.rs` TyRef labels), so `declared_raw_result_for_target`
+            // is false; the CFG colour is then FUNC.RESULT
+            // (`func_result_kind` falls back to the returnblock). A
+            // declared Ref residual (`FrameRoot::new`) keeps Ref even
+            // when its unfinalized returnblock cell is Signed.
             ValueType::Int
         } else {
             result_ty.clone()
         }
+    }
+
+    /// Callee `FUNC.RESULT` kind: the declared stamp when present, else
+    /// the CFG return colour. `None` when neither is known.
+    fn callee_func_result_kind(&self, target: &CallTarget) -> Option<char> {
+        let cc = self.callcontrol.as_deref()?;
+        cc.declared_return_kind_for_target(target)
+            .or_else(|| cc.cfg_result_kind_for_target(target))
     }
 
     fn direct_funcptr_value_for_path(
@@ -9804,18 +9818,6 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
-        // A one-word pointer / scalar slot taken by address is the same
-        // `getsubstruct` (`int_add`) as a `FLAG_STRUCT` row. Leaving it as
-        // `getfield` is `getfield_raw_r` of the word, which
-        // `rewrite_op_getfield` refuses.
-        if let Some(offset) = raw_taken_field_offset(field, self.callcontrol.as_deref())
-            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
-        {
-            let OpKind::FieldRead { base, .. } = &op.kind else {
-                unreachable!("rewrite_op_getfield called on non-FieldRead op")
-            };
-            return self.rewrite_raw_substruct_address(op, base, offset, graph);
-        }
         // A place read of the same aggregate (`(*raw).inline.field`) does
         // not set `taken_by_address`. On a raw container that read is still
         // `rewrite_op_getsubstruct`: the result is the interior address.
@@ -10113,10 +10115,9 @@ impl<'a> Transformer<'a> {
                 // lltype `inst_` prefix before prepending `mutate_`.  Rust
                 // structs carry no such prefix, so we prepend `mutate_`
                 // directly.
-                let mutate_field = FieldDescriptor::new(
-                    format!("mutate_{}", field.name),
-                    field.owner_root.clone(),
-                );
+                // `cpu.fielddescrof(STRUCT, mutate_name)` uses the same
+                // STRUCT object as `field` (`descr.py get_field_descr`).
+                let mutate_field = mutate_field_descr(field);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!(
@@ -10664,24 +10665,24 @@ impl<'a> Transformer<'a> {
         }
         let (array_type_id, mut array, nolength, source_gckind, source_pure, taken_by_address) =
             match &op.kind {
-            OpKind::ArrayRead {
-                array_type_id,
-                array,
-                nolength,
-                gckind,
-                pure,
-                taken_by_address,
-                ..
-            } => (
-                array_type_id.clone(),
-                array.clone(),
-                *nolength,
-                *gckind,
-                *pure,
-                *taken_by_address,
-            ),
-            _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
-        };
+                OpKind::ArrayRead {
+                    array_type_id,
+                    array,
+                    nolength,
+                    gckind,
+                    pure,
+                    taken_by_address,
+                    ..
+                } => (
+                    array_type_id.clone(),
+                    array.clone(),
+                    *nolength,
+                    *gckind,
+                    *pure,
+                    *taken_by_address,
+                ),
+                _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
+            };
         let had_array = array.clone();
         if let Some(from_ct) =
             crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
@@ -11515,6 +11516,30 @@ impl<'a> Transformer<'a> {
                     },
                 },
             ]);
+        }
+        // `__majit_stringbuilder_append(builder, piece)` — the front's
+        // deferred `ll_append` (`AbstractStringBuilderRepr.rtype_method_append`).
+        // A graph on this spine never met the rtyper, so retarget to the
+        // 2-arg residual stub (`ll_append_res0`), the same way
+        // `__majit_stringbuilder_build` retargets to `jit_ll_build`.
+        // Keep the marker name unbound.
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && segments.len() == 1
+            && segments[0] == crate::runtime_names::shims::STRINGBUILDER_APPEND
+            && args.len() == 2
+        {
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["ll_append_res0"]),
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return match self.rewrite_operation(&helper_call, graph_name, graph) {
+                RewriteResult::Keep => RewriteResult::Replace(vec![helper_call]),
+                other => other,
+            };
         }
         // `__majit_stringbuilder_build(builder)` — the front's deferred
         // `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`).
@@ -12507,6 +12532,26 @@ impl<'a> Transformer<'a> {
                         op.result.as_ref(),
                         result_ty,
                     );
+                    // `call.py getcalldescr` uses FUNC.RESULT. When the
+                    // declared graph result is Int, or an ordinary fn's
+                    // CFG return is Int (`return_type` empty), stamp that
+                    // bank before reading the result cell: a residual
+                    // by-value raw ADT keeps the frontend's aggregate Ref
+                    // token on the dest (`Ptr(GcStruct object)`), and
+                    // `resolve_call_result` would otherwise prefer that
+                    // cell over the reconciled Int. A dest that already
+                    // carries a raw-pointer concretetype (CCHARP / Signed)
+                    // is already that bank.
+                    if self.callcontrol.as_deref().is_some_and(|cc| {
+                        cc.declared_raw_result_for_target(target)
+                            || cc.undeclared_cfg_result_kind_for_target(target) == Some('i')
+                    }) {
+                        self.stamp_value_kind_from_value_type(
+                            graph,
+                            op.result.clone(),
+                            &ValueType::Int,
+                        );
+                    }
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -15068,8 +15113,35 @@ impl<'a> Transformer<'a> {
         // Split args by kind (RPython make_three_lists)
         let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
-        let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_call_result(graph, op.result.clone(), result_ty);
+        let callee_kind = self.callee_func_result_kind(target);
+        let mut dest = op.result.clone();
+        // RPython still carries a typed `op.result` (`rewrite_call`
+        // `reskind = getkind(op.result.concretetype)[0]`). The front can
+        // drop an unused dest; mint one from FUNC.RESULT so unique
+        // interpret's `_opimpl_any_return` / `make_result_of_lastop`
+        // has a destination byte. Residual unused dests stay `_v`.
+        if dest.is_none()
+            && let Some(kind) = callee_kind
+            && kind != 'v'
+        {
+            dest = Some(self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::kind_char_to_concrete(kind),
+            ));
+        }
+        // Stamp FUNC.RESULT onto the dest cell *before* `resolve_call_result`
+        // reads it. A front `PyObjectRef` dest is GcRef; the cell would
+        // otherwise win `'r'` while the callee's CFG encodes `int_return`.
+        if callee_kind == Some('i') {
+            self.stamp_value_kind_from_value_type(graph, dest.clone(), &ValueType::Int);
+        } else if matches!(
+            result_ty,
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool
+        ) {
+            self.stamp_value_kind_from_value_type(graph, dest.clone(), result_ty);
+        }
+        let result_kind = self.resolve_call_result(dest.as_ref(), result_ty).kind;
+        self.stamp_call_result(graph, dest.clone(), result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -15079,7 +15151,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:480-481: inline_call always followed by -live-
         RewriteResult::Replace(vec![
             SpaceOperation {
-                result: op.result.clone(),
+                result: dest,
                 kind: OpKind::InlineCall {
                     jitcode,
                     args_i,
@@ -27370,6 +27442,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Ref(Some("String".into())),
                     array_type_id: Some("Vec<String>".into()),
+                    array: None,
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -27453,6 +27526,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(Some("String".into())),
                 array_type_id: Some("[String]".into()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -27515,6 +27589,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Unsigned,
                     array_type_id: Some("Vec<u8>".into()),
+                    array: None,
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -27590,6 +27665,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Ref(None),
                     array_type_id: Some("[[u8;1];20]".into()),
+                    array: None,
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
@@ -27609,6 +27685,7 @@ mod tests {
                     index: zero,
                     item_ty: ValueType::Unsigned,
                     array_type_id: Some("[u8;1]".into()),
+                    array: None,
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
@@ -36989,6 +37066,63 @@ mod tests {
     }
 
     #[test]
+    fn stringbuilder_append_marker_retargets_to_ll_append_res0() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("sb_append");
+        let builder = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let piece = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([crate::runtime_names::shims::STRINGBUILDER_APPEND]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![builder.clone(), piece.clone()]),
+                result_ty: ValueType::Void,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[builder.clone(), piece.clone()],
+            &ValueType::Void,
+            "sb_append",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.as_slice() == ["ll_append_res0"]
+                    )),
+                    "append marker must become ll_append_res0; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some(crate::runtime_names::shims::STRINGBUILDER_APPEND)
+                    )),
+                    "the unbound append marker must not survive; ops={ops:?}"
+                );
+            }
+            RewriteResult::Keep => panic!("expected Replace onto ll_append_res0, got Keep"),
+            RewriteResult::Identity(_) => {
+                panic!("expected Replace onto ll_append_res0, got Identity")
+            }
+            RewriteResult::Constant(_) => {
+                panic!("expected Replace onto ll_append_res0, got Constant")
+            }
+        }
+    }
+
+    #[test]
     fn stringbuilder_build_marker_retargets_to_ll_build() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
@@ -39985,18 +40119,222 @@ mod tests {
         assert_eq!(resolved.ir_type, majit_ir::value::Type::Int);
     }
 
-    /// Cell GcRef wins over front `Int` (`call.py getcalldescr`
-    /// `RESULT = op.result.concretetype`).
+    /// A concrete `Int` `result_ty` is already `FUNC.RESULT`; the cell
+    /// is consulted only for `Unknown`/`Ref` (`resolve_call_result_kind`).
     #[test]
-    fn resolve_call_result_gcref_cell_wins_over_int_result_ty() {
+    fn resolve_call_result_int_result_ty_skips_gcref_cell() {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("caller");
         let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let result_ty = ValueType::Int;
         let resolved = transformer.resolve_call_result(Some(&result), &result_ty);
-        assert_eq!(resolved.kind, 'r', "GcRef cell is getkind ref");
-        assert_eq!(resolved.ir_type, majit_ir::value::Type::Ref);
+        assert_eq!(resolved.kind, 'i', "Int result_ty is FUNC.RESULT");
+        assert_eq!(resolved.ir_type, majit_ir::value::Type::Int);
+    }
+
+    fn register_cfg_int_callee(cc: &mut crate::call::CallControl, name: &str) {
+        let callee = FunctionGraph::new(name);
+        let ret = callee.block(callee.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret, ConcreteType::Signed);
+        let path = crate::parse::CallPath::from_segments([name]);
+        cc.register_function_graph(path.clone(), callee);
+        cc.add_candidate_graph(path);
+    }
+
+    /// Ordinary callee (`return_type` empty) whose CFG return is Signed.
+    /// The caller's dest cell is still the front `PyObjectRef` GcRef.
+    /// Stamp FUNC.RESULT before `resolve_call_result` so reskind is `'i'`.
+    #[test]
+    fn regular_call_cfg_int_stamps_gcref_dest_int() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        register_cfg_int_callee(&mut cc, "borrowed");
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("managed");
+        let dest = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["borrowed"]);
+        let result_ty = ValueType::Ref(Some("pyobject::PyObject".into()));
+        let op = SpaceOperation {
+            result: Some(dest.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "managed",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                let inline = ops.iter().find_map(|op| match &op.kind {
+                    OpKind::InlineCall { result_kind, .. } => {
+                        Some((*result_kind, op.result.clone()))
+                    }
+                    _ => None,
+                });
+                let (kind, result) = inline.expect("inline_call");
+                assert_eq!(kind, 'i', "CFG Int callee encodes inline_call_*_i");
+                let result = result.expect("dest present");
+                assert_eq!(
+                    FunctionGraph::concretetype_of(&result),
+                    ConcreteType::Signed
+                );
+                assert_eq!(FunctionGraph::concretetype_of(&dest), ConcreteType::Signed);
+            }
+            RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
+            RewriteResult::Keep => panic!("expected Replace, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Replace, got Constant"),
+        }
+    }
+
+    /// Pre-rtyper CFG Unknown leaves the dest cell's kind (`'r'`).
+    #[test]
+    fn regular_call_unknown_cfg_keeps_gcref_dest() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let callee = FunctionGraph::new("borrowed");
+        let path = crate::parse::CallPath::from_segments(["borrowed"]);
+        cc.register_function_graph(path.clone(), callee);
+        cc.add_candidate_graph(path);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("managed");
+        let dest = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["borrowed"]);
+        let result_ty = ValueType::Ref(Some("pyobject::PyObject".into()));
+        let op = SpaceOperation {
+            result: Some(dest.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "managed",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                let inline = ops.iter().find_map(|op| match &op.kind {
+                    OpKind::InlineCall { result_kind, .. } => Some(*result_kind),
+                    _ => None,
+                });
+                assert_eq!(inline, Some('r'), "Unknown CFG keeps dest GcRef");
+                assert_eq!(FunctionGraph::concretetype_of(&dest), ConcreteType::GcRef);
+            }
+            RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
+            RewriteResult::Keep => panic!("expected Replace, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Replace, got Constant"),
+        }
+    }
+
+    /// Front dropped dest, callee CFG Int: mint a Signed dest so unique
+    /// interpret's int_return has a register (`make_result_of_lastop`).
+    #[test]
+    fn regular_call_cfg_int_mints_dropped_dest() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        register_cfg_int_callee(&mut cc, "borrowed");
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("managed");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["borrowed"]);
+        let result_ty = ValueType::Ref(Some("pyobject::PyObject".into()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "managed",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                let inline = ops.iter().find_map(|op| match &op.kind {
+                    OpKind::InlineCall { result_kind, .. } => {
+                        Some((*result_kind, op.result.clone()))
+                    }
+                    _ => None,
+                });
+                let (kind, result) = inline.expect("inline_call");
+                assert_eq!(kind, 'i');
+                let result = result.expect("minted dest");
+                assert_eq!(
+                    FunctionGraph::concretetype_of(&result),
+                    ConcreteType::Signed
+                );
+            }
+            RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
+            RewriteResult::Keep => panic!("expected Replace, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Replace, got Constant"),
+        }
+    }
+
+    /// `dont_look_inside` residual with declared `FUNC.RESULT` Ref and a
+    /// Signed returnblock that never went through finalize. `getcalldescr`
+    /// compares RESULT to the declared type (`call.py`); restamping dest
+    /// Int from that CFG cell panics (`FrameRoot::new`).
+    #[test]
+    fn residual_declared_ref_keeps_gcref_dest_when_cfg_int() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let mut callee = FunctionGraph::new("frame_root_new");
+        callee.return_type = Some("ref".into());
+        let ret = callee.block(callee.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret, ConcreteType::Signed);
+        let path = crate::parse::CallPath::from_segments(["frame_root_new"]);
+        cc.register_function_graph(path, callee);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("eval_with_jit_inner");
+        let dest = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["frame_root_new"]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(dest.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(Vec::new()),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "eval_with_jit_inner",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                let residual = ops.iter().find_map(|op| match &op.kind {
+                    OpKind::CallResidual { result_kind, .. } => Some(*result_kind),
+                    _ => None,
+                });
+                assert_eq!(residual, Some('r'), "declared Ref residual stays _r");
+                assert_eq!(FunctionGraph::concretetype_of(&dest), ConcreteType::GcRef);
+            }
+            RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
+            RewriteResult::Keep => panic!("expected Replace, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Replace, got Constant"),
+        }
     }
 
     /// Front `Ref(Some("QuasiImmut"))` FieldWrite of a Signed word is
@@ -45212,6 +45550,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert!(

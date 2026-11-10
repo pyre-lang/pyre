@@ -212,7 +212,10 @@ fn insert_minted_exception_class_rows(map: &mut HashMap<&'static str, i64>) {
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied().or_else(|| generated_residual_shim_fnaddr(path))
+    RUNTIME_FNADDRS
+        .get(path)
+        .copied()
+        .or_else(|| generated_residual_shim_fnaddr(path))
 }
 
 fn generated_residual_shim_fnaddr(path: &str) -> Option<i64> {

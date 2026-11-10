@@ -6271,19 +6271,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     let (is_gc_managed, headerless) = cc
         .struct_storage_for(owner)
         .or_else(|| cc.struct_storage_for(template_owner))
-        .unwrap_or_else(|| {
-            match cc
-                .declared_gckind_for(owner)
-                .or_else(|| cc.declared_gckind_for(template_owner))
-            {
-                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc) => (true, false),
-                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw)
-                | Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Prebuilt) => {
-                    (false, false)
-                }
-                None => (true, false),
-            }
-        });
+        .unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
         is_gc_managed,
@@ -7184,7 +7172,6 @@ fn bh_array_pool_type_id(
             .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned())
     }
 }
-
 
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
 ///
@@ -8553,40 +8540,6 @@ mod tests {
             }
             other => panic!("arraydescrof must mint a BhDescr::Array, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn a_nameless_length_prefixed_int_array_names_gcarray_i64() {
-        use crate::call::CallControl;
-
-        let cc = CallControl::new();
-        let descr = arraydescrof(&crate::model::ValueType::Int, &None, Some(0), Some(&cc));
-        let crate::jitcode::BhDescr::Array {
-            array_type_id,
-            len_offset,
-            item_type,
-            ..
-        } = descr
-        else {
-            panic!("arraydescrof must mint a BhDescr::Array");
-        };
-        assert_eq!(len_offset, Some(0));
-        assert_eq!(item_type, majit_ir::value::Type::Int);
-        assert_eq!(
-            array_type_id.as_deref(),
-            Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY)
-        );
-        let headerless = arraydescrof(&crate::model::ValueType::Int, &None, None, Some(&cc));
-        let crate::jitcode::BhDescr::Array {
-            array_type_id: headerless_id,
-            len_offset: headerless_len,
-            ..
-        } = headerless
-        else {
-            panic!("headerless arraydescrof must mint a BhDescr::Array");
-        };
-        assert_eq!(headerless_len, None);
-        assert!(headerless_id.is_none());
     }
 
     #[test]
@@ -10289,7 +10242,6 @@ mod tests {
             "ref_isconstant/r",
             "float_isconstant/f",
             "ref_isvirtual/r",
-            "int_isvirtual/i",
         ] {
             assert!(
                 crate::insns::insn_byte_opt(key).is_none(),

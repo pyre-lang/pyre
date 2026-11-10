@@ -10396,7 +10396,6 @@ impl<'a> Lowering<'a> {
         self.spec_const_generics = const_generics;
     }
 
-
     /// Specialized path for a direct call whose type args are concrete,
     /// or whose `generics.trait_refs` name impls. The bare path is
     /// unchanged when the callee is not generic or the call still
@@ -10518,7 +10517,6 @@ impl<'a> Lowering<'a> {
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
                 fn_id: fd.def_id,
-                fn_path: fd.item_meta.name_path(),
                 leaf,
                 trait_refs,
                 types,
@@ -10730,7 +10728,6 @@ impl<'a> Lowering<'a> {
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
                 fn_id: fd.def_id,
-                fn_path: fd.item_meta.name_path(),
                 leaf: leaf.clone(),
                 trait_refs,
                 types,
@@ -10749,10 +10746,17 @@ impl<'a> Lowering<'a> {
         path: &str,
     ) -> Option<Vec<String>> {
         let cross = self.cross_crate?;
-        let trait_refs =
-            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+        // A leftover `Clause` ref (`T: ?Sized` MetaSized / Pointee) does
+        // not refuse once the type arguments are concrete: the
+        // unstructured path (`enqueue_spec`) already uses
+        // `unwrap_or_default`, and `substitute_clauses` no-ops when the
+        // replacement is missing. `loop_unrolling_heuristic` is that
+        // shape (`rlib/jit.py` `specialize.call_location`).
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                .unwrap_or_default();
         let mut result = None;
         let mut decline: Option<&'static str> = None;
         cross.with_crates(&mut |crates| {
@@ -10922,7 +10926,8 @@ impl<'a> Lowering<'a> {
                     // before `enqueue_spec` copies it.  (The reflexive
                     // `Identity` outcome is intercepted at `lower_call`
                     // before reaching here.)
-                    if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg) {
+                    if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg)
+                    {
                         return (segments, None);
                     }
                     if let Some(segments) = self.specialized_fun_segments(fd, reg) {

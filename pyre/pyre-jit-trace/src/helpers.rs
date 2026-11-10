@@ -1994,6 +1994,29 @@ pub fn emit_new_pyframe_inline_with_params(
     Some(new_frame)
 }
 
+/// Pair the constructor `NewArrayClear` locals array with the recording-time
+/// `PyFrame.locals_cells_stack_w`. The heapcache forwards that array box for
+/// every later `setarrayitem_vable`, and `execute_setarrayitem_gc` stores
+/// through its concrete pointer; an unstamped virtual array is address 0.
+pub fn stamp_inline_frame_locals_array(
+    ctx: &mut TraceCtx,
+    frame: OpRef,
+    concrete_frame: *mut pyre_interpreter::pyframe::PyFrame,
+) {
+    if concrete_frame.is_null() {
+        return;
+    }
+    let array_ptr = unsafe { (*concrete_frame).locals_cells_stack_w as usize };
+    if array_ptr == 0 {
+        return;
+    }
+    let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+    let Some(array_op) = ctx.heapcache_getfield_cached(frame, locals_descr.index()) else {
+        return;
+    };
+    ctx.set_opref_concrete(array_op, Value::Ref(GcRef(array_ptr)));
+}
+
 /// Store the constructor `debugdata` pointer on `new_frame` and cache it.
 fn store_inline_frame_debugdata(
     ctx: &mut TraceCtx,

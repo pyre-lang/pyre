@@ -740,9 +740,12 @@ pub(in crate::front::mir) struct Lowering<'a> {
 /// `rtyper.py` `setconcretetype` of a parameter from `FUNC.ARGS`.
 /// Parameters are minted `Unknown`; `getcalldescr` maps that cell to
 /// `'r'` (`resolve_non_void_arg_types_from_vars`). Stamp the Input bank
-/// here so a skipped-rtyper graph still matches. A raw `Ptr` (`&CodeObject`,
-/// `*const CellFamily`) stays a pointer here; `history.getkind` `'int'`
-/// is the JIT kind (`get_type_flag` FLAG_UNSIGNED), not this bank.
+/// here so a skipped-rtyper graph still matches, except `Ref`: a missing
+/// cell is the by-value struct (`operand_is_already_raw_pointer`). A
+/// `GcRef`/`Ptr` stamp would skip the raw-owned box rewrite of a moved
+/// raw-flavor attr. A raw `Ptr` (`&CodeObject`, `*const CellFamily`)
+/// stays a pointer in the dual-gate; `history.getkind` `'int'` is the
+/// JIT kind (`get_type_flag` FLAG_UNSIGNED), not this bank.
 ///
 /// `ValueType::Str` is rstr `STR` (`history.py` `getkind` `'ref'`).
 /// Keep the `STRPTR` lltype so `<[u8]>::as_ptr` emits `cast_ptr_to_int`
@@ -752,6 +755,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
 pub(in crate::front::mir) fn paint_str_param_gcref(var: &Variable, ty: &ValueType) {
     if matches!(ty, ValueType::Str) {
         stamp_as_rstr_str(var);
+        return;
+    }
+    if matches!(ty, ValueType::Ref(_) | ValueType::StringBuilder) {
         return;
     }
     let want = concretetype_for_field(ty);
