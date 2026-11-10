@@ -10533,12 +10533,14 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         // `_opimpl_getfield_gc_any_pureornot` (heapcache field box), and
         // `implement_guard_value` (Const after the first promote) record
         // nothing on the second walk. `profilefunc is not None` is
-        // `unop_int_record` (`int_is_zero/i>i`) of that cached GetfieldGcI
-        // FrontendOp plus `fused_goto_if_not_int_unary`
-        // (`goto_if_not_int_is_zero/iL` → `opimpl_goto_if_not_int_is_zero`:
-        // `execute(INT_IS_ZERO)` then `opimpl_goto_if_not(..., replace=False)`).
-        // `execute_and_record` folds only `_all_constants`, so a non-Const
-        // field box re-records INT_IS_ZERO and GuardFalse.
+        // `ptr_iszero` of the cached GetfieldGcI box (`rmodel.py rtype_is_`
+        // -> `jtransform.py _rewrite_equality` / `_rewrite_cmp_ptrs`:
+        // non-gc `ptr_iszero` is `int_is_zero`), fused into
+        // `goto_if_not_int_is_zero` with the exits swapped
+        // (`opimpl_goto_if_not_int_is_zero`: `execute(INT_IS_ZERO)` then
+        // `opimpl_goto_if_not(..., replace=False)`); `execute_and_record`
+        // folds only `_all_constants`, so a non-Const field box re-records
+        // INT_IS_ZERO and GuardTrue.
         assert!(
             !leftover.iter().any(|op| matches!(
                 *op,
@@ -10553,13 +10555,9 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         );
         assert_eq!(
             leftover,
-            vec![
-                majit_ir::OpCode::IntIsZero,
-                majit_ir::OpCode::IntIsZero,
-                majit_ir::OpCode::GuardFalse,
-            ],
+            vec![majit_ir::OpCode::IntIsZero, majit_ir::OpCode::GuardTrue],
             "second walk re-records the generated profilefunc is-not-None \
-             INT_IS_ZERO / GuardFalse: leftover={leftover:?} first={first_ops:?}"
+             INT_IS_ZERO / GuardTrue: leftover={leftover:?} first={first_ops:?}"
         );
         assert_unarmed_call_trace_recorded(
             wc, session, &r_before, &i_before, &f_before, &generated,
@@ -10567,7 +10565,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         let mut saw_tracefunc_getfield = false;
         let mut saw_tracefunc_isnull = false;
         let mut saw_profilefunc_getfield = false;
-        let mut saw_profilefunc_false = false;
+        let mut saw_profilefunc_isnull = false;
         for op in wc.trace_ctx.ops() {
             if op.opcode == majit_ir::OpCode::GetfieldGcR
                 && op
@@ -10586,8 +10584,8 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
             {
                 saw_profilefunc_getfield = true;
             }
-            if saw_profilefunc_getfield && op.opcode == majit_ir::OpCode::GuardFalse {
-                saw_profilefunc_false = true;
+            if saw_profilefunc_getfield && op.opcode == majit_ir::OpCode::GuardTrue {
+                saw_profilefunc_isnull = true;
             }
         }
         let dump = format!(
@@ -10603,8 +10601,8 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
             "gettrace() promote(None) is GetfieldGcR + GuardValue: {dump}"
         );
         assert!(
-            saw_profilefunc_getfield && saw_profilefunc_false,
-            "profilefunc is not None is GetfieldGcI + GuardFalse: {dump}"
+            saw_profilefunc_getfield && saw_profilefunc_isnull,
+            "profilefunc is not None is GetfieldGcI + IntIsZero + GuardTrue: {dump}"
         );
     });
 }
