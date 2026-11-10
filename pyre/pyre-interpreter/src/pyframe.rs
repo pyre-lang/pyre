@@ -2127,11 +2127,23 @@ impl FrameBox {
             Some(qualname) => qualname,
             None => pyre_object::PY_NULL,
         });
-        self.run_generator_prologue()?;
+        // `run_generator_prologue` runs `MAKE_CELL` / `COPY_FREE_VARS` and
+        // `capture_coroutine_origin` walks the caller chain; both collect.
+        // `pyframe.py initialize_as_generator` / `generator.py
+        // GeneratorIterator.__init__` keep `frame` as a GCREF local;
+        // `framework.py` `gct_direct_call` / `shadowstack.py` `pop_roots`
+        // rewrite it. `owner_root` is the same slot; `FrameAnchor` is the
+        // reload used after each collecting call.
+        let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(self.frame_ptr()) };
+        unsafe { (*frame_anchor.live()).run_generator_prologue()? };
         let register_final = unsafe {
-            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
+            crate::pycode::w_code_yields_inside_try(
+                (*frame_anchor.live()).pycode as pyre_object::PyObjectRef,
+            )
         };
-        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
+        let is_coroutine = unsafe { (*frame_anchor.live()).co_flags() }
+            & crate::astcompiler::consts::CO_COROUTINE
+            != 0;
         let origin = if is_coroutine {
             capture_coroutine_origin(crate::call::getexecutioncontext())
         } else {
@@ -2145,8 +2157,11 @@ impl FrameBox {
         // `execute_frame`).  Null it now so the generator's custom trace,
         // which greys the frame block and recurses `f_backref`, never greys
         // the (possibly already-freed) caller frame captured at suspend.
-        self.f_backref = std::ptr::null_mut();
-        let frame_ptr = self.into_raw();
+        unsafe { (*frame_anchor.live()).f_backref = std::ptr::null_mut() };
+        // `into_raw` drops `owner_root`; the address is the reloaded
+        // `FrameAnchor` slot (`initialize_as_generator`).
+        let _ = self.into_raw();
+        let frame_ptr = frame_anchor.live();
         // `w_generator_new` allocates and may trigger a collection. Until the
         // generator owns `frame_ptr` (and its custom trace greys the frame
         // block), the frame is an RPython allocation result still live in the
@@ -2156,7 +2171,9 @@ impl FrameBox {
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+        let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
         let _root = FrameLocalsRoot::new(frame_ptr);
+        let frame_ptr = frame_anchor.live();
         // generator.py `self.pycode = frame.pycode`: preserve the exact
         // code object independently of the frame, which is cleared when the
         // generator finishes.

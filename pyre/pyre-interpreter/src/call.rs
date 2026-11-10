@@ -1762,6 +1762,10 @@ fn call_function_carrier_with_mode(
             // two `is_builtin_code` looks through.
             let profile_frame = c_profile_frame(profile_frame);
             if !profile_frame.is_null() {
+                // `call_args_and_c_profile` owns the `FrameAnchor`
+                // (`funccall_valuestack` / `call_valuestack`). This arm
+                // does not take one, so the user-function speedhack never
+                // pays a push/pop.
                 let w_res = crate::baseobjspace::call_args_and_c_profile(
                     unsafe { &mut *profile_frame },
                     callable,
@@ -2250,11 +2254,6 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-    // The caller frame stays anchored across binding and the callee. A user
-    // function does not receive it: `Function.call_args` is the entry, and
-    // `call_user_function_resolved` keeps that shape. The non-user arm reads
-    // it back with `FrameAnchor::live` for `call_callable_with_mode`.
-    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     // `crate::is_function` is also true for a builtin function and a method
     // descriptor. Those stay on `resolve_kwargs` (the builtin arm above
     // already returned). `get_pycode` is the same user-code gate
@@ -2264,6 +2263,10 @@ fn call_kw_in_ctx_impl(
             && !crate::is_builtin_code(crate::getcode(target_func) as pyre_object::PyObjectRef)
     };
     if plain_user {
+        // `Function.call_args` → `pycode.py PyCode.funcrun`. The caller
+        // frame is not read after `createframe` (`funccall_valuestack`
+        // drops values first on the non-flat path; here the opcode already
+        // popped). Do not take a `FrameAnchor` on this arm.
         return call_user_function_from_call_kw(
             execution_context,
             target_func,
@@ -2278,6 +2281,9 @@ fn call_kw_in_ctx_impl(
     // profiled frame afterwards. Publish the words first. The frame is not a
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
     // keeping the raw pointer live across the call.
+    // `CALL_FUNCTION_KW` keeps `frame` across `argument_factory` /
+    // `call_args` (`pyopcode.py`). Park it before the first collecting bind.
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let n_args = call_args.len();
     let roots = pyre_object::gc_roots::push_roots();
     let func_slot = roots.publish(&[target_func, kwarg_names]);

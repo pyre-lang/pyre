@@ -23,7 +23,17 @@ pub(super) fn call_named(
                 "a cpyext keyword call has no current frame",
             ));
         }
-        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, names)
+        // `cpyext/object.py` / `space.call_args`: the executing frame is a
+        // GCREF local. `framework.py` `gct_direct_call` / `shadowstack.py`
+        // `pop_roots` rewrite it across the call. The TLS cell is extra-area
+        // walked; this local copy is not.
+        let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::call::call_with_kwargs(
+            unsafe { &mut *frame_anchor.live() },
+            callable,
+            arguments,
+            names,
+        )
     })
 }
 
