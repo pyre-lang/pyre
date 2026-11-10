@@ -2935,6 +2935,10 @@ impl SharedOpcodeHandler for PyFrame {
         Ok(())
     }
 
+    fn live_handler(anchor: &Self::Anchor) -> *mut Self {
+        anchor.live()
+    }
+
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.push(value);
         Ok(())
@@ -3005,15 +3009,24 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn store_subscr(
         &mut self,
-        obj: Self::Value,
-        key: Self::Value,
-        value: Self::Value,
+        mut obj: Self::Value,
+        mut key: Self::Value,
+        mut value: Self::Value,
     ) -> Result<(), PyError> {
-        setitem(obj, key, value).map(|_| ())
+        // pyopcode.py STORE_SUBSCR: pop then space.setitem. The three
+        // livevars are rooted across that collecting call
+        // (framework.py gct_direct_call / shadowstack.py push_roots).
+        pyre_object::with_roots!(obj, key, value => setitem(obj, key, value)).map(|_| ())
     }
 
-    fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
-        unsafe { w_list_append(list, value) };
+    fn list_append(
+        &mut self,
+        mut list: Self::Value,
+        mut value: Self::Value,
+    ) -> Result<(), PyError> {
+        // pyopcode.py LIST_APPEND: popvalue then peekvalue then
+        // space.call_method(v, 'append', w).
+        pyre_object::with_roots!(list, value => unsafe { w_list_append(list, value) });
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
@@ -3035,13 +3048,14 @@ impl SharedOpcodeHandler for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         let obj = roots.pin_root(obj);
+        let anchor = FrameAnchor::new(self);
         getattr_str(obj, name).inspect_err(|error| {
             if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 // Keep this write on the live virtualizable red frame.  The
                 // opaque helper only answers the semantic type question;
                 // writing `frame.flags` inside it would race the JIT's
                 // register-resident copy of the same field.
-                self.defer_failed_attr_until_pop_except();
+                unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
             }
         })
     }
@@ -3052,11 +3066,13 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn store_attr(
         &mut self,
-        obj: Self::Value,
+        mut obj: Self::Value,
         name: &str,
-        value: Self::Value,
+        mut value: Self::Value,
     ) -> Result<(), PyError> {
-        setattr_str(obj, name, value).map(|_| ())
+        // pyopcode.py STORE_ATTR: pop then space.setattr. Root the popped
+        // livevars across that collecting call (shadowstack.py push_roots).
+        pyre_object::with_roots!(obj, value => setattr_str(obj, name, value)).map(|_| ())
     }
 }
 
@@ -3134,6 +3150,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 // namespace that cannot use the borrowed-key shortcut — a
                 // `dict` subclass, a non-dict mapping — wraps no key of its own
                 // per execution either.
+                let anchor = FrameAnchor::new(self);
                 if let Some(value) = pyre_object::with_roots!(w_locals =>
                     crate::baseobjspace::finditem_str_named(
                         w_locals,
@@ -3144,8 +3161,10 @@ impl NamespaceOpcodeHandler for PyFrame {
                 )? {
                     return crate::lazyimport::maybe_reify_str(value, name, w_locals);
                 }
-                // pyopcode.py:972 — a missing locals entry falls through to
-                // `LOAD_GLOBAL_cached`.
+                // pyopcode.py LOAD_NAME: a missing locals entry falls through
+                // to LOAD_GLOBAL_cached. shadowstack.py pop_roots rewrites
+                // `self` across finditem_str.
+                return unsafe { &mut *anchor.live() }.load_global_value(name, nameindex);
             }
             return self.load_global_value(name, nameindex);
         }
@@ -5077,10 +5096,10 @@ impl OpcodeStepExecutor for PyFrame {
         // `pyopcode.py CONTAINS_OP`: `w_2 = popvalue(); w_1 = popvalue();
         // space.contains_w(w_2, w_1)`. Exact-builtin membership does not
         // collect; `contains` pins only the subclass/override arm.
-        let haystack = self.pop();
-        let needle = self.pop();
+        let mut haystack = self.pop();
+        let mut needle = self.pop();
         let anchor = FrameAnchor::new(self);
-        let result = crate::baseobjspace::contains(haystack, needle)?;
+        let result = pyre_object::with_roots!(haystack, needle => crate::baseobjspace::contains(haystack, needle))?;
         let inverted = match invert {
             crate::bytecode::Invert::No => result,
             crate::bytecode::Invert::Yes => !result,
@@ -5106,19 +5125,20 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.13: converts TOS to bool
 
     fn to_bool(&mut self) -> Result<(), PyError> {
-        let val = self.pop();
+        let mut val = self.pop();
         let anchor = FrameAnchor::new(self);
-        let truth = crate::baseobjspace::is_true(val)?;
+        let truth = pyre_object::with_roots!(val => crate::baseobjspace::is_true(val))?;
         Self::push_anchored(&anchor, pyre_object::w_bool_from(truth))
     }
 
     // ── DeleteSubscr ──
 
     fn delete_subscript(&mut self) -> Result<(), PyError> {
-        let index = self.pop();
-        let obj = self.pop();
-        crate::baseobjspace::delitem(obj, index)?;
-        Ok(())
+        let mut index = self.pop();
+        let mut obj = self.pop();
+        // pyopcode.py DELETE_SUBSCR: pop then space.delitem. Root the popped
+        // livevars across that collecting call (shadowstack.py push_roots).
+        pyre_object::with_roots!(obj, index => crate::baseobjspace::delitem(obj, index))
     }
 
     // ── DeleteFast ──
@@ -5143,38 +5163,43 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── FormatSimple (str(TOS)) ──
     fn format_simple(&mut self) -> Result<(), PyError> {
-        let val = self.pop();
+        let mut val = self.pop();
         // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
         // invoked with an empty spec, otherwise this is `str(value)`.
         let anchor = FrameAnchor::new(self);
-        let s = crate::runtime_ops::format_value(val, pyre_object::PY_NULL)?;
+        let s = pyre_object::with_roots!(val => {
+            crate::runtime_ops::format_value(val, pyre_object::PY_NULL)
+        })?;
         Self::push_anchored(&anchor, s)
     }
 
     // ── FormatWithSpec (format(TOS1, TOS)) ──
     fn format_with_spec(&mut self) -> Result<(), PyError> {
-        let spec = self.pop();
-        let val = self.pop();
+        let mut spec = self.pop();
+        let mut val = self.pop();
         // `PyObject_Format(value, spec)` — dispatch to a user-defined
         // `__format__` when present, else apply the shared spec parser
         // (empty spec → `str(value)`).  `runtime_ops::format_value` keeps
         // f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical, and
         // reads a non-`str`/non-UTF-8 spec as empty rather than panicking.
         let anchor = FrameAnchor::new(self);
-        let s = crate::runtime_ops::format_value(val, spec)?;
+        let s = pyre_object::with_roots!(val, spec => {
+            crate::runtime_ops::format_value(val, spec)
+        })?;
         Self::push_anchored(&anchor, s)
     }
 
     // ── ConvertValue (repr/str/ascii conversion) ──
     fn convert_value(&mut self, conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
-        let val = self.pop();
+        let mut val = self.pop();
         // An instance dunder returns its str object (`DescrOperation.str`).
         // Every other shape is built as WTF-8, so a lone surrogate (a str,
         // or an exception whose single argument is a str) survives a Rust
         // `String`.  This is the path the `'%s' % x` rewrite takes.
         let code = crate::runtime_ops::convert_value_code(conv);
         let anchor = FrameAnchor::new(self);
-        let converted = crate::runtime_ops::convert_value(val, code)?;
+        let converted =
+            pyre_object::with_roots!(val => crate::runtime_ops::convert_value(val, code))?;
         Self::push_anchored(&anchor, converted)
     }
 
@@ -5294,23 +5319,28 @@ impl OpcodeStepExecutor for PyFrame {
     // TOS = exception type to match, TOS1 = caught exception
     // Pops type, peeks exc, pushes bool result
     fn check_exc_match(&mut self) -> Result<(), PyError> {
-        let exc_type = self.pop();
-        let exc_value = self.peek();
+        // pyopcode.py CHECK_EXC_MATCH: pop the type, peek the exception so it
+        // stays on the value stack, then cmp_exc_match / pushvalue(newbool).
+        // The popped type is a livevar across validation (`issubtype_w` /
+        // `__subclasscheck__`); shadowstack.py pop_roots rewrites `self`
+        // before the push.
+        let type_roots = pyre_object::gc_roots::push_roots();
+        let type_slot = type_roots.base();
+        let _ = type_roots.pin_root(self.pop());
+        let anchor = FrameAnchor::new(self);
         // pyopcode.py cmp_exc_match split:
-        //   :1034-1039 — `validate_check_exc_match_class(exc_type)?`
-        //                raises TypeError(CANNOT_CATCH_MSG) for invalid
-        //                except targets (`raise oefmt(...)` upstream).
-        //   :1040     — `check_exc_match_against(exc_value, exc_type)`
-        //                computes the match boolean.
+        //   validate_check_exc_match_class raises TypeError(CANNOT_CATCH_MSG)
+        //   for invalid except targets (`raise oefmt(...)` upstream).
+        //   check_exc_match_against computes the match boolean.
         // PyPy keeps both in a single `@jit.unroll_safe cmp_exc_match`;
         // the JIT inlines and the `raise` becomes a guard. Pyre splits
         // so the bool-returning hot helper keeps a 1-register ABI for
         // residual JIT calls; the validity gate runs in this BC handler
         // (outside the residual call path) and lifts to `?` propagation.
-        validate_check_exc_match_class(exc_type)?;
-        let matched = check_exc_match_against(exc_value, exc_type);
-        self.push(pyre_object::w_bool_from(matched));
-        Ok(())
+        validate_check_exc_match_class(type_roots.get(type_slot))?;
+        let exc_value = unsafe { &mut *anchor.live() }.peek();
+        let matched = check_exc_match_against(exc_value, type_roots.get(type_slot));
+        Self::push_anchored(&anchor, pyre_object::w_bool_from(matched))
     }
 
     fn check_eg_match(&mut self) -> Result<(), PyError> {
@@ -5374,10 +5404,12 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn prep_reraise_star(
         &mut self,
-        orig: Self::Value,
-        exceptions: Self::Value,
+        mut orig: Self::Value,
+        mut exceptions: Self::Value,
     ) -> Result<Self::Value, PyError> {
-        crate::builtins::exception_group_prep_reraise_star(orig, exceptions)
+        pyre_object::with_roots!(orig, exceptions => {
+            crate::builtins::exception_group_prep_reraise_star(orig, exceptions)
+        })
     }
 
     // ── PopExcept ──
@@ -5645,44 +5677,48 @@ impl OpcodeStepExecutor for PyFrame {
     // error through.  `dict_update_value` is the wrapper that draws the line
     // where 3.14 does.
     fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
-        let source = self.pop();
-        let dict = PyFrame::peek_at(self, i - 1);
-        crate::opcode_ops::dict_update_value(dict, source)
+        let mut source = self.pop();
+        let mut dict = PyFrame::peek_at(self, i - 1);
+        pyre_object::with_roots!(dict, source => crate::opcode_ops::dict_update_value(dict, source))
     }
 
     // ── DictMerge ──
     // pypy/interpreter/pyopcode.py DICT_MERGE → _dict_merge
     // (pyopcode.py).
     fn dict_merge(&mut self, i: usize) -> Result<(), PyError> {
-        let source = self.pop();
-        let dict = PyFrame::peek_at(self, i - 1);
+        let mut source = self.pop();
+        let mut dict = PyFrame::peek_at(self, i - 1);
         // pyopcode.py:1514 — callable = peekvalue(oparg + 2)
         // Stack after pop: [..., callable, NULL, args_tuple, dict]
-        let w_callable = if self.valuestackdepth > i + 2 {
+        let mut w_callable = if self.valuestackdepth > i + 2 {
             PyFrame::peek_at(self, i + 2)
         } else {
             pyre_object::PY_NULL
         };
-        crate::opcode_ops::dict_merge_value(dict, source, w_callable)
+        pyre_object::with_roots!(dict, source, w_callable => {
+            crate::opcode_ops::dict_merge_value(dict, source, w_callable)
+        })
     }
 
     // ── MapAdd ──
     // PyPy: STORE_MAP/MAP_ADD; CPython: MAP_ADD
     // dict = STACK[-i-2]; dict[TOS1] = TOS; pop key+value
     fn map_add(&mut self, i: usize) -> Result<(), PyError> {
-        let value = self.pop();
-        let key = self.pop();
-        let dict = PyFrame::peek_at(self, i - 1);
-        crate::opcode_ops::map_add_value(dict, key, value)
+        let mut value = self.pop();
+        let mut key = self.pop();
+        let mut dict = PyFrame::peek_at(self, i - 1);
+        pyre_object::with_roots!(dict, key, value => {
+            crate::opcode_ops::map_add_value(dict, key, value)
+        })
     }
 
     // ── SetAdd ──
     // PyPy: SET_ADD; CPython: SET_ADD
     // set = STACK[-i]; set.add(TOS); pop value
     fn set_add(&mut self, i: usize) -> Result<(), PyError> {
-        let value = self.pop();
-        let set = PyFrame::peek_at(self, i - 1);
-        crate::opcode_ops::set_add_value(set, value)
+        let mut value = self.pop();
+        let mut set = PyFrame::peek_at(self, i - 1);
+        pyre_object::with_roots!(set, value => crate::opcode_ops::set_add_value(set, value))
     }
 
     // ── none_value ──
@@ -6100,18 +6136,21 @@ impl OpcodeStepExecutor for PyFrame {
         // Method wrapper.  Shared with the JIT tracer (trace_opcode.rs) so the
         // concrete and symbolic frames produce the identical stack shape.
         // `__getattribute__` allocates and relocates a JIT-created frame, so
-        // the receiver is published before either lookup.
+        // the receiver is published before either lookup. Both pushes go
+        // through the forwarded frame (shadowstack.py pop_roots), matching
+        // the slow path.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         let _ = roots.pin_root(obj);
+        let anchor = FrameAnchor::new(self);
         if let Some((_, _, w_descr)) =
             unsafe { crate::baseobjspace::load_method_fast_path(roots.get(obj_slot), name) }
         {
-            self.push(w_descr);
-            self.push(roots.get(obj_slot));
+            let live = unsafe { &mut *anchor.live() };
+            live.push(w_descr);
+            live.push(roots.get(obj_slot));
             return Ok(());
         }
-        let anchor = FrameAnchor::new(self);
         let attr = crate::baseobjspace::getattr_str(roots.get(obj_slot), name)?;
         let attr_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(attr);
@@ -6130,11 +6169,13 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn load_special(&mut self, name: &str) -> Result<(), PyError> {
-        let obj = self.pop();
+        let mut obj = self.pop();
         // The descriptor `__get__` allocates and can relocate a JIT-created
         // frame; push onto the forwarded live frame.
         let anchor = FrameAnchor::new(self);
-        let bound = crate::baseobjspace::load_special_resolve(obj, name)?;
+        let bound = pyre_object::with_roots!(obj => {
+            crate::baseobjspace::load_special_resolve(obj, name)
+        })?;
         let live = unsafe { &mut *anchor.live() };
         live.push(bound);
         live.push(PY_NULL);
@@ -6187,17 +6228,16 @@ impl OpcodeStepExecutor for PyFrame {
         // Graceful underflow like `opcode_store_attr` (`shared_opcode.rs`)
         // so a corrupted trace-recording stack aborts the trace instead of
         // panicking the hard-asserting `pop()`.
-        let obj = self.pop_value()?;
-        let value = self.pop_value()?;
-        unsafe {
+        let mut obj = self.pop_value()?;
+        let mut value = self.pop_value()?;
+        let w_code = self.getcode_w();
+        // pyopcode.py STORE_ATTR: the pops are livevars across
+        // STORE_ATTR_caching / space.setattr (shadowstack.py push_roots).
+        pyre_object::with_roots!(obj, value => unsafe {
             crate::objspace::std::mapdict::store_attr_caching(
-                self.getcode_w(),
-                obj,
-                nameindex,
-                name,
-                value,
+                w_code, obj, nameindex, name, value,
             )
-        }
+        })
     }
 
     // ── call ──
@@ -6416,17 +6456,19 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_attr ──
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
     fn delete_attr(&mut self, name: &str) -> Result<(), PyError> {
-        let obj = self.pop();
-        crate::baseobjspace::delattr_str(obj, name)?;
+        let mut obj = self.pop();
+        // pyopcode.py DELETE_ATTR: pop then space.delattr. Root the popped
+        // receiver across that collecting call (shadowstack.py push_roots).
+        pyre_object::with_roots!(obj => crate::baseobjspace::delattr_str(obj, name))?;
         Ok(())
     }
 
     // ── set_update ──
     // PyPy: set.update(iterable); CPython: SET_UPDATE
     fn set_update(&mut self, i: usize) -> Result<(), PyError> {
-        let iterable = self.pop();
-        let set = PyFrame::peek_at(self, i - 1);
-        crate::opcode_ops::set_update_value(set, iterable)
+        let mut iterable = self.pop();
+        let mut set = PyFrame::peek_at(self, i - 1);
+        pyre_object::with_roots!(set, iterable => crate::opcode_ops::set_update_value(set, iterable))
     }
 
     // ── BuildSlice ──
@@ -6470,18 +6512,23 @@ impl OpcodeStepExecutor for PyFrame {
     /// `pyopcode.py BUILD_STRING` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
-        // `peekvalue` is index-from-top; reversing walks source order
-        // (first pushed = index 0), the order `build_string_from_refs` reports.
+        // pyopcode.py BUILD_STRING: peekvalue, dropvalues, space.newutf8,
+        // pushvalue. `peekvalue` is index-from-top; reversing walks source
+        // order (first pushed = index 0), the order `build_string_from_refs`
+        // reports. newutf8 collects; shadowstack.py pop_roots rewrites `self`.
         let mut parts = Vec::with_capacity(count);
         for i in (0..count).rev() {
             parts.push(self.peekvalue(i));
         }
+        let anchor = FrameAnchor::new(self);
         let result = crate::runtime_ops::build_string_from_refs(&parts)?;
-        for _ in 0..count {
-            let _ = self.pop();
+        {
+            let frame = unsafe { &mut *anchor.live() };
+            for _ in 0..count {
+                let _ = frame.pop();
+            }
         }
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     // ── ListExtend ──
@@ -6490,9 +6537,9 @@ impl OpcodeStepExecutor for PyFrame {
     // surfaces "Value after * must be an iterable, not <T>" when the
     // operand isn't iterable, else re-raises the inner error.
     fn list_extend(&mut self, i: usize) -> Result<(), PyError> {
-        let iterable = self.pop();
-        let list = PyFrame::peek_at(self, i - 1);
-        crate::opcode_ops::list_extend_value(list, iterable)
+        let mut iterable = self.pop();
+        let mut list = PyFrame::peek_at(self, i - 1);
+        pyre_object::with_roots!(list, iterable => crate::opcode_ops::list_extend_value(list, iterable))
     }
 
     fn unsupported(

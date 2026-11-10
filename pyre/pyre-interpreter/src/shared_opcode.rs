@@ -23,6 +23,13 @@ pub trait SharedOpcodeHandler {
     /// so the anchor is the only sound way back to the live one.
     fn push_anchored(anchor: &Self::Anchor, value: Self::Value) -> OpcodeResult<()>;
 
+    /// The forwarded handler after a collecting call.
+    ///
+    /// `shadowstack.py pop_roots` rewrites every live GCREF local, including
+    /// the frame `self`. Deliberately takes no `self`: the caller's `&mut Self`
+    /// may name the abandoned copy.
+    fn live_handler(anchor: &Self::Anchor) -> *mut Self;
+
     fn push_value(&mut self, value: Self::Value) -> OpcodeResult<()>;
     fn pop_value(&mut self) -> OpcodeResult<Self::Value>;
     fn peek_at(&mut self, depth: usize) -> OpcodeResult<Self::Value>;

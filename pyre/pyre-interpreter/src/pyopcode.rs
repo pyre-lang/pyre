@@ -935,8 +935,12 @@ pub fn opcode_load_name<H: NamespaceOpcodeHandler + ?Sized>(
     name: &str,
     nameindex: usize,
 ) -> Result<(), PyError> {
+    // pyopcode.py LOAD_NAME: finditem_str on w_locals, then pushvalue.
+    // The lookup can run `__getitem__`; shadowstack.py pop_roots rewrites
+    // `self` before the push.
+    let anchor = handler.anchor();
     let value = handler.load_name_checked_value(name, nameindex)?;
-    handler.push_value(value)
+    H::push_anchored(&anchor, value)
 }
 
 pub fn opcode_load_global<H: NamespaceOpcodeHandler + ?Sized>(
@@ -945,11 +949,13 @@ pub fn opcode_load_global<H: NamespaceOpcodeHandler + ?Sized>(
     nameindex: usize,
     push_null: bool,
 ) -> Result<(), PyError> {
+    // pyopcode.py LOAD_GLOBAL: `_load_global` / finditem_str, then pushvalue.
+    let anchor = handler.anchor();
     let value = handler.load_global_checked_value(name, nameindex)?;
-    handler.push_value(value)?;
+    H::push_anchored(&anchor, value)?;
     if push_null {
         let null = handler.null_value()?;
-        handler.push_value(null)?;
+        H::push_anchored(&anchor, null)?;
     }
     Ok(())
 }
@@ -998,13 +1004,14 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
 ) -> Result<(), PyError> {
     // Iterator sits under the index-or-NULL slot GET_ITER pushed.
     let iter = handler.peek_at(1)?;
-    // `PyFrame` can be the nursery frame materialised by an inlined
-    // CALL_ASSEMBLER.  After `iter_next` runs Python a minor collection may
-    // relocate it, so later writes go through the live frame rather than the
-    // abandoned copy.
+    // pyopcode.py FOR_ITER: `w_iterator = self.peekvalue();
+    // w_nextitem = self.space.next(w_iterator)` then `self.pushvalue` or
+    // jump. `self` is a translated livevar; shadowstack.py pop_roots
+    // rewrites it after the collecting `space.next`.
     let anchor = handler.anchor();
     match handler.iter_next(iter)? {
         Some(next) => {
+            let handler = unsafe { &mut *H::live_handler(&anchor) };
             let fallthrough = handler.fallthrough_target();
             // On guard failure this bytecode exits through the exhaustion path.
             handler.set_next_instr(target)?;
@@ -1013,7 +1020,7 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
             H::push_anchored(&anchor, next)
         }
         None => {
-            handler.record_for_iter_guard_exhausted()?;
+            unsafe { &mut *H::live_handler(&anchor) }.record_for_iter_guard_exhausted()?;
             H::on_iter_exhausted_anchored(&anchor, target)
         }
     }
@@ -1080,7 +1087,12 @@ fn opcode_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
     handler.enter_branch_truth(value)?;
+    // pyopcode.py POP_JUMP_IF_FALSE / POP_JUMP_IF_TRUE: `w_value = popvalue();
+    // space.is_true(w_value)` then `jump_absolute` on `self`. shadowstack.py
+    // pop_roots rewrites `self` after the collecting `is_true`.
+    let anchor = handler.anchor();
     let truth = handler.truth_value(value)?;
+    let handler = unsafe { &mut *H::live_handler(&anchor) };
     let concrete_truth = handler.concrete_truth_as_bool(value, truth)?;
     let should_jump = concrete_truth == jump_if_true;
     let fallthrough = handler.fallthrough_target();
@@ -1433,10 +1445,11 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
     {
         let obj = self.pop_value()?;
+        let anchor = self.anchor();
         let attr_val = SharedOpcodeHandler::load_attr(self, obj, name)?;
-        self.push_value(attr_val)?;
+        Self::push_anchored(&anchor, attr_val)?;
         let null = self.null_value()?;
-        self.push_value(null)
+        Self::push_anchored(&anchor, null)
     }
 
     /// LOAD_SPECIAL used by synchronous/asynchronous context managers.
@@ -1447,10 +1460,11 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
     {
         let obj = self.pop_value()?;
+        let anchor = self.anchor();
         let attr = SharedOpcodeHandler::load_special_attr(self, obj, name)?;
-        self.push_value(attr)?;
+        Self::push_anchored(&anchor, attr)?;
         let null = self.null_value()?;
-        self.push_value(null)
+        Self::push_anchored(&anchor, null)
     }
 
     fn store_attr(&mut self, name: &str) -> Result<(), PyError>
@@ -1890,30 +1904,30 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction1::UnaryPositive => {
                 // PyPy: UNARY_POSITIVE → space.pos(w_value)
                 let val = self.pop_value()?;
+                let anchor = self.anchor();
                 let result = self.unary_positive(val)?;
-                self.push_value(result)?;
-                Ok(())
+                Self::push_anchored(&anchor, result)
             }
             IntrinsicFunction1::ListToTuple => {
                 let val = self.pop_value()?;
+                let anchor = self.anchor();
                 let result = self.list_to_tuple(val)?;
-                self.push_value(result)?;
-                Ok(())
+                Self::push_anchored(&anchor, result)
             }
             IntrinsicFunction1::ImportStar => {
                 // Module is TOS; import_star pops it internally
+                let anchor = self.anchor();
                 self.import_star()?;
                 let none = self.none_value()?;
-                self.push_value(none)?;
-                Ok(())
+                Self::push_anchored(&anchor, none)
             }
             IntrinsicFunction1::Print => {
                 // sys.displayhook(value)
                 let val = self.pop_value()?;
+                let anchor = self.anchor();
                 self.print_expr(val)?;
                 let none = self.none_value()?;
-                self.push_value(none)?;
-                Ok(())
+                Self::push_anchored(&anchor, none)
             }
             IntrinsicFunction1::StopIterationError => {
                 // CPython: convert StopIteration to RuntimeError in generator context.
@@ -1924,9 +1938,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 // PyPy `YIELD_VALUE`: an async-generator yield is wrapped so
                 // AsyncGenASend can distinguish it from an await suspension.
                 let value = self.pop_value()?;
+                let anchor = self.anchor();
                 let wrapped = self.async_gen_wrap(value)?;
-                self.push_value(wrapped)?;
-                Ok(())
+                Self::push_anchored(&anchor, wrapped)
             }
             // PEP 695 type-parameter construction (`class C[T]:`, `def f[T]()`).
             IntrinsicFunction1::TypeVar => self.typing_intrinsic_1("_intrinsic_typevar"),
@@ -1946,9 +1960,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction2::PrepReraiseStar => {
                 let exceptions = self.pop_value()?;
                 let orig = self.pop_value()?;
+                let anchor = self.anchor();
                 let result = self.prep_reraise_star(orig, exceptions)?;
-                self.push_value(result)?;
-                Ok(())
+                Self::push_anchored(&anchor, result)
             }
             IntrinsicFunction2::SetFunctionTypeParams => {
                 // arg2 = type_params, arg1 = function
