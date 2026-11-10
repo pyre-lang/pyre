@@ -592,11 +592,14 @@ impl CallRegistry {
     /// Drop every pending lift whose graph was never asked for. A built
     /// template stays: it is the code object
     /// (`translator.buildflowgraph`). The annotator is complete; no
-    /// graph is built after it.
+    /// graph is built after it, so the `getdesc` callback that describes
+    /// a declared function object on its first lookup goes too, with the
+    /// graph store it reads.
     pub fn release_source_graphs(&self) {
         for entry in self.entries.borrow().values() {
             entry.function_desc.borrow().release_source_graph();
         }
+        self.getdesc.borrow_mut().take();
     }
 
     /// Mutable access to the two-phase type cache.

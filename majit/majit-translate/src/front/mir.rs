@@ -7670,6 +7670,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
         lo.graph.fixeggblocks();
         reject_rust_heap_string_attr_call(lo)?;
+        // The graph is finished and is stored for the rest of the
+        // translation; release what the lowering's pushes over-allocated.
+        lo.graph.shrink_to_fit();
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals

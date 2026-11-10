@@ -1835,15 +1835,23 @@ impl<'a> Lowering<'a> {
         for (bb_idx, locals) in cell_extra.into_iter().enumerate() {
             extra_live[bb_idx].extend(locals);
         }
-        let mut block_live_in =
-            compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops, &cell_plan.locals);
+        // Panic-abort blocks stay in the fixpoint above so their uses still
+        // flow into the switch that targets them. Only the lowered closure
+        // keeps a row; filtering before the extensions below keeps the
+        // dropped rows from growing to `n_slots` bits.
+        let mut block_live_in: Vec<(usize, bit_set::BitSet)> =
+            compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops, &cell_plan.locals)
+                .into_iter()
+                .enumerate()
+                .filter(|(mir_bb, _)| lowered.get(*mir_bb).copied().unwrap_or(false))
+                .collect();
         // The erased guard, its borrows, its `base()` results, the
         // `base + k` and `shadow_stack_len` indices, the `pin_roots`
         // argument temporaries and the closure-capture temporaries bind no
         // Variable, so no block may ask a predecessor to pass one. The
         // pinned values stay live: `get_sites` already pushed them.
         if root_bracket.enabled {
-            for live in &mut block_live_in {
+            for (_, live) in &mut block_live_in {
                 for scope in root_bracket.scopes.iter() {
                     live.remove(scope);
                 }
@@ -1873,7 +1881,7 @@ impl<'a> Lowering<'a> {
                 matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
             })
             .collect();
-        for live in &mut block_live_in {
+        for (_, live) in &mut block_live_in {
             let lens: Vec<usize> = live
                 .iter()
                 .filter_map(|local| len_shadow.get(local).copied().flatten())
@@ -1885,8 +1893,8 @@ impl<'a> Lowering<'a> {
         // Owner slots are not startblock ABI params (`(data, len)` only).
         // Function-scope residual-`&T` cells are the same: malloc on
         // entry, free on exit, live-in everywhere except bb0.
-        for (mir_bb, live) in block_live_in.iter_mut().enumerate() {
-            if mir_bb == 0 {
+        for (mir_bb, live) in &mut block_live_in {
+            if *mir_bb == 0 {
                 continue;
             }
             let owners: Vec<usize> = live
@@ -1896,8 +1904,8 @@ impl<'a> Lowering<'a> {
             live.extend(owners);
             live.extend(function_scope_start..n_slots);
         }
-        for (mir_bb, live) in block_live_in.iter_mut().enumerate() {
-            if mir_bb == 0 {
+        for (mir_bb, live) in &mut block_live_in {
+            if *mir_bb == 0 {
                 continue;
             }
             let extras: Vec<usize> = live
@@ -1912,15 +1920,8 @@ impl<'a> Lowering<'a> {
                 .collect();
             live.extend(extras);
         }
-        // Panic-abort blocks stay in the fixpoint above so their uses still
-        // flow into the switch that targets them. Only the lowered closure
-        // keeps a row.
-        let block_live_in: Vec<bit_set::BitSet> = block_live_in
-            .into_iter()
-            .enumerate()
-            .filter(|(mir_bb, _)| lowered.get(*mir_bb).copied().unwrap_or(false))
-            .map(|(_, live)| live)
-            .collect();
+        let block_live_in: Vec<bit_set::BitSet> =
+            block_live_in.into_iter().map(|(_, live)| live).collect();
         let nrows = block_id.nrows();
         let mut block_entry_local_var = vec![
             PackedLocalRow {
