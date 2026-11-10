@@ -1416,7 +1416,7 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
-        // Forced-alive `-live-` args (`liveness.py:8-12`) are graph-side
+        // Forced-alive `-live-` args (`liveness.py`) are graph-side
         // information: `make_dependencies` reads them off the graph op to
         // keep co-live frame slots interfering (and so on distinct colors).
         // The serialized marker stays argless — `compute_liveness` derives

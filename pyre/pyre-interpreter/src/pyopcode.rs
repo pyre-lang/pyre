@@ -481,7 +481,14 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 /// opcode. The PC projection and the opcode/oparg projection each repeat
 /// that walk; this returns both from the single pass. `usize::MAX` /
 /// `u64::MAX` are the corruption sentinels of the two projections.
+///
+/// Same `@jit.unroll_safe` as the two projections (`dispatch_bytecode`'s
+/// EXTENDED_ARG loop). `instruction_discriminant` rather than
+/// `u8::from(instruction)`: Charon lowers `From` as
+/// `instruction::<Impl>::from`, which is not in the CallRegistry and
+/// skips `eval_loop_jit_portal` in the prepass.
 #[inline]
+#[majit_macros::unroll_safe]
 pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {
     let mut start = pc;
     while start > 0
@@ -508,7 +515,7 @@ pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usi
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return (usize::MAX, u64::MAX);
@@ -1923,10 +1930,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 self.typing_intrinsic_1("_intrinsic_subscript_generic")
             }
             IntrinsicFunction1::TypeAlias => self.typing_intrinsic_1("_intrinsic_typealias"),
-            _ => Err(crate::PyError::type_error(format!(
-                "intrinsic function {:?} not implemented",
-                func
-            ))),
+            _ => Err(call_intrinsic_1_err_not_implemented(func)),
         }
     }
 
@@ -1959,10 +1963,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction2::SetTypeparamDefault => {
                 self.typing_intrinsic_2("_intrinsic_set_typeparam_default")
             }
-            _ => Err(crate::PyError::type_error(format!(
-                "intrinsic function {:?} not implemented",
-                func
-            ))),
+            _ => Err(call_intrinsic_2_err_not_implemented(func)),
         }
     }
 
@@ -2239,6 +2240,22 @@ pub fn make_function_flag_arg(
     op_arg: OpArg,
 ) -> MakeFunctionFlag {
     flag.get(op_arg)
+}
+
+/// Residual TypeError for an unimplemented `CALL_INTRINSIC_1` variant.
+/// `alloc::fmt::format` of a fieldless enum does not source-lift; upstream
+/// `oefmt` is likewise not looked inside.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn call_intrinsic_1_err_not_implemented(func: IntrinsicFunction1) -> crate::PyError {
+    crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
+}
+
+/// Residual TypeError for an unimplemented `CALL_INTRINSIC_2` variant.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn call_intrinsic_2_err_not_implemented(func: IntrinsicFunction2) -> crate::PyError {
+    crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
 }
 
 /// Decode `CALL_INTRINSIC_1`'s enum oparg behind a first-party helper.

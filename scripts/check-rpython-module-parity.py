@@ -362,14 +362,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "dispatch_rtyper_makerepr": "Rust dispatcher for upstream SomeBuiltin/SomeBuiltinMethod extension-method routing",
             "pair_builtin_method_convert_from_to": "Rust public helper for upstream `pairtype(BuiltinMethodRepr, BuiltinMethodRepr).convert_from_to`",
-            "reset_swap_fallback_hits": "temporary diagnostic counter reset for the legacy cast_ptr_to_int InstanceRepr-to-PtrRepr fallback",
             "rtype_bigint_from": "pyre builtin hook for bigint construction; no upstream RPython builtin object with this exact host name",
             "rtype_malloc_raw": "pyre host-name split for raw malloc lowering; upstream routes through malloc policy helpers",
             "rtype_cast_instance_intrinsic": "pyre-internal front-end pointer-downcast helper with no upstream public builtin",
             "rtype_same_as": "pyre host-name split for same_as lowering; upstream routes through low-level operation helpers",
             "somebuiltin_rtyper_makerepr": "Rust free-function carrier for upstream SomeBuiltin.rtyper_makerepr extension method",
             "somebuiltinmethod_rtyper_makerepr": "Rust free-function carrier for upstream SomeBuiltinMethod.rtyper_makerepr extension method",
-            "swap_fallback_hits": "temporary diagnostic counter accessor for the legacy cast_ptr_to_int InstanceRepr-to-PtrRepr fallback",
         },
         "types": {
             "BuiltinTyperFn": "Rust function-pointer carrier for upstream rtype_builtin_* callables stored by typer_for",

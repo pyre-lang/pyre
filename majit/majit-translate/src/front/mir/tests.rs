@@ -7419,6 +7419,17 @@ fn transmute_lowering_fixture() -> Llbc {
             }
         }
     });
+    let pair_struct_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
     let instruction_ty = serde_json::json!({
         "Adt": {
             "id": 0,
@@ -7517,6 +7528,31 @@ fn transmute_lowering_fixture() -> Llbc {
             }
         }]
     });
+    let pair_struct = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "Pair"], true),
+        "kind": {"Struct": [
+            {
+                "name": "a",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                "attr_info": null
+            },
+            {
+                "name": "b",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                "attr_info": null
+            }
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0, 4]}],
+                "repr": {"repr_algo": "C", "transparent": false}
+            }
+        }]
+    });
     let transmute = serde_json::json!({
         "def_id": 2,
         "item_meta": item_meta(&["core", "intrinsics", "transmute"], false),
@@ -7532,12 +7568,13 @@ fn transmute_lowering_fixture() -> Llbc {
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [instruction],
+            "type_decls": [instruction, pair_struct],
             "fun_decls": [
                 caller(0, "transmute_u8_to_instruction", u8_ty, instruction_ty),
-                caller(1, "transmute_u64_to_f64", u64_ty, f64_ty),
+                caller(1, "transmute_u64_to_f64", u64_ty.clone(), f64_ty),
                 transmute,
-                caller(3, "transmute_rawptr_to_fnptr", raw_ptr_ty, fnptr_ty)
+                caller(3, "transmute_rawptr_to_fnptr", raw_ptr_ty, fnptr_ty),
+                caller(4, "transmute_struct_to_u64", pair_struct_ty, u64_ty)
             ],
             "global_decls": [],
             "trait_decls": [],
@@ -12344,9 +12381,11 @@ fn equal_size_int_to_float_transmute_stays_residual() {
 
 #[test]
 fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
-    // `history.getkind`: data pointer is `ref`, `Ptr(FuncType)` is
-    // `int`.  Equal-size transmute is `lltype.cast_ptr_to_int`
-    // (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+    // `_cffi_backend::cglob` transmutes a data pointer (`*mut u8`) to
+    // `unsafe extern "C" fn`. `history.getkind` banks a pointer to a
+    // GC container as `ref` and a pointer to a raw container (and
+    // `Ptr(FuncType)`) as `int`. The lowering is
+    // `lltype.cast_ptr_to_int` (`rbuiltin.py` `rtype_cast_ptr_to_int`).
     let llbc = transmute_lowering_fixture();
     let graph = crate::test_support::lower_function(&llbc, "transmute_rawptr_to_fnptr")
         .expect("lower rawptr-to-fnptr transmute");
@@ -12386,6 +12425,52 @@ fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
             )
         }),
         "expected cast_ptr_to_int host call, ops={ops:?}"
+    );
+}
+
+#[test]
+fn equal_size_struct_to_u64_transmute_stays_residual() {
+    // `#[repr(C)] struct Pair { a: u32, b: u32 }` is eight bytes and
+    // sits in the ref bank, same as a pointer, but it is not a
+    // pointer TYPE. Reinterpreting its bytes is not
+    // `rtype_cast_ptr_to_int`.
+    let llbc = transmute_lowering_fixture();
+    let graph = super::lower_function(&llbc, "transmute_struct_to_u64")
+        .expect("lower struct-to-u64 transmute");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+
+    assert_eq!(
+        ops.iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["core", "intrinsics", "transmute"]
+                )
+            })
+            .count(),
+        1,
+        "equal-size struct↔u64 transmute must stay the residual intrinsic: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| {
+                    leaf == "cast_ptr_to_int" || leaf == "cast_int_to_ptr"
+                })
+            )
+        }),
+        "struct↔u64 transmute must not lower to a ptr/int host cast: {ops:?}"
     );
 }
 
@@ -23027,6 +23112,28 @@ fn object_vec_trait_impl_deref_builds_the_gcarray() {
     assert!(
         !matches!(returned, crate::model::LinkArg::Value(value) if value == input),
         "trait-impl deref must not alias the header; graph: {graph:#?}"
+    );
+}
+
+/// Short `vec::Vec::deref` spelling (`call_target_segments` owner type).
+#[test]
+fn object_vec_deref_short_spelling_builds_the_gcarray() {
+    let (_llbc, graph) = object_vec_whole_list_fixture(
+        "view_short",
+        &["vec", "Vec", "deref"],
+        1,
+        false,
+        false,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let leaves = object_vec_call_leaves(&graph);
+    assert!(
+        leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+        "vec::Vec::deref must copy into a gcarray: {leaves:?}"
     );
 }
 

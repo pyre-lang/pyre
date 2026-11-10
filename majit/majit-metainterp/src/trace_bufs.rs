@@ -765,8 +765,11 @@ fn from_gc_addr<T: Copy>(bits: usize) -> T {
 
 /// `Trace._refs`: one slot per `GCREF`. Item width is `usize`, which is
 /// 4 bytes on wasm32 and 8 on the native backends.
+///
+/// `opencoder.py` `self._refs = [nullptr]` is `ll_newlist(1)`: items
+/// length 1, no overallocate.
 pub fn new_refs() -> WordArray<usize> {
-    let mut refs = WordArray::with_capacity(32, true, refs_type_id);
+    let mut refs = WordArray::with_capacity(1, true, refs_type_id);
     refs.push(0);
     refs
 }
@@ -779,8 +782,10 @@ pub fn new_floats() -> WordArray<u64> {
     WordArray::empty(false, word_type_id)
 }
 
+/// `opencoder.py` `self._snapshot_data = []` / `_snapshot_array_data = []`
+/// is `ll_newemptylist` (`INITIAL_EMPTY_LIST_ALLOCATION = 0`).
 pub fn new_snapshot() -> CharList {
-    CharList::with_capacity(128)
+    CharList::with_capacity(0)
 }
 
 /// `blackhole.py` `_get_list_of_values` after `make_sure_not_resized`.

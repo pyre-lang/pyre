@@ -5470,8 +5470,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
                 let n = if n < 0 { 1 } else { n };
-                let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(n + 1));
-                socket_set_attr(obj, "_usecount", value);
+                let mut value = pyre_object::with_roots!(obj => pyre_object::w_int_new(n + 1));
+                pyre_object::with_roots!(obj, value => {
+                    socket_set_attr(obj, "_usecount", value);
+                });
                 Ok(pyre_object::w_none())
             },
             1,
@@ -5507,8 +5509,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                                 let _ = unsafe { rffi::close(fd) };
                             }
                         });
-                        let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
-                        socket_set_attr(obj, "_fd", value);
+                        let mut value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                        pyre_object::with_roots!(obj, value => {
+                            socket_set_attr(obj, "_fd", value);
+                        });
                     }
                 }
                 Ok(pyre_object::w_none())

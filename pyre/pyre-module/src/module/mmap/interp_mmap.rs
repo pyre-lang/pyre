@@ -1353,9 +1353,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             }
             let mut obj = args[0];
             let mut w_pos = args[1];
-            let off = pyre_object::with_roots!(obj, w_pos => mmap_index_w(obj, w_pos))?;
-            let whence = if args.len() >= 3 {
-                let mut w_whence = args[2];
+            let mut w_whence = if args.len() >= 3 {
+                args[2]
+            } else {
+                pyre_object::PY_NULL
+            };
+            let has_whence = args.len() >= 3;
+            let off = pyre_object::with_roots!(obj, w_pos, w_whence => mmap_index_w(obj, w_pos))?;
+            let whence = if has_whence {
                 pyre_object::with_roots!(obj, w_pos, w_whence => mmap_index_w(obj, w_whence))?
             } else {
                 0

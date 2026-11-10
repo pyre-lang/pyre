@@ -42,16 +42,13 @@ pub(crate) fn record_classdef_less_input(
     canon_known: bool,
     has_bk: bool,
 ) {
-    let _ = (
-        graph,
-        var,
-        payload,
-        class_root,
-        canon,
-        raw_known,
-        canon_known,
-        has_bk,
-    );
+    if crate::translator::rtyper::cutover::rtyper_verbose_enabled() {
+        eprintln!(
+            "[classdef-less input] graph={graph} var={var} payload={payload:?} \
+             class_root={class_root:?} canon={canon:?} raw_known={raw_known} \
+             canon_known={canon_known} has_bk={has_bk}"
+        );
+    }
 }
 
 /// Former classdef-less `Ref` census. The thread-local counter is gone.

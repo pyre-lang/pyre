@@ -667,6 +667,10 @@ static LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::
 static BYTECODE_ONLY_TRACE_AD_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Generated Regular `executioncontext.py call_trace` graph.
 static CALL_TRACE_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Translated `gil_ready_word` body (`gil.py` `gil_ready?` quasi-immut).
+static GIL_READY_WORD_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Translated `_get_adapted_tick_counter` body (`interp_jit.py`).
+static ADAPTED_TICK_COUNTER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 
 /// Scan the build-time names index for the unique entry equal to `name`.
 ///
@@ -877,6 +881,18 @@ pub fn call_trace_jitcode_index() -> Option<usize> {
     *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("executioncontext::ExecutionContext::call_trace")
     })
+}
+
+/// `gil_ready_word` jitcode the handwritten back-edge inline_calls.
+pub fn gil_ready_word_jitcode_index() -> Option<usize> {
+    *GIL_READY_WORD_JITCODE_INDEX
+        .get_or_init(|| compute_pathed_jitcode_index("pyre_object::gil_ready::gil_ready_word"))
+}
+
+/// `_get_adapted_tick_counter` jitcode the handwritten back-edge inline_calls.
+pub fn adapted_tick_counter_jitcode_index() -> Option<usize> {
+    *ADAPTED_TICK_COUNTER_JITCODE_INDEX
+        .get_or_init(|| compute_pathed_jitcode_index("pyre_jit::eval::_get_adapted_tick_counter"))
 }
 
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
@@ -3066,9 +3082,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
     // resolve `d`/`j` through `JitCode::descr_at` →
     // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
-    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
-    // builder; without the pool, `inline_call` panics on the first helper
-    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    // Without the pool, `inline_call` panics on the first helper `j`
+    // operand even though `setup_descrs` filled `bh.descrs`.
     install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
@@ -3096,23 +3111,22 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
-    // Same `JitCode::descr_at` pool the FBW abort builder installs.
-    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    // Same `JitCode::descr_at` pool helper jitcodes index through
+    // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
-    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
-    // take the byte this build's assembler gave them.
-    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
-    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
-    // this build actually emitted need a slot. `wire_bhimpl_handlers`
-    // already binds each key; without the slot, `setup_insns` never
-    // records the byte and a guard-failure resume panics here.
-    // `build_inline_call_only_bh_builder` registers the four raw-array keys
-    // at their canonical `BC_*` bytes.
+    // `setup_insns(asm.insns)`: keys the production builder already pins at
+    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
+    // emitted byte is a no-op when it matches; a mismatch is the overlay
+    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
+    // the curated list; keep it here so a build that emitted it before the
+    // pin still binds.
     // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
     // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
     // (`blackhole.py bhimpl_getfield_raw_r`).
     // `record_quasiimmut_field/idd` is the headerless twin of `/rdd`
     // (int-bank base, same no-op skip).
+    // `_get_adapted_tick_counter` (`interp_jit.py`) emits
+    // `current_trace_length/>i`; no BC_* pin, assembler get_opnum.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
@@ -3121,6 +3135,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         "int_isvirtual/i>i",
         "getfield_raw_r/id>r",
         "record_quasiimmut_field/idd",
+        "current_trace_length/>i",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
@@ -3231,9 +3246,9 @@ fn handler_newtuple_refs(
 /// and `production_bh_builder_bytes_match_canonical_table` —
 /// which read the generated tables of whatever tree ran them; the failure they
 /// describe belongs to the binary that dispatches, so it is raised where that
-/// binary assembles its builder.  Both production call sites build once per
-/// thread behind a `thread_local!`, so this walks a few hundred keys per
-/// thread, not per resume.
+/// binary assembles its builder. `finish_setup` installs this constructor
+/// once on `metainterp_sd.blackholeinterpbuilder`, so this walks a few
+/// hundred keys at setup, not per resume.
 ///
 /// The universe is `build_emitted_insns()` — pyre's `asm.insns`, the serialised
 /// build-time `pipeline.insns` before the canonical overlay — and deliberately
@@ -5460,6 +5475,28 @@ mod tests {
             assert_eq!(jc.name, expect, "case {name}");
             assert!(!jc.code.is_empty(), "case {name}");
         }
+    }
+
+    #[test]
+    fn gil_ready_and_adapted_tick_helpers_are_in_the_production_prepass() {
+        let ready_idx =
+            gil_ready_word_jitcode_index().expect("production prepass must include gil_ready_word");
+        let adapted_idx = adapted_tick_counter_jitcode_index()
+            .expect("production prepass must include _get_adapted_tick_counter");
+        let ready = get_jitcode_by_index(ready_idx).expect("gil_ready_word jitcode");
+        let adapted = get_jitcode_by_index(adapted_idx).expect("_get_adapted_tick_counter jitcode");
+        assert!(
+            ready.name.ends_with("gil_ready_word"),
+            "gil_ready_word jitcode name, got {:?}",
+            ready.name
+        );
+        assert!(
+            adapted.name.ends_with("_get_adapted_tick_counter"),
+            "_get_adapted_tick_counter jitcode name, got {:?}",
+            adapted.name
+        );
+        assert!(!ready.code.is_empty());
+        assert!(!adapted.code.is_empty());
     }
 
     #[test]

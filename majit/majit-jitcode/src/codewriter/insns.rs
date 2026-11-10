@@ -74,21 +74,16 @@ pub const BC_NEW: u8 = 217;
 pub const BC_NEW_ARRAY: u8 = 218;
 pub const BC_NEW_WITH_VTABLE: u8 = 219;
 
-// Recursive-portal call (`#[jit_interp]` mainloop calling itself, e.g. tl.py:177
-// `interp(code, pc+offset)`).  Siblings of the `BC_CALL_ASSEMBLER_*` family
-// (bytes 50-53): the depth-exceeded branch of a recursive call records one of
-// these as an assembler call into the same green-key loop, while the
-// depth-bounded branch inline-traces the callee (`should_inline_core`).  Bytes
-// continue the above-high-water sequence (223-226, above the `setfield_gc_i/rcd`
-// C-form byte 222) so existing serialised byte assignments are undisturbed.
-// These consts only DECLARE the intended byte
-// numbers; a byte is not actually reserved (`is_reserved_opcode_byte`) until its
-// key joins `extension_insns()`, and the blackhole handler is bound there.
-// That registration + the macro lowering + the `run_one_step` dispatch arm are
-// wired together (the registration may shift dynamic byte assignments, so it is
-// verified against the serialised JitCode artifacts at that point, not here).  The
-// `recursive_call_bytes_reserved_without_collision` test guards these chosen
-// numbers against the currently-reserved tables.
+// Recursive-portal call (`blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`,
+// `pyjitpl.py` `opimpl_recursive_call_{i,r,f,v}`). Siblings of the
+// `BC_CALL_ASSEMBLER_*` family (bytes 50-53): the depth-exceeded branch of a
+// recursive call records one of these as an assembler call into the same
+// green-key loop, while the depth-bounded branch inline-traces the callee
+// (`should_inline_core`). Bytes continue the above-high-water sequence
+// (223-226, above the `setfield_gc_i/rcd` C-form byte 222) so existing
+// serialised byte assignments are undisturbed. Keys live in
+// `wellknown_bh_insns()`; `assembler.py` `setdefault` must not hand them a
+// dynamic gap (byte 38 was the first freed `call_may_force_*` slot).
 pub const BC_RECURSIVE_CALL_INT: u8 = 223;
 pub const BC_RECURSIVE_CALL_REF: u8 = 224;
 pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
@@ -962,6 +957,15 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("residual_call_ir_r/iIRd>r", BC_RESIDUAL_CALL_IR_R);
     m.insert("residual_call_irf_r/iIRFd>r", BC_RESIDUAL_CALL_IRF_R);
     m.insert("residual_call_irf_f/iIRFd>f", BC_RESIDUAL_CALL_IRF_F);
+    // `blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`:
+    // `@arguments("self", "i", "I", "R", "F", "I", "R", "F", returns=...)`.
+    // `assembler.py` does not put `recursive_call` in `USE_C_FORM`, so the
+    // jitdriver index is `i` (const-pool slot), never `c`.
+    // `jtransform.py` `handle_recursive_call` always emits all six lists.
+    m.insert("recursive_call_i/iIRFIRF>i", BC_RECURSIVE_CALL_INT);
+    m.insert("recursive_call_r/iIRFIRF>r", BC_RECURSIVE_CALL_REF);
+    m.insert("recursive_call_f/iIRFIRF>f", BC_RECURSIVE_CALL_FLOAT);
+    m.insert("recursive_call_v/iIRFIRF", BC_RECURSIVE_CALL_VOID);
     // jtransform.py rewrite_op_jit_record_known_result / 1672-1688 conditional/known-result family
     // intentionally omitted. The helper-side `BC_COND_CALL_*` /
     // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags
@@ -1590,22 +1594,23 @@ mod tests {
 mod recursive_call_byte_tests {
     use super::*;
 
-    /// The reserved `BC_RECURSIVE_CALL_*` bytes (223-226) must be mutually
-    /// distinct, sit above the prior high-water (`BC_NEW_WITH_VTABLE` = 219),
-    /// and not collide with any byte already registered in `wellknown_bh_insns`
-    /// or `extension_insns`.  Guards against the #199-class byte-collision
-    /// (BC_INT_BETWEEN vs BC_NEW) at the point the bytes are reserved, before
-    /// the recursive-call lowering/handlers are wired.
+    /// The `BC_RECURSIVE_CALL_*` bytes (223-226) are the canonical
+    /// `recursive_call_{i,r,f,v}/iIRFIRF{>X,}` keys (`blackhole.py`
+    /// `bhimpl_recursive_call_*`). They must be mutually distinct, sit above
+    /// the prior high-water (`BC_NEW_WITH_VTABLE` = 219), and match
+    /// `wellknown_bh_insns()` so `get_opnum` does not land them on a freed
+    /// gap (`assembler.py` `setdefault`).
     #[test]
     fn recursive_call_bytes_reserved_without_collision() {
-        let reserved = [
-            BC_RECURSIVE_CALL_INT,
-            BC_RECURSIVE_CALL_REF,
-            BC_RECURSIVE_CALL_FLOAT,
-            BC_RECURSIVE_CALL_VOID,
+        let keys = [
+            ("recursive_call_i/iIRFIRF>i", BC_RECURSIVE_CALL_INT),
+            ("recursive_call_r/iIRFIRF>r", BC_RECURSIVE_CALL_REF),
+            ("recursive_call_f/iIRFIRF>f", BC_RECURSIVE_CALL_FLOAT),
+            ("recursive_call_v/iIRFIRF", BC_RECURSIVE_CALL_VOID),
         ];
+        let reserved: Vec<u8> = keys.iter().map(|(_, b)| *b).collect();
 
-        let mut sorted: Vec<u8> = reserved.to_vec();
+        let mut sorted: Vec<u8> = reserved.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
@@ -1614,23 +1619,24 @@ mod recursive_call_byte_tests {
             "recursive_call bytes must be mutually distinct"
         );
 
-        for b in reserved {
+        for b in &reserved {
             assert!(
-                b > BC_NEW_WITH_VTABLE,
+                *b > BC_NEW_WITH_VTABLE,
                 "recursive_call byte {b} must be above the prior high-water {}",
                 BC_NEW_WITH_VTABLE
             );
         }
 
-        let registered: Vec<u8> = wellknown_bh_insns()
-            .values()
-            .chain(extension_insns().values())
-            .copied()
-            .collect();
-        for b in reserved {
+        let wellknown = wellknown_bh_insns();
+        for (key, byte) in keys {
+            assert_eq!(
+                wellknown.get(key).copied(),
+                Some(byte),
+                "{key} must be the wellknown_bh_insns key for byte {byte}"
+            );
             assert!(
-                !registered.contains(&b),
-                "recursive_call byte {b} collides with an already-registered insn"
+                extension_insns().values().all(|&b| b != byte),
+                "recursive_call byte {byte} collides with an extension insn"
             );
         }
     }

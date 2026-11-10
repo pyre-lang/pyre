@@ -2069,20 +2069,29 @@ pub unsafe fn init_kwdefaults_dict(w_kw_defs: PyObjectRef) -> PyObjectRef {
             return w_kw_defs;
         }
         let items = pyre_object::dictmultiobject::w_dict_items(w_kw_defs);
-        if !items
-            .iter()
-            .all(|&(key, _)| pyre_object::is_exact_type(key, &pyre_object::STR_TYPE))
-        {
-            return w_kw_defs;
+        let n = items.len();
+        let p = items.as_ptr();
+        let mut i = 0usize;
+        while i < n {
+            let (key, _) = unsafe { *p.add(i) };
+            if !pyre_object::is_exact_type(key, &pyre_object::STR_TYPE) {
+                return w_kw_defs;
+            }
+            i += 1;
         }
         // Every store mints a cell, so the pairs read out above are published
         // before the mapping is allocated, and both they and the receiver are
         // re-read from the shadow stack after each store.
         let roots = pyre_object::gc_roots::push_roots();
-        let flat: Vec<PyObjectRef> = items
-            .iter()
-            .flat_map(|&(key, value)| [key, value])
-            .collect();
+        // Counted `as_ptr` loop: `Iter::flat_map` is not in CallRegistry.
+        let mut flat = Vec::with_capacity(n.saturating_mul(2));
+        let mut i = 0usize;
+        while i < n {
+            let (key, value) = unsafe { *p.add(i) };
+            flat.push(key);
+            flat.push(value);
+            i += 1;
+        }
         let pairs_base = roots.publish(&flat);
         let dict_slot = roots.publish(&[pyre_object::dictmultiobject::w_module_dict_new()]);
         for index in 0..items.len() {

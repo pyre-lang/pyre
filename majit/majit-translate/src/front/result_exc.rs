@@ -22414,6 +22414,18 @@ mod merged_continue_tests {
                 ty: ValueType::Int,
             },
         });
+        // Struct-typed Continue payload store: the continue block already
+        // holds `carried` as an input, so this FieldWrite does not read the
+        // ControlFlow carrier outside `__pos_0`.
+        graph.blocks[cont.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: carried.clone(),
+                field: FieldDescriptor::new("record", Some("test::Record".into())),
+                value: LinkArg::Value(carried.clone()),
+                ty: ValueType::Ref(Some("test::Record".into())),
+            },
+        });
         graph.set_return(cont, Some(carried));
 
         let (brk, brk_args) = graph.create_block_with_arg_vars(1);
@@ -22785,6 +22797,21 @@ mod merged_continue_tests {
                 .iter()
                 .all(|arg| !matches!(arg, LinkArg::Value(value) if value == &ctor))
         }));
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite {
+                            ty: ValueType::Ref(Some(root)),
+                            field,
+                            ..
+                        } if field.name == "record" && root == "test::Record"
+                    )
+                })
+            }),
+            "struct-typed Continue payload FieldWrite"
+        );
     }
 
     /// A scoped call and a literal `Err` share the continue block that

@@ -75,3 +75,38 @@ assert held == [0, 1, 3, 4, 6, 7, 9, 10, 11], held
 held = bytearray(b"abcdefgh")
 held[Idx(2) : Idx(4)] = b"ZZZ"
 assert held == bytearray(b"abZZZefgh"), held
+
+# Extended-slice delete: `AbstractUnwrappedStrategy.deleteslice` /
+# `_delitem_slice_helper` (positive step, negative step, step larger than
+# len, empty slice) on list and bytearray.
+xs = list(range(6))
+del xs[::2]
+assert xs == [1, 3, 5], xs
+xs = list(range(6))
+del xs[::-2]
+assert xs == [0, 2, 4], xs
+xs = list(range(6))
+del xs[::10]
+assert xs == [1, 2, 3, 4, 5], xs
+xs = list(range(6))
+del xs[2:2]
+assert xs == list(range(6)), xs
+xs = list(range(6))
+del xs[1:1:2]
+assert xs == list(range(6)), xs
+
+ba = bytearray(b"abcdef")
+del ba[::2]
+assert ba == bytearray(b"bdf"), ba
+ba = bytearray(b"abcdef")
+del ba[::-2]
+assert ba == bytearray(b"ace"), ba
+ba = bytearray(b"abcdef")
+del ba[::10]
+assert ba == bytearray(b"bcdef"), ba
+ba = bytearray(b"abcdef")
+del ba[2:2]
+assert ba == bytearray(b"abcdef"), ba
+ba = bytearray(b"abcdef")
+del ba[1:1:2]
+assert ba == bytearray(b"abcdef"), ba

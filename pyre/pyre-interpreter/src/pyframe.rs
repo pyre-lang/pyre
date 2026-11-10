@@ -5530,7 +5530,12 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        // `RangeInclusive::new` is Opaque in LLBC; `rewire_range_contains_call_sites`
+        // only folds I64/Isize `(a..=b).contains`. This field is `u8`, so
+        // `(1..=3).contains` stays a residual `ops::range::RangeInclusive::new`
+        // and the walker declines the symbolic path on every POP_TOP.
+        let cleanup = self.failed_attr_cleanup;
+        if cleanup < 1 || cleanup > 3 {
             return;
         }
         self.failed_attr_cleanup -= 1;
@@ -5975,34 +5980,6 @@ impl PyFrame {
             last_instr
         };
         unsafe { offset2lineno(self.pycode as PyObjectRef, stopat) }
-    }
-
-    /// pycode.py `_get_lineno_for_pc_tracing(frame.last_instr)` — the line a
-    /// trace function attributes to the instruction the frame is executing, or
-    /// `-1` when that instruction cannot start a line.
-    ///
-    /// Upstream decodes the line table into one entry per code unit and leaves
-    /// `-1` in every entry the decode never reached, so `-1` is the "no line
-    /// here" answer `run_trace_func` guards on twice.  pyre's table covers
-    /// every instruction, so the sentinel comes from the opcode instead:
-    /// [`crate::pycode::instruction_can_start_a_line`].
-    ///
-    /// Separate from [`Self::get_last_lineno`], which answers the *frame's*
-    /// line for `f_lineno` and reports `co_firstlineno` for a frame that has
-    /// not started.  That is the right answer for the getset — a not-yet-run
-    /// generator's `f_lineno` is its `def` line — and the wrong one for a line
-    /// event, which is why this is a second entry point rather than an edit to
-    /// that one.
-    /// `pycode.py _get_lineno_for_pc_tracing` is `@jit.elidable`.
-    #[inline]
-    #[majit_macros::elidable]
-    pub fn get_lineno_for_pc_tracing(&self) -> isize {
-        if self.last_instr < 0
-            || !crate::pycode::instruction_can_start_a_line(self.code(), self.last_instr as usize)
-        {
-            return -1;
-        }
-        self.get_last_lineno()
     }
 
     /// pyframe.py fget_f_lineno — the line currently executing.

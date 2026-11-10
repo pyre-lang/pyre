@@ -240,6 +240,7 @@ fn build() -> AllJitCodes {
                     virtualizables: vec!["frame".to_string()],
                     red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
                     split_portal: false,
+                    extends: None,
                 }],
                 register_trait_families: Vec::new(),
                 helper_graphs: Vec::new(),

@@ -189,7 +189,9 @@ fn braced_body(src: &str, open: usize) -> &str {
 
 /// The keys pyre's walker answers: the arms of `handle`'s `match op.key`, plus
 /// the `regular_record_table!` entries that stand in for the arithmetic arms.
-fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
+/// Prefix arms (`key if key.starts_with("recursive_call_")`) are returned
+/// separately so a canonical key the encoding names can match them.
+fn pyre_walker_keys_and_prefixes(root: &Path) -> (BTreeSet<String>, Vec<String>) {
     let src = read(root, "pyre/pyre-jit-trace/src/jitcode_dispatch/mod.rs");
     let at = src
         .find("fn handle<Sym: WalkSym>(")
@@ -199,11 +201,16 @@ fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
         .map(|rel| at + rel)
         .expect("`handle` must dispatch on `op.key`");
     let mut out = BTreeSet::new();
+    let mut prefixes = Vec::new();
     for line in braced_body(&src, open).lines() {
         // An arm pattern sits at the match's own indent and carries its `=>`
         // on the same line; every arm in `handle` is written that way, and the
         // length assertion below is what notices if one stops being.
         let Some(fat) = line.find("=>") else { continue };
+        if line.contains("starts_with(") {
+            prefixes.extend(quoted(&line[..fat]));
+            continue;
+        }
         if !line.starts_with("        \"") {
             continue;
         }
@@ -230,7 +237,7 @@ fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
          one-per-line at the match indent",
         out.len(),
     );
-    out
+    (out, prefixes)
 }
 
 /// Keys majit's tracer decodes and pyre's walker does not.
@@ -353,13 +360,16 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
     let root = repo_root();
     let table = insns_table(&root);
     let majit_bc = majit_walker_bytecodes(&root);
-    let pyre_keys = pyre_walker_keys(&root);
+    let (pyre_keys, pyre_prefixes) = pyre_walker_keys_and_prefixes(&root);
+    let pyre_has = |key: &str| {
+        pyre_keys.contains(key) || pyre_prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    };
 
     let (mut majit_only, mut pyre_only, mut neither) =
         (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let mut both = 0usize;
     for (key, bc) in &table {
-        match (majit_bc.contains(bc), pyre_keys.contains(key)) {
+        match (majit_bc.contains(bc), pyre_has(key)) {
             (true, true) => both += 1,
             (true, false) => {
                 majit_only.insert(key.clone());
@@ -420,11 +430,19 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// `record_quasiimmut_field/idd`; `blackhole.rs wire_bhimpl_handlers`
 /// binds `handler_record_quasiimmut_field` next to `/rdd` (`blackhole.py
 /// bhimpl_record_quasiimmut_field`). `insns.rs` has no `BC_*`.
+///
+/// `current_trace_length/>i` is numbered the same way. `_get_adapted_tick_counter`
+/// (`interp_jit.py`) calls `jit.current_trace_length`, which `jtransform.py`
+/// lowers to `current_trace_length`; the walker answers it as
+/// `pyjitpl.py opimpl_current_trace_length` and `blackhole.rs
+/// wire_bhimpl_handlers` binds `handler_current_trace_length`
+/// (`blackhole.py bhimpl_current_trace_length`). `insns.rs` has no `BC_*`.
 #[test]
 fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let root = repo_root();
     let named: BTreeSet<String> = insns_table(&root).into_iter().map(|(key, _)| key).collect();
-    let mut unnamed: Vec<String> = pyre_walker_keys(&root)
+    let (pyre_keys, _prefixes) = pyre_walker_keys_and_prefixes(&root);
+    let mut unnamed: Vec<String> = pyre_keys
         .into_iter()
         .filter(|key| !named.contains(key))
         .collect();
@@ -432,6 +450,7 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let mut expected: Vec<String> = [
         "getfield_raw_r/id>r",
         "record_quasiimmut_field/idd",
+        "current_trace_length/>i",
         "int_same_as/i>i",
         "newstr/i>r",
         "newstr/c>r",

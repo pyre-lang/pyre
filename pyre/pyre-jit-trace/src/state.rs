@@ -2455,6 +2455,41 @@ pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, None, jitcode_pc)
 }
 
+/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
+/// a jitcode. The pcdep color map records live Variables only;
+/// `sync_inlined_section_heap_frame` uses this to refill the registerless
+/// constant slots an inlined-callee overlay leaves empty after the color→slot
+/// inversion. Sources the slots from the predecessor-keyed
+/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
+/// coordinate as `pcdep_entries` and the liveness decode.
+pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
+            return Vec::new();
+        };
+        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+            let jp = jitcode_pc as usize;
+            if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                // Source the const slots directly from the carried
+                // genuine `jitcode_pc` via the predecessor-keyed twin — the same
+                // decode-identity shape the pcdep/depth twins use at
+                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
+                // returns `Some` (an empty slot list is a legitimate hit).
+                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
+                    return slots.to_vec();
+                }
+            }
+        }
+        Vec::new()
+    })
+}
+
+pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
+    const_ref_slots_at_pc_at(jitcode_index, pc)
+}
+
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
@@ -5284,6 +5319,162 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
         }
         _ => {}
     }
+}
+
+/// Overlay a resumed inlined section's live Ref boxes onto its heap
+/// `PyFrame` operand stack.
+///
+/// FBW keeps those slots in the MIFrame register file
+/// (`pyjitpl.py get_list_of_active_boxes`). `consume_boxes` restores the
+/// registers, but `bhimpl_jit_merge_point` recursive-portals
+/// (`bhimpl_recursive_call_r`) and the portal reads the HEAP frame
+/// (`pyframe.py popvalue`). Bridge resume already overlays stream slots
+/// (`reconstruct_inline_recipe` `overlay_stream_ref_slots`); blackhole
+/// `build_resumed_frames` must do the same before the portal.
+///
+/// An inlined callee is a non-standard virtualizable: fields are written
+/// by recorded `setfield_gc`/`setarrayitem_gc` (`pyjitpl.py
+/// _opimpl_setfield_vable` / `_nonstandard_virtualizable`) or materialized
+/// on resume with every field, None included (`resume.py
+/// AbstractVirtualStructInfo.setfields`, `VArrayInfoClear.setfields`;
+/// `virtualizable.py write_from_resume_data_partial` writes every item
+/// `0..len`). Operand slots `0..stack_only` are therefore written in full
+/// — a live NULL register and an unrecovered slot both store NULL.
+/// `stack_only` is `maps.stack_depth_at_pc` capped at the frame's stored
+/// `valuestackdepth` (the last recorded `setfield_vable`); the overlay
+/// never writes `valuestackdepth`.
+pub fn sync_inlined_section_heap_frame(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    frame_ptr: usize,
+    values: &[majit_ir::Value],
+) {
+    if frame_ptr == 0 {
+        return;
+    }
+    let Some(nlocals) = concrete_nlocals(frame_ptr) else {
+        return;
+    };
+    let py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, jitcode_pc);
+    let maps = bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, Some(py_pc), jitcode_pc);
+    let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, jitcode_pc);
+    if banks.total_len() != values.len() {
+        return;
+    }
+    let (frame_reg, ec_reg) = portal_red_regs_at(jitcode_index);
+    // The frame's `valuestackdepth` is what the last recorded
+    // `setfield_vable` wrote (`pyjitpl.py _opimpl_setfield_vable` /
+    // `_nonstandard_virtualizable`, materialized by `resume.py
+    // AbstractVirtualStructInfo.setfields`). Slots at or above it were
+    // popped before the guard; `stack_depth_at_pc` is the opcode-start
+    // depth and must not widen it.
+    let Some(vsd) = concrete_stack_depth(frame_ptr) else {
+        return;
+    };
+    let stack_only = maps.stack_depth_at_pc.min(vsd.saturating_sub(nlocals));
+    let int_len = banks.int.len();
+    let null_ref = majit_ir::Value::Ref(majit_ir::GcRef::NULL);
+    let mut operand: Vec<Option<majit_ir::Value>> = vec![None; stack_only];
+    for (ref_pos, &color) in banks.ref_.iter().enumerate() {
+        if color == u32::from(frame_reg) || color == u32::from(ec_reg) {
+            continue;
+        }
+        let Some(value @ majit_ir::Value::Ref(r)) = values.get(int_len + ref_pos).copied() else {
+            continue;
+        };
+        // `write_from_resume_data_partial` writes every item, null
+        // included. `NO_CONCRETE` is an unstamped register, not a recovered
+        // null.
+        if r == majit_ir::GcRef::NO_CONCRETE {
+            continue;
+        }
+        for slot in semantic_ref_slots_for_reg_color(
+            nlocals,
+            stack_only,
+            &maps.pcdep_entries,
+            color as usize,
+        ) {
+            if slot < nlocals {
+                store_live_frame_array_slot(frame_ptr, slot, value);
+            } else {
+                let i = slot - nlocals;
+                if i < operand.len() && operand[i].is_none() {
+                    operand[i] = Some(value);
+                }
+            }
+        }
+    }
+    // Refill registerless operand-stack constants the color map omits
+    // (`const_ref_slots_from_pc`; pcdep records Variables only).
+    let const_slots = const_ref_slots_from_pc(jitcode_index, jitcode_pc);
+    for &(slot, raw) in &const_slots {
+        let slot = slot as usize;
+        let value = majit_ir::Value::Ref(majit_ir::GcRef(raw as usize));
+        if slot < nlocals {
+            store_live_frame_array_slot(frame_ptr, slot, value);
+        } else {
+            let i = slot - nlocals;
+            if i < operand.len() && operand[i].is_none() {
+                operand[i] = Some(value);
+            }
+        }
+    }
+    for i in 0..stack_only {
+        // Write every slot (`VArrayInfoClear.setfields` / overlay
+        // `4aca568bf2e`). An unrecovered live-register hole is filled from
+        // the already-materialized heap frame — the virtual's array items
+        // or the portal vable write — so this loop never meets a hole.
+        let value = match operand[i] {
+            Some(v) => v,
+            None => match concrete_stack_value(frame_ptr, nlocals + i) {
+                Some(p) if !p.is_null() => majit_ir::Value::Ref(majit_ir::GcRef(p as usize)),
+                _ => null_ref,
+            },
+        };
+        store_live_frame_array_slot(frame_ptr, nlocals + i, value);
+    }
+}
+
+/// Blackhole analog of [`sync_inlined_section_heap_frame`]: rebuild the
+/// section-value vector from the color-indexed BH register file
+/// (`resume.py consume_boxes` / `get_list_of_active_boxes`) and overlay
+/// it onto the HEAP frame the recursive portal will `popvalue`.
+pub fn sync_inlined_bh_section_heap_frame(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    registers_i: &[i64],
+    registers_r: &[i64],
+    registers_f: &[i64],
+) {
+    let (frame_reg, _) = portal_red_regs_at(jitcode_index);
+    if frame_reg == u16::MAX {
+        return;
+    }
+    let Some(&frame_raw) = registers_r.get(usize::from(frame_reg)) else {
+        return;
+    };
+    if frame_raw == 0 {
+        return;
+    }
+    let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, jitcode_pc);
+    if banks.total_len() == 0 {
+        return;
+    }
+    let mut values = Vec::with_capacity(banks.total_len());
+    for &c in &banks.int {
+        values.push(majit_ir::Value::Int(
+            registers_i.get(c as usize).copied().unwrap_or(0),
+        ));
+    }
+    for &c in &banks.ref_ {
+        let raw = registers_r.get(c as usize).copied().unwrap_or(0);
+        values.push(majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)));
+    }
+    for &c in &banks.float {
+        let bits = registers_f.get(c as usize).copied().unwrap_or(0);
+        values.push(majit_ir::Value::Float(f64::from_bits(bits as u64)));
+    }
+    sync_inlined_section_heap_frame(jitcode_index, jitcode_pc, frame_raw as usize, &values);
 }
 
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
@@ -17810,6 +18001,31 @@ fn store_reconstructed_callee_array_image(
             _ => PY_NULL,
         };
         let _ = pyre_object::gc_roots::pin_root(ptr);
+    }
+    // `_opimpl_setfield_gc_any` → `heapcache.setfield` of the array SSA
+    // `emit_new_pyframe_inline_with_params` already cached (`NewArrayClear`),
+    // not a `ConstPtr` of the tracing-time nursery pointer. `FrameBox::new`
+    // allocated a different array; bind that SSA's concrete to it so
+    // GETFIELD sanity (`_opimpl_getfield_gc_any_pureornot`) sees the same
+    // object. A constant pointer here bakes the trace-time array into
+    // every later resume of the compiled guard (`rec()` then answers a
+    // constant `n`).
+    let live_arr =
+        pyre_object::gc_roots::shadow_stack_get(root_base) as *mut pyre_object::FixedObjectArray;
+    if !live_arr.is_null() {
+        let locals_descr = frame_locals_cells_stack_descr();
+        let locals_idx = locals_descr.index();
+        if let Some(array_ssa) = ctx
+            .heapcache_getfield_cached(frame, locals_idx)
+            .filter(|b| !b.is_constant() && b.ty() == Some(majit_ir::Type::Ref))
+        {
+            ctx.try_set_opref_concrete(
+                array_ssa,
+                majit_ir::Value::Ref(majit_ir::GcRef(live_arr as usize)),
+            );
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame, array_ssa], locals_descr);
+            ctx.heapcache_setfield_cached(frame, locals_idx, array_ssa);
+        }
     }
     let locals_array = frame_locals_cells_stack_array(ctx, frame);
     let live_arr =

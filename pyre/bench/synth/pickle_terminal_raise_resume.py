@@ -14,7 +14,8 @@
 # measures.
 # pyre-check: jitstats-band=fbw_blackhole_adopted_single_frame=1,fbw_blackhole_adopted_multi_frame=1
 # The blackhole adoptions split between single- and multi-frame by host;
-# darwin reads 3/0 (single/multi) on dynasm, cranelift and wasm.
+# darwin reads 4/0 (single/multi) on dynasm, cranelift and wasm. loops
+# and bridges stay exact.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once
@@ -28,19 +29,19 @@
 # (`W_ListObject.descr_getitem` -> strategy `getitem`); its failures on
 # other-strategy lists are part of guard_failures.
 #
-# Import pickle (and its stdlib graph) before dropping the thresholds.
-# At `function_threshold=1`, nested `warmstate.py maybe_compile_and_run`
-# compiles every function entry the import walks. That walk is `_find_spec`
-# over `sys.meta_path`, and the first finder is not the same on every binary:
-# `_pypy_abi3_tags.install` inserts `_Abi3TagsFinder` at `meta_path[0]` iff
-# `'.abi3.so'` is in `_imp.extension_suffixes()`. The product dynasm binary
-# lists that suffix (cpyext); the core cranelift binary lists none, and
-# `install` returns on win32. PYRE_FBW_INLINE_DIAG then resolves
-# `finder.find_spec` to `_Abi3TagsFinder.find_spec` versus
-# `BuiltinImporter.find_spec`, so the compiled importlib set (including
-# wasm's extra `get_data`) is a function of that finder. The subject loops
-# below still compile pickle's own `save`/`load_*` entries at threshold 1.
+# Import pickle (and the codecs its protocol 0/1 `save_bytes` loads) before
+# dropping the thresholds, so no import runs at `function_threshold=1`.
+# Protocol 0/1 `save_bytes` loads `encodings.latin_1` and
+# `encodings.raw_unicode_escape`. A post-drop import would compile
+# importlib functions that depend on the first `sys.meta_path` finder
+# (`_pypy_abi3_tags.install` / `_Abi3TagsFinder`) and on whether the
+# nursery kept `_blocking_on`'s weakly held `_List` alive
+# (`_WeakValueDictionary.KeyedRef`); pypy3 shows the same nursery
+# dependence. The subject loops below still compile pickle's own
+# `save`/`load_*` entries at threshold 1.
 import pickle
+import encodings.latin_1
+import encodings.raw_unicode_escape
 
 try:
     import pypyjit

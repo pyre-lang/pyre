@@ -6768,6 +6768,167 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     }
 }
 
+/// `AbstractUnwrappedStrategy.deleteslice` compaction (`listobject.py`):
+/// `items[j - discard] = items[j]`, then the tail move. The caller truncates
+/// `n - slicelength` afterwards (`del items[n - slicelength:]`).
+///
+/// Uses the strategy `ll_getitem_fast` / `ll_setitem_fast` leaves rather than
+/// a generic `*mut T` helper: Charon types that pointer as Int while
+/// `typed_items_block_items_base` is a Ref.
+macro_rules! deleteslice_compact_loop {
+    ($list:expr, $n:expr, $start:expr, $step:expr, $slicelength:expr, $get:expr, $set:expr) => {{
+        let mut i = $start;
+        let mut discard: i64 = 1;
+        while discard < $slicelength {
+            let mut j = i.wrapping_add(1);
+            i = i.wrapping_add($step);
+            while j < i {
+                let v = $get($list, j as usize);
+                $set($list, j.wrapping_sub(discard) as usize, v);
+                j = j.wrapping_add(1);
+            }
+            discard = discard.wrapping_add(1);
+        }
+        let mut j = i.wrapping_add(1);
+        while j < $n as i64 {
+            let v = $get($list, j as usize);
+            $set($list, j.wrapping_sub($slicelength) as usize, v);
+            j = j.wrapping_add(1);
+        }
+    }};
+}
+
+unsafe fn bytes_setitem_fast(
+    l: &mut W_ListObject,
+    index: usize,
+    item: *const crate::bytesobject::BytesBlock,
+) {
+    let block = l.bytes_items.block;
+    debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+    crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
+    l.bytes_items[index] = item;
+}
+
+/// `ListStrategy.deleteslice` / `AbstractUnwrappedStrategy.deleteslice`
+/// (`listobject.py`). `W_ListObject.descr_delitem` calls this for every
+/// slice, including `step == 1`. Empty/Size is a no-op; Range materialises
+/// then recurses.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_deleteslice(obj: PyObjectRef, start: i64, step: i64, slicelength: i64) {
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let obj = roots.pin_root(obj);
+    let list = &mut *(obj as *mut W_ListObject);
+    match list.strategy {
+        // EmptyListStrategy.deleteslice is a no-op (`pass`).
+        ListStrategy::Empty | ListStrategy::Size => return,
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            let obj = switch_range_to_integer_strategy(list);
+            w_list_deleteslice(obj, start, step, slicelength);
+            return;
+        }
+        _ => {}
+    }
+    if slicelength == 0 {
+        return;
+    }
+    let mut start = start;
+    let mut step = step;
+    if step < 0 {
+        start = start.wrapping_add(step.wrapping_mul(slicelength.wrapping_sub(1)));
+        step = step.wrapping_neg();
+    }
+    if step == 1 {
+        debug_assert!(start >= 0);
+        if slicelength > 0 {
+            w_list_delslice(
+                roots.get(obj_slot),
+                start as usize,
+                start.wrapping_add(slicelength) as usize,
+            );
+        }
+        return;
+    }
+    let list = &mut *(roots.get(obj_slot) as *mut W_ListObject);
+    let old_size = list.live_len();
+    match list.strategy {
+        ListStrategy::Empty | ListStrategy::Size => return,
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            unreachable!("RangeListStrategy.deleteslice already switched to Integer")
+        }
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let n = list.int_items.len();
+            deleteslice_compact_loop!(
+                list,
+                n,
+                start,
+                step,
+                slicelength,
+                ll_list_int_getitem_fast,
+                ll_list_int_setitem_fast
+            );
+            list.int_items.drain((n - slicelength as usize)..n);
+        }
+        ListStrategy::Float => {
+            let n = list.float_items.len();
+            deleteslice_compact_loop!(
+                list,
+                n,
+                start,
+                step,
+                slicelength,
+                ll_list_float_getitem_fast,
+                ll_list_float_setitem_fast
+            );
+            list.float_items.drain((n - slicelength as usize)..n);
+        }
+        ListStrategy::Bytes => {
+            let n = list.bytes_items.len();
+            deleteslice_compact_loop!(
+                list,
+                n,
+                start,
+                step,
+                slicelength,
+                ll_list_bytes_getitem_fast,
+                bytes_setitem_fast
+            );
+            list.bytes_items.drain((n - slicelength as usize)..n);
+        }
+        ListStrategy::Ascii => {
+            let n = list.ascii_items.len();
+            deleteslice_compact_loop!(
+                list,
+                n,
+                start,
+                step,
+                slicelength,
+                ll_list_ascii_getitem_fast,
+                ll_list_ascii_setitem_fast
+            );
+            list.ascii_items.drain((n - slicelength as usize)..n);
+        }
+        ListStrategy::Object => {
+            let n = list.length_relaxed();
+            deleteslice_compact_loop!(
+                list,
+                n,
+                start,
+                step,
+                slicelength,
+                ll_list_obj_getitem_fast,
+                ll_list_obj_setitem_fast
+            );
+            list.object_drain((n - slicelength as usize)..n);
+        }
+    }
+    let list = &mut *(roots.get(obj_slot) as *mut W_ListObject);
+    list.sync_allocated(old_size);
+}
+
 /// Outcome of `W_ListObject.find_or_count` fast path. Mirrors the
 /// short-circuit return in `IntegerListStrategy.find_or_count`
 /// (listobject.py) and `FloatListStrategy.find_or_count` — when the
@@ -8839,6 +9000,79 @@ mod tests {
                 crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
                 4
             );
+        }
+    }
+
+    #[test]
+    fn test_list_deleteslice_extended_step() {
+        // AbstractUnwrappedStrategy.deleteslice (listobject.py): positive
+        // step, negative step, empty slice, wrapping `i64::MIN` step.
+        let list = w_list_new((0..6).map(w_int_new).collect());
+        unsafe {
+            w_list_deleteslice(list, 0, 2, 3);
+            assert!(w_list_uses_int_storage(list));
+            assert_eq!(w_list_len(list), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
+                5
+            );
+        }
+        let list = w_list_new((0..6).map(w_int_new).collect());
+        unsafe {
+            w_list_deleteslice(list, 5, -2, 3);
+            assert_eq!(w_list_len(list), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                0
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                2
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
+                4
+            );
+        }
+        let list = w_list_new((0..6).map(w_int_new).collect());
+        unsafe {
+            w_list_deleteslice(list, 2, 1, 0);
+            assert_eq!(w_list_len(list), 6);
+        }
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        unsafe {
+            w_list_deleteslice(list, 7, i64::MIN, 1);
+            assert_eq!(w_list_len(list), 7);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 6).unwrap()),
+                6
+            );
+        }
+        let objects = w_list_new_object((0..6).map(w_int_new).collect());
+        unsafe {
+            assert!(w_list_uses_object_storage(objects));
+            w_list_deleteslice(objects, 0, 2, 3);
+            assert!(w_list_uses_object_storage(objects));
+            assert_eq!(w_list_len(objects), 3);
+        }
+        let floats = w_list_new(
+            (0..6)
+                .map(|n| crate::floatobject::w_float_new(n as f64))
+                .collect(),
+        );
+        unsafe {
+            assert!(w_list_uses_float_storage(floats));
+            w_list_deleteslice(floats, 0, 2, 3);
+            assert!(w_list_uses_float_storage(floats));
+            assert_eq!(w_list_len(floats), 3);
         }
     }
 

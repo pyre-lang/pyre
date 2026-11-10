@@ -22555,6 +22555,10 @@ pub(crate) fn hash_secret() -> &'static [u8; 16] {
 
 /// CPython 3.14 `_Py_HashBytes`: empty input hashes to zero; every other byte
 /// sequence uses SipHash-1-3 with the process-global 128-bit secret.
+/// `rsiphash.py siphash24` is `@jit.dont_look_inside`; SipHasher13::write
+/// is not in CallRegistry.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
     if bytes.is_empty() {
         return 0;
@@ -22577,7 +22581,8 @@ pub(crate) fn hash_buffer(bytes: &[u8]) -> i64 {
     _hash_bytes(bytes)
 }
 
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn _hash_bytes(bytes: &[u8]) -> i64 {
     _hash_bytes_with_key(bytes, hash_secret())
 }
@@ -22585,6 +22590,10 @@ fn _hash_bytes(bytes: &[u8]) -> i64 {
 /// CPython 3.14 `unicode_hash`: hash the PEP 393 canonical code-unit storage,
 /// selecting one-, two-, or four-byte native-endian units from the maximum
 /// code point.  Pyre stores WTF-8, so materialize only this hash input.
+/// Residual with `_hash_bytes_with_key`: `Copied::max` / `Iterator::map`
+/// packing is part of the hash and stays off the trace, as `siphash24`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i64 {
     // An all-ASCII string's PEP 393 canonical code-unit storage is its
     // one-byte-per-char form, byte-identical to the WTF-8 bytes, so hash those
@@ -22639,7 +22648,8 @@ fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i6
     _hash_bytes_with_key(&bytes, secret)
 }
 
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
     _hash_unicode_with_key(wtf8, hash_secret())
 }

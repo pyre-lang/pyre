@@ -1135,55 +1135,45 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Equal-size ptr↔int: `history.getkind` banks
-                    // `Ptr(FuncType)` as `int` and a data pointer as
-                    // `ref`, so the pair is a bank crossing.  Residual
-                    // `transmute` is not in CallRegistry; the same
-                    // conversion is `lltype.cast_ptr_to_int` /
-                    // `lltype.cast_int_to_ptr` (`rbuiltin.py`
-                    // `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr`).
+                    // Equal-size pointer TYPE ↔ machine-word integer, or a
+                    // data pointer ↔ `fn` pointer (`_cffi_backend::cglob`
+                    // transmutes `*mut u8` to `unsafe extern "C" fn`).
+                    // `history.getkind` banks a pointer to a GC container as
+                    // `ref` and a pointer to a raw container (and
+                    // `Ptr(FuncType)`) as `int`. The origin is the Charon
+                    // `TyKind` (`RawPtr` / `Ref` / `FnPtr`), not that bank:
+                    // a non-transparent struct also sits in the ref bank.
+                    // Residual `transmute` is not in CallRegistry;
+                    // `rbuiltin.py` `rtype_cast_ptr_to_int` /
+                    // `rtype_cast_int_to_ptr` accept
+                    // `lltype.cast_ptr_to_int` / `lltype.cast_int_to_ptr`.
                     if let Some(src_ty) = first_arg_ty.as_ref()
-                        && tyref_exact_layout_size(src_ty, self.llbc)
-                            == tyref_exact_layout_size(&call.dest.ty, self.llbc)
-                        && tyref_exact_layout_size(src_ty, self.llbc).is_some()
+                        && let Some((op, result_ty)) =
+                            transmute_ptr_int_host_cast(src_ty, &call.dest.ty, self.llbc)
                     {
-                        let src_vt = tyref_to_value_type(src_ty, self.llbc);
-                        let dst_vt = tyref_to_value_type(&call.dest.ty, self.llbc);
-                        match (value_type_bank(&src_vt), value_type_bank(&dst_vt)) {
-                            (1, 0) => {
-                                return self.emit_host_cast_llop(
-                                    mir_bb,
-                                    dest_local,
-                                    target,
-                                    args[0].clone(),
-                                    "cast_ptr_to_int",
-                                    ValueType::Int,
-                                );
+                        if op == "cast_int_to_ptr" {
+                            let src_vt = tyref_to_value_type(src_ty, self.llbc);
+                            if let Some(raw) = self.emit_dest_overlay_cast(
+                                bb_id,
+                                Some(&src_vt),
+                                args[0].clone(),
+                                &call.dest.ty,
+                            ) {
+                                self.local_var[dest_local] = Some(LocalValue::One(raw));
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
                             }
-                            (0, 1) => {
-                                if let Some(raw) = self.emit_dest_overlay_cast(
-                                    bb_id,
-                                    Some(&src_vt),
-                                    args[0].clone(),
-                                    &call.dest.ty,
-                                ) {
-                                    self.local_var[dest_local] = Some(LocalValue::One(raw));
-                                    let target_bb = self.block_id[target];
-                                    let link_args = self.edge_args(mir_bb, target)?;
-                                    self.graph.set_goto(bb_id, target_bb, link_args);
-                                    return Ok(());
-                                }
-                                return self.emit_host_cast_llop(
-                                    mir_bb,
-                                    dest_local,
-                                    target,
-                                    args[0].clone(),
-                                    "cast_int_to_ptr",
-                                    dst_vt,
-                                );
-                            }
-                            _ => {}
                         }
+                        return self.emit_host_cast_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            op,
+                            result_ty,
+                        );
                     }
                 }
                 // `core::intrinsics::saturating_add` / `saturating_sub`

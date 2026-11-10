@@ -1406,12 +1406,12 @@ pub(in crate::front::mir) fn replace_whole_value_uses_in_kind(
             result_ty,
         } => {
             // `get_eval_fn` is an `indirect_call` (`rpbc.py FunctionReprBase.call`).
-            // `execute_generator_frame` builds `FrameResumeArgs` and passes
-            // `&mut resume`; a stack address would be the walker's C frame.
-            // Materialise one `New` so the residual sees a heap pointer, the
-            // same escape `Call` already takes. `FunctionReprBase.call` builds
-            // one `vlist` and passes those variables to the single
-            // `indirect_call`; a repeated argument is the same object.
+            // A by-value struct argument is a stack address in the walker C
+            // frame unless materialised. One `New` gives the residual a heap
+            // pointer, the same escape `Call` already takes.
+            // `FunctionReprBase.call` builds one `vlist` and passes those
+            // variables to the single `indirect_call`; a repeated argument is
+            // the same object.
             let copy = emit_materialized_struct_copy(graph, out, owner, fields, has_vtable);
             let args = args
                 .iter()

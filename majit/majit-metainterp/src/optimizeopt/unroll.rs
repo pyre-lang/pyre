@@ -1483,23 +1483,28 @@ impl UnrollOptimizer {
         for (frame, boxes) in opt_p2.snapshot_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
                 // p2_cache is keyed by the Phase-1 recording position.
-                // Attach the Phase-2 iterator box before rewriting the OpRef
-                // into the Phase-2 namespace; a later producer-map lookup
-                // by that remapped raw would collide with Phase-1.
-                r.attach_iter_cache(&p2_cache);
-                *r = r.map_opref(|opref| translate_opref("snapshot_boxes", frame, opref));
+                // Rebind to the Phase-2 iterator box (`opencoder.py
+                // TraceIterator._get` / `SnapshotIterator._untag`) before
+                // rewriting the OpRef; a slot that already carries the
+                // Phase-1 cache box must not keep it. A later producer-map
+                // lookup by that remapped raw would collide with Phase-1.
+                remap_snapshot_box_into_iter_namespace(r, &p2_cache, |opref| {
+                    translate_opref("snapshot_boxes", frame, opref)
+                });
             }
         }
         for (frame, boxes) in opt_p2.snapshot_vable_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
-                r.attach_iter_cache(&p2_cache);
-                *r = r.map_opref(|opref| translate_opref("snapshot_vable_boxes", frame, opref));
+                remap_snapshot_box_into_iter_namespace(r, &p2_cache, |opref| {
+                    translate_opref("snapshot_vable_boxes", frame, opref)
+                });
             }
         }
         for (frame, boxes) in opt_p2.snapshot_vref_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
-                r.attach_iter_cache(&p2_cache);
-                *r = r.map_opref(|opref| translate_opref("snapshot_vref_boxes", frame, opref));
+                remap_snapshot_box_into_iter_namespace(r, &p2_cache, |opref| {
+                    translate_opref("snapshot_vref_boxes", frame, opref)
+                });
             }
         }
         self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
@@ -6285,6 +6290,19 @@ impl OptUnrollState {
     }
 }
 
+/// Rebind a snapshot slot onto `cache` (`opencoder.py TraceIterator._get` /
+/// `SnapshotIterator._untag`) and then rewrite its OpRef. The cache box is
+/// the current iterator's, never a previous namespace's. `cache` is keyed
+/// by the pre-remap recording position, so this runs before `map_opref`.
+fn remap_snapshot_box_into_iter_namespace(
+    r: &mut SnapshotBox,
+    cache: &[Option<Operand>],
+    translate: impl FnOnce(OpRef) -> OpRef,
+) {
+    r.rebind_iter_cache(cache);
+    *r = r.map_opref(translate);
+}
+
 /// Resolve a remapped peel position to its canonical producer operand.
 /// Peel / body positions are minted at allocation (`reserve_virtual_box`);
 /// `emit` adopts that stand-in. The None arm is a bind-at-alloc gap.
@@ -6305,13 +6323,30 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
     next_snapshot_pos(&ctx.snapshot_boxes)
 }
 
+/// Rewrite each slot's OpRef through `ref_map` and rebind `cached` to
+/// `current_box` of the translated OpRef (`opencoder.py
+/// TraceIterator._get` / `SnapshotIterator._untag`). One snapshot
+/// coordinate, one current-namespace cache box: `map_opref` alone
+/// would keep the source box and `_number_one` would tag the slot as
+/// the stale failarg. Constants / none keep `cached` empty; a miss
+/// also clears it so numbering falls back to
+/// `get_box_replacement_operand`.
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
     ref_map: &crate::FxIndexMap<OpRef, OpRef>,
+    mut current_box: impl FnMut(OpRef) -> Option<Operand>,
 ) -> crate::optimizeopt::SnapshotBoxList {
     boxes
         .iter()
-        .map(|boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
+        .map(|boxref| {
+            let mut r = boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref));
+            if r.opref.is_none() || r.opref.is_constant() {
+                r.cached = None;
+            } else {
+                r.cached = current_box(r.opref);
+            }
+            r
+        })
         .collect()
 }
 
@@ -6327,30 +6362,31 @@ fn clone_guard_snapshot_remapped(
     let Some(snapshot_boxes) = snapshot_get(&ctx.snapshot_boxes, old_pos).cloned() else {
         return;
     };
+    let vable_boxes = snapshot_get(&ctx.snapshot_vable_boxes, old_pos).cloned();
+    let vref_boxes = snapshot_get(&ctx.snapshot_vref_boxes, old_pos).cloned();
 
     // RPython TraceIterator decodes snapshot box references against the
     // current iteration's box cache.  Majit keeps snapshots in side tables,
     // so cloned guards need a cloned snapshot table entry with the same
-    // raw-box -> cloned-box mapping used for op args.
+    // raw-box -> cloned-box mapping used for op args. Rebind `cached` to
+    // the remapped producer (`remapped_producer_operand`) so numbering
+    // walks that box, not the source-namespace cache `map_opref` keeps.
     let new_pos = fresh_snapshot_key(ctx);
-    snapshot_insert(
-        &mut ctx.snapshot_boxes,
-        new_pos,
-        remap_snapshot_boxes(&snapshot_boxes, ref_map),
-    );
-    if let Some(vable_boxes) = snapshot_get(&ctx.snapshot_vable_boxes, old_pos).cloned() {
-        snapshot_insert(
-            &mut ctx.snapshot_vable_boxes,
-            new_pos,
-            remap_snapshot_boxes(&vable_boxes, ref_map),
-        );
+    let remapped_boxes = remap_snapshot_boxes(&snapshot_boxes, ref_map, |opref| {
+        Some(remapped_producer_operand(ctx, opref))
+    });
+    snapshot_insert(&mut ctx.snapshot_boxes, new_pos, remapped_boxes);
+    if let Some(vable_boxes) = vable_boxes {
+        let remapped = remap_snapshot_boxes(&vable_boxes, ref_map, |opref| {
+            Some(remapped_producer_operand(ctx, opref))
+        });
+        snapshot_insert(&mut ctx.snapshot_vable_boxes, new_pos, remapped);
     }
-    if let Some(vref_boxes) = snapshot_get(&ctx.snapshot_vref_boxes, old_pos).cloned() {
-        snapshot_insert(
-            &mut ctx.snapshot_vref_boxes,
-            new_pos,
-            remap_snapshot_boxes(&vref_boxes, ref_map),
-        );
+    if let Some(vref_boxes) = vref_boxes {
+        let remapped = remap_snapshot_boxes(&vref_boxes, ref_map, |opref| {
+            Some(remapped_producer_operand(ctx, opref))
+        });
+        snapshot_insert(&mut ctx.snapshot_vref_boxes, new_pos, remapped);
     }
     ctx.snapshot_frame_pcs.copy_run(old_pos, new_pos);
     ctx.snapshot_frame_sizes.copy_run(old_pos, new_pos);
@@ -6480,6 +6516,120 @@ mod tests {
             &phase2.snapshot_boxes,
             0
         ));
+    }
+
+    #[test]
+    fn remapped_snapshot_slot_numbers_the_current_namespace_cache_box() {
+        // Guard snapshot with two adjacent distinct refs: the caught
+        // exception (non-null) then the null CallMayForceR result. The
+        // frame slot's OpRef is the caught exception, but it still
+        // carries the earlier-namespace cache box of the null result.
+        // Phase-2 remap must rebind to the current iterator cache
+        // (`opencoder.py TraceIterator._get` / `SnapshotIterator._untag`)
+        // so numbering emits TAGBOX of the caught exception. Using
+        // `attach_iter_cache` here would keep the stale box and number
+        // TAGBOX of the null result instead.
+        use crate::resume::{
+            BoxEnv, ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotBox, TAGBOX, untag,
+        };
+
+        let env = SimpleBoxEnv::new();
+        let caught = env.get_box_replacement_operand(OpRef::ref_op(27));
+        let null_result = env.get_box_replacement_operand(OpRef::ref_op(26));
+        assert!(
+            !caught.same_box(&null_result),
+            "the two refs must be distinct boxes"
+        );
+
+        let mut frame_slot = SnapshotBox {
+            opref: OpRef::ref_op(27),
+            cached: Some(null_result.clone()),
+            const_gcref: None,
+        };
+        let mut null_slot = SnapshotBox {
+            opref: OpRef::ref_op(26),
+            cached: Some(null_result.clone()),
+            const_gcref: None,
+        };
+
+        let mut p2_cache: Vec<Option<Operand>> = vec![None; 28];
+        p2_cache[27] = Some(caught.clone());
+        p2_cache[26] = Some(null_result.clone());
+
+        remap_snapshot_box_into_iter_namespace(&mut frame_slot, &p2_cache, |opref| {
+            p2_cache
+                .get(opref.raw() as usize)
+                .and_then(|slot| slot.as_ref())
+                .map(|b| b.to_opref())
+                .unwrap_or(opref)
+        });
+        remap_snapshot_box_into_iter_namespace(&mut null_slot, &p2_cache, |opref| {
+            p2_cache
+                .get(opref.raw() as usize)
+                .and_then(|slot| slot.as_ref())
+                .map(|b| b.to_opref())
+                .unwrap_or(opref)
+        });
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let snapshot = Snapshot::single_frame_boxes(0, 4518, vec![frame_slot, null_slot]);
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
+        // [size, nfailargs, vable_len, vref_len, jitcode_index, pc, frame...]
+        let (caught_idx, caught_tag) = untag(items[6] as i16);
+        assert_eq!(caught_tag, TAGBOX);
+        let (null_idx, null_tag) = untag(items[7] as i16);
+        assert_eq!(null_tag, TAGBOX);
+        assert_eq!(
+            caught_idx, 0,
+            "the frame word is TAGBOX of the first ref's failarg index"
+        );
+        assert_eq!(null_idx, 1, "the null result is the adjacent failarg");
+
+        let (_, _, _, liveboxes) = memo.finish(numb_state, &env, &mut [], None).unwrap();
+        assert!(
+            liveboxes[caught_idx as usize].same_box(&caught),
+            "liveboxes at the frame word's TAGBOX index must be the caught exception"
+        );
+        assert!(liveboxes[null_idx as usize].same_box(&null_result));
+
+        // Peel clone (`clone_guard_snapshot_remapped`): `map_opref` kept
+        // the source cache; rebind to the remapped producer of the
+        // translated OpRef (`remapped_producer_operand`).
+        let mut ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
+        ref_map.insert(OpRef::ref_op(27), OpRef::ref_op(27));
+        ref_map.insert(OpRef::ref_op(26), OpRef::ref_op(26));
+        let peel_slots = remap_snapshot_boxes(
+            &[
+                SnapshotBox {
+                    opref: OpRef::ref_op(27),
+                    cached: Some(null_result.clone()),
+                    const_gcref: None,
+                },
+                SnapshotBox {
+                    opref: OpRef::ref_op(26),
+                    cached: Some(null_result.clone()),
+                    const_gcref: None,
+                },
+            ],
+            &ref_map,
+            |opref| Some(env.get_box_replacement_operand(opref)),
+        );
+        let mut peel_memo = ResumeDataLoopMemo::new();
+        let peel_snapshot = Snapshot::single_frame_boxes(0, 4518, peel_slots.to_vec());
+        let peel_numb = peel_memo.number(&peel_snapshot, &env, -1).unwrap();
+        let peel_items = crate::resumecode::unpack_numbering(&peel_numb.create_numbering());
+        let (peel_caught_idx, peel_caught_tag) = untag(peel_items[6] as i16);
+        assert_eq!(peel_caught_tag, TAGBOX);
+        assert_eq!(
+            peel_caught_idx, 0,
+            "peeled frame word is TAGBOX of the first ref's failarg index"
+        );
+        let (_, _, _, peel_liveboxes) = peel_memo.finish(peel_numb, &env, &mut [], None).unwrap();
+        assert!(
+            peel_liveboxes[peel_caught_idx as usize].same_box(&caught),
+            "peeled liveboxes at that index must be the caught exception"
+        );
     }
 
     /// Publish a `PreviewShortState` the way the preview pass does at its

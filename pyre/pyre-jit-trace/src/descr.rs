@@ -3840,13 +3840,14 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// The inlined header's non-typeptr leaf (`w_class`) is a row of the
-/// same list: `heaptracker.py all_fielddescrs` recurses into an inlined
-/// `lltype.Struct` and skips only Void and `typeptr`. The virtualizable
-/// token is `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`),
-/// so it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields`
-/// zeroes it. The factory prepends the nested leaf so payload accessors
-/// that index this group keep their slots.
+/// The factory prepends the nested `w_class` leaf (`heaptracker.py
+/// all_fielddescrs` recurses into the inlined `PyObject` header and skips
+/// only Void and `typeptr`). The payload rows follow `PyFrame` declaration
+/// order, so the listed position is `index_in_parent`
+/// (`heaptracker.py get_fielddescr_index_in`). The virtualizable token is
+/// `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`), so
+/// it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields` zeroes
+/// it.
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
@@ -3857,6 +3858,15 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         // tag as a `FrameBox`-constructed one.
         &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
         &[
+            (
+                "pycode",
+                crate::frame_layout::PYFRAME_PYCODE_OFFSET,
+                WORD,
+                Type::Ref,
+                true,
+                false,
+                false,
+            ),
             (
                 "locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -3891,12 +3901,25 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py PyFrame.escaped` and its neighbours live in one `u8`, so
+            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
+            // word store.  Appended after the named accessors that address
+            // this group by index.
             (
-                "pycode",
-                crate::frame_layout::PYFRAME_PYCODE_OFFSET,
-                WORD,
-                Type::Ref,
-                true,
+                "flags",
+                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "failed_attr_cleanup",
+                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
                 false,
                 false,
             ),
@@ -3904,6 +3927,15 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
                 WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -3940,37 +3972,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "w_builtin",
                 crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
                 WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
-            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
-            // word store.  Appended after the named accessors that address
-            // this group by index.
-            (
-                "flags",
-                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
-                std::mem::size_of::<u8>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "failed_attr_cleanup",
-                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-                std::mem::size_of::<u8>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "vable_token",
-                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -10175,44 +10176,44 @@ pub fn pyframe_size_descr() -> DescrRef {
 }
 
 pub fn pyframe_locals_cells_stack_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 0)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "locals_cells_stack_w")
 }
 
 pub fn pyframe_stack_depth_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 1)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "valuestackdepth")
 }
 
 pub fn pyframe_next_instr_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 2)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "last_instr")
 }
 
 pub fn pyframe_code_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "pycode")
 }
 
 /// rewrite.py `handle_call_assembler` scalar field read for the
 /// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
 pub fn pyframe_debugdata_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "debugdata")
 }
 
 pub fn pyframe_f_generator_wref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "f_generator_wref")
 }
 
 pub fn pyframe_w_yielding_from_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "w_yielding_from")
 }
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "f_backref")
 }
 
 /// `pyframe.py PyFrame.get_builtin` — the per-frame builtin module selected
 /// when the frame is created.  IMPORT_NAME traces this ordinary field read
 /// before looking up `__import__` in the module dict.
 pub fn pyframe_w_builtin_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "w_builtin")
 }
 
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED` (`pyframe.py escaped`).
@@ -11392,17 +11393,15 @@ mod tests {
         assert!(user_sd.all_fielddescrs()[0].is_w_class());
     }
 
-    /// The named `pyframe_*_descr` accessors pick their descr by position in
-    /// `PYFRAME_DESCR_GROUP`, so removing a field from the group shifts every
-    /// later position.  A stale index hands out a neighbouring field's descr:
-    /// after `lastblock` left the group, `pyframe_f_backref_descr` answered
-    /// `w_builtin`, and every JIT-built frame lost its caller chain and its
-    /// builtins.
+    /// The named `pyframe_*_descr` accessors locate their descr by
+    /// `field_key` in `PYFRAME_DESCR_GROUP` (`descr.py get_field_descr`).
+    /// A group reorder cannot hand out a neighbouring field's descr.
     #[test]
     fn pyframe_field_descr_accessors_name_their_own_offsets() {
         use crate::frame_layout as fl;
         let offset = |descr: DescrRef| descr.as_field_descr().expect("PyFrame FieldDescr").offset();
         let cases: [(&str, DescrRef, usize); 12] = [
+            ("pycode", pyframe_code_descr(), fl::PYFRAME_PYCODE_OFFSET),
             (
                 "locals_cells_stack_w",
                 pyframe_locals_cells_stack_descr(),
@@ -11418,11 +11417,21 @@ mod tests {
                 pyframe_next_instr_descr(),
                 fl::PYFRAME_LAST_INSTR_OFFSET,
             ),
-            ("pycode", pyframe_code_descr(), fl::PYFRAME_PYCODE_OFFSET),
+            ("flags", pyframe_flags_descr(), fl::PYFRAME_FLAGS_OFFSET),
+            (
+                "failed_attr_cleanup",
+                pyframe_failed_attr_cleanup_descr(),
+                fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+            ),
             (
                 "debugdata",
                 pyframe_debugdata_descr(),
                 fl::PYFRAME_DEBUGDATA_OFFSET,
+            ),
+            (
+                "vable_token",
+                pyframe_vable_token_descr(),
+                fl::PYFRAME_VABLE_TOKEN_OFFSET,
             ),
             (
                 "f_generator_wref",
@@ -11443,17 +11452,6 @@ mod tests {
                 "w_builtin",
                 pyframe_w_builtin_descr(),
                 fl::PYFRAME_W_BUILTIN_OFFSET,
-            ),
-            ("flags", pyframe_flags_descr(), fl::PYFRAME_FLAGS_OFFSET),
-            (
-                "failed_attr_cleanup",
-                pyframe_failed_attr_cleanup_descr(),
-                fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-            ),
-            (
-                "vable_token",
-                pyframe_vable_token_descr(),
-                fl::PYFRAME_VABLE_TOKEN_OFFSET,
             ),
         ];
         for (name, descr, want) in cases {
@@ -11578,6 +11576,8 @@ mod tests {
         let size = pyframe_size_descr();
         let sd = size.as_size_descr().expect("PyFrame SizeDescr");
         let want = [
+            ("w_class", pyre_object::pyobject::W_CLASS_OFFSET),
+            ("pycode", crate::frame_layout::PYFRAME_PYCODE_OFFSET),
             (
                 "locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -11587,8 +11587,16 @@ mod tests {
                 crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
             ),
             ("last_instr", crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET),
-            ("pycode", crate::frame_layout::PYFRAME_PYCODE_OFFSET),
+            ("flags", crate::frame_layout::PYFRAME_FLAGS_OFFSET),
+            (
+                "failed_attr_cleanup",
+                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+            ),
             ("debugdata", crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET),
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+            ),
             (
                 "f_generator_wref",
                 crate::frame_layout::PYFRAME_F_GENERATOR_WREF_OFFSET,
@@ -11599,27 +11607,24 @@ mod tests {
             ),
             ("f_backref", crate::frame_layout::PYFRAME_F_BACKREF_OFFSET),
             ("w_builtin", crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET),
-            ("flags", crate::frame_layout::PYFRAME_FLAGS_OFFSET),
-            (
-                "failed_attr_cleanup",
-                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-            ),
-            (
-                "vable_token",
-                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-            ),
-            ("w_class", pyre_object::pyobject::W_CLASS_OFFSET),
         ];
-        for (name, offset) in want {
-            let row = sd
-                .all_fielddescrs()
-                .iter()
-                .find(|fd| majit_ir::descr::cache_fieldname(fd.field_key()) == name);
-            let row = row.unwrap_or_else(|| panic!("PyFrame all_fielddescrs has no {name}"));
+        let listed = sd.all_fielddescrs();
+        assert_eq!(listed.len(), want.len(), "PyFrame all_fielddescrs length");
+        for (i, ((name, offset), row)) in want.iter().zip(listed.iter()).enumerate() {
+            assert_eq!(
+                majit_ir::descr::cache_fieldname(row.field_key()),
+                *name,
+                "listed[{i}] field_key"
+            );
             assert_eq!(
                 row.offset(),
-                offset,
+                *offset,
                 "listed {name} offset must equal host offset_of!"
+            );
+            assert_eq!(
+                row.index_in_parent(),
+                i,
+                "listed[{i}] ({name}) index_in_parent"
             );
         }
         let named = pyframe_vable_token_descr();

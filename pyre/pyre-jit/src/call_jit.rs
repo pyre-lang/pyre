@@ -3373,6 +3373,31 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         bh.virtualizable_ptr = 0;
         bh.virtualizable_info = std::ptr::null();
     }
+    // Inlined callees keep operand slots in the MIFrame register file
+    // (`pyjitpl.py get_list_of_active_boxes`). `consume_one_section`
+    // restores those registers; `bhimpl_jit_merge_point` then
+    // recursive-portals (`bhimpl_recursive_call_r`) and the portal
+    // reads the HEAP frame (`pyframe.py popvalue`). Bridge resume
+    // already overlays stream slots (`reconstruct_inline_recipe`
+    // `overlay_stream_ref_slots`); do the same for every inner BH
+    // section before `_run_forever`.
+    {
+        let mut interp: Option<&majit_metainterp::blackhole::BlackholeInterpreter> = Some(&bh);
+        while let Some(cur) = interp {
+            if cur.nextblackholeinterp.is_some() {
+                if let Some(jc) = cur.jitcode.try_index() {
+                    pyre_jit_trace::state::sync_inlined_bh_section_heap_frame(
+                        jc as i32,
+                        cur.position as i32,
+                        &cur.registers_i,
+                        &cur.registers_r,
+                        &cur.registers_f,
+                    );
+                }
+            }
+            interp = cur.nextblackholeinterp.as_deref();
+        }
+    }
     // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
     // live value into the blackhole register banks, which the collector reaches
     // through their own root source (`walk_bh_regs`), so the off-heap copy is
@@ -9176,20 +9201,18 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Residual callee for the jitted `jump_absolute` armed path:
-/// `ec.bytecode_trace(frame, decr_by)`.
+/// Residual callee for the jitted `jump_absolute` slow path:
+/// `ec.bytecode_trace(frame, 0)`.
+///
+/// The hot jitcode owns the one `ActionFlag.decrement_ticker` subtraction
+/// (`interp_jit.py` `jump_absolute`). This zero-decrement call observes the
+/// resulting ticker: a negative value runs `action_dispatcher` /
+/// `gil.py` `GILReleaseAction` once, and a breaker-only exit leaves those
+/// bits armed for `eval_loop_jit`.
 ///
 /// Void result (`residual_call_r_v`), matching `bh_delete_subscr_fn`:
 /// an exception is published through `BH_LAST_EXC_VALUE`
 /// for the trailing `GuardNoException`.
-///
-/// pyre-adaptation: the walked guard fails on `word >= JIT_BREAKER_FLOOR`,
-/// so it also fires for the pyre-only breaker bits (`EB_STW`,
-/// `EB_FINALIZING`, `EB_GC`, `EB_MEMORY_ERROR`).  This helper consumes only
-/// what `bytecode_trace` consumes and leaves those bits armed for the
-/// bytecode-boundary service in `eval_loop_jit`: that service collects
-/// through `gc_interp::safepoint`, which is safe only at the interpreter's
-/// dispatch safepoint, not from a residual call inside machine code.
 pub extern "C" fn bh_bytecode_trace_jitted_slow(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
@@ -9197,12 +9220,7 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(
     if ec.is_null() {
         return;
     }
-    let decr_by = if pyre_interpreter::module::thread::gil::threads_initialized() {
-        crate::eval::_get_adapted_tick_counter()
-    } else {
-        0
-    };
-    match unsafe { (*ec).bytecode_trace(frame_ptr, decr_by) } {
+    match unsafe { (*ec).bytecode_trace(frame_ptr, 0) } {
         Ok(()) => {}
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());

@@ -72,6 +72,12 @@ pub struct JitDriverSpec {
     /// a fixed `numreds`, matching `warmspot.py find_portals`.
     #[serde(default)]
     pub split_portal: bool,
+    /// Interpreter function whose definition the portal replaces
+    /// (`interp_jit.py` `class __extend__(PyFrame): def dispatch`). Every
+    /// spelling of it shares the rewritten origportal graph, so its callers
+    /// see `return portal_runner(*args)`. The runtime function keeps its body.
+    #[serde(default)]
+    pub extends: Option<CallPath>,
 }
 
 /// Configuration for the full analysis pipeline.
@@ -311,6 +317,7 @@ mod tests {
                 virtualizables: Vec::new(),
                 red_types: Vec::new(),
                 split_portal: false,
+                extends: None,
             }],
             register_trait_families: Vec::new(),
         };

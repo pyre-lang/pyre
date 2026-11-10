@@ -529,6 +529,37 @@ pub fn ll_vec_append_i(l: &mut Vec<usize>, newitem: usize) {
     ll_vec_setitem_fast_i(l, length, newitem);
 }
 
+/// `rgc.ll_arraymove` over raw items, a residual call
+/// (`list.ll_arraymove`, `OS_ARRAYMOVE`) like [`ll_slice_arraycopy_i`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_vec_arraymove_i(items: usize, source_start: usize, dest_start: usize, length: usize) {
+    let nbytes = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
+    unsafe {
+        std::ptr::copy(
+            slice_item_addr(items, source_start, ITEM_SIZE_I) as *const u8,
+            slice_item_addr(items, dest_start, ITEM_SIZE_I) as *mut u8,
+            nbytes,
+        );
+    }
+}
+
+/// `rlist.py ll_prepend`.
+pub fn ll_vec_prepend_i(l: &mut Vec<usize>, newitem: usize) {
+    let length = ll_vec_length_i(l);
+    ll_vec_resize_ge_i(l, length + 1);
+    ll_vec_arraymove_i(ll_vec_items_i(l), 0, 1, length);
+    ll_vec_setitem_fast_i(l, 0, newitem);
+}
+
+/// `rlist.py ll_insert_nonneg`.
+pub fn ll_vec_insert_nonneg_i(l: &mut Vec<usize>, index: usize, newitem: usize) {
+    let length = ll_vec_length_i(l);
+    assert!(index <= length, "list insertion index out of bound");
+    ll_vec_resize_ge_i(l, length + 1);
+    ll_vec_arraymove_i(ll_vec_items_i(l), index, index + 1, length - index);
+    ll_vec_setitem_fast_i(l, index, newitem);
+}
+
 /// `_ll_list_resize_ge`.
 pub fn ll_vec_resize_ge_i(l: &mut Vec<usize>, newsize: usize) {
     let allocated = vec_header_word(vec_header_i(l), VEC_CAP_WORD);
@@ -878,6 +909,36 @@ pub fn ll_vec_append_r(l: &mut Vec<GCREF>, newitem: GCREF) {
     let length = ll_vec_length_r(l);
     ll_vec_resize_ge_r(l, length + 1);
     ll_vec_setitem_fast_r(l, length, newitem);
+}
+
+/// `rgc.ll_arraymove` over raw items, a residual call
+/// (`list.ll_arraymove`, `OS_ARRAYMOVE`) like [`ll_slice_arraycopy_r`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_vec_arraymove_r(items: usize, source_start: usize, dest_start: usize, length: usize) {
+    unsafe {
+        std::ptr::copy(
+            slice_item_addr(items, source_start, ITEM_SIZE_R) as *const u8,
+            slice_item_addr(items, dest_start, ITEM_SIZE_R) as *mut u8,
+            item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow"),
+        );
+    }
+}
+
+/// `rlist.py ll_prepend`.
+pub fn ll_vec_prepend_r(l: &mut Vec<GCREF>, newitem: GCREF) {
+    let length = ll_vec_length_r(l);
+    ll_vec_resize_ge_r(l, length + 1);
+    ll_vec_arraymove_r(ll_vec_items_r(l), 0, 1, length);
+    ll_vec_setitem_fast_r(l, 0, newitem);
+}
+
+/// `rlist.py ll_insert_nonneg`.
+pub fn ll_vec_insert_nonneg_r(l: &mut Vec<GCREF>, index: usize, newitem: GCREF) {
+    let length = ll_vec_length_r(l);
+    assert!(index <= length, "list insertion index out of bound");
+    ll_vec_resize_ge_r(l, length + 1);
+    ll_vec_arraymove_r(ll_vec_items_r(l), index, index + 1, length - index);
+    ll_vec_setitem_fast_r(l, index, newitem);
 }
 
 /// `_ll_list_resize_ge`. See [`ll_vec_resize_ge_i`].
@@ -1300,6 +1361,36 @@ pub fn ll_vec_append_f(l: &mut Vec<f64>, newitem: f64) {
     ll_vec_setitem_fast_f(l, length, newitem);
 }
 
+/// `rgc.ll_arraymove` over raw items, a residual call
+/// (`list.ll_arraymove`, `OS_ARRAYMOVE`) like [`ll_slice_arraycopy_f`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_vec_arraymove_f(items: usize, source_start: usize, dest_start: usize, length: usize) {
+    unsafe {
+        std::ptr::copy(
+            slice_item_addr(items, source_start, ITEM_SIZE_F) as *const u8,
+            slice_item_addr(items, dest_start, ITEM_SIZE_F) as *mut u8,
+            item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow"),
+        );
+    }
+}
+
+/// `rlist.py ll_prepend`.
+pub fn ll_vec_prepend_f(l: &mut Vec<f64>, newitem: f64) {
+    let length = ll_vec_length_f(l);
+    ll_vec_resize_ge_f(l, length + 1);
+    ll_vec_arraymove_f(ll_vec_items_f(l), 0, 1, length);
+    ll_vec_setitem_fast_f(l, 0, newitem);
+}
+
+/// `rlist.py ll_insert_nonneg`.
+pub fn ll_vec_insert_nonneg_f(l: &mut Vec<f64>, index: usize, newitem: f64) {
+    let length = ll_vec_length_f(l);
+    assert!(index <= length, "list insertion index out of bound");
+    ll_vec_resize_ge_f(l, length + 1);
+    ll_vec_arraymove_f(ll_vec_items_f(l), index, index + 1, length - index);
+    ll_vec_setitem_fast_f(l, index, newitem);
+}
+
 /// `_ll_list_resize_ge`. See [`ll_vec_resize_ge_i`].
 pub fn ll_vec_resize_ge_f(l: &mut Vec<f64>, newsize: usize) {
     let allocated = vec_header_word(vec_header_f(l), VEC_CAP_WORD);
@@ -1663,6 +1754,34 @@ mod tests {
         ll_vec_append_r(&mut r, b);
         ll_vec_reverse_r(&mut r);
         assert_eq!(r, vec![b, a]);
+    }
+
+    #[test]
+    fn helpers_prepend_and_insert_nonneg() {
+        let mut v = ll_vec_newemptylist_i();
+        ll_vec_prepend_i(&mut v, 1);
+        assert_eq!(v, vec![1]);
+        ll_vec_append_i(&mut v, 3);
+        ll_vec_insert_nonneg_i(&mut v, 1, 2);
+        ll_vec_prepend_i(&mut v, 0);
+        ll_vec_insert_nonneg_i(&mut v, 4, 4);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+
+        let mut f = ll_vec_newemptylist_f();
+        ll_vec_append_f(&mut f, 1.5);
+        ll_vec_append_f(&mut f, 2.5);
+        ll_vec_prepend_f(&mut f, 0.5);
+        ll_vec_insert_nonneg_f(&mut f, 2, 1.75);
+        assert_eq!(f, vec![0.5, 1.5, 1.75, 2.5]);
+
+        let a = 0x10 as GCREF;
+        let b = 0x20 as GCREF;
+        let c = 0x30 as GCREF;
+        let mut r = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut r, b);
+        ll_vec_prepend_r(&mut r, a);
+        ll_vec_insert_nonneg_r(&mut r, 2, c);
+        assert_eq!(r, vec![a, b, c]);
     }
 
     #[test]

@@ -4665,7 +4665,7 @@ pub fn after_return_generator_index(code: &crate::CodeObject) -> usize {
 ///   `cache_entries=1`, and that unit inherits the `def` line; tracing it
 ///   would put a line event on the `def` line at every call.
 ///
-/// [`crate::PyFrame::get_lineno_for_pc_tracing`] needs both because the
+/// [`w_code_get_lineno_for_pc_tracing`] needs both because the
 /// prologue and the `RESUME` that ends it are all stamped with the `def` line,
 /// so tracing any of them as a line start puts a line event on the `def` line
 /// at every call.  `pycode.py` cannot answer this: its 3.11 bytecode has none
@@ -4692,6 +4692,43 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
             | Instruction::PopIter
             | Instruction::Resume { .. }
     )
+}
+
+/// pycode.py `PyCode._get_lineno_for_pc_tracing(pc)` — the line a
+/// trace function attributes to instruction `pc`, or `-1` when that
+/// instruction cannot start a line.
+///
+/// Upstream decodes the line table into one entry per code unit and leaves
+/// `-1` in every entry the decode never reached, so `-1` is the "no line
+/// here" answer `run_trace_func` guards on twice.  pyre's table covers
+/// every instruction, so the sentinel comes from the opcode instead:
+/// [`instruction_can_start_a_line`].
+///
+/// Separate from [`crate::PyFrame::get_last_lineno`], which answers the *frame's*
+/// line for `f_lineno` and reports `co_firstlineno` for a frame that has
+/// not started.  That is the right answer for the getset — a not-yet-run
+/// generator's `f_lineno` is its `def` line — and the wrong one for a line
+/// event, which is why this is a second entry point rather than an edit to
+/// that one.
+///
+/// `pycode.py _get_lineno_for_pc_tracing` is `@jit.elidable`.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode`.
+#[majit_macros::elidable]
+pub unsafe fn w_code_get_lineno_for_pc_tracing(w_code: PyObjectRef, pc: isize) -> isize {
+    if w_code.is_null() || pc < 0 {
+        return -1;
+    }
+    let code_ptr = unsafe { (*(w_code as *const PyCode)).code_ptr };
+    if code_ptr.is_null() {
+        return -1;
+    }
+    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
+    if !instruction_can_start_a_line(code, pc as usize) {
+        return -1;
+    }
+    unsafe { crate::pyframe::offset2lineno(w_code, pc) }
 }
 
 /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the

@@ -3061,6 +3061,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "items" => "rustvec_method_items",
             "extend_from_slice" => "rustvec_method_extend_from_slice",
             "extend" => "rustvec_method_extend",
+            "insert" => "rustvec_method_insert",
             _ => return None,
         },
         // rstring.py — the `UnicodeBuilder` surface the rtyper
@@ -3908,12 +3909,14 @@ pub(crate) fn call_builtin_method(
         | "rustvec_method_reverse"
         | "rustvec_method_free"
         | "rustvec_method_extend_from_slice"
-        | "rustvec_method_extend" => {
+        | "rustvec_method_extend"
+        | "rustvec_method_insert" => {
             let SomeValue::RustVec(_) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
             let params: &[&str] = match method.analyser_name.as_str() {
                 "rustvec_method_append" => &["s_item"],
+                "rustvec_method_insert" => &["s_index", "s_item"],
                 // The `(items, length)` words of the source slice.
                 "rustvec_method_extend_from_slice" => &["s_items", "s_length"],
                 // `rlist.ll_extend(l1, l2)`: `l2` is the GcArray word.
@@ -6905,6 +6908,7 @@ mod tests {
                 ("items", "rustvec_method_items"),
                 ("extend_from_slice", "rustvec_method_extend_from_slice"),
                 ("extend", "rustvec_method_extend"),
+                ("insert", "rustvec_method_insert"),
             ] {
                 let SomeValue::BuiltinMethod(bound) = s_self.find_method(name).unwrap() else {
                     panic!("Vec.{name} must be recognized");

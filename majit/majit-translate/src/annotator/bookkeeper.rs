@@ -3143,6 +3143,87 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
+    /// Redirect a bare-leaf `root` whose field alias was withdrawn by
+    /// `harden_duplicate_leaf_metadata` (a cross-namespace leaf collision —
+    /// e.g. a struct leaf colliding with an enum variant of the same name) to
+    /// the unique surviving *qualified* struct key that carries that leaf.
+    /// A withdrawn bare leaf has no `fields` entry, so `project_struct_rows`
+    /// finds nothing and the classdef stays attrs-empty (every field getattr
+    /// on the cast result then blocks). The qualified key survives hardening
+    /// (only the bare alias is removed), so resolving through it projects the
+    /// struct's rows. Returns `None` — leaving the current bare-leaf behaviour
+    /// — unless there is exactly one surviving non-enum-variant qualified
+    /// identity with this leaf. Crate-prefix dual-publish
+    /// (`pyframe::PyFrame` and `pyre_interpreter::pyframe::PyFrame`) is one
+    /// identity (`intern_class_by_qualname`); a genuinely ambiguous leaf
+    /// (two module paths that are not prefixes of each other) stays
+    /// unresolved, and an unwithdrawn leaf is untouched.
+    fn redirect_withdrawn_struct_leaf(self: &Rc<Self>, root: &str) -> Option<String> {
+        // Only a bare leaf can be a withdrawal victim; a qualified or
+        // per-instantiation spelling already survives hardening.
+        if root.contains("::") || root.contains('<') {
+            return None;
+        }
+        let guard = self.struct_fields.borrow();
+        let reg = guard.as_ref()?;
+        if reg.fields.contains_key(root) {
+            return None;
+        }
+        let mut hits: Vec<String> = Vec::new();
+        for k in reg.with_keys_by_last_segment(root, |keys| keys.to_vec()) {
+            let Some((head, _leaf)) = k.rsplit_once("::") else {
+                continue;
+            };
+            // An `{Enum}::{Variant}` key's tail is a variant name, not a
+            // struct leaf — the enum base carries the `__discriminant` row.
+            if reg.is_enum_base(head) {
+                continue;
+            }
+            hits.push(k.clone());
+        }
+        if hits.is_empty() {
+            return None;
+        }
+        hits.sort_by_key(|k| k.len());
+        let shortest = &hits[0];
+        if hits.iter().all(|k| crate_prefix_struct_alias(k, shortest)) {
+            return Some(shortest.clone());
+        }
+        None
+    }
+
+    /// Registry key for a struct-root spelling, if one is published.
+    ///
+    /// `derive_subject_inputcells` and `getuniqueclassdef_for_struct_root`
+    /// must agree: a bare driver red-type (`PYPYJIT_RED_TYPES` `PyFrame`)
+    /// is not a `fields` key when `harden_duplicate_leaf_metadata` withdrew
+    /// the leaf alias. `canonical_struct_name` recovers the origin module
+    /// path; `redirect_withdrawn_struct_leaf` recovers a unique qualified
+    /// survivor. Either key is what `intern_class_by_qualname` already
+    /// projects.
+    pub(crate) fn registered_struct_root_key(self: &Rc<Self>, root: &str) -> Option<String> {
+        {
+            let guard = self.struct_fields.borrow();
+            let reg = guard.as_ref()?;
+            if reg.fields.contains_key(root) {
+                return Some(root.to_string());
+            }
+            let canon = majit_ir::descr::canonical_struct_name(root);
+            if canon != root && reg.fields.contains_key(&canon) {
+                return Some(canon);
+            }
+            let normalized = normalize_class_qualname(root);
+            if normalized != root && reg.fields.contains_key(&normalized) {
+                return Some(normalized);
+            }
+            let normalized_canon = normalize_class_qualname(&canon);
+            if normalized_canon != root && reg.fields.contains_key(&normalized_canon) {
+                return Some(normalized_canon);
+            }
+        }
+        self.redirect_withdrawn_struct_leaf(root)
+    }
+
     /// `SomeInstance(classdef)` for a struct root already interned, present
     /// in the field registry, or harvested `_alloc_flavor_ = raw`. Unknown
     /// names stay unresolved so the classdef-less `Ref` fallback remains
@@ -6463,6 +6544,37 @@ fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
     }
 }
 
+/// True when `a` and `b` name one declaration after normalising only
+/// crate-root spelling (`crate::` vs a loaded LLBC crate name). A suffix
+/// is not identity: `a::Frame` and `b::a::Frame` stay distinct.
+/// `Bookkeeper.getdesc` keys by the class object.
+fn crate_prefix_struct_alias(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (crate_kw_tail(a), crate_kw_tail(b)) {
+        (Some(ta), Some(tb)) => ta == tb,
+        (Some(ta), None) => is_crate_name_plus(b, ta),
+        (None, Some(tb)) => is_crate_name_plus(a, tb),
+        (None, None) => is_crate_name_plus(a, b) || is_crate_name_plus(b, a),
+    }
+}
+
+fn crate_kw_tail(path: &str) -> Option<&str> {
+    path.strip_prefix("crate::")
+}
+
+fn is_crate_name_plus(full: &str, tail: &str) -> bool {
+    let Some((head, rest)) = full.split_once("::") else {
+        return false;
+    };
+    // `Bookkeeper.getdesc` keys by the class object. A `crate::T` spelling
+    // aliases `<crate_name>::T` only when `crate_name` is a loaded LLBC
+    // crate (`local_crates::register_local_crate_roots` from
+    // `extract-llbc.py` / Charon `crate_name()`), not a hand-written list.
+    rest == tail && crate::local_crates::is_local_crate_root(head)
+}
+
 /// Dotted constructor qualnames become `::` path spellings.
 ///
 /// Class intern keys are [`Bookkeeper::intern_class_key`]: this helper is
@@ -7819,6 +7931,21 @@ mod tests {
     }
 
     #[test]
+    fn crate_prefix_alias_uses_registered_llbc_crate_names() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            assert!(crate_prefix_struct_alias(
+                "crate::pyframe::PyFrame",
+                "pyre_interpreter::pyframe::PyFrame"
+            ));
+        });
+        assert!(!crate_prefix_struct_alias("a::Frame", "b::a::Frame"));
+        assert!(!crate_prefix_struct_alias(
+            "crate::pyframe::PyFrame",
+            "not_a_loaded_crate::pyframe::PyFrame"
+        ));
+    }
+
+    #[test]
     fn immutablevalue_preserves_full_width_integer_known_types_and_constants() {
         use crate::annotator::model::{KnownType, SomeObjectTrait};
 
@@ -7987,6 +8114,40 @@ mod tests {
             String,
             Vec<String>,
         )>());
+    }
+
+    #[test]
+    fn registered_struct_root_key_resolves_withdrawn_leaf() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            use crate::front::StructFieldRegistry;
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            let rows = vec![("last_instr".to_string(), "i64".to_string())];
+            // Production dual-publishes the crate-relative and crate-included
+            // spellings; counting them as two identities left the bare
+            // `PYPYJIT_RED_TYPES` `PyFrame` unresolved. The crate name is
+            // a loaded LLBC root (`register_local_crate_roots`), not a
+            // hand-written list.
+            reg.fields
+                .insert("pyframe::PyFrame".to_string(), rows.clone());
+            reg.fields
+                .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+            bk.set_struct_fields(Rc::new(reg));
+            assert_eq!(
+                bk.registered_struct_root_key("PyFrame").as_deref(),
+                Some("pyframe::PyFrame"),
+                "bare PYPYJIT_RED_TYPES spelling must recover the unique qualified key"
+            );
+            assert_eq!(
+                bk.registered_struct_root_key("pyframe::PyFrame").as_deref(),
+                Some("pyframe::PyFrame")
+            );
+            assert_eq!(
+                bk.registered_struct_root_key("pyre_interpreter::pyframe::PyFrame")
+                    .as_deref(),
+                Some("pyre_interpreter::pyframe::PyFrame")
+            );
+        });
     }
 
     #[test]

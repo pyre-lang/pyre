@@ -1239,6 +1239,31 @@ fn real_main() {
                     "baseobjspace",
                     "generator_frame_is_finished",
                 ]),
+                // SET_ADD's `inline_call` target (`flatten.rs
+                // inline_call_targets::SET_ADD`). `pyopcode.py SET_ADD` is
+                // `space.call_method(w_set, 'add', w_value)`; the exact-set
+                // helper is `opcode_ops::set_add_value`. The portal
+                // residualizes `PyFrame::set_add`, so the portal closure
+                // never names this graph (`call.py`
+                // `CallControl.register_helper_graph` /
+                // `grab_initial_jitcodes`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "set_add_value",
+                ]),
+                // Handwritten JUMP_BACKWARD jitcode inline_calls these
+                // (`emit_jump_absolute_tick`); the portal never names them.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "gil_ready",
+                    "gil_ready_word",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_jit",
+                    "eval",
+                    "_get_adapted_tick_counter",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
@@ -1307,6 +1332,10 @@ fn real_main() {
                         .collect(),
                     // warmspot.py find_portals → split_graph_and_record_jitdriver
                     split_portal: true,
+                    extends: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "dispatch_frame",
+                    ])),
                 },
                 majit_translate::JitDriverSpec {
                     // `warmspot.py split_graph_and_record_jitdriver` copy of
@@ -1331,6 +1360,7 @@ fn real_main() {
                     // Already the split body; `rewrite_jit_merge_point` lives
                     // in `_unpackiterable_unknown_length` at source level.
                     split_portal: false,
+                    extends: None,
                 },
                 majit_translate::JitDriverSpec {
                     // `generator.py` `generatorentry_driver`. Greens `pycode`,
@@ -1357,6 +1387,7 @@ fn real_main() {
                     // `rewrite_jit_merge_point` leaves the original as the
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
+                    extends: None,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

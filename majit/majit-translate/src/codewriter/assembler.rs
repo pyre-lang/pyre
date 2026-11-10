@@ -1664,11 +1664,18 @@ impl AssemblerEncode for Assembler {
                 {
                     self.indirectcalltargets.extend(t.lst.iter().cloned());
                 }
-                let base = match &op.kind {
-                    OpKind::CallMayForce { .. } => "call_may_force",
-                    OpKind::CallElidable { .. } => "call_elidable",
-                    _ => "residual_call",
-                };
+                // `insns.rs` slots 38..=40 / 46..=48: may_force /
+                // loopinvariant / elidable policy rides on
+                // `EffectInfo.extraeffect` (`effectinfo.py`) carried by
+                // the canonical `residual_call_*` family. Distinct
+                // `call_may_force_*` / `call_elidable_*` keys are not
+                // in `wellknown_bh_insns`, so `get_opnum` setdefault
+                // lands them on the freed bytes and the walker hits
+                // `opimpl_unknown`. `pyjitpl.py do_residual_call`
+                // already branches on
+                // `check_forces_virtual_or_virtualizable` /
+                // `check_is_elidable`.
+                let base = "residual_call";
                 // RPython `jtransform.py` `rewrite_call` emits args
                 // by kind (I, R, F) first, then the calldescr, producing
                 // keys like `residual_call_ir_r/iIRd>r`. jtransform now
@@ -9565,6 +9572,8 @@ mod tests {
             ("int_guard_value/i", "int_guard_value/i"),
             ("ref_guard_value/r", "ref_guard_value/r"),
             ("float_guard_value/f", "float_guard_value/f"),
+            ("recursive_call_r/iIRFIRF>r", "recursive_call_r/iIRFIRF>r"),
+            ("recursive_call_v/iIRFIRF", "recursive_call_v/iIRFIRF"),
         ] {
             let byte = asm.get_opnum(key);
             let expected = crate::insns::insn_byte(canonical);

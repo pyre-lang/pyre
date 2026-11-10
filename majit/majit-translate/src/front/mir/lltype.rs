@@ -2932,6 +2932,8 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// A copied TypeDecl in a later crate does not see a marker that
     /// lives only on the defining artefact.
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
+    /// Module of the unique type whose last path segment is `FrameAnchor`.
+    pub(in crate::front::mir) frame_anchor_module: std::sync::OnceLock<Option<String>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {

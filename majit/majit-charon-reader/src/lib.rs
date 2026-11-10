@@ -122,6 +122,10 @@ pub struct Llbc {
     /// `stack_sensitive_fns`.  Sorted.  Harvested in link order like
     /// the sensitive set, so a later crate sees earlier crates' answers.
     stack_depth_neutral_fns: parking_lot::RwLock<Vec<String>>,
+    /// Function paths (crate prefix stripped) that the configured
+    /// jitdrivers' `rewrite_jit_merge_point` turns into a portal-runner
+    /// stub. Empty until the translator publishes the set. Sorted.
+    rewritten_origportal_fns: parking_lot::RwLock<Vec<String>>,
     /// Function paths whose body can return with slots still published
     /// above its entry depth, or at a depth the walk could not bound.
     /// A subset of `stack_sensitive_fns`.  Sorted.  Harvested in link
@@ -288,6 +292,7 @@ pub struct LinkStateSnapshot {
     root_stack_effects: (Vec<String>, Vec<String>),
     stack_sensitive_fns: Vec<String>,
     stack_depth_neutral_fns: Vec<String>,
+    rewritten_origportal_fns: Vec<String>,
     stack_leaves_above_fns: Vec<String>,
     stack_observes_fns: Vec<String>,
     stack_param_slots_fns: Vec<(String, Vec<u8>)>,
@@ -469,6 +474,7 @@ impl Llbc {
             stack_sensitive_fns: parking_lot::RwLock::new(Vec::new()),
             stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
             stack_depth_neutral_fns: parking_lot::RwLock::new(Vec::new()),
+            rewritten_origportal_fns: parking_lot::RwLock::new(Vec::new()),
             stack_leaves_above_fns: parking_lot::RwLock::new(Vec::new()),
             stack_observes_fns: parking_lot::RwLock::new(Vec::new()),
             stack_param_slots_fns: parking_lot::RwLock::new(Vec::new()),
@@ -653,6 +659,24 @@ impl Llbc {
             .is_ok()
     }
 
+    /// Record function paths (crate prefix stripped) that the configured
+    /// jitdrivers' `rewrite_jit_merge_point` turns into a portal-runner stub.
+    pub fn register_rewritten_origportal_fns(&self, paths: impl IntoIterator<Item = String>) {
+        let mut known = self.rewritten_origportal_fns.write();
+        known.extend(paths);
+        known.sort();
+        known.dedup();
+    }
+
+    /// Whether `path` was registered through
+    /// [`register_rewritten_origportal_fns`](Self::register_rewritten_origportal_fns).
+    pub fn is_rewritten_origportal_fn(&self, path: &str) -> bool {
+        self.rewritten_origportal_fns
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
+    }
+
     /// Record function paths that leave slots published above entry.
     pub fn register_stack_leaves_above_fns(&self, paths: impl IntoIterator<Item = String>) {
         let mut known = self.stack_leaves_above_fns.write();
@@ -752,6 +776,7 @@ impl Llbc {
             root_stack_effects: self.root_stack_effects.read().clone(),
             stack_sensitive_fns: self.stack_sensitive_fns.read().clone(),
             stack_depth_neutral_fns: self.stack_depth_neutral_fns.read().clone(),
+            rewritten_origportal_fns: self.rewritten_origportal_fns.read().clone(),
             stack_leaves_above_fns: self.stack_leaves_above_fns.read().clone(),
             stack_observes_fns: self.stack_observes_fns.read().clone(),
             stack_param_slots_fns: self.stack_param_slots_fns.read().clone(),
@@ -781,6 +806,7 @@ impl Llbc {
         *self.root_stack_effects.write() = snapshot.root_stack_effects;
         *self.stack_sensitive_fns.write() = snapshot.stack_sensitive_fns;
         *self.stack_depth_neutral_fns.write() = snapshot.stack_depth_neutral_fns;
+        *self.rewritten_origportal_fns.write() = snapshot.rewritten_origportal_fns;
         *self.stack_leaves_above_fns.write() = snapshot.stack_leaves_above_fns;
         *self.stack_observes_fns.write() = snapshot.stack_observes_fns;
         *self.stack_param_slots_fns.write() = snapshot.stack_param_slots_fns;
@@ -1796,6 +1822,7 @@ mod tests {
         assert!(l.exception_carrier().is_empty());
         assert!(!l.is_stack_sensitive_fn("p"));
         assert!(!l.is_stack_depth_neutral_fn("p"));
+        assert!(!l.is_rewritten_origportal_fn("p"));
         assert!(!l.is_stack_leaves_above_fn("p"));
         assert!(!l.is_stack_observes_fn("p"));
         assert!(!l.is_stack_returns_index_fn("p"));
@@ -1819,6 +1846,7 @@ mod tests {
         l.set_root_stack_effects(vec!["c".into()], vec!["p".into()]);
         l.register_stack_sensitive_fns(["p".into()]);
         l.register_stack_depth_neutral_fns(["p".into()]);
+        l.register_rewritten_origportal_fns(["p".into()]);
         l.register_stack_leaves_above_fns(["p".into()]);
         l.register_stack_observes_fns(["p".into()]);
         l.register_stack_param_slots_fns([("p".into(), vec![0])]);
@@ -1840,6 +1868,7 @@ mod tests {
         assert_eq!(l.exception_carrier(), "Bookkeeper");
         assert!(l.is_stack_sensitive_fn("p"));
         assert!(l.is_stack_depth_neutral_fn("p"));
+        assert!(l.is_rewritten_origportal_fn("p"));
         assert!(l.is_stack_leaves_above_fn("p"));
         assert!(l.is_stack_observes_fn("p"));
         assert!(l.is_stack_returns_index_fn("p"));

@@ -926,6 +926,7 @@ impl PyError {
     /// returns. A later collecting call forwards the slot only;
     /// [`Self::reload`] stores it, as `shadowstack.py expand_pop_roots`
     /// writes every live variable after `pop_roots`.
+    #[inline(always)]
     pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> usize {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         self.0 = roots.pin_root(self.0);
@@ -936,6 +937,7 @@ impl PyError {
     ///
     /// `shadowstack.py gc_restore_root` / `expand_pop_roots`: the local read
     /// after the call is the slot, not the word from before the call.
+    #[inline(always)]
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
     }
@@ -2692,11 +2694,15 @@ impl PyError {
         }
         let type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_type);
-        let w_value = self.get_w_value(space);
+        let space_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(space);
         self.reload(&_roots, handle_slot);
+        let w_value = self.get_w_value(pyre_object::gc_roots::shadow_stack_get(space_slot));
         w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         let mut norm = ExceptionNormalization::new(w_type, w_value);
-        let w_value = pyre_object::with_roots!(w_type => norm.normalize_exception(space))?;
+        let w_value = pyre_object::with_roots!(w_type => {
+            norm.normalize_exception(pyre_object::gc_roots::shadow_stack_get(space_slot))
+        })?;
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_value);
         self.reload(&_roots, handle_slot);
@@ -3710,7 +3716,8 @@ impl PyError {
         // Infallible Display-side context: a raising `__str__` degrades to
         // the placeholder rather than propagating, and a lone surrogate is
         // backslash-escaped rather than panicking.
-        unsafe { crate::display::py_str_display(this.exc_object) }
+        let mut exc = this.exc_object;
+        pyre_object::with_roots!(exc => unsafe { crate::display::py_str_display(exc) })
     }
 
     /// [`message_text`] without the display encode — the text as a value.
@@ -3727,7 +3734,8 @@ impl PyError {
         if has || this.exc_object.is_null() {
             return this.display_message_buf();
         }
-        unsafe { crate::display::py_str_wtf8(this.exc_object) }
+        let mut exc = this.exc_object;
+        pyre_object::with_roots!(exc => unsafe { crate::display::py_str_wtf8(exc) })
             .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()))
     }
 

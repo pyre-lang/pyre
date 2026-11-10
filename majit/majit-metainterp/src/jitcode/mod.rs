@@ -1884,6 +1884,22 @@ mod tests {
             insns.get("residual_call_irf_v/iIRFd"),
             Some(&super::insns::BC_RESIDUAL_CALL_IRF_V),
         );
+        assert_eq!(
+            insns.get("recursive_call_i/iIRFIRF>i"),
+            Some(&super::insns::BC_RECURSIVE_CALL_INT),
+        );
+        assert_eq!(
+            insns.get("recursive_call_r/iIRFIRF>r"),
+            Some(&super::insns::BC_RECURSIVE_CALL_REF),
+        );
+        assert_eq!(
+            insns.get("recursive_call_f/iIRFIRF>f"),
+            Some(&super::insns::BC_RECURSIVE_CALL_FLOAT),
+        );
+        assert_eq!(
+            insns.get("recursive_call_v/iIRFIRF"),
+            Some(&super::insns::BC_RECURSIVE_CALL_VOID),
+        );
     }
 
     /// The `extension_insns()` quarantine holds 8 keys arising from

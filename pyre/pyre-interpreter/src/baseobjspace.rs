@@ -17656,7 +17656,7 @@ fn generator_unpack_into(
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
         if w_generator_is_running(gen_obj()) {
-            // generator.py:112 `"%s already executing" % self.KIND`.
+            // generator.py GeneratorOrCoroutine._invoke_execute_frame `oefmt(space.w_ValueError, "%s already executing", self.KIND)`.
             return Err(PyError::value_error(format!(
                 "{} already executing",
                 generator_kind(gen_obj())
@@ -23402,7 +23402,7 @@ pub unsafe fn generator_invoke_execute_frame(
         gen_slot + 1,
     ) as *mut crate::pyframe::PyFrame);
     if w_generator_is_running(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
-        // generator.py:112 `"%s already executing" % self.KIND`.
+        // generator.py GeneratorOrCoroutine._invoke_execute_frame `oefmt(space.w_ValueError, "%s already executing", self.KIND)`.
         crate::eval::frame_anchor_release(frame_depth);
         return Err(PyError::value_error(format!(
             "{} already executing",
@@ -23474,7 +23474,7 @@ pub unsafe fn generator_invoke_execute_frame(
         }
         Ok(value) => (None, Some(value)),
     };
-    // generator.py:142-145 `finally`.
+    // generator.py `_invoke_execute_frame` `finally`.
     (*crate::eval::frame_anchor_live(frame_depth)).f_backref = std::ptr::null_mut();
     w_generator_set_running(pyre_object::gc_roots::shadow_stack_get(gen_slot), false);
     if !ec.is_null() {
@@ -26290,53 +26290,11 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     unpacked
                 };
                 let len = w_list_len(obj) as i64;
-                let (start, stop, step, slicelength) =
+                let (start, _stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
-                if step == 1 {
-                    w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
-                    // Diagnostic (#24 wasm-Linux miscompile, root cause unpinned):
-                    // a correct `del list[a:b]` removes exactly `slicelength`
-                    // elements, leaving `len - slicelength`. The null-Ref operand
-                    // class was refuted on Linux CI (eval_slice_index's is_null
-                    // assert sits on this exact path and never fired), so a
-                    // stale/moved `items` backing or a length read desynced from
-                    // the mutated backing is the surviving hypothesis; trap loudly
-                    // with the counts so a wasm Linux run pins the divergence.
-                    let after = w_list_len(obj) as i64;
-                    assert!(
-                        after == len - slicelength,
-                        "delitem_slot step-1 slice-delete count mismatch (#24): after={after} expected={} len={len} slicelength={slicelength} start={start} stop={stop} raw_start={raw_start} raw_stop={raw_stop}",
-                        len - slicelength
-                    );
-                    return Ok(());
-                }
-                // Extended-slice delete: gather the selected indices, then
-                // pop them in descending order so earlier removals do not
-                // shift the positions of later targets.
-                let old_allocated = w_list_allocated(obj);
-                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
-                let mut i = start;
-                for n in 0..slicelength {
-                    indices.push(i);
-                    // Like PyPy's range over the computed slice length, avoid
-                    // forming a successor after the final selected item.
-                    if n + 1 < slicelength {
-                        i += step;
-                    }
-                }
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in indices {
-                    if idx >= 0 && idx < w_list_len(obj) as i64 {
-                        w_list_pop(obj, idx);
-                    }
-                }
-                if slicelength > 0 {
-                    pyre_object::listobject::w_list_finish_batch_resize(
-                        obj,
-                        len as usize,
-                        old_allocated,
-                    );
-                }
+                // `W_ListObject.descr_delitem` → `self.deleteslice` for every
+                // slice, including `step == 1`.
+                pyre_object::listobject::w_list_deleteslice(obj, start, step, slicelength);
                 return Ok(());
             }
             // `descr_delitem`: getindex_w(idx, IndexError, "list") coerces a
@@ -26369,12 +26327,11 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         if is_dict(obj) {
             return dict_delitem(obj, index);
         }
-        // `bytearrayobject.py` ass_subscript with a NULL value deletes like a
-        // list: a single index removes one byte, a slice removes its selected
-        // bytes (contiguous via drain, extended-step descending).  `descr_delitem`
-        // runs `_unpack_slice` — the slice's `__index__` is evaluated before the
-        // length is read, so a mutation during index evaluation is reflected in
-        // the bounds.
+        // `bytearrayobject.py` `W_BytearrayObject.descr_delitem`: a single
+        // index removes one byte; a slice goes through `_delitem_slice_helper`.
+        // `_unpack_slice` evaluates the slice's `__index__` before the length
+        // is read, so a mutation during index evaluation is reflected in the
+        // bounds.
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             // `descr_delitem` refuses any deletion (single or slice — every
             // delete shrinks the buffer) while an export is outstanding.
@@ -26394,37 +26351,20 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     unpacked
                 };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let (start, stop, step, slicelength) =
+                let (start, _stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 let old_size = vec.len();
-                if step == 1 {
-                    let s = start.max(0) as usize;
-                    let e = stop.max(start).min(vec.len() as i64) as usize;
-                    if s == 0 {
-                        pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, e - s);
-                    }
-                    vec.drain(s..e);
-                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
-                    return Ok(());
+                // `descr_delitem`: `start == 0 and step == 1` advances
+                // `_offset` (`_delete_from_start`). pyre keeps the payload at
+                // `Vec[0]`, so the helper still physically shrinks the buffer.
+                if start == 0 && step == 1 {
+                    pyre_object::bytearrayobject::w_bytearray_advance_logical_start(
+                        obj,
+                        slicelength.max(0) as usize,
+                    );
                 }
-                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
-                let mut i = start;
-                for n in 0..slicelength {
-                    indices.push(i);
-                    // `_delitem_slice_helper` consumes the explicit slice
-                    // length. Do not form an unused successor after the final
-                    // selected byte when `step` is i64::MAX.
-                    if n + 1 < slicelength {
-                        i += step;
-                    }
-                }
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in indices {
-                    if idx >= 0 && idx < vec.len() as i64 {
-                        vec.remove(idx as usize);
-                    }
-                }
+                pyre_object::bytearrayobject::_delitem_slice_helper(vec, start, step, slicelength);
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                 return Ok(());
             }
@@ -26441,7 +26381,15 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if idx == 0 {
                     pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, 1);
                 }
-                pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                // `del self._data[idx]` (`descr_delitem`). `Vec::remove` is
+                // unlowerable; `_delitem_slice_helper` with step 1 is the
+                // contiguous `del items[idx:idx+1]` move.
+                pyre_object::bytearrayobject::_delitem_slice_helper(
+                    pyre_object::bytearrayobject::w_bytearray_vec_mut(obj),
+                    idx,
+                    1,
+                    1,
+                );
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
                 return Ok(());
             }

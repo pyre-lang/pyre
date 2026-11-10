@@ -1345,9 +1345,9 @@ fn malloc_removal_reads_zero_for_an_unwritten_field() {
     );
 }
 
-/// `execute_generator_frame` residualizes `get_eval_fn` as `indirect_call`.
-/// The resume struct is the argument; a stack alias would be the walker's
-/// C frame. Materialise `New` at that escape the same way `Call` does.
+/// An `indirect_call` that takes a struct by value must materialise `New`
+/// at that argument; a stack alias would be the walker's C frame. Same
+/// escape as `Call`.
 #[test]
 fn aggregate_passed_by_value_to_an_indirect_call() {
     let mut graph = FunctionGraph::new("struct_ctor_indirect");

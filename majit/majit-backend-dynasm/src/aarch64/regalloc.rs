@@ -1414,7 +1414,14 @@ impl<'a> RegAlloc<'a> {
         asm: &mut dyn RegAllocAssembler,
     ) {
         let args = [base.clone(), offset.clone(), value.clone()];
-        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        // aarch64/regalloc.py `prepare_op_gc_store`: `make_sure_var_in_reg(boxes[0], boxes)`
+        // uses the box type; a Const base is loaded into a scratch register by
+        // `ARMRegisterManager.return_constant` (`const_int_in_reg`).
+        let base_loc = if base.is_constant() {
+            self.const_int_in_reg(base, &args)
+        } else {
+            self.make_sure_var_in_reg(base, self.tp(base), &args, None, false)
+        };
         let tp_val = self.tp(value);
         let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
@@ -1428,6 +1435,7 @@ impl<'a> RegAlloc<'a> {
             self.gc_offset_loc(ofs)
         };
         self.perform_discard_gc_store(i, value_loc, base_loc, ofs_loc, size, asm);
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
     }
 
     /// aarch64/regalloc.py prepare_op_gc_store_indexed parity.

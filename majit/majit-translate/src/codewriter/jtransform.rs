@@ -965,7 +965,16 @@ const NULL_PTR_BUILTIN_QUALNAMES: &[&str] = &[
     "std.ptr.null_mut",
 ];
 
-/// Whether a 0-arg `FunctionPath` call names one of those builtins.
+/// The null-function-pointer builtin `HostEnv::bootstrap` registers
+/// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
+/// `history.getkind` of `Ptr(FuncType)` is `'int'`.
+/// Only Skip (legacy-walker) graphs reach it: a Match graph's `null_fn`
+/// hop arrives as the rtyper's Constant (`rtype_const_result`). It goes
+/// away when those graphs are Match.
+const NULL_FN_BUILTIN_QUALNAMES: &[&str] = &["core.ptr.null_fn"];
+
+/// Whether a 0-arg `FunctionPath` call names a `HOST_ENV` builtin whose
+/// `HostObject::qualname` is in `qualnames`.
 ///
 /// A guest const-global defined as `std::ptr::null_mut()` is bound to the SAME
 /// `HostObject` as the spelled-out call (`flowspace/model.rs` binds the attr to
@@ -974,7 +983,7 @@ const NULL_PTR_BUILTIN_QUALNAMES: &[&str] = &[
 /// model graph still carries whichever path the source spelled, so resolve it
 /// through that same registry instead of listing the guest's spellings here —
 /// the alias keeps one owner, and no guest name is repeated in the codewriter.
-fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
+fn resolves_to_host_qualname(segments: &[String], qualnames: &[&str]) -> bool {
     let Some((leaf, module_path)) = segments.split_last() else {
         return false;
     };
@@ -984,7 +993,11 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
     crate::flowspace::model::HOST_ENV
         .import_module(&module_path.join("."))
         .and_then(|module| module.module_get(leaf))
-        .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+        .is_some_and(|attr| qualnames.contains(&attr.qualname()))
+}
+
+fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
+    resolves_to_host_qualname(segments, NULL_PTR_BUILTIN_QUALNAMES)
 }
 
 /// Result banks on which `ptr::null[_mut]()` is `lltype.nullptr`.
@@ -996,29 +1009,9 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
     matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
 }
 
-/// The null-function-pointer builtin `HostEnv::bootstrap` registers
-/// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
-/// `history.getkind` of `Ptr(FuncType)` is `'int'`.
-/// Only Skip (legacy-walker) graphs reach it: a Match graph's `null_fn`
-/// hop arrives as the rtyper's Constant (`rtype_const_result`). It goes
-/// away when those graphs are Match.
-const NULL_FN_BUILTIN_QUALNAMES: &[&str] = &["core.ptr.null_fn"];
-
 /// Whether a `FunctionPath` call names `core.ptr.null_fn`.
-///
-/// Resolve through `HOST_ENV` the same way as [`resolves_to_null_ptr_builtin`]:
-/// the surviving model graph still carries whichever path the source spelled.
 fn resolves_to_null_fn_builtin(segments: &[String]) -> bool {
-    let Some((leaf, module_path)) = segments.split_last() else {
-        return false;
-    };
-    if module_path.is_empty() {
-        return false;
-    }
-    crate::flowspace::model::HOST_ENV
-        .import_module(&module_path.join("."))
-        .and_then(|module| module.module_get(leaf))
-        .is_some_and(|attr| NULL_FN_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+    resolves_to_host_qualname(segments, NULL_FN_BUILTIN_QUALNAMES)
 }
 
 /// Result banks on which `ptr::null_fn()` is `lltype.nullptr(FUNC)`.

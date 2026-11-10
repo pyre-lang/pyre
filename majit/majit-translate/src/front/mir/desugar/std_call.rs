@@ -7665,17 +7665,24 @@ impl<'a> Lowering<'a> {
         }
         let kind = match op {
             "cast_int_to_ptr" => cast_int_to_ptr_call(operand),
-            "cast_ptr_to_int" => cast_ptr_to_int_call(operand),
+            "cast_ptr_to_int" => cast_ptr_to_int_call(operand.clone()),
             _ => OpKind::UnaryOp {
                 op: op.to_string(),
-                operand,
-                result_ty,
+                operand: operand.clone(),
+                result_ty: result_ty.clone(),
             },
         };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind,
         });
+        // `rbuiltin.py rtype_cast_ptr_to_int` resulttype Signed, then
+        // `gen_cast` to Unsigned (`r_uint`) when the dest is usize/u64.
+        let res = if op == "cast_ptr_to_int" && result_ty == ValueType::Unsigned {
+            crate::front::mir::operation::push_r_uint(&mut self.graph, bb_id, res)
+        } else {
+            res
+        };
         self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;

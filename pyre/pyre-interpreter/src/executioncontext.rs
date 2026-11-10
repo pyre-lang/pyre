@@ -298,7 +298,23 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 /// that cleared token is the one marker `tracing_after_residual_call` reads as
 /// "the callee forced this vref".  A reader that forced would report its own
 /// read as a callee escape.
+///
+/// `#[dont_look_inside]` for the same reason as [`force_vref`]: the typeptr
+/// test lives in `majit-metainterp` (`ptr_is_virtual_ref`), which is not
+/// LLBC.  A look-inside residualized a symbolic hash and aborted with
+/// `OrthodoxSubWalkTraceUnsupported` on the generatorentry walk
+/// (enter-chain identity).  Inlining `is_virtual_ref`
+/// (`inst.typeptr == jit_virtual_ref_vtable`) plus `return vref.forced` as
+/// field reads is the interpreter copy; the jitcode copy cannot hold those
+/// reads.  `jtransform.py rewrite_op_getfield` refuses a non-pure
+/// `getfield_raw_r`, and `forced` is a raw ref that `continue_tracing`
+/// rewrites, so it is not `_pure`.  `rewrite_op_jit_is_virtual` also
+/// refuses `vref.virtual` from jit-visible code.  Upstream
+/// `replace_force_virtual_with_call` supplies the typeptr test only to the
+/// interpreter copy; this attribute is how pyre spells that for a reader
+/// that never forces.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as majit_gc::header::GCREF) } {
         unsafe {
@@ -993,6 +1009,21 @@ pub unsafe fn executioncontext_custom_trace(
 /// quasi-immut watchers).
 pub unsafe fn executioncontext_destructor(obj_addr: usize) {
     unsafe { std::ptr::drop_in_place(obj_addr as *mut ExecutionContext) };
+}
+
+/// `root_stack_slot` cache read (`gc_enter_roots_frame`). A concrete
+/// accessor keeps the rtyper from binding generic `std::cell::Cell<T>::get`. The dispatch loop
+/// loads this word; zero means the context is missing or the slot is
+/// unresolved. `#[inline(never)]` keeps the residual at this function so
+/// rustc does not paste `Cell::get` into `eval_loop_jit`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn execution_context_root_stack_slot_get(ec: *const ExecutionContext) -> usize {
+    if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).root_stack_slot.get() }
+    }
 }
 
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
@@ -1937,7 +1968,12 @@ impl ExecutionContext {
         // `get_last_lineno`: the two differ on exactly the instructions that
         // carry a line but may not start one, and `-1` is what both guards
         // below are written against.
-        let lineno = unsafe { (*anchor.live()).get_lineno_for_pc_tracing() };
+        let lineno = unsafe {
+            crate::pycode::w_code_get_lineno_for_pc_tracing(
+                (*anchor.live()).pycode as PyObjectRef,
+                last_instr,
+            )
+        };
         let want_line = unsafe {
             // `getorcreatedebug()` with no argument: reached only through
             // `bytecode_only_trace`, which returns early unless

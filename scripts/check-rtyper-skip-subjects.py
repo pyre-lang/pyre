@@ -252,6 +252,91 @@ def read_baseline(
     return True, header, want
 
 
+def module_move_key(name: str) -> str:
+    """Rewrite a crate-moved optional module onto one comparison name.
+
+    `#1854` moved optional modules from `pyre-interpreter` to
+    `pyre-module`. The graph is the same subject; only the crate prefix
+    changed, so both spellings compare as one name. The specialized-graph
+    digest stays: two `__spec_` copies that differ only in that suffix
+    are distinct subjects.
+    """
+    for prefix in (
+        "pyre_interpreter::module::",
+        "pyre_module::module::",
+    ):
+        if name.startswith(prefix):
+            return "module::" + name[len(prefix):]
+    return name
+
+
+def spec_stem(name: str) -> str:
+    """Digest-less stem of a specialized graph name.
+
+    `clause_spec.spec_leaf` ends a specialized graph with an FNV-1a
+    digest of the spelled trait refs and types. A corpus move that
+    respells one mints a new digest for the same `{leaf}__spec_{readable}`
+    copy; the stem is that shared prefix.
+    """
+    return SPEC_DIGEST.sub("", name)
+
+
+def diff_skip_subjects(
+    got: dict[str, set[str]],
+    want: dict[str, set[str]],
+) -> tuple[
+    list[tuple[str, str]],
+    list[tuple[str, str]],
+    list[tuple[str, str, str]],
+    list[tuple[str, tuple[str, str], tuple[str, str]]],
+]:
+    """Split a Skip-set pair-diff into additions, removals, and renames.
+
+    Names are rewritten with [`module_move_key`] first. A graph that
+    lands in a different Skip class under the same full name is a
+    relocation, not an addition. A digest change is a rename only when
+    it is one: added and gone names are grouped by [`spec_stem`], and
+    within a stem gone pairs with added one-to-one. Only unpaired added
+    names (more added than gone under that stem) are additions.
+    """
+    flat_got = {(c, s) for c, subjects in got.items() for s in subjects}
+    flat_want = {(c, s) for c, subjects in want.items() for s in subjects}
+    pair_added = ({(c, module_move_key(s)) for c, s in flat_got}
+                  - {(c, module_move_key(s)) for c, s in flat_want})
+    pair_gone = ({(c, module_move_key(s)) for c, s in flat_want}
+                 - {(c, module_move_key(s)) for c, s in flat_got})
+    gone_names = {s for _, s in pair_gone}
+    added_names = {s for _, s in pair_added}
+    relocated = sorted(
+        (s, before, now)
+        for s in gone_names & added_names
+        for before in (c for c, t in pair_gone if t == s)
+        for now in (c for c, t in pair_added if t == s)
+    )
+
+    added_by_stem: dict[str, list[tuple[str, str]]] = {}
+    gone_by_stem: dict[str, list[tuple[str, str]]] = {}
+    for cls, subject in pair_added:
+        if subject not in gone_names:
+            added_by_stem.setdefault(spec_stem(subject), []).append((cls, subject))
+    for cls, subject in pair_gone:
+        if subject not in added_names:
+            gone_by_stem.setdefault(spec_stem(subject), []).append((cls, subject))
+
+    added: list[tuple[str, str]] = []
+    gone: list[tuple[str, str]] = []
+    digest_renamed: list[tuple[str, tuple[str, str], tuple[str, str]]] = []
+    for stem in sorted(set(added_by_stem) | set(gone_by_stem)):
+        added_here = sorted(added_by_stem.get(stem, ()))
+        gone_here = sorted(gone_by_stem.get(stem, ()))
+        n_pair = min(len(added_here), len(gone_here))
+        for i in range(n_pair):
+            digest_renamed.append((stem, gone_here[i], added_here[i]))
+        added.extend(added_here[n_pair:])
+        gone.extend(gone_here[n_pair:])
+    return sorted(added), sorted(gone), relocated, digest_renamed
+
+
 def write_baseline(header: dict[str, str], got: dict[str, set[str]]) -> None:
     lines = [
         "# The graphs the two-phase prepass still Skips to the legacy walker.",
@@ -325,41 +410,11 @@ def main() -> int:
     # addition "newly Skipped" is false -- the name never left the set.
     # Relocation is the ordinary shape of progress here: a graph that
     # stops declining on its first blocker reaches a later one and is
-    # categorised by that instead.
-    def module_move_key(name: str) -> str:
-        # `#1854` moved optional modules from `pyre-interpreter` to
-        # `pyre-module`. The graph is the same subject; only the crate
-        # prefix changed, so both spellings compare as one name.
-        for prefix in (
-            "pyre_interpreter::module::",
-            "pyre_module::module::",
-        ):
-            if name.startswith(prefix):
-                name = "module::" + name[len(prefix) :]
-                break
-        # `clause_spec.spec_leaf` ends a specialized graph's name with an
-        # FNV-1a digest of the spelled trait refs and types. A corpus move
-        # that respells one (a new impl, a changed path) mints a new digest
-        # for the same `{leaf}__spec_{readable}` copy, so the digest is not
-        # part of the subject.
-        if "__spec_" in name:
-            name = SPEC_DIGEST.sub("", name)
-        return name
-
-    pair_added = ({(c, module_move_key(s)) for c, s in flat_got}
-                  - {(c, module_move_key(s)) for c, s in flat_want})
-    pair_gone = ({(c, module_move_key(s)) for c, s in flat_want}
-                 - {(c, module_move_key(s)) for c, s in flat_got})
-    gone_names = {s for _, s in pair_gone}
-    added_names = {s for _, s in pair_added}
-    added = sorted((c, s) for c, s in pair_added if s not in gone_names)
-    gone = sorted((c, s) for c, s in pair_gone if s not in added_names)
-    relocated = sorted(
-        (s, before, now)
-        for s in gone_names & added_names
-        for before in (c for c, t in pair_gone if t == s)
-        for now in (c for c, t in pair_added if t == s)
-    )
+    # categorised by that instead. A specialized-graph digest change is
+    # the same kind of rename when one gone name pairs with one added
+    # name under the digest-less stem; a second copy under that stem is
+    # a new subject.
+    added, gone, relocated, digest_renamed = diff_skip_subjects(got, want)
 
     print(f"rtyper skip-subject ratchet [{header['platform']}]: "
           f"{len(flat_got)} subjects, baseline {len(flat_want)}")
@@ -393,6 +448,14 @@ def main() -> int:
             print(f"  - {subject}: {before} -> {now}")
         if len(relocated) > 20:
             print(f"  ... and {len(relocated) - 20} more")
+
+    if digest_renamed:
+        print(f"\n{len(digest_renamed)} specialized subject(s) changed digest "
+              f"— still skipped, so not an addition; record with --update:")
+        for stem, (_gcls, gone_name), (_acls, added_name) in digest_renamed[:20]:
+            print(f"  - {stem}: {gone_name} -> {added_name}")
+        if len(digest_renamed) > 20:
+            print(f"  ... and {len(digest_renamed) - 20} more")
 
     if gone:
         print(f"\n{len(gone)} subject(s) no longer skipped — pay the baseline "

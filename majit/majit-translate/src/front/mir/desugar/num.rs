@@ -691,7 +691,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*const T>::read` / `<*mut T>::read` of a one-word pointee is
-    /// `raw_load` at offset 0. A wider `T` stays a residual call.
+    /// `raw_load` at offset 0. A multi-word `T` is the field-wise copy
+    /// `rffi.py` `_get_structcopy_fn.copyfn` emits for `structcopy`.
     pub(in crate::front::mir) fn try_lower_ptr_read(
         &mut self,
         mir_bb: usize,
@@ -715,35 +716,63 @@ impl<'a> Lowering<'a> {
         let [base] = args else {
             return Ok(false);
         };
-        let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty) else {
-            return Ok(false);
-        };
-        let bb_id = self.emit_bb(mir_bb);
-        let offset = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(offset.clone()),
-            kind: OpKind::ConstInt(0),
-        });
-        let res = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::RawLoad {
-                base: base.clone(),
-                offset,
-                item_ty,
-                itemsize,
-                is_item_signed,
-            },
-        });
-        self.local_var[dest_local] = Some(LocalValue::One(res));
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(true)
+        if let Some((item_ty, itemsize, is_item_signed)) = self
+            .raw_word_descr(dest_ty)
+            .or_else(|| self.span_raw_for_ty(dest_ty))
+        {
+            let bb_id = self.emit_bb(mir_bb);
+            let offset = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::RawLoad {
+                    base: base.clone(),
+                    offset,
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                },
+            });
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
+        // Multi-word pointee: `rffi.py` `_get_structcopy_fn.copyfn` copies
+        // one field at a time. `ptr::read` is that copy with no store-back.
+        // A residual `core::ptr::const_ptr::<Impl>::read` has no code
+        // address, so the walker sets `symbolic_residual_abort` and
+        // `run_blackhole_interp_to_cancel_tracing` refuses the frames.
+        if self.move_plan(dest_ty).is_some() {
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(u64::MAX),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: clone_tyref(dest_ty),
+            };
+            if let Some(old) = self.read_moved_aggregate(mir_bb, &place, Some(base.clone()))? {
+                self.local_var[dest_local] = Some(LocalValue::One(old));
+                let bb_id = self.emit_bb(mir_bb);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph.set_goto(bb_id, target_bb, link_args);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `i64`/`u64`/`isize`/`usize::wrapping_neg` is `llop.int_neg`.  The

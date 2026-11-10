@@ -6051,8 +6051,8 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
 /// segment [`trait_impl_identity_path`] writes) is not part of the owner.
 /// Dropping it makes `vec::Vec::<impl Deref<Vec<…>>>::deref` the same leaf
 /// as `alloc::vec::<Impl>::deref`. [`rust_vec_std_call`] still lowers only
-/// `new` / `with_capacity` / `push` / `as_ptr` / `as_mut_ptr`; the slice-view
-/// leaves go through [`rust_vec_slice_view`].
+/// `new` / `with_capacity` / `push` / `insert` / `as_ptr` / `as_mut_ptr`;
+/// the slice-view leaves go through [`rust_vec_slice_view`].
 pub(in crate::front::mir) fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
     let mut idx = [0usize; 4];
     let mut n = 0usize;
@@ -6152,12 +6152,14 @@ pub(in crate::front::mir) fn is_alloc_vec_from_elem(segments: &[String]) -> bool
 }
 
 /// The `Vec` operation and item kind of a `Vec::new()` /
-/// `Vec::with_capacity(n)` / `v.push(x)` / `v.as_ptr()` / `v.as_mut_ptr()`
-/// call on a `Vec` of one-word items: the constructors read the item from
-/// the result type, `push` / `as_ptr` / `as_mut_ptr` from the receiver.
-/// `as_ptr` / `as_mut_ptr` are `ll_items` (`rlist.py`: `return l.items`).
-/// `Vec::set_len` is a `FieldWrite` of the header `len` word (`l.length = n`),
-/// not a `VecOp` helper.
+/// `Vec::with_capacity(n)` / `v.push(x)` / `v.insert(i, x)` / `v.as_ptr()` /
+/// `v.as_mut_ptr()` call on a `Vec` of one-word items: the constructors read
+/// the item from the result type, `push` / `insert` / `as_ptr` /
+/// `as_mut_ptr` from the receiver. `as_ptr` / `as_mut_ptr` are `ll_items`
+/// (`rlist.py`: `return l.items`). `insert` is `ll_insert_nonneg`; rtyping
+/// rewrites a constant-0 index to `ll_prepend`. `Vec::set_len` is a
+/// `FieldWrite` of the header `len` word (`l.length = n`), not a `VecOp`
+/// helper.
 pub(in crate::front::mir) fn rust_vec_std_call(
     segments: &[String],
     nargs: usize,
@@ -6174,6 +6176,10 @@ pub(in crate::front::mir) fn rust_vec_std_call(
         ("with_capacity", 1) => Some((VecOp::NewHint, tyref_rust_vec_item_kind(dest_ty, llbc)?)),
         ("push", 2) => Some((
             VecOp::Append,
+            tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
+        )),
+        ("insert", 3) => Some((
+            VecOp::InsertNonneg,
             tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
         )),
         ("as_ptr" | "as_mut_ptr", 1) => {

@@ -18,7 +18,7 @@ use majit_ir::rvec::{
     VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, VecOp, vec_helper_path,
 };
 
-use crate::annotator::model::SomeValue;
+use crate::annotator::model::{SomeObjectTrait, SomeValue};
 use crate::flowspace::model::{ConstValue, Hlvalue};
 use crate::model::ConcreteType;
 use crate::translator::rtyper::error::TyperError;
@@ -356,6 +356,57 @@ impl Repr for RustVecRepr {
                     vec![self.lltype.clone(), self.item_lltype().clone()],
                     LowLevelType::Void,
                 )
+            }
+            // `rlist.py AbstractListRepr.rtype_method_insert`.
+            "insert" => {
+                let v = hop.inputargs(vec![
+                    ConvertedTo::Repr(self),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                    ConvertedTo::Repr(self.item_repr.as_ref()),
+                ])?;
+                let arg1 = hop.args_s.borrow().get(1).cloned().ok_or_else(|| {
+                    TyperError::message("RustVecRepr.rtype_method_insert: args_s[1] missing")
+                })?;
+                if arg1.is_constant()
+                    && matches!(
+                        arg1.const_(),
+                        Some(ConstValue::Int(0) | ConstValue::UInt(0))
+                    )
+                {
+                    hop.exception_cannot_occur()?;
+                    self.call_helper(
+                        hop,
+                        VecOp::Prepend,
+                        vec![v[0].clone(), v[2].clone()],
+                        vec![self.lltype.clone(), self.item_lltype().clone()],
+                        LowLevelType::Void,
+                    )
+                } else if matches!(&arg1, SomeValue::Integer(i) if i.nonneg) {
+                    hop.exception_cannot_occur()?;
+                    let index_lltype = match &v[1] {
+                        Hlvalue::Variable(var) => {
+                            var.concretetype().unwrap_or(LowLevelType::Signed)
+                        }
+                        Hlvalue::Constant(c) => {
+                            c.concretetype.clone().unwrap_or(LowLevelType::Signed)
+                        }
+                    };
+                    self.call_helper(
+                        hop,
+                        VecOp::InsertNonneg,
+                        v,
+                        vec![
+                            self.lltype.clone(),
+                            index_lltype,
+                            self.item_lltype().clone(),
+                        ],
+                        LowLevelType::Void,
+                    )
+                } else {
+                    Err(TyperError::message(
+                        "insert() index must be proven non-negative",
+                    ))
+                }
             }
             // `ll_reverse`.
             "reverse" => {

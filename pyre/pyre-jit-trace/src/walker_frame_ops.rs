@@ -262,12 +262,11 @@ impl<'frame, 'static_a: 'frame, Sym: crate::state::WalkSym> WalkerFrameOps
                 return;
             }
         }
-        // Record the guard op first; then capture the snapshot via the
-        // walker-side helper that reads `outer_active_boxes`,
-        // `outer_jitcode_index`, `entry_py_pc` from `self` (the
-        // `WalkContext`).  Re-borrow `trace_ctx` from `self` in a scope
-        // narrow enough that `walker_capture_snapshot_for_last_guard`'s
-        // `&mut WalkContext` arg sees a fresh exclusive borrow.
+        // Fill virtualizable holes before the guard is recorded so
+        // `capture_resumedata` numbers only boxes that already exist
+        // (`pyjitpl.py MetaInterp.generate_guard`).
+        self.trace_ctx
+            .fill_virtualizable_boxes_to_declared_layout(None);
         self.trace_ctx.record_guard(opcode, args, 0);
         // `walker_capture_snapshot_for_last_guard` returns a typed abort
         // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the

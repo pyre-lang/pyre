@@ -4155,7 +4155,7 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     // JitCode position can sit in a later emission island owned by that same
     // opcode (notably an exception-edge bridge), where the containing/floor
     // coordinate still names the preceding instruction.  Use the same
-    // exact-first resolution as `record_caught_blackhole_traceback`; otherwise
+    // exact-first resolution as `dispatch_bytecode` / `handle_exception`; otherwise
     // the traceback records the raising opcode while GUARD_NOT_FORCED_2 saves
     // the preceding one and a later force rolls `frame.last_instr` backwards.
     let Some(py_pc) =

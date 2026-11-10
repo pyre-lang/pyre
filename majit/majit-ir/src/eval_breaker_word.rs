@@ -99,6 +99,16 @@ static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
 static ACTION_TICKER: AtomicPtr<AtomicIsize> = AtomicPtr::new(std::ptr::null_mut());
 static TICKER_FORCED: AtomicIsize = AtomicIsize::new(0);
 
+/// Address of the process-owned `ActionFlag._ticker`, or 0 before the
+/// process action flag has been constructed.  Compiled back-edges embed this
+/// stable address and perform PyPy's raw ticker load/store sequence.
+pub fn action_ticker_addr() -> usize {
+    ACTION_TICKER.load(Ordering::Acquire) as usize
+}
+
+/// Width used by `raw_load_i` / `raw_store_i` for `ActionFlag._ticker`.
+pub const ACTION_TICKER_WORD_SIZE: usize = size_of::<AtomicIsize>();
+
 /// Publish the process `ActionFlag` ticker. The cell is an `AtomicIsize`;
 /// signal handlers and collectors store `-1` into it.
 pub fn publish_action_ticker(ptr: *mut AtomicIsize) {
@@ -660,6 +670,13 @@ mod tests {
             OpCode::GuardNotForced,
             &[]
         )));
+    }
+
+    /// `ActionFlag.decrement_ticker` stores an `isize`; the compiled back-edge
+    /// load/store descriptor must use the same width.
+    #[test]
+    fn action_ticker_word_is_pointer_width() {
+        assert_eq!(ACTION_TICKER_WORD_SIZE, size_of::<isize>());
     }
 
     /// One request arms the poll once: the taker reports it, clears it, and the

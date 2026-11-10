@@ -256,9 +256,9 @@ pub struct Snapshot {
 /// `OpRef` enum (resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref},
 /// resoperation.py IntOp *Op mixin variants) carries the same type
 /// tag intrinsically. `cached` is the box object
-/// `opencoder.py SnapshotIterator._untag` / `TraceIterator._cache` holds
-/// for the slot; resume numbering walks that instead of resolving the
-/// OpRef through a producer map.
+/// `opencoder.py TraceIterator._get` / `SnapshotIterator._untag` hold
+/// for this snapshot coordinate in the current iterator; resume numbering
+/// walks that instead of resolving the OpRef through a producer map.
 #[derive(Debug, Clone)]
 pub struct SnapshotBox {
     /// The trace-position ref this snapshot slot references. A
@@ -320,6 +320,21 @@ impl SnapshotBox {
         if self.cached.is_none() && !self.opref.is_none() && !self.opref.is_constant() {
             self.cached = cache.get(self.opref.raw() as usize).cloned().flatten();
         }
+    }
+
+    /// Overwrite `cached` with the current iterator's box for this slot
+    /// (`opencoder.py TraceIterator._get` / `SnapshotIterator._untag`).
+    /// One snapshot coordinate, one current cache box: a remapped slot
+    /// never keeps an earlier namespace's box. Constants and none keep
+    /// `cached` empty. A miss on a non-constant slot also clears `cached`
+    /// so `_number_one` falls back to `get_box_replacement_operand`.
+    /// Call before `map_opref` rewrites the OpRef.
+    pub fn rebind_iter_cache(&mut self, cache: &[Option<Operand>]) {
+        if self.opref.is_none() || self.opref.is_constant() {
+            self.cached = None;
+            return;
+        }
+        self.cached = cache.get(self.opref.raw() as usize).cloned().flatten();
     }
 }
 
@@ -3456,9 +3471,9 @@ impl ResumeDataLoopMemo {
     /// before the next box is decoded. Callers that already hold a slice use
     /// `_number_boxes`; the byte-bridge walk calls this directly.
     ///
-    /// `cached` is the box object `TraceIterator._cache` holds for the slot
-    /// when the caller has it (`SnapshotIterator._untag` hands out that
-    /// object), so the replacement walk starts from the box itself.
+    /// `cached` is the box object `opencoder.py TraceIterator._get` /
+    /// `SnapshotIterator._untag` hold for the slot when the caller has it,
+    /// so the replacement walk starts from the current iterator's box.
     fn _number_one(
         &mut self,
         snapshot_box: SnapshotBox,

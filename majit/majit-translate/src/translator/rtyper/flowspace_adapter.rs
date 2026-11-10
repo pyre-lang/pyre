@@ -114,7 +114,7 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// The high-level operations one `ll_vec_*` helper call stands for:
 /// `newrustvec(ITEM[, hint])`, `len`, `getitem`, `setitem`, or a
 /// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
-/// `extend_from_slice` / `extend` method. `ITEM` is a constant item
+/// `extend_from_slice` / `extend` / `insert` method. `ITEM` is a constant item
 /// lowleveltype (`lltype.py` `malloc` / `ann_malloc`).
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
@@ -128,8 +128,8 @@ fn rust_vec_helper_ops(
     let arity = match op {
         VecOp::NewEmpty => 0,
         VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
-        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
-        VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend | VecOp::Prepend => 2,
+        VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
     };
     if arg_hls.len() != arity {
         return Err(TyperError::message(format!(
@@ -156,6 +156,7 @@ fn rust_vec_helper_ops(
         VecOp::Items => ("simple_call", Some("items")),
         VecOp::ExtendFromSlice => ("simple_call", Some("extend_from_slice")),
         VecOp::Extend => ("simple_call", Some("extend")),
+        VecOp::InsertNonneg | VecOp::Prepend => ("simple_call", Some("insert")),
     };
     let Some(method) = method else {
         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
@@ -164,6 +165,9 @@ fn rust_vec_helper_ops(
     let receiver = args.next().expect("arity checked");
     let bound_method = Hlvalue::Variable(Variable::new());
     let mut call_args = vec![bound_method.clone()];
+    if op == VecOp::Prepend {
+        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::Int(0))));
+    }
     call_args.extend(args);
     Ok(vec![
         FlowspaceOp::new(
@@ -5859,7 +5863,6 @@ pub(crate) fn derive_subject_inputcells(
                         .get(root)
                         .cloned()
                         .unwrap_or_else(|| root.clone());
-                    let root = &root;
                     // A `GcStruct._arrayfld` block (`lltype.py`) is
                     // `SomePtr(GcArray)` or `FixedSizeListRepr`
                     // (`SomeList`), not the wrapping ClassDef.
@@ -5871,7 +5874,7 @@ pub(crate) fn derive_subject_inputcells(
                     // is `getarraysize` / `SomeList.len`, not
                     // `getattr("__len__")` on `SomeInstance`
                     // (`unaryop.py` `len_SomeInstance`).
-                    let projected = bk.project_struct_field_type(root);
+                    let projected = bk.project_struct_field_type(&root);
                     if matches!(
                         projected,
                         crate::annotator::model::SomeValue::Ptr(_)
@@ -5892,15 +5895,24 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
+                    // A `MutRef<T>` cell is a synthetic one-field class with no
+                    // struct-field rows, interned by qualname like its constructor.
+                    // Bare red-type names (`PyFrame`) miss the registry when the
+                    // leaf alias was withdrawn; `registered_struct_root_key`
+                    // recovers the qualified key `getuniqueclassdef_for_struct_root`
+                    // already projects (`redirect_withdrawn_struct_leaf`).
                     let known = bk
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
-                        // A `MutRef<T>` cell is a synthetic one-field class with no
-                        // struct-field rows, interned by qualname like its constructor.
-                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
-                    if known {
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root))
+                        || majit_ir::descr::strip_instantiation_suffix(&root) == "MutRef";
+                    let resolved_root = if known {
+                        Some(root)
+                    } else {
+                        bk.registered_struct_root_key(&root)
+                    };
+                    if let Some(root) = resolved_root.as_deref() {
                         // A `&RawStruct` is the address of that struct
                         // (`Ptr` of a raw `Struct`, `history.getkind`).
                         // FieldRead of the same owner already seeds
@@ -8207,6 +8219,61 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    /// `PYPYJIT_RED_TYPES` spells the bare leaf `PyFrame`. When
+    /// `harden_duplicate_leaf_metadata` withdraws that alias, the
+    /// registry keeps only `pyframe::PyFrame`. `bindinputargs` must still
+    /// seed the ClassDef so portal `setattr("last_instr")` is not
+    /// classdef-less (`unaryop.py`).
+    #[test]
+    fn derive_subject_inputcells_seeds_bare_pypyjit_red_type_from_qualified_key() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut graph = LegacyGraph::new("pypyjit_red_type");
+            let entry = graph.startblock;
+            let frame = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "frame".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some("PyFrame".to_string()),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, frame);
+            graph.access_directly_inputs = Some(vec![graph.block(entry).inputargs[0].id()]);
+
+            let bk = Rc::new(Bookkeeper::new());
+            let mut fields = crate::front::StructFieldRegistry::default();
+            let rows = vec![
+                ("last_instr".to_string(), "i64".to_string()),
+                ("pycode".to_string(), "usize".to_string()),
+            ];
+            fields
+                .fields
+                .insert("pyframe::PyFrame".to_string(), rows.clone());
+            fields
+                .fields
+                .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+            bk.set_struct_fields(Rc::new(fields));
+
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
+                .expect("bare PyFrame red-type must resolve the qualified registry key");
+            let SomeValue::Instance(value) = &cells[0] else {
+                panic!("portal red must seed SomeInstance, got {:?}", cells[0])
+            };
+            let classdef = value
+                .classdef
+                .as_ref()
+                .expect("withdrawn-leaf PyFrame must not stay classdef-less");
+            assert!(
+                classdef.borrow().attrs.contains_key("last_instr"),
+                "PyFrame.last_instr must be projected so setattr can locate it"
+            );
+            assert_eq!(value.flags.get("access_directly"), Some(&true));
+        });
     }
 
     #[test]
@@ -12397,8 +12464,12 @@ mod tests {
                     | VecOp::Reverse
                     | VecOp::Free
                     | VecOp::Items => 1,
-                    VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
-                    VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+                    VecOp::GetItem
+                    | VecOp::Append
+                    | VecOp::AllocAndSet
+                    | VecOp::Extend
+                    | VecOp::Prepend => 2,
+                    VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
                 };
                 let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
                 let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -12473,13 +12544,16 @@ mod tests {
                     | VecOp::Free
                     | VecOp::Items
                     | VecOp::ExtendFromSlice
-                    | VecOp::Extend => {
+                    | VecOp::Extend
+                    | VecOp::InsertNonneg
+                    | VecOp::Prepend => {
                         let method = match op {
                             VecOp::Append => "append",
                             VecOp::Reverse => "reverse",
                             VecOp::Items => "items",
                             VecOp::ExtendFromSlice => "extend_from_slice",
                             VecOp::Extend => "extend",
+                            VecOp::InsertNonneg | VecOp::Prepend => "insert",
                             _ => "free",
                         };
                         assert_eq!(translated.len(), 2);
@@ -12491,7 +12565,20 @@ mod tests {
                         assert_eq!(name.value.as_text(), Some(method));
                         assert_eq!(last.opname, "simple_call");
                         assert_eq!(last.args[0], translated[0].result);
-                        assert_eq!(&last.args[1..], &arg_hls[1..]);
+                        if op == VecOp::Prepend {
+                            assert_eq!(last.args.len(), 3, "{path}");
+                            let Hlvalue::Constant(index) = &last.args[1] else {
+                                panic!("{path}: prepend index must be a Constant");
+                            };
+                            assert!(
+                                matches!(index.value, ConstValue::Int(0)),
+                                "{path}: prepend index must be signed 0, got {:?}",
+                                index.value
+                            );
+                            assert_eq!(last.args[2], arg_hls[1]);
+                        } else {
+                            assert_eq!(&last.args[1..], &arg_hls[1..]);
+                        }
                     }
                 }
             }

@@ -533,6 +533,8 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // cannot report it.  Left out, an unwind to the handler read as a block
     // permutation and armed the reorder region over the whole handler body,
     // where `ShadowReseed` drops every operand box the shadow does not carry.
+    // The same edge now lands the mirror via `land_vstack_at_handler` rather
+    // than replaying the raising opcode's ordinary stack-effect class.
     // One Python opcode's jitcode expansion can carry more than one boundary
     // marker, so a boundary can report the py_pc it came from.  The walk has
     // not left that opcode there, so the opcode has not retired.
@@ -585,6 +587,26 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             crate::liveness::exception_target_pc(code, prev_pypc),
             ctx.frame_state.borrow().vstack_last_ref
         );
+    }
+    // pyjitpl.py MetaInterp.finishframe_exception moves the live frame to the
+    // catch_exception target with the exception already in its registers
+    // before any later capture_resumedata; the raising opcode's normal stack
+    // effect is never replayed across the unwind.
+    let exception_edge = !repeat_boundary
+        && !(has_fallthrough && new_pypc as usize == fallthrough)
+        && crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) != Some(new_pypc as usize)
+        && crate::liveness::exception_target_pc(code, prev_pypc) == Some(new_pypc as usize);
+    if exception_edge {
+        land_vstack_at_handler(
+            ctx,
+            "reconcile",
+            jit_pc,
+            new_pypc,
+            new_pypc,
+            new_depth,
+            ctx.last_exc_value().unwrap_or(OpRef::NONE),
+        );
+        return;
     }
     // A JitCode's block layout can visit source-PC floor segments out of
     // Python bytecode order.  In that case `vstack_cur_pypc` is only the
@@ -1678,6 +1700,54 @@ fn vstack_handler_diag(
     }
 }
 
+/// Shared handler-entry reconstruction for [`vstack_enter_exception_handler`],
+/// the callee twin, and an exception-table edge in
+/// [`reconcile_vstack_at_boundary`].  Callers compute `handler_py` /
+/// `handler_depth`; this applies the landing itself.
+fn land_vstack_at_handler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    arm: &str,
+    handler_jit_pc: usize,
+    handler_py: u32,
+    floor_py: u32,
+    handler_depth: usize,
+    exc: OpRef,
+) {
+    if !ctx.fbw_mode.inline_subwalk {
+        ctx.frame_state.borrow_mut().vstack_boxes.clear();
+    }
+    ctx.frame_state
+        .borrow_mut()
+        .vstack_boxes
+        .resize(handler_depth, OpRef::NONE);
+    disarm_vstack_reorder_region(ctx);
+    // The unwinder pushes the caught exception onto the new TOS.
+    if handler_depth >= 1 && exc != OpRef::NONE {
+        ctx.frame_state.borrow_mut().vstack_boxes[handler_depth - 1] = exc;
+    }
+    vstack_handler_diag(
+        arm,
+        handler_jit_pc,
+        ctx.vstack_cur_pypc,
+        handler_py,
+        floor_py,
+        handler_depth,
+    );
+    ctx.vstack_cur_pypc = handler_py;
+    ctx.vstack_depth = handler_depth;
+    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
+    ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
+    if !ctx.fbw_mode.inline_subwalk {
+        // Revive: the handler-entry state is shadow-sourced, independent of the
+        // pre-raise mirror.
+        ctx.vstack_valid = true;
+        // Fill the surviving slots below the pushed exc from the shadow; reseed
+        // skips the already-set exc slot (non-NONE).  Leaves un-sourceable slots
+        // NONE (per-slot decline) rather than latching the whole mirror invalid.
+        let _ = reseed_vstack_from_shadow(ctx, handler_depth);
+    }
+}
+
 /// #370: model the exception-unwind boundary on the operand-stack mirror.
 /// When a raised exception is caught by THIS frame's handler (the SubRaise
 /// catch in the dispatch loop), the unwinder truncates the operand stack to
@@ -1756,35 +1826,15 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     } else {
         py_stack_depth(code_ptr, handler_py)
     };
-    ctx.frame_state.borrow_mut().vstack_boxes.clear();
-    ctx.frame_state
-        .borrow_mut()
-        .vstack_boxes
-        .resize(handler_depth, OpRef::NONE);
-    disarm_vstack_reorder_region(ctx);
-    // The unwinder pushes the caught exception onto the new TOS.
-    if handler_depth >= 1 && exc != OpRef::NONE {
-        ctx.frame_state.borrow_mut().vstack_boxes[handler_depth - 1] = exc;
-    }
-    vstack_handler_diag(
+    land_vstack_at_handler(
+        ctx,
         "outer",
         handler_jit_pc,
-        ctx.vstack_cur_pypc,
         handler_py,
         floor_py,
         handler_depth,
+        exc,
     );
-    ctx.vstack_cur_pypc = handler_py;
-    ctx.vstack_depth = handler_depth;
-    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
-    ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
-    // Revive: the handler-entry state is shadow-sourced, independent of the
-    // pre-raise mirror.
-    ctx.vstack_valid = true;
-    // Fill the surviving slots below the pushed exc from the shadow; reseed
-    // skips the already-set exc slot (non-NONE).  Leaves un-sourceable slots
-    // NONE (per-slot decline) rather than latching the whole mirror invalid.
-    let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
 
 /// Handler-entry re-seed for a catch that happens INSIDE an inline sub-walk.
@@ -1834,27 +1884,15 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     // Truncate to the handler's setup depth, keeping the tracked survivors; a
     // mirror shallower than the handler depth pads with NONE holes, which
     // `mirror_covers_kept` declines per slot rather than latching invalid.
-    ctx.frame_state
-        .borrow_mut()
-        .vstack_boxes
-        .resize(handler_depth, OpRef::NONE);
-    disarm_vstack_reorder_region(ctx);
-    // The unwinder pushes the caught exception onto the new TOS.
-    if handler_depth >= 1 && exc != OpRef::NONE {
-        ctx.frame_state.borrow_mut().vstack_boxes[handler_depth - 1] = exc;
-    }
-    vstack_handler_diag(
+    land_vstack_at_handler(
+        ctx,
         "callee",
         handler_jit_pc,
-        ctx.vstack_cur_pypc,
         handler_py,
         floor_py,
         handler_depth,
+        exc,
     );
-    ctx.vstack_cur_pypc = handler_py;
-    ctx.vstack_depth = handler_depth;
-    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
-    ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
 }
 
 #[cfg(test)]

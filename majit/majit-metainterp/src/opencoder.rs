@@ -1962,14 +1962,13 @@ impl Trace {
             // opencoder.py — `_descrs = [None]` so index 0 is reserved.
             // Stays host: items are `DescrRef`, not GC objects yet.
             _descrs: vec![None],
-            // opencoder.py `Trace._refs = [nullptr]`. Items array starts at
-            // 32 slots so the first ConstPtrs do not reallocate.
+            // opencoder.py `Trace._refs = [nullptr]`.
             _refs: trace_bufs::new_refs(),
-            _refs_dict: crate::FxIndexMap::with_capacity_and_hasher(32, Default::default()),
+            _refs_dict: crate::FxIndexMap::default(),
             _bigints: trace_bufs::new_bigints(),
             _bigints_dict: crate::FxIndexMap::default(),
             _floats: trace_bufs::new_floats(),
-            // `ListRepr` items reserved at 128 chars (`ll_newlist_hint`).
+            // opencoder.py `self._snapshot_data = []`.
             _snapshot_data: trace_bufs::new_snapshot(),
             _snapshot_array_data: trace_bufs::new_snapshot(),
             _total_snapshots: 0,
@@ -3661,44 +3660,16 @@ mod tests {
     }
 
     #[test]
-    fn trace_new_reserves_constptr_and_snapshot_pools() {
-        // opencoder.py Trace.__init__ starts `_refs` / snapshot lists
-        // empty. A Vec that doubles through 8/16/32/64/128 B on every
-        // regex bridge was the timed-row class (`_encode_ptr`,
-        // `encode_varint_signed`). The first 16 unique ConstPtrs and the
-        // first 128 snapshot bytes must stay inside the constructor
-        // reserve.
-        let mut trace = TraceRecordBuffer::new(0, empty_sd());
-        assert!(
-            trace._refs.capacity() >= 32,
-            "_refs must absorb the first unique ConstPtrs without growing"
-        );
-        assert!(
-            trace._snapshot_data.capacity() >= 128,
-            "_snapshot_data must absorb the first snapshot without a 64 B grow"
-        );
-        assert!(
-            trace._snapshot_array_data.capacity() >= 128,
-            "_snapshot_array_data must absorb the first snapshot without a 64 B grow"
-        );
-        let refs_cap = trace._refs.capacity();
-        let snap_cap = trace._snapshot_array_data.capacity();
-        for i in 1..=16u64 {
-            let _ = trace._encode_ptr(i * 0x1000);
-        }
-        assert_eq!(
-            trace._refs.capacity(),
-            refs_cap,
-            "16 unique ConstPtrs grew _refs off the constructor reserve"
-        );
-        for i in 0..32 {
-            trace.append_snapshot_array_data_int(i);
-        }
-        assert_eq!(
-            trace._snapshot_array_data.capacity(),
-            snap_cap,
-            "32 snapshot varints grew _snapshot_array_data off the constructor reserve"
-        );
+    fn trace_new_matches_opencoder_init_list_sizes() {
+        // opencoder.py Trace.__init__: `_refs = [nullptr]` is `ll_newlist(1)`;
+        // `_snapshot_data = []` is `ll_newemptylist`. Constructor then
+        // `append_snapshot_array_data_int(0)`, which grows that list.
+        let trace = TraceRecordBuffer::new(0, empty_sd());
+        assert_eq!(trace._refs.len(), 1);
+        assert_eq!(trace._refs.capacity(), 1);
+        assert_eq!(trace._snapshot_data.len(), 0);
+        assert_eq!(trace._snapshot_data.capacity(), 0);
+        assert!(!trace._snapshot_array_data.is_empty());
     }
 
     #[test]

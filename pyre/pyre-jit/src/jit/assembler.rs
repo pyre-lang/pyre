@@ -287,8 +287,9 @@ impl Assembler {
     }
 
     /// Checked assembly used by runtime graph construction.  The canonical
-    /// `assembler.py` format has one-byte register/constant operands; `None`
-    /// declines a graph whose per-kind namespace cannot be represented.
+    /// `assembler.py` format has one-byte register/constant operands and a
+    /// 2-byte `-live-` offset (`liveness.encode_offset`); `None` declines a
+    /// graph whose per-kind namespace or liveness offset cannot be represented.
     pub fn try_assemble(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -326,7 +327,7 @@ impl Assembler {
                 .as_mut()
                 .expect("insns_pos initialized")
                 .push(state.builder.current_pos());
-            self.write_insn(&mut state, insn);
+            self.write_insn(&mut state, insn)?;
         }
 
         self.fix_labels(&mut state);
@@ -341,7 +342,13 @@ impl Assembler {
     }
 
     /// `assembler.py` `write_insn(insn)`.
-    fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) {
+    ///
+    /// `None` when a `-live-` offset would not fit in the 2-byte operand
+    /// (`assembler.py` `_encode_liveness` / `encode_offset`). The caller
+    /// declines the graph the same way `try_assemble` declines a
+    /// single-byte register overflow, and `drain_unfinished_graphs`
+    /// records `JIT_SHAPE_CONST_ENCODING_OVERFLOW`.
+    fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) -> Option<()> {
         match insn {
             Insn::Unreachable => {}
             Insn::Label(label) => {
@@ -365,10 +372,10 @@ impl Assembler {
                     let live_r = get_liveness_info(args, Kind::Ref);
                     let live_f = get_liveness_info(args, Kind::Float);
                     let patch_offset = state.builder.live_placeholder();
-                    let offset = self.encode_liveness_info(&live_i, &live_r, &live_f);
+                    let offset = self.encode_liveness_info(&live_i, &live_r, &live_f)?;
                     state.builder.patch_live_offset(patch_offset, offset);
                     self.record_insn_key(opname, args, None);
-                    return;
+                    return Some(());
                 }
                 // `assembler.py:208-209`:
                 //   elif isinstance(x, IndirectCallTargets):
@@ -400,6 +407,7 @@ impl Assembler {
                 dispatch_op(state, opname, args, result.as_ref(), opcode_byte);
             }
         }
+        Some(())
     }
 
     /// `assembler.py` `fix_labels()`.
@@ -469,7 +477,7 @@ impl Assembler {
         live_i: &VecSet<u8>,
         live_r: &VecSet<u8>,
         live_f: &VecSet<u8>,
-    ) -> u16 {
+    ) -> Option<u16> {
         use majit_jitcode::liveness::encode_liveness;
 
         self.num_liveness_ops += 1;
@@ -477,24 +485,18 @@ impl Assembler {
         let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
             cached
         } else {
-            // The 2-byte `-live-` operand caps the buffer at 64 KiB, upstream
-            // included. pyre spends the low end of that budget on the
-            // build-time drain's bytes (`resuming_build_time_liveness`), so
-            // name both halves — an overflow here is "the shared pool filled
-            // up", not "the runtime codewriter alone ran away".
-            assert!(
-                self.all_liveness_length <= u16::MAX as usize,
-                "all_liveness offset overflow at {} bytes ({} of them the \
-                 build-time drain's prefix); a `-live-` operand is 2 bytes",
-                self.all_liveness_length,
-                pyre_jit_trace::jitcode_runtime::all_liveness().len(),
-            );
-            assert!(
-                live_i.len() <= u8::MAX as usize
-                    && live_r.len() <= u8::MAX as usize
-                    && live_f.len() <= u8::MAX as usize,
-                "too many live registers in one slot"
-            );
+            // The 2-byte `-live-` operand caps the buffer at 64 KiB
+            // (`liveness.encode_offset`). Runtime FBW of user graphs shares
+            // this pool with the build-time drain prefix
+            // (`resuming_build_time_liveness`). Decline the graph the same
+            // way `intern_liveness` already does.
+            if self.all_liveness_length > u16::MAX as usize
+                || live_i.len() > u8::MAX as usize
+                || live_r.len() > u8::MAX as usize
+                || live_f.len() > u8::MAX as usize
+            {
+                return None;
+            }
             let pos = self.all_liveness_length as u16;
             self.all_liveness.push(live_i.len() as u8);
             self.all_liveness.push(live_r.len() as u8);
@@ -515,7 +517,13 @@ impl Assembler {
             self.all_liveness_length,
             self.num_liveness_ops,
         );
-        pos
+        Some(pos)
+    }
+
+    #[cfg(test)]
+    fn fill_liveness_past_u16_offset(&mut self) {
+        self.all_liveness.resize(u16::MAX as usize + 1, 0);
+        self.all_liveness_length = self.all_liveness.len();
     }
 
     fn record_insn_key(
@@ -1533,6 +1541,33 @@ fn dispatch_op(
                 _ => expect_array_bh_descr(state, &args[2], "raw_load_i"),
             };
             state.builder.raw_load_i(dst, base, offset, descr_idx);
+        }
+        // `blackhole.py bhimpl_raw_store_i` / `jtransform.py rewrite_op_raw_store`.
+        // Same raw (non-GC) array descr as `raw_load_i`; used by the compiled
+        // `ActionFlag.decrement_ticker` store on JUMP_BACKWARD.
+        "raw_store_i" => {
+            assert_eq!(
+                args.len(),
+                4,
+                "raw_store_i expects [base, offset, value, arraydescr]"
+            );
+            let base = expect_int_reg_or_pool(state, &args[0]);
+            let offset = expect_int_reg_or_pool(state, &args[1]);
+            let value = expect_int_reg_or_pool(state, &args[2]);
+            let descr_idx = match &args[3] {
+                Operand::Descr(d) => match &**d {
+                    DescrOperand::Bh(majit_jitcode::jitcode::BhDescr::Array {
+                        itemsize,
+                        is_item_signed,
+                        ..
+                    }) => state
+                        .builder
+                        .add_raw_int_array_descr_signed(*itemsize, *is_item_signed),
+                    _ => expect_array_bh_descr(state, &args[3], "raw_store_i"),
+                },
+                _ => expect_array_bh_descr(state, &args[3], "raw_store_i"),
+            };
+            state.builder.raw_store_i(base, offset, value, descr_idx);
         }
         // Heap GC-array primitives, canonical shapes
         // `new_array_clear/id>r` (blackhole.py `bhimpl_new_array_clear`)
@@ -2657,6 +2692,21 @@ mod tests {
             jitcode.is_none(),
             "200 ref registers + 100 pooled ref constants exceeds the one-byte \
              operand namespace and must decline"
+        );
+    }
+
+    #[test]
+    fn try_assemble_declines_liveness_offset_overflow() {
+        let mut ssarepr = SSARepr::new("live_overflow");
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(r(Kind::Ref, 0))]));
+        let mut assembler = Assembler::new();
+        assembler.fill_liveness_past_u16_offset();
+        let jitcode = assembler.try_assemble(&mut ssarepr, JitCodeBuilder::default(), None);
+        assert!(
+            jitcode.is_none(),
+            "a `-live-` offset past the 2-byte operand must decline the graph"
         );
     }
 

@@ -1308,6 +1308,29 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// One-word `*p = v`: a raw pointer to a scalar, or a transparent
+    /// GCREF newtype (`PyError`, `PyObjectRef`). Multi-word pointees
+    /// use `move_plan` / `rffi.py` `_get_structcopy_fn`.
+    fn one_word_deref_store_descr(
+        &self,
+        dest_ty: &TyRef,
+        deref_base_is_raw_ptr: bool,
+    ) -> Option<(ValueType, usize, bool)> {
+        if deref_base_is_raw_ptr {
+            if let Some(descr) = self.raw_word_descr(dest_ty) {
+                // `rewrite_op_raw_store` stores a raw word. A GC `Ref`
+                // pointee is `setfield` of a GC struct (`rewrite_op_setfield`);
+                // `gc_mut_ref_param_root` already took FieldWrite of `value`.
+                if !matches!(descr.0, ValueType::Ref(_)) {
+                    return Some(descr);
+                }
+            }
+        }
+        // A transparent GCREF newtype (`PyError`) that missed the cell
+        // FieldWrite declines rather than `raw_store` of a GCREF.
+        None
+    }
+
     /// `*p = v` when `p` is not a field or array reborrow.
     ///
     /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
@@ -1361,8 +1384,8 @@ impl<'a> Lowering<'a> {
                 return Ok(None);
             }
         }
-        if deref_base_is_raw_ptr
-            && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+        if let Some((item_ty, itemsize, is_item_signed)) =
+            self.one_word_deref_store_descr(dest_ty, deref_base_is_raw_ptr)
         {
             let offset = self
                 .graph
@@ -10010,6 +10033,71 @@ fn peel_raw_ptr_instance_root(root: &str) -> &str {
         .or_else(|| t.strip_prefix("*mut "))
         .map(str::trim)
         .unwrap_or(t)
+}
+
+/// `usize` / `isize` / `u64` / `i64` whose width is the target pointer size.
+fn tyref_is_machine_word_int(ty: &TyRef, llbc: &Llbc) -> bool {
+    int_cast_size_and_sign(ty, llbc)
+        .is_some_and(|(size, _)| size == crate::layout::target_word_size() as u64)
+}
+
+/// Charon `TyKind` of a data pointer: `RawPtr` or `Ref`, after alias peel.
+fn tyref_is_data_pointer_type(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| type_node_peel_aliases(node, llbc))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|obj| obj.contains_key("RawPtr") || obj.contains_key("Ref"))
+}
+
+/// Charon `TyKind` of a function pointer (`FnPtr`), after alias peel.
+fn tyref_is_fn_pointer_type(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+}
+
+/// Pointer TYPE: raw pointer, reference, or `fn` pointer. Decided from
+/// the Charon constructor, not `history.getkind`'s register bank.
+fn tyref_is_pointer_type(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_data_pointer_type(ty, llbc) || tyref_is_fn_pointer_type(ty, llbc)
+}
+
+/// Host cast for an equal-size `transmute` that `rbuiltin.py`
+/// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` cover: a pointer
+/// TYPE (`RawPtr` / `Ref` / `FnPtr`) and a machine-word integer, or a
+/// data pointer ↔ `fn` pointer pair (`_cffi_backend::cglob`). `None`
+/// keeps the residual intrinsic.
+pub(in crate::front::mir) fn transmute_ptr_int_host_cast(
+    src: &TyRef,
+    dst: &TyRef,
+    llbc: &Llbc,
+) -> Option<(&'static str, ValueType)> {
+    let src_size = tyref_exact_layout_size(src, llbc)?;
+    let dst_size = tyref_exact_layout_size(dst, llbc)?;
+    if src_size != dst_size {
+        return None;
+    }
+    let src_ptr = tyref_is_pointer_type(src, llbc);
+    let dst_ptr = tyref_is_pointer_type(dst, llbc);
+    let src_word = tyref_is_machine_word_int(src, llbc);
+    let dst_word = tyref_is_machine_word_int(dst, llbc);
+    if src_ptr && dst_word {
+        let unsigned = int_cast_size_and_sign(dst, llbc).is_some_and(|(_, unsigned)| unsigned);
+        Some((
+            "cast_ptr_to_int",
+            if unsigned {
+                ValueType::Unsigned
+            } else {
+                ValueType::Int
+            },
+        ))
+    } else if dst_ptr && src_word {
+        Some(("cast_int_to_ptr", ValueType::Ref(None)))
+    } else if tyref_is_data_pointer_type(src, llbc) && tyref_is_fn_pointer_type(dst, llbc) {
+        Some(("cast_ptr_to_int", ValueType::Int))
+    } else if tyref_is_fn_pointer_type(src, llbc) && tyref_is_data_pointer_type(dst, llbc) {
+        Some(("cast_int_to_ptr", ValueType::Ref(None)))
+    } else {
+        None
+    }
 }
 
 /// The operation `jtransform.py _int_to_int_cast` rewrites an integer

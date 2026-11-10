@@ -661,6 +661,15 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
+/// `pyjitpl.py` `opimpl_jit_force_quasi_immutable` raises
+/// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force ran.
+fn abort_force_quasi_immut_action() -> TraceAction {
+    TraceAction::SwitchToBlackhole(majit_metainterp::SwitchToBlackhole {
+        reason: majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT,
+        raising_exception: false,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct MidBodyFlushWords {
     call_py_pc: usize,
@@ -1442,6 +1451,7 @@ fn static_entry_merge_point(
 /// and is populated by `copy_constants` instead. The sidecar
 /// enters before the marker, so forward selection (unlike bridge resume's
 /// backward selection) identifies the marker owned by this green entry.
+
 fn static_entry_merge_point_green_regs(
     code: &[u8],
     scan: &crate::pyjitcode::LoopScanIndex,
@@ -5760,6 +5770,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // is_being_profiled] are seeded below with the concrete greens that
     // selected the cell. The reds `rr` = [frame, ec] are seeded here.
     // `frame` is the
+
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `ec` must remain the second live red box.  PyPy's
     // `PyPyJitDriver.reds` names `ec`, and `MIFrame.get_list_of_active_boxes`
@@ -5798,6 +5809,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // inputs at their per-JitCode metadata colors. The marker's
             // `pycode` green is a Constant; its Int greens are seeded with
             // the `argboxes_i` below.
+
             let frame_color = if portal_frame_reg != u16::MAX {
                 portal_frame_reg as u8
             } else {
@@ -5810,6 +5822,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             };
             seed(frame_color, frame_box);
             seed(ec_color, ec_box);
+
             reserved_red_colors.push(frame_color);
             reserved_red_colors.push(ec_color);
         } else {
@@ -8433,19 +8446,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
-                // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
-                // attempt because the version was live when the walk met the
-                // write.  The forcing already ran, so the next attempt finds a
-                // stabilised namespace and traces — the reason PyPy reports
-                // thousands of these and still compiles the loop.  Retiring the
-                // location would be strictly wrong.
-                | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. }
                 // The callee, not this portal, is what `disable_noninlinable_function`
                 // (`warmstate.py`) names. `abort_operator_tail_after_return`
                 // marks that callee (`fbw_mark_callee_dont_trace`); retiring
                 // the enclosing portal blacklists every later walk of the loop.
                 | DE::LoopBearingCalleeInlineUnsupported { .. } => TraceAction::Abort,
+                // `opimpl_jit_force_quasi_immutable` raises
+                // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force
+                // ran. The next attempt traces a stabilised namespace;
+                // retiring the location would be strictly wrong.
+                DE::ForceQuasiImmutable { .. } => abort_force_quasi_immut_action(),
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same

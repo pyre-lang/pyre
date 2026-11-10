@@ -223,14 +223,6 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .and_then(|value| value.one().ok())
         {
-            // The residual ABI is the depth word (`frame_anchor_release`
-            // / lock-release). `FUNC.ARGS` is Int; stamp the cell so a
-            // later Skip-arm `s_None` projection cannot Void it before
-            // `getcalldescr` (`call.py`).
-            crate::model::FunctionGraph::set_concretetype_of_inline(
-                &arg,
-                crate::model::ConcreteType::Signed,
-            );
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Call {

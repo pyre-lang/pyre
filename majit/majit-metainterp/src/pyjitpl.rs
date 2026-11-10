@@ -1530,9 +1530,11 @@ fn translate_trace_iter_box_map(
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
             // Look up `_cache` by the recording position, then rewrite the
-            // OpRef. `attach_iter_cache` must run first: after the map the
-            // slot is in the fresh-iterator namespace.
-            boxref.attach_iter_cache(cache);
+            // OpRef. Rebind first (`opencoder.py TraceIterator._get` /
+            // `SnapshotIterator._untag`): `attach_iter_cache` would keep a
+            // parent-loop cache box, and after the map the slot is in the
+            // fresh-iterator namespace.
+            boxref.rebind_iter_cache(cache);
             *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
         }
     }
@@ -4924,18 +4926,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the slot's `OnceLock` and stamps `jitdriver_sd` the way
     /// `JitDriver::install_extracted_portal_jitcode` does.
     pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
-        let jd = self.staticdata.jitdrivers_sd.get(index)?;
-        if let Some(jitcode) = jd.mainjitcode.as_ref() {
-            return Some(jitcode);
-        }
-        let loader = jd.mainjitcode_loader?;
-        if jd.mainjitcode_loaded.get().is_none()
-            && let Some(jitcode) = loader()
-        {
-            jitcode.set_jitdriver_sd(index);
-            let _ = jd.mainjitcode_loaded.set(jitcode);
-        }
-        jd.mainjitcode_loaded.get()
+        self.staticdata.mainjitcode_of(index)
     }
 
     /// Whether the driver in `jitdrivers_sd[index]` carries a
@@ -4999,6 +4990,26 @@ impl<M: Clone> MetaInterp<M> {
             );
             staticdata.setup_insns(insns);
             staticdata.liveness_info.set(all_liveness.to_vec());
+        }
+        self.bind_blackhole_builder_shared_fields();
+    }
+
+    /// `blackhole.py` `BlackholeInterpBuilder(codewriter, self)` at
+    /// `pyjitpl.py` `finish_setup`. Replaces the default inline-call-only
+    /// constructor so FBW abort and guard-fail resume share one table.
+    /// Same single-owner `Arc::get_mut` window as [`Self::finish_setup`].
+    /// `install_wired` drops the previous cpu; rebind it the way
+    /// `BlackholeInterpBuilder.__init__` copies `codewriter.cpu`.
+    pub fn install_blackhole_builder_constructor(
+        &mut self,
+        wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
+    ) {
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_blackhole_builder_constructor called after `staticdata` was \
+             cloned; RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+            );
+            staticdata.blackholeinterpbuilder.install_constructor(wire);
         }
         self.bind_blackhole_builder_shared_fields();
     }
@@ -6250,21 +6261,19 @@ impl<M: Clone> MetaInterp<M> {
     /// Get the active virtualizable info.
     ///
     /// pyjitpl.py:3315 `vinfo = self.jitdriver_sd.virtualizable_info`.
-    /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
-    /// scanning `jitdrivers_sd` for callers that read this before any
-    /// trace has started (warmspot init, host-side queries).
+    /// Same slot as [`Self::resolve_active_jitdriver_sd_with_vinfo`]: an
+    /// elected novable driver (`generatorentry_driver`) must not inherit
+    /// a sibling's vinfo. The resolver still scans when no driver is
+    /// elected (warmspot init / host-side queries).
     #[inline]
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
-        if let Some(idx) = self.active_jitdriver_sd
-            && let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)
-            && jd.virtualizable_info.is_some()
-        {
-            return jd.virtualizable_info.as_ref();
-        }
-        self.staticdata
-            .jitdrivers_sd
-            .iter()
-            .find_map(|jd| jd.virtualizable_info.as_ref())
+        self.resolve_active_jitdriver_sd_with_vinfo()
+            .and_then(|idx| {
+                self.staticdata
+                    .jitdrivers_sd
+                    .get(idx)
+                    .and_then(|jd| jd.virtualizable_info.as_ref())
+            })
     }
 
     /// pyjitpl.py `self.jitdriver_sd = jitdriver_sd` parity —
@@ -21642,6 +21651,10 @@ impl PartialEq<&[u8]> for SharedLiveness {
     }
 }
 
+fn default_blackhole_builder() -> crate::blackhole::BlackholeInterpBuilder {
+    crate::blackhole::build_inline_call_only_bh_builder(&[])
+}
+
 /// `pyjitpl.py` `MetaInterpStaticData.blackholeinterpbuilder`.
 ///
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
@@ -21656,12 +21669,16 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// resume on the same thread pops another interpreter off this same builder.
 pub struct SharedBlackholeInterpBuilder {
     inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
+    /// `BlackholeInterpBuilder(codewriter, self)`. Nested `lock` while the
+    /// one builder is held constructs the same table rather than blocking.
+    wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
 }
 
 impl Default for SharedBlackholeInterpBuilder {
     fn default() -> Self {
         Self {
             inner: parking_lot::Mutex::new(crate::blackhole::BlackholeInterpBuilder::new()),
+            wire: default_blackhole_builder,
         }
     }
 }
@@ -21675,13 +21692,24 @@ impl std::fmt::Debug for SharedBlackholeInterpBuilder {
 
 impl SharedBlackholeInterpBuilder {
     /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
-    /// are not the blackhole dispatch table; the constructor body is
-    /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// are not the blackhole dispatch table; the default constructor body is
+    /// [`crate::blackhole::build_inline_call_only_bh_builder`]. Pyre's
+    /// `finish_setup` replaces that with the production builder so helper
+    /// jitcodes and user-function bodies share this one table.
     /// Replaces the builder. The owner rebinds cpu afterwards
-    /// (`MetaInterp::new` / `finish_setup` call
+    /// (`MetaInterp::new` / `finish_setup` /
+    /// `install_blackhole_builder_constructor` call
     /// `bind_blackhole_builder_shared_fields`).
     fn install_wired(&mut self) {
-        *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
+        *self.inner.get_mut() = (self.wire)();
+    }
+
+    /// Install `wire` as the one `BlackholeInterpBuilder` constructor.
+    /// Nested `lock` while the mutex is held uses the same function.
+    /// Call while `staticdata` is uniquely owned (`warmspot.py` `finish_setup`).
+    pub fn install_constructor(&mut self, wire: fn() -> crate::blackhole::BlackholeInterpBuilder) {
+        self.wire = wire;
+        self.install_wired();
     }
 
     /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
@@ -21692,7 +21720,8 @@ impl SharedBlackholeInterpBuilder {
     /// Drop the guard before `resume_mainloop` / `run` / any residual call:
     /// `BlackholeInterpreter.__init__` already copied cpu/descrs/dispatch
     /// off the builder, and holding the mutex across those would deadlock a
-    /// nested resume on this thread.
+    /// nested resume on this thread. Nested resume uses a second
+    /// `acquire_interp` after that drop (`blackhole.py` `acquire_interp`).
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
         self.inner.lock()
     }
@@ -22070,6 +22099,25 @@ fn unique_effect_info_snapshots(
 }
 
 impl MetaInterpStaticData {
+    /// `call.py grab_initial_jitcodes` `jd.mainjitcode` for a `jitdrivers_sd`
+    /// slot. Shared by [`MetaInterp::mainjitcode_of`] and the machine's
+    /// `BC_RECURSIVE_CALL_*` inline path (`pyjitpl.py _opimpl_recursive_call`
+    /// `portal_code = targetjitdriver_sd.mainjitcode`).
+    pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        let jd = self.jitdrivers_sd.get(index)?;
+        if let Some(jitcode) = jd.mainjitcode.as_ref() {
+            return Some(jitcode);
+        }
+        let loader = jd.mainjitcode_loader?;
+        if jd.mainjitcode_loaded.get().is_none()
+            && let Some(jitcode) = loader()
+        {
+            jitcode.set_jitdriver_sd(index);
+            let _ = jd.mainjitcode_loaded.set(jitcode);
+        }
+        jd.mainjitcode_loaded.get()
+    }
+
     /// pyjitpl.py `self.jitlog.setup_once()`: install the logger late if
     /// the static data was built before the environment was set. Idempotent.
     pub fn ensure_jitlog_initialised(&self) {
@@ -29757,6 +29805,19 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn install_blackhole_builder_constructor_rebinds_cpu() {
+        fn empty() -> crate::blackhole::BlackholeInterpBuilder {
+            crate::blackhole::BlackholeInterpBuilder::new()
+        }
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.install_blackhole_builder_constructor(empty);
+        assert!(
+            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            "install_blackhole_builder_constructor rebinds BlackholeInterpBuilder.cpu"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "called after `staticdata` was cloned")]
     fn metainterp_finish_setup_panics_after_staticdata_clone() {
         // The Rust `Arc::get_mut` adaptation only matches RPython's
@@ -29956,6 +30017,59 @@ mod metainterp_static_data_tests {
             &info
         ));
     }
+
+    #[test]
+    fn virtualizable_info_does_not_borrow_sibling_when_novable_driver_is_elected() {
+        // pyjitpl.py `vinfo = self.jitdriver_sd.virtualizable_info`:
+        // `generatorentry_driver` / `unpackiterable_driver` carry none.
+        // A registered sibling with vinfo (jd0) must not leak into that
+        // read; `_do_jit_force_virtual` would otherwise force jd0's
+        // virtualizable from the novable guard's resume data.
+        let mut meta = MetaInterp::<()>::new(1);
+        let info = std::sync::Arc::new(crate::virtualizable::VirtualizableInfo::new(0));
+        meta.set_virtualizable_info(info.clone());
+
+        let mut jd0 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd0.portal_runner_adr = 0x1111;
+        let idx0 = meta.register_jitdriver_sd(jd0);
+        assert_eq!(idx0, 0);
+        assert!(
+            meta.staticdata.jitdrivers_sd[0]
+                .virtualizable_info
+                .is_some()
+        );
+
+        let mut jd1 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd1.portal_runner_adr = 0x2222;
+        let idx1 = meta.register_jitdriver_sd(jd1);
+        assert!(
+            meta.staticdata.jitdrivers_sd[idx1]
+                .virtualizable_info
+                .is_none()
+        );
+
+        meta.active_jitdriver_sd = Some(idx0);
+        assert!(std::sync::Arc::ptr_eq(
+            meta.virtualizable_info().expect("jd0 keeps vinfo"),
+            &info
+        ));
+
+        meta.active_jitdriver_sd = Some(idx1);
+        assert!(
+            meta.virtualizable_info().is_none(),
+            "elected novable driver must not borrow jd0 vinfo"
+        );
+        // `fielddescr.get_vinfo()` / `vinfos[VTYPEPTR]` still names jd0:
+        // opcode FieldDescr lookup uses that table, not the tracing
+        // driver's session vable (`virtualizable_info_does_not_borrow_sibling`).
+        assert!(std::sync::Arc::ptr_eq(
+            meta.staticdata.jitdrivers_sd[0]
+                .virtualizable_info
+                .as_ref()
+                .expect("jd0 keeps VTYPE vinfo for FieldDescr"),
+            &info
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -29995,6 +30109,23 @@ mod tests {
     #[test]
     fn nested_resume_acquires_from_the_same_builder() {
         let sd = MetaInterpStaticData::new();
+        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.lock();
+        builder.release_interp(nested);
+        builder.release_interp(outer);
+    }
+
+    #[test]
+    fn blackholeinterpbuilder_nested_uses_the_installed_constructor() {
+        fn marker() -> crate::blackhole::BlackholeInterpBuilder {
+            let mut builder = default_blackhole_builder();
+            builder.op_live = 7;
+            builder
+        }
+        let mut sd = MetaInterpStaticData::new();
+        sd.blackholeinterpbuilder.install_constructor(marker);
+        assert_eq!(sd.blackholeinterpbuilder.lock().op_live, 7);
         let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
         let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
         let mut builder = sd.blackholeinterpbuilder.lock();

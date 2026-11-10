@@ -25875,42 +25875,27 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
 
 /// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
 ///
-/// `collect_outer_active_boxes` / `reseed_vstack_from_shadow` already treat
-/// that encoding as unwritten; overlaying it onto `_opimpl_setarrayitem_vable`
-/// last_exc is what made `bhimpl_raise` see a null ref register.
+/// `publish_frame_array_slots_for_snapshot` keeps a real vable box
+/// (`_opimpl_setarrayitem_vable` last_exc) and fills only a hole from the
+/// mirror; a mirror ConstPtr(NULL) fills that hole only for a stored live
+/// NULL (CALL `self_or_null`). Otherwise `bhimpl_raise` sees a null ref.
 #[test]
 fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
-    let last_exc = OpRef::const_ptr(majit_ir::GcRef(0x1000));
     let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
     let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), false),
+        resume_snapshot::snapshot_stack_box(hole, false),
         None,
-        "Const NULL must not overwrite a live last_exc box"
+        "a dead-color Const NULL does not fill a slot"
     );
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), true),
+        resume_snapshot::snapshot_stack_box(hole, true),
         Some(hole),
-        "CALL self_or_null still overwrites when the slot stored live NULL"
+        "CALL self_or_null fills the slot that stored live NULL"
     );
+    assert_eq!(resume_snapshot::snapshot_stack_box(live, false), Some(live));
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(hole), false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, None, false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(OpRef::NONE), false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(live, Some(last_exc), false),
-        Some(live)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(OpRef::NONE, Some(last_exc), false),
+        resume_snapshot::snapshot_stack_box(OpRef::NONE, false),
         None
     );
 }
@@ -28633,6 +28618,185 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
     assert_eq!(live[0], red0);
     assert_eq!(live[1], red1);
     assert_eq!(&live[2..], initial_boxes.as_slice());
+
+    // `MetaInterp.capture_resumedata` encodes existing boxes, including a
+    // declared `ConstPtr(NULL)`. Capture records nothing after the guard.
+    let cond = tc.const_int(1);
+    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond], 0);
+    assert_eq!(tc.last_op_opcode(), Some(majit_ir::OpCode::GuardTrue));
+    let ops_at_guard = tc.num_recorded_ops();
+    assert!(tc.virtualizable_boxes_declared_through(array_len));
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                array_len,
+                &[],
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.last_op_opcode(),
+                Some(majit_ir::OpCode::GuardTrue)
+            );
+            assert_eq!(
+                wc.trace_ctx.num_recorded_ops(),
+                ops_at_guard,
+                "snapshot capture recorded an operation after the guard"
+            );
+        },
+    );
+}
+
+/// A pcdep Ref color fills a missing stack slot only when that color is
+/// live at the resume jitcode pc (`MIFrame.get_list_of_active_boxes`).
+#[test]
+fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 1;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let reg = tc.const_ref(0x10);
+    let mut regs_r = [reg];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x10_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            wc.vstack_valid = false;
+            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[],
+                None,
+                None,
+            );
+            assert_ne!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(reg),
+                "dead pcdep Ref color must not fill a missing stack slot"
+            );
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[0],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(reg),
+                "live pcdep Ref color fills a missing stack slot"
+            );
+        },
+    );
+}
+
+/// A stored live NULL is a real item (`capture_resumedata` encodes the
+/// existing box); a live pcdep Ref must not replace it.
+#[test]
+fn snapshot_stack_slot_keeps_stored_live_null() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 1;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let const_null = tc.const_null();
+    let initial_boxes = vec![const_null; slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    tc.mark_virtualizable_slot_live_null(nvs);
+    let reg = tc.const_ref(0x10);
+    let mut regs_r = [reg];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x10_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            wc.vstack_valid = false;
+            let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[0],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(const_null),
+                "stored live NULL must stay; live pcdep Ref must not fill it"
+            );
+        },
+    );
 }
 
 /// An inlined callee's first `jit_merge_point` with

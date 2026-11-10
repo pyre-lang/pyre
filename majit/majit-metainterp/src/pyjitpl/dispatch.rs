@@ -2572,6 +2572,9 @@ where
     /// [`resolve_vable_box`].  Mirrors the upstream
     /// `(struct, fielddescr)` argument tuple of
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
+    ///
+    /// Session vinfo first (`jitdriver_sd.virtualizable_info`), then the
+    /// current frame's driver. Never the first registered driver.
     fn vable_field_descr(
         &mut self,
         ctx: &TraceCtx,
@@ -2579,19 +2582,37 @@ where
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let descr = ctx
-            .virtualizable_info()
-            .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
+        let descr = if let Some(info) = ctx.virtualizable_info() {
+            info.static_field_descrs().get(field_idx).cloned()
+        } else {
+            self.current_jitdriver_vinfo(ctx)
+                .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
+        };
         match descr {
             Some(descr) => Some((vable_opref, descr)),
             None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .map(|info| info.static_field_descrs().len());
+                let declared = if let Some(info) = ctx.virtualizable_info() {
+                    Some(info.static_field_descrs().len())
+                } else {
+                    self.current_jitdriver_vinfo(ctx)
+                        .map(|info| info.static_field_descrs().len())
+                };
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
             }
         }
+    }
+
+    /// `jitcode.jitdriver_sd.virtualizable_info` of the current MIFrame.
+    fn current_jitdriver_vinfo<'a>(
+        &mut self,
+        ctx: &'a TraceCtx,
+    ) -> Option<&'a std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
+        let jd = self.frames.current_mut().jitcode.jitdriver_sd()?;
+        ctx.metainterp_sd()
+            .jitdrivers_sd
+            .get(jd)
+            .and_then(|jd| jd.virtualizable_info.as_ref())
     }
 
     /// Name the reason a vable descriptor lookup declined, under
@@ -2648,6 +2669,8 @@ where
     /// array index to the cached `(arrayfielddescr, arraydescr)` pair
     /// from `VirtualizableInfo` and pairs it with the box operand
     /// resolved by [`resolve_vable_box`].
+    ///
+    /// Same driver-owned vinfo as [`Self::vable_field_descr`].
     fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
@@ -2655,17 +2678,31 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let pair = ctx.virtualizable_info().and_then(|info| {
-            let fdescr = info.array_field_descrs().get(array_idx)?.clone();
-            let adescr = info.array_descrs.get(array_idx)?.clone();
-            Some((fdescr, adescr))
-        });
+        let pair = if let Some(info) = ctx.virtualizable_info() {
+            match (
+                info.array_field_descrs().get(array_idx).cloned(),
+                info.array_descrs.get(array_idx).cloned(),
+            ) {
+                (Some(fdescr), Some(adescr)) => Some((fdescr, adescr)),
+                _ => None,
+            }
+        } else {
+            self.current_jitdriver_vinfo(ctx).and_then(|info| {
+                Some((
+                    info.array_field_descrs().get(array_idx)?.clone(),
+                    info.array_descrs.get(array_idx)?.clone(),
+                ))
+            })
+        };
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
             None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .map(|info| info.array_field_descrs().len());
+                let declared = if let Some(info) = ctx.virtualizable_info() {
+                    Some(info.array_field_descrs().len())
+                } else {
+                    self.current_jitdriver_vinfo(ctx)
+                        .map(|info| info.array_field_descrs().len())
+                };
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None
             }
@@ -3797,7 +3834,28 @@ where
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
         // `portal_jitcode`; enter their portal at `green_pc` as before.
-        if let Some(portal) = runtime.portal_jitcode(jd_index) {
+        // Otherwise `pyjitpl.py _opimpl_recursive_call`
+        // `perform_call(portal_code)` with `portal_code =
+        // targetjitdriver_sd.mainjitcode`: production carries the extracted
+        // portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
+        // grab_initial_jitcodes`), and `MIFrame.setup_call` starts it at pc 0.
+        //
+        // `#[jit_interp]` `recursive_portal_call!` emits greens only
+        // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
+        // are a fresh frame (`recursive_fresh_entry_reds`) on the assembler
+        // arm, not opcode boxes. `mainjitcode_of` still finds the extracted
+        // portal for those drivers, but `setup_call` of greens alone leaves
+        // the merge-point vable identity empty (`listed red register 1`).
+        // Take the mainjitcode fallback only when the opcode carries reds
+        // (jtransform `handle_recursive_call` `make_three_lists` of the
+        // portal reds).
+        let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
+        let (portal, start_pc) = match runtime.portal_jitcode(jd_index) {
+            Some(portal) => (Some(portal), green_pc),
+            None if opcode_has_reds => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
+            None => (None, 0),
+        };
+        if let Some(portal) = portal {
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
             // R then F; `newframe(jitcode, greenkey)` → `f.setup(jitcode,
             // greenkey)` uses that one `greenkey` for unique_id and
@@ -3810,8 +3868,8 @@ where
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =
                 self.frames
-                    .take_frame(portal, green_pc, Some(greenkey.clone()), Some(ctx));
-            portal_frame.code_cursor = green_pc;
+                    .take_frame(portal, start_pc, Some(greenkey.clone()), Some(ctx));
+            portal_frame.code_cursor = start_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
             // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
             // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
@@ -3871,34 +3929,13 @@ where
             return TraceAction::Continue;
         }
 
-        // State-field production runtime leaves `portal_jitcode` None.  The
-        // former inline re-entry path recorded a fresh per-driver callee
-        // vable identity leaked for the process lifetime — no RPython/PyPy
-        // analog (PyPy reconstructs the callee vable from resumedata per
-        // resume) — so it is removed.  This shape aborts until a
-        // trace-scoped rebuild lands.
-        //
-        // Sending it to `exec_recursive_call_assembler` instead — which is
-        // what `_opimpl_recursive_call` does for every path that does not
-        // `perform_call`, and which reads as the obvious repair — does NOT
-        // work today, measured: the seam resolves its token through
-        // `get_assembler_token` → `compile_tmp_callback`, and that requires
-        // `jitdriver_sd.portal_runner_adr`.  Registering a driver without one
-        // violates `register_jitdriver_sd`'s documented invariant, and the
-        // `#[jit_interp]` macro install path has no hook that supplies it, so
-        // `majit/examples/tl` — the only crate in the corpus that emits
-        // `BC_RECURSIVE_CALL_*` — registers a driver with `portal_runner_adr`
-        // still 0.  Routing this arm there panics that `debug_assert!`; the
-        // `catch_unwind` in `run_to_end` swallows it into an abort whose
-        // rollback does not undo what the seam already did to the interpreter
-        // state, and `tl`'s `jit_recursive_call_matches_interp` then reads a
-        // wrong stack.  In release the same shape is worse than a panic: the
-        // assertion compiles out and `funcbox` bakes address 0.
-        //
-        // The prerequisite is therefore a portal runner on the driver
-        // (`warmspot.py` `jd.portal_runner_adr = adr_of(ll_portal_runner)`;
-        // `eval.rs` wires one for jd0, which is why production has no such
-        // hole), not a decision-routing change here.
+        // No portal jitcode on the runtime seam, or the extracted
+        // `jitdrivers_sd[jd].mainjitcode` was skipped because the opcode
+        // carries no reds (`#[jit_interp]` / `tl`). A refused recursive
+        // call has not run, so the blackhole must not resume past it
+        // (`refuse_unexecuted_recursive_call`). Routing to
+        // `exec_recursive_call_assembler` would bake `portal_runner_adr == 0`
+        // into `funcbox` (`compile_tmp_callback`).
         refuse_unexecuted_recursive_call(ctx)
     }
 
@@ -5288,23 +5325,19 @@ where
 /// shape as the green write `lower_stmt_fallback` used to discard, one layer
 /// down.
 ///
-/// This does NOT abort the process. `run_to_end` wraps every `run_one_step`
-/// in `catch_unwind` (see the `abort_after_panic` site above), so the unwind is
-/// caught and converted to [`TraceAction::Abort`] — the trace is discarded and
-/// the interpreter answers, with the message printed only under `MAJIT_LOG`.
-/// That is the point: it puts this mismatch on the same disposition as the
-/// sibling site in [`MetaInterp::run_one_step`]'s finished-frame branch, which
-/// reaches the same catch through `expect("inline int return missing caller
-/// destination")`. Before this, the two disagreed — that one aborted the trace,
-/// this one let the walk continue against a register the callee never wrote.
-fn typed_return_without_caller_destination(insn: &str, argcode: char) -> ! {
-    panic!(
-        "{insn} returned an `{argcode}` value into a non-empty framestack, but the \
-         caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. The \
-         `inline_call_*_{argcode}` form and the callee's terminator are one \
-         decision (jtransform.py:434 `reskind`) and this pair disagrees, so the \
-         returned value has no destination"
-    );
+/// Return [`TraceAction::Abort`]: discard the trace and let the interpreter
+/// answer. `check.py` treats a default-hook `panicked at` on stderr as
+/// JIT-PANIC even when `run_to_end`'s `catch_unwind` would convert it.
+fn typed_return_without_caller_destination(insn: &str, argcode: char) -> TraceAction {
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[jit] {insn} returned an `{argcode}` value into a non-empty framestack, \
+             but the caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. \
+             The `inline_call_*_{argcode}` form and the callee's terminator are one \
+             decision (jtransform.py:434 `reskind`); aborting the trace"
+        );
+    }
+    TraceAction::Abort
 }
 
 /// Legacy entry point used by tests and integrations that still hold
@@ -5745,7 +5778,10 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(header_pc);
-    machine.run_to_end(ctx, sym, runtime)
+    let action = machine.run_to_end(ctx, sym, runtime);
+    drop(machine);
+    publish_walk_abort_handoff(ctx, &action, &mut standalone);
+    action
 }
 
 /// `history.py *FrontendOp` / `resoperation.py InputArgInt(intval)`:
@@ -7552,6 +7588,59 @@ mod tests {
             !ctx.symbolic_residual_abort,
             "the one-shot refusal flag must be consumed by the publisher",
         );
+    }
+
+    /// Production `ClosureRuntimeWithResolver` leaves `portal_jitcode` None
+    /// and puts the extracted portal on `jitdrivers_sd[jd].mainjitcode`
+    /// (`call.py grab_initial_jitcodes`). Inline must still
+    /// `perform_call` that jitcode (`pyjitpl.py _opimpl_recursive_call`).
+    #[test]
+    fn recursive_call_inlines_mainjitcode_when_runtime_portal_is_none() {
+        let mut portal_builder = JitCodeBuilder::new();
+        portal_builder.int_return(0);
+        let portal = std::sync::Arc::new(portal_builder.finish());
+        portal.set_jitdriver_sd(0);
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(5, 42);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
+        jd.index = Some(0);
+        jd.mainjitcode = Some(portal.clone());
+        staticdata.jitdrivers_sd.push(jd);
+
+        let mut ctx = TraceCtx::new(
+            crate::recorder::Trace::new(),
+            0,
+            std::sync::Arc::new(staticdata),
+        );
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args_and_runtime(
+            &mut ctx,
+            &mut sym,
+            &caller,
+            0,
+            &RecursivePortalWithoutJitcodeRuntime,
+            &[],
+        );
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+                ..
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
+                finish_args
+            }
+            other => panic!("expected Finish[Int] from mainjitcode inline, got {other:?}"),
+        };
+        assert_eq!(finish_args.len(), 1);
+        assert_eq!(ctx.const_value(finish_args[0]), Some(42));
     }
 
     thread_local! {
@@ -11254,12 +11343,9 @@ mod tests {
     /// stale register.  The negative twin below is the same jitcode pair with
     /// the destination declared, and it must still return 7.
     ///
-    /// Asserted as `TraceAction::Abort`, not `#[should_panic]`: `run_to_end`
-    /// wraps `run_one_step` in `catch_unwind`, so the refusal never leaves the
-    /// tracer as a panic. A `#[should_panic]` version of this test FAILS with
-    /// "test did not panic as expected" while the message is printed — which is
-    /// also the answer to "is the sibling `.expect` at the finished-frame site
-    /// really louder than this was?". It is not; it aborts, and now so does this.
+    /// Asserted as `TraceAction::Abort`. The encoder can mint this pair;
+    /// the tracer discards the walk rather than writing the result into a
+    /// stale caller register.
     #[test]
     fn typed_return_under_a_void_inline_call_is_refused() {
         let mut callee = JitCodeBuilder::new();

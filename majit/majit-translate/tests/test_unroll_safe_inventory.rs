@@ -268,17 +268,22 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
     // EXTENDED_ARG loop is split here into the interpreter decoder and the
-    // two scalar projections consumed by `eval_loop_jit`.  The projections
-    // exist because the generated JIT's residual ABI cannot publish the
-    // decoder's Result<(usize, Instruction, OpArg)> as one value.  Each loop
-    // is bounded by the bytecode format's at-most-three EXTENDED_ARG units.
+    // two scalar projections plus the one-walk pair consumed by
+    // `eval_loop_jit`.  The projections exist because the generated JIT's
+    // residual ABI cannot publish the decoder's Result<(usize, Instruction,
+    // OpArg)> as one value.  Each loop is bounded by the bytecode format's
+    // at-most-three EXTENDED_ARG units.
     //
-    // Evidence for all three descent-scope changes: the complete cranelift
-    // `pyre/check.py` corpus passed in PR #1580's CI with every committed
-    // per-fixture jitstats baseline unchanged, including the corpus-wide
-    // `fbw_rolled_back_with_effects == 0` gate.  The public decoder has no
-    // jitcode in the generated metadata; both scalar projections do, so the
-    // evidence covers the reached pair as well as the unreachable graph.
+    // Evidence for the three PR #1580 descent-scope changes: the complete
+    // cranelift `pyre/check.py` corpus passed in that PR's CI with every
+    // committed per-fixture jitstats baseline unchanged, including the
+    // corpus-wide `fbw_rolled_back_with_effects == 0` gate.  The public
+    // decoder has no jitcode in the generated metadata; both scalar
+    // projections do, so the evidence covers the reached pair as well as
+    // the unreachable graph.  `decode_instruction_forward_dispatch` is the
+    // same loop returning both projections in one walk; `eval_loop_jit`
+    // calls it.  Without the hint, `look_inside_graph` residualizes the
+    // loop and the portal prepass skips on `instruction::<Impl>::from`.
     (
         "decode_instruction_forward",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop",
@@ -290,6 +295,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     (
         "decode_instruction_forward_packed",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (opcode/oparg projection)",
+    ),
+    (
+        "decode_instruction_forward_dispatch",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (pc+packed one walk)",
     ),
     // `ctypefunc.py W_CTypeFunc._call` carries `@jit.unroll_safe`, and the two
     // halves it is split into here both take it: the body that converts the

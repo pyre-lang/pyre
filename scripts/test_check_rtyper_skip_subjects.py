@@ -110,6 +110,63 @@ class SkipSubjectRatchetTests(unittest.TestCase):
             self.assertEqual(header, {"corpus": "abc", "platform": "test"})
             self.assertEqual(subjects, {})
 
+    def test_module_move_key_keeps_the_spec_digest(self) -> None:
+        name = "foo::bar__spec_Trait_0123456789abcdef"
+        self.assertEqual(CHECKER.module_move_key(name), name)
+        self.assertEqual(
+            CHECKER.module_move_key(
+                "pyre_interpreter::module::x__spec_T_0123456789abcdef"
+            ),
+            "module::x__spec_T_0123456789abcdef",
+        )
+        self.assertEqual(
+            CHECKER.module_move_key("pyre_module::module::x__spec_T_fedcba9876543210"),
+            "module::x__spec_T_fedcba9876543210",
+        )
+
+    def test_digest_respell_of_one_spec_is_not_an_addition(self) -> None:
+        want = {"two-phase-annotate-skipped": {"leaf__spec_T_0123456789abcdef"}}
+        got = {"two-phase-annotate-skipped": {"leaf__spec_T_fedcba9876543210"}}
+        added, gone, relocated, renamed = CHECKER.diff_skip_subjects(got, want)
+        self.assertEqual(added, [])
+        self.assertEqual(gone, [])
+        self.assertEqual(relocated, [])
+        self.assertEqual(len(renamed), 1)
+
+    def test_new_specialization_under_the_same_stem_is_an_addition(self) -> None:
+        want = {"two-phase-annotate-skipped": {"leaf__spec_T_0123456789abcdef"}}
+        got = {
+            "two-phase-annotate-skipped": {
+                "leaf__spec_T_0123456789abcdef",
+                "leaf__spec_T_fedcba9876543210",
+            }
+        }
+        added, gone, relocated, renamed = CHECKER.diff_skip_subjects(got, want)
+        self.assertEqual(
+            added,
+            [("two-phase-annotate-skipped", "leaf__spec_T_fedcba9876543210")],
+        )
+        self.assertEqual(gone, [])
+        self.assertEqual(relocated, [])
+        self.assertEqual(renamed, [])
+
+    def test_module_move_and_digest_respell_is_not_an_addition(self) -> None:
+        want = {
+            "two-phase-annotate-skipped": {
+                "pyre_interpreter::module::x__spec_T_0123456789abcdef"
+            }
+        }
+        got = {
+            "two-phase-annotate-skipped": {
+                "pyre_module::module::x__spec_T_fedcba9876543210"
+            }
+        }
+        added, gone, relocated, renamed = CHECKER.diff_skip_subjects(got, want)
+        self.assertEqual(added, [])
+        self.assertEqual(gone, [])
+        self.assertEqual(relocated, [])
+        self.assertEqual(len(renamed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

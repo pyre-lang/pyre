@@ -3208,6 +3208,8 @@ fn create_segmented_trace<Sym: WalkSym>(
     // is true, so `get_list_of_active_boxes` snapshots `self.pc` after the
     // `jit_merge_point` handler has decoded the op — the following `-live-`
     // (`jtransform.py handle_jit_marker__jit_merge_point` op2).
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
     let snapshot = if synthesized_python_opcode_boundary {
         walker_capture_segmented_python_opcode_guard(ctx, mp_opcode_pc)
@@ -12799,6 +12801,8 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
@@ -12928,6 +12932,8 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
         return Ok(false);
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
@@ -15237,10 +15243,14 @@ fn maybe_segment_python_merge<Sym: WalkSym>(
     jit_pc: usize,
     py_pc: usize,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
+    // `debug_merge_point` has no pending-exception guard.
+    // `convert_and_run_from_pyjitpl` copies `MetaInterp.last_exc_value` onto
+    // the first blackhole frame; `latch_abort_blackhole` already snapshots
+    // `last_exc_value_concrete` into that image, so a standing exception
+    // (the `except E as exc` handler) does not defer the cut.
     if ctx.is_top_level
         && ctx.trace_ctx.force_finish_trace()
         && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
-        && ctx.session.borrow().last_exc_value.is_none()
     {
         create_segmented_trace(ctx, jit_pc, py_pc, true)
     } else {
@@ -17162,6 +17172,15 @@ fn handle<Sym: WalkSym>(
             let outcome = trace_record_exact_value(ctx, OpCode::RecordExactValueR, box_, const_box);
             Ok((outcome, op.next_pc))
         }
+        // `pyjitpl.py opimpl_current_trace_length`: ConstInt(history.length()),
+        // no IR. Operand layout `/>i`: `[dst]`.
+        "current_trace_length/>i" => {
+            let len = ctx.trace_ctx.num_ops() as i64;
+            let result = ctx.trace_ctx.const_int(len);
+            let dst = code[op.pc + 1] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(len))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: write
         // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.
         "int_isconstant/i>i" => {
@@ -18292,6 +18311,12 @@ fn handle<Sym: WalkSym>(
             // The FBW walker keeps portal frames on `WalkSession::framestack`;
             // canonical helper levels have `w_code == 0` and do not contribute
             // to either depth or call identity.
+            //
+            // `pyjitpl.py opimpl_jit_merge_point` snapshots
+            // `history.any_operation()` *before* `debug_merge_point`. The
+            // empty-history Continue must not see this record, or a retrace
+            // at a header that already has targets would auto-close here.
+            let any_operation = ctx.trace_ctx.num_ops() > 0;
             let portal_call_depth = ctx
                 .trace_ctx
                 .portal_call_depth_fn
@@ -18632,6 +18657,18 @@ fn handle<Sym: WalkSym>(
                         .map(|f| f(key))
                         .unwrap_or(false);
                     if !has_targets {
+                        // pyjitpl.py `opimpl_jit_merge_point`: a new
+                        // `next_instr` green is not a loop close.
+                        // `FORCE_TOKEN` is the jitframe (`resoperation.py`).
+                        // `cpu.force` copies `jf_force_descr` onto `jf_descr`
+                        // (`llmodel.py force`); that cell is written only by
+                        // `CALL_MAY_FORCE` `_store_force_index` (the next
+                        // `GUARD_NOT_FORCED`) and `GUARD_NOT_FORCED_2`
+                        // `store_force_descr` (`assembler.py`). A standalone
+                        // merge-point `GUARD_NOT_FORCED` never becomes the
+                        // force descr, so token store stays
+                        // `vable_and_vrefs_before_residual_call` /
+                        // `store_token_in_vable` (`compile_done`).
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                 }

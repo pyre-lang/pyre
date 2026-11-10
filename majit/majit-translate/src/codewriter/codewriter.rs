@@ -331,11 +331,17 @@ impl CodeWriter {
                 subjects.insert(path.clone());
             }
         }
+        let portals: Vec<_> = callcontrol
+            .jitdrivers_sd()
+            .iter()
+            .map(|jd| (jd.portal_graph.clone(), jd.jit_merge_point_in.clone()))
+            .collect();
         crate::translator::rtyper::cutover::run_two_phase_prepass_with_wrappers(
             &registry,
             &subjects,
             callcontrol.function_graphs(),
             callcontrol.builtin_wrapper_indirect_graphs(),
+            &portals,
         );
         // The annotator is complete and no graph is built after it. The
         // pending bodies share their graphs with `function_graphs`, which

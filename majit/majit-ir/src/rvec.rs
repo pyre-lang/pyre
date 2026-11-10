@@ -263,10 +263,14 @@ pub enum VecOp {
     /// `v.extend_from_slice(s)` of a one-word object slice — `rlist.ll_extend`
     /// with `l2` the GcArray word (length at offset 0, items after it).
     Extend,
+    /// `v.insert(0, x)` — `ll_prepend`.
+    Prepend,
+    /// `v.insert(i, x)` — `ll_insert_nonneg`.
+    InsertNonneg,
 }
 
 impl VecOp {
-    pub const ALL: [VecOp; 12] = [
+    pub const ALL: [VecOp; 14] = [
         VecOp::NewEmpty,
         VecOp::NewHint,
         VecOp::Length,
@@ -279,6 +283,8 @@ impl VecOp {
         VecOp::ExtendFromSlice,
         VecOp::AllocAndSet,
         VecOp::Extend,
+        VecOp::Prepend,
+        VecOp::InsertNonneg,
     ];
 
     fn row(self) -> usize {
@@ -295,6 +301,8 @@ impl VecOp {
             VecOp::ExtendFromSlice => 9,
             VecOp::AllocAndSet => 10,
             VecOp::Extend => 11,
+            VecOp::Prepend => 12,
+            VecOp::InsertNonneg => 13,
         }
     }
 }
@@ -419,7 +427,7 @@ pub const VEC_BUF_ALLOC_CLEAR: &str = "majit_rlib::lltypesystem::rvec::vec_buf_a
 
 /// `(operation, item kind)` → helper path, rows in [`VecOp::ALL`] order and
 /// columns in [`VecItemKind::ALL`] order. Every path is spelled here once.
-const VEC_HELPERS: [[&str; 3]; 12] = [
+const VEC_HELPERS: [[&str; 3]; 14] = [
     [
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_r",
@@ -483,6 +491,16 @@ const VEC_HELPERS: [[&str; 3]; 12] = [
         "majit_rlib::lltypesystem::rvec::ll_vec_extend_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_extend_r",
         "majit_rlib::lltypesystem::rvec::ll_vec_extend_f",
+    ],
+    [
+        "majit_rlib::lltypesystem::rvec::ll_vec_prepend_i",
+        "majit_rlib::lltypesystem::rvec::ll_vec_prepend_r",
+        "majit_rlib::lltypesystem::rvec::ll_vec_prepend_f",
+    ],
+    [
+        "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_i",
+        "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_r",
+        "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_f",
     ],
 ];
 

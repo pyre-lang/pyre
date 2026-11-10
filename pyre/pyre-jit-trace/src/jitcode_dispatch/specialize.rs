@@ -19180,21 +19180,18 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         if !is_covered_bare_raise_read {
             // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
             // slot and the field otherwise.  Trace that test as the nullity
-            // guard `if prev_operr is not None` records.  It has to carry the
-            // walk's own `-live-` as both resume and liveness: this opcode is
+            // guard `if prev_operr is not None` records.  Resume and liveness
+            // are the later `-live-` after `getarrayitem_vable_r` of
+            // `exc_value` (`emit_live_placeholder!(py_pc)`): this opcode is
             // an exception-table target, so its block head is the handler
             // landing, which reads a `last_exception` value no guard failure
-            // carries (`blackhole.py` `bhimpl_last_exc_value`).  A later
-            // `-live-` whose snapshot still used that landing's liveness
-            // omitted the caught exception, and `GuardIsnull(prev)` failing
-            // resumed `raise/r` with a non-exception (`bhimpl_raise` /
-            // `resume.py _prepare_next_section`).  Skip only that guard when
-            // no later `-live-` exists.  Completing the save still records
-            // the GETFIELD and arms `FBW_EXC_PREV` so `POP_EXCEPT`
-            // (`pyframe.py _restore_exc_info` → `set_sys_exc_info3`)
-            // restores the saved prev.  Fold `w_prev` only when that guard
-            // was actually recorded (`pyjitpl.py` records a guard at every
-            // branch it specializes).  Without one, bind dst to the GETFIELD
+            // carries (`blackhole.py` `bhimpl_last_exc_value`).  Completing
+            // the save always records the GETFIELD and arms `FBW_EXC_PREV` so
+            // `POP_EXCEPT` (`pyframe.py _restore_exc_info` →
+            // `set_sys_exc_info3`) restores the saved prev.  Fold `w_prev`
+            // only when that guard was actually recorded (`pyjitpl.py`
+            // records a guard at every branch it specializes).  Without a
+            // named later live (unit-test skeleton), bind dst to the GETFIELD
             // so a residual `current_exception_or_none` Call does not also
             // stand.
             let is_null = prev_obj.is_null();

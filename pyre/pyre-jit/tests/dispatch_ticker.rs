@@ -34,6 +34,30 @@ fn fired_ticker_is_serviced_once_before_the_opcode() {
 }
 
 #[test]
+fn simple_counted_loop_few_iters_stays_in_the_interpreter() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            pyre_module::register();
+            init_jit_hooks();
+            let ec = alloc_execution_context();
+            let ec_ptr = ec.as_mut_ptr();
+            pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+            let code = compile_source_with_filename(
+                "i = 0\nwhile i < 10:\n    i += 1\nassert i == 10\n",
+                Mode::Exec,
+                "t1_loop_small.py",
+            )
+            .unwrap();
+            let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
+            eval_with_jit(&mut frame, None).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn simple_counted_loop_runs_through_the_portal() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)

@@ -219,7 +219,14 @@ impl Drop for RuntimeThread {
 /// thread and each entry point names it. The registration is given back by
 /// `RUNTIME_THREAD`'s destructor when the thread exits, which is what lets a
 /// second thread run pyre code afterwards.
-#[inline]
+///
+/// `dont_look_inside`: the body reads `thread_local!` `RUNTIME_THREAD_ENTERED`
+/// (`LocalKey::with`). Charon extracts that static as a `PlaceKind::Global`
+/// whose nullary FunctionPath is not a function (`front/mod.rs` thread_local
+/// accessor stubs). A trace already holds the GIL; the first-entry check is
+/// the same residual boundary as `all_thread_hooks_current` in this module.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn ensure_runtime_thread() {
     if RUNTIME_THREAD_ENTERED.with(|entered| entered.get()) {
         return;
@@ -228,6 +235,8 @@ pub fn ensure_runtime_thread() {
 }
 
 #[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn enter_runtime_thread() {
     // `_make_wrapper_for` enters a callback through this (`rgil.acquire_maybe_in_new_thread`).
     majit_rlib::rffi::set_acquire_maybe_in_new_thread(enter_external_callback_from_foreign_thread);
@@ -241,6 +250,11 @@ fn enter_runtime_thread() {
 ///
 /// pyre-jit's GC bootstrap has per-thread work of its own to hang off the same
 /// registration, so it asks rather than keeping a second flag.
+///
+/// `dont_look_inside`: same `RUNTIME_THREAD_ENTERED` `thread_local!` accessor
+/// as [`ensure_runtime_thread`].
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn runtime_thread_entered() -> bool {
     RUNTIME_THREAD_ENTERED.with(|entered| entered.get())
 }

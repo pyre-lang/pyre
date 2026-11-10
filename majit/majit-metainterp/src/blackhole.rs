@@ -3542,7 +3542,11 @@ fn handle_jitexception<P: BlackholeInterpPool>(
     // The leave callback runs return_trace/leave, which can collect; the pending
     // exception payload is a GC-traced local of `_handle_jitexception` (`blackhole.py`).
     let mut exc_roots = root_jitexception_payload(&mut exc);
-    // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
+    // `blackhole.py _handle_jitexception`: walk while
+    // `jitcode.jitdriver_sd is None`. `call.py` stamps
+    // `jd.mainjitcode.jitdriver_sd = jd`; `jitcode.py` leaves it `None`
+    // for non-portals. `bhimpl_jit_merge_point` acts on every level
+    // whose jitcode is a portal.
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
         // `pyopcode.py handle_operation_error` stores
@@ -12367,15 +12371,40 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "jit_force_quasi_immutable/id",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I,
         ),
+        // `blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`. Canonical keys,
+        // not a dynamic `setdefault` gap: `handle_recursive_call` always
+        // emits all six lists (`jtransform.py`).
+        (
+            "recursive_call_i/iIRFIRF>i",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_INT,
+        ),
+        (
+            "recursive_call_r/iIRFIRF>r",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_REF,
+        ),
+        (
+            "recursive_call_f/iIRFIRF>f",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+        ),
+        (
+            "recursive_call_v/iIRFIRF",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`, a key the
-    // assembler numbers dynamically; `handler_recursive_call_v` is wired
-    // below and no-ops until the key is in this map (`blackhole.py
-    // bhimpl_recursive_call_v`).
+    // Extra keys a caller already numbered (tests, or a build whose
+    // `asm.insns` still holds a pre-pin recursive_call byte). Same key at
+    // the same byte is a no-op.
     for (key, byte) in dynamic_insns {
-        debug_assert!(
+        if let Some(&existing) = insns.get(*key) {
+            assert_eq!(
+                existing, *byte,
+                "dynamic insn {key} byte {byte} disagrees with registered {existing}"
+            );
+            continue;
+        }
+        assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"
         );
