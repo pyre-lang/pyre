@@ -970,6 +970,118 @@ pub fn filter_portal_runner(
     }
 }
 
+/// jd5 (`generator.py` `unpack_into`) merge-point hook.
+/// `pycode` is the green; `w_gen` and `w_list` are the pinned reds;
+/// `root_base` is the pinned generator-slot Int red.
+type UnpackIntoMergeFn =
+    fn(pycode: PyObjectRef, w_gen: PyObjectRef, w_list: PyObjectRef, root_base: i64);
+majit_gc::oncelock_fn_static!(static UNPACK_INTO_MERGE_HOOK: OnceLock<UnpackIntoMergeFn>);
+
+pub fn register_unpack_into_merge_hook(f: UnpackIntoMergeFn) {
+    let _ = UNPACK_INTO_MERGE_HOOK.set(f);
+}
+
+thread_local! {
+    /// `DoneWithThisFrameVoid` analogue for jd5. 0 = fall through into the
+    /// drain body; 1 = compiled drain finished; 2 = compiled exception
+    /// parked in [`UNPACK_INTO_COMPILED_EXC`]
+    /// (`warmspot.py` `handle_jitexception` / `ExitFrameWithExceptionRef`).
+    static UNPACK_INTO_COMPILED_KIND: Cell<i64> = const { Cell::new(0) };
+    /// Exception parked when [`UNPACK_INTO_COMPILED_KIND`] is 2.
+    static UNPACK_INTO_COMPILED_EXC: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Called from `UnpackIntoJitDriver::jit_merge_point`. No-op until the JIT
+/// installs the hook.
+#[inline]
+pub fn unpack_into_merge_point(
+    pycode: PyObjectRef,
+    w_gen: PyObjectRef,
+    w_list: PyObjectRef,
+    root_base: i64,
+) {
+    if let Some(f) = UNPACK_INTO_MERGE_HOOK.get() {
+        f(pycode, w_gen, w_list, root_base);
+    }
+}
+
+/// `warmspot.py` `handle_jitexception` `DoneWithThisFrameVoid`: the compiled
+/// `unpack_into_w` drain finished.
+pub fn park_unpack_into_done() {
+    UNPACK_INTO_COMPILED_KIND.with(|c| c.set(1));
+    UNPACK_INTO_COMPILED_EXC.with(|c| c.set(0));
+}
+
+/// `warmspot.py` `handle_jitexception` `ExitFrameWithExceptionRef`.
+pub fn park_unpack_into_err(mut err: crate::PyError) {
+    UNPACK_INTO_COMPILED_KIND.with(|c| c.set(2));
+    UNPACK_INTO_COMPILED_EXC.with(|c| c.set(err.to_exc_object() as i64));
+}
+
+/// Int kind parked by a compiled jd5 enter. Clears the slot.
+///
+/// `dont_look_inside`: TLS `.with` is leftover-Unknown to the annotator.
+/// `extern "C"` so `jit_fnaddr.rs` `cp0!` can publish the word ABI.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn unpack_into_compiled_kind() -> i64 {
+    UNPACK_INTO_COMPILED_KIND.with(|slot| {
+        let kind = slot.get();
+        slot.set(0);
+        kind
+    })
+}
+
+/// Exception parked when [`unpack_into_compiled_kind`] was 2. Clears the
+/// exception slot. `dont_look_inside` so the portal loop has no
+/// `Result<(), PyError>` shell.
+#[majit_macros::dont_look_inside]
+pub fn unpack_into_compiled_take_err() -> crate::PyError {
+    let word = UNPACK_INTO_COMPILED_EXC.with(|slot| {
+        let word = slot.get();
+        slot.set(0);
+        word
+    });
+    unsafe { crate::PyError::from_exc_object(word as PyObjectRef) }
+}
+
+/// Shadow-stack root walker for the parked jd5 exception. The object is
+/// reachable from nothing else between the merge-point hook and the
+/// portal's kind check, and compilation in the hook can collect.
+pub fn walk_unpack_into_compiled_exc(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    UNPACK_INTO_COMPILED_EXC.with(|slot| unsafe {
+        crate::eval::walk_raw_exception_cell_area(slot as *const _, visitor)
+    });
+}
+
+/// Address of this thread's parked-exception cell, for the per-mutator
+/// `PyFrameRootArea` (`rthread.py` `_trace_tlref`).
+pub(crate) fn capture_unpack_into_compiled_exc_area() -> *const Cell<i64> {
+    UNPACK_INTO_COMPILED_EXC.with(|slot| slot as *const _)
+}
+
+/// `warmspot.py rewrite_jit_merge_point` for `unpack_into`.
+type UnpackIntoPortalRunnerFn =
+    fn(PyObjectRef, PyObjectRef, PyObjectRef) -> Result<(), crate::PyError>;
+majit_gc::oncelock_fn_static!(static UNPACK_INTO_PORTAL_RUNNER_HOOK: OnceLock<UnpackIntoPortalRunnerFn>);
+
+pub fn register_unpack_into_portal_runner_hook(f: UnpackIntoPortalRunnerFn) {
+    let _ = UNPACK_INTO_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `unpack_into`. Falls back to
+/// [`crate::unpack_into_w_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn unpack_into_w_portal_runner(
+    pycode: PyObjectRef,
+    w_gen: PyObjectRef,
+    w_list: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    match UNPACK_INTO_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(pycode, w_gen, w_list),
+        None => crate::unpack_into_w_portal(pycode, w_gen, w_list),
+    }
+}
+
 /// `warmspot.py rewrite_jit_merge_point`: the original portal graph ends in
 /// `return portal_runner(*args)`. pyre-interpreter cannot import pyre-jit, so
 /// the JIT registers the runner at boot. Without a hook the split portal

@@ -6298,6 +6298,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::filter_jitdriver_jit_abi",
         crate::baseobjspace::filter_jitdriver_jit_abi,
     );
+    // jd5 `DoneWithThisFrameVoid` analogue: Void marker then Int kind.
+    // `dont_look_inside` TLS take (`call.rs` `unpack_into_compiled_kind`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::unpack_into_compiled_kind",
+        crate::call::unpack_into_compiled_kind,
+    );
 
     // `ncells` / `npure_cellvars` take a `CodeObject` and carry
     // `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
@@ -9926,23 +9933,25 @@ mod tests {
             "pyre_interpreter::pycode::w_code_get_w_globals",
             crate::pycode::w_code_get_w_globals as *const () as usize as i64,
         );
-        let live = crate::pycode::register_live_code_wrapper as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pycode::register_live_code_wrapper"],
-            live,
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::pycode::register_live_code_wrapper",
+            crate::pycode::register_live_code_wrapper as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["pyre_interpreter::register_live_code_wrapper"],
-            live
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::register_live_code_wrapper",
+            crate::pycode::register_live_code_wrapper as *const () as usize as i64,
         );
-        let stamped = crate::pycode::register_w_globals_stamped_code as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pycode::register_w_globals_stamped_code"],
-            stamped,
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::pycode::register_w_globals_stamped_code",
+            crate::pycode::register_w_globals_stamped_code as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["pyre_interpreter::register_w_globals_stamped_code"],
-            stamped,
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::register_w_globals_stamped_code",
+            crate::pycode::register_w_globals_stamped_code as *const () as usize as i64,
         );
         assert_occupied_binding(
             &bindings,

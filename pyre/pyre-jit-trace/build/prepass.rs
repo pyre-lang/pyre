@@ -1449,6 +1449,31 @@ fn real_main() {
                     // The registered jitcode is `filter_jitdriver_portal_portal`.
                     split_portal: true,
                 },
+                majit_translate::JitDriverSpec {
+                    // `generator.py` `_create_unpack_into` for `unpack_into_w`.
+                    // greens=['pycode'], reds='auto', name='unpack_into'.
+                    // The portal is the source-level split of
+                    // `unpack_into_w` at `jit_merge_point`.
+                    portal: majit_translate::CallPath::from_segments([
+                        "baseobjspace",
+                        "unpack_into_w_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_unpack_into_w_portal_runner_shim",
+                    ])),
+                    greens: vec!["pycode".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    // `warmspot.py split_graph_and_record_jitdriver` copies
+                    // `unpack_into_w` and cuts at `jit_merge_point`.
+                    // The registered jitcode is `unpack_into_w_portal_portal`.
+                    split_portal: true,
+                },
             ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),

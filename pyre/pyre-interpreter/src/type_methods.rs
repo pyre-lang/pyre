@@ -600,6 +600,11 @@ pub(crate) fn list_extend_items(
         extend_from_list(list, other)?;
     } else if unsafe { is_exact_tuple(other) } {
         extend_from_tuple(list, other)?;
+    } else if unsafe { pyre_object::generator::is_generator(other) } {
+        // listobject.py `ListStrategy.extend`: `space.is_generator(w_any)`
+        // then `w_any.unpack_into_w(w_list)`. The drain is
+        // `generator.py unpack_into_w`, not `_do_extend_from_iterable`.
+        crate::baseobjspace::generator_unpack_into_w(other, list)?;
     } else if unsafe {
         pyre_object::is_set_or_frozenset(other)
             && crate::objspace::std::mapdict::instance_getclass(other)

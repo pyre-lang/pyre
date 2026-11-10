@@ -56,6 +56,7 @@ thread_local! {
         jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         filter_compiled_obj: crate::call::capture_filter_compiled_area(),
         list_extend_compiled_exc: crate::call::capture_list_extend_compiled_exc_area(),
+        unpack_into_compiled_exc: crate::call::capture_unpack_into_compiled_exc_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
         pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
@@ -71,6 +72,7 @@ struct PyFrameRootArea {
     jit_pending_exception: *const Cell<i64>,
     filter_compiled_obj: *const Cell<i64>,
     list_extend_compiled_exc: *const Cell<i64>,
+    unpack_into_compiled_exc: *const Cell<i64>,
     pending_call_error: *const (),
     pending_hash_error: *const (),
 }
@@ -1176,6 +1178,7 @@ pub unsafe fn walk_pyframe_roots_area(
             walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
             walk_raw_exception_cell_area(area.filter_compiled_obj, visitor);
             walk_raw_exception_cell_area(area.list_extend_compiled_exc, visitor);
+            walk_raw_exception_cell_area(area.unpack_into_compiled_exc, visitor);
         }
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
         crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);

@@ -1010,6 +1010,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "GeneratorEntryJitDriver",
     "ListExtendJitDriver",
     "FilterJitDriver",
+    "UnpackIntoJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -32316,6 +32317,12 @@ mod tests {
         let filter_merge = CallTarget::method("jit_merge_point", Some("FilterJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&filter_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let unpack_into_merge =
+            CallTarget::method("jit_merge_point", Some("UnpackIntoJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&unpack_into_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 

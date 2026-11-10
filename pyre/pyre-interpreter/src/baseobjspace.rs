@@ -17653,10 +17653,39 @@ impl UnpackIterableJitDriver {
 #[allow(non_upper_case_globals)]
 const unpackiterable_driver: UnpackIterableJitDriver = UnpackIterableJitDriver;
 
-/// pypy/interpreter/generator.py:330
-/// `jitdriver.jit_merge_point(pycode=pycode)`, with `greens=['pycode']`.
+/// pypy/interpreter/generator.py `_create_unpack_into` interp-level
+/// `unpack_into` (a `Vec` of `W_Root`). Still a no-op merge point; the
+/// `W_List` specialisation `unpack_into_w` has [`UnpackIntoJitDriver`].
 #[inline]
 fn generator_unpack_driver_jit_merge_point(_pycode: PyObjectRef) {}
+
+/// `generator.py` `_create_unpack_into` JitDriver for `unpack_into_w`.
+/// greens=`['pycode']`, reds='auto', name=`unpack_into`.
+struct UnpackIntoJitDriver;
+
+impl UnpackIntoJitDriver {
+    /// `generator.py` `jitdriver.jit_merge_point(pycode=pycode)`.
+    ///
+    /// Void, matching RPython `jit_marker` (`extregistry.py`
+    /// `hop.genop(..., resulttype=lltype.Void)`). Greens come first, then
+    /// the live reds `w_gen`, `w_list`, and the pinned generator-slot Int.
+    /// A compiled finish is parked as an Int kind
+    /// (`call.rs` `unpack_into_compiled_kind`) rather than returned from
+    /// this marker.
+    #[inline]
+    fn jit_merge_point(
+        &self,
+        pycode: PyObjectRef,
+        w_gen: PyObjectRef,
+        w_list: PyObjectRef,
+        root_base: i64,
+    ) {
+        crate::call::unpack_into_merge_point(pycode, w_gen, w_list, root_base);
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const unpack_into_driver: UnpackIntoJitDriver = UnpackIntoJitDriver;
 
 /// `generator.py` `generatorentry_driver` — greens=`['pycode']`,
 /// reds=`['gen', 'w_arg']`, name=`generatorentry`.
@@ -17955,6 +17984,114 @@ fn generator_unpack_into(
         );
         Ok(())
     }
+}
+
+/// `generator.py unpack_into_w` prologue: `frame is None` then enter the
+/// split portal (`warmspot.py rewrite_jit_merge_point` → `portal_runner`).
+/// `listobject.py ListStrategy.extend` calls this when `space.is_generator`.
+pub(crate) fn generator_unpack_into_w(
+    gen_obj: PyObjectRef,
+    w_list: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::generator::*;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[gen_obj, w_list]);
+    unsafe {
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(base);
+        if w_generator_is_running(gen_obj) {
+            return Err(PyError::value_error(format!(
+                "{} already executing",
+                generator_kind(gen_obj)
+            )));
+        }
+        if w_generator_is_exhausted(gen_obj) {
+            return Ok(());
+        }
+        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            w_generator_set_exhausted(gen_obj);
+            return Ok(());
+        }
+        let pycode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root((*frame_ptr).pycode as PyObjectRef);
+        crate::call::unpack_into_w_portal_runner(
+            pyre_object::gc_roots::shadow_stack_get(pycode_slot),
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        )
+    }
+}
+
+/// Split-portal body of `unpack_into_w`: the loop that starts at
+/// `jit_merge_point`. Pin order `[w_gen, w_list, pycode]`. `list_slot` is
+/// the pinned list so the merge-point reds stay Int slots, matching
+/// `_do_extend_jitdriver`.
+///
+/// `generator.py` `_create_unpack_into` returns None after the drain.
+pub fn unpack_into_w_portal(
+    pycode: PyObjectRef,
+    w_gen: PyObjectRef,
+    w_list: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::generator::*;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_gen, w_list, pycode]) as i64;
+    let list_slot = root_base + 1;
+    loop {
+        unpack_into_driver.jit_merge_point(
+            pyre_object::gc_roots::shadow_stack_get((root_base + 2) as usize),
+            pyre_object::gc_roots::shadow_stack_get(root_base as usize),
+            pyre_object::gc_roots::shadow_stack_get(list_slot as usize),
+            root_base,
+        );
+        // `warmspot.py` `handle_jitexception` `DoneWithThisFrameVoid` /
+        // `ExitFrameWithExceptionRef`: the marker is Void, so a compiled
+        // finish is an Int kind parked by the jd5 enter. Extra residual vs
+        // PyPy; the helpers are `dont_look_inside` so the annotator sees i64.
+        let kind = crate::call::unpack_into_compiled_kind();
+        if kind == 1 {
+            return Ok(());
+        }
+        if kind == 2 {
+            return Err(crate::call::unpack_into_compiled_take_err());
+        }
+        unsafe {
+            let gen_obj = pyre_object::gc_roots::shadow_stack_get(root_base as usize);
+            let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+            if frame_ptr.is_null() {
+                w_generator_set_exhausted(gen_obj);
+                break;
+            }
+            w_generator_set_started(gen_obj);
+            match generator_invoke_execute_frame(gen_obj, &mut *frame_ptr, pyre_object::w_none()) {
+                Err(e) => {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
+                        break;
+                    }
+                    return Err(e);
+                }
+                Ok(w_result) => {
+                    let gen_obj = pyre_object::gc_roots::shadow_stack_get(root_base as usize);
+                    let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+                    if frame_ptr.is_null() || (*frame_ptr).frame_finished_execution() {
+                        if !frame_ptr.is_null() {
+                            generator_frame_is_finished(gen_obj, &mut *frame_ptr);
+                        }
+                        break;
+                    }
+                    let _item_roots = pyre_object::gc_roots::push_roots();
+                    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_result);
+                    pyre_object::listobject::w_list_append(
+                        pyre_object::gc_roots::shadow_stack_get(list_slot as usize),
+                        pyre_object::gc_roots::shadow_stack_get(item_slot),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// pypy/interpreter/baseobjspace.py:1000-1021
