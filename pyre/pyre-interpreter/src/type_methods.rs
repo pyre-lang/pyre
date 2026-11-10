@@ -640,6 +640,11 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
         }
         other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let n = w_list_len(other);
+        // [3.15-spec] `list_extend_fast`: empty iterable is a no-op and does
+        // not go through `list_ass_slice_lock_held` / `list_clear`.
+        if n == 0 {
+            return Ok(());
+        }
         // list_preallocate_exact sizes the emulated allocation for both arms.
         pyre_object::listobject::w_list_reserve_for_extend(list, n);
         // The reservation can allocate (the sizehint cell, a resized backing).
@@ -719,6 +724,10 @@ fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate:
     let base = pyre_object::gc_roots::pin_roots(&[list, other]);
     unsafe {
         let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        // [3.15-spec] `list_extend_fast`: empty iterable is a no-op.
+        if n == 0 {
+            return Ok(());
+        }
         // `w_list._resize_hint(w_list.length() + len(tup_w))`, sized as the
         // `list_extend` reservation `__sizeof__` reports.
         pyre_object::listobject::w_list_reserve_for_extend(
@@ -994,7 +1003,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             }
         };
     }
-    match unsafe { pyre_object::listobject::w_list_pop(list, index) } {
+    match unsafe { pyre_object::listobject::w_list_pop(list, index, true) } {
         Some(v) => crate::runtime_ops::obj_or_memory_error(v),
         None => {
             if pyre_object::gc_hook::gc_alloc_failed_pending() {

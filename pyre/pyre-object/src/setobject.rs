@@ -6355,7 +6355,7 @@ mod tests {
         unsafe {
             let items = crate::w_list_new(vec![crate::w_bytes_from_bytes(b"a")]);
             assert_eq!(list_kind(items), crate::ListStrategy::Bytes);
-            assert!(crate::w_list_pop(items, 0).is_some());
+            assert!(crate::w_list_pop(items, 0, true).is_some());
             assert_eq!(list_kind(items), crate::ListStrategy::Bytes);
             assert_eq!(crate::w_list_len(items), 0);
 

@@ -161,7 +161,7 @@ pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyErr
     let length = unsafe { pyre_object::w_list_len(obj) } as i64;
     if i < length {
         unsafe {
-            pyre_object::listobject::w_list_pop(obj, i);
+            pyre_object::listobject::w_list_pop(obj, i, true);
         }
     }
     Ok(())

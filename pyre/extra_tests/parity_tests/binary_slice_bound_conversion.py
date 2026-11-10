@@ -129,7 +129,17 @@ print(l)
 assert l == []
 
 
+_B = [].__sizeof__()
+
+
+def _slots(lst):
+    return (lst.__sizeof__() - _B) // 8
+
+
 class EmptyHint:
+    def __init__(self, hint):
+        self.hint = hint
+
     def __iter__(self):
         return self
 
@@ -137,17 +147,49 @@ class EmptyHint:
         raise StopIteration
 
     def __length_hint__(self):
-        return 32
+        return self.hint
 
 
-x = []
-x.extend(EmptyHint())
-x.append(1)
-y = []
-y.append(1)
-empty_hint_eq = x.__sizeof__() == y.__sizeof__()
-print(empty_hint_eq)
-assert empty_hint_eq
+# list_extend_iter_lock_held cuts an unused reservation back with list_resize:
+# an allocation of LIST_SMALL_ALLOCATED (32) or fewer is kept, a larger one is freed.
+small = []
+small.extend(EmptyHint(32))
+small.append(1)
+big = []
+big.extend(EmptyHint(100))
+big.append(1)
+print("empty-hint", _slots(small), _slots(big))
+
+l = [1]
+l.pop()
+print("pop1", _slots(l))
+l = [1]
+l.remove(1)
+print("remove1", _slots(l))
+l = [1]
+l[:] = []
+print("setslice-empty", _slots(l))
+l = [1]
+del l[0]
+print("delitem1", _slots(l))
+l = [1, 2]
+del l[::-1]
+print("del-reversed", _slots(l))
+l = [1, 2]
+del l[::1]
+print("del-step1", _slots(l))
+l = []
+l.extend(EmptyHint(32))
+l.clear()
+print("eh32-clear", _slots(l))
+l = []
+l.extend(EmptyHint(32))
+l.sort()
+print("eh32-sort", _slots(l))
+l = []
+l.extend(EmptyHint(32))
+l.extend([1.5])
+print("eh32-ext-float", _slots(l))
 
 dest = []
 before = dest.__sizeof__()

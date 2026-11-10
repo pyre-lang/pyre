@@ -23600,9 +23600,9 @@ pub fn sort_list_in_place(
         // TimSort only moves integer indices.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         // [3.15-spec] `list_sort_impl` restores `saved_ob_item`/`saved_allocated`
-        // so `__sizeof__` after sort equals before. Read physical capacity
-        // before the Empty detach; Range has no backing.
-        let saved_capacity = pyre_object::listobject::w_list_physical_size(list);
+        // so `__sizeof__` after sort equals before. Read the 3.15 allocation
+        // before the Empty detach; Empty/Range answer 0.
+        let saved_allocated = pyre_object::listobject::w_list_allocated(list);
         // Snapshot through getitem + pin, not a bare Vec: integer/float/range
         // strategies box each element (`getitems_copy`), and a Rust Vec of
         // those boxes is invisible to the collector.  `listsort.py` TimSort
@@ -23637,13 +23637,11 @@ pub fn sort_list_in_place(
             .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
             .collect();
         pyre_object::listobject::w_list_init_items(list, restored);
-        if let Some(saved_capacity) = saved_capacity {
-            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-            let live = pyre_object::listobject::w_list_len(list);
-            pyre_object::listobject::w_list_publish_physical_capacity(
-                list,
-                saved_capacity.max(live),
-            );
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let live = pyre_object::listobject::w_list_len(list);
+        let saved = saved_allocated.max(0) as usize;
+        if saved != 0 || live != 0 {
+            pyre_object::listobject::w_list_publish_physical_capacity(list, saved.max(live));
         }
         sorted?;
         if mucked {
@@ -29337,7 +29335,9 @@ mod tests {
             );
             pyre_object::listobject::w_list_reverse(list);
             assert_eq!(
-                pyre_object::w_str_get_wtf8(pyre_object::listobject::w_list_pop(list, 0).unwrap()),
+                pyre_object::w_str_get_wtf8(
+                    pyre_object::listobject::w_list_pop(list, 0, true).unwrap(),
+                ),
                 "c"
             );
             assert_eq!(

@@ -7007,7 +7007,7 @@ result = (
                            16, 16, 16, 16, 16, 16, 16, 16,
                            24, 24, 24, 24]
     and [allocation(item) for item in sources] == [6, 6, 6, 8, 8, 8, 8, 8, 8]
-    and allocation(list(HintTwenty())) == 8
+    and allocation(list(HintTwenty())) == 20
     and sort_seen == [(0, 56), (0, 56), (0, 56)]
     and sorted_value == [1, 2, 3]
     and allocation(sorted_value) == 4
