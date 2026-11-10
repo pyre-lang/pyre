@@ -827,6 +827,7 @@ pub(in crate::front::mir) enum FormatStrDef {
 /// rvalue, call, or projected write declines the local. A non-Shared borrow
 /// of a local (or a projection of it) also declines it: a mutable borrow can
 /// change the value without a def of the local (`String::push_str(&mut s)`).
+/// Blocks off the forward-reachable set (`on_unwind` cleanup) are skipped, as in `local_def_counts`.
 pub(in crate::front::mir) fn format_str_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let n = body.locals.locals.len();
     let arg_count = body.locals.arg_count as usize;
@@ -840,7 +841,11 @@ pub(in crate::front::mir) fn format_str_locals(body: &Unstructured, llbc: &Llbc)
             declined[local] = true;
         }
     };
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
                 continue;
