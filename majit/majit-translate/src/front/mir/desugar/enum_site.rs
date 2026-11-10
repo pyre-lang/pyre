@@ -369,6 +369,16 @@ impl<'a> Lowering<'a> {
         &self,
         option_ty: &TyRef,
     ) -> Option<String> {
+        // An int-bank niche (`Option<&RawEnum>`, `Option<&RawStruct>`,
+        // `Option<fn>`) is Address / SomePtr (`ty_is_raw_address` /
+        // `tyref_niche_option_payload_paint`). `rclass.py`
+        // `InstanceRepr.convert_const(None)` is `null_instance` of a GC
+        // class; `rnone.py` `rtype_is_None` is `ptr_iszero` of that
+        // pointer. Promoting the Address to Instance is the
+        // `Ptr ∪ Instance` union (`project_struct_rows`).
+        if self.option_niche_is_int_bank(option_ty) {
+            return None;
+        }
         let payload = strip_ty_indirections(
             type_decl_ref_generics(
                 tyref_node(option_ty, self.llbc)?
@@ -614,6 +624,14 @@ impl<'a> Lowering<'a> {
         &self,
         place_ty: &TyRef,
     ) -> bool {
+        // Tagged `Option<Option<&Raw>>::__pos_0` is the inner int-bank
+        // niche word. Recasting it through `W_ROOT` is
+        // `Int ∪ Ref(PyObject)` at the flatten return (`rnone.py`
+        // `rtype_is_None` / `rclass.py` `convert_const(None)`: one None
+        // per pointer, the outer tag cannot reuse it).
+        if self.option_niche_is_int_bank(place_ty) {
+            return false;
+        }
         if self
             .option_niche_null_cast(place_ty)
             .is_some_and(|(root, ty)| {

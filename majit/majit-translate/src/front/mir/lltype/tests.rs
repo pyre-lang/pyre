@@ -10456,6 +10456,433 @@ fn option_map_family_keeps_regular_call_to_core_body() {
     );
 }
 
+fn option_core_regular_call_count(graph: &crate::model::FunctionGraph, leaf: &str) -> usize {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == leaf,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some(leaf)
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count()
+}
+
+fn option_core_body_matches_tag(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{ExitSwitch, OpKind};
+    graph.blocks.iter().any(|block| {
+        matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+            || block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            || block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"))
+    })
+}
+
+fn option_core_body_calls_fnonce(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "call_once" || name == "call" || name == "call_mut",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
+            }
+            _ => false,
+        })
+    })
+}
+
+/// `Option::map_or_else` / `Option::flatten` stay regular calls of the
+/// extracted core bodies (`CHARON_CORE_INCLUDE`), same as `map_or`.
+///
+/// `lower_function` has no `SpecQueue`, so the caller may still spell
+/// `CallTarget::Method`; production `enqueue_spec` names the extracted
+/// body once the FunDecl is Unstructured and the call's `trait_refs`
+/// are concrete (`TraitImpl`, not `Clause`).
+#[test]
+fn option_map_or_else_and_flatten_keep_regular_call_to_core_body() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+
+    let map_or_else_caller = crate::test_support::lower_function(llbc, "concat_operand_name")
+        .expect("lower concat_operand_name");
+    let map_or_else_calls = option_core_regular_call_count(&map_or_else_caller, "map_or_else");
+    assert_eq!(
+        map_or_else_calls, 1,
+        "concat_operand_name keeps one regular call to the core map_or_else body, got {map_or_else_calls}"
+    );
+
+    crate::test_support::with_lowering(llbc, |ctx| {
+        let mut lowered_map_or_else = 0usize;
+        let mut lowered_flatten = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            let is_map_or_else = name_path.ends_with("::option::<Impl>::map_or_else");
+            let is_flatten = name_path.ends_with("::option::<Impl>::flatten");
+            if !is_map_or_else && !is_flatten {
+                continue;
+            }
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            assert!(
+                option_core_body_matches_tag(&graph),
+                "{name_path}: core body matches on the Option tag"
+            );
+            if is_map_or_else {
+                assert!(
+                    option_core_body_calls_fnonce(&graph),
+                    "{name_path}: core body calls d()/f(t); ops={:?}",
+                    graph_ops(&graph)
+                );
+                lowered_map_or_else += 1;
+            } else {
+                lowered_flatten += 1;
+            }
+        }
+        assert_eq!(
+            lowered_map_or_else, 1,
+            "extracted map_or_else FunDecl bodies must lower, got {lowered_map_or_else}"
+        );
+        assert_eq!(
+            lowered_flatten, 1,
+            "extracted flatten FunDecl bodies must lower, got {lowered_flatten}"
+        );
+
+        let mut flatten_caller_calls = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            if !fd
+                .item_meta
+                .name_path()
+                .ends_with("::type_fully_qualified_name")
+            {
+                continue;
+            }
+            if let Ok(graph) = super::lower_fun_decl(ctx, fd) {
+                flatten_caller_calls += option_core_regular_call_count(&graph, "flatten");
+            }
+        }
+        assert!(
+            flatten_caller_calls >= 1,
+            "type_fully_qualified_name keeps a regular call to the core flatten body, got {flatten_caller_calls}"
+        );
+    });
+}
+
+fn raw_store_struct(def_id: u64) -> serde_json::Value {
+    let mut decl = struct_decl(
+        def_id,
+        ident_path(&["fixture", "RawStore"]),
+        serde_json::json!([
+            {
+                "name": "ptr",
+                "ty": {"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "len",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    decl
+}
+
+fn raw_storage_enum(def_id: u64, payload_id: u64) -> serde_json::Value {
+    let mut decl = serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "RawEnum"])),
+        "kind": {"Enum": [{
+            "name": "Mapped",
+            "fields": [{
+                "name": null,
+                "ty": adt_node(payload_id),
+                "attr_info": null
+            }],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    });
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    decl
+}
+
+fn nested_option_raw_enum_nodes() -> (serde_json::Value, serde_json::Value) {
+    let inner = option_adt_node(0, option_shared_ref(adt_node(2)));
+    let outer = option_adt_node(0, inner.clone());
+    (inner, outer)
+}
+
+/// rustc layout of `Option<Option<&RawEnum>>` is inner pointer-niche
+/// (one word) plus an outer tag (two words). The outer cannot reuse the
+/// inner None (`rclass.py` `InstanceRepr.convert_const(None)` /
+/// `rnone.py` `rtype_is_None`).
+#[test]
+fn tagged_outer_option_of_niche_raw_enum_borrow_is_not_raw_address() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), raw_store_struct(1), raw_storage_enum(2, 1)],
+        vec![],
+    );
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let tomb = super::no_tombstoned_leaves();
+    let (inner_node, outer_node) = nested_option_raw_enum_nodes();
+    let inner = TyRef::Other(inner_node);
+    let outer = TyRef::Other(outer_node);
+    let mut stack = Vec::new();
+    assert!(
+        super::adt_def_is_raw_storage(
+            2,
+            &llbc,
+            &empty_gc,
+            super::no_immutable_fields(),
+            &mut stack
+        ),
+        "RawEnum with a raw-struct payload is storage-raw"
+    );
+    assert!(
+        super::tyref_is_niche_option(&inner, &llbc),
+        "Option<&RawEnum> is the pointer niche"
+    );
+    assert!(
+        !super::tyref_is_niche_option(&outer, &llbc),
+        "Option<Option<&RawEnum>> keeps the outer tag"
+    );
+    assert!(
+        super::ty_is_raw_address(&inner, &llbc, &empty_gc, &empty_s),
+        "inner Option<&RawEnum> is the int-bank null word"
+    );
+    assert!(
+        !super::ty_is_raw_address(&outer, &llbc, &empty_gc, &empty_s),
+        "tagged outer Option must not inherit the inner raw-address bank"
+    );
+    assert_eq!(
+        super::tyref_niche_option_gc_payload_spelling(&inner, &llbc, &empty_gc, &empty_s),
+        None,
+        "raw-enum borrow Option is not a GC payload stamp"
+    );
+    assert_eq!(
+        super::tyref_niche_option_gc_payload_spelling(&outer, &llbc, &empty_gc, &empty_s),
+        None,
+        "tagged outer Option is not a GC payload stamp"
+    );
+    let inner_vt = super::tyref_to_value_type_with(&inner, &llbc, tomb, &empty_gc, &empty_s);
+    let outer_vt = super::tyref_to_value_type_with(&outer, &llbc, tomb, &empty_gc, &empty_s);
+    assert!(
+        matches!(inner_vt, ValueType::Int),
+        "inner Option<&RawEnum> paints Int, got {inner_vt:?}"
+    );
+    match &outer_vt {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.contains("Option"),
+                "outer tagged Option class root names Option, got {root}"
+            );
+        }
+        other => panic!("outer Option<Option<&RawEnum>> paints Ref(class), got {other:?}"),
+    }
+}
+
+/// Extracted `flatten` body for `Option<Option<&RawEnum>>`: match the
+/// outer tag, yield the inner niche word. Self is the tagged Option
+/// class (`Ref`), not the inner address (`Int`), so the match must not
+/// `__cast_instance_intrinsic` an Integer onto `Option<Option<RawEnum>>`.
+#[test]
+fn flatten_of_tagged_option_of_raw_enum_borrow_keeps_ref_self() {
+    let (inner, outer) = nested_option_raw_enum_nodes();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &outer);
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &inner);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let some_payload = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [opt_place.clone(), {"Downcast": 1}]}),
+                &outer
+            ),
+            {"Field": [1, 0]}
+        ]}),
+        &inner,
+    );
+    let none_aggregate = serde_json::json!({
+        "Aggregate": [
+            {"Adt": [
+                {"id": 0, "generics": {
+                    "regions": [],
+                    "types": [option_shared_ref(adt_node(2))],
+                    "const_generics": [],
+                    "trait_refs": []
+                }},
+                0,
+                null
+            ]},
+            []
+        ]
+    });
+    let flatten = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "flatten"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [outer.clone()],
+            "output": inner.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &inner),
+                window_local(1, &outer),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            disc_place.clone(),
+                            {"Discriminant": opt_place.clone()}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Read": disc_place.clone()},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                            ],
+                            2
+                        ]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Read": some_payload}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            none_aggregate
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), raw_store_struct(1), raw_storage_enum(2, 1)],
+        vec![flatten],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "flatten")
+        .unwrap_or_else(|err| panic!("lower flatten of Option<Option<&RawEnum>>: {err}"));
+    assert!(
+        option_core_body_matches_tag(&graph),
+        "flatten matches the outer Option tag; graph={}",
+        graph.dump()
+    );
+    let self_input = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .find_map(|op| match &op.kind {
+            OpKind::Input { name, ty, .. } if name == "arg1" || name == "self" => Some(ty.clone()),
+            _ => None,
+        });
+    let self_ty = self_input.expect("flatten stamps an Input for self");
+    assert!(
+        matches!(self_ty, ValueType::Ref(Some(ref root)) if root.contains("Option")),
+        "flatten self of tagged Option<Option<&RawEnum>> is Ref(Option class), got {self_ty:?}; graph={}",
+        graph.dump()
+    );
+    let pos0_int = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Int, .. } if field.name == "__pos_0"
+            )
+        })
+    });
+    assert!(
+        pos0_int,
+        "Some.__pos_0 of the tagged outer is the inner niche Int word; graph={}",
+        graph.dump()
+    );
+    let w_root_cast = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind).is_some_and(|root| root.contains("PyObject"))
+        })
+    });
+    assert!(
+        !w_root_cast,
+        "inner niche word must not recast through W_ROOT; graph={}",
+        graph.dump()
+    );
+}
+
 #[test]
 fn result_of_tombstoned_layout_leafs_paint_distinct_class_roots() {
     // `alloc::layout::Layout` and `typeobject::Layout` share the leaf

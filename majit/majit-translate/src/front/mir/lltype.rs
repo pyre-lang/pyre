@@ -2805,13 +2805,20 @@ pub(in crate::front::mir) fn ty_is_raw_address(
             }
         }
     }
-    // Niche `Option<NonNull<Raw>>` / `Option<Box<Raw>>` aliases `Some(p)`
-    // to the payload word. Classify the Option with that payload's bank.
-    // `Option<*mut T>` has no niche (`*mut T` may be null), so it stays the
-    // tagged Option instance: `flatten.py` `make_return` / `history.getkind`
-    // of that CFG return is `ref`, and `FUNC.RESULT` must agree.
-    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+    // Niche `Option<NonNull<Raw>>` / `Option<Box<Raw>>` / `Option<&RawEnum>`
+    // aliases `Some(p)` to the payload word. Classify the Option with that
+    // payload's bank. Only a pointer-niche Option peels: rustc cannot niche
+    // `Option<Option<T>>` (two nested T-or-None values; the outer cannot
+    // reuse the inner None). `rclass.py` `InstanceRepr.convert_const(None)`
+    // is `null_instance`; `rnone.py` `rtype_is_None` is `ptr_iszero` — one
+    // None per pointer word. `Option<*mut T>` has no niche (`*mut T` may
+    // be null), so it stays the tagged Option instance: `flatten.py`
+    // `make_return` / `history.getkind` of that CFG return is `ref`, and
+    // `FUNC.RESULT` must agree.
+    if tyref_is_niche_option(ty, llbc)
+        && let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
         && !tyref_is_raw_pointer(&payload, llbc)
+        && !crate::front::result_exc::tyref_is_option(&payload, llbc)
     {
         return ty_is_raw_address(&payload, llbc, gc_struct_ids, raw_alloc_flavor_structs);
     }

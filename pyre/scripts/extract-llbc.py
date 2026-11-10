@@ -145,6 +145,12 @@ CHARON_CORE_INCLUDE = [
     "core::result::_::map_err",
     "--include",
     "core::option::_::map_or",
+    # `map_or_else` is the FnOnce-default sibling of `map_or`.
+    # `flatten` peels `Option<Option<T>>`.
+    "--include",
+    "core::option::_::map_or_else",
+    "--include",
+    "core::option::_::flatten",
     "--include",
     "core::option::_::expect",
     "--include",
