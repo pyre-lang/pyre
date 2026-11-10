@@ -1560,6 +1560,20 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
             return None;
         }
+        // A `repr(transparent)` scalar wrapper is its inner word
+        // (`tyref_is_borrowed_transparent_scalar`). A store of that
+        // word through a borrow — rustc capturing `&FrameAnchor` into
+        // a closure env — is already the int; `cast_pointer` has no
+        // integer operand.
+        if tyref_is_borrowed_transparent_scalar(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return None;
+        }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
         // Thin `Box<T>` is one pointer word to `T` (`type_node_is_thin_box`).
         // FieldWrite of `Buffer::Sub.parent` must intern the Buffer
@@ -4368,6 +4382,15 @@ impl<'a> Lowering<'a> {
         // `pair(rtype_eq) (InstanceRepr, IntegerRepr)` wall: the tag
         // compare becomes `eq` of a minted empty instance with `ConstInt`.
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
+            return None;
+        }
+        if tyref_is_borrowed_transparent_scalar(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {

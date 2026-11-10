@@ -3451,7 +3451,8 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
 /// Prefers the place's post-projection type (generic substitution is
 /// already applied there).  A shell variant peels a shared borrow of a
 /// primitive the way [`tyref_enum_payload_value_type`] does.  A closure-env
-/// field whose declared type is that same borrow is the integer too: the
+/// field whose declared type is that same borrow, or a borrow of a
+/// `repr(transparent)` scalar wrapper, is the integer too: the
 /// body reads the capture through the borrow as a scalar (`Rvalue::Ref`
 /// aliases the referent, `resolve_place` collapses `Deref`, and
 /// `Ptr(Signed)` does not exist), so a captured `&usize` is the `usize`.
@@ -3500,6 +3501,27 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             if owner_is_closure_env
                 && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
                     .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
+                    .or_else(|| {
+                        [field_ty, place_ty].into_iter().find_map(|ty| {
+                            tyref_is_borrowed_transparent_scalar(
+                                ty,
+                                llbc,
+                                tombstoned,
+                                gc_struct_ids,
+                                raw_alloc_flavor_structs,
+                            )
+                            .then(|| {
+                                tyref_transparent_inner_value_type(
+                                    ty,
+                                    llbc,
+                                    tombstoned,
+                                    gc_struct_ids,
+                                    raw_alloc_flavor_structs,
+                                )
+                            })
+                            .flatten()
+                        })
+                    })
             {
                 return peeled;
             }
@@ -5459,10 +5481,10 @@ pub(in crate::front::mir) fn tyref_is_type_parameter(ty: &TyRef, llbc: &Llbc) ->
 
 /// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
 /// except for a closure-env capture whose declared type is a shared borrow
-/// of a primitive: seed that attr as the scalar so FORCE does not install
-/// a Ref class field against an Int-banked getfield.  Ordinary struct
-/// fields of reference type stay `Ref`; a type-parameter field is
-/// `Unknown` ([`tyref_is_type_parameter`]).
+/// of a primitive or of a `repr(transparent)` scalar wrapper: seed that
+/// attr as the scalar so FORCE does not install a Ref class field against
+/// an Int-banked getfield.  Ordinary struct fields of reference type stay
+/// `Ref`; a type-parameter field is `Unknown` ([`tyref_is_type_parameter`]).
 pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
     ty: &TyRef,
     owner: &TypeDecl,
@@ -5474,7 +5496,25 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
         return ValueType::Unknown;
     }
     if type_decl_is_closure_env(owner)
-        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
+        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc).or_else(|| {
+            tyref_is_borrowed_transparent_scalar(
+                ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+            .then(|| {
+                tyref_transparent_inner_value_type(
+                    ty,
+                    llbc,
+                    no_tombstoned_leaves(),
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            })
+            .flatten()
+        })
     {
         return peeled;
     }
@@ -12460,6 +12500,67 @@ pub(in crate::front::mir) fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> Str
     }
 }
 
+/// Inner-scalar spelling of a borrowed `repr(transparent)` wrapper.
+///
+/// [`tyref_is_borrowed_transparent_scalar`] is the same predicate
+/// `place_borrow_takes_address` uses to alias `Rvalue::Ref` onto the
+/// depth word: a `&FrameAnchor` local is `Unsigned`, so the layout row
+/// of a capture of that borrow must be the inner scalar too. A GC
+/// handle borrow (`&PyError`) is not this predicate and keeps `&T`.
+fn borrowed_transparent_scalar_field_layout_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !tyref_is_borrowed_transparent_scalar(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return None;
+    }
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if let TypeDeclKind::Struct(fields) = &decl.kind
+        && !decl.published_struct_copy
+        && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
+        && let Some(field) = fields.get(index)
+    {
+        return Some(tyref_to_field_layout_string(
+            &field.ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ));
+    }
+    transparent_scalar_kind_layout_spelling(decl, llbc)
+}
+
+fn transparent_scalar_kind_layout_spelling(decl: &TypeDecl, llbc: &Llbc) -> Option<String> {
+    let kind = llbc.transparent_scalar_kind(&decl.item_meta.name_path())?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let size = decl
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.size)
+        .unwrap_or(8);
+    Some(match (kind, size) {
+        (majit_charon_reader::TransparentScalarKind::Signed, 1) => "i8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 2) => "i16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 4) => "i32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, _) => "i64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => "u8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => "u16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => "u32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => "u64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Bool, _) => "bool".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
+    })
+}
+
 pub(in crate::front::mir) fn tyref_to_field_layout_string(
     ty: &TyRef,
     llbc: &Llbc,
@@ -12471,6 +12572,23 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // Spell it as the discriminant scalar before the reference arm, which
     // would otherwise keep `&E` as a pointer row against an Int FORCE.
     if let Some(spelling) = fieldless_enum_field_layout_spelling(ty, llbc) {
+        return spelling;
+    }
+    // A borrow of a `repr(transparent)` scalar wrapper is that inner
+    // word (`tyref_to_value_type` / `tyref_is_borrowed_transparent_scalar`;
+    // `Rvalue::Ref` aliases the referent). Spell it as the inner scalar
+    // before the reference arm, which would otherwise keep `&Wrapper` as
+    // a pointer row against an Int FORCE. `project_struct_field_type`
+    // peels `&` and then `raw_struct_ptr_annotation` mints
+    // `Ptr(eval::FrameAnchor)` for a raw-word owner; setattr of the
+    // captured depth word is `unionof` Integer ∪ Ptr
+    // (`annotator/model.py`; `rclass.py` field reprs).
+    if let Some(spelling) = borrowed_transparent_scalar_field_layout_spelling(
+        ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return spelling;
     }
     // A reference field is one pointer repr, not an inline copy of its
@@ -12575,27 +12693,8 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     {
         return tyref_to_ast_string(&field.ty, llbc);
     }
-    let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) else {
-        return tyref_to_ast_string(ty, llbc);
-    };
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let size = decl
-        .layout_for_target(llbc, &target)
-        .and_then(|layout| layout.size)
-        .unwrap_or(8);
-    match (kind, size) {
-        (majit_charon_reader::TransparentScalarKind::Signed, 1) => "i8".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Signed, 2) => "i16".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Signed, 4) => "i32".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Signed, _) => "i64".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => "u8".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => "u16".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => "u32".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => "u64".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Bool, _) => "bool".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
-        (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
-    }
+    transparent_scalar_kind_layout_spelling(decl, llbc)
+        .unwrap_or_else(|| tyref_to_ast_string(ty, llbc))
 }
 
 /// The physical type spelling of a top-level Rust reference field.

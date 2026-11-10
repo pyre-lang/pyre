@@ -8004,6 +8004,256 @@ fn closure_capturing_fieldless_enum_annotates() {
         .expect("Discriminant of a borrowed fieldless-enum tag annotates");
 }
 
+/// A rustc closure env that captures `&TransparentWrapper` of a scalar
+/// (`eval::FrameAnchor` / `_trace` closure `__pos_5`) must annotate: the
+/// stored word is Integer and the env field must be that same Integer
+/// (`rclass.py` field reprs; `annotator/model.py` `unionof`).
+#[test]
+fn closure_capturing_borrowed_transparent_scalar_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeInteger, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+    use std::rc::Rc;
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 32}
+    }});
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let phantom_adt = serde_json::json!({"Adt": {"id": 1, "generics": generics}});
+    let anchor_adt = serde_json::json!({"Adt": {"id": 2, "generics": generics}});
+    let borrowed_anchor = serde_json::json!({"Ref": ["_", anchor_adt.clone(), "Shared"]});
+    let closure_adt = serde_json::json!({"Adt": {"id": 3, "generics": generics}});
+    let place =
+        |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                null,
+                {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["core", 0]}, {"Ident": ["marker", 0]}, {"Ident": ["PhantomData", 0]}],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 0, "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": {
+                        "name": [{"Ident": ["eval", 0]}, {"Ident": ["FrameAnchor", 0]}],
+                        "span": span,
+                        "source_text": "pub struct FrameAnchor { depth: usize, _not_send: PhantomData<*const ()> }",
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [
+                        {
+                            "name": "depth",
+                            "ty": usize_ty,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        },
+                        {
+                            "name": "_not_send",
+                            "ty": phantom_adt,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }
+                    ]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0, 8]}],
+                            "repr": {"repr_algo": "Rust", "transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 3,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["fixture", 0]},
+                            {"Ident": ["capture_anchor", 0]},
+                            {"Ident": ["closure", 0]}
+                        ],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": borrowed_anchor.clone(),
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }],
+                    "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                }
+            ],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": {
+                    "name": [{"Ident": ["fixture", 0]}, {"Ident": ["capture_anchor", 0]}],
+                    "span": span, "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [borrowed_anchor.clone()],
+                    "output": closure_adt.clone()
+                },
+                "body": {"Unstructured": {
+                    "span": span,
+                    "locals": {"arg_count": 1, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": closure_adt.clone()},
+                        {"index": 1, "name": "frame_anchor", "span": span, "ty": borrowed_anchor.clone()}
+                    ]},
+                    "body": [
+                        {"statements": [{
+                            "span": span,
+                            "kind": {"Assign": [
+                                place(0, &closure_adt),
+                                {"Aggregate": [
+                                    {"Adt": [3, null, null, generics.clone()]},
+                                    [{"Read": place(1, &borrowed_anchor)}]
+                                ]}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [],
+                         "kind": "Regular",
+                         "terminator": {"span": span, "kind": "UnwindResume"}}
+                    ]
+                }}
+            }],
+            "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let borrowed_ty = serde_json::from_value::<super::TyRef>(borrowed_anchor.clone())
+        .expect("borrowed wrapper TyRef parses");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let env = llbc.type_by_id(3).expect("closure env");
+
+    assert_eq!(
+        super::tyref_to_field_layout_string(
+            &borrowed_ty,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        "usize",
+        "a borrow of a transparent scalar wrapper is the inner word"
+    );
+    assert_eq!(
+        tyref_to_attr_value_type(&borrowed_ty, &llbc),
+        ValueType::Unsigned,
+        "FORCE must seed Integer for a captured &Wrapper"
+    );
+    assert_eq!(
+        tyref_to_attr_value_type_for_struct_field(
+            &borrowed_ty,
+            env,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Unsigned,
+        "closure-env FORCE rows match the Int-banked capture"
+    );
+
+    let graph =
+        crate::test_support::lower_function(&llbc, "capture_anchor").expect("lower capture_anchor");
+    let cast_roots: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        cast_roots.is_empty(),
+        "transparent-scalar capture must not emit __cast_instance_intrinsic; roots={cast_roots:?}"
+    );
+
+    let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
+        &llbc,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    let closure_key = "fixture::capture_anchor::closure";
+    let attr_rows = attrs
+        .get("capture_anchor::closure")
+        .or_else(|| attrs.get(closure_key))
+        .expect("closure FORCE rows");
+    let layout_rows = fields
+        .fields
+        .get(closure_key)
+        .or_else(|| fields.fields.get("capture_anchor::closure"))
+        .cloned()
+        .expect("closure layout rows");
+    let layout_pairs: Vec<(String, String)> = layout_rows
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    assert_eq!(
+        layout_pairs[0].1, "usize",
+        "published closure-env capture layout is the inner scalar; got {layout_pairs:?}"
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout(
+        closure_key,
+        attr_rows,
+        Some(layout_pairs.as_slice()),
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout(
+        "capture_anchor::closure",
+        attr_rows,
+        Some(layout_pairs.as_slice()),
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let bk = &ann.bookkeeper;
+    bk.set_struct_fields(Rc::new(fields));
+    let registry = CallRegistry::new(bk.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift capture_anchor");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs)
+        .map(|_| Some(SomeValue::Integer(SomeInteger::new(false, true))))
+        .collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("a closure capturing a borrowed transparent scalar annotates");
+}
+
 /// Each receiver that reaches a `Vec` — an inline field, a `&mut Vec`
 /// local, and a pointer loaded out of `Box<Vec<_>>` — becomes a getfield
 /// of the buffer word. A declared virtualizable array is not a receiver

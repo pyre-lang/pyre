@@ -9742,6 +9742,149 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
     );
 }
 
+/// `#[repr(transparent)] struct Anchor { depth: usize, _not_send: PhantomData }`
+/// plus a rustc closure env that captures `&Anchor`. Mirrors
+/// `eval::FrameAnchor` / `_trace::{closure#2}.__pos_5`.
+fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let phantom_adt = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let anchor_adt = serde_json::json!({"Adt": {"id": 1, "generics": generics}});
+    let borrowed_anchor =
+        serde_json::json!({"Ref": [{"Erased": null}, anchor_adt.clone(), "Shared"]});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201", "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": type_decl_meta(&["core", "marker", "PhantomData"]),
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 0, "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }],
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": type_decl_meta(&["eval", "FrameAnchor"]),
+                    "kind": {"Struct": [
+                        {
+                            "name": "depth",
+                            "ty": usize_ty,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        },
+                        {
+                            "name": "_not_send",
+                            "ty": phantom_adt,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }
+                    ]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0, 8]}],
+                            "repr": {"repr_algo": "Rust", "transparent": true}
+                        }
+                    }],
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": type_decl_meta(&["fixture", "Holder"]),
+                    "kind": {"Struct": [{
+                        "name": "anchor",
+                        "ty": borrowed_anchor.clone(),
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                    }]},
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 3,
+                    "item_meta": type_decl_meta(&["fixture", "_trace", "closure"]),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": borrowed_anchor.clone(),
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }],
+                    "src": {"Closure": {"info": {"kind": "Fn"}}}
+                }
+            ],
+            "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let borrowed = serde_json::from_value::<TyRef>(borrowed_anchor).expect("borrowed TyRef");
+    let by_value = adt_ty(1);
+    (llbc, borrowed, by_value)
+}
+
+/// A closure env that captures `&TransparentWrapper` of a scalar must
+/// paint that field as the inner word, matching `Rvalue::Ref` aliasing
+/// of the local. Layout `&eval::FrameAnchor` would project
+/// `Ptr(FrameAnchor)` against the stored Integer
+/// (`annotator/model.py` `unionof`).
+#[test]
+fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
+    let (llbc, borrowed, by_value) = llbc_with_transparent_anchor_closure_env();
+    let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let tomb = no_tombstoned_leaves();
+    assert_eq!(
+        tyref_to_value_type(&by_value, &llbc),
+        ValueType::Unsigned,
+        "by-value transparent wrapper is its depth word"
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed, &llbc),
+        ValueType::Unsigned,
+        "a borrow of the wrapper is the same word"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&by_value, &llbc, &gc_ids, &raw),
+        "usize",
+        "by-value layout is the inner scalar"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
+        "usize",
+        "a captured &Wrapper layout is the inner scalar, not &eval::FrameAnchor"
+    );
+    let ordinary = llbc.type_by_id(2).expect("ordinary holder");
+    let env = llbc.type_by_id(3).expect("closure env");
+    assert!(type_decl_is_closure_env(env));
+    assert!(!type_decl_is_closure_env(ordinary));
+    assert_eq!(
+        tyref_to_attr_value_type_for_struct_field(&borrowed, env, &llbc, &gc_ids, &raw),
+        ValueType::Unsigned,
+        "closure-env FORCE of a captured &Wrapper is the inner word"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &borrowed, &borrowed, false, true, None, &llbc, tomb, &gc_ids, &raw
+        ),
+        ValueType::Unsigned,
+        "closure-env getfield of a captured &Wrapper is the inner word"
+    );
+}
+
 fn raw_mut_u8() -> TyRef {
     fixture_ty(serde_json::json!({
         "RawPtr": [
