@@ -5387,11 +5387,20 @@ impl PyFrame {
         // sent value or `SApplicationException` is still the argument. One
         // shadow-stack bracket covers the whole span.
         let pins = crate::pin_resume_args!(&mut resume);
+        // `drain_jit_pending_exception` / `stack_check` overflow allocate
+        // RecursionError (`pyframe.py` `execute_frame.insert_stack_check_here`).
+        // `framework.py` `gct_direct_call` / `shadowstack.py` `pop_roots`
+        // rewrite the frame after those collecting calls.
+        let anchor = crate::eval::FrameAnchor::new(self);
         crate::stack_check::drain_jit_pending_exception()?;
         crate::reload_resume_args!(pins.as_ref(), &mut resume);
         crate::stack_check::stack_check()?;
         crate::reload_resume_args!(pins.as_ref(), &mut resume);
-        crate::eval::eval_frame_plain_with_resume(self, &mut resume, pins.as_ref())
+        crate::eval::eval_frame_plain_with_resume(
+            unsafe { &mut *anchor.live() },
+            &mut resume,
+            pins.as_ref(),
+        )
     }
 
     /// Generator/coroutine execution entry.  PyPy's
@@ -5441,11 +5450,18 @@ impl PyFrame {
         // allocates before `call_trace` / `resume_execute_frame` consume the
         // sent value or `SApplicationException`.
         let pins = crate::pin_resume_args!(resume);
+        // Same collecting `stack_check` as `execute_frame`
+        // (`pyframe.py` `execute_frame.insert_stack_check_here`).
+        let anchor = crate::eval::FrameAnchor::new(self);
         crate::stack_check::drain_jit_pending_exception()?;
         crate::reload_resume_args!(pins.as_ref(), resume);
         crate::stack_check::stack_check()?;
         crate::reload_resume_args!(pins.as_ref(), resume);
-        crate::eval::eval_frame_plain_with_resume(self, resume, pins.as_ref())
+        crate::eval::eval_frame_plain_with_resume(
+            unsafe { &mut *anchor.live() },
+            resume,
+            pins.as_ref(),
+        )
     }
 
     /// pyframe.py `hide(self): return self.pycode.hidden_applevel`.
