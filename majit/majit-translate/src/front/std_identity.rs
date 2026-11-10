@@ -64,7 +64,7 @@ fn is_identity_wrapper_target(
             }
             matches!(
                 (name.as_str(), path_leaf(receiver_root.as_deref())),
-                ("get", Some("Cell")) | ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard"))
+                ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard"))
             )
         }
         CallTarget::FunctionPath { segments, .. } => {
@@ -88,7 +88,6 @@ fn is_identity_wrapper_target(
                     true
                 }
                 Some("new") if path_has(segments, "atomic") => true,
-                Some("get") if recv == Some("Cell") || path_has(segments, "Cell") => true,
                 Some("deref" | "deref_mut")
                     if matches!(recv, Some("Ref") | Some("MutexGuard"))
                         || path_has(segments, "MutexGuard")
@@ -542,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_get_and_atomic_new_are_identity() {
+    fn atomic_new_is_identity_and_cell_get_stays_a_call() {
         let v = dummy_var();
         let get = lower_std_primitive_op(
             call(
@@ -559,13 +558,10 @@ mod tests {
             Some(&[("value".into(), ValueType::Int)]),
             false,
         );
-        match get {
-            OpKind::UnaryOp { op, operand, .. } => {
-                assert_eq!(op, "same_as");
-                assert_eq!(operand, v);
-            }
-            other => panic!("expected same_as, got {other:?}"),
-        }
+        assert!(
+            matches!(get, OpKind::Call { .. }),
+            "a Cell read is a place read handled in lower_call, not a by-value wrapper payload"
+        );
 
         let new = lower_std_primitive_op(
             call(

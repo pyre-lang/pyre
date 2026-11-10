@@ -5635,6 +5635,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::execution_context_root_stack_slot_get",
         crate::executioncontext::execution_context_root_stack_slot_get,
     );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::executioncontext::execution_context_cache_root_stack_slot",
+        "pyre_interpreter::execution_context_cache_root_stack_slot",
+        crate::executioncontext::execution_context_cache_root_stack_slot,
+    );
     cpa0!(
         &mut entries,
         "pyre_object::dict_eq_hook::has_compares_by_identity_hook",

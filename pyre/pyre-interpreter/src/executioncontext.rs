@@ -1026,6 +1026,18 @@ pub fn execution_context_root_stack_slot_get(ec: *const ExecutionContext) -> usi
     }
 }
 
+/// `root_stack_slot` cache fill (`gc_enter_roots_frame`): resolve this
+/// thread's shadow-stack slot into the context once per activation. Takes the
+/// owner pointer because the field's JIT representation is its `usize` word,
+/// not an address a residual could receive.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn execution_context_cache_root_stack_slot(ec: *const ExecutionContext) {
+    if !ec.is_null() {
+        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*ec).root_stack_slot });
+    }
+}
+
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);

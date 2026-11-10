@@ -1253,21 +1253,19 @@ pub(crate) fn field_owner_is_gc(
     if field.is_vtable_method_slot() {
         return false;
     }
-    // The front records `Struct._gckind` on the descriptor. A Raw owner
-    // stays a raw address even when this `CallControl` has no layout
-    // registered for the leaf name (`getattr(..., '_gckind', 'gc')` is
-    // the fallback only when the producer did not record a kind).
-    if let Some(declared_gc) = field.owner_declared_gc {
-        return declared_gc;
-    }
+    // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
+    // front's structural stamp is used only when no row exists.
     let Some(owner) = field.owner_root.as_deref() else {
-        return true;
+        return field.owner_declared_gc.unwrap_or(true);
     };
     let Some(cc) = callcontrol else {
-        return true;
+        return field.owner_declared_gc.unwrap_or(true);
     };
     if let Some((is_gc, _)) = cc.struct_storage_for(owner) {
         return is_gc;
+    }
+    if let Some(declared_gc) = field.owner_declared_gc {
+        return declared_gc;
     }
     match cc.declared_gckind_for(owner) {
         Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw) => false,

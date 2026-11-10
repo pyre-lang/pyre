@@ -11656,9 +11656,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // shadow-stack cell is the `gc_enter_roots_frame` cache: resolved once
     // here, before the marker, so the pointer is not live across
     // `split_before_jit_merge_point`. Later opcodes load that cell.
-    if !marker_ec.is_null() {
-        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
-    }
+    pyre_interpreter::executioncontext::execution_context_cache_root_stack_slot(marker_ec);
 
     loop {
         // Frame may move at a collection point. Collection now happens inside

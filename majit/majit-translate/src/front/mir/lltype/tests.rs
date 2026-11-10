@@ -5605,6 +5605,17 @@ fn transparent_scalar_struct_uses_inner_register_bank() {
         super::tyref_to_value_type(&word_ty, &llbc),
         crate::model::ValueType::Int
     );
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &word_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .is_none(),
+        "a transparent wrapper over a scalar is that scalar's one-word field"
+    );
 }
 
 /// `BuildHasherDefault<H>` is Opaque in std LLBC and has no layout.
