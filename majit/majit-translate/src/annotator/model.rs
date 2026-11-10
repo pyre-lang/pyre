@@ -333,39 +333,6 @@ fn same_struct_identity(a: &str, b: &str) -> bool {
         == crate::annotator::bookkeeper::normalize_class_qualname(b)
 }
 
-/// Whether `payload` names the GC pointee of a `MutRef<T>` cell.
-///
-/// The cell ClassDef is pyre-only (`front::mir::mut_ref_shape_rows`) and
-/// is not a subclass of `T` (`alias_exception_carrier_handle`: getattr
-/// of `.value` must stay on the cell). `ClassDef.commonbase` of two
-/// unrelated classes is None, so union prefers the cell here instead.
-fn mut_ref_cell_unifies_with_payload(cell: &str, payload: &str) -> bool {
-    let Some(inner) = crate::annotator::bookkeeper::mut_ref_gc_payload_name(cell) else {
-        return false;
-    };
-    if crate::annotator::bookkeeper::mut_ref_gc_payload_name(payload).is_some() {
-        return false;
-    }
-    same_struct_identity(inner, payload)
-        || crate::front::semantic::is_path_suffix(payload, inner)
-        || crate::front::semantic::is_path_suffix(inner, payload)
-}
-
-fn mut_ref_cell_class(
-    ca: &Rc<RefCell<ClassDef>>,
-    cb: &Rc<RefCell<ClassDef>>,
-) -> Option<Rc<RefCell<ClassDef>>> {
-    let an = ca.borrow().name.clone();
-    let bn = cb.borrow().name.clone();
-    if mut_ref_cell_unifies_with_payload(&an, &bn) {
-        return Some(ca.clone());
-    }
-    if mut_ref_cell_unifies_with_payload(&bn, &an) {
-        return Some(cb.clone());
-    }
-    None
-}
-
 // SomeObject base — RPython `model.py`.
 
 /// RPython `class SomeObject(object)` (model.py).
@@ -3609,59 +3576,51 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             // (legacy fallback), which is the parity-correct outcome.
             let merged_classdef = match (&a.classdef, &b.classdef) {
                 (Some(ca), Some(cb)) => {
-                    // Prefer the `MutRef<T>` cell over the payload `T`.
-                    // The cell is not a subclass of `T`; `commonbase` is
-                    // None and would UnionError. getattr of `.value` stays
-                    // on the cell (`alias_exception_carrier_handle`).
-                    if let Some(cell) = mut_ref_cell_class(ca, cb) {
-                        Some(cell)
-                    } else {
-                        match ClassDef::commonbase(ca, cb) {
-                            Some(base) => Some(base),
-                            None if same_struct_identity(&ca.borrow().name, &cb.borrow().name) => {
-                                // One struct reached by two frontend name spellings
-                                // (dot-joined crate-included ctor qualname vs the
-                                // crate-stripped `::` field-read spelling): two
-                                // base-less leaves with no shared base but the same
-                                // canonical identity.  Unify to the lhs class.
-                                Some(ca.clone())
-                            }
-                            None if unresolved_option_none_name(&ca.borrow().name)
-                                || unresolved_option_none_name(&cb.borrow().name) =>
-                            {
-                                // `RDict::get` returns `Option<V>`. A pointer payload
-                                // is stored as the object itself, and the unresolved
-                                // `None` variant is that object's null. The merge is
-                                // the payload class, nullable.
-                                let payload = if unresolved_option_none_name(&ca.borrow().name) {
-                                    cb.clone()
-                                } else {
-                                    ca.clone()
-                                };
-                                return Ok(SomeValue::Instance(SomeInstance::new(
-                                    Some(payload),
-                                    true,
-                                    flags,
-                                )));
-                            }
-                            None => {
-                                // Name the two colliding classdefs so the
-                                // skip-classified panic path is diagnosable
-                                // instead of a blind `<other> ∪ <other>`.  The
-                                // "cannot unify instances with no common base
-                                // class" phrase is preserved verbatim so the
-                                // dual-gate skip classifier still matches.
-                                return Err(UnionError {
-                                    lhs: Box::new(s1.clone()),
-                                    rhs: Box::new(s2.clone()),
-                                    msg: format!(
-                                        "RPython cannot unify instances with no \
+                    match ClassDef::commonbase(ca, cb) {
+                        Some(base) => Some(base),
+                        None if same_struct_identity(&ca.borrow().name, &cb.borrow().name) => {
+                            // One struct reached by two frontend name spellings
+                            // (dot-joined crate-included ctor qualname vs the
+                            // crate-stripped `::` field-read spelling): two
+                            // base-less leaves with no shared base but the same
+                            // canonical identity.  Unify to the lhs class.
+                            Some(ca.clone())
+                        }
+                        None if unresolved_option_none_name(&ca.borrow().name)
+                            || unresolved_option_none_name(&cb.borrow().name) =>
+                        {
+                            // `RDict::get` returns `Option<V>`. A pointer payload
+                            // is stored as the object itself, and the unresolved
+                            // `None` variant is that object's null. The merge is
+                            // the payload class, nullable.
+                            let payload = if unresolved_option_none_name(&ca.borrow().name) {
+                                cb.clone()
+                            } else {
+                                ca.clone()
+                            };
+                            return Ok(SomeValue::Instance(SomeInstance::new(
+                                Some(payload),
+                                true,
+                                flags,
+                            )));
+                        }
+                        None => {
+                            // Name the two colliding classdefs so the
+                            // skip-classified panic path is diagnosable
+                            // instead of a blind `<other> ∪ <other>`.  The
+                            // "cannot unify instances with no common base
+                            // class" phrase is preserved verbatim so the
+                            // dual-gate skip classifier still matches.
+                            return Err(UnionError {
+                                lhs: Box::new(s1.clone()),
+                                rhs: Box::new(s2.clone()),
+                                msg: format!(
+                                    "RPython cannot unify instances with no \
                                  common base class: {} ∪ {}",
-                                        ca.borrow().name,
-                                        cb.borrow().name
-                                    ),
-                                });
-                            }
+                                    ca.borrow().name,
+                                    cb.borrow().name
+                                ),
+                            });
                         }
                     }
                 }
@@ -4897,7 +4856,9 @@ mod tests {
     }
 
     #[test]
-    fn mut_ref_cell_unions_with_payload_instance() {
+    fn mut_ref_cell_union_with_payload_is_union_error() {
+        // `binaryop.py` `pairtype(SomeInstance, SomeInstance).union`
+        // walks `commonbase`; MutRef is not a subclass of the payload.
         let cell = ClassDef::new_standalone("MutRef<PyError>", None);
         let payload = ClassDef::new_standalone("pyre_interpreter::error::PyError", None);
         let s_cell = SomeValue::Instance(SomeInstance::new(
@@ -4910,21 +4871,20 @@ mod tests {
             false,
             std::collections::BTreeMap::new(),
         ));
-        let merged = union(&s_cell, &s_payload).expect("MutRef<T> ∪ T");
-        let SomeValue::Instance(inst) = merged else {
-            panic!("expected SomeInstance, got {merged:?}");
-        };
-        assert_eq!(
-            inst.classdef.as_ref().expect("classdef").borrow().name,
-            "MutRef<PyError>"
+        let err = union(&s_cell, &s_payload).expect_err("MutRef<T> ∪ T");
+        assert!(
+            err.msg
+                .contains("cannot unify instances with no common base class"),
+            "union error: {}",
+            err.msg
         );
-        let merged_rev = union(&s_payload, &s_cell).expect("T ∪ MutRef<T>");
-        let SomeValue::Instance(inst_rev) = merged_rev else {
-            panic!("expected SomeInstance, got {merged_rev:?}");
-        };
-        assert_eq!(
-            inst_rev.classdef.as_ref().expect("classdef").borrow().name,
-            "MutRef<PyError>"
+        let err_rev = union(&s_payload, &s_cell).expect_err("T ∪ MutRef<T>");
+        assert!(
+            err_rev
+                .msg
+                .contains("cannot unify instances with no common base class"),
+            "union error: {}",
+            err_rev.msg
         );
     }
 

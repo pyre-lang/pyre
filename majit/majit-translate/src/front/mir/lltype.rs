@@ -6627,6 +6627,23 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
         return None;
     }
+    // A GC handle is one pointer word (`gc_ref_pointer`). `all_fielddescrs`
+    // does not recurse into Ptr; `InstanceRepr.setfield` writes one field.
+    // A published copy can lose `repr.transparent` while still being that
+    // handle, so the transparent-handle spelling above misses it and a
+    // leaf-copy would getattr the container field plus the handle's inner
+    // field as a dotted path (`expand_pop_roots` reloads the handle word
+    // into the same field it came from).
+    if gc_ref_pointer(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        0,
+        raw_alloc_flavor_structs,
+    ) {
+        return None;
+    }
     // One integer word is not an inlined STRUCT. `getcalldescr` reads
     // that lltype off the value (`call.py`); leaf-copy would GETFIELD
     // `__pos_0` with the Int as the base (`VersionTag(u64)`).
@@ -11936,7 +11953,37 @@ pub(in crate::front::mir) fn gc_ref_pointer(
     let Some(decl) = llbc.type_by_id(id) else {
         return false;
     };
-    if !decl.is_repr_transparent() || decl.published_struct_copy {
+    // An imported `repr(transparent)` pointer handle has no field
+    // list (`TypeDeclKind::Opaque`). `apply_published_structs` copies
+    // the defining crate's field list onto that import and sets
+    // `published_struct_copy`; call routing still treats the decl as
+    // the Opaque import. One pointer word that is not a linked scalar
+    // is the same GC handle (`opaque_pointer_handle`).
+    if matches!(decl.kind, TypeDeclKind::Opaque) || decl.published_struct_copy {
+        if opaque_pointer_handle(decl, llbc) {
+            return true;
+        }
+        if matches!(decl.kind, TypeDeclKind::Opaque) {
+            return false;
+        }
+        // Published copy whose layout did not keep `repr.transparent`:
+        // the copied field list is the handle.
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            return false;
+        };
+        return fields.len() == 1
+            && fields.first().is_some_and(|field| {
+                gc_ref_pointer(
+                    &field.ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    depth + 1,
+                    raw_alloc_flavor_structs,
+                )
+            });
+    }
+    if !decl.is_repr_transparent() {
         return false;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -12080,6 +12127,55 @@ pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
         gc_struct_ids,
         raw_alloc_flavor_structs,
     )
+}
+
+/// Input stamp of a MutRef cell parameter.
+///
+/// `&mut T` is `MutRef<T>` (`can_be_None=false`). `Option<&mut T>` is the
+/// same cell, nullable: `SomeInstance.__init__(can_be_None)` (`model.py`).
+/// The Option word is the cell `expand_pop_roots` (`shadowcolor.py`)
+/// writes through. Returns `(value_root, class_root)`.
+pub(in crate::front::mir) fn gc_mut_ref_input_stamp(
+    ty: &TyRef,
+    index: usize,
+    gc_mut_ref_params: &std::collections::HashSet<usize>,
+    gc_mut_ref_option_params: &std::collections::HashSet<usize>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    if gc_mut_ref_params.contains(&index) {
+        let root = tyref_gc_mut_ref_cell_root(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )?;
+        return Some((root.clone(), root));
+    }
+    if gc_mut_ref_option_params.contains(&index) {
+        let root = tyref_option_gc_mut_ref_cell_root(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )?;
+        return Some((root.clone(), format!("Option<{root}>")));
+    }
+    None
+}
+
+/// Raw `*T` / borrowed `&T` / `&mut T`. A by-value GC ADT is not a
+/// pointer; `pointer_target_json` names only those wrappers.
+pub(in crate::front::mir) fn tyref_is_raw_or_borrowed_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(|node| node.as_object())
+        .and_then(pointer_target_json)
+        .is_some()
 }
 
 /// Parameter locals declared `Option<&mut T>` whose payload would occupy

@@ -2830,12 +2830,21 @@ impl<'l> CrateLowering<'l> {
     ) -> Option<crate::model::FunctionGraph> {
         let locals = fd.unstructured_locals()?;
         let mut graph = crate::model::FunctionGraph::new(graph_name_of(self.llbc, fd));
+        let residual = fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside);
         let cells = gc_mut_ref_param_locals(
             &locals,
             self.llbc,
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            residual,
+            &self.state.raw_alloc_flavor_structs,
+        );
+        let option_cells = gc_mut_ref_option_param_locals(
+            &locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            &self.state.gc_struct_ids,
+            residual,
             &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
@@ -2845,6 +2854,7 @@ impl<'l> CrateLowering<'l> {
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
             &cells,
+            &option_cells,
             &self.state.gc_struct_ids,
             fundecl_keeps_zst_self(
                 self.llbc,
@@ -3081,12 +3091,21 @@ impl<'l> CrateLowering<'l> {
             .fn_by_id(spec.body.fn_id)
             .expect("a declared specialization names its FunDecl");
         let mut graph = crate::model::FunctionGraph::new(spec.body.segments.join("::"));
+        let residual = fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside);
         let cells = gc_mut_ref_param_locals(
             &spec.body.body.locals,
             self.llbc,
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            residual,
+            &self.state.raw_alloc_flavor_structs,
+        );
+        let option_cells = gc_mut_ref_option_param_locals(
+            &spec.body.body.locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            &self.state.gc_struct_ids,
+            residual,
             &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
@@ -3096,6 +3115,7 @@ impl<'l> CrateLowering<'l> {
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
             &cells,
+            &option_cells,
             &self.state.gc_struct_ids,
             fundecl_keeps_zst_self(
                 self.llbc,

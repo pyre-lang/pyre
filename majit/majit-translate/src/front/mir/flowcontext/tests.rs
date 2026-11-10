@@ -11977,6 +11977,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         None,
         tomb,
         &cells,
+        &std::collections::HashSet::<usize>::new(),
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
@@ -12004,6 +12005,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         None,
         tomb,
         &residual,
+        &std::collections::HashSet::<usize>::new(),
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
@@ -12146,6 +12148,30 @@ fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
     .unwrap();
     assert!(lowering.gc_mut_ref_option_params.contains(&1));
     assert!(!lowering.gc_mut_ref_params.contains(&1));
+    let opt_input = lowering
+        .graph
+        .block(lowering.graph.startblock)
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "opt"))
+        .expect("opt input");
+    let OpKind::Input { ty, class_root, .. } = &opt_input.kind else {
+        panic!("opt is an input");
+    };
+    let class_root = class_root
+        .as_deref()
+        .expect("Option<&mut T> Input carries a class_root");
+    assert!(
+        class_root.starts_with("Option<MutRef<"),
+        "Option<&mut T> Input is nullable MutRef, got {class_root}"
+    );
+    match ty {
+        ValueType::Ref(Some(root)) => assert!(
+            root.starts_with("MutRef<"),
+            "Option<&mut T> value root is MutRef, got {root}"
+        ),
+        other => panic!("Option<&mut T> Input is Ref(MutRef), got {other:?}"),
+    }
 
     let opt_place = serde_json::json!({"kind": {"Local": 1}, "ty": option_ty});
     let mut_place = serde_json::json!({"kind": {"Local": 2}, "ty": mut_ref});
@@ -12181,8 +12207,11 @@ fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
     );
 }
 
-/// A residual callee — no body, or `dont_look_inside` — is not given a
-/// cell signature. The traced callee with the same `&mut` GC pointer is.
+/// A `dont_look_inside` callee is not given a cell signature (the Rust
+/// ABI takes the address of the word). An Opaque import of a `&mut` GC
+/// pointer still wraps so pycall of the defining graph sees the cell
+/// (`expand_pop_roots`). The traced callee with the same formal is a
+/// cell.
 #[test]
 fn mut_ref_cell_signature_skips_a_residual_callee() {
     let span = serde_json::json!({"data": {
@@ -12306,7 +12335,11 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
         .expect("a traced &mut GC pointer is a cell");
     assert_eq!(traced.0, Some(0));
     assert!(traced.1[0].1.starts_with("MutRef<"));
-    assert!(lowering.gc_mut_ref_signature(&call(1), &[]).is_none());
+    let opaque = lowering
+        .gc_mut_ref_signature(&call(1), &[])
+        .expect("an Opaque &mut GC pointer is a cell");
+    assert_eq!(opaque.0, Some(1));
+    assert!(opaque.1[0].1.starts_with("MutRef<"));
     assert!(lowering.gc_mut_ref_signature(&call(2), &[]).is_none());
 }
 
