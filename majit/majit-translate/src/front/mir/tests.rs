@@ -18803,7 +18803,7 @@ fn reflexive_from_fn_item_llbc(
         },
         "methods": []
     });
-    llbc_with_types_traits(
+    llbc_with_types_and_traits(
         "fixture",
         vec![],
         vec![caller, from],
@@ -19022,7 +19022,7 @@ fn trait_into_equal_types_is_identity() {
             interior_bb(vec![], interior_return()),
         ],
     );
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![],
         vec![caller],
@@ -19155,7 +19155,7 @@ fn trait_into_targets_selected_from() {
         },
         "methods": []
     });
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![],
         vec![caller, from],
@@ -38183,7 +38183,7 @@ fn copy_struct_slice_get_through_unsafecell_deref_is_bounds_and_interior_read() 
         vec![option_ty],
         cf_ty,
     );
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![
             copy_pair_struct(),

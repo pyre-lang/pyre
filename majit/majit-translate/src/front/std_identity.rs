@@ -810,9 +810,10 @@ mod tests {
     }
 
     #[test]
-    fn cell_get_is_a_load_when_layout_is_unknown() {
-        // `Cell::get(&Cell<T>) -> T` is a load of the inner word, even
-        // when Charon left `Cell` Opaque without a field list.
+    fn a_cross_bank_wrapper_member_stays_residual() {
+        // `Cell::get(&Cell<T>) -> T` is a load: the receiver is in the
+        // ref bank and the result in the int bank.  Aliasing it spells
+        // `int_same_as/r>i`, which the blackhole leaves unwired.
         let v = dummy_var();
         let get = lower_std_primitive_op(
             call(
@@ -829,20 +830,10 @@ mod tests {
             None,
             false,
         );
-        match get {
-            OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            } => {
-                assert_eq!(base, v);
-                assert_eq!(field.name, "value");
-                assert_eq!(ty, ValueType::Int);
-                assert!(!pure);
-            }
-            other => panic!("Cell::get must be a field load, got {other:?}"),
-        }
+        assert!(
+            matches!(get, OpKind::Call { .. }),
+            "a cross-bank wrapper member must keep its residual call"
+        );
     }
 
     #[test]

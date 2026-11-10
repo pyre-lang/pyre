@@ -10703,7 +10703,6 @@ impl FunctionGraph {
         matches!(Self::concretetype_of(var), ConcreteType::Signed)
     }
 
-
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython
@@ -14158,6 +14157,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![write_args[0].clone(), write_args[1].clone()]),
@@ -14233,6 +14233,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![write_args[0].clone(), write_args[1].clone()]),
@@ -22837,6 +22838,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg]),

@@ -9008,6 +9008,18 @@ impl<'a> LowerContext<'a> {
         Self::new_with_dependency_raw_flavors(llbc, &std::collections::HashSet::new())
     }
 
+    /// `new` plus a dependency artefact's flavor-raw classes and
+    /// transparent-scalar kinds (the pair [`link_transparent_scalar_types`]
+    /// publishes). Interpreter/module tests that lower one artefact still
+    /// peel a defining-crate `RootScope`.
+    pub fn new_with_dependency_llbc(llbc: &'a Llbc, dependency: &Llbc) -> Self {
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(dependency));
+        let flavors = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(dependency),
+        );
+        Self::new_with_dependency_raw_flavors(llbc, &flavors)
+    }
+
     /// `new` plus the flavor-raw classes of the crates `llbc` links against (`lib.rs` passes the program-wide set to whole-crate lowering).
     pub fn new_with_dependency_raw_flavors(
         llbc: &'a Llbc,
@@ -9027,17 +9039,18 @@ impl<'a> LowerContext<'a> {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
-        llbc.register_raw_struct_paths(discover_raw_struct_paths(
-            llbc,
-            &gc_struct_ids,
-            &immutable_fields,
-        ));
         let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
+        llbc.register_raw_struct_paths(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &immutable_fields,
+            &raw_alloc_flavor_structs,
+        ));
         llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
@@ -9271,6 +9284,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         Some(gc_root_effects),
         func_hints,
+        None,
     )
 }
 
@@ -9467,6 +9481,8 @@ pub use self::gcroot::{
     mark_foreign_scope_owners, pin_roots_published_locals, scope_owner_identity,
     shadow_stack_erase_status,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::type_decl_nullable_str_enum;
 pub(crate) use self::lltype::{
     NullableStrEnum, RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS,
     ThreadLocalRefLlop, adt_head_instantiation_suffix, cached_global_marker_str,
@@ -9488,8 +9504,6 @@ pub(crate) use self::lltype::{
     type_decl_adt_tyref, tyref_nullable_str_enum, tyref_to_value_type,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
-#[cfg(test)]
-pub(crate) use self::lltype::{stamp_fn_ptr_spelling, type_decl_nullable_str_enum};
 pub(crate) use self::malloc::forward_identity;
 pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,

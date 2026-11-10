@@ -11955,6 +11955,7 @@ mod tests {
                             OPTION_FN_PBC_CALLEE.into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
