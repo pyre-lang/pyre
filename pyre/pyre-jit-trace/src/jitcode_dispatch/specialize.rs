@@ -8154,11 +8154,16 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             // register; `write_residual_call_result_to_dst` no-ops `'v'`.
             DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
                 let _ = finish_inline_callee_return(ctx, None);
-                helper_blackhole_after_no_driver_finishframe(
-                    ctx,
-                    no_driver_finishframe_latch(ctx, op_pc),
-                    op_pc,
-                )?;
+                // `boxed_out` is a result-box request: the caller writes dest
+                // (`finishframe` / `make_result_of_lastop`) and `_interpret`
+                // checks `blackhole_if_trace_too_long` after that write.
+                if boxed_out.is_none() {
+                    helper_blackhole_after_no_driver_finishframe(
+                        ctx,
+                        no_driver_finishframe_latch(ctx, op_pc),
+                        op_pc,
+                    )?;
+                }
                 return Ok(Some(DispatchOutcome::Continue));
             }
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
@@ -8172,14 +8177,18 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             raised @ DispatchOutcome::SubRaise { .. } => return Ok(Some(raised)),
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
-    write_no_driver_finishframe_dest(
-        ctx,
-        op_pc,
-        no_driver_finishframe_latch(ctx, op_pc),
-        dst,
-        dst_bank,
-        result,
-    )?;
+    if boxed_out.is_some() {
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    } else {
+        write_no_driver_finishframe_dest(
+            ctx,
+            op_pc,
+            no_driver_finishframe_latch(ctx, op_pc),
+            dst,
+            dst_bank,
+            result,
+        )?;
+    }
     if let Some(slot) = boxed_out {
         *slot = Some(result);
     }

@@ -12018,7 +12018,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?
         .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        // Dest is the boxed `makespecialisedtuple2` result; `_interpret`
+        // checks after that write (`finishframe` / `make_result_of_lastop`).
+        return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
     // The arities `makespecialisedtuple2` does not claim take the canonical
@@ -12755,7 +12757,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     if let Some(result) =
                         try_walker_orthodox_newutf8(ctx, op.pc, r_args[0], i_args[0], boxed)?
                     {
-                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+                        // Void-bank boxed_out: dest is this write
+                        // (`finishframe` / `make_result_of_lastop`).
+                        write_no_driver_finishframe_dest(ctx, op.pc, op.next_pc, dst, 'r', result)?;
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                 }
