@@ -7980,20 +7980,20 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
 /// CALL captures this before its callable/type/bound-method guards so a
 /// missing coordinate is a clean decline; LOAD_ATTR captures it after the
 /// type pin.  The walk itself is [`walk_translated_builtin_wrapper`].
-struct BuiltinWrapperCallSite {
-    nested_helper: bool,
-    helper_return: HelperReturn,
-    nested_helper_entry: Option<HelperLevel>,
-    call_site_py_pc: u32,
-    vsd_value: i64,
-    outer_jitcode_index: u32,
-    call_site_marker: Option<usize>,
-    call_site_active: Vec<OpRef>,
-    owns_virtualizable_shadow: bool,
+pub(crate) struct BuiltinWrapperCallSite {
+    pub(crate) nested_helper: bool,
+    pub(crate) helper_return: HelperReturn,
+    pub(crate) nested_helper_entry: Option<HelperLevel>,
+    pub(crate) call_site_py_pc: u32,
+    pub(crate) vsd_value: i64,
+    pub(crate) outer_jitcode_index: u32,
+    pub(crate) call_site_marker: Option<usize>,
+    pub(crate) call_site_active: Vec<OpRef>,
+    pub(crate) owns_virtualizable_shadow: bool,
 }
 
 /// `typeobject.py descr_call`'s `__init__` half, walked after `__new__`.
-struct BuiltinWrapperTypeCallInit<'a> {
+pub(crate) struct BuiltinWrapperTypeCallInit<'a> {
     tp_init: pyre_object::PyObjectRef,
     r_args: &'a [OpRef],
     arg_concretes: &'a [ConcreteValue],
@@ -8169,7 +8169,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
 /// (`try_walker_descend_builtin_getattribute`).
 #[allow(clippy::too_many_arguments)]
-fn walk_translated_builtin_wrapper<Sym: WalkSym>(
+pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
@@ -8498,7 +8498,9 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                     return Ok(inlined);
                 }
                 write_ref_reg(ctx, op.pc, dst, value, concrete)?;
-                Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+                Ok(Some(super::continue_after_no_driver_finishframe(
+                    ctx, op.next_pc, op.pc,
+                )?))
             }
             None => Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
         },
@@ -8511,7 +8513,9 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                 // context call (`resolve_exception_context`); a second call would duplicate it.
                 record_caller_frame_traceback(ctx, exc, &mut exc_concrete, op.pc)?;
                 ctx.set_last_exc_value(exc, exc_concrete);
-                Ok(Some((DispatchOutcome::Continue, target)))
+                Ok(Some(super::continue_after_no_driver_finishframe(
+                    ctx, target, op.pc,
+                )?))
             } else {
                 Ok(Some((
                     DispatchOutcome::SubRaise { exc, exc_concrete },
@@ -8899,7 +8903,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         DispatchOutcome::SubReturn { result: _ } => {
             // `descr_call` discards `__init__`'s None and returns the instance.
             write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+            Ok(Some(super::continue_after_no_driver_finishframe(
+                ctx, op.next_pc, op.pc,
+            )?))
         }
         DispatchOutcome::SubRaise {
             exc,
@@ -8910,7 +8916,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                 // context call (`resolve_exception_context`); a second call would duplicate it.
                 record_caller_frame_traceback(ctx, exc, &mut exc_concrete, op.pc)?;
                 ctx.set_last_exc_value(exc, exc_concrete);
-                Ok(Some((DispatchOutcome::Continue, target)))
+                Ok(Some(super::continue_after_no_driver_finishframe(
+                    ctx, target, op.pc,
+                )?))
             } else {
                 Ok(Some((
                     DispatchOutcome::SubRaise { exc, exc_concrete },
@@ -18621,7 +18629,9 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     let null_box = ctx.trace_ctx.const_null();
     write_ref_reg(ctx, op.pc, dst, null_box, ConcreteValue::Null)?;
     ctx.frame_state.borrow_mut().vstack_last_ref = null_box;
-    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+    Ok(Some(super::continue_after_no_driver_finishframe(
+        ctx, op.next_pc, op.pc,
+    )?))
 }
 
 /// Write the yielded FOR_ITER item from the live box, after any recording
@@ -21224,7 +21234,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                         ctx, pc, op_tag, ref_args, dst, dst_bank,
                     )
                 })? {
-                    return Ok(outcome.into());
+                    return Ok(InlineCallOutcome::residual(outcome));
                 }
                 if matches!(
                     pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
@@ -21232,7 +21242,9 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 ) && let Some(outcome) = spec_gate(SpecFold::Subscr, || {
                     super::specialize::try_emit_list_int_getitem(ctx, pc, ref_args, dst, dst_bank)
                 })? {
-                    return Ok(outcome.into());
+                    // The getitem body `finishframe`d; dest-write in
+                    // `dispatch_inline_call_*` then `_interpret`.
+                    return Ok(InlineCallOutcome::from(outcome));
                 }
             } else if fbw_debug_abort_enabled() {
                 let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
@@ -21368,12 +21380,43 @@ fn inline_fnaddr_call_setup_from_jc<Sym: WalkSym>(
 /// `GUARD_NO_EXCEPTION` inside `handle_possible_exception`.
 struct InlineCallOutcome {
     outcome: DispatchOutcome,
+    /// `run_sub_jitcode_walk` completed (`finishframe`). Fnaddr residualize
+    /// stays inside the same `run_one_step`.
+    finishframe: bool,
 }
 
 impl From<DispatchOutcome> for InlineCallOutcome {
     fn from(outcome: DispatchOutcome) -> Self {
-        Self { outcome }
+        Self {
+            outcome,
+            finishframe: true,
+        }
     }
+}
+
+impl InlineCallOutcome {
+    fn residual(outcome: DispatchOutcome) -> Self {
+        Self {
+            outcome,
+            finishframe: false,
+        }
+    }
+}
+
+/// Dest-write of a child that `run_sub_jitcode_walk_from` completed under
+/// this CALL (`drive` Ok, no parent `SubWalkDriver`). Residualize via
+/// fnaddr does not `perform_call`. Skip when a parent driver dest-write
+/// already checks (`pending_subreturn`).
+fn helper_blackhole_after_inline_finishframe<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    latch_pc: usize,
+    error_pc: usize,
+    finishframe: bool,
+) -> Result<(), DispatchError> {
+    if !finishframe {
+        return Ok(());
+    }
+    super::helper_blackhole_after_no_driver_finishframe(ctx, latch_pc, error_pc)
 }
 
 /// `cpu.bh_call_*(jitcode.fnaddr, ...)` for a helper body the walker
@@ -21603,22 +21646,19 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
                 pc,
                 symbolic: fnaddr,
             })?;
-        return Ok(DispatchOutcome::SubRaise {
+        return Ok(InlineCallOutcome::residual(DispatchOutcome::SubRaise {
             exc,
             exc_concrete: ctx.last_exc_value_concrete(),
-        }
-        .into());
+        }));
     }
     if can_raise {
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
-    Ok(InlineCallOutcome {
-        outcome: DispatchOutcome::SubReturn {
-            result: (dst_bank != 'v').then_some(recorded),
-        },
-    })
+    Ok(InlineCallOutcome::residual(DispatchOutcome::SubReturn {
+        result: (dst_bank != 'v').then_some(recorded),
+    }))
 }
 
 thread_local! {
@@ -21767,9 +21807,13 @@ struct PendingSubReturn {
 }
 
 impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
+    /// `residual_replay` is true when `SubWalkDriver` has parked a child at
+    /// this frame's CALL (`replay_log` was non-empty). That re-entry is not
+    /// `newframe`; the CALL opcode still has to consume the parked result.
     fn drive(
         &mut self,
         trace_ctx: &mut TraceCtx,
+        residual_replay: bool,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
         let mut walk_ctx = WalkContext {
             frame_state: self.frame_state.clone(),
@@ -21816,6 +21860,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // the opcode after the CALL.  The first CALL step already ran
         // vstack/live bookkeeping before it suspended.
         let mut published_raise = None;
+        let mut finishframe_error_pc = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
             if let DispatchOutcome::SubRaise { exc, exc_concrete } =
                 promote_published_null_return_since(
@@ -21843,6 +21888,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 };
                 if applied {
                     SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    finishframe_error_pc = Some(pending.caller_pc);
                     None
                 } else {
                     Some(DispatchError::UnexpectedVoidSubReturn {
@@ -21862,6 +21908,15 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         } else {
             #[cfg(test)]
             maybe_test_helper_before_walk_bump(self.body.jitcode_index);
+            if let Some(error_pc) = finishframe_error_pc {
+                // `MetaInterp.finishframe` / `make_result_of_lastop` delivered
+                // the dest; `_interpret` then checks before the next opcode.
+                helper_blackhole_after_run_one_step(&mut walk_ctx, self.pc, error_pc)?;
+            } else if !residual_replay {
+                // `MetaInterp.newframe` / `perform_call` raise ChangeFrame
+                // before the helper's first instruction; `_interpret` checks.
+                helper_blackhole_after_run_one_step(&mut walk_ctx, self.pc, self.pc)?;
+            }
             walk(self.body.code, self.pc, &mut walk_ctx)
         };
 
@@ -22055,9 +22110,10 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 self.exchange.ancestor_len = ancestors.len();
                 self.exchange.active_caller_pc = frame.caller_pc;
                 self.exchange.active_frame_id = frame.id;
+                let residual_replay = !frame.replay_log.is_empty();
                 self.exchange.completed = std::mem::take(&mut frame.replay_log);
                 self.exchange.completed_cursor = 0;
-                let driven = frame.drive(trace_ctx);
+                let driven = frame.drive(trace_ctx, residual_replay);
                 self.exchange.ancestor_len = 0;
                 self.exchange.ancestor_frames = std::ptr::null();
                 driven
@@ -22242,7 +22298,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 }
 
 /// Called by `walk` immediately before each opcode step while an explicit
-/// sub-walk driver is active.  A nested CALL yields and replays that one step;
+/// sub-walk driver is active. A nested CALL yields and replays that one step;
 /// these marks prove the replay crosses no concrete effect and delimit the IR
 /// preamble to cut.
 ///
@@ -22257,15 +22313,21 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 /// The checkpoint itself is cloned later, by
 /// [`snapshot_residual_heap_before_suspend`] at the suspend, so this mark
 /// needs only the opname and the trace position.
+///
+/// Returns whether this step will consume a parked child
+/// (`SubWalkExchange.completed` after the pc filter) — residual replay of
+/// `perform_call` / `_opimpl_recursive_call` / orthodox descent. `walk`
+/// samples that before `step` and, on `Continue`, runs
+/// `blackhole_if_trace_too_long` (`MetaInterp._interpret`).
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
     opname: &str,
     pc: usize,
     trace_position: majit_metainterp::recorder::TracePosition,
-) {
+) -> bool {
     SUBWALK_DRIVER.with(|slot| {
         let pointer = slot.get();
         if pointer.is_null() {
-            return;
+            return false;
         }
         // SAFETY: `SubWalkDriverGuard` installs only the driver's exchange
         // object and clears it before the enclosing stack frame returns.
@@ -22292,7 +22354,8 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         // only a residual that actually yields clones, at the yield.
         exchange.step_heap_cache = None;
         exchange.residual_step = opname.starts_with("residual_call_");
-    });
+        !exchange.completed.is_empty()
+    })
 }
 
 /// Snapshot the heap cache when a residual step yields a nested walk.
@@ -23838,7 +23901,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             })?
         {
             write_boxed(ctx, boxed)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
         // Named `add`/`mul`/… helpers arrive as `dR>r`, not
         // `binary_value_from_tag`.  Descend the generated body the same
@@ -23887,13 +23950,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         &args,
         &arg_concretes,
         &[],
-    );
-    let callee_outcome = promote_published_null_return_since(
-        ctx,
-        callee_result?.outcome,
-        op.pc,
-        exc_before_subwalk,
     )?;
+    let finishframe = callee_result.finishframe;
+    let callee_outcome =
+        promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -23926,12 +23986,14 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                      codewriter does not emit dR>f shape today)"
                     ),
                 }
+                helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
             None => {
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR` expects exactly this — callee
                     // exits via `void_return/`, no SubReturn writeback.
+                    helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // Same shape contract as `_r_r`: a `_r_<X>` variant promises
@@ -23976,6 +24038,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 // downstream `raise/r` / `reraise/` in the caller's handler
                 // keeps the class-known pin the callee's leg established.
                 ctx.set_last_exc_value(exc, exc_concrete);
+                helper_blackhole_after_inline_finishframe(ctx, target, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
@@ -24140,7 +24203,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // that lookup is a global index and misses the per-fn pool.
         if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
             && let Some(call_descr) = setup.descr.as_call_descr()
-            && spec_gate(SpecFold::Subscr, || {
+        {
+            super::residual_call::note_residual_pc_advanced(ctx, op.next_pc);
+            match spec_gate(SpecFold::Subscr, || {
                 super::specialize::try_walker_specialize_subscr(
                     ctx,
                     op.pc,
@@ -24150,10 +24215,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     dst,
                     dst_bank,
                 )
-            })?
-            .is_some()
-        {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            }) {
+                Ok(Some(())) => {
+                    super::residual_call::clear_residual_pc_advanced(ctx);
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                Ok(None) => super::residual_call::clear_residual_pc_advanced(ctx),
+                Err(error) => return Err(error),
+            }
         }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
@@ -24162,7 +24231,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         })? {
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
     }
 
@@ -24367,6 +24436,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &[],
     )?;
+    let finishframe = walked.finishframe;
     let callee_outcome =
         promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk)?;
 
@@ -24418,10 +24488,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                         }
                     }
                 }
+                helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
             None => {
                 if dst_bank == 'v' {
+                    helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
@@ -24463,6 +24535,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // downstream `raise/r` / `reraise/` in the caller's handler
                 // keeps the class-known pin the callee's leg established.
                 ctx.set_last_exc_value(exc, exc_concrete);
+                helper_blackhole_after_inline_finishframe(ctx, target, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
@@ -24616,13 +24689,10 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_args,
         &ref_arg_concretes,
         &float_args,
-    );
-    let callee_outcome = promote_published_null_return_since(
-        ctx,
-        callee_result?.outcome,
-        op.pc,
-        exc_before_subwalk,
     )?;
+    let finishframe = callee_result.finishframe;
+    let callee_outcome =
+        promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -24659,10 +24729,12 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                         "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
                     ),
                 }
+                helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
             None => {
                 if dst_bank == 'v' {
+                    helper_blackhole_after_inline_finishframe(ctx, op.next_pc, op.pc, finishframe)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
@@ -24704,6 +24776,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 // downstream `raise/r` / `reraise/` in the caller's handler
                 // keeps the class-known pin the callee's leg established.
                 ctx.set_last_exc_value(exc, exc_concrete);
+                helper_blackhole_after_inline_finishframe(ctx, target, op.pc, finishframe)?;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
