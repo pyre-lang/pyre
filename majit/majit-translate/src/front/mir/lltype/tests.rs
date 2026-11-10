@@ -1,9 +1,10 @@
 use super::{
-    adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
-    charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
-    is_cow_str_family_class_root, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
-    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration,
-    is_rustc_pointer_niche_spelling, is_str_family_class_root, json_ty_is_thin_pointer_element,
+    adt_def_is_raw_storage, adt_field_read_value_type, adt_node_class_root_identity,
+    charon_type_value_to_ast_string, charon_type_value_to_enum_arg, dont_look_inside_return_token,
+    field_ty_is_raw_word, is_cow_str_family_class_root, is_niche_option_gc_payload_spelling,
+    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
     json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
     payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
     shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
@@ -14,7 +15,7 @@ use super::{
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -4722,6 +4723,381 @@ fn a_scalar_element_names_its_width_and_a_thin_pointer_needs_no_name() {
     assert!(!thin(uint("U8")));
 }
 
+fn named_copy_field(name: &str, ty: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": name, "ty": ty, "attr_info": null})
+}
+
+#[test]
+fn json_ty_is_by_value_copy_aggregate_accepts_named_copy_structs() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let unsafe_cell = type_decl_struct(
+        1,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field(
+            "value",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+        )],
+    );
+    let atomic = type_decl_struct(
+        2,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![named_copy_field("v", adt_node(1))],
+    );
+    let unique = type_decl_struct(
+        3,
+        &["core", "ptr", "unique", "Unique"],
+        vec![named_copy_field(
+            "pointer",
+            serde_json::json!({"RawPtr": [u8_ty.clone(), "Mut"]}),
+        )],
+    );
+    let entry = type_decl_struct(
+        4,
+        &["fixture", "Entry"],
+        vec![named_copy_field("key", u8_ty.clone())],
+    );
+    let option = option_enum(5);
+    let arg_marker = opaque_type_decl(
+        6,
+        &["rustpython_compiler_core", "bytecode", "instruction", "Arg"],
+    );
+    let instruction = serde_json::json!({
+        "def_id": 7,
+        "item_meta": {
+            "name": [
+                {"Ident": ["rustpython_compiler_core", 0]},
+                {"Ident": ["bytecode", 0]},
+                {"Ident": ["instruction", 0]},
+                {"Ident": ["Instruction", 0]}
+            ],
+            "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {"name": "Nop", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+            {"name": "LoadName", "fields": [{
+                "name": null,
+                "ty": adt_node(6),
+                "attr_info": null
+            }], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+        ]}
+    });
+    let code_unit = type_decl_struct(
+        8,
+        &["rustpython_compiler_core", "bytecode", "CodeUnit"],
+        vec![
+            named_copy_field("op", adt_node(7)),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            pair,
+            unsafe_cell,
+            atomic,
+            unique,
+            entry,
+            option,
+            arg_marker,
+            instruction,
+            code_unit,
+        ],
+        vec![],
+    );
+    assert!(
+        json_ty_is_by_value_copy_aggregate(&adt_node(0), &llbc),
+        "a two-field Copy struct is the getarrayitem item"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&adt_node(2), &llbc),
+        "AtomicU64 is interior-mutable; get must not copy the slot"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&adt_node(3), &llbc),
+        "a pointer field is not a by-value Copy item"
+    );
+    let option_ty = serde_json::json!({
+        "Adt": {
+            "id": 5,
+            "generics": {
+                "regions": [],
+                "types": [adt_node(4)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&option_ty, &llbc),
+        "Option<Entry> is an enum slot, not a Copy struct item"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&u8_ty, &llbc),
+        "a scalar stays on the existing spelling arm"
+    );
+    assert!(
+        json_ty_is_by_value_copy_aggregate(&adt_node(8), &llbc),
+        "CodeUnit is a Copy struct of a C-like opcode enum plus a byte"
+    );
+}
+
+#[test]
+fn json_ty_is_by_value_copy_aggregate_rejects_interior_mut_and_heap_payloads() {
+    let atomic = type_decl_struct(
+        0,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![named_copy_field(
+            "v",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![atomic], vec![]);
+    assert!(!json_ty_is_by_value_copy_aggregate(&adt_node(0), &llbc));
+}
+
+#[test]
+fn unique_unsafecell_slice_deref_field_index_picks_the_cell_slice() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = type_decl_struct(
+        1,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field("value", typevar)],
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [adt_node(0), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder = type_decl_struct(
+        2,
+        &["fixture", "CellPairUnits"],
+        vec![
+            named_copy_field("units", cell_ty),
+            named_copy_field("pad", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![pair, unsafecell, holder], vec![]);
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": ["_", {
+            "Adt": {
+                "id": 2,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }, "Shared"]
+    }));
+    let dest = TyRef::Other(serde_json::json!({
+        "Ref": ["_", {"Slice": [adt_node(0), null]}, "Shared"]
+    }));
+    assert_eq!(
+        unique_unsafecell_slice_deref_field_index(&recv, &dest, &llbc),
+        Some(0)
+    );
+}
+
+/// A slice of a unique two-segment Copy struct keeps the TypeDecl leaf.
+/// `strip_crate_prefix("fixture::CodePair")` is `CodePair`, so Place Index
+/// `array_type_id` stays `[CodePair]`.
+#[test]
+fn unique_leaf_copy_struct_slice_keeps_leaf_spelling() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![pair], vec![]);
+    let slice = TyRef::Other(serde_json::json!({"Slice": [adt_node(0), null]}));
+    assert_eq!(super::tyref_to_ast_string(&slice, &llbc), "[CodePair]");
+}
+
+/// Two TypeDecls share the leaf `CopyInstrWord`. Harvest of
+/// `UnsafeCell<Box<[CopyInstrWord]>>` qualifies the slice element
+/// (`field_row_struct_identity`) as the crate-stripped identity, the
+/// same identity ArrayRead / InteriorFieldRead use
+/// (`adt_node_class_root_identity`). `tyref_to_ast_string` keeps the
+/// TypeDecl leaf. Projecting that field is a SomeList whose item is
+/// that instance, so getitem (`listdef.py` `read_item`) is not
+/// Impossible.
+#[test]
+fn harvested_copy_struct_slice_item_is_class_identity_not_duplicate_leaf() {
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let bytecode_word = type_decl_struct(
+        0,
+        &["fixture", "bytecode", "CopyInstrWord"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let gc_word = type_decl_struct(
+        1,
+        &["fixture", "gc", "CopyInstrWord"],
+        vec![
+            named_copy_field("wrappers", usize_ty.clone()),
+            named_copy_field("pinned", usize_ty),
+        ],
+    );
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = type_decl_struct(
+        2,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field("value", typevar)],
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [adt_node(0), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder = type_decl_struct(
+        3,
+        &["fixture", "CellInstrUnits"],
+        vec![
+            named_copy_field("units", cell_ty),
+            named_copy_field("pad", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![bytecode_word, gc_word, unsafecell, holder],
+        vec![],
+    );
+
+    let slice = TyRef::Other(serde_json::json!({"Slice": [adt_node(0), null]}));
+    assert_eq!(
+        super::tyref_to_ast_string(&slice, &llbc),
+        "[CopyInstrWord]",
+        "tyref_to_ast_string keeps the TypeDecl leaf"
+    );
+    let tombstoned = super::tombstoned_leaves_of(&llbc);
+    assert!(
+        tombstoned.contains("CopyInstrWord"),
+        "duplicate leaf is withdrawn; tombstoned={tombstoned:?}"
+    );
+    assert_eq!(
+        adt_node_class_root_identity(&adt_node(0), &llbc, &tombstoned).as_deref(),
+        Some("bytecode::CopyInstrWord"),
+        "ArrayRead / InteriorFieldRead FLAG_STRUCT item identity"
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("harvest CellInstrUnits");
+    let units_ty = program
+        .struct_fields
+        .fields
+        .get("CellInstrUnits")
+        .or_else(|| program.struct_fields.fields.get("fixture::CellInstrUnits"))
+        .and_then(|rows| rows.iter().find(|row| row.name == "units"))
+        .map(|row| row.ty.clone())
+        .unwrap_or_default();
+    assert!(
+        units_ty.contains("[bytecode::CopyInstrWord]"),
+        "harvested units field carries the ArrayRead item identity; units_ty={units_ty:?}; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        program.struct_fields.fields.get("CopyInstrWord").is_none(),
+        "harden withdraws the duplicate leaf; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(program.struct_fields));
+    let projected = bk.project_struct_field_type(&units_ty);
+    let SomeValue::List(list) = &projected else {
+        panic!("units projects to SomeList, got {projected:?}");
+    };
+    let item = list.listdef.read_item(None);
+    assert!(
+        !matches!(item, SomeValue::Impossible),
+        "getitem read_item must not be Impossible; SomeList={list:?} item={item:?}"
+    );
+    let SomeValue::Instance(inst) = &item else {
+        panic!("list item is SomeInstance of the Copy struct, got {item:?}");
+    };
+    let classdef = inst.classdef.as_ref().expect("named instance");
+    assert_eq!(
+        classdef.borrow().name,
+        "bytecode::CopyInstrWord",
+        "list item matches ArrayRead class identity"
+    );
+    let _ = bk
+        .getuniqueclassdef_for_struct_root("bytecode::CopyInstrWord")
+        .expect("element classdef projects");
+    assert!(
+        classdef.borrow().attrs.contains_key("arg"),
+        "element rows are the bytecode CopyInstrWord fields; attrs={:?}",
+        classdef.borrow().attrs.keys().collect::<Vec<_>>()
+    );
+}
+
 /// `Vec::index_mut` of `Vec<Box<T>>` is one word per element when `T` has
 /// a concrete size. `IndexMut::index_mut` then lowers to `ArrayRead`
 /// (`getarrayitem`) instead of staying a residual call.
@@ -5810,6 +6186,193 @@ fn field_row_struct_identity_qualifies_array_of_adt_element() {
     assert_eq!(primitive_layout, "[i64;0]");
     assert_eq!(
         super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
+fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell() {
+    // `charon_adt_to_ast_string` renders the ADT leaf, so a harvested
+    // `[CopyInstrWord]` would collide with a second TypeDecl of the same
+    // leaf. The slice arm qualifies only a by-value Copy struct element
+    // (`json_ty_is_by_value_copy_aggregate`, the FLAG_STRUCT item
+    // `adt_node_class_root_identity` names). A slice-of-Copy-struct row,
+    // including `[T]` reached through `Box` / `UnsafeCell`, carries the
+    // TypeDecl path the same way a by-value ADT field does and keeps
+    // the wrapper spelling.
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "bytecode", "CopyInstrWord"],
+                vec![
+                    named_copy_field("op", u8_ty.clone()),
+                    named_copy_field("arg", u8_ty.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["host", "gc", "CopyInstrWord"],
+                vec![
+                    named_copy_field("wrappers", u8_ty.clone()),
+                    named_copy_field("pinned", u8_ty),
+                ],
+            ),
+            type_decl_struct(
+                2,
+                &["core", "cell", "UnsafeCell"],
+                vec![named_copy_field("value", typevar)],
+            ),
+        ],
+        vec![],
+    );
+    let word = adt_node(0);
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [word.clone(), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    assert_eq!(cell_layout, "UnsafeCell<Box<[CopyInstrWord]>>");
+    assert_eq!(
+        super::field_row_struct_identity(&cell_ty, &llbc, &cell_layout).as_deref(),
+        Some("UnsafeCell<Box<[bytecode::CopyInstrWord]>>")
+    );
+
+    let slice_ty = TyRef::Other(serde_json::json!({"Slice": [word.clone(), null]}));
+    let slice_layout = super::tyref_to_field_layout_string(&slice_ty, &llbc, &gc, &raw);
+    assert_eq!(slice_layout, "[CopyInstrWord]");
+    assert_eq!(
+        super::field_row_struct_identity(&slice_ty, &llbc, &slice_layout).as_deref(),
+        Some("[bytecode::CopyInstrWord]")
+    );
+
+    let box_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [word, null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let box_layout = super::tyref_to_field_layout_string(&box_ty, &llbc, &gc, &raw);
+    assert_eq!(box_layout, "Box<[CopyInstrWord]>");
+    assert_eq!(
+        super::field_row_struct_identity(&box_ty, &llbc, &box_layout).as_deref(),
+        Some("Box<[bytecode::CopyInstrWord]>")
+    );
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let primitive = TyRef::Other(serde_json::json!({"Slice": [i64_ty, null]}));
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    assert_eq!(primitive_layout, "[i64]");
+    assert_eq!(
+        super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
+fn field_row_struct_identity_keeps_slice_of_gc_pointer_struct() {
+    // `RDict.entries` is `UnsafeCell<Box<[Entry<IdentityKey, PyObjectRef>]>>`.
+    // The slice arm must not qualify a GC-pointer-carrying struct: that
+    // spelling stays `tyref_to_field_layout_string`.
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let gc_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Mut"
+        ]
+    });
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "rordereddict_entries", "Entry"],
+                vec![
+                    named_copy_field("key", gc_ptr.clone()),
+                    named_copy_field("value", gc_ptr),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["core", "cell", "UnsafeCell"],
+                vec![named_copy_field("value", typevar)],
+            ),
+        ],
+        vec![],
+    );
+    let entry = named_adt(
+        0,
+        vec![
+            serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+            serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+        ],
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&entry, &llbc),
+        "a GC/raw pointer field is not a by-value Copy item"
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [entry, null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    assert_eq!(
+        cell_layout,
+        "UnsafeCell<Box<[Entry<??TypeVar#0,??TypeVar#1>]>>"
+    );
+    assert_eq!(
+        super::field_row_struct_identity(&cell_ty, &llbc, &cell_layout),
         None
     );
 }

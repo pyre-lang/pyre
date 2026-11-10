@@ -3404,6 +3404,46 @@ pub(in crate::front::mir) fn promoted_const_copied_const(
     Some(value)
 }
 
+/// `Option::branch` behind `?`. Charon records `core::option::<Impl>::branch`.
+/// A trait `Try::branch` is the same operator only when Self is `Option<_>`.
+pub(in crate::front::mir) fn regular_call_is_option_try_branch(
+    reg: &RegularCall,
+    llbc: &Llbc,
+) -> bool {
+    if let Some(path) = regular_call_name_path(reg, llbc) {
+        return path == "core::option::<Impl>::branch";
+    }
+    let CallKind::Trait(payload) = &reg.kind else {
+        return false;
+    };
+    trait_payload_path_and_method(payload, llbc).is_some_and(|(trait_path, method)| {
+        method == "branch" && trait_path == "core::ops::try_trait::Try"
+    }) && trait_payload_self_is_option(payload, llbc)
+}
+
+/// `Try`'s Self, the same `generics.types[0]` slot `trait_clone_self_node`
+/// reads. `tyref_is_option` is the Option counterpart of
+/// `tyref_is_result` on `recognize_result_try_site`.
+fn trait_payload_self_is_option(payload: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(arr) = payload.as_array() else {
+        return false;
+    };
+    let Some(tref) = arr.first().and_then(|tref| traitref_unwrap(tref, llbc, 0)) else {
+        return false;
+    };
+    let Some(ty) = crate::front::clause_spec::trait_decl_pred(tref)
+        .and_then(|pred| pred.pointer("/generics/types"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+    else {
+        return false;
+    };
+    let Some(node) = strip_ty_indirections(ty, llbc) else {
+        return false;
+    };
+    crate::front::result_exc::tyref_is_option(&TyRef::Other(node.clone()), llbc)
+}
+
 /// `Result::branch` behind `?`. Charon records the impl method
 /// `core::result::<Impl>::branch`. A trait `Try::branch` is the same
 /// operator. `Result::expect` is a different leaf and stays out.
@@ -4490,6 +4530,184 @@ pub(in crate::front::mir) fn add_dest_used_only_as_struct_field(
 ) -> bool {
     let census = struct_field_census(llbc, body, dest);
     census.defs == 1 && census.fields >= 1 && census.other == 0
+}
+
+fn place_enum_payload_of(place: &Place, dest: usize) -> Option<(u64, usize)> {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return None;
+    };
+    if !matches!(inner.kind, PlaceKind::Local(i) if i as usize == dest) {
+        return None;
+    }
+    let arr = v.get("Field")?.as_array()?;
+    Some((arr.first()?.as_u64()?, arr.get(1)?.as_u64()? as usize))
+}
+
+fn place_is_deref_field_of(place: &Place, dest: usize) -> bool {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return false;
+    };
+    v.get("Field").is_some() && place_is_immediate_deref_of(inner, dest)
+}
+
+/// `<[T]>::get` dest is only the Option disc / `?` / match, and the Some
+/// payload is only `(*p).field` Copy reads (`ll_getitem_nonneg` +
+/// `getinteriorfield`). Any other use keeps the residual call.
+pub(in crate::front::mir) fn copy_struct_slice_get_fusable(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> bool {
+    let mut cf = Vec::new();
+    let mut payloads = Vec::new();
+    // role 0 = Option dest, 1 = ControlFlow dest, 2 = `&T` payload.
+    if !fused_get_local_ok(llbc, body, dest, 0, &mut cf, &mut payloads, &mut 0) {
+        return false;
+    }
+    for local in std::mem::take(&mut cf) {
+        if !fused_get_local_ok(llbc, body, local, 1, &mut cf, &mut payloads, &mut 0) {
+            return false;
+        }
+    }
+    let mut fields = 0;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(local) = payloads.pop() {
+        if !seen.insert(local) {
+            continue;
+        }
+        if !fused_get_local_ok(llbc, body, local, 2, &mut cf, &mut payloads, &mut fields) {
+            return false;
+        }
+    }
+    fields >= 1
+}
+
+fn fused_get_local_ok(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+    role: u8,
+    cf: &mut Vec<usize>,
+    payloads: &mut Vec<usize>,
+    fields: &mut usize,
+) -> bool {
+    let forward = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if !fused_get_assign_ok(place, rvalue, dest, role, payloads, fields) {
+                        return false;
+                    }
+                }
+                Ok(StmtKind::Assert(assert))
+                    if operand_place(&assert.cond)
+                        .is_some_and(|p| place_references_local(p, dest)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. })
+                if operand_place(discr).is_some_and(|p| place_references_local(p, dest)) =>
+            {
+                return false;
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                    continue;
+                }
+                if !call
+                    .args
+                    .iter()
+                    .any(|arg| operand_place(arg).is_some_and(|p| place_references_local(p, dest)))
+                {
+                    continue;
+                }
+                let PlaceKind::Local(bind) = call.dest.kind else {
+                    return false;
+                };
+                let is_branch = matches!(&call.func, CallFunc::Regular(reg)
+                    if regular_call_is_option_try_branch(reg, llbc))
+                    && call.args.len() == 1
+                    && operand_local(Some(&call.args[0])) == Some(dest);
+                if role == 0 && is_branch {
+                    cf.push(bind as usize);
+                } else {
+                    return false;
+                }
+            }
+            Ok(TermKind::Return) if dest == 0 => return false,
+            Ok(TermKind::Assert { assert, .. })
+                if operand_place(&assert.cond).is_some_and(|p| place_references_local(p, dest)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn fused_get_assign_ok(
+    place: &Place,
+    rvalue: &Rvalue,
+    dest: usize,
+    role: u8,
+    payloads: &mut Vec<usize>,
+    fields: &mut usize,
+) -> bool {
+    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
+        return true;
+    }
+    if matches!(rvalue, Rvalue::Discriminant(p) if matches!(p.kind, PlaceKind::Local(i) if i as usize == dest))
+    {
+        return role < 2;
+    }
+    if let Rvalue::Use(op, _) = rvalue
+        && let Some(src) = operand_place(op)
+    {
+        if let Some((variant, field)) = place_enum_payload_of(src, dest) {
+            let PlaceKind::Local(bind) = place.kind else {
+                return false;
+            };
+            if field != 0 {
+                return false;
+            }
+            let some_or_continue = (role == 0 && variant == 1) || (role == 1 && variant == 0);
+            let none_or_break = (role == 0 && variant == 0) || (role == 1 && variant == 1);
+            if some_or_continue {
+                payloads.push(bind as usize);
+                return true;
+            }
+            return none_or_break;
+        }
+        if place_is_deref_field_of(src, dest) {
+            *fields += 1;
+            return role == 2;
+        }
+        if matches!(src.kind, PlaceKind::Local(i) if i as usize == dest) {
+            let PlaceKind::Local(bind) = place.kind else {
+                return false;
+            };
+            payloads.push(bind as usize);
+            return role == 2;
+        }
+        if place_references_local(src, dest) {
+            return false;
+        }
+    }
+    if place_is_deref_field_of(place, dest) || place_references_local(place, dest) {
+        return false;
+    }
+    let mut other = 0;
+    scan_rvalue_struct_field(rvalue, dest, &mut 0, &mut other);
+    other == 0
 }
 
 /// Header recovered from the add's base before any flowspace Variable exists.

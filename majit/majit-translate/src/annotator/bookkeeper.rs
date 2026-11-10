@@ -5903,6 +5903,13 @@ impl Bookkeeper {
         if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
             return self.project_struct_field_type(&format!("*mut {inner}"));
         }
+        // `cell::UnsafeCell<T>` is the cell word (`lltype.py` `getfield`).
+        // `field_row_struct_identity` qualifies the leaf, so the
+        // prefix-only `UnsafeCell<` peel below would miss and mint
+        // `SomeInstance(cell::UnsafeCell)`.
+        if let Some(inner) = strip_generic_leaf(stripped, "UnsafeCell") {
+            return self.project_struct_field_type(inner);
+        }
         for wrapper in [
             "Rc<",
             "Arc<",
@@ -9453,6 +9460,20 @@ mod tests {
             }),
             "*mut bool FUNC arg is Signed; RESULT GCREFOpaque is GCREF"
         );
+    }
+
+    #[test]
+    fn project_struct_field_type_qualified_unsafecell_box_slice_is_somelist() {
+        let bk = bk();
+        for spelling in [
+            "cell::UnsafeCell<Box<[CodePair]>>",
+            "UnsafeCell<Box<[CodePair]>>",
+        ] {
+            match bk.project_struct_field_type(spelling) {
+                SomeValue::List(_) => {}
+                other => panic!("{spelling} must project to SomeList, got {other:?}"),
+            }
+        }
     }
 
     #[test]

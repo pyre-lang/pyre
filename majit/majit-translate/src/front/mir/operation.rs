@@ -100,6 +100,279 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `<[T]>::get(s, i)` of a Copy struct used only as `get(i)?.field`.
+    ///
+    /// Bounds check `i < len(s)` (`ll_getitem_nonneg`); the Option dest is
+    /// that bool. The Some/Continue payload is an [`InteriorFieldAlias`]
+    /// so `(*p).field` is `getinteriorfield` (`rewrite_op_getinteriorfield`).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_copy_struct_slice_get(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        index_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2
+            || !self.is_slice_get_scalar_call(reg, index_ty)
+            || self.is_slice_get_mut_call(reg)
+        {
+            return Ok(false);
+        }
+        let Some(element_ty) = reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+        else {
+            return Ok(false);
+        };
+        let Some(element) = tyref_node(&element_ty, self.llbc) else {
+            return Ok(false);
+        };
+        if !json_ty_is_by_value_copy_aggregate(element, self.llbc) {
+            return Ok(false);
+        }
+        let Some(slice_local) = arg_locals.first().copied().flatten() else {
+            return Ok(false);
+        };
+        let Some(index_local) = arg_locals.get(1).copied().flatten() else {
+            return Ok(false);
+        };
+        if self.string_byte_view_locals.contains(&slice_local) {
+            return Ok(false);
+        }
+        if locals_assigned_reachable(self.body, self.llbc, target, &[slice_local, index_local]) {
+            return Ok(false);
+        }
+        if !copy_struct_slice_get_fusable(self.llbc, self.body, dest_local) {
+            return Ok(false);
+        }
+        let spelling = tyref_to_ast_string(&element_ty, self.llbc);
+        if spelling.starts_with("??") || spelling.is_empty() {
+            return Ok(false);
+        }
+        // Place `Index` already names this ARRAY identity.
+        let Some(array_type_id) = slice_array_type_id(&format!("[{spelling}]")) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: crate::front::option_variant::slice_len_op(args[0].clone(), None, false),
+        });
+        let cond = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(cond.clone()),
+            kind: OpKind::BinOp {
+                op: "lt".to_string(),
+                lhs: args[1].clone(),
+                rhs: len,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(cond.clone()));
+        self.niche_disc_vars.insert(cond.id());
+        self.fused_copy_struct_get.insert(
+            dest_local,
+            FusedCopyStructGet {
+                slice_local,
+                slice_var: args[0].clone(),
+                index_local,
+                index_var: args[1].clone(),
+                array_type_id,
+            },
+        );
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `<Wrapper as Deref>::deref` whose unique field wraps `UnsafeCell`
+    /// and peels to the dest slice. The cell has no runtime class
+    /// (`rclass.py` / `lltype.py` `getfield`); the field is the GC array
+    /// Place `Index` already reads (`rlist.py` `ll_len` /
+    /// `ll_getitem_nonneg`). Emit that same Field projection.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_unsafecell_slice_deref(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !is_deref_call(reg, self.llbc) {
+            return Ok(false);
+        }
+        let Some(recv_ty) = first_arg_ty else {
+            return Ok(false);
+        };
+        let Some(recv_local) = arg_locals.first().copied().flatten() else {
+            return Ok(false);
+        };
+        let Some(field_idx) =
+            unique_unsafecell_slice_deref_field_index(recv_ty, dest_ty, self.llbc)
+        else {
+            return Ok(false);
+        };
+        let pointee = self
+            .tyref_peel_ref_to_pointee(recv_ty)
+            .unwrap_or_else(|| clone_tyref(recv_ty));
+        let field_payload = serde_json::json!([null, field_idx]);
+        let Some((_, _, field_ty, _, _)) = self.resolve_adt_field(&pointee, &field_payload) else {
+            return Ok(false);
+        };
+        let place = Place {
+            kind: PlaceKind::Projection(
+                Box::new(Place {
+                    kind: PlaceKind::Projection(
+                        Box::new(Place {
+                            kind: PlaceKind::Local(recv_local as u64),
+                            ty: clone_tyref(recv_ty),
+                        }),
+                        ProjectionElem::Atom("Deref".to_string()),
+                    ),
+                    ty: pointee,
+                }),
+                ProjectionElem::Tagged(serde_json::json!({"Field": [null, field_idx]})),
+            ),
+            ty: field_ty,
+        };
+        let res = self.resolve_place(mir_bb, place)?;
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `Try::branch` of a fused Copy-struct get dest. ControlFlow Continue=0 /
+    /// Break=1 is the inverse of the Option Some=1 / None=0 bounds bool.
+    pub(in crate::front::mir) fn try_lower_fused_option_try_branch(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 || !regular_call_is_option_try_branch(reg, self.llbc) {
+            return Ok(false);
+        }
+        let Some(opt_local) = arg_locals.first().copied().flatten() else {
+            return Ok(false);
+        };
+        if !self.fused_copy_struct_get.contains_key(&opt_local) {
+            return Ok(false);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let in_bounds = args[0].clone();
+        let false_var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(false_var.clone()),
+            kind: OpKind::ConstBool(false),
+        });
+        let oob = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(oob.clone()),
+            kind: OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: in_bounds,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(oob.clone()));
+        self.niche_disc_vars.insert(oob.id());
+        self.fused_copy_struct_get_cf.insert(dest_local, opt_local);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    fn fused_copy_struct_get_alias(&self, local: usize) -> Option<InteriorFieldAlias> {
+        let site = self.fused_copy_struct_get.get(&local).or_else(|| {
+            self.fused_copy_struct_get_cf
+                .get(&local)
+                .and_then(|opt| self.fused_copy_struct_get.get(opt))
+        })?;
+        Some(InteriorFieldAlias {
+            header: InteriorHeader::Local {
+                local: site.slice_local,
+                var: site.slice_var.clone(),
+            },
+            index_local: site.index_local,
+            index_var: site.index_var.clone(),
+            array_type_id: site.array_type_id.clone(),
+        })
+    }
+
+    /// `(_r as Some).0` / `(_cf as Continue).0` of a fused get dest.
+    pub(in crate::front::mir) fn fused_copy_struct_get_place_alias(
+        &self,
+        place: &Place,
+    ) -> Option<InteriorFieldAlias> {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+            return None;
+        };
+        let PlaceKind::Local(local) = inner.kind else {
+            return None;
+        };
+        let field_payload = v.as_object().and_then(|m| m.get("Field"))?;
+        let (variant, field) = indexed_field_parts(field_payload)?;
+        if self.fused_copy_struct_get_payload_kind(local as usize, variant, field) != Some(true) {
+            return None;
+        }
+        self.fused_copy_struct_get_alias(local as usize)
+    }
+
+    /// Some=1 / Continue=0 is the payload; None=0 / Break=1 is the residual.
+    fn fused_copy_struct_get_payload_kind(
+        &self,
+        local: usize,
+        variant: Option<u64>,
+        field: usize,
+    ) -> Option<bool> {
+        if field != 0 {
+            return None;
+        }
+        if self.fused_copy_struct_get.contains_key(&local) {
+            return match variant {
+                Some(1) => Some(true),
+                Some(0) => Some(false),
+                _ => None,
+            };
+        }
+        if self.fused_copy_struct_get_cf.contains_key(&local) {
+            return match variant {
+                Some(0) => Some(true),
+                Some(1) => Some(false),
+                _ => None,
+            };
+        }
+        None
+    }
+
     /// `*p.add(i)` where `p` is the data pointer of a `&[u8]` byte string.
     ///
     /// `<[u8]>::as_ptr` aliases that pointer to the string and marks it.
@@ -286,17 +559,34 @@ impl<'a> Lowering<'a> {
             self.immutable_fields,
             &self.raw_alloc_flavor_structs,
         );
-        let item_ty = adt_field_read_value_type(
-            place_ty,
-            field_ty,
-            container_is_enum,
-            owner_is_closure_env,
-            owner_declared_gc,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        // Stored tag is unsigned (`u8`/`u16`/`u32`/`u64`);
+        // `rffi.cast(lltype.Signed, ...)` / `rarithmetic.intmask` retypes
+        // it to the signed Int every other site uses (`tyref_to_value_type`).
+        let enum_ty = if tyref_is_fieldless_enum_free(field_ty, self.llbc) {
+            Some(field_ty)
+        } else if tyref_is_fieldless_enum_free(place_ty, self.llbc) {
+            Some(place_ty)
+        } else {
+            None
+        };
+        let enum_tag_unsigned = enum_ty
+            .and_then(|ty| fieldless_enum_field_layout_spelling(ty, self.llbc))
+            .is_some_and(|spelling| spelling.starts_with('u'));
+        let item_ty = if enum_tag_unsigned {
+            ValueType::Unsigned
+        } else {
+            adt_field_read_value_type(
+                place_ty,
+                field_ty,
+                container_is_enum,
+                owner_is_closure_env,
+                owner_declared_gc,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        };
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -317,6 +607,14 @@ impl<'a> Lowering<'a> {
                 array: None,
             },
         });
+        if enum_tag_unsigned {
+            let (kind, signed) = signedness_retype_op(&mut self.graph, res, true);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(signed.clone()),
+                kind,
+            });
+            return Ok(Some(signed));
+        }
         Ok(Some(res))
     }
 
@@ -3459,6 +3757,16 @@ impl<'a> Lowering<'a> {
             // case) registers 0, identical to the prior heuristic.  An
             // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
+                if let PlaceKind::Local(i) = &place.kind {
+                    let local = *i as usize;
+                    if self.fused_copy_struct_get.contains_key(&local)
+                        || self.fused_copy_struct_get_cf.contains_key(&local)
+                    {
+                        let base = self.resolve_place(mir_bb, place)?;
+                        self.niche_disc_vars.insert(base.id());
+                        return Ok((None, base));
+                    }
+                }
                 // The `Option<&T>` a pair-slice `get` yields is the item's
                 // address, 0 for `None`.
                 if let PlaceKind::Local(opt) = place.kind
@@ -6325,6 +6633,17 @@ impl<'a> Lowering<'a> {
                 // parameter is the exception: `*p` reads the cell's
                 // `value` field. `Deref` of a raw pointer to a
                 // primitive is `raw_load` (below), not that alias.
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let PlaceKind::Local(local) = &inner.kind
+                    && let Some((variant, field)) = indexed_field_parts(field_payload)
+                    && self
+                        .fused_copy_struct_get_payload_kind(*local as usize, variant, field)
+                        .is_some()
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    return Ok(self.emit_unit(bb_id));
+                }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner_root, field_name, field_ty, owner_id, host_index)) =

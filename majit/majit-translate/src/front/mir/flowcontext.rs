@@ -97,6 +97,17 @@ pub(in crate::front::mir) struct InteriorFieldAlias {
     pub(in crate::front::mir) array_type_id: String,
 }
 
+/// `<[T]>::get` of a Copy struct fused to `i < len(s)` plus an interior
+/// field alias on the Some/Continue payload (`rewrite_op_getinteriorfield`).
+#[derive(Clone)]
+pub(in crate::front::mir) struct FusedCopyStructGet {
+    pub(in crate::front::mir) slice_local: usize,
+    pub(in crate::front::mir) slice_var: Variable,
+    pub(in crate::front::mir) index_local: usize,
+    pub(in crate::front::mir) index_var: Variable,
+    pub(in crate::front::mir) array_type_id: String,
+}
+
 /// A native conversion's temporary aggregate tail, consumed immediately after
 /// MIR framestate threading. This is frontend work order, not a ClassDef or
 /// per-box side table: annotation only sees ordinary variant constructors and
@@ -352,6 +363,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
+    /// Option dest of a fused Copy-struct `<[T]>::get`, bound to `i < len`.
+    pub(in crate::front::mir) fused_copy_struct_get:
+        std::collections::HashMap<usize, FusedCopyStructGet>,
+    /// ControlFlow dest of `Try::branch` of a fused get dest.
+    pub(in crate::front::mir) fused_copy_struct_get_cf: std::collections::HashMap<usize, usize>,
     /// MIR locals bound by `_i = &place` / `&raw place`, mapped to the place
     /// they borrowed, for the place-addressed consumers of a borrow (`*p = v`,
     /// `core::mem::{replace,swap,take}`, raw / scalar alias paths). The atomic
@@ -2113,6 +2129,8 @@ impl<'a> Lowering<'a> {
             accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
             interior_field_alias: std::collections::HashMap::new(),
+            fused_copy_struct_get: std::collections::HashMap::new(),
+            fused_copy_struct_get_cf: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
             scalar_address_locals: Vec::new(),
@@ -3393,6 +3411,21 @@ impl<'a> Lowering<'a> {
                     // is that same address (`Rvalue::Use` aliases the
                     // Variable), so `*_j` still has to `RawLoad`.
                     self.scalar_address_locals.push(i as usize);
+                }
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && let Some(alias) = self.fused_copy_struct_get_place_alias(src)
+                {
+                    self.interior_field_alias.insert(i as usize, alias);
+                }
+                if !self.multi_assigned_locals.contains(&(i as usize))
+                    && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && let Some(alias) = self
+                        .interior_field_alias
+                        .get(&(src_local as usize))
+                        .cloned()
+                {
+                    self.interior_field_alias.insert(i as usize, alias);
                 }
                 if !self.multi_assigned_locals.contains(&(i as usize)) {
                     // `_i = Ordering::<V>` — the ordering the store arm has

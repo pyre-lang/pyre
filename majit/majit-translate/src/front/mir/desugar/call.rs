@@ -1502,6 +1502,23 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `UnsafeCell<Box<[T]>>` (and the same cell wrapping a
+                // slice) has no runtime class. Deref is `getfield` of
+                // that unique field — the GC array Place `Index` already
+                // reads (`rclass.py` `getfield`, `rlist.py` `ll_len`).
+                if args.len() == 1
+                    && self.try_lower_unsafecell_slice_deref(
+                        mir_bb,
+                        &reg,
+                        &arg_locals,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                        dest_local,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
                 // One-word `Vec::deref` / `deref_mut` that did not enter
                 // `is_pair_call`. `&[i64]` has a length slot and takes the
                 // pair arm; `&[f64]` does not (`PAIR_SLICE_ITEM_KINDS` has
@@ -1845,6 +1862,30 @@ impl<'a> Lowering<'a> {
                     &args,
                     &arg_locals,
                     first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // Copy-struct `<[T]>::get(s, i)` used only as `get(i)?.field`
+                // is `ll_getitem_nonneg` + `getinteriorfield`. The Option
+                // dest stays a bounds bool, never a tagged aggregate.
+                if self.try_lower_copy_struct_slice_get(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_fused_option_try_branch(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
                     dest_local,
                     target,
                 )? {

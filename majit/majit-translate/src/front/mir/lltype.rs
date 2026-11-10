@@ -8414,6 +8414,117 @@ pub(in crate::front::mir) fn tyref_is_unsafecell(ty: &TyRef, llbc: &Llbc) -> boo
         .is_some_and(|p| p == "core::cell::UnsafeCell" || p.ends_with("::UnsafeCell"))
 }
 
+/// Peel one `Ref` wrapper, leaving `RawPtr` in place.
+fn tyref_peel_one_reference(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let r = node.as_object()?.get("Ref")?;
+    let (inner, _) = ref_inner_and_kind(r);
+    Some(TyRef::Other(inner?.clone()))
+}
+
+/// Peel references, `UnsafeCell`, and `Box` until a slice `[T]`. The bool
+/// is whether `UnsafeCell` sat on the path.
+///
+/// RPython has no cell: `getfield` of that wrapping field is the GC
+/// array (`rclass.py` / `lltype.py` `getfield`; `rlist.py` `ll_len` /
+/// `ll_getitem_nonneg`).
+fn peel_unsafecell_box_to_slice_ty(ty: &TyRef, llbc: &Llbc) -> Option<(TyRef, bool)> {
+    let mut cur = clone_tyref(ty);
+    let mut saw_cell = false;
+    for _ in 0..8 {
+        if let Some(inner) = tyref_peel_one_reference(&cur, llbc) {
+            cur = inner;
+            continue;
+        }
+        if tyref_is_unsafecell(&cur, llbc) {
+            saw_cell = true;
+            cur = tyref_adt_generics_type_arg(&cur, 0, llbc)?;
+            continue;
+        }
+        let Some(node) = tyref_node(&cur, llbc) else {
+            return None;
+        };
+        if let Some(pointee) = type_node_box_pointee(node, llbc) {
+            cur = TyRef::Other(pointee.clone());
+            continue;
+        }
+        if tyref_strips_to_slice(&cur, llbc) {
+            return Some((cur, saw_cell));
+        }
+        return None;
+    }
+    None
+}
+
+/// Peel `UnsafeCell` / `Box` until a slice `[T]`. The bool is whether
+/// `UnsafeCell` sat on the path.
+///
+/// RPython has no cell: `getfield` of that wrapping field is the GC
+/// array (`rclass.py` / `lltype.py` `getfield`; `rlist.py` `ll_len` /
+/// `ll_getitem_nonneg`).
+pub(in crate::front::mir) fn peel_unsafecell_box_to_slice_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<(String, bool)> {
+    let (slice_ty, saw_cell) = peel_unsafecell_box_to_slice_ty(ty, llbc)?;
+    let spelling = tyref_to_ast_string(&slice_ty, llbc);
+    let normalized = peel_ref_prefix(&spelling);
+    slice_element_spelling(normalized).map(|_| (normalized.to_string(), saw_cell))
+}
+
+/// Element TyRef of a slice node (`{"Slice": [elem, …]}` or builtin
+/// `Slice`). Wrappers on `ty` are stripped first.
+fn slice_tyref_element(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    if let Some(elem) = node
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+    {
+        return Some(TyRef::Other(elem.clone()));
+    }
+    if node.get("Adt").and_then(type_decl_ref_builtin) == Some("Slice") {
+        return tyref_adt_generics_type_arg(ty, 0, llbc);
+    }
+    None
+}
+
+/// Unique struct field of `recv_ty` whose type wraps `UnsafeCell` and
+/// peels to the same ARRAY identity as `dest_ty` (`slice_array_type_id`).
+/// Two matching fields, or none, is `None`.
+pub(in crate::front::mir) fn unique_unsafecell_slice_deref_field_index(
+    recv_ty: &TyRef,
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let dest_id = slice_array_type_id(&tyref_to_ast_string(dest_ty, llbc))?;
+    let td = tyref_type_decl(recv_ty, llbc)?;
+    let fields = type_decl_struct_fields(td, llbc)?;
+    let mut found = None;
+    for (idx, field) in fields.iter().enumerate() {
+        let field_ty = tyref_subst_bound_typevar(&field.ty, recv_ty, llbc);
+        let Some((slice_spelling, saw_cell)) =
+            peel_unsafecell_box_to_slice_spelling(&field_ty, llbc)
+        else {
+            continue;
+        };
+        if !saw_cell {
+            continue;
+        }
+        let Some(id) = slice_array_type_id(&slice_spelling) else {
+            continue;
+        };
+        if id != dest_id {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(idx);
+    }
+    found
+}
+
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
 /// the zero-sized oparg marker (`pub struct Arg<T: OpArgType>
 /// (PhantomData<T>)`, instruction.rs).  The external decl is
@@ -11395,6 +11506,139 @@ pub(in crate::front::mir) fn json_ty_is_statically_sized(
         Some("Tuple" | "Box") | None => adt.get("id").and_then(serde_json::Value::as_u64).is_some(),
         Some(_) => false,
     }
+}
+
+/// Named Copy struct used as a by-value slice element (`ll_getitem_nonneg`
+/// then `getinteriorfield`). Interior-mutable wrappers and a pointer /
+/// `Box` / `Vec` / `String` field stay residual so a later store still
+/// hits the live slot. Enums as the element (`Option<Entry>`) decline; a
+/// Copy enum field of the struct (opcode tag, ZST `Arg<T>`) walks as pod.
+pub(in crate::front::mir) fn json_ty_is_by_value_copy_aggregate(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    let Some(node) = strip_ty_indirections(node, llbc) else {
+        return false;
+    };
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
+        return false;
+    };
+    if json_ty_is_copy_scalar(node, llbc) || json_ty_is_thin_pointer_element(node, llbc) {
+        return false;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    if type_decl_struct_owner(td, llbc).is_none() {
+        return false;
+    }
+    if adt_path_is_interior_mutable(&td.item_meta.name_path()) {
+        return false;
+    }
+    json_ty_is_copy_pod_value(node, llbc, 0)
+}
+
+fn json_ty_is_copy_pod_value(node: &serde_json::Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Some(node) = strip_ty_indirections(node, llbc) else {
+        return false;
+    };
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
+        return false;
+    };
+    if json_ty_is_copy_scalar(node, llbc) {
+        return true;
+    }
+    let ty = TyRef::Other(node.clone());
+    if tyref_is_bytecode_arg_marker(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) {
+        return true;
+    }
+    if tyref_is_fieldless_enum_free(&ty, llbc) {
+        return true;
+    }
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Ref")
+        || obj.contains_key("RawPtr")
+        || obj.contains_key("Slice")
+        || obj.contains_key("Array")
+        || obj.contains_key("FnPtr")
+    {
+        return false;
+    }
+    if obj
+        .get("Adt")
+        .and_then(|adt| adt.get("builtin"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Tuple")
+    {
+        let Some(types) = obj
+            .get("Adt")
+            .and_then(|adt| adt.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        return types
+            .iter()
+            .all(|field| json_ty_is_copy_pod_value(field, llbc, depth + 1));
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    if adt_path_is_interior_mutable(&td.item_meta.name_path())
+        || tyref_atomic_arg(&ty, llbc).is_some()
+    {
+        return false;
+    }
+    match &td.kind {
+        TypeDeclKind::Struct(fields) => fields
+            .iter()
+            .all(|field| tyref_is_copy_pod_value(&field.ty, llbc, depth + 1)),
+        TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .all(|field| tyref_is_copy_pod_value(&field.ty, llbc, depth + 1))
+        }),
+        TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Union(_) => false,
+        TypeDeclKind::Unknown => false,
+    }
+}
+
+fn tyref_is_copy_pod_value(ty: &TyRef, llbc: &Llbc, depth: usize) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| json_ty_is_copy_pod_value(node, llbc, depth))
+}
+
+fn adt_path_is_interior_mutable(path: &str) -> bool {
+    path.contains("::sync::atomic::")
+        || matches!(
+            path.rsplit("::")
+                .next()
+                .unwrap_or(path)
+                .split('<')
+                .next()
+                .unwrap_or(path),
+            "UnsafeCell"
+                | "Cell"
+                | "RefCell"
+                | "Mutex"
+                | "RwLock"
+                | "OnceLock"
+                | "OnceCell"
+                | "LazyCell"
+                | "LazyLock"
+        )
 }
 
 /// A Copy scalar: a Charon `Literal` integer, float, `bool`, or `char`.
@@ -14898,9 +15142,15 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
 /// beside `eval::Code`) collide unless the row carries `name_path()`.
 /// `consider_struct` / `all_fielddescrs` / `get_field_descr` key on
 /// the STRUCT. An array-of-ADT layout qualifies the element the same
-/// way and reassembles `[path;N]`. Pointer, reference, and builtin
-/// layouts keep the spelling `tyref_to_field_layout_string` already
-/// produced.
+/// way and reassembles `[path;N]`. A slice-of-ADT layout, including
+/// `[T]` reached through `Box` / `UnsafeCell`, qualifies the element
+/// only when it is a by-value Copy struct
+/// (`json_ty_is_by_value_copy_aggregate`, the FLAG_STRUCT item
+/// `adt_node_class_root_identity` names) and keeps the wrapper
+/// spelling; a slice of any other ADT keeps the spelling
+/// `tyref_to_field_layout_string` produced. Pointer, reference,
+/// and builtin layouts keep the spelling `tyref_to_field_layout_string`
+/// already produced.
 pub(in crate::front::mir) fn field_row_struct_identity(
     ty: &TyRef,
     llbc: &Llbc,
@@ -14922,6 +15172,29 @@ pub(in crate::front::mir) fn field_row_struct_identity(
         } else {
             format!("[{qualified};{len}]")
         });
+    }
+    if let Some((slice_ty, _)) = peel_unsafecell_box_to_slice_ty(ty, llbc) {
+        let slice_spelling = {
+            let rendered = tyref_to_ast_string(&slice_ty, llbc);
+            peel_ref_prefix(&rendered).to_string()
+        };
+        let item = slice_element_spelling(layout)
+            .map(str::to_string)
+            .or_else(|| slice_element_spelling(&slice_spelling).map(str::to_string))?;
+        let elem_ty = slice_tyref_element(&slice_ty, llbc)?;
+        let elem_node = tyref_node(&elem_ty, llbc)?;
+        if !json_ty_is_by_value_copy_aggregate(elem_node, llbc) {
+            return None;
+        }
+        let qualified = field_row_struct_identity(&elem_ty, llbc, &item)?;
+        if qualified == item {
+            return None;
+        }
+        let slice = format!("[{item}]");
+        if layout.matches(slice.as_str()).count() != 1 {
+            return None;
+        }
+        return Some(layout.replacen(&slice, &format!("[{qualified}]"), 1));
     }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;

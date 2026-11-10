@@ -33345,6 +33345,54 @@ pub(in crate::front::mir) fn interior_opaque(
     })
 }
 
+/// Opaque FunDecl whose `"<Impl>"` segment is a trait impl
+/// (`{"Impl": {"Ty": {"skip_binder": {"Value": [0, self_ty]}}, "Trait": trait_id}}`).
+/// [`interior_opaque`] keeps the inherent-impl shape.
+pub(in crate::front::mir) fn interior_trait_opaque(
+    def_id: u64,
+    path: &[&str],
+    self_ty: serde_json::Value,
+    trait_id: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_trait_meta(path, self_ty, trait_id, false),
+        "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
+        "body": "Opaque"
+    })
+}
+
+fn interior_trait_meta(
+    path: &[&str],
+    self_ty: serde_json::Value,
+    trait_id: u64,
+    is_local: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": path.iter().map(|segment| {
+            if *segment == "<Impl>" {
+                serde_json::json!({"Impl": {
+                    "Ty": {"skip_binder": {"Value": [0, self_ty.clone()]}},
+                    "Trait": trait_id
+                }})
+            } else {
+                serde_json::json!({"Ident": [segment, 0]})
+            }
+        }).collect::<Vec<_>>(),
+        "span": interior_span(),
+        "source_text": null,
+        "attr_info": {
+            "attributes": [],
+            "inline": null,
+            "rename": null,
+            "public": true
+        },
+        "is_local": is_local
+    })
+}
+
 pub(in crate::front::mir) fn interior_local(
     index: u64,
     name: Option<&str>,
@@ -33676,6 +33724,874 @@ fn interior_field_read_of_ptr_add() {
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
         "ops={ops:?}"
+    );
+}
+
+fn copy_pair_u8() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+}
+
+fn copy_pair_struct() -> serde_json::Value {
+    type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            serde_json::json!({"name": "op", "ty": copy_pair_u8(), "attr_info": null}),
+            serde_json::json!({"name": "arg", "ty": copy_pair_u8(), "attr_info": null}),
+        ],
+    )
+}
+
+fn tag_op_kind_adt() -> serde_json::Value {
+    interior_adt(3)
+}
+
+fn tag_op_kind_enum() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 3,
+        "item_meta": interior_meta(&["fixture", "TagOpKind"], true),
+        "kind": {"Enum": [
+            {"name": "Nop", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+            {"name": "Load", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 1,
+                "align": 1,
+                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": []}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    })
+}
+
+fn tag_op_unit_struct() -> serde_json::Value {
+    type_decl_struct(
+        0,
+        &["fixture", "TagOpUnit"],
+        vec![
+            serde_json::json!({"name": "op", "ty": tag_op_kind_adt(), "attr_info": null}),
+            serde_json::json!({"name": "arg", "ty": copy_pair_u8(), "attr_info": null}),
+        ],
+    )
+}
+
+fn copy_pair_ref(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["_", pair, "Shared"]})
+}
+
+fn copy_pair_option_ty(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [copy_pair_ref(pair)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn copy_pair_slice_ty(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["_", {"Slice": [pair, null]}, "Shared"]})
+}
+
+fn slice_get_call(
+    fun: u64,
+    args: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+    target: u64,
+    unwind: u64,
+    elem: &serde_json::Value,
+    index: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": interior_span(),
+        "kind": {
+            "Call": {
+                "call": {
+                    "func": {
+                        "Regular": {
+                            "kind": {"Fun": fun},
+                            "generics": {
+                                "regions": [],
+                                "types": [elem, index],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    },
+                    "args": args}, "dest": dest,
+                "target": target,
+                "on_unwind": unwind
+            }
+        }
+    })
+}
+
+fn copy_pair_get_callee(
+    dest_ty: &serde_json::Value,
+    slice_ty: &serde_json::Value,
+    usize_ty: &serde_json::Value,
+) -> serde_json::Value {
+    interior_opaque(
+        1,
+        &["core", "slice", "<Impl>", "get"],
+        vec![slice_ty.clone(), usize_ty.clone()],
+        dest_ty.clone(),
+    )
+}
+
+/// `get(i)?.field` of a Copy struct is a bounds `lt` plus
+/// `getinteriorfield`. The Option dest is never a tagged aggregate.
+#[test]
+fn copy_struct_slice_get_field_is_bounds_and_interior_read() {
+    let u8_ty = copy_pair_u8();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(3, &option_ty);
+    let cf_place = interior_place(4, &cf_ty);
+    let disc_place = interior_place(5, &disc_ty);
+    let payload_place = interior_place(6, &ref_ty);
+    let ret_place = interior_place(0, &u8_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let caller = interior_caller(
+        "get_pair_field",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("opt"), &option_ty),
+            interior_local(4, Some("cf"), &cf_ty),
+            interior_local(5, Some("disc"), &disc_ty),
+            interior_local(6, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(3, &option_ty))],
+                    cf_place.clone(),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 5],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 6]
+                            ],
+                            6
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(6, &ref_ty, &pair_ty, &u8_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Unsigned": ["U8", "0"]}}, u8_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let branch = interior_opaque(
+        2,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![copy_pair_struct(), option_enum(1), control_flow_enum(2)],
+        vec![caller, get, branch],
+    );
+    let graph = lower_interior(&llbc, "get_pair_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch"),
+        "Copy-struct get(i)?.field must not residualize; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )),
+        "bounds check is unsigned lt; ops={ops:?}"
+    );
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(array_type_id.as_deref(), Some("[CodePair]"));
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } | OpKind::FieldRead { field, .. }
+                if field.name == "__discriminant" || field.name == "__pos_0"
+        )),
+        "fused get must not materialise a tagged Option; ops={ops:?}"
+    );
+}
+
+/// `get(i)?.op` of a Copy struct whose `op` is a `#[repr(u8)]` fieldless
+/// enum is `getinteriorfield` of the stored unsigned tag, then
+/// `rarithmetic.intmask` so the value that flows is the signed Int.
+#[test]
+fn copy_struct_slice_get_fieldless_enum_field_intmasks() {
+    let enum_ty = tag_op_kind_adt();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), enum_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(3, &option_ty);
+    let cf_place = interior_place(4, &cf_ty);
+    let disc_place = interior_place(5, &disc_ty);
+    let payload_place = interior_place(6, &ref_ty);
+    let ret_place = interior_place(0, &enum_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let caller = interior_caller(
+        "get_tag_op_unit_field",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        enum_ty.clone(),
+        vec![
+            interior_local(0, None, &enum_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("opt"), &option_ty),
+            interior_local(4, Some("cf"), &cf_ty),
+            interior_local(5, Some("disc"), &disc_ty),
+            interior_local(6, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(3, &option_ty))],
+                    cf_place.clone(),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 5],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 6]
+                            ],
+                            6
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(6, &ref_ty, &pair_ty, &enum_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Signed": ["I8", "0"]}}, enum_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let branch = interior_opaque(
+        2,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            tag_op_unit_struct(),
+            option_enum(1),
+            control_flow_enum(2),
+            tag_op_kind_enum(),
+        ],
+        vec![caller, get, branch],
+    );
+    let graph = lower_interior(&llbc, "get_tag_op_unit_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch"),
+        "Copy-struct get(i)?.op must not residualize; ops={ops:?}"
+    );
+    let block = interior_read_block(&graph);
+    let read_idx = block
+        .operations
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .expect("InteriorFieldRead");
+    let read = &block.operations[read_idx];
+    let OpKind::InteriorFieldRead {
+        field,
+        item_ty,
+        array_type_id,
+        ..
+    } = &read.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(item_ty, &ValueType::Unsigned);
+    assert_eq!(array_type_id.as_deref(), Some("[TagOpUnit]"));
+    let read_res = read.result.as_ref().expect("InteriorFieldRead result");
+    assert!(
+        read_idx + 1 < block.operations.len(),
+        "intmask must follow InteriorFieldRead; ops={:?}",
+        block.operations
+    );
+    let intmask = &block.operations[read_idx + 1];
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        result_ty,
+    } = &intmask.kind
+    else {
+        panic!("expected intmask after InteriorFieldRead; op={intmask:?}");
+    };
+    assert_eq!(
+        segments.as_slice(),
+        ["rpython", "rlib", "rarithmetic", "intmask"],
+        "intmask path; op={intmask:?}"
+    );
+    assert_eq!(result_ty, &ValueType::Int);
+    assert_eq!(args[0].as_variable(), Some(read_res));
+    let signed = intmask.result.as_ref().expect("intmask result");
+    let flows_on = graph.blocks.iter().any(|b| {
+        b.exits.iter().any(|link| {
+            link.target == graph.returnblock
+                && matches!(&link.args[..], [LinkArg::Value(v)] if v == signed)
+        })
+    });
+    assert!(
+        flows_on,
+        "intmask result must be the Some-path return; graph={}",
+        graph.dump()
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
+    match signed.annotation.borrow().as_deref() {
+        Some(crate::annotator::model::SomeValue::Integer(i)) => {
+            assert!(
+                !i.unsigned,
+                "intmask result annotates as signed SomeInteger, got {i:?}"
+            );
+        }
+        other => panic!("intmask result annotates as signed SomeInteger, got {other:?}"),
+    }
+}
+
+/// `get(i)?.field` through an `UnsafeCell<Box<[T]>>` Deref is the same
+/// bounds `lt` plus `getinteriorfield`. Deref is `getfield` of that
+/// unique cell field, not a residual `deref` getattr.
+#[test]
+fn copy_struct_slice_get_through_unsafecell_deref_is_bounds_and_interior_read() {
+    let u8_ty = copy_pair_u8();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let box_slice_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [pair_ty.clone(), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unsafecell_ty = serde_json::json!({
+        "Adt": {
+            "id": 3,
+            "generics": {
+                "regions": [],
+                "types": [box_slice_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder_ty = interior_adt(4);
+    let holder_ref = interior_shared(holder_ty.clone());
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(4, &option_ty);
+    let cf_place = interior_place(5, &cf_ty);
+    let disc_place = interior_place(6, &disc_ty);
+    let payload_place = interior_place(7, &ref_ty);
+    let ret_place = interior_place(0, &u8_ty);
+    let slice_place = interior_place(3, &slice_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = transparent_unique_field_decl(3, &["core", "cell", "UnsafeCell"], typevar);
+    let holder = interior_struct(
+        4,
+        &["fixture", "CellPairUnits"],
+        &[("units", unsafecell_ty), ("pad", u8_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "get_cell_pair_field",
+        2,
+        vec![holder_ref.clone(), usize_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("holder"), &holder_ref),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("slice"), &slice_ty),
+            interior_local(4, Some("opt"), &option_ty),
+            interior_local(5, Some("cf"), &cf_ty),
+            interior_local(6, Some("disc"), &disc_ty),
+            interior_local(7, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &holder_ref))],
+                    slice_place.clone(),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    2,
+                    vec![
+                        interior_copy(slice_place),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    4,
+                    3,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(4, &option_ty))],
+                    cf_place.clone(),
+                    6,
+                    5,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 7],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 8]
+                            ],
+                            8
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(7, &ref_ty, &pair_ty, &u8_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Unsigned": ["U8", "0"]}}, u8_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let deref = interior_trait_opaque(
+        1,
+        &["core", "ops", "deref", "<Impl>", "deref"],
+        holder_ty.clone(),
+        0,
+        vec![holder_ref],
+        slice_ty.clone(),
+    );
+    let get = interior_opaque(
+        2,
+        &["core", "slice", "<Impl>", "get"],
+        vec![slice_ty, usize_ty],
+        option_ty.clone(),
+    );
+    let branch = interior_opaque(
+        3,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![
+            copy_pair_struct(),
+            option_enum(1),
+            control_flow_enum(2),
+            unsafecell,
+            holder,
+        ],
+        vec![caller, deref, get, branch],
+        vec![ops_deref_trait_decl()],
+        vec![serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [holder_ty]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [0, 0]},
+                "skip_binder": {"id": 1}
+            }]
+        })],
+    );
+    let graph = lower_interior(&llbc, "get_cell_pair_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch" || *leaf == "deref"),
+        "UnsafeCell Deref get(i)?.field must not residualize; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "deref" || name == "deref_mut"
+        )),
+        "UnsafeCell Deref must not emit Method getattr deref; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "units"
+        )),
+        "Deref is getfield of the unique UnsafeCell-wrapping field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )),
+        "bounds check is unsigned lt; ops={ops:?}"
+    );
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(array_type_id.as_deref(), Some("[CodePair]"));
+}
+
+/// An escaping `get(i)` result stays the residual `core::slice::<Impl>::get`.
+#[test]
+fn copy_struct_slice_get_escape_stays_residual() {
+    let pair_ty = interior_adt(0);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let usize_ty = interior_usize();
+    let caller = interior_caller(
+        "get_pair_escape",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(0, &option_ty),
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![copy_pair_struct(), option_enum(1)],
+        vec![caller, get],
+    );
+    let graph = lower_interior(&llbc, "get_pair_escape");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| *leaf == "get"),
+        "escaping get must stay residual; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "escaping get must not emit getinteriorfield; ops={ops:?}"
+    );
+}
+
+/// `AtomicU64` is interior-mutable; `<[AtomicU64]>::get` stays residual.
+#[test]
+fn atomic_slice_get_stays_a_residual_core_call() {
+    let atomic = type_decl_struct(
+        0,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![serde_json::json!({
+            "name": "v",
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+            "attr_info": null
+        })],
+    );
+    let atomic_ty = interior_adt(0);
+    let option_ty = copy_pair_option_ty(&atomic_ty);
+    let slice_ty = copy_pair_slice_ty(&atomic_ty);
+    let usize_ty = interior_usize();
+    let caller = interior_caller(
+        "get_atomic",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(0, &option_ty),
+                    2,
+                    1,
+                    &atomic_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let llbc = llbc_with_types("fixture", vec![atomic, option_enum(1)], vec![caller, get]);
+    let graph = lower_interior(&llbc, "get_atomic");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| *leaf == "get"),
+        "AtomicU64 get must stay residual; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "AtomicU64 get must not copy the slot; ops={ops:?}"
     );
 }
 
