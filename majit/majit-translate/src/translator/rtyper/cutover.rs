@@ -12104,6 +12104,7 @@ mod tests {
                         ],
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),

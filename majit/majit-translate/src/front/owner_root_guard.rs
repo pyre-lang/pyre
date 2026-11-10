@@ -111,18 +111,8 @@ fn impl_skip_binder_is_guard(fd: &FunDecl, llbc: &Llbc) -> bool {
     if last_ident == 0 {
         return false;
     }
-    let NameSeg::Other(value) = &segs[last_ident - 1] else {
-        return false;
-    };
-    let Some(payload) = value.as_object().and_then(|m| m.get("Impl")) else {
-        return false;
-    };
-    let Some(obj) = payload.as_object() else {
-        return false;
-    };
-    obj.get("Ty")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|ty| ty.get("skip_binder"))
+    segs[last_ident - 1]
+        .impl_ty_skip_binder()
         .is_some_and(|sb| type_node_is_guard(sb, llbc))
 }
 

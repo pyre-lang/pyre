@@ -340,7 +340,7 @@ mod imp {
     }
 
     fn decode_arg(
-        mut at: PyObjectRef,
+        at: PyObjectRef,
         p: *const c_void,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let at_slot = pyre_object::gc_roots::pin_roots(&[at]);

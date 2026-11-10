@@ -78,13 +78,12 @@ fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
-    guard_words: &std::collections::HashSet<Variable>,
+    _guard_words: &std::collections::HashSet<Variable>,
 ) {
     simplify_lowered_graph_expanding(
         graph,
         struct_field_attrs,
         sweep_dead_vars,
-        guard_words,
         &|_, _| None,
         &std::collections::HashMap::new(),
     )
@@ -240,6 +239,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             None,
             None,
             &context.func_hints,
+            None,
         )
         .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
 
@@ -5720,6 +5720,7 @@ fn single_arg_lower_hex_fmt_graph(
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![new_arg.clone()]),
@@ -5791,6 +5792,7 @@ fn single_arg_lower_hex_fmt_graph(
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -5813,6 +5815,7 @@ fn single_arg_lower_hex_fmt_graph(
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -5951,6 +5954,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_function_scope_cell() {
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![spilled.clone()]),
@@ -6065,6 +6069,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_join_phi_cell() {
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![join_h.clone()]),
@@ -6170,6 +6175,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_loop_carried_cell() {
                     .collect(),
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![carried.clone()]),
@@ -14022,46 +14028,6 @@ fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
 #[test]
 fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
     use crate::model::OpKind;
-
-    let llbc = fixture_llbc();
-    let tomb = no_tombstoned_leaves();
-    let gc_struct_ids = std::collections::HashSet::new();
-    let span = serde_json::json!({"data": {
-        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
-    }});
-    let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
-    let mut_ref = serde_json::json!({"Ref": ["Erased", pointee, "Mut"]});
-    let locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
-        "arg_count": 1,
-        "locals": [
-            {
-                "index": 0,
-                "name": null,
-                "span": span,
-                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}}
-            },
-            {"index": 1, "name": "slot", "span": span, "ty": mut_ref}
-        ]
-    }))
-    .unwrap();
-    let pointee_ty: TyRef = serde_json::from_value(pointee).unwrap();
-    let root = super::mut_ref_cell_root_of(
-        &pointee_ty,
-        &llbc,
-        tomb,
-        &gc_struct_ids,
-        &std::collections::HashSet::<String>::new(),
-    )
-    .expect("raw GC pointer behind &mut is a cell");
-    let slot = |graph: &FunctionGraph| {
-        graph
-            .block(graph.startblock)
-            .operations
-            .iter()
-            .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "slot"))
-            .expect("slot input")
-            .clone()
-    };
 
     let llbc = fixture_llbc();
     let tomb = no_tombstoned_leaves();

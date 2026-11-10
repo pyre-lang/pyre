@@ -47,6 +47,7 @@ pub mod listobject;
 pub mod lltype;
 pub mod longobject;
 pub mod lowlevel_string;
+pub use lowlevel_string::jit_raw_memcopy;
 pub mod mapdict;
 pub mod memoryview;
 pub mod module;

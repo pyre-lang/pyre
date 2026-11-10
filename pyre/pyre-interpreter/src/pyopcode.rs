@@ -1013,10 +1013,11 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     match handler.iter_next(iter)? {
         Some(next) => {
             let handler = unsafe { &mut *H::live_handler(&anchor) };
-            // `pyopcode.py FOR_ITER` exhausts only on StopIteration (`None`
-            // here). A guard fail at `space.next` is a deopt that re-runs
-            // `next` in the blackhole, not "iterator done".
+            let fallthrough = handler.fallthrough_target();
+            // On guard failure this bytecode exits through the exhaustion path.
+            handler.set_next_instr(target)?;
             handler.record_for_iter_guard(next, true)?;
+            handler.set_next_instr(fallthrough)?;
             H::push_anchored(&anchor, next)
         }
         None => {
