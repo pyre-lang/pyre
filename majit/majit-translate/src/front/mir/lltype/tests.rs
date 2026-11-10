@@ -1195,6 +1195,60 @@ fn enumerate_slice_iter_next_records_the_list_item() {
     assert_eq!(peeled, Some(ValueType::Int));
 }
 
+/// Opaque `core::cell::Ref` / `RefMut` / `RefCell` type as generic 0.
+/// RPython has no RefCell; the borrow flag has no lltype counterpart.
+#[test]
+fn std_cell_ref_wrappers_type_as_generic0() {
+    let llbc = llbc_with_types(
+        "core",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "Ref"]),
+            opaque_type_decl(1, &["core", "cell", "RefMut"]),
+            opaque_type_decl(2, &["core", "cell", "RefCell"]),
+            type_decl_struct(3, &["alloc", "vec", "Vec"], vec![]),
+            opaque_type_decl(4, &["my_crate", "cell", "Ref"]),
+        ],
+        vec![],
+    );
+    let i64 = i64_ty();
+    let vec_i64 = named_adt(3, vec![i64.clone()]);
+    let ref_i64 = TyRef::Other(named_adt(0, vec![i64.clone()]));
+    assert_eq!(
+        tyref_to_value_type(&ref_i64, &llbc),
+        ValueType::Int,
+        "Ref<i64> occupies i64's bank"
+    );
+    let refmut_i64 = TyRef::Other(named_adt(1, vec![i64.clone()]));
+    assert_eq!(tyref_to_value_type(&refmut_i64, &llbc), ValueType::Int);
+    let refcell_i64 = TyRef::Other(named_adt(2, vec![i64.clone()]));
+    assert_eq!(tyref_to_value_type(&refcell_i64, &llbc), ValueType::Int);
+
+    let ref_vec = TyRef::Other(named_adt(0, vec![vec_i64.clone()]));
+    assert_eq!(
+        tyref_to_value_type(&ref_vec, &llbc),
+        ValueType::Int,
+        "Ref<Vec<i64>> occupies the RustVec int bank"
+    );
+    let refcell_vec = TyRef::Other(named_adt(2, vec![vec_i64]));
+    assert_eq!(tyref_to_value_type(&refcell_vec, &llbc), ValueType::Int);
+
+    let borrowed_ref = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", named_adt(0, vec![i64.clone()]), "Shared"]
+    }));
+    assert_eq!(
+        tyref_to_value_type(&borrowed_ref, &llbc),
+        ValueType::Int,
+        "&Ref<i64> peels to the same bank as Ref<i64>"
+    );
+
+    let user = TyRef::Other(named_adt(4, vec![i64]));
+    assert_eq!(
+        tyref_to_value_type(&user, &llbc),
+        ValueType::Ref(None),
+        "a user cell::Ref is not the std wrapper"
+    );
+}
+
 #[test]
 fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
     let llbc = fixture_llbc();

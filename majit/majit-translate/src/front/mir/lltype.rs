@@ -2967,6 +2967,21 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     {
         return inner;
     }
+    // Opaque `core::cell::Ref` / `RefMut` / `RefCell` have no `value`
+    // field in this artefact. RPython has no RefCell: a single-owner
+    // interpreter field is a direct getattr, and the dynamic borrow flag
+    // has no lltype counterpart, so the wrapper word is T
+    // (`Adt.generics.types[0]`). Mapping here is what lets
+    // `RefCell::borrow` and `Ref::deref` pass `banks_agree` as identities.
+    if let Some(inner) = tyref_std_cell_payload_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return inner;
+    }
     // `rstring.py` `StringBuilder` is `SomeStringBuilder`, not the word its
     // one-field Rust struct wraps; checked before the transparent peel.
     if tyref_is_string_builder(ty, llbc) {
@@ -7107,6 +7122,69 @@ pub(in crate::front::mir) fn tyref_atomic_inner_value_type(
         }
         _ => None,
     }
+}
+
+/// Inner [`ValueType`] of an Opaque std `Ref` / `RefMut` / `RefCell`.
+///
+/// Charon records those ADTs as `TypeDeclKind::Opaque` (no `value`
+/// field). RPython has no RefCell: `ec.<attr>` is a direct getattr, and
+/// the borrow flag has no lltype counterpart, so the wrapper occupies
+/// T's register bank. Keyed on the ADT path plus generic 0.
+pub(in crate::front::mir) fn tyref_std_cell_payload_value_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
+    if !tyref_is_std_cell_wrapper(ty, llbc) {
+        return None;
+    }
+    let inner = tyref_adt_generics_type_arg(ty, 0, llbc)?;
+    Some(tyref_to_value_type_with(
+        &inner,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ))
+}
+
+/// `core::cell::{Ref, RefMut, RefCell}` (and the `std::cell` re-export),
+/// by value or behind one borrow. A user type that shares a leaf name
+/// does not match.
+fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    match td.item_meta.template_name().next_back() {
+        Some(NameSeg::Ident { ident: (s, _) })
+            if matches!(s.as_str(), "Ref" | "RefMut" | "RefCell") => {}
+        _ => return false,
+    }
+    let mut crate_ok = false;
+    let mut saw_cell = false;
+    for seg in td.item_meta.template_name() {
+        let NameSeg::Ident { ident: (id, _) } = seg else {
+            continue;
+        };
+        if !crate_ok && !saw_cell {
+            if !matches!(id.as_str(), "core" | "std") {
+                return false;
+            }
+            crate_ok = true;
+        }
+        if id == "cell" {
+            saw_cell = true;
+        }
+    }
+    crate_ok && saw_cell
 }
 
 /// The type argument `T` of a `core::sync::atomic::Atomic<T>`, resolved

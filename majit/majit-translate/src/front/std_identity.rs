@@ -53,6 +53,18 @@ fn is_identity_wrapper_target(
     dest_path: Option<&str>,
     receiver_is_thin_box: bool,
 ) -> bool {
+    // TYPE-based: `core::cell::Ref` / `RefMut` `Deref` / `DerefMut`,
+    // and `RefCell::borrow` / `borrow_mut`. `spec_segments` peels the
+    // crate, so the FunctionPath is `cell::<Impl>::borrow` /
+    // `cell::Ref::<impl Deref<Ref<v0>>>::deref` and `is_std_fn_path`
+    // (first segment `core`/`std`/`alloc`/`sync`) misses it. The owner
+    // TypeDecl is Opaque, so `impl_method_owner` also declines
+    // `CallTarget::Method`.
+    if is_std_cell_ref_deref_target(target, receiver_path)
+        || is_std_cell_refcell_borrow_target(target, receiver_path)
+    {
+        return true;
+    }
     match target {
         CallTarget::Method {
             name,
@@ -64,7 +76,10 @@ fn is_identity_wrapper_target(
             }
             matches!(
                 (name.as_str(), path_leaf(receiver_root.as_deref())),
-                ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard"))
+                (
+                    "deref" | "deref_mut",
+                    Some("Ref") | Some("RefMut") | Some("MutexGuard")
+                ) | ("borrow" | "borrow_mut", Some("RefCell"))
             )
         }
         CallTarget::FunctionPath { segments, .. } => {
@@ -89,14 +104,150 @@ fn is_identity_wrapper_target(
                 }
                 Some("new") if path_has(segments, "atomic") => true,
                 Some("deref" | "deref_mut")
-                    if matches!(recv, Some("Ref") | Some("MutexGuard"))
+                    if matches!(recv, Some("Ref") | Some("RefMut") | Some("MutexGuard"))
                         || path_has(segments, "MutexGuard")
+                        || path_has(segments, "RefMut")
                         || (path_has(segments, "Ref") && !path_has(segments, "RefCell")) =>
+                {
+                    true
+                }
+                Some("borrow" | "borrow_mut")
+                    if recv == Some("RefCell") || path_has(segments, "RefCell") =>
                 {
                     true
                 }
                 _ => false,
             }
+        }
+        _ => false,
+    }
+}
+
+/// `core::cell::Ref` / `RefMut` (and the `std::cell` re-export).
+/// `RefCell` is a different ADT.
+fn is_std_cell_ref_adt(path: Option<&str>) -> bool {
+    matches!(
+        path,
+        Some("core::cell::Ref")
+            | Some("core::cell::RefMut")
+            | Some("std::cell::Ref")
+            | Some("std::cell::RefMut")
+    )
+}
+
+/// Trait-impl identity of `Deref` / `DerefMut` for a std `Ref` / `RefMut`.
+///
+/// `render_trait_impl` spells
+/// `core::ops::deref::Deref<core::cell::Ref<v0>>`. `RefCell` does not
+/// match: `core::cell::Ref<` / `Ref>` is not a prefix of `RefCell`.
+fn impl_identity_is_std_cell_ref_deref(segment: &str) -> bool {
+    let Some(identity) = segment
+        .strip_prefix("<impl ")
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    if !(identity.starts_with("core::ops::deref::Deref")
+        || identity.starts_with("std::ops::deref::Deref"))
+    {
+        return false;
+    }
+    const ADTS: &[&str] = &[
+        "core::cell::Ref<",
+        "core::cell::Ref>",
+        "core::cell::RefMut<",
+        "core::cell::RefMut>",
+        "std::cell::Ref<",
+        "std::cell::Ref>",
+        "std::cell::RefMut<",
+        "std::cell::RefMut>",
+    ];
+    ADTS.iter().any(|needle| identity.contains(needle))
+}
+
+/// `Deref::deref` / `DerefMut::deref_mut` on `core::cell::Ref` / `RefMut`.
+///
+/// Keyed on the ADT path and on the trait-impl identity Charon records
+/// for that `Self`, not on a peeled `cell` crate prefix.
+fn is_std_cell_ref_deref_target(target: &CallTarget, receiver_path: Option<&str>) -> bool {
+    let deref_leaf = match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            matches!(function_leaf(segments), Some("deref" | "deref_mut"))
+        }
+        CallTarget::Method { name, .. } => matches!(name.as_str(), "deref" | "deref_mut"),
+        _ => false,
+    };
+    if !deref_leaf {
+        return false;
+    }
+    if is_std_cell_ref_adt(receiver_path) {
+        return true;
+    }
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments
+            .iter()
+            .any(|s| impl_identity_is_std_cell_ref_deref(s)),
+        CallTarget::Method { receiver_root, .. } => is_std_cell_ref_adt(receiver_root.as_deref()),
+        _ => false,
+    }
+}
+
+/// `core::cell::RefCell` (and the `std::cell` re-export).
+fn is_std_cell_refcell_adt(path: Option<&str>) -> bool {
+    matches!(
+        path,
+        Some("core::cell::RefCell") | Some("std::cell::RefCell")
+    )
+}
+
+/// Inherent-impl identity of `borrow` / `borrow_mut` for a std `RefCell`.
+///
+/// `core::cell::<Impl>::borrow` peels to `<Impl>`; the ADT is in the
+/// rendered trait-impl form when Charon keeps it.
+fn impl_identity_is_std_cell_refcell(segment: &str) -> bool {
+    let Some(identity) = segment
+        .strip_prefix("<impl ")
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    const ADTS: &[&str] = &[
+        "core::cell::RefCell<",
+        "core::cell::RefCell>",
+        "std::cell::RefCell<",
+        "std::cell::RefCell>",
+    ];
+    ADTS.iter().any(|needle| identity.contains(needle))
+}
+
+/// `RefCell::borrow` / `borrow_mut`. `try_borrow` / `try_borrow_mut`
+/// return `Result` and stay residual calls.
+///
+/// Keyed on the ADT path and on the impl identity Charon records for
+/// that `Self`, not on a peeled `cell` crate prefix.
+fn is_std_cell_refcell_borrow_target(target: &CallTarget, receiver_path: Option<&str>) -> bool {
+    let borrow_leaf = match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            matches!(function_leaf(segments), Some("borrow" | "borrow_mut"))
+        }
+        CallTarget::Method { name, .. } => matches!(name.as_str(), "borrow" | "borrow_mut"),
+        _ => false,
+    };
+    if !borrow_leaf {
+        return false;
+    }
+    if is_std_cell_refcell_adt(receiver_path) {
+        return true;
+    }
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            path_has(segments, "RefCell")
+                || segments
+                    .iter()
+                    .any(|s| impl_identity_is_std_cell_refcell(s))
+        }
+        CallTarget::Method { receiver_root, .. } => {
+            is_std_cell_refcell_adt(receiver_root.as_deref())
         }
         _ => false,
     }
@@ -151,7 +302,10 @@ pub(crate) fn is_scalar_copy_width(
 /// wrapper's is that same identity. Any other visible payload is a field
 /// read (`getfield`) of `value` / `data`, or of the sole field when the
 /// banks differ. An opaque layout declines — aliasing the wrapper register
-/// would read the guard, not the payload.
+/// would read the guard, not the payload — except when `banks_agree` and
+/// the call is a std `Ref`/`RefMut` deref or `RefCell` borrow: those ADTs
+/// type as T (`tyref_std_cell_payload_value_type`), so the wrapper word
+/// is the inner value and the borrow flag has no lltype counterpart.
 ///
 /// `banks_agree` is the caller's verdict that the wrapper and the
 /// destination occupy the same register bank (`flatten.py getkind`).
@@ -210,6 +364,15 @@ pub(crate) fn lower_std_primitive_op(
                 return payload_field_read(operand, name, owner, result_ty.clone());
             }
             return op_kind;
+        }
+        // Opaque `Ref` / `RefMut` / `RefCell` have no field list
+        // (`TypeDeclKind::Opaque`). They type as T, so `banks_agree`
+        // is the identity verdict; do not bypass it.
+        if banks_agree
+            && (is_std_cell_ref_deref_target(target, receiver_path)
+                || is_std_cell_refcell_borrow_target(target, receiver_path))
+        {
+            return same_as(operand, result_ty.clone());
         }
         return op_kind;
     }
@@ -957,6 +1120,284 @@ mod tests {
             }
             other => panic!("expected a field read of Ref.value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trait_impl_ref_deref_aliases_the_borrowed_value() {
+        // Charon + `spec_segments`: crate prefix peeled, trait-impl
+        // identity between owner and leaf. `core::cell::Ref` is Opaque
+        // in the artefact, so there is no `value` field to project.
+        let v = dummy_var();
+        let trait_impl = path(&[
+            "cell",
+            "Ref",
+            "<impl core::ops::deref::Deref<core::cell::Ref<v0>>>",
+            "deref",
+        ]);
+        let deref = lower_std_primitive_op(
+            call(
+                trait_impl,
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        match deref {
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
+            }
+            other => panic!("opaque Ref::deref is the inner value, got {other:?}"),
+        }
+
+        // The impl identity names the ADT even when the receiver path
+        // is missing (`adt_path_of_tyref` declined).
+        let by_identity = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "Ref",
+                    "<impl core::ops::deref::Deref<core::cell::Ref<v0>>>",
+                    "deref",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(by_identity, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "Deref<core::cell::Ref<_>> identity aliases without receiver_path, got {by_identity:?}"
+        );
+
+        let deref_mut = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "RefMut",
+                    "<impl core::ops::deref::DerefMut<core::cell::RefMut<v0>>>",
+                    "deref_mut",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::RefMut"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(deref_mut, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "opaque RefMut::deref_mut is the inner value, got {deref_mut:?}"
+        );
+
+        // `tyref_std_cell_payload_value_type` maps `Ref<T>` to T, so the
+        // caller reports `banks_agree`. A mismatched bank stays a Call;
+        // the identity arm does not bypass that gate.
+        let disagree = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "Ref",
+                    "<impl core::ops::deref::Deref<core::cell::Ref<v0>>>",
+                    "deref",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            false,
+        );
+        assert!(
+            matches!(disagree, OpKind::Call { .. }),
+            "opaque Ref::deref keeps the residual Call when banks disagree, got {disagree:?}"
+        );
+    }
+
+    #[test]
+    fn refcell_borrow_then_ref_deref_aliases_the_inner_value() {
+        let v = dummy_var();
+        let inner = ValueType::Ref(Some("Vec".into()));
+        let borrow = lower_std_primitive_op(
+            call(
+                path(&["cell", "<Impl>", "borrow"]),
+                vec![v.clone()],
+                inner.clone(),
+            ),
+            Some("core::cell::RefCell"),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        match borrow {
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
+            }
+            other => panic!("opaque RefCell::borrow is the inner value, got {other:?}"),
+        }
+
+        let deref = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "Ref",
+                    "<impl core::ops::deref::Deref<core::cell::Ref<v0>>>",
+                    "deref",
+                ]),
+                vec![v.clone()],
+                inner.clone(),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        match deref {
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
+            }
+            other => panic!("Ref::deref after borrow aliases the inner value, got {other:?}"),
+        }
+
+        let borrow_mut = lower_std_primitive_op(
+            call(
+                path(&["cell", "<Impl>", "borrow_mut"]),
+                vec![v.clone()],
+                inner,
+            ),
+            Some("core::cell::RefCell"),
+            Some("core::cell::RefMut"),
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(borrow_mut, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "opaque RefCell::borrow_mut is the inner value, got {borrow_mut:?}"
+        );
+
+        let try_borrow = lower_std_primitive_op(
+            call(
+                path(&["cell", "<Impl>", "try_borrow"]),
+                vec![v],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::RefCell"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(try_borrow, OpKind::Call { .. }),
+            "try_borrow returns Result and stays a call, got {try_borrow:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_deref_impl_stays_a_call() {
+        let v = dummy_var();
+        let user = lower_std_primitive_op(
+            call(
+                path(&[
+                    "my_crate",
+                    "Wrapper",
+                    "<impl core::ops::deref::Deref<my_crate::Wrapper>>",
+                    "deref",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("my_crate::Wrapper"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(user, OpKind::Call { .. }),
+            "a user Deref impl is not the std Ref identity, got {user:?}"
+        );
+
+        let refcell = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "RefCell",
+                    "<impl core::ops::deref::Deref<core::cell::RefCell<v0>>>",
+                    "deref",
+                ]),
+                vec![v],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::RefCell"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(refcell, OpKind::Call { .. }),
+            "RefCell is not Ref, got {refcell:?}"
+        );
     }
 
     #[test]
