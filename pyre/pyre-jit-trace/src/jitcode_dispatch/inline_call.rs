@@ -3529,6 +3529,60 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
+/// Overlay the callee sub-walk's operand-stack mirror onto live Ref-bank
+/// colors that map to stack slots.
+///
+/// `collect_outer_active_boxes` overlays `vstack_boxes[sem - nlocals]` for
+/// the portal frame.  The callee sub-walk is sym-less and owns no
+/// virtualizable, so [`collect_callee_active_boxes`] used to encode only
+/// `registers_r`.  A coalesced `LOAD_FAST` / `COPY` / `MATCH_CLASS` kept
+/// slot lives in the walk mirror and may still be `OpRef::NONE` in the
+/// register bank; without this overlay a branch-guard snapshot would
+/// encode NONE for a live Ref.
+///
+/// Fill holes only: a color that already holds a box stays on the
+/// register / callee-shadow recovery path.  Only `OpRef::NONE` is a hole.
+/// A present null constant (`ConstPtr(GcRef(0))` / CONST_NULL) is a real
+/// value — a `PUSH_NULL` / `self_or_null` — and is kept, matching
+/// `get_list_of_active_boxes` (`pyjitpl.py`) and `collect_outer_active_boxes`.
+/// The mirror substitutes whenever `m != OpRef::NONE`, including a mirror
+/// CONST_NULL.  Preferring the mirror over a set register (the portal
+/// CALL-site overlay) is wrong here because the branch-guard capture keys
+/// pcdep at the resume coordinate while `vstack_boxes` is the walk's
+/// current stack — a reused color then publishes a kept operand (the dict
+/// `d` in `lookup(d, k)`) as a live local.  Local slots (`< stack_base`)
+/// stay on the register / shadow path.
+pub(crate) fn overlay_callee_vstack_on_ref_regs(
+    regs_r: &mut [OpRef],
+    stack_base: usize,
+    stack_depth: usize,
+    pcdep: &[(u8, u16, u16)],
+    vstack: &[OpRef],
+) {
+    if vstack.is_empty() {
+        return;
+    }
+    for (color, value) in regs_r.iter_mut().enumerate() {
+        if *value != OpRef::NONE {
+            continue;
+        }
+        let Some(slot) =
+            crate::state::semantic_ref_slot_for_reg_color(stack_base, stack_depth, pcdep, color)
+        else {
+            continue;
+        };
+        if slot < stack_base {
+            continue;
+        }
+        let Some(&m) = vstack.get(slot - stack_base) else {
+            continue;
+        };
+        if m != OpRef::NONE {
+            *value = m;
+        }
+    }
+}
+
 /// Whether a loop-carried operand parked below the call keeps the fold
 /// worthwhile.
 ///
@@ -3558,63 +3612,113 @@ fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
     }
 }
 
-/// Whether the call at `op_pc` in the walk's own code sits inside a protected
-/// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
+/// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
 ///
-/// Asked of the CALL's own coordinate, not of the whole body: the deopt
-/// resumes at this call site, so a `try` elsewhere in the function is not a
-/// handler it can reach.  `lookup_exceptiontable` answers exactly that question
-/// and returns the innermost covering entry.
+/// `_opimpl_recursive_call` (`pyjitpl.py`) falls through to
+/// `do_recursive_call(assembler_call=True)` with no extra callee screens.
+/// `direct_assembler_call` records `CALL_ASSEMBLER` to
+/// `warmstate.get_assembler_token(greenargs)`; the callee's compiled loop
+/// already contains its handlers. A raise that crosses the boundary is
+/// `handle_possible_exception` (`GUARD_NO_EXCEPTION`).
 ///
-/// The `depth != 0 || !lasti` test excludes the whole-body, depth-zero,
-/// `lasti` entry 3.14 wraps around every generator, which exists only to
-/// convert an escaping `StopIteration` at the generator boundary and catches
-/// nothing at a call site.  Same discrimination, same reason, as
-/// `code_yields_inside_try` (`pycode.rs`) applies to decide whether a
-/// generator really yields inside a `try`.
-fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> bool {
-    if sym.jitcode().is_null() {
-        return false;
-    }
-    let jitcode = unsafe { &*sym.jitcode() };
-    let raw = jitcode.payload.code_ptr;
-    if raw.is_null() {
-        return false;
-    }
-    let code = unsafe { &*raw };
-    // `lookup_exceptiontable` keys on the byte offset of the instruction
-    // itself, and `containing_py_pc_for_jitcode_pc` gives the CALL's own
-    // Python instruction index — so the offset is `py_pc * 2`, without the
-    // `next_instr` back-step a resume coordinate would need.
-    let call_py_pc =
-        crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc);
-    matches!(
-        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, call_py_pc * 2),
-        Some((_target, depth, lasti)) if depth != 0 || !lasti
-    )
-}
-
-/// Whether a callee that is not the walk's own code carries a body this fold
-/// can represent.
-///
-/// This screen is the fold's own precondition, not upstream's.  The whole call
-/// collapses into one `CALL_ASSEMBLER` plus
-/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`.  A `raise` that crosses the
-/// boundary needs nothing more: the callee's compiled trace propagates it and
-/// `GUARD_NO_EXCEPTION` resumes the caller into its unwind, as
-/// `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) does for every
-/// callee it reaches.  What the fold cannot represent is a protected region
-/// inside the callee or an `abort_permanent` marker; those stay a residual,
-/// the direction `look_inside_graph` (`codewriter/policy.py`) answers a "no"
-/// with.
-///
-/// Not asked of the walk's own code: `call_site_inside_protected_region` already
-/// read that body's table at this very call site.
+/// The `has_abort_permanent` decline (and the missing-facts decline) is a
+/// pyre-only screen with no upstream counterpart. `guess_call_kind`
+/// (`call.py`) returns `'recursive'` for a portal-runner call before any
+/// look-inside policy.
 fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
     };
-    !facts.has_exception_table && !facts.has_abort_permanent
+    foreign_callee_facts_admit_call_assembler(facts)
+}
+
+fn foreign_callee_facts_admit_call_assembler(facts: crate::pyjitcode::InlineBodyFacts) -> bool {
+    !facts.has_abort_permanent
+}
+
+#[cfg(test)]
+mod foreign_call_assembler_admission_tests {
+    use super::*;
+    use crate::pyjitcode::InlineBodyFacts;
+
+    fn facts(has_exception_table: bool, has_abort_permanent: bool) -> InlineBodyFacts {
+        InlineBodyFacts {
+            contains_raise: false,
+            has_abort_permanent,
+            exc_override_straight_line: true,
+            exc_override_sample_safe: false,
+            index_sample_safe: false,
+            exc_override_has_nested_call: false,
+            owns_loop_header: false,
+            has_exception_table,
+        }
+    }
+
+    #[test]
+    fn callee_exception_table_does_not_block_call_assembler() {
+        // `_opimpl_recursive_call` fall-through has no callee-table screen.
+        // The `has_abort_permanent` decline is a pyre-only screen with no
+        // upstream counterpart (`guess_call_kind` returns `'recursive'` for
+        // a portal-runner call before any look-inside policy).
+        assert!(foreign_callee_facts_admit_call_assembler(facts(
+            true, false
+        )));
+        assert!(!foreign_callee_facts_admit_call_assembler(facts(
+            false, true
+        )));
+    }
+}
+
+#[cfg(test)]
+mod overlay_callee_vstack_tests {
+    use super::*;
+    use majit_ir::GcRef;
+
+    fn box_at(word: usize) -> OpRef {
+        OpRef::const_ptr(GcRef(word))
+    }
+
+    #[test]
+    fn overlay_fills_none_stack_color_from_callee_mirror() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![box_at(0x100), box_at(0x200)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 2, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], box_at(0x100));
+    }
+
+    #[test]
+    fn overlay_does_not_overwrite_set_register() {
+        let mut regs = vec![OpRef::NONE; 5];
+        regs[3] = box_at(0x999);
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], box_at(0x999));
+    }
+
+    #[test]
+    fn overlay_keeps_null_const_stack_color() {
+        let mut regs = vec![OpRef::NONE; 5];
+        regs[3] = OpRef::const_ptr(GcRef(0));
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
+    }
+
+    #[test]
+    fn overlay_fills_none_stack_color_from_null_const_mirror() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![OpRef::const_ptr(GcRef(0))];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
+    }
+
+    #[test]
+    fn overlay_does_not_write_local_slots() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 1, 0)], &vstack);
+        assert_eq!(regs[1], OpRef::NONE);
+    }
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
@@ -3642,13 +3746,11 @@ fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
 /// identity is pinned upstream by the same `LOAD_GLOBAL` machinery the
 /// residual path already relies on.
 ///
-/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`)
-/// counts same-greenkey portal frames on the framestack and flips to
-/// `assembler_call` only at `count >= memmgr.max_unroll_recursion`,
-/// inlining (`perform_call`) below the bound.  The inline attempt immediately
-/// preceding this function applies the same count, including reconstructed
-/// carrier frames, so reaching this fold at the recursion boundary has the
-/// same transition.
+/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`) sets
+/// `assembler_call` only when `inlining` is on and `can_inline_callable` is
+/// false (the unroll bound first calls `dont_trace_here`). This fold consults
+/// that same predicate before recording IR. The inline attempt immediately
+/// preceding it applies the bound, including reconstructed carrier frames.
 pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -3685,15 +3787,21 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`).
     // A statement call (`plain(n+1)`) is void (`residual_call_r_v`); a
-    // value-producing call is Ref.  Declining void kept that self-rec
+    // value-producing call is Ref. Declining void kept that self-rec
     // on an inlined jump with no `execute_frame` depth charge, so a
     // JIT-hot recursion ran past `sys.getrecursionlimit()`.
-    if (dst_bank != 'r' && dst_bank != 'v') || r_args.len() < 3 {
+    // Zero positional args is `def f():`; `emit_new_pyframe_inline_with_params`
+    // stores an empty `param_boxes` into a NewArrayClear locals array.
+    if dst_bank != 'r' && dst_bank != 'v' {
         return Ok(None);
     }
-    // The handler test this fold needs is positional and lives below, once the
-    // caller's jitcode is in hand: see `call_site_inside_protected_region`.
+    if r_args.len() < 2 {
+        return Ok(None);
+    }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    if arg_concretes.len() < 2 {
+        return Ok(None);
+    }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
     };
@@ -3720,6 +3828,32 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    // `_opimpl_recursive_call` residualizes with `assembler_call = False`
+    // when `warmrunnerstate.inlining` is off. With inlining on, a callee
+    // `can_inline_callable` accepts is inlined through `perform_call`
+    // unless it is already `max_unroll_recursion` deep on the framestack;
+    // then `dont_trace_here` marks the key and the call falls through to
+    // `assembler_call = True`, as does a callee `can_inline_callable`
+    // rejects. FBW reaches this point only after its own inline attempt
+    // declined. That attempt applies the unroll bound through
+    // `disable_noninlinable_function_for_key`, so the key then answers
+    // false here; when it declined for a reason `can_inline_callable`
+    // does not check, upstream would still inline and this path leaves a
+    // plain residual. No driver means a skeleton walk: leave the call a
+    // plain residual.
+    let callee_green_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    let assembler_call = {
+        let Some((driver, _)) = crate::driver::try_driver_pair() else {
+            return Ok(None);
+        };
+        let warm_state = driver
+            .meta_interp_mut()
+            .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX);
+        warm_state.inlining() && !warm_state.can_inline_callable_for_key(&callee_green_key)
+    };
+    if !assembler_call {
+        return Ok(None);
+    }
     // Positional args fill `locals[0..co_argcount]`. Keyword-only defaults,
     // the empty `*args` tuple and the empty `**kwargs` dict are filled below
     // from the function object (`_match_signature`), so a scope that owns
@@ -3755,21 +3889,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let caller_frame = sym.frame();
-    // A CALL_ASSEMBLER raising inside a `try` body must route its
-    // GUARD_NO_EXCEPTION deopt into the handler, and this fold cannot encode
-    // that resume in its snapshot.  Ask whether THIS call site is protected
-    // rather than whether the body carries a handler anywhere: the latter
-    // reads a property of the function, not of the call, and it excludes
-    // every generator outright — 3.14 wraps each generator body in a
-    // whole-body entry, so a `while` loop in a generator that calls nothing
-    // protected was declining on a handler it can never reach.
-    if call_site_inside_protected_region(sym, op.pc) {
-        if p2_diag_enabled() {
-            eprintln!("[p2-ca] decline pc={} reason=call-inside-try", op.pc);
-        }
-        return Ok(None);
-    }
     // `is_self_recursive = callee code == portal code`. During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
     // `w_code` already in hand) equals `getcode` — the pointer the
@@ -3786,13 +3905,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // is resolved / synthesised per `callee_key` via `get_assembler_token`.
     //
     // Any other callee is admitted only through
-    // [`foreign_callee_admits_call_assembler`].  That screen is this fold's own
-    // precondition and has no counterpart in `_opimpl_recursive_call`
-    // (`pyjitpl.py`), which puts no condition at all on `assembler_call` — once
-    // control reaches the fall-through it emits unconditionally.  Without the
-    // screen an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would fold
-    // to CALL_ASSEMBLER, building and entering a frame the callee's own loop
-    // was never traced against.
+    // [`foreign_callee_admits_call_assembler`]. `_opimpl_recursive_call`
+    // (`pyjitpl.py`) puts no condition on `assembler_call` once control
+    // reaches the fall-through. The remaining `has_abort_permanent` (and
+    // missing-facts) decline is a pyre-only screen with no upstream
+    // counterpart; a callee exception table lives in the target token.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
@@ -3864,11 +3981,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let has_varkeywords = callee_code
         .flags
         .contains(pyre_interpreter::CodeFlags::VARKEYWORDS);
-    // `def f():` has nothing to store. A zero-arg scope that owns kwonly /
-    // `*args` / `**kwargs` still has slots `_match_signature` fills.
-    if nparams == 0 && kwonly_count == 0 && !has_varargs && !has_varkeywords {
-        return Ok(None);
-    }
+    // `_match_signature` fills kwonly / `*args` / `**kwargs` slots below.
+    // `def f():` is empty `param_boxes`; `_opimpl_recursive_call` still
+    // emits `CALL_ASSEMBLER` at the unroll bound.
     let total_slots =
         nparams + kwonly_count + usize::from(has_varargs) + usize::from(has_varkeywords);
     if total_slots > FBW_REC_CA_MAX_PARAMS {
@@ -4139,6 +4254,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // stores precede it and the call stays adjacent to `GUARD_NOT_FORCED`.
     // A decline before the hook still records the symbolic `CALL_ASSEMBLER`.
     let ei = call_descr.get_extra_info().clone();
+    // PyPy: the CALL_ASSEMBLER prefix (funccall frame construction,
+    // `pyframe.py` `execute_frame` `enter` + `call_trace`) is look-inside
+    // of `execute_frame`, a non-portal MIFrame; `_interpret` too-long there
+    // resumes multi-frame inside `execute_frame` (`blackhole.py`
+    // `convert_and_run_from_pyjitpl`), never at the caller's CALL pc.
+    // Over-limit FINISH is stopped by
+    // `blackhole_if_trace_too_long_before_portal_finish`.
     let mut ran = false;
     let mut ca_result = OpRef::NONE;
     let exec = {
@@ -4376,9 +4498,19 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             op.next_pc,
         )));
     }
-    // GUARD_NO_EXCEPTION on the non-raising recording path.
+    // `handle_possible_exception` (`pyjitpl.py`): GUARD_NO_EXCEPTION.
+    // `residual_call_catch_resume` is the same request the residual
+    // `call_fn` path makes: a CALL inside a `try` deopts at the call's
+    // own `catch_exception`, not the fallthrough opcode.
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(
+        ctx,
+        op.pc,
+        GuardCaptureScope {
+            residual_call_catch_resume: true,
+            ..GuardCaptureScope::default()
+        },
+    )?;
 
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -8523,16 +8655,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok(Some((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        ))),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok(Some((outcome, op.next_pc))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -8926,16 +9049,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok(Some((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        ))),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok(Some((outcome, op.next_pc))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -11175,61 +11289,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
     // below), so returning costs nothing but the inline.
     {
-        // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
-        // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
-        // result feeds the exitswitch -- no residual call and no boxed
-        // bool.  The tested operand's bank does not matter:
-        // `collect_callee_active_boxes` sizes the frame's section from the
-        // liveness at the carried `jitcode_pc`, the coordinate the decoder
-        // reads, so an int-specialized local encodes in the bank it lives in.
-        // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-        // int bank.  A strict straight-line callee has no branch at all, so
-        // this scan never fires for it.
-        // Stored bound methods carry their explicit receiver and callee frame,
-        // so their Ref operands remain available to the resume path.
-        //
-        // This precondition used to abort the enclosing trace rather than
-        // decline the inline, because residualizing it let loops compile that
-        // then printed traceback tuples missing their OUTERMOST frame.  That
-        // node is now recorded — the two bridge handler-entry arms attach the
-        // catching frame's own node — so the decline joins every other
-        // precondition here and returns `Ok(None)`.
-        //
-        // The abort was expensive out of all proportion to the inline it was
-        // protecting: a callee that walks a traceback (`while tb is not None`)
-        // lowers to exactly this instruction, so any handler calling such a
-        // helper aborted every retrace of the enclosing loop.  The guard whose
-        // bridge the retrace was building therefore never got one and deopted
-        // on every delivery.
-        if bound_method.is_none() {
-            let liveness = crate::liveness::liveness_for(raw_callee_code);
-            let has_is_none_branch = (0..callee_code.instructions.len()).any(|pc| {
-                matches!(
-                    pyre_interpreter::decode_instruction_at(callee_code, pc),
-                    Some((
-                        pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                            | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                        _
-                    ))
-                ) && (
-                    // Kept operands. A branch that leaves slots
-                    // on the value stack needs its guard resume to restore
-                    // them, and the inline sub-walk's mirror does not model
-                    // them, so the kept Ref reads NULL and
-                    // `walker_branch_guard` raises
-                    // BranchGuardUnrestorableKeptStackPermanent — a
-                    // permanent abort that discards the enclosing loop
-                    // trace.  `stack_depth_at` is the depth BEFORE the
-                    // instruction and the branch pops the tested value, so
-                    // `depth > 1` is exactly "a kept slot survives".  An
-                    // unreachable pc has no depth and cannot fire a guard.
-                    liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
-                )
-            });
-            if has_is_none_branch {
-                return resolved_inline_decline(op.pc, line!());
-            }
-        }
         let nlocals = callee_code.varnames.len();
         let ncells = pyre_interpreter::ncells(callee_code);
         let frame_array_size = nlocals + ncells + callee_code.max_stackdepth as usize;
@@ -24081,16 +24140,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -24578,16 +24628,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -24819,16 +24860,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,

@@ -7345,19 +7345,29 @@ fn run_perfn_walk<Sym: WalkSym>(
 
     // The epilogue above can allocate.  `walk_session_roots` forwards a
     // `ConstPtr` finish operand on the session; copy that address onto the
-    // outcome the caller records as the FINISH arg.
+    // outcome the caller records as the FINISH arg. `portal_finish_too_long`
+    // is `WalkSession::trace_too_long` after
+    // `blackhole_if_trace_too_long_before_portal_finish`; the session drops
+    // when this function returns, so the Terminate arm in
+    // `full_body_walk_trace` reads the bit off the outcome.
     if let Ok((
         crate::jitcode_dispatch::DispatchOutcome::Terminate {
             finish_arg,
             finish_arg_type,
+            portal_finish_too_long,
         },
         _,
     )) = &mut walk_result
     {
-        if let Some((arg, ty)) = session.borrow_mut().finish_payload.take() {
+        let (payload, too_long) = {
+            let mut session = session.borrow_mut();
+            (session.finish_payload.take(), session.trace_too_long)
+        };
+        if let Some((arg, ty)) = payload {
             *finish_arg = arg;
             *finish_arg_type = ty;
         }
+        *portal_finish_too_long = too_long;
     }
 
     Some((entry, code_len, walk_result))
@@ -8324,7 +8334,22 @@ fn full_body_walk_trace<Sym: WalkSym>(
             crate::jitcode_dispatch::DispatchOutcome::Terminate {
                 finish_arg,
                 finish_arg_type,
+                portal_finish_too_long,
             } => {
+                // Follows the portal-finish seam's decision:
+                // `blackhole_if_trace_too_long_before_portal_finish` set
+                // `WalkSession::trace_too_long`, and `run_perfn_walk`
+                // copied that bit onto this outcome. Keep TraceCtx live so
+                // jitdriver Finish can `publish_single_pass_outcome`
+                // (`warmspot.py handle_jitexception` CRN banks). The
+                // Finish consumer's `compile_finish_from_active_session`
+                // then returns `Err(SwitchToBlackhole)` — the
+                // `finishframe_exception` `except SwitchToBlackhole`
+                // delivery. `compile_segmented_trace_prefix` is
+                // SegmentTrace, not Terminate, and does not mark.
+                if portal_finish_too_long {
+                    meta.mark_portal_finish_too_long();
+                }
                 // A loop-free portal exit: the top-level `*_return` reached
                 // `done_with_this_frame` with no back-edge.  The return arm
                 // routed through `fbw_terminate_with_finish`, which re-boxed the

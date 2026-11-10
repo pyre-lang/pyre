@@ -4162,6 +4162,23 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             }
         }
     }
+    // Portal `collect_outer_active_boxes` overlays `vstack_boxes` onto live
+    // Ref colors that map to operand-stack slots.  Fill NONE / NULL-const
+    // holes on this callee frame after shadow recovery so a kept COPY /
+    // MATCH_CLASS slot the walk mirror holds is the box the snapshot
+    // encodes.  A color that already holds a real box stays on the
+    // register / shadow path (the resume pcdep and the walk mirror are
+    // not the same coordinate).
+    if ctx.vstack_valid {
+        let vstack = ctx.frame_state.borrow().vstack_boxes.clone();
+        overlay_callee_vstack_on_ref_regs(
+            &mut recovered_regs_r,
+            stack_base,
+            maps.stack_depth_at_pc,
+            &maps.pcdep_entries,
+            &vstack,
+        );
+    }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         &recovered_regs_r,

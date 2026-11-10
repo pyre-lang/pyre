@@ -333,6 +333,7 @@ fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
         DispatchOutcome::Terminate {
             finish_arg,
             finish_arg_type,
+            ..
         } => Some((*finish_arg, *finish_arg_type)),
         _ => None,
     }
@@ -2415,7 +2416,7 @@ fn exact_vstack_step_uses_depth_of_its_own_python_opcode() {
         vstack_step_depth(&pyjit, 0, floor_pc as u32),
         floor_depth as usize
     );
-    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit));
+    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit), 0);
     let (pc, _, depth) = frame
         .vstack_step_coordinate_for_jitcode_pc(0, u32::MAX)
         .unwrap();
@@ -5134,6 +5135,212 @@ fn helper_too_long_decision_table() {
     assert_eq!(
         helper_too_long_decision(true, false, 1),
         HelperTooLongDecision::KeepExecuting
+    );
+}
+
+/// `_interpret` (`pyjitpl.py`) `blackhole_if_trace_too_long` after each
+/// look-inside step of portal `handle_operation_error`, before
+/// `compile_exit_frame_with_exception`. FBW records those steps inside
+/// the same opcode's SubRaise handling; the cut is
+/// `blackhole_if_trace_too_long_before_portal_finish` after the
+/// no-handler unwind ops. The pending exception stays on `Terminate` /
+/// `FBW_FINISH_CONCRETE` so the compile consumer delivers it
+/// (`finishframe_exception` after `except SwitchToBlackhole`).
+#[test]
+fn over_limit_portal_subraise_must_not_compile_finish() {
+    let raise_byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    let code = [raise_byte, 0x02];
+    let mut tc = fresh_trace_ctx();
+    dummy_ptr_eq_box(&mut tc);
+    tc.set_trace_limit(0);
+    assert!(tc.is_too_long(), "the walk must start over budget");
+    tc.clear_merge_points();
+    let regs = distinct_const_refs(&mut tc, 4);
+    let expected_exc = regs[2];
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    fbw_finish_payload_reset();
+    let result = walk(&code, 0, &mut wc);
+    assert!(
+        matches!(result, Ok((DispatchOutcome::Terminate { .. }, _))),
+        "over-limit portal SubRaise still terminates so the pending exception is delivered: {result:?}"
+    );
+    let (outcome, _) = result.expect("Terminate");
+    assert!(
+        wc.session.borrow().trace_too_long,
+        "note_root_trace_too_long marks the session so the FINISH compile is refused"
+    );
+    assert!(
+        fbw_finish_is_exception(),
+        "the pending exception stays on FBW_FINISH_CONCRETE"
+    );
+    let (finish_value, finish_ty) =
+        finish_payload_of(&outcome).expect("exception finish payload must be stashed");
+    assert_eq!(finish_ty, Type::Ref);
+    assert_eq!(finish_value, expected_exc);
+    drop(wc);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "walk must not record FINISH; the compile consumer is refused"
+    );
+
+    tc.set_trace_limit(10_000);
+    fbw_finish_payload_reset();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&code, 0, &mut wc);
+    assert!(
+        matches!(result, Ok((DispatchOutcome::Terminate { .. }, _))),
+        "under-limit portal SubRaise still terminates: {result:?}"
+    );
+    assert!(
+        !wc.session.borrow().trace_too_long,
+        "an under-limit portal SubRaise does not mark the session"
+    );
+}
+
+/// Portal-finish seam judges the plain history length
+/// (`blackhole_if_trace_too_long`: `length > warmrunnerstate.trace_limit
+/// or history.trace_tag_overflow()`). `fbw_store_token_in_vable` is
+/// recorded after this seam.
+#[test]
+fn portal_finish_seam_judges_plain_length() {
+    let mut tc = fresh_trace_ctx();
+    dummy_ptr_eq_box(&mut tc);
+    dummy_ptr_eq_box(&mut tc);
+    let n = tc.num_recorded_ops();
+    assert!(n >= 1, "need at least one recorded op");
+    tc.clear_merge_points();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    wc.trace_ctx.set_trace_limit(n);
+    assert!(
+        !wc.trace_ctx.is_too_long(),
+        "at the limit the trace is not too long"
+    );
+    blackhole_if_trace_too_long_before_portal_finish(&wc);
+    assert!(
+        !wc.session.borrow().trace_too_long,
+        "at-limit portal finish must not mark the session"
+    );
+
+    wc.session.borrow_mut().trace_too_long = false;
+    wc.trace_ctx.set_trace_limit(n.saturating_sub(1));
+    assert!(
+        wc.trace_ctx.is_too_long(),
+        "one op over the limit is too long"
+    );
+    blackhole_if_trace_too_long_before_portal_finish(&wc);
+    assert!(
+        wc.session.borrow().trace_too_long,
+        "over-limit portal finish marks the session"
     );
 }
 

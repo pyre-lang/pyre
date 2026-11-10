@@ -2229,6 +2229,13 @@ pub struct ActiveTraceSession<M: Clone> {
     /// by MetaInterp so the finish-compile helpers can consume it
     /// without requiring the JitDriver to mediate.
     pub trace_meta: M,
+    /// Walk-loop portal-finish seam already ran
+    /// `blackhole_if_trace_too_long` (`pyjitpl.py` `_interpret` after
+    /// `handle_operation_error` / `RETURN_VALUE`). `compile_finish`
+    /// returns `Err(SwitchToBlackhole)` so the Finish consumer can
+    /// publish CRN banks first. Not a length check in `compile_*`:
+    /// `compile_segmented_trace_prefix` never sets this.
+    portal_finish_too_long: bool,
 }
 
 pub struct MetaInterp<M: Clone> {
@@ -5046,7 +5053,20 @@ impl<M: Clone> MetaInterp<M> {
             self.active_trace_session.is_none(),
             "begin_trace_session called while a trace session is already active",
         );
-        self.active_trace_session = Some(ActiveTraceSession { trace_meta });
+        self.active_trace_session = Some(ActiveTraceSession {
+            trace_meta,
+            portal_finish_too_long: false,
+        });
+    }
+
+    /// Portal Terminate / no-handler SubRaise already crossed
+    /// `trace_limit`. The Finish consumer still needs a live TraceCtx
+    /// for `publish_single_pass_outcome`; `compile_finish_from_active_session`
+    /// then returns `Err(SwitchToBlackhole(ABORT_TOO_LONG))`.
+    pub fn mark_portal_finish_too_long(&mut self) {
+        if let Some(session) = self.active_trace_session.as_mut() {
+            session.portal_finish_too_long = true;
+        }
     }
 
     /// Attach bridge-origin metadata.  Called once at bridge entry
@@ -19409,6 +19429,24 @@ impl<M: Clone> MetaInterp<M> {
         // finish entry (e.g. `TraceAction::Finish` arm ran first).
         if self.active_trace_session.is_none() {
             return Ok(());
+        }
+        // Not a length check (`compile_segmented_trace_prefix` uses this
+        // helper and must compile). The walk-loop portal-finish seam
+        // (`blackhole_if_trace_too_long_before_portal_finish`) already
+        // ran `note_root_trace_too_long`. Returning Err is the
+        // `finishframe_exception` `except SwitchToBlackhole` delivery
+        // so jitdriver Finish can publish CRN banks while TraceCtx is
+        // still live (`publish_single_pass_outcome`).
+        if self
+            .active_trace_session
+            .as_ref()
+            .is_some_and(|s| s.portal_finish_too_long)
+        {
+            self.abort_trace_live(false);
+            return Err(SwitchToBlackhole {
+                reason: counters::ABORT_TOO_LONG,
+                raising_exception: false,
+            });
         }
         // bridge branch: `compile_trace_finish` records FINISH on the
         // existing tracer and dispatches to `compile_trace_inner`.

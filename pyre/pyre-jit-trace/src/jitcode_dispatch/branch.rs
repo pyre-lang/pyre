@@ -265,57 +265,44 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
 /// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
 /// boundary `n()`).  These are exactly the registers the blackhole restores
 /// into `registers_r` before re-executing the arm: the snapshot live set
-/// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
-/// plus the const-window registers at index `>= num_regs_r` (auto-loaded
-/// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
-/// Same `fbw_mode.snapshot_sym` contract as
-/// [`branch_resume_target_stack_depth`].
-pub(crate) fn branch_arm_resume_ref_liveness<Sym: WalkSym>(
-    fbw_mode: FbwWalkMode<Sym>,
+/// (`collect_outer_active_boxes` / `collect_callee_active_boxes` →
+/// `frame_liveness_reg_indices_by_bank_from_pc`) plus the const-window
+/// registers at index `>= num_regs_r` (auto-loaded from `jitcode.constants_r`
+/// by `init_register_files_from_runtime_jitcode`).
+///
+/// `frame` is the same [`ActiveResumeFrame`] the depth gate already
+/// resolved: portal via [`ActiveResumeFrame::outer`], inlined callee via
+/// [`ActiveResumeFrame::current`].  Keying liveness off that frame's SD
+/// index keeps a callee `target` from being read against the portal
+/// jitcode (the previous `fbw_mode.snapshot_sym` path returned `None` for
+/// every inline sub-walk, so `reads_null_ref` treated the arm as
+/// unrestorable).
+pub(crate) fn branch_arm_resume_ref_liveness(
+    frame: Option<&ActiveResumeFrame>,
     target: usize,
 ) -> Option<(std::collections::HashSet<u16>, u16)> {
-    // Conservative under an inline sub-walk: `target` indexes the innermost
-    // callee's jitcode while `fbw_mode.snapshot_sym` (read below) is the
-    // outer portal frame, so the outer-keyed liveness banks would be read at
-    // a foreign coordinate.  `None` → the caller treats the arm as
-    // unrestorable and declines, which is the current sub-walk behavior.
-    if fbw_mode.inline_subwalk {
+    let frame = frame?;
+    if frame.1 < 0 || frame.0.code_ptr.is_null() {
         return None;
     }
-    let full_body_sym = fbw_mode.snapshot_sym;
-    if full_body_sym.is_null() {
-        return None;
-    }
-    let sym = unsafe { &*full_body_sym };
-    if sym.jitcode().is_null() {
-        return None;
-    }
-    unsafe {
-        let jc = &*sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        // Key the liveness store off the sym's own stamped `jitcode.index`
-        // — the same per-function index the snapshot encoder
-        // (`collect_outer_active_boxes`) and the resume decoder
-        // (`setup_bridge_sym`, via the snapshot frame's `jitcode_index`)
-        // resolve — NOT the walk context's `outer_jitcode_index`, which is
-        // 0 for the second and later distinct functions in a program.  A
-        // wrong index resolves `target` against the FIRST function's
-        // jitcode, where it is out of range, and the silent empty default
-        // reports every arm read unrestorable (a spurious permanent
-        // decline for every kept-stack branch outside the first function).
-        //
-        // Source the branch-arm Ref-liveness banks directly from the carried
-        // jitcode-pc `target` via the jitcode-pc-keyed reader, with no reverse
-        // translation to a Python opcode pc and no trivia skip.
-        let jitcode_index = jc.index;
-        let banks =
-            crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, target as i32);
-        let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
-        let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
-        Some((live, num_regs_r))
-    }
+    // Key the liveness store off the frame's SD `jitcode.index` — the same
+    // per-function index the snapshot encoder (`collect_outer_active_boxes`
+    // / `collect_callee_active_boxes`) and the resume decoder
+    // (`setup_bridge_sym`, via the snapshot frame's `jitcode_index`)
+    // resolve — NOT the walk context's `outer_jitcode_index`, which is
+    // 0 for the second and later distinct functions in a program.  A
+    // wrong index resolves `target` against the FIRST function's
+    // jitcode, where it is out of range, and the silent empty default
+    // reports every arm read unrestorable (a spurious permanent
+    // decline for every kept-stack branch outside the first function).
+    //
+    // Source the branch-arm Ref-liveness banks directly from the carried
+    // jitcode-pc `target` via the jitcode-pc-keyed reader, with no reverse
+    // translation to a Python opcode pc and no trivia skip.
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(frame.1, target as i32);
+    let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
+    let num_regs_r = frame.0.jitcode.num_regs_r() as u16;
+    Some((live, num_regs_r))
 }
 
 /// Scan a kept-stack branch guard's not-taken (resume) arm for a Ref
