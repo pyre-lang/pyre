@@ -1,4 +1,4 @@
-# pyre-check: pypy-diverges: 3.15 `_PyEval_SliceIndex` dropped "or None"; pypy 3.11 still emits it
+# pyre-check: pypy-diverges: 3.15 `_PyEval_SliceIndex` dropped "or None"; pypy 3.11 still emits it; pypy3 has no list.__sizeof__ (AttributeError)
 # CPython-suite gap: bound conversion (int subclass, bigint clamp, rewritten
 # TypeError) and lock-free conversion vs the copy stripe are not in the suite.
 # parity-tests reason: `_eval_slice_index` is `space.getindex_w`; the list copy
@@ -113,4 +113,60 @@ threading.Thread(target=watchdog, daemon=True).start()
 publish_threads()
 assert warmup_list_slice() == 3 * N
 slice_index_waits_for_append()
+
+# AbstractUnwrappedStrategy.deleteslice: compact then one tail shrink.
+l = list(range(20))
+del l[::3]
+print(l)
+assert l == [1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19]
+l = list(range(20))
+del l[15:2:-2]
+print(l)
+assert l == [0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 17, 18, 19]
+l = list(range(20))
+del l[::-1]
+print(l)
+assert l == []
+
+
+class EmptyHint:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise StopIteration
+
+    def __length_hint__(self):
+        return 32
+
+
+x = []
+x.extend(EmptyHint())
+x.append(1)
+y = []
+y.append(1)
+empty_hint_eq = x.__sizeof__() == y.__sizeof__()
+print(empty_hint_eq)
+assert empty_hint_eq
+
+dest = []
+before = dest.__sizeof__()
+grew = []
+
+
+class Hinted:
+    def __iter__(self):
+        def gen():
+            grew.append(dest.__sizeof__() > before)
+            yield 1
+
+        return gen()
+
+    def __length_hint__(self):
+        return 32
+
+
+dest.extend(Hinted())
+print(grew[0])
+assert grew[0]
 print("OK")

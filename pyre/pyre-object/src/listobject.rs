@@ -5462,17 +5462,24 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     (*(obj as *const W_ListObject)).live_len()
 }
 
-/// [3.15-spec] `list___sizeof___impl` (Py_GIL_DISABLED arm) reads
+/// [3.15-spec] `list___sizeof___impl` reports the reserved allocated ↔
+/// SizeListStrategy keeps the hint unallocated.
+///
+/// `list___sizeof___impl` (Py_GIL_DISABLED arm) reads
 /// `list_capacity(ob_item)` with a relaxed load of `ob_item` and no
 /// critical section (`test_free_threading/test_list.py`
 /// `test_list_sizeof_free_threaded_build`). PyPy has no `list.__sizeof__`;
 /// the only allocation state is `len(l.items)` (`rlist.py`).
 ///
-/// Empty / Size / Range have no backing (`ob_item == NULL`) and answer 0.
+/// Empty / Range have no backing (`ob_item == NULL`) and answer 0.
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_allocated(obj: PyObjectRef) -> isize {
-    match strategy_capacity(&*(obj as *const W_ListObject)) {
+    let list = &*(obj as *const W_ListObject);
+    if list.strategy == ListStrategy::Size {
+        return sizehint_state_value(list.items).max(0) as isize;
+    }
+    match strategy_capacity(list) {
         Some(cap) => cap as isize,
         None => 0,
     }
@@ -5987,6 +5994,13 @@ pub unsafe fn w_list_finish_extend(obj: PyObjectRef) {
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
+    if list.strategy == ListStrategy::Size {
+        // ListStrategy._extend_from_iterable: if extended < length_hint,
+        // `_resize_hint(w_list.length())`. SizeListStrategy._resize_hint
+        // stores that live length into the sizehint cell.
+        set_sizehint_state_value(list.items, list.live_len() as i64);
+        return;
+    }
     let Some(current) = strategy_capacity(list) else {
         return;
     };
@@ -5996,26 +6010,6 @@ pub unsafe fn w_list_finish_extend(obj: PyObjectRef) {
         let target = list_resize_target(current, size, size);
         let _ = publish_physical_capacity(obj, root_base, target);
     }
-}
-
-/// One `_ll_list_resize_le`-style shrink to the live length after a batch of
-/// primitive removals. `list_resize` sees `Py_SIZE` already at the new size.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_finish_batch_resize(obj: PyObjectRef) {
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _list_guard = w_list_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let list = &mut *(obj as *mut W_ListObject);
-    let Some(current) = strategy_capacity(list) else {
-        return;
-    };
-    let new_size = list.live_len();
-    let target = list_resize_target(current, new_size, new_size);
-    let _ = publish_physical_capacity(obj, root_base, target);
 }
 
 /// Whether `obj` is a list currently backed by the Integer strategy — the
@@ -9675,6 +9669,39 @@ mod tests {
     }
 
     #[test]
+    fn size_strategy_finish_extend_cuts_pending_sizehint() {
+        // ListStrategy._extend_from_iterable cuts a too-large length hint
+        // with `_resize_hint(w_list.length())`; SizeListStrategy._resize_hint
+        // stores that live length.
+        unsafe {
+            let extra = 32usize;
+            let list = w_list_new(Vec::new());
+            w_list_reserve_for_extend(list, extra);
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Size
+            );
+            let reserved_target = (extra + 1) & !1;
+            assert_eq!(w_list_allocated(list), reserved_target as isize);
+            assert_eq!(w_list_physical_size(list), Some(0));
+
+            w_list_finish_extend(list);
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Size
+            );
+            assert_eq!(w_list_sizehint(list), Some(0));
+            assert_eq!(w_list_allocated(list), 0);
+
+            w_list_append(list, w_int_new(1));
+            let fresh = w_list_new(Vec::new());
+            w_list_append(fresh, w_int_new(1));
+            assert_eq!(w_list_physical_size(list), w_list_physical_size(fresh));
+            assert_eq!(w_list_allocated(list), w_list_allocated(fresh));
+        }
+    }
+
+    #[test]
     fn test_size_list_strategy_consumes_hint_on_first_append() {
         // listobject.py SizeListStrategy inherits EmptyListStrategy and only
         // overrides get_sizehint/_resize_hint.
@@ -9970,6 +9997,51 @@ mod tests {
             w_list_deleteslice(floats, 0, 2, 3);
             assert!(w_list_uses_float_storage(floats));
             assert_eq!(w_list_len(floats), 3);
+        }
+    }
+
+    #[test]
+    fn test_deleteslice_negative_step_one_resize() {
+        // AbstractUnwrappedStrategy.deleteslice: `del l[99:17:-1]` on an
+        // Integer list of 100, then one `_ll_list_resize_le`.
+        let list = w_list_new((0..100).map(w_int_new).collect());
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            assert_eq!(w_list_len(list), 100);
+            let cap_before = w_list_physical_size(list).unwrap();
+            assert_eq!(cap_before, 100);
+            w_list_deleteslice(list, 99, -1, 82);
+            assert_eq!(w_list_len(list), 18);
+            for i in 0..18 {
+                assert_eq!(
+                    crate::intobject::w_int_get_value(w_list_getitem(list, i).unwrap()),
+                    i
+                );
+            }
+            let expected = list_resize_target(cap_before, cap_before, 18);
+            assert_eq!(w_list_physical_size(list), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_deleteslice_object_strategy_step_3() {
+        // AbstractUnwrappedStrategy.deleteslice compact loop on Object storage.
+        let items: Vec<PyObjectRef> = (0..10).map(|i| crate::w_str_new(&i.to_string())).collect();
+        let list = w_list_new_object(items);
+        unsafe {
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Object
+            );
+            w_list_deleteslice(list, 0, 3, 4);
+            assert_eq!(w_list_len(list), 6);
+            let expect = ["1", "2", "4", "5", "7", "8"];
+            for (i, s) in expect.iter().enumerate() {
+                assert_eq!(
+                    crate::w_str_get_wtf8(w_list_getitem(list, i as i64).unwrap()),
+                    *s
+                );
+            }
         }
     }
 
