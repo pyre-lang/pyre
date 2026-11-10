@@ -388,8 +388,10 @@ impl<'a> Lowering<'a> {
     /// (`classdesc.get_param('_alloc_flavor_')`). `raw_struct_ptr_annotation`
     /// is storage-raw only and does not accept a flavor-raw spelling.
     /// A GC pointee whose class root is registered becomes a spelled
-    /// `core.ptr.null_mut` (`push_null_gc_ptr_with_spelling`); any other
-    /// pointee returns `false` and keeps the unspelled `null_mut`.
+    /// `core.ptr.null_mut` (`push_null_gc_ptr_with_spelling`); a declared
+    /// flexible GcArray wrapper pointee returns `false` for
+    /// [`Self::try_lower_gcarray_ptr_null`]; any other pointee returns
+    /// `false` and keeps the unspelled `null_mut`.
     pub(in crate::front::mir) fn try_lower_raw_adt_ptr_null(
         &mut self,
         mir_bb: usize,
@@ -518,6 +520,14 @@ impl<'a> Lowering<'a> {
             return Ok(true);
         }
         if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        // A flexible GcArray wrapper pointee is left to
+        // `try_lower_gcarray_ptr_null` (`lltype.nullptr(GcArray(ITEM))`).
+        if self
+            .tyref_scalar_flexible_gcarray_item(&call.dest.ty)
+            .is_some()
+        {
             return Ok(false);
         }
         let Some(root) = tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
