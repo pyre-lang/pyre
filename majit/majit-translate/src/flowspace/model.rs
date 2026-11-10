@@ -2777,6 +2777,17 @@ impl HostEnv {
             HostObject::new_builtin_callable(crate::runtime_names::modules::JIT_LL_ARRAYCOPY),
         );
 
+        // `majit_gc::add_memory_pressure` — `rgc.add_memory_pressure`
+        // (`rgc.py` `AddMemoryPressureEntry`). `canonical_dedup_key` keeps
+        // the `majit_gc` crate root, so Layer-3b resolves prefix `majit_gc`
+        // + leaf `add_memory_pressure`. The ExtRegistryEntry specializes
+        // the call to llop `gc_add_memory_pressure`.
+        let gc_module = HostObject::new_module(crate::runtime_names::modules::GC);
+        gc_module.module_set(
+            "add_memory_pressure",
+            HostObject::new_builtin_callable(crate::runtime_names::modules::ADD_MEMORY_PRESSURE),
+        );
+
         // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
         // / `dealloc_varsize_with_gc_header` — concrete `malloc_varsize`
         // analogues (`init_gc_object_immortal`). Generic `alloc_with_gc_header`
@@ -2883,6 +2894,7 @@ impl HostEnv {
             crate::runtime_names::modules::OBJECT_LLTYPE.into(),
             lltype_module,
         );
+        mods.insert(crate::runtime_names::modules::GC.into(), gc_module);
         mods.insert(
             crate::runtime_names::modules::OBJECT_ARRAY.into(),
             object_array_module.clone(),
