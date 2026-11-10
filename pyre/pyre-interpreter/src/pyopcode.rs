@@ -2736,8 +2736,12 @@ pub fn execute_get_len<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     let obj = executor.peek_at(0)?;
+    // pyopcode.py GET_LEN: `w_sequence = self.peekvalue();
+    // w_len = self.space.len(w_sequence); self.pushvalue(w_len)`.
+    // shadowstack.py pop_roots rewrites `self` after the collecting `len`.
+    let anchor = executor.anchor();
     let len = executor.get_len(obj)?;
-    executor.push_value(len)?;
+    E::push_anchored(&anchor, len)?;
     Ok(StepResult::Continue)
 }
 

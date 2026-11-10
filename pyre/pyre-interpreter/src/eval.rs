@@ -3835,8 +3835,11 @@ impl PyFrame {
         let _ = pyre_object::gc_roots::pin_root(func);
         let mut live = vec![pyre_object::PY_NULL; args.len()];
         pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut live);
+        // import_module / getattr_str / the helper call all collect;
+        // framework.py gct_direct_call / shadowstack.py pop_roots rewrite
+        // the frame before call_callable (pyopcode.py CALL_INTRINSIC_1).
         let result = call_callable(
-            self,
+            unsafe { &mut *anchor.live() },
             pyre_object::gc_roots::shadow_stack_get(func_slot),
             &live,
         )?;
@@ -4841,8 +4844,14 @@ impl OpcodeStepExecutor for PyFrame {
             let family = unsafe {
                 crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, idx)
             };
-            let cell = pyre_object::w_cell_new(current, family);
-            self.set_locals_w(idx, cell);
+            // `w_cell_new` is a collecting malloc (`nestedscope.py` `Cell.__init__`).
+            // framework.py gct_direct_call / shadowstack.py pop_roots rewrite
+            // the frame and the wrapped value before `set_locals_w`.
+            let mut current = current;
+            let anchor = FrameAnchor::new(self);
+            let cell =
+                pyre_object::with_roots!(current => pyre_object::w_cell_new(current, family));
+            unsafe { &mut *anchor.live() }.set_locals_w(idx, cell);
         }
         Ok(())
     }
@@ -5503,12 +5512,14 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_globals(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         // `w_code_getname_w_or_new` realizes the `co_names_w` slot on its
         // first read, so the popped mapping crosses an allocation.
+        // FrameAnchor before that intern: `pycode.getname_w` may allocate,
+        // and shadowstack.py pop_roots rewrites `self`.
         let roots = pyre_object::gc_roots::push_roots();
         let mapping_slot = roots.base();
         let _ = roots.pin_root(self.pop());
+        let anchor = FrameAnchor::new(self);
         let key =
             unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
-        let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(roots.get(mapping_slot), key) {
             Ok(value) => {
                 // The mapping may be the raw type namespace.  `setdictvalue`
@@ -5534,11 +5545,13 @@ impl OpcodeStepExecutor for PyFrame {
         // bounds how often this runs; interning is what keeps an immortal
         // string per execution from being an immortal string per execution.
         // The popped mapping crosses that allocation.
+        // FrameAnchor before intern_str_value: the intern allocates, and
+        // shadowstack.py pop_roots rewrites `self`.
         let roots = pyre_object::gc_roots::push_roots();
         let mapping_slot = roots.base();
         let _ = roots.pin_root(self.pop());
-        let key = pyre_object::unicodeobject::intern_str_value(name);
         let anchor = FrameAnchor::new(self);
+        let key = pyre_object::unicodeobject::intern_str_value(name);
         match crate::baseobjspace::getitem(roots.get(mapping_slot), key) {
             Ok(value) => {
                 // The mapping is the raw type namespace (`__classdictcell__`).
@@ -6095,18 +6108,26 @@ impl OpcodeStepExecutor for PyFrame {
         is_method: bool,
         is_two_arg: bool,
     ) -> Result<(), PyError> {
-        let w_code = self.getcode_w();
-        let name = &self.code().names[name_idx];
+        let (self_is_cell, class_slot) =
+            crate::builtins::bare_super_frame_layout_words(self.code());
         // Resolve while the three opcode operands still live in the frame's
         // value stack.  First realization may allocate; after publication the
         // interned `co_names_w` entry is immutable, as in PyPy's `getname_w`.
-        let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, name_idx, name) };
-        let (self_is_cell, class_slot) =
-            crate::builtins::bare_super_frame_layout_words(self.code());
-        let self_obj = self.pop();
-        let cls = self.pop();
-        let global_super = self.pop();
+        // FrameAnchor before that intern: shadowstack.py pop_roots rewrites
+        // `self` so the pops and `load_super_attr_value_w` see the live frame.
         let anchor = FrameAnchor::new(self);
+        let w_name = unsafe {
+            let live = &*anchor.live();
+            crate::pycode::w_code_getname_w_or_new(
+                live.getcode_w(),
+                name_idx,
+                &live.code().names[name_idx],
+            )
+        };
+        let self_ = unsafe { &mut *anchor.live() };
+        let self_obj = self_.pop();
+        let cls = self_.pop();
+        let global_super = self_.pop();
 
         let result = load_super_attr_value_w(
             global_super,
