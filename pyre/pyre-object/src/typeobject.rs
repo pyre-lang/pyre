@@ -2537,8 +2537,8 @@ unsafe fn w_type_subclasses_lock(w_parent: PyObjectRef) -> SubclassesGuard {
 /// exactly once on the acquiring thread.
 #[majit_macros::dont_look_inside]
 unsafe fn w_type_subclasses_lock_acquire(w_parent: PyObjectRef) -> usize {
-    // A heap type can move like any nursery object while its guard is held.
-    // Stripe on its stable class identity, not the movable instance address.
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class.
     SUBCLASSES_LOCKS.acquire(crate::mapdict::instance_getclass(w_parent) as usize)
 }
 
@@ -2643,7 +2643,15 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
     if !is_type(w_parent) {
         return;
     }
-    let _subclasses_guard = w_type_subclasses_lock(w_parent);
+    // Parent and subclass are pinned before the lock because a contended wait can move a heap type.
+    let _roots = crate::gc_roots::push_roots();
+    let parent_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_parent);
+    let subclass_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_subclass);
+    let _subclasses_guard = w_type_subclasses_lock(crate::gc_roots::shadow_stack_get(parent_slot));
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
+    let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);
     let parent = &mut *(w_parent as *mut W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return;
@@ -2678,7 +2686,12 @@ pub unsafe fn w_type_get_subclasses(
     if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
-    let _subclasses_guard = w_type_subclasses_lock(w_parent);
+    // Parent is pinned before the lock because a contended wait can move a heap type.
+    let _roots = crate::gc_roots::push_roots();
+    let parent_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_parent);
+    let _subclasses_guard = w_type_subclasses_lock(crate::gc_roots::shadow_stack_get(parent_slot));
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
     let parent = &*(w_parent as *const W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return Vec::new();

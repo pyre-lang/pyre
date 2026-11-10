@@ -392,8 +392,8 @@ unsafe fn w_descr_dict_lock(obj: PyObjectRef) -> crate::objlock::ObjectLockGuard
 /// the returned handle exactly once on the acquiring thread.
 #[majit_macros::dont_look_inside]
 unsafe fn w_descr_dict_lock_acquire(obj: PyObjectRef) -> usize {
-    // A nursery wrapper can move while its guard is held. Stripe on its
-    // stable class identity, not the movable instance address.
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class.
     DESCR_DICT_LOCKS.acquire(unsafe { crate::mapdict::instance_getclass(obj) } as usize)
 }
 

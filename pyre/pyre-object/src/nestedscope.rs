@@ -262,7 +262,8 @@ pub unsafe fn w_cell_family(obj: PyObjectRef) -> *const CellFamily {
 
 // Cell.set / Cell.delete read `contents`, decide whether the write is a
 // bound-to-bound mutation, then write. PyPy runs that under its GIL; the stripe
-// covers a mutator that has dropped the GIL. Keyed on the cell address (never moves).
+// covers a mutator that has dropped the GIL. Keyed on the cell's GC identity
+// hash, which survives a move.
 static CELL_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
 
 /// The guard is the zero word while `gil_ready` is unpublished.
@@ -300,13 +301,22 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { w_cell_set_unlocked(obj, value) }
 }
 
-/// Contended stripe wait may collect: keep `value` rooted across it (the cell never moves).
+/// A contended stripe wait may collect and move a nursery cell: pin the cell and `value` before the wait and reload both after it.
 unsafe fn w_cell_set_locked(obj: PyObjectRef, value: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
-    let value_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value);
-    let _guard = unsafe { crate::objlock::ObjectLockGuard::from_word(w_cell_lock_acquire(obj)) };
-    unsafe { w_cell_set_unlocked(obj, crate::gc_roots::shadow_stack_get(value_slot)) }
+    let cell_slot = crate::gc_roots::pin_roots(&[obj, value]);
+    let value_slot = cell_slot + 1;
+    let _guard = unsafe {
+        crate::objlock::ObjectLockGuard::from_word(w_cell_lock_acquire(
+            crate::gc_roots::shadow_stack_get(cell_slot),
+        ))
+    };
+    unsafe {
+        w_cell_set_unlocked(
+            crate::gc_roots::shadow_stack_get(cell_slot),
+            crate::gc_roots::shadow_stack_get(value_slot),
+        )
+    }
 }
 
 #[inline]
@@ -322,10 +332,9 @@ unsafe fn w_cell_set_unlocked(obj: PyObjectRef, value: PyObjectRef) {
         }
     }
     unsafe { (*cell).contents = value }
-    // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
-    // possibly-nursery `value` into it needs the incminimark write barrier
-    // (incminimark.py write_barrier_from_array) so the next minor collection scans the cell and
-    // relocates the young value held only by `contents`.
+    // The cell may already be old; storing a possibly-nursery `value` into it needs the
+    // incminimark write barrier (incminimark.py write_barrier_from_array) so the next minor
+    // collection scans the cell and relocates the young value held only by `contents`.
     crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
@@ -337,7 +346,12 @@ unsafe fn w_cell_set_unlocked(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_delete(obj: PyObjectRef) -> bool {
-    let _guard = unsafe { w_cell_lock(obj) };
+    // The cell is pinned before the lock because a contended wait can move a nursery cell.
+    let _roots = crate::gc_roots::push_roots();
+    let cell_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let _guard = unsafe { w_cell_lock(crate::gc_roots::shadow_stack_get(cell_slot)) };
+    let obj = crate::gc_roots::shadow_stack_get(cell_slot);
     let cell = obj as *mut Cell;
     let family = unsafe { (*cell).family };
     if !family.is_null() {

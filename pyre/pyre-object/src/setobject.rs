@@ -2223,11 +2223,6 @@ static SET_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new()
 
 type SetGuard = crate::objlock::ObjectLockGuard;
 
-#[inline]
-fn set_lock_index(obj: PyObjectRef) -> usize {
-    SET_LOCKS.stripe_index(obj as usize)
-}
-
 /// Acquire a set's stripe without letting a contending mutator prevent a GC
 /// stop-the-world. Only the acquire is opaque; the guarded set operation stays
 /// visible to source translation, matching listobject/dictmultiobject.
@@ -2397,18 +2392,33 @@ pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
 }
 
 /// Lock two sets in stripe order. A shared stripe is acquired once.
+/// Keys are computed before the first wait because a wait can move either set.
 #[majit_macros::dont_look_inside]
 unsafe fn w_set_lock_pair(left: PyObjectRef, right: PyObjectRef) -> (SetGuard, Option<SetGuard>) {
-    let left_index = set_lock_index(left);
-    let right_index = set_lock_index(right);
-    if left_index == right_index {
+    if !crate::objlock::stripes_taken() {
         return (w_set_lock(left), None);
     }
-    if left_index < right_index {
-        (w_set_lock(left), Some(w_set_lock(right)))
-    } else {
-        (w_set_lock(right), Some(w_set_lock(left)))
+    let left_key = crate::gc_hook::gc_identity_hash(left as usize);
+    let right_key = crate::gc_hook::gc_identity_hash(right as usize);
+    let left_index = crate::objlock::stripe_index(left_key);
+    let right_index = crate::objlock::stripe_index(right_key);
+    if left_index == right_index {
+        return (
+            crate::objlock::ObjectLockGuard::from_word(SET_LOCKS.acquire_unconditionally(left_key)),
+            None,
+        );
     }
+    let (first_key, second_key) = if left_index < right_index {
+        (left_key, right_key)
+    } else {
+        (right_key, left_key)
+    };
+    (
+        crate::objlock::ObjectLockGuard::from_word(SET_LOCKS.acquire_unconditionally(first_key)),
+        Some(crate::objlock::ObjectLockGuard::from_word(
+            SET_LOCKS.acquire_unconditionally(second_key),
+        )),
+    )
 }
 
 pub fn set_locks_after_fork_child() {
@@ -3294,12 +3304,15 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `dst` and `src` must point to valid `W_SetObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
-    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
-    // `w_other.get_storage_copy()` installed by `copy_real` /
-    // `EmptySetStrategy.update`.
     let _roots = crate::gc_roots::push_roots();
     let dst_slot = crate::gc_roots::pin_roots(&[dst, src]);
     let src_slot = dst_slot + 1;
+    let (_first_guard, _second_guard) = w_set_lock_pair(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(src_slot),
+    );
+    // `w_other.get_storage_copy()` installed by `copy_real` /
+    // `EmptySetStrategy.update`.
     let src = crate::gc_roots::shadow_stack_get(src_slot);
     let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let src_set = &*(src as *const W_SetObject);

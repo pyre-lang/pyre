@@ -106,9 +106,9 @@ fn register_w_list_lock_jit_abi() {
 /// exactly once on the acquiring thread, including on exception exits.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_list_lock_acquire(obj: PyObjectRef) -> usize {
-    // A nursery list can move while its guard is held.  Stripe on its stable
-    // class identity, not the movable instance address, so every operation on
-    // one list continues to acquire the same lock after collection.
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class, so every operation on one list
+    // continues to acquire the same lock after collection.
     let w_class = crate::mapdict::instance_getclass(obj);
     LIST_LOCKS.acquire(w_class as usize)
 }
@@ -2912,16 +2912,31 @@ unsafe fn snapshot_range_storage(obj: PyObjectRef) -> Vec<i64> {
     range_list_values(&*(obj as *const W_ListObject))
 }
 
+/// Lock two lists in stripe order; a shared stripe is acquired once.
+/// Keys are computed before the first wait because a wait can move either list or its class.
 unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
-    let class_a = crate::mapdict::instance_getclass(a) as usize;
-    let class_b = crate::mapdict::instance_getclass(b) as usize;
-    if class_a <= class_b {
-        (w_list_lock(a), w_list_lock(b))
-    } else {
-        let guard_b = w_list_lock(b);
-        let guard_a = w_list_lock(a);
-        (guard_a, guard_b)
+    if !crate::objlock::stripes_taken() {
+        return (w_list_lock(a), w_list_lock(b));
     }
+    let a_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(a) as usize);
+    let b_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(b) as usize);
+    let a_index = crate::objlock::stripe_index(a_key);
+    let b_index = crate::objlock::stripe_index(b_key);
+    if a_index == b_index {
+        return (
+            crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(a_key)),
+            crate::objlock::ObjectLockGuard::from_word(0),
+        );
+    }
+    let (first_key, second_key) = if a_index < b_index {
+        (a_key, b_key)
+    } else {
+        (b_key, a_key)
+    };
+    (
+        crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(first_key)),
+        crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(second_key)),
+    )
 }
 
 unsafe fn concat_same_unwrapped(

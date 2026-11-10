@@ -57,15 +57,13 @@ pub(crate) fn lock_class_stripe(w_class: PyObjectRef) -> MapDictGuard {
 
 /// Two class stripes are taken lower index first so two `__class__`
 /// transitions cannot deadlock; equal indices take the same reentrant stripe
-/// twice.
-pub(crate) fn class_stripe_order(a: PyObjectRef, b: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
-    if pyre_object::objlock::stripe_index(a as usize)
-        <= pyre_object::objlock::stripe_index(b as usize)
-    {
-        (a, b)
-    } else {
-        (b, a)
+/// twice. Returns `true` to keep argument order (`a` then `b`).
+pub(crate) fn class_stripe_order(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if !pyre_object::objlock::stripes_taken() {
+        return true;
     }
+    pyre_object::objlock::stable_stripe_index(a as usize)
+        <= pyre_object::objlock::stable_stripe_index(b as usize)
 }
 
 fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
@@ -92,9 +90,17 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     let mut obj = pyre_object::gc_roots::pin_root(obj);
     loop {
         let w_class = unsafe { instance_getclass(obj) };
+        // Hash before the wait: the pre-wait pointer may be stale afterwards.
+        let class_key = pyre_object::objlock::stripes_taken()
+            .then(|| pyre_object::gc_hook::gc_identity_hash(w_class as usize));
         let guard = lock_class_stripe(w_class);
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
-        if unsafe { instance_getclass(obj) } == w_class {
+        let w_class_now = unsafe { instance_getclass(obj) };
+        let same_class = match class_key {
+            Some(k) => pyre_object::gc_hook::gc_identity_hash(w_class_now as usize) == k,
+            None => w_class_now == w_class,
+        };
+        if same_class {
             return (guard, obj);
         }
     }

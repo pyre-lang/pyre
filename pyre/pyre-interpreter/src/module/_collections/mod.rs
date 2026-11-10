@@ -109,9 +109,9 @@ unsafe fn w_deque_lock(obj: PyObjectRef) -> DequeGuard {
 /// exactly once on the acquiring thread.
 #[majit_macros::dont_look_inside]
 unsafe fn w_deque_lock_acquire(obj: PyObjectRef) -> usize {
-    // A nursery object can move while its guard is held.  Stripe on its stable
-    // class identity, not the movable instance address, so every operation on
-    // one deque continues to acquire the same lock after collection.
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class, so every operation on one deque
+    // continues to acquire the same lock after collection.
     DEQUE_LOCKS.acquire(pyre_object::mapdict::instance_getclass(obj) as usize)
 }
 
