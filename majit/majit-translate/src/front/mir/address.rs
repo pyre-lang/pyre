@@ -2334,7 +2334,7 @@ impl<'a> Lowering<'a> {
             Rvalue::Aggregate(_, operands) => operands
                 .iter()
                 .any(|op| self.operand_hides_spill_alias(op, groups, depth)),
-            Rvalue::Repeat(operand, _, _, _) => {
+            Rvalue::Repeat { operand, .. } => {
                 self.operand_hides_spill_alias(operand, groups, depth)
             }
             Rvalue::Use(operand, _) => self.operand_hides_spill_alias(operand, groups, depth),
@@ -2640,7 +2640,7 @@ impl<'a> Lowering<'a> {
                 };
                 self.operand_field_source(op, &path[1..], depth + 1)
             }
-            Rvalue::Repeat(operand, _, _, _) => {
+            Rvalue::Repeat { operand, .. } => {
                 self.operand_field_source(operand, &path[1..], depth + 1)
             }
             Rvalue::Use(op, _) => self.operand_field_source(op, path, depth + 1),
@@ -4807,7 +4807,7 @@ pub(in crate::front::mir) fn rvalue_carries_referent(
         return true;
     }
     match rvalue {
-        Rvalue::Use(op, _) | Rvalue::Repeat(op, _, _, _) => {
+        Rvalue::Use(op, _) | Rvalue::Repeat { operand: op, .. } => {
             operand_referent(op, depths, llbc).is_some()
                 || slots_have_referent(&operand_nested_slots(op, depths, llbc))
         }
@@ -5108,6 +5108,7 @@ pub(in crate::front::mir) fn cast_kind_is_address_cast(kind: &serde_json::Value)
     }) || kind.as_object().is_some_and(|obj| {
         obj.contains_key("Scalar")
             || obj.contains_key("RawPtr")
+            || obj.contains_key("PtrExposeProvenance")
             || obj.contains_key("PtrWithExposedProvenance")
     })
 }
@@ -5394,7 +5395,10 @@ pub(in crate::front::mir) fn repeat_slots(
     depths: &[LocalAddress],
     llbc: &Llbc,
 ) -> Option<Vec<FieldSlot>> {
-    let Rvalue::Repeat(op, _, count, _) = rvalue? else {
+    let Rvalue::Repeat {
+        operand: op, count, ..
+    } = rvalue?
+    else {
         return None;
     };
     let n = repeat_element_count(llbc, count)?;
@@ -5791,7 +5795,9 @@ pub(in crate::front::mir) fn rvalue_address(
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             ref_address(place, depths, llbc)
         }
-        Rvalue::Repeat(op, _, count, _) => {
+        Rvalue::Repeat {
+            operand: op, count, ..
+        } => {
             let mut value = operand_address(op, depths, llbc);
             // `[q; N]` copies `q`. A count this walk can name stores
             // `q`'s referent on each element (`repeat_slots`). An

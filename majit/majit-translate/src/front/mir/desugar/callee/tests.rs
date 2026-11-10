@@ -80,7 +80,7 @@ fn promoted_const_initializer_copies_the_inner_global() {
                     {"span": {"Deduplicated": 0}, "kind": {"StorageLive": 1}},
                     {"span": {"Deduplicated": 0}, "kind": {"Assign": [
                         {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {
                                 "id": 31,
                                 "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
@@ -169,7 +169,7 @@ fn local_place(id: u64) -> serde_json::Value {
 fn assign_copy(dest: serde_json::Value, src: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "span": {"Deduplicated": 0},
-        "kind": {"Assign": [dest, {"Use": [{"Copy": src}, "Yes"]}]}
+        "kind": {"Assign": [dest, {"Use": [{"Read": src}, "Yes"]}]}
     })
 }
 
@@ -337,7 +337,7 @@ fn fundecl_fn_item_segments_uses_the_registered_instance_leaf() {
 #[test]
 fn a_mono_vtable_call_reads_the_slot_under_its_fn_ptr_cast() {
     let ty = ptr_ty();
-    let slot = serde_json::json!({"Copy": {"kind": {"Projection": [
+    let slot = serde_json::json!({"Read": {"kind": {"Projection": [
             {"kind": {"Projection": [{"kind": {"Local": 1}, "ty": ty}, "Deref"]}, "ty": ty},
             {"Field": [null, 4]}
         ]}, "ty": ty}});
@@ -373,7 +373,7 @@ fn a_mono_vtable_call_reads_the_slot_under_its_fn_ptr_cast() {
     let body = fd.unstructured().expect("fixture body");
     let operand = |index: u64| {
         serde_json::from_value::<majit_charon_reader::ullbc::Operand>(serde_json::json!(
-            {"Copy": {"kind": {"Local": index}, "ty": ty}}
+            {"Read": {"kind": {"Local": index}, "ty": ty}}
         ))
         .unwrap()
     };
@@ -484,7 +484,7 @@ fn add_dest_single_deref_guard_classifies_uses() {
 
     // `_2 = *_1` — one deref read: accepted.
     let read = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": deref_place(1)}, "No"]}]
+        "Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]
     }))]);
     assert!(super::add_dest_used_only_as_single_deref(
         &fixture_llbc(),
@@ -494,7 +494,7 @@ fn add_dest_single_deref_guard_classifies_uses() {
 
     // `*_1 = _2` — one deref write: accepted.
     let write = body_of(vec![stmt(serde_json::json!({
-        "Assign": [deref_place(1), {"Use": [{"Copy": place_local(2)}, "No"]}]
+        "Assign": [deref_place(1), {"Use": [{"Read": place_local(2)}, "No"]}]
     }))]);
     assert!(super::add_dest_used_only_as_single_deref(
         &fixture_llbc(),
@@ -504,7 +504,7 @@ fn add_dest_single_deref_guard_classifies_uses() {
 
     // `_2 = _1` — the pointer escapes by value: rejected.
     let escape = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        "Assign": [place_local(2), {"Use": [{"Read": place_local(1)}, "No"]}]
     }))]);
     assert!(!super::add_dest_used_only_as_single_deref(
         &fixture_llbc(),
@@ -515,10 +515,10 @@ fn add_dest_single_deref_guard_classifies_uses() {
     // `_2 = *_1; _3 = *_1` — two derefs: rejected.
     let twice = body_of(vec![
         stmt(
-            serde_json::json!({"Assign": [place_local(2), {"Use": [{"Copy": deref_place(1)}, "No"]}]}),
+            serde_json::json!({"Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]}),
         ),
         stmt(
-            serde_json::json!({"Assign": [place_local(2), {"Use": [{"Copy": deref_place(1)}, "No"]}]}),
+            serde_json::json!({"Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]}),
         ),
     ]);
     assert!(!super::add_dest_used_only_as_single_deref(
@@ -735,33 +735,33 @@ fn add_dest_struct_field_guard_classifies_uses() {
     let read = body_of(vec![
         stmt(serde_json::json!({"StorageLive": 1})),
         stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+            "Assign": [place_local(2), {"Use": [{"Read": field_place(1, 0)}, "No"]}]
         })),
     ]);
     assert!(accepts(&read), "one field read");
 
     let write = body_of(vec![stmt(serde_json::json!({
-        "Assign": [field_place(1, 1), {"Use": [{"Copy": place_local(2)}, "No"]}]
+        "Assign": [field_place(1, 1), {"Use": [{"Read": place_local(2)}, "No"]}]
     }))]);
     assert!(accepts(&write), "one field write");
 
     let twice = body_of(vec![
         stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+            "Assign": [place_local(2), {"Use": [{"Read": field_place(1, 0)}, "No"]}]
         })),
         stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 1)}, "No"]}]
+            "Assign": [place_local(2), {"Use": [{"Read": field_place(1, 1)}, "No"]}]
         })),
     ]);
     assert!(accepts(&twice), "two field reads of one add");
 
     let escape = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        "Assign": [place_local(2), {"Use": [{"Read": place_local(1)}, "No"]}]
     }))]);
     assert!(!accepts(&escape), "the pointer escapes by value");
 
     let bare = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": deref_place(1)}, "No"]}]
+        "Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]
     }))]);
     assert!(!accepts(&bare), "a bare deref is not a struct field");
 
@@ -773,7 +773,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
     assert!(!accepts(&address), "&(*dest).field is not a value read");
 
     let deeper = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": {
+        "Assign": [place_local(2), {"Use": [{"Read": {
             "kind": {"Projection": [field_place(1, 0), {"Field": [null, 0]}]},
             "ty": ty()
         }}, "No"]}]
@@ -788,7 +788,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
             "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
         })),
         stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+            "Assign": [place_local(2), {"Use": [{"Read": field_place(1, 0)}, "No"]}]
         })),
     ]);
     assert!(!accepts(&redefined), "a second definition stays residual");
@@ -817,9 +817,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
                                         }
                                     }
                                 },
-                                "args": [{"Copy": field_place(1, 0)}],
-                                "dest": place_local(2)
-                            },
+                                "args": [{"Read": field_place(1, 0)}]}, "dest": place_local(2),
                             "target": 0,
                             "on_unwind": 0
                         }

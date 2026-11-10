@@ -1726,7 +1726,7 @@ mod tests {
             stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
         };
         let copy =
-            |index: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(index, ty)});
+            |index: u64, ty: &serde_json::Value| serde_json::json!({"Read": place(index, ty)});
         let usize_lit = |k: &str| {
             serde_json::json!({
                 "Const": [
@@ -1824,9 +1824,7 @@ mod tests {
                                         "const_generics": [], "trait_refs": []
                                     }
                                 }},
-                                "args": [copy(3, &range_ty)],
-                                "dest": place(4, &option_ty)
-                            },
+                                "args": [copy(3, &range_ty)]}, "dest": place(4, &option_ty),
                             "target": 2,
                             "on_unwind": 4
                         }}}

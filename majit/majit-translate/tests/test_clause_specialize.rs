@@ -931,7 +931,7 @@ fn mk_fixture_llbc() -> String {
                 "locals": {"arg_count": 0, "locals": [{"index": 0, "name": null, "span": span, "ty": ret}]},
                 "body": [
                     {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
-                        "call": {"func": func, "args": [], "dest": {"kind": {"Local": 0}, "ty": ret}},
+                        "call": {"func": func, "args": []}, "dest": {"kind": {"Local": 0}, "ty": ret},
                         "target": 2,
                         "on_unwind": 1
                     }}}},
@@ -1080,9 +1080,7 @@ fn put_fixture_llbc() -> String {
                             "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
                             "generics": empty_g
                         }},
-                        "args": [],
-                        "dest": place(3, &tvar)
-                    },
+                        "args": []}, "dest": place(3, &tvar),
                     "target": 2,
                     "on_unwind": 1
                 }}}},
@@ -1093,9 +1091,7 @@ fn put_fixture_llbc() -> String {
                             "kind": {"Fun": 2},
                             "generics": {"regions": [], "types": [tvar], "const_generics": [], "trait_refs": []}
                         }},
-                        "args": [{"Copy": place(1, &slot_ty)}, {"Copy": place(2, &tvar)}],
-                        "dest": place(0, &tvar)
-                    },
+                        "args": [{"Read": place(1, &slot_ty)}, {"Read": place(2, &tvar)}]}, "dest": place(0, &tvar),
                     "target": 3,
                     "on_unwind": 1
                 }}}},
@@ -1114,9 +1110,7 @@ fn put_fixture_llbc() -> String {
                             "kind": {"Fun": 3},
                             "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": [impl_ref]}
                         }},
-                        "args": [],
-                        "dest": place(0, &unit)
-                    },
+                        "args": []}, "dest": place(0, &unit),
                     "target": 2,
                     "on_unwind": 1
                 }}}},
@@ -1136,9 +1130,7 @@ fn put_fixture_llbc() -> String {
                             "kind": {"Fun": 2},
                             "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}
                         }},
-                        "args": [],
-                        "dest": place(0, &unit)
-                    },
+                        "args": []}, "dest": place(0, &unit),
                     "target": 2,
                     "on_unwind": 1
                 }}}},
@@ -1175,9 +1167,7 @@ fn put_fixture_llbc() -> String {
                             "kind": {"Fun": 6},
                             "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}
                         }},
-                        "args": [],
-                        "dest": place(0, &unit)
-                    },
+                        "args": []}, "dest": place(0, &unit),
                     "target": 2,
                     "on_unwind": 1
                 }}}},
@@ -1329,9 +1319,7 @@ fn unit_field_fixture_llbc() -> String {
                                         "kind": {"Fun": 1},
                                         "generics": empty_g
                                     }},
-                                    "args": [{"Copy": place(2, &unit)}, {"Copy": place(3, &unit)}],
-                                    "dest": place(0, &unit)
-                                },
+                                    "args": [{"Read": place(2, &unit)}, {"Read": place(3, &unit)}]}, "dest": place(0, &unit),
                                 "target": 1,
                                 "on_unwind": 2
                             }}}},
@@ -1427,9 +1415,7 @@ fn malloc_typed_fixture_llbc() -> String {
                             "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
                             "generics": empty_g
                         }},
-                        "args": [],
-                        "dest": place(1, &i64_ty)
-                    },
+                        "args": []}, "dest": place(1, &i64_ty),
                     "target": 2,
                     "on_unwind": 1
                 }}}},
@@ -1440,9 +1426,7 @@ fn malloc_typed_fixture_llbc() -> String {
                             "kind": {"Fun": 2},
                             "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}
                         }},
-                        "args": [],
-                        "dest": place(0, &i64_ty)
-                    },
+                        "args": []}, "dest": place(0, &i64_ty),
                     "target": 3,
                     "on_unwind": 1
                 }}}},
@@ -1461,9 +1445,7 @@ fn malloc_typed_fixture_llbc() -> String {
                             "kind": {"Fun": 3},
                             "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": [impl_ref]}
                         }},
-                        "args": [],
-                        "dest": place(0, &i64_ty)
-                    },
+                        "args": []}, "dest": place(0, &i64_ty),
                     "target": 2,
                     "on_unwind": 1
                 }}}},

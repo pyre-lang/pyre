@@ -2860,7 +2860,11 @@ impl<'a> Lowering<'a> {
             // is `ValueType::Ref`). `rtype_alloc_and_set` concretetypes
             // that pointer `GcRef`. Declaring `Int` makes the legacy
             // walker `Signed` on the same variable.
-            Rvalue::Repeat(elem, _elem_ty, count, _) => {
+            Rvalue::Repeat {
+                operand: elem,
+                count,
+                ..
+            } => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph

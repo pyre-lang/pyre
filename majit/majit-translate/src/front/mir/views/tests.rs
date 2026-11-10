@@ -70,9 +70,7 @@ fn w_bytes_data_local_stays_str_view_for_rdict_get() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &bytes_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &bytes_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -84,11 +82,9 @@ fn w_bytes_data_local_stays_str_view_for_rdict_get() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 1}), &rdict_ref)},
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &n)
-                    }, "target": 3, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &rdict_ref)},
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &shared)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &n), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]

@@ -225,9 +225,7 @@ fn owned_vec_new_call(
                     "trait_refs": []
                 }
             }},
-            "args": [],
-            "dest": owned_vec_place(dest, dest_ty)
-        },
+            "args": []}, "dest": owned_vec_place(dest, dest_ty),
         "target": target,
         "on_unwind": unwind
     }})
@@ -355,9 +353,7 @@ fn rust_vec_drop_after_move_into_call_does_not_free() {
                     "trait_refs": []
                 }
             }},
-            "args": [{"Move": owned_vec_place(1, &vec_ty)}],
-            "dest": owned_vec_place(2, &unit)
-        },
+            "args": [{"Move": owned_vec_place(1, &vec_ty)}]}, "dest": owned_vec_place(2, &unit),
         "target": 2,
         "on_unwind": 4
     }});
@@ -499,9 +495,7 @@ fn rust_vec_drop_maybe_initialised_declines_without_free() {
                     "trait_refs": []
                 }
             }},
-            "args": [{"Move": owned_vec_place(2, &vec_ty)}],
-            "dest": owned_vec_place(3, &unit)
-        },
+            "args": [{"Move": owned_vec_place(2, &vec_ty)}]}, "dest": owned_vec_place(3, &unit),
         "target": 4,
         "on_unwind": 6
     }});
@@ -519,7 +513,7 @@ fn rust_vec_drop_maybe_initialised_declines_without_free() {
             owned_vec_block(
                 vec![],
                 serde_json::json!({"Switch": {
-                    "discr": {"Copy": owned_vec_place(1, &cond_ty)},
+                    "discr": {"Read": owned_vec_place(1, &cond_ty)},
                     "targets": {"If": [2, 3]}
                 }}),
             ),
@@ -699,7 +693,7 @@ fn owner_root_erasure_needs_every_handle_use_to_be_new_deref_or_drop() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     let borrow = |dest: u64, src: u64| {
@@ -711,9 +705,7 @@ fn owner_root_erasure_needs_every_handle_use_to_be_new_deref_or_drop() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -891,7 +883,7 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     let borrow = |dest: u64, src: u64| {
@@ -903,9 +895,7 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -1032,9 +1022,7 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 6
         }})
@@ -1327,7 +1315,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -1346,9 +1334,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -1567,7 +1553,7 @@ fn root_bracket_erasure_answers_a_later_pin_roots_dest() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -1586,9 +1572,7 @@ fn root_bracket_erasure_answers_a_later_pin_roots_dest() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -1761,7 +1745,7 @@ fn root_bracket_erasure_answers_an_incoming_slice_pin() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -1779,9 +1763,7 @@ fn root_bracket_erasure_answers_an_incoming_slice_pin() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -1892,7 +1874,7 @@ fn root_bracket_erasure_answers_an_incoming_elem_pin() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let deref =
@@ -1918,9 +1900,7 @@ fn root_bracket_erasure_answers_an_incoming_elem_pin() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -1959,7 +1939,7 @@ fn root_bracket_erasure_answers_an_incoming_elem_pin() {
             block(
                 vec![
                     assign(6, serde_json::json!({"Use": [usize_lit(0), "No"]})),
-                    assign(7, serde_json::json!({"Use": [{"Copy": index_place(1, 6)}, "Yes"]})),
+                    assign(7, serde_json::json!({"Use": [{"Read": index_place(1, 6)}, "Yes"]})),
                     borrow(8, 3),
                     assign(9, serde_json::json!({"Use": [copy(7), "Yes"]})),
                 ],
@@ -2022,7 +2002,7 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -2039,9 +2019,7 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -2273,7 +2251,7 @@ fn root_stack_analysis_charges_free_pin_callees_to_the_bracket_around_them() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     let borrow = |dest: u64, src: u64| {
@@ -2285,9 +2263,7 @@ fn root_stack_analysis_charges_free_pin_callees_to_the_bracket_around_them() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -2474,15 +2450,13 @@ fn root_bracket_erasure_keeps_an_unnameable_read_back() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -2558,7 +2532,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
     let deref = |base: serde_json::Value| project(base, serde_json::json!("Deref"));
     let field =
         |base: serde_json::Value, f: u64| project(base, serde_json::json!({"Field": [null, f]}));
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -2582,9 +2556,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -2608,7 +2580,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
                     assign(3, use_op(serde_json::json!({"Move": field(place(2), 0)}))),
                     assign(
                         5,
-                        use_op(serde_json::json!({"Copy": deref(field(deref(place(1)), 0))})),
+                        use_op(serde_json::json!({"Read": deref(field(deref(place(1)), 0))})),
                     ),
                     assign(6, use_op(copy(3))),
                     assign(
@@ -2692,8 +2664,8 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
                     3,
                     serde_json::json!({"BinaryOp": [
                         "AddChecked",
-                        serde_json::json!({"Copy": deref(place(1))}),
-                        serde_json::json!({"Copy": deref(place(1))})
+                        serde_json::json!({"Read": deref(place(1))}),
+                        serde_json::json!({"Read": deref(place(1))})
                     ]}),
                 )],
                 call(7, vec![copy(3)], 0, 1),
@@ -2717,9 +2689,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": 7}, "generics": null}},
-                "args": [copy(1)],
-                "dest": place(dest)
-            },
+                "args": [copy(1)]}, "dest": place(dest),
             "target": target,
             "on_unwind": on_unwind
         }})
@@ -3051,15 +3021,13 @@ fn root_stack_analysis_does_not_merge_a_cycle_closed_inside_a_bracket() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -3188,9 +3156,7 @@ fn recursive_scope_constructors_answer_independent_of_query_order() {
                         "trait_refs": []
                     }
                 }},
-                "args": args,
-                "dest": owned_vec_place(dest, dest_ty)
-            },
+                "args": args}, "dest": owned_vec_place(dest, dest_ty),
             "target": target,
             "on_unwind": 99
         }})
@@ -3246,7 +3212,7 @@ fn recursive_scope_constructors_answer_independent_of_query_order() {
             owned_vec_block(
                 vec![],
                 serde_json::json!({"Switch": {
-                    "discr": {"Copy": owned_vec_place(1, &bool_ty)},
+                    "discr": {"Read": owned_vec_place(1, &bool_ty)},
                     "targets": {"If": [1, 2]}
                 }}),
             ),
@@ -3351,15 +3317,13 @@ fn root_stack_analysis_charges_no_unknown_body_in_an_artefact_below_the_api() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -3499,7 +3463,7 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     let move_into = |dest: u64, src: u64| {
@@ -3509,9 +3473,7 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": unwind
         }})
@@ -4418,7 +4380,7 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
     let body = |blocks: Vec<serde_json::Value>| {
@@ -4486,9 +4448,7 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": generics}},
-                "args": [copy(1)],
-                "dest": place(dest)
-            },
+                "args": [copy(1)]}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -4499,9 +4459,7 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
                 "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
                 "generics": null
             }},
-            "args": [copy(1)],
-            "dest": place(2)
-        },
+            "args": [copy(1)]}, "dest": place(2),
         "target": 1,
         "on_unwind": 99
     }});
@@ -4633,7 +4591,7 @@ fn generic_opaque_callee_is_analyzed_as_external() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
     let body = |blocks: Vec<serde_json::Value>| {
@@ -4684,9 +4642,7 @@ fn generic_opaque_callee_is_analyzed_as_external() {
             block(serde_json::json!({"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 1}, "generics": size_of_generics.clone()}},
-                    "args": [copy(1)],
-                    "dest": place(2)
-                },
+                    "args": [copy(1)]}, "dest": place(2),
                 "target": 1,
                 "on_unwind": 99
             }})),
@@ -4746,7 +4702,7 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
     let body = |blocks: Vec<serde_json::Value>| {
@@ -4821,9 +4777,7 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
                     "kind": {"Trait": [clause(index), 0]},
                     "generics": null
                 }},
-                "args": [copy(1)],
-                "dest": place(dest)
-            },
+                "args": [copy(1)]}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -4872,9 +4826,7 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
                 block(serde_json::json!({"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": 2}, "generics": map_call_generics.clone()}},
-                        "args": [copy(1)],
-                        "dest": place(2)
-                    },
+                        "args": [copy(1)]}, "dest": place(2),
                     "target": 1,
                     "on_unwind": 99
                 }})),

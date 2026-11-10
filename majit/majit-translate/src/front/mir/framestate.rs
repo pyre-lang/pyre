@@ -628,7 +628,7 @@ pub(in crate::front::mir) fn mark_rvalue_uses(
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => mark_operand_use(op, uses, defs, n_locals),
         Rvalue::BinaryOp(_, lhs, rhs) => {
             mark_operand_use(lhs, uses, defs, n_locals);

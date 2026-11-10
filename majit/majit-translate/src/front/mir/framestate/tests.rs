@@ -25,7 +25,7 @@ fn liveness_marks_loop_carried_index_local_as_live_in() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy_local = |i: u64| serde_json::json!({"Copy": place_local(i)});
+    let copy_local = |i: u64| serde_json::json!({"Read": place_local(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     // bb0:  _2 = const 0;  goto bb1
@@ -40,7 +40,7 @@ fn liveness_marks_loop_carried_index_local_as_live_in() {
     let read_index = stmt(serde_json::json!({
         "Assign": [
             place_local(3),
-            {"Use": [{"Copy": {
+            {"Use": [{"Read": {
                 "kind": {"Projection": [
                     place_local(1),
                     {"Index": {"offset": copy_local(2), "from_end": false}}
@@ -115,7 +115,7 @@ fn liveness_marks_offset_bytes_local_as_live_in() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy_local = |i: u64| serde_json::json!({"Copy": place_local(i)});
+    let copy_local = |i: u64| serde_json::json!({"Read": place_local(i)});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
     let bb0 = serde_json::json!({
@@ -128,7 +128,7 @@ fn liveness_marks_offset_bytes_local_as_live_in() {
     let read_offset = stmt(serde_json::json!({
         "Assign": [
             place_local(3),
-            {"Use": [{"Copy": {
+            {"Use": [{"Read": {
                 "kind": {"Projection": [
                     place_local(1),
                     {"Offset": {"bytes": copy_local(2), "in_bounds": true, "ty_is_sized": true}}

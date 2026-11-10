@@ -36,12 +36,12 @@ fn mem_forget_returns_a_defined_unit_value() {
                     "body": [
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Move": place(1, &word)}], "dest": place(2, &unit)},
+                                "args": [{"Move": place(1, &word)}]}, "dest": place(2, &unit),
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                                "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
+                                "args": [{"Read": place(2, &unit)}]}, "dest": place(0, &word),
                             "target": 3, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
@@ -111,12 +111,12 @@ fn icf_identity_token_is_erased_to_a_defined_unit_value() {
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1},
                                 "generics": generics}},
-                                "args": [], "dest": place(2, &unit)},
+                                "args": []}, "dest": place(2, &unit),
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                                "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
+                                "args": [{"Read": place(2, &unit)}]}, "dest": place(0, &word),
                             "target": 3, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},

@@ -12115,7 +12115,7 @@ mod tests {
                 &i64_ty,
             )
         };
-        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Copy": src}, "No"]});
+        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Read": src}, "No"]});
         let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
         let item_meta = |path: &[&str]| {
             serde_json::json!({
@@ -12381,7 +12381,7 @@ mod tests {
                 ty,
             )
         };
-        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Copy": src}, "No"]});
+        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Read": src}, "No"]});
         let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
         let item_meta = |path: &[&str]| {
             serde_json::json!({
@@ -12783,7 +12783,7 @@ mod tests {
                                     "terminator": {
                                         "span": span(),
                                         "kind": {"Switch": {
-                                            "discr": {"Copy": local(2, &i64_ty)},
+                                            "discr": {"Read": local(2, &i64_ty)},
                                             "targets": {"SwitchInt": [
                                                 null,
                                                 [[scalar("0"), 1], [scalar("1"), 2], [scalar("2"), 3]],

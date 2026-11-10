@@ -134,7 +134,7 @@ fn place(index: u64, ty: &Value) -> Value {
 }
 
 fn copy_of(place: Value) -> Value {
-    json!({"Copy": place})
+    json!({"Read": place})
 }
 
 fn assign(dest: Value, rvalue: Value) -> Value {
@@ -205,7 +205,7 @@ fn use_copy(
         json!({"Projection": [down, {"Field": [variant_idx, field_idx]}]}),
         field_ty,
     );
-    json!({"Use": [{"Copy": field}, "No"]})
+    json!({"Use": [{"Read": field}, "No"]})
 }
 
 fn switch_int(discr: Value, arms: &[(i64, u64)], default_bb: u64) -> Value {
@@ -214,7 +214,7 @@ fn switch_int(discr: Value, arms: &[(i64, u64)], default_bb: u64) -> Value {
         .map(|(disc, bb)| json!([{"Scalar": {"Signed": ["Isize", disc.to_string()]}}, bb]))
         .collect();
     json!({"Switch": {
-        "discr": {"Copy": discr},
+        "discr": {"Read": discr},
         "targets": {"SwitchInt": [null, pairs, default_bb]}
     }})
 }
@@ -225,9 +225,7 @@ fn call_term(fun: u64, args: Vec<Value>, dest: Value, target: u64, unwind: u64) 
             "kind": {"Fun": fun},
             "generics": super::tests::window_empty_generics()
         }},
-        "args": args,
-        "dest": dest
-    }, "target": target, "on_unwind": unwind}})
+        "args": args}, "dest": dest, "target": target, "on_unwind": unwind}})
 }
 
 fn unstructured(arg_count: u64, locals: Vec<Value>, body: Vec<Value>) -> Value {

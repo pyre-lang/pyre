@@ -432,7 +432,7 @@ fn pointer_newtype_llbc(
                     "span": window_span(),
                     "kind": {"Assign": [
                         window_place(serde_json::json!({"Local": 0}), &inner_ptr),
-                        {"Use": [{"Copy": field_place}, "No"]}
+                        {"Use": [{"Read": field_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",
@@ -4137,11 +4137,11 @@ fn box_dyn_ptr_metadata_is_fat_meta() {
                     "statements": [
                         {"span": span, "kind": {"Assign": [
                             place(serde_json::json!({"Local": 2}), &fat_ty),
-                            {"Use": [{"Copy": slot_place}, "No"]}
+                            {"Use": [{"Read": slot_place}, "No"]}
                         ]}},
                         {"span": span, "kind": {"Assign": [
                             place(serde_json::json!({"Local": 0}), &meta_ty),
-                            {"Use": [{"Copy": metadata_place}, "No"]}
+                            {"Use": [{"Read": metadata_place}, "No"]}
                         ]}}
                     ],
                     "kind": "Regular",
@@ -5089,16 +5089,14 @@ fn inherent_vs_trait_setitem_fixture() -> Llbc {
                                             }
                                         },
                                         "args": [{
-                                            "Copy": {
+                                            "Read": {
                                                 "kind": {"Local": 1},
                                                 "ty": self_ty.clone()
                                             }
-                                        }],
-                                        "dest": {
+                                        }]}, "dest": {
                                             "kind": {"Local": 0},
                                             "ty": bool_ty.clone()
-                                        }
-                                    },
+                                        },
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -6597,7 +6595,7 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
                     "span": window_span(),
                     "kind": {"Assign": [
                         field_place,
-                        {"Use": [{"Copy": window_place(
+                        {"Use": [{"Read": window_place(
                             serde_json::json!({"Local": 2}),
                             &handle_adt
                         )}, "No"]}
@@ -7021,7 +7019,7 @@ fn integer_newtype_shared_ref_method_returns_the_inner_integer() {
                     "span": span,
                     "kind": {"Assign": [
                         place(serde_json::json!({"Local": 0}), &i64_ty),
-                        {"Use": [{"Copy": field_place}, "No"]}
+                        {"Use": [{"Read": field_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",
@@ -10460,9 +10458,7 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
                                                 }
                                             }
                                         },
-                                        "args": [{"Move": place(2, &mut_self)}],
-                                        "dest": place(0, &unit)
-                                    },
+                                        "args": [{"Move": place(2, &mut_self)}]}, "dest": place(0, &unit),
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -10503,9 +10499,7 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
                                                 }
                                             }
                                         },
-                                        "args": [{"Move": place(3, &shared_self)}],
-                                        "dest": place(0, &unit)
-                                    },
+                                        "args": [{"Move": place(3, &shared_self)}]}, "dest": place(0, &unit),
                                     "target": 3,
                                     "on_unwind": 1
                                 }

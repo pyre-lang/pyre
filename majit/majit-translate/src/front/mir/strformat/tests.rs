@@ -1730,18 +1730,16 @@ fn niche_option_str_ne_lowers_to_string_binop() {
                                 "call": {
                                     "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                     "args": [
-                                        {"Copy": place(1, &option_ref)},
-                                        {"Copy": place(2, &option_ref)}
-                                    ],
-                                    "dest": place(3, &bool_ty)
-                                },
+                                        {"Read": place(1, &option_ref)},
+                                        {"Read": place(2, &option_ref)}
+                                    ]}, "dest": place(3, &bool_ty),
                                 "target": 1, "on_unwind": 2
                             }}}},
                             {"statements": [{
                                 "span": span,
                                 "kind": {"Assign": [
                                     place(0, &bool_ty),
-                                    {"Use": [{"Copy": place(3, &bool_ty)}, "Yes"]}
+                                    {"Use": [{"Read": place(3, &bool_ty)}, "Yes"]}
                                 ]}
                             }], "terminator": {"span": span, "kind": "Return"}},
                             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}

@@ -52,12 +52,14 @@ fn lowers_straight_line_add() {
         3,
         "straight_line_add takes three i64 args"
     );
-    // Charon emits 7 MIR BBs: three overflow Asserts, a Return, and one
-    // cleanup UnwindResume per Assert. `FlowContext.build_flow` records a
-    // block only when `pendingblocks` reaches it, and the lowering never
-    // follows `on_unwind`, so the three cleanup blocks are not recorded.
-    // bb0 maps onto startblock; returnblock and exceptblock are the other
-    // sentinels. 4 reachable MIR blocks + those two sentinels = 6.
+    // Charon emits 11 MIR BBs: three overflow Call/Assert pairs, a Return,
+    // and cleanup UnwindResume/UndefinedBehavior blocks. The reader
+    // rewrites each overflow Call into Assign+Assert on the call block.
+    // `FlowContext.build_flow` records a block only when `pendingblocks`
+    // reaches it, and the lowering never follows `on_unwind`, so cleanup
+    // and the emptied Assert targets are not recorded. bb0 maps onto
+    // startblock; returnblock and exceptblock are the other sentinels.
+    // 4 reachable MIR blocks + those two sentinels = 6.
     assert_eq!(
         graph.blocks.len(),
         6,
@@ -332,7 +334,7 @@ fn generic_one_arm_switchint_panic_default_lowers() {
                             }],
                             "kind": "Regular",
                             "terminator": {"span": span, "kind": {"Switch": {
-                                "discr": {"Copy": place(2, &i64_ty)},
+                                "discr": {"Read": place(2, &i64_ty)},
                                 "targets": {"SwitchInt": [
                                     null,
                                     [[{"Scalar": {"Unsigned": ["U8", "0"]}}, 1]],
@@ -608,11 +610,12 @@ fn front_graph_carries_no_synthesized_exception_edges() {
     //
     //   A. No lowered block carries a `LastException` exitswitch — the
     //      driver never synthesizes a typed try/except handler dispatch.
-    //   B. Every edge into the canonical exceptblock is a bare
-    //      panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
-    //      so the count of blocks linking to the exceptblock equals the
-    //      count of `UnwindResume` / `Abort` MIR terminators. A Call /
-    //      Assert / Drop success block contributes zero such edges.
+    //   B. Every edge into the canonical exceptblock is a raise the
+    //      lowering emits for a non-`on_unwind` source (`UnwindResume` /
+    //      `Abort` -> set_raise, a failed `Assert` terminator). The
+    //      count of blocks linking to the exceptblock never exceeds the
+    //      count of those MIR terminators. A Call / Assert / Drop
+    //      success continuation contributes zero such edges.
     use majit_charon_reader::ullbc::{TermKind, Unstructured};
     use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
@@ -658,9 +661,11 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             }
 
             // Invariant B: no Call/Assert/Drop on_unwind edge leaks into the
-            // front graph, i.e. every live edge into the exceptblock is a bare
-            // panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
-            // so the live count never EXCEEDS the MIR's raise terminators.  It
+            // front graph, i.e. every live edge into the exceptblock is a
+            // raise the lowering emits for a non-`on_unwind` source
+            // (`UnwindResume` / `Abort` -> set_raise, a failed `Assert`
+            // terminator). The live count never EXCEEDS the MIR's raise
+            // terminators.  It
             // may be fewer: a graph that runs `clear_unreachable_blocks` (the
             // iterator `next`-diamond and `?` rewrites do) prunes the dead
             // panic-cleanup blocks the driver leaves unreachable — those
@@ -677,6 +682,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
                             | Ok(TermKind::UnwindTerminate)
                             | Ok(TermKind::Abort(_))
                             | Ok(TermKind::UndefinedBehavior)
+                            | Ok(TermKind::Assert { .. })
                     )
                 })
                 .count();
@@ -1602,7 +1608,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
                 OpKind::ArrayRead {
                     item_ty,
                     array_type_id,
-                    array,
+                    array: _,
                     nolength,
                     ..
                 } => {
@@ -4169,7 +4175,7 @@ fn py_null_global_narrows_to_w_root_class() {
                     "span": span,
                     "kind": {"Assign": [
                         class_root_probe_place(0, &w_root_ptr),
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_g, "id": 0}},
                             "ty": w_root_ptr
                         }}, "No"]}
@@ -4260,7 +4266,7 @@ fn object_key_field_read_narrows_to_object_key_class() {
                     "span": span,
                     "kind": {"Assign": [
                         class_root_probe_place(0, &i64_ty),
-                        {"Use": [{"Copy": hash_place}, "No"]}
+                        {"Use": [{"Read": hash_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",

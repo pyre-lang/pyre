@@ -1119,7 +1119,7 @@ pub(in crate::front::mir) fn clean_accumulator_ref_temps_scan(
                         Rvalue::Use(op, _)
                         | Rvalue::UnaryOp(_, op)
                         | Rvalue::Cast(_, op, _)
-                        | Rvalue::Repeat(op, _, _, _)
+                        | Rvalue::Repeat { operand: op, .. }
                         | Rvalue::ShallowInitBox(op, _) => {
                             if c_operand_kind(op, c) == Some(false) {
                                 return None;
@@ -1959,7 +1959,7 @@ pub(in crate::front::mir) fn accumulator_materialization_site_count(
                     Rvalue::Use(op, _)
                     | Rvalue::UnaryOp(_, op)
                     | Rvalue::Cast(_, op, _)
-                    | Rvalue::Repeat(op, _, _, _)
+                    | Rvalue::Repeat { operand: op, .. }
                     | Rvalue::ShallowInitBox(op, _) => {
                         if is_move(op) {
                             moves += 1;
@@ -3195,7 +3195,7 @@ pub(in crate::front::mir) fn rvalue_mentions_alias(rvalue: &Rvalue, alias: &[usi
             operands.iter().any(|op| operand_mentions_alias(op, alias))
         }
         Rvalue::Discriminant(place) | Rvalue::Len(place) => place_root_in_alias(place, alias),
-        Rvalue::Repeat(op, _, _, _) => operand_mentions_alias(op, alias),
+        Rvalue::Repeat { operand: op, .. } => operand_mentions_alias(op, alias),
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => false,
     }
 }
@@ -3701,7 +3701,7 @@ pub(in crate::front::mir) fn scan_rvalue_dest_ref(
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => bump_dest_ref(operand_dest_ref(op, dest), derefs, other),
         Rvalue::BinaryOp(_, lhs, rhs) => {
             bump_dest_ref(operand_dest_ref(lhs, dest), derefs, other);
@@ -3953,7 +3953,7 @@ pub(in crate::front::mir) fn scan_rvalue_struct_field(
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => {
             bump_struct_field_use(operand_struct_field_use(op, dest), fields, other);
         }

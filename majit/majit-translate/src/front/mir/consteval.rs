@@ -1388,7 +1388,7 @@ pub(in crate::front::mir) fn rvalue_variant_name(rv: &Rvalue) -> &'static str {
         Rvalue::Discriminant(_) => "Discriminant",
         Rvalue::Cast(..) => "Cast",
         Rvalue::Len(_) => "Len",
-        Rvalue::Repeat(..) => "Repeat",
+        Rvalue::Repeat { .. } => "Repeat",
         Rvalue::RawPtr { .. } => "RawPtr",
         Rvalue::NullaryOp(..) => "NullaryOp",
         Rvalue::ShallowInitBox(..) => "ShallowInitBox",
@@ -2107,7 +2107,9 @@ pub(in crate::front::mir) fn eval_arr_rvalue(
 ) -> Option<ArrVal> {
     match rvalue {
         Rvalue::Use(op, _) => eval_arr_operand(llbc, locals, op),
-        Rvalue::Repeat(op, _, count, _) => {
+        Rvalue::Repeat {
+            operand: op, count, ..
+        } => {
             let fill = arr_as_i64(&eval_arr_operand(llbc, locals, op)?)?;
             let n = match decode_constant(llbc, count)
                 .ok()
@@ -2337,7 +2339,7 @@ pub(in crate::front::mir) fn scan_rvalue_const_struct(
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => {
             bump_const_struct_use(operand_const_struct_use(op, aliases), fields, other);
         }

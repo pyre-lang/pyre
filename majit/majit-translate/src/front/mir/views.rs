@@ -1662,7 +1662,7 @@ impl<'a> Lowering<'a> {
                     self.emit_slice_setitem(mir_bb, ptr.clone(), index, kind, value, &item_ty);
                 }
             }
-            Rvalue::Repeat(op, ..) => {
+            Rvalue::Repeat { operand: op, .. } => {
                 let value = self.resolve_operand(mir_bb, op)?;
                 let helper_ty = Self::pair_helper_item_ty(kind);
                 let value = self.retype_word(mir_bb, value, &item_ty, &helper_ty);
@@ -5834,7 +5834,7 @@ pub(in crate::front::mir) fn raw_array_roles(
                                 mentions_local_outside_raw_array_items(rv, &wanted, &roles)
                             })
                         }
-                        (PlaceKind::Local(dest), Rvalue::Repeat(..))
+                        (PlaceKind::Local(dest), Rvalue::Repeat { .. })
                             if *dest as usize == storage =>
                         {
                             !rvalue_json.is_some_and(|rv| {

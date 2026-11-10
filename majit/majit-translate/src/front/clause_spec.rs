@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use majit_charon_reader::ullbc::{Signature, TyRef};
+use majit_charon_reader::ullbc::{Signature, TyRef, duplicate_return};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -307,6 +307,8 @@ pub(crate) fn substituted_unstructured(
     // _gckind == 'raw').
     let mut u = serde_json::from_value::<Proj>(value).ok()?.unstructured;
     fd.rewrite_str_literal_reads(&mut u);
+    fd.rewrite_checked_binop_calls(&mut u);
+    duplicate_return(&mut u);
     Some(u)
 }
 
@@ -864,7 +866,8 @@ impl Space {
             // an associated type and an associated const.
             "trait_refs" | "implied_trait_refs" | "Trait" | "ParentClause" | "TraitType"
             | "TraitConst" => Space::TraitRef,
-            "const_generics" | "Const" => Space::Const,
+            "const_generics" | "Const" | "count" => Space::Const,
+            "elem_is_copy" | "elem_is_sized" => Space::TraitRef,
             _ => self,
         }
     }
@@ -888,13 +891,6 @@ impl Space {
             // Nested arrays are walked with `key = None`, so the pair must
             // already be Const for its element 0 to stay Const.
             Some("branches") => Space::Const,
-            // `{"Repeat": [operand, elem_ty, count, trait_info]}`.
-            Some("Repeat") => match index {
-                1 => Space::Ty,
-                2 => Space::Const,
-                3 => Space::TraitRef,
-                _ => self,
-            },
             // `[trait_ref, index]` / `[trait_ref, name]`: only the head is a
             // trait ref.
             Some("Trait" | "ParentClause" | "TraitType" | "TraitConst") if index > 0 => Space::Ty,
@@ -2212,7 +2208,7 @@ mod tests {
                             "span": span,
                             "kind": {"Switch": {
                                 "data": {
-                                    "scrutinee": {"Value": {"Copy": {"kind": {"Local": 0}, "ty": bool_ty}}},
+                                    "scrutinee": {"Value": {"Read": {"kind": {"Local": 0}, "ty": bool_ty}}},
                                     "branches": [[{"Deduplicated": 11}, 1]],
                                     "fallback": 0
                                 },

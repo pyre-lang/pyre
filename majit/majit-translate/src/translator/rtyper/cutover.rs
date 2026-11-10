@@ -18055,7 +18055,7 @@ mod tests {
                         "span": span(),
                         "kind": {"Assign": [
                             place(0, i64_ty()),
-                            {"Use": [{"Copy": field_place}, "No"]}
+                            {"Use": [{"Read": field_place}, "No"]}
                         ]}
                     }],
                     "kind": "Regular",
@@ -18094,9 +18094,7 @@ mod tests {
                                             "trait_refs": []
                                         }
                                     }},
-                                    "args": [{"Copy": place(1, ref_e())}],
-                                    "dest": place(0, i64_ty())
-                                },
+                                    "args": [{"Read": place(1, ref_e())}]}, "dest": place(0, i64_ty()),
                                 "target": 2,
                                 "on_unwind": 1
                             }}
@@ -22049,8 +22047,7 @@ mod tests {
                         "body": [
                             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                    "args": [{"Copy": place(1, &receiver)}, {"Copy": place(2, &adt(1))}],
-                                    "dest": place(0, &word)}, "target": 1, "on_unwind": 2
+                                    "args": [{"Read": place(1, &receiver)}, {"Read": place(2, &adt(1))}]}, "dest": place(0, &word), "target": 1, "on_unwind": 2
                             }}}},
                             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}

@@ -53,8 +53,7 @@ fn empty_class_call() -> Llbc {
                          "kind": "Regular",
                          "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Move": place(1, &marker_ty)}],
-                                "dest": place(0, &word)},
+                                "args": [{"Move": place(1, &marker_ty)}]}, "dest": place(0, &word),
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},

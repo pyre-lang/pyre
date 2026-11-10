@@ -2678,7 +2678,7 @@ mod tests {
             vec![key_ty.clone()],
             utf8_ptr.clone(),
             assign_return(
-                serde_json::json!({"Use": [{"Copy": field_place}, "No"]}),
+                serde_json::json!({"Use": [{"Read": field_place}, "No"]}),
                 &utf8_ptr,
             ),
         );
@@ -2689,7 +2689,7 @@ mod tests {
             key_ref.clone(),
             assign_return(
                 serde_json::json!({"Use": [
-                    {"Copy": place(serde_json::json!({"Local": 1}), &key_ref)},
+                    {"Read": place(serde_json::json!({"Local": 1}), &key_ref)},
                     "No"
                 ]}),
                 &key_ref,

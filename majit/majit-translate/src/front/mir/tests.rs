@@ -83,7 +83,7 @@ mod reachable_mask_tests {
     #[test]
     fn lowered_mask_keeps_niche_option_panic_default() {
         let switch = json!({"Switch": {
-            "discr": {"Copy": place(0)},
+            "discr": {"Read": place(0)},
             "targets": {"SwitchInt": [
                 null,
                 [[{"Ref": [{"Body": 18}, {"DynTrait": {"id": 0}}, "Mut"]}, 1]],
@@ -110,7 +110,7 @@ mod reachable_mask_tests {
     #[test]
     fn lowered_mask_drops_generic_switchint_panic_default() {
         let switch = json!({"Switch": {
-            "discr": {"Copy": place(0)},
+            "discr": {"Read": place(0)},
             "targets": {"SwitchInt": [
                 null,
                 [
@@ -1938,7 +1938,7 @@ fn gcref_cast_to_lowlevel_string_header_emits_cast_instance_str() {
                         "span": span,
                         "kind": {"Assign": [
                             place(0, &n),
-                            {"Use": [{"Copy": length_place}, "No"]}
+                            {"Use": [{"Read": length_place}, "No"]}
                         ]}
                     }
                 ],
@@ -3266,7 +3266,7 @@ fn window_f1_const_u8_slice_field_read_is_fat_window() {
                     "span": window_span(),
                     "kind": {"Assign": [
                         window_place(serde_json::json!({"Local": 0}), &field_ty),
-                        {"Use": [{"Copy": slot_place}, "No"]}
+                        {"Use": [{"Read": slot_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",
@@ -3442,9 +3442,7 @@ fn window_vec_u8_as_slice_is_list_to_window() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &vec_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &vec_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -3533,9 +3531,7 @@ fn str_view_shared_slice_reborrow_is_one_word() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -3624,9 +3620,7 @@ fn window_f4_mut_slice_as_mut_ptr_write_is_not_a_copy() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &mut_slice)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &mut_ptr)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &mut_slice)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &mut_ptr), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -3708,11 +3702,9 @@ fn window_f5_from_raw_parts_of_non_str_address_is_window() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 1}), &ptr)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -3771,9 +3763,7 @@ fn window_nullary_opaque_call_to_shared_slice_does_not_panic() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": []}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -3813,9 +3803,7 @@ fn window_param_passed_to_opaque_window_fn_is_identity() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -3927,9 +3915,7 @@ fn window_param_to_vec_is_charpsize2str() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4021,7 +4007,7 @@ fn owner_to_window_unclassified_owner_is_unsupported() {
                     "span": window_span(),
                     "kind": {"Assign": [
                         window_place(serde_json::json!({"Local": 0}), &shared),
-                        {"Use": [{"Copy": window_place(serde_json::json!({"Local": 1}), &i64_ty)}, "No"]}
+                        {"Use": [{"Read": window_place(serde_json::json!({"Local": 1}), &i64_ty)}, "No"]}
                     ]}
                 }],
                 "terminator": {"span": window_span(), "kind": "Return"}
@@ -4087,9 +4073,7 @@ fn window_param_deref_reborrow_passed_to_opaque_window_fn_is_identity() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4169,9 +4153,7 @@ fn window_opaque_tail_of_u8_slice_keeps_call() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4226,9 +4208,7 @@ fn window_opaque_str_to_u8_slice_keeps_call() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4314,11 +4294,9 @@ fn window_from_raw_parts_subslice_is_not_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 1}), &ptr)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 5}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 5}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -4333,8 +4311,8 @@ fn window_from_raw_parts_subslice_is_not_getslice() {
                                     null
                                 ]},
                                 [
-                                    {"Copy": window_place(serde_json::json!({"Local": 3}), &n)},
-                                    {"Copy": window_place(serde_json::json!({"Local": 4}), &n)}
+                                    {"Read": window_place(serde_json::json!({"Local": 3}), &n)},
+                                    {"Read": window_place(serde_json::json!({"Local": 4}), &n)}
                                 ]
                             ]}
                         ]}
@@ -4345,11 +4323,9 @@ fn window_from_raw_parts_subslice_is_not_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 5}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 5}), &shared)},
                             {"Move": window_place(serde_json::json!({"Local": 6}), &range_adt)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 3, "on_unwind": 1}}}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -4444,7 +4420,7 @@ fn window_match_join_then_subslice_is_not_getslice() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -4458,11 +4434,9 @@ fn window_match_join_then_subslice_is_not_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &ptr)},
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 8}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 8}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -4473,11 +4447,9 @@ fn window_match_join_then_subslice_is_not_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 4}), &ptr)},
-                            {"Copy": window_place(serde_json::json!({"Local": 5}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 8}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 4}), &ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 5}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 8}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [{
@@ -4491,8 +4463,8 @@ fn window_match_join_then_subslice_is_not_getslice() {
                                     null
                                 ]},
                                 [
-                                    {"Copy": window_place(serde_json::json!({"Local": 6}), &n)},
-                                    {"Copy": window_place(serde_json::json!({"Local": 7}), &n)}
+                                    {"Read": window_place(serde_json::json!({"Local": 6}), &n)},
+                                    {"Read": window_place(serde_json::json!({"Local": 7}), &n)}
                                 ]
                             ]}
                         ]}
@@ -4503,11 +4475,9 @@ fn window_match_join_then_subslice_is_not_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 8}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 8}), &shared)},
                             {"Move": window_place(serde_json::json!({"Local": 9}), &range_adt)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 5, "on_unwind": 1}}}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 5, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -4584,9 +4554,7 @@ fn window_str_to_window_as_bytes_of_utf8str() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4736,9 +4704,7 @@ fn newtype_str_as_bytes_is_view_noop() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &k_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &k_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -4748,9 +4714,7 @@ fn newtype_str_as_bytes_is_view_noop() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &k_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 4}), &shared)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &k_ref)}]}, "dest": window_place(serde_json::json!({"Local": 4}), &shared), "target": 3, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -4760,11 +4724,9 @@ fn newtype_str_as_bytes_is_view_noop() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
-                            {"Copy": window_place(serde_json::json!({"Local": 4}), &shared)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 4}), &shared)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -4886,9 +4848,7 @@ fn as_star_into_option_dest_is_not_a_view_noop() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &k_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &option_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &k_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &option_ty), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -4976,9 +4936,7 @@ fn heap_string_as_bytes_into_window_param_keeps_call() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &string_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &string_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -4988,9 +4946,7 @@ fn heap_string_as_bytes_into_window_param_keeps_call() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -5073,9 +5029,7 @@ fn heap_string_as_ref_bytes_into_window_param_keeps_call() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &string_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &string_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -5085,9 +5039,7 @@ fn heap_string_as_ref_bytes_into_window_param_keeps_call() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -5173,9 +5125,7 @@ fn window_keep_gain_fmtarg_bytes_pos0_is_window_write() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -5294,9 +5244,7 @@ fn str_view_borrows_window_at_window_param() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -5307,9 +5255,7 @@ fn str_view_borrows_window_at_window_param() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -5416,9 +5362,7 @@ fn str_window_keepalive_fixture(goto_before_call: bool) -> crate::model::Functio
                 "kind": {"Fun": 1},
                 "generics": window_empty_generics()
             }},
-            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-        }, "target": 2, "on_unwind": 1}}}
+            "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
     });
     let window_call = |target: u64| {
         serde_json::json!({
@@ -5429,9 +5373,7 @@ fn str_window_keepalive_fixture(goto_before_call: bool) -> crate::model::Functio
                     "kind": {"Fun": 2},
                     "generics": window_empty_generics()
                 }},
-                "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                "dest": window_place(serde_json::json!({"Local": 0}), &unit)
-            }, "target": target, "on_unwind": 1}}}
+                "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": target, "on_unwind": 1}}}
         })
     };
     let body = if goto_before_call {
@@ -5678,7 +5620,7 @@ fn window_owner_survives_merge_with_ownerless_window() {
                     }],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -5691,9 +5633,7 @@ fn window_owner_survives_merge_with_ownerless_window() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -5703,9 +5643,7 @@ fn window_owner_survives_merge_with_ownerless_window() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": []}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [dead],
@@ -5812,9 +5750,7 @@ fn str_view_iter_borrows_window_at_slice_iter() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -5825,9 +5761,7 @@ fn str_view_iter_borrows_window_at_slice_iter() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &iter_ty)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &iter_ty), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -5938,9 +5872,7 @@ fn str_view_to_vec_passes_str_to_ll_str2uintlist() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -5950,9 +5882,7 @@ fn str_view_to_vec_passes_str_to_ll_str2uintlist() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6207,9 +6137,7 @@ fn utf8_payload_bytes_from_utf8_unchecked_is_str_view_identity() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -6220,9 +6148,7 @@ fn utf8_payload_bytes_from_utf8_unchecked_is_str_view_identity() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &str_ty)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6339,9 +6265,7 @@ fn from_utf8_unchecked_of_str_view_rangefrom_is_getslice() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -6351,7 +6275,7 @@ fn from_utf8_unchecked_of_str_view_rangefrom_is_getslice() {
                             range_place,
                             {"Aggregate": [
                                 {"Adt": [1, 0, null]},
-                                [{"Copy": window_place(serde_json::json!({"Local": 2}), &n)}]
+                                [{"Read": window_place(serde_json::json!({"Local": 2}), &n)}]
                             ]}
                         ]}
                     }],
@@ -6362,11 +6286,9 @@ fn from_utf8_unchecked_of_str_view_rangefrom_is_getslice() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &shared)},
                             {"Move": window_place(serde_json::json!({"Local": 4}), &rangefrom_adt)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 5}), &shared)
-                    }, "target": 3, "on_unwind": 1}}}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 5}), &shared), "target": 3, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -6376,9 +6298,7 @@ fn from_utf8_unchecked_of_str_view_rangefrom_is_getslice() {
                             "kind": {"Fun": 3},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 5}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &str_ty)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 5}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6466,7 +6386,7 @@ fn mixed_w1_and_window_return_passes_len_slot() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -6479,9 +6399,7 @@ fn mixed_w1_and_window_return_passes_len_slot() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &obj_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &obj_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -6491,9 +6409,7 @@ fn mixed_w1_and_window_return_passes_len_slot() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &obj_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &obj_ref)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6582,9 +6498,7 @@ fn str_view_index_is_strgetitem() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -6596,11 +6510,9 @@ fn str_view_index_is_strgetitem() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty)
-                    }, "target": 3, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6721,7 +6633,7 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             window_place(serde_json::json!({"Local": 3}), &utf8_ref),
-                            {"Use": [{"Copy": field_place}, "No"]}
+                            {"Use": [{"Read": field_place}, "No"]}
                         ]}
                     }],
                     "kind": "Regular",
@@ -6730,9 +6642,7 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &utf8_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 4}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &utf8_ref)}]}, "dest": window_place(serde_json::json!({"Local": 4}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -6743,9 +6653,7 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 4}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 5}), &ptr_ty)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 4}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 5}), &ptr_ty), "target": 3, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -6756,11 +6664,9 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 5}), &ptr_ty)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 6}), &ptr_ty)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 5}), &ptr_ty)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 6}), &ptr_ty), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [
@@ -6768,7 +6674,7 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                             "span": window_span(),
                             "kind": {"Assign": [
                                 window_place(serde_json::json!({"Local": 0}), &u8_ty),
-                                {"Use": [{"Copy": add_deref}, "No"]}
+                                {"Use": [{"Read": add_deref}, "No"]}
                             ]}
                         },
                         {
@@ -7026,29 +6932,27 @@ fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
                     "statements": [
                         {"span": span, "kind": {"Assign": [
                             place(serde_json::json!({"Local": 2}), &fat_ty),
-                            {"Use": [{"Copy": slot_place}, "No"]}
+                            {"Use": [{"Read": slot_place}, "No"]}
                         ]}},
                         {"span": span, "kind": {"Assign": [
                             place(serde_json::json!({"Local": 3}), &fn_ptr),
                             {"UnaryOp": [
                                 {"Cast": {"RawPtr": fn_ptr.clone()}},
-                                {"Copy": slot_field}
+                                {"Read": slot_field}
                             ]}
                         ]}}
                     ],
                     "kind": "Regular",
                     "terminator": {"span": span, "kind": {"Call": {
                         "call": {
-                            "func": {"Dynamic": [{"Copy": place(
+                            "func": {"Dynamic": [{"Read": place(
                                 serde_json::json!({"Local": 3}),
                                 &fn_ptr
                             )}, {"regions": []}]},
                             "args": [{"Move": place(
                                 serde_json::json!({"Local": 2}),
                                 &fat_ty
-                            )}],
-                            "dest": place(serde_json::json!({"Local": 0}), &unit)
-                        },
+                            )}]}, "dest": place(serde_json::json!({"Local": 0}), &unit),
                         "target": 1,
                         "on_unwind": 2
                     }}}
@@ -7216,7 +7120,7 @@ fn dyn_trait_vtable_slot_base_is_defined_after_a_passthrough() {
     );
     let assign_slot = serde_json::json!({"span": span, "kind": {"Assign": [
         place(serde_json::json!({"Local": 3}), &fat_ty),
-        {"Use": [{"Copy": slot_place}, "No"]}
+        {"Use": [{"Read": slot_place}, "No"]}
     ]}});
     let metadata_place = place(
         serde_json::json!({"Projection": [
@@ -7257,7 +7161,7 @@ fn dyn_trait_vtable_slot_base_is_defined_after_a_passthrough() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": span, "kind": {"Switch": {
-                        "discr": {"Copy": place(serde_json::json!({"Local": 2}), &bool_ty)},
+                        "discr": {"Read": place(serde_json::json!({"Local": 2}), &bool_ty)},
                         "targets": {"If": [1, 2]}
                     }}}
                 },
@@ -7279,21 +7183,19 @@ fn dyn_trait_vtable_slot_base_is_defined_after_a_passthrough() {
                         place(serde_json::json!({"Local": 4}), &fn_ptr),
                         {"UnaryOp": [
                             {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
-                            {"Copy": slot_field}
+                            {"Read": slot_field}
                         ]}
                     ]}}],
                     "terminator": {"span": span, "kind": {"Call": {
                         "call": {
-                            "func": {"Dynamic": [{"Copy": place(
+                            "func": {"Dynamic": [{"Read": place(
                                 serde_json::json!({"Local": 4}),
                                 &fn_ptr
                             )}, {"regions": []}]},
                             "args": [{"Move": place(
                                 serde_json::json!({"Local": 3}),
                                 &fat_ty
-                            )}],
-                            "dest": place(serde_json::json!({"Local": 0}), &unit)
-                        },
+                            )}]}, "dest": place(serde_json::json!({"Local": 0}), &unit),
                         "target": 5,
                         "on_unwind": 6
                     }}}
@@ -7481,10 +7383,8 @@ fn transmute_lowering_fixture() -> Llbc {
                                                 }
                                             },
                                             "args": [{
-                                                "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
-                                            }],
-                                            "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
-                                        },
+                                                "Read": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                            }]}, "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()},
                                         "target": 2,
                                         "on_unwind": 1
                                     }
@@ -7708,11 +7608,9 @@ pub(in crate::front::mir) fn range_contains_fixture() -> Llbc {
                                                 }
                                             },
                                             "args": [
-                                                {"Copy": {"kind": {"Local": 1}, "ty": range_ty.clone()}},
-                                                {"Copy": {"kind": {"Local": 2}, "ty": i64_ty.clone()}}
-                                            ],
-                                            "dest": {"kind": {"Local": 0}, "ty": bool_ty.clone()}
-                                        },
+                                                {"Read": {"kind": {"Local": 1}, "ty": range_ty.clone()}},
+                                                {"Read": {"kind": {"Local": 2}, "ty": i64_ty.clone()}}
+                                            ]}, "dest": {"kind": {"Local": 0}, "ty": bool_ty.clone()},
                                         "target": 2,
                                         "on_unwind": 1
                                     }
@@ -7864,10 +7762,8 @@ fn scalar_method_call_fixture(
                                             }
                                         },
                                         "args": [{
-                                            "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
-                                        }],
-                                        "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
-                                    },
+                                            "Read": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                        }]}, "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -7986,7 +7882,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
         .enumerate()
         .map(|(i, ty)| {
             serde_json::json!({
-                "Copy": {"kind": {"Local": i + 1}, "ty": ty}
+                "Read": {"kind": {"Local": i + 1}, "ty": ty}
             })
         })
         .collect();
@@ -8020,9 +7916,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": call_args,
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
-                                    },
+                                        "args": call_args}, "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -8166,10 +8060,8 @@ pub(in crate::front::mir) fn trait_clone_call_fixture(
                                             }
                                         },
                                         "args": [{
-                                            "Copy": {"kind": {"Local": 1}, "ty": recv_ty.clone()}
-                                        }],
-                                        "dest": {"kind": {"Local": 0}, "ty": self_ty.clone()}
-                                    },
+                                            "Read": {"kind": {"Local": 1}, "ty": recv_ty.clone()}
+                                        }]}, "dest": {"kind": {"Local": 0}, "ty": self_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -8267,12 +8159,12 @@ fn icf_identity_token_lowers_without_a_call_op() {
                     "body": [
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": token_generics}},
-                                "args": [], "dest": place(2, &unit)},
+                                "args": []}, "dest": place(2, &unit),
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                                "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
+                                "args": [{"Read": place(2, &unit)}]}, "dest": place(0, &word),
                             "target": 3, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
@@ -8898,7 +8790,7 @@ fn std_trait_call_fixture(
         .enumerate()
         .map(|(i, ty)| {
             serde_json::json!({
-                "Copy": {"kind": {"Local": i + 1}, "ty": ty}
+                "Read": {"kind": {"Local": i + 1}, "ty": ty}
             })
         })
         .collect();
@@ -8940,9 +8832,7 @@ fn std_trait_call_fixture(
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": call_args,
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
-                                    },
+                                        "args": call_args}, "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -9363,10 +9253,8 @@ fn fn_item_call_once_fixture_with(
                                         },
                                         "args": [
                                             fn_const,
-                                            {"Copy": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
-                                        ],
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
-                                    },
+                                            {"Read": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
+                                        ]}, "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -9694,10 +9582,8 @@ fn fn_item_call_once_gc_mut_ref_fixture() -> Llbc {
                                         },
                                         "args": [
                                             fn_const,
-                                            {"Copy": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
-                                        ],
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
-                                    },
+                                            {"Read": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
+                                        ]}, "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -9743,9 +9629,7 @@ fn fn_item_call_once_gc_mut_ref_fixture() -> Llbc {
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": [{"Copy": field0}],
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
-                                    },
+                                        "args": [{"Read": field0}]}, "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -11166,7 +11050,7 @@ fn object_vec_deref_mut_rotate_calls_ll_slice_rotate() {
     let place =
         |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
     let local = |i: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": i, "name": name, "span": span(), "ty": ty});
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": place(i, ty)});
     let caller = serde_json::json!({
         "def_id": 0,
         "item_meta": item_meta(&["fixture", "object_vec_deref_mut_rotate"], true),
@@ -11202,9 +11086,7 @@ fn object_vec_deref_mut_rotate_calls_ll_slice_rotate() {
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": [copy(1, &recv)],
-                                        "dest": place(3, &slice)
-                                    },
+                                        "args": [copy(1, &recv)]}, "dest": place(3, &slice),
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -11230,9 +11112,7 @@ fn object_vec_deref_mut_rotate_calls_ll_slice_rotate() {
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": [copy(3, &slice), copy(2, &usize_ty)],
-                                        "dest": place(0, &unit)
-                                    },
+                                        "args": [copy(3, &slice), copy(2, &usize_ty)]}, "dest": place(0, &unit),
                                     "target": 4,
                                     "on_unwind": 3
                                 }
@@ -11378,7 +11258,7 @@ fn an_object_array_literal_unsize_is_newlist() {
         stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
     };
     let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": place(i, ty)});
     let usize_lit = serde_json::json!({
         "Const": [
             {"Integer": {"Unsigned": ["Usize", "3"]}},
@@ -11446,9 +11326,7 @@ fn an_object_array_literal_unsize_is_newlist() {
                                                 "generics": generics()
                                             }
                                         },
-                                        "args": [copy(6, &slice_ref)],
-                                        "dest": place(0, &unit)
-                                    },
+                                        "args": [copy(6, &slice_ref)]}, "dest": place(0, &unit),
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -11585,18 +11463,19 @@ fn slice_from_ref_of_an_object_pointer_is_newlist() {
         stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
     };
     let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
-    let call =
-        |fun: u64, args: serde_json::Value, dest: u64, dest_ty: &serde_json::Value, target: u64| {
-            serde_json::json!({"Call": {"call": {
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": place(i, ty)});
+    let call = |fun: u64,
+                args: serde_json::Value,
+                dest: u64,
+                dest_ty: &serde_json::Value,
+                target: u64| {
+        serde_json::json!({"Call": {"call": {
                 "func": {"Regular": {
                     "kind": {"Fun": fun},
                     "generics": generics()
                 }},
-                "args": args,
-                "dest": {"kind": {"Local": dest}, "ty": dest_ty}
-            }, "target": target, "on_unwind": 1}})
-        };
+                "args": args}, "dest": {"kind": {"Local": dest}, "ty": dest_ty}, "target": target, "on_unwind": 1}})
+    };
     let caller = serde_json::json!({
         "def_id": 0,
         "item_meta": item_meta(&["fixture", "pass_object_from_ref"], true),
@@ -11800,7 +11679,7 @@ fn an_object_array_literal_unsize_mut_is_not_newlist() {
         stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
     };
     let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": place(i, ty)});
     let usize_lit = serde_json::json!({
         "Const": [
             {"Integer": {"Unsigned": ["Usize", "3"]}},
@@ -11868,9 +11747,7 @@ fn an_object_array_literal_unsize_mut_is_not_newlist() {
                                                 "generics": generics()
                                             }
                                         },
-                                        "args": [copy(6, &slice_ref)],
-                                        "dest": place(0, &unit)
-                                    },
+                                        "args": [copy(6, &slice_ref)]}, "dest": place(0, &unit),
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -12641,13 +12518,11 @@ fn generic_residual_borrow_of_transparent_scalar_is_refused() {
                                                 }
                                             },
                                             "args": [{
-                                                "Copy": {
+                                                "Read": {
                                                     "kind": {"Local": 1},
                                                     "ty": arg_ty.clone()
                                                 }
-                                            }],
-                                            "dest": {"kind": {"Local": 0}, "ty": unit.clone()}
-                                        },
+                                            }]}, "dest": {"kind": {"Local": 0}, "ty": unit.clone()},
                                         "target": 2,
                                         "on_unwind": 1
                                     }
@@ -12773,20 +12648,21 @@ fn str_chars_view_fun(offset_leaf: &str, len_local: u64) -> Llbc {
     let copy = |src: u64, dst: u64, slot_ty: serde_json::Value| {
         serde_json::json!({"Assign": [
             {"kind": {"Local": dst}, "ty": slot_ty},
-            {"Use": [{"Copy": {"kind": {"Local": src}, "ty": slot_ty}}, "No"]}
+            {"Use": [{"Read": {"kind": {"Local": src}, "ty": slot_ty}}, "No"]}
         ]})
     };
-    let call =
-        |fun: u64, args: serde_json::Value, dest: u64, dest_ty: serde_json::Value, target: u64| {
-            serde_json::json!({"Call": {"call": {
+    let call = |fun: u64,
+                args: serde_json::Value,
+                dest: u64,
+                dest_ty: serde_json::Value,
+                target: u64| {
+        serde_json::json!({"Call": {"call": {
                 "func": {"Regular": {
                     "kind": {"Fun": fun},
                     "generics": empty_generics()
                 }},
-                "args": args,
-                "dest": {"kind": {"Local": dest}, "ty": dest_ty}
-            }, "target": target, "on_unwind": 4}})
-        };
+                "args": args}, "dest": {"kind": {"Local": dest}, "ty": dest_ty}, "target": target, "on_unwind": 4}})
+    };
     let stmt = |kind: serde_json::Value| serde_json::json!({"span": span_json(), "kind": kind});
     let viewer = serde_json::json!({
         "def_id": 0,
@@ -12830,7 +12706,7 @@ fn str_chars_view_fun(offset_leaf: &str, len_local: u64) -> Llbc {
                         2,
                         serde_json::json!([
                             {"Move": {"kind": {"Local": 7}, "ty": ty}},
-                            {"Copy": {"kind": {"Global": {
+                            {"Read": {"kind": {"Global": {
                                 "generics": empty_generics(),
                                 "id": 1
                             }}, "ty": usize_t}}
@@ -12988,14 +12864,12 @@ fn ptr_offset_chars_const_fun(
                             "generics": empty_generics()
                         }},
                         "args": [
-                            {"Copy": {"kind": {"Local": 1}, "ty": ptr_ty}},
-                            {"Copy": {"kind": {"Global": {
+                            {"Read": {"kind": {"Local": 1}, "ty": ptr_ty}},
+                            {"Read": {"kind": {"Global": {
                                 "generics": empty_generics(),
                                 "id": 1
                             }}, "ty": usize_t}}
-                        ],
-                        "dest": {"kind": {"Local": 0}, "ty": ptr_ty}
-                    }, "target": 2, "on_unwind": 1}}}
+                        ]}, "dest": {"kind": {"Local": 0}, "ty": ptr_ty}, "target": 2, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -13155,13 +13029,11 @@ fn header_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
                         }},
                         "args": [
                             {"Move": {"kind": {"Local": 2}, "ty": u8_ptr}},
-                            {"Copy": {"kind": {"Global": {
+                            {"Read": {"kind": {"Global": {
                                 "generics": empty_generics(),
                                 "id": 1
                             }}, "ty": usize_t}}
-                        ],
-                        "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
-                    }, "target": 2, "on_unwind": 1}}}
+                        ]}, "dest": {"kind": {"Local": 0}, "ty": u8_ptr}, "target": 2, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -13256,7 +13128,7 @@ fn raw_utf8str_length_read_lowers_without_a_class_cast() {
                     "span": window_span(),
                     "kind": {"Assign": [
                         window_place(serde_json::json!({"Local": 0}), &n),
-                        {"Use": [{"Copy": length_place}, "No"]}
+                        {"Use": [{"Read": length_place}, "No"]}
                     ]}
                 }],
                 "kind": "Regular",
@@ -13365,7 +13237,7 @@ fn raw_unicode_value_storage_field_write_emits_a_class_cast() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             field_place,
-                            {"Use": [{"Copy": window_place(
+                            {"Use": [{"Read": window_place(
                                 serde_json::json!({"Local": 2}),
                                 &storage_ptr
                             )}, "No"]}
@@ -13375,7 +13247,7 @@ fn raw_unicode_value_storage_field_write_emits_a_class_cast() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             window_place(serde_json::json!({"Local": 0}), &storage_ptr),
-                            {"Use": [{"Copy": window_place(
+                            {"Use": [{"Read": window_place(
                                 serde_json::json!({"Local": 2}),
                                 &storage_ptr
                             )}, "No"]}
@@ -13501,13 +13373,11 @@ fn header_ref_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
                         }},
                         "args": [
                             {"Move": {"kind": {"Local": 3}, "ty": u8_ptr}},
-                            {"Copy": {"kind": {"Global": {
+                            {"Read": {"kind": {"Global": {
                                 "generics": empty_generics(),
                                 "id": 1
                             }}, "ty": usize_t}}
-                        ],
-                        "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
-                    }, "target": 2, "on_unwind": 1}}}
+                        ]}, "dest": {"kind": {"Local": 0}, "ty": u8_ptr}, "target": 2, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -13662,7 +13532,7 @@ pub(in crate::front::mir) fn reader_fun(path: &[&str], global_id: u64) -> serde_
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
                             "ty": ty
                         }}, "No"]}
@@ -13765,7 +13635,7 @@ fn char_reader_fun(path: &[&str], global_id: u64) -> serde_json::Value {
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
                             "ty": ty
                         }}, "No"]}
@@ -14195,7 +14065,7 @@ fn fn_ptr_as_usize_emits_cast_ptr_to_int_then_r_uint() {
                         place(0, &usize_ty),
                         {"UnaryOp": [
                             {"Cast": {"Scalar": [fn_ptr.clone(), usize_ty.clone()]}},
-                            {"Copy": place(1, &fn_ptr)}
+                            {"Read": place(1, &fn_ptr)}
                         ]}
                     ]}
                 }],
@@ -14369,7 +14239,7 @@ pub(in crate::front::mir) fn as_usize_cast_fixture(
             place(0, &usize_ty),
             {"UnaryOp": [
                 {"Cast": {"Scalar": [cast_src_ty, usize_ty.clone()]}},
-                {"Copy": cast_src_place}
+                {"Read": cast_src_place}
             ]}
         ]}
     }));
@@ -14490,7 +14360,7 @@ fn vec_header_as_usize_emits_cast_ptr_to_int_then_r_uint() {
         Some((
             raw_ty.clone(),
             serde_json::json!({"Cast": {"RawPtr": [ref_ty.clone(), raw_ty.clone()]}}),
-            serde_json::json!({"Copy": span_place(1, &ref_ty)}),
+            serde_json::json!({"Read": span_place(1, &ref_ty)}),
         )),
     );
     let graph =
@@ -14879,7 +14749,7 @@ fn option_map_or_typed_fn_item_llbc(
                         serde_json::json!({
                             "span": interior_span(),
                             "kind": {"Switch": {
-                                "discr": {"Copy": disc_place.clone()},
+                                "discr": {"Read": disc_place.clone()},
                                 "targets": {"SwitchInt": [
                                     null,
                                     [
@@ -15532,9 +15402,7 @@ fn intern_map_caller(
                                                 "generics": call_generics
                                             }
                                         },
-                                        "args": [],
-                                        "dest": interior_place(0, &unit)
-                                    },
+                                        "args": []}, "dest": interior_place(0, &unit),
                                     "target": 1,
                                     "on_unwind": 2
                                 }
@@ -16713,9 +16581,7 @@ fn same_inst_leaf_two_modules_llbc() -> Llbc {
                                                 "generics": call_generics(type_arg)
                                             }
                                         },
-                                        "args": [],
-                                        "dest": interior_place(0, dest_ty)
-                                    },
+                                        "args": []}, "dest": interior_place(0, dest_ty),
                                     "target": 1,
                                     "on_unwind": 2
                                 }
@@ -16772,9 +16638,7 @@ fn same_inst_leaf_two_modules_llbc() -> Llbc {
                                                     "generics": call_generics(gc_adt.clone())
                                                 }
                                             },
-                                            "args": [],
-                                            "dest": interior_place(0, &unit)
-                                        },
+                                            "args": []}, "dest": interior_place(0, &unit),
                                         "target": 1,
                                         "on_unwind": 2
                                     }
@@ -16912,9 +16776,7 @@ fn specialize_argtype_inst_return_token_llbc() -> Llbc {
                                                 "generics": call_generics(type_arg)
                                             }
                                         },
-                                        "args": [],
-                                        "dest": interior_place(0, dest_ty)
-                                    },
+                                        "args": []}, "dest": interior_place(0, dest_ty),
                                     "target": 1,
                                     "on_unwind": 2
                                 }
@@ -16953,9 +16815,7 @@ fn specialize_argtype_inst_return_token_llbc() -> Llbc {
                                                     "generics": call_generics(type_arg)
                                                 }
                                             },
-                                            "args": [],
-                                            "dest": interior_place(0, &unit)
-                                        },
+                                            "args": []}, "dest": interior_place(0, &unit),
                                         "target": 1,
                                         "on_unwind": 2
                                     }
@@ -19426,7 +19286,7 @@ fn option_ref_niche_discriminant_is_ptr_nonzero() {
                     ],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": disc_place.clone()},
+                        "discr": {"Read": disc_place.clone()},
                         "targets": {"SwitchInt": [
                             null,
                             [
@@ -19669,12 +19529,12 @@ fn not_of_bool_as_branch_switches_on_unnegated_with_swapped_exits() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             not_place.clone(),
-                            {"UnaryOp": ["Not", {"Copy": b_place.clone()}]}
+                            {"UnaryOp": ["Not", {"Read": b_place.clone()}]}
                         ]}
                     }],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": not_place.clone()},
+                        "discr": {"Read": not_place.clone()},
                         "targets": {"If": [1, 2]}
                     }}}
                 },
@@ -20090,7 +19950,7 @@ fn option_ref_niche_discriminant_eq_one_is_some() {
                                 ret_place.clone(),
                                 {"BinaryOp": [
                                     "Eq",
-                                    {"Copy": disc_place.clone()},
+                                    {"Read": disc_place.clone()},
                                     {"Const": [
                                         {"Integer": {"Signed": ["Isize", "1"]}},
                                         disc_ty.clone()
@@ -20238,7 +20098,7 @@ fn option_u8_window_some_payload_is_the_window() {
                         }],
                         "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Switch": {
-                            "discr": {"Copy": disc_place.clone()},
+                            "discr": {"Read": disc_place.clone()},
                             "targets": {"SwitchInt": [
                                 null,
                                 [
@@ -20254,7 +20114,7 @@ fn option_u8_window_some_payload_is_the_window() {
                             "span": window_span(),
                             "kind": {"Assign": [
                                 ret_place.clone(),
-                                {"Use": [{"Copy": some_payload}, "No"]}
+                                {"Use": [{"Read": some_payload}, "No"]}
                             ]}
                         }],
                         "kind": "Regular",
@@ -20265,7 +20125,7 @@ fn option_u8_window_some_payload_is_the_window() {
                             "span": window_span(),
                             "kind": {"Assign": [
                                 ret_place.clone(),
-                                {"Use": [{"Copy": default_place}, "No"]}
+                                {"Use": [{"Read": default_place}, "No"]}
                             ]}
                         }],
                         "kind": "Regular",
@@ -20427,7 +20287,7 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": flag.clone()},
+                        "discr": {"Read": flag.clone()},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -20440,9 +20300,7 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": a.clone()}],
-                        "dest": wa.clone()
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": a.clone()}]}, "dest": wa.clone(), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -20452,15 +20310,13 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": wa.clone()
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": []}, "dest": wa.clone(), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": flag.clone()},
+                        "discr": {"Read": flag.clone()},
                         "targets": {"If": [5, 6]}
                     }}}
                 },
@@ -20472,9 +20328,7 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": b.clone()}],
-                        "dest": wb.clone()
-                    }, "target": 7, "on_unwind": 1}}}
+                        "args": [{"Read": b.clone()}]}, "dest": wb.clone(), "target": 7, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -20484,15 +20338,13 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": wb.clone()
-                    }, "target": 7, "on_unwind": 1}}}
+                        "args": []}, "dest": wb.clone(), "target": 7, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": flag.clone()},
+                        "discr": {"Read": flag.clone()},
                         "targets": {"If": [8, 9]}
                     }}}
                 },
@@ -20506,10 +20358,8 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                         }},
                         "args": [
                             {"Move": wa.clone()},
-                            {"Copy": wb.clone()}
-                        ],
-                        "dest": w.clone()
-                    }, "target": 10, "on_unwind": 1}}}
+                            {"Read": wb.clone()}
+                        ]}, "dest": w.clone(), "target": 10, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -20519,9 +20369,7 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": a.clone()}],
-                        "dest": w.clone()
-                    }, "target": 10, "on_unwind": 1}}}
+                        "args": [{"Read": a.clone()}]}, "dest": w.clone(), "target": 10, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -20531,9 +20379,7 @@ fn unwrap_or_window_keeps_selected_owner_alive() {
                             "kind": {"Fun": 4},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": w.clone()}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
-                    }, "target": 11, "on_unwind": 1}}}
+                        "args": [{"Read": w.clone()}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 11, "on_unwind": 1}}}
                 },
                 {
                     "statements": [{
@@ -21345,7 +21191,7 @@ fn niche_option_ptr_eq_llbc(trait_name: &[&str]) -> Llbc {
                                         place(3, &option_ty),
                                         {"Aggregate": [
                                             {"Adt": [0, 1, null]},
-                                            [{"Copy": place(2, &ptr_ty)}]
+                                            [{"Read": place(2, &ptr_ty)}]
                                         ]}
                                     ]}
                                 },
@@ -21375,18 +21221,16 @@ fn niche_option_ptr_eq_llbc(trait_name: &[&str]) -> Llbc {
                                 "call": {
                                     "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                     "args": [
-                                        {"Copy": place(4, &option_ref)},
-                                        {"Copy": place(5, &option_ref)}
-                                    ],
-                                    "dest": place(6, &bool_ty)
-                                },
+                                        {"Read": place(4, &option_ref)},
+                                        {"Read": place(5, &option_ref)}
+                                    ]}, "dest": place(6, &bool_ty),
                                 "target": 1, "on_unwind": 2
                             }}}},
                             {"statements": [{
                                 "span": span,
                                 "kind": {"Assign": [
                                     place(0, &bool_ty),
-                                    {"Use": [{"Copy": place(6, &bool_ty)}, "Yes"]}
+                                    {"Use": [{"Read": place(6, &bool_ty)}, "Yes"]}
                                 ]}
                             }], "terminator": {"span": span, "kind": "Return"}},
                             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -22788,9 +22632,7 @@ fn object_vec_deref_mut_iter_mut_store_writes_through_the_buffer() {
             "terminator": {"span": span, "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": fun}, "generics": generics}},
-                    "args": args,
-                    "dest": dest
-                },
+                    "args": args}, "dest": dest,
                 "target": target,
                 "on_unwind": 5
             }}}
@@ -22834,9 +22676,9 @@ fn object_vec_deref_mut_iter_mut_store_writes_through_the_buffer() {
             local(7, Some("iter_ref"), &iter_mut_ref),
         ]},
         "body": [
-            call(1, vec![serde_json::json!({"Copy": place(1, &vec_mut)})], place(3, &slice_ty), 1, vec![init_ret]),
-            call(2, vec![serde_json::json!({"Copy": place(3, &slice_ty)})], place(4, &iter_ty), 2, vec![]),
-            call(3, vec![serde_json::json!({"Copy": place(7, &iter_mut_ref)})], place(5, &opt_ty), 3, vec![
+            call(1, vec![serde_json::json!({"Read": place(1, &vec_mut)})], place(3, &slice_ty), 1, vec![init_ret]),
+            call(2, vec![serde_json::json!({"Read": place(3, &slice_ty)})], place(4, &iter_ty), 2, vec![]),
+            call(3, vec![serde_json::json!({"Read": place(7, &iter_mut_ref)})], place(5, &opt_ty), 3, vec![
                 serde_json::json!({"span": span, "kind": {"Assign": [
                     place(7, &iter_mut_ref),
                     {"Ref": {"place": place(4, &iter_ty), "kind": "Mut", "ptr_metadata": null}}
@@ -22845,11 +22687,11 @@ fn object_vec_deref_mut_iter_mut_store_writes_through_the_buffer() {
             {"statements": [
                 {"span": span, "kind": {"Assign": [
                     place(6, &slot_ty),
-                    {"Use": [{"Copy": field_place}, "No"]}
+                    {"Use": [{"Read": field_place}, "No"]}
                 ]}},
                 {"span": span, "kind": {"Assign": [
                     deref_slot,
-                    {"Use": [{"Copy": place(2, &objptr)}, "No"]}
+                    {"Use": [{"Read": place(2, &objptr)}, "No"]}
                 ]}}
             ], "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -22945,7 +22787,7 @@ fn object_vec_whole_list_fixture(
     let mut inputs = vec![vec_ref.clone()];
     inputs.extend(extra_inputs);
     let arg_count = inputs.len() as u64;
-    let mut args = vec![serde_json::json!({"Copy": place(1, &vec_ref)})];
+    let mut args = vec![serde_json::json!({"Read": place(1, &vec_ref)})];
     args.extend(extra_args);
     let mut body_blocks = vec![serde_json::json!({
         "statements": [],
@@ -22953,9 +22795,7 @@ fn object_vec_whole_list_fixture(
         "terminator": {"span": span, "kind": {"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": callee_id}, "generics": generics}},
-                "args": args,
-                "dest": place(0, &slice_ty)
-            },
+                "args": args}, "dest": place(0, &slice_ty),
             "target": 1,
             "on_unwind": extra_blocks.len() as u64 + 2
         }}}
@@ -23253,9 +23093,7 @@ fn one_word_vec_deref_leaves(item: serde_json::Value, callee_path: &[&str]) -> V
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Copy": place(1, &vec_ref)}],
-                    "dest": place(0, &slice_ty)
-                },
+                    "args": [{"Read": place(1, &vec_ref)}]}, "dest": place(0, &slice_ty),
                 "target": 1,
                 "on_unwind": 2
             }}}},
@@ -23384,9 +23222,7 @@ fn object_vec_deref_mut_retargets_shadow_stack_copy_into_vec() {
             {"statements": [init_ret], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Copy": place(2, &vec_mut)}],
-                    "dest": place(3, &slice_ty)
-                },
+                    "args": [{"Read": place(2, &vec_mut)}]}, "dest": place(3, &slice_ty),
                 "target": 1,
                 "on_unwind": 3
             }}}},
@@ -23394,11 +23230,9 @@ fn object_vec_deref_mut_retargets_shadow_stack_copy_into_vec() {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                     "args": [
-                        {"Copy": place(1, &usize_ty)},
-                        {"Copy": place(3, &slice_ty)}
-                    ],
-                    "dest": place(0, &unit)
-                },
+                        {"Read": place(1, &usize_ty)},
+                        {"Read": place(3, &slice_ty)}
+                    ]}, "dest": place(0, &unit),
                 "target": 2,
                 "on_unwind": 3
             }}}},
@@ -24218,7 +24052,7 @@ fn use_move(place: Value) -> Value {
 }
 
 fn use_copy(place: Value) -> Value {
-    json!({"Use": [{"Copy": place}, "No"]})
+    json!({"Use": [{"Read": place}, "No"]})
 }
 
 pub(in crate::front::mir) fn move_op(place: Value) -> Value {
@@ -24226,7 +24060,7 @@ pub(in crate::front::mir) fn move_op(place: Value) -> Value {
 }
 
 fn copy_op(place: Value) -> Value {
-    json!({"Copy": place})
+    json!({"Read": place})
 }
 
 pub(in crate::front::mir) fn bb(statements: Vec<Value>, term: Value) -> Value {
@@ -24246,9 +24080,7 @@ pub(in crate::front::mir) fn call_term(
     json!({"Call": {
         "call": {
             "func": {"Regular": {"kind": {"Fun": fun}, "generics": str_builder_generics()}},
-            "args": args,
-            "dest": dest
-        },
+            "args": args}, "dest": dest,
         "target": target,
         "on_unwind": unwind
     }})
@@ -25373,7 +25205,7 @@ fn mixed_format_and_heap_string_as_bytes_keeps_call() {
                     bb(
                         vec![],
                         json!({"Switch": {
-                            "discr": {"Copy": place_of(2, &flag)},
+                            "discr": {"Read": place_of(2, &flag)},
                             "targets": {"If": [1, 2]}
                         }}),
                     ),
@@ -25502,7 +25334,7 @@ fn shadowed_builder_as_bytes_graph(
                     bb(
                         vec![],
                         json!({"Switch": {
-                            "discr": {"Copy": place_of(2, &flag)},
+                            "discr": {"Read": place_of(2, &flag)},
                             "targets": {"If": [3, 4]}
                         }}),
                     ),
@@ -26844,9 +26676,7 @@ fn regular_call_block(
                                 "generics": empty_generics()
                             }
                         },
-                        "args": args,
-                        "dest": dest
-                    },
+                        "args": args}, "dest": dest,
                     "target": target,
                     "on_unwind": unwind
                 }
@@ -26955,7 +26785,7 @@ fn fmt_placeholder_chain_blocks(
     after_format: u64,
     unwind: u64,
 ) -> Vec<serde_json::Value> {
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": {"kind": {"Local": i}, "ty": ty}});
     let dest = |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
     vec![
         regular_call_block(
@@ -27003,7 +26833,7 @@ fn panic_placeholder_format_melts_to_implicit_assertion_error() {
     );
     body.push(regular_call_block(
         4,
-        vec![serde_json::json!({"Copy": {"kind": {"Local": 4}, "ty": str_ty}})],
+        vec![serde_json::json!({"Read": {"kind": {"Local": 4}, "ty": str_ty}})],
         serde_json::json!({"kind": {"Local": 0}, "ty": unit}),
         5,
         unwind,
@@ -27084,7 +26914,7 @@ fn assert_eq_placeholder_format_melts_to_implicit_assertion_error() {
     let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
     let bool_ty = serde_json::json!({"Scalar": "Bool"});
     let unwind = 6u64;
-    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+    let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Read": {"kind": {"Local": i}, "ty": ty}});
     let dest = |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
     let body = vec![
         serde_json::json!({
@@ -27094,7 +26924,7 @@ fn assert_eq_placeholder_format_melts_to_implicit_assertion_error() {
                 "span": span_json(),
                 "kind": {
                     "Switch": {
-                        "discr": {"Copy": {"kind": {"Local": 1}, "ty": bool_ty}},
+                        "discr": {"Read": {"kind": {"Local": 1}, "ty": bool_ty}},
                         "targets": {"If": [1, 2]}
                     }
                 }
@@ -29266,7 +29096,7 @@ fn tuple_ctor_of_cast_ccharp_writes_field_type() {
                     serde_json::json!({
                         "UnaryOp": [
                             {"Cast": {"RawPtr": [u8_ty.clone(), usize_ptr.clone()]}},
-                            {"Copy": interior_place(1, &u8_ty)}
+                            {"Read": interior_place(1, &u8_ty)}
                         ]
                     }),
                 ),
@@ -29427,7 +29257,7 @@ fn raw_u8_result_payload_is_ccharp() {
                 serde_json::json!({
                     "span": interior_span(),
                     "kind": {"Switch": {
-                        "discr": {"Copy": interior_place(3, &isize_ty)},
+                        "discr": {"Read": interior_place(3, &isize_ty)},
                         "targets": {"SwitchInt": [
                             isize_ty,
                             [
@@ -30905,7 +30735,7 @@ fn interior_stmt(kind: serde_json::Value) -> serde_json::Value {
 }
 
 fn interior_copy(place: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"Copy": place})
+    serde_json::json!({"Read": place})
 }
 
 fn interior_use(place: serde_json::Value) -> serde_json::Value {
@@ -30947,9 +30777,7 @@ fn interior_call(
                             }
                         }
                     },
-                    "args": args,
-                    "dest": dest
-                },
+                    "args": args}, "dest": dest,
                 "target": target,
                 "on_unwind": unwind
             }
@@ -33378,9 +33206,7 @@ fn string_view_call_llbc(leaf: &str, dest_ty: serde_json::Value) -> Llbc {
                             "kind": {"Fun": 1},
                             "generics": empty_generics()
                         }},
-                        "args": [{"Copy": {"kind": {"Local": 1}, "ty": arg_ty}}],
-                        "dest": {"kind": {"Local": 0}, "ty": dest_ty}
-                    },
+                        "args": [{"Read": {"kind": {"Local": 1}, "ty": arg_ty}}]}, "dest": {"kind": {"Local": 0}, "ty": dest_ty},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -33560,9 +33386,7 @@ fn default_call_llbc(kind: serde_json::Value, layout_value: Option<serde_json::V
                             "kind": {"Fun": 1},
                             "generics": empty_generics()
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": dest_ty}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": dest_ty},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -34657,9 +34481,7 @@ fn str_family_payload_slice_len_annotates_someinteger() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}],
-                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}]}, "dest": window_place(serde_json::json!({"Local": 2}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -34670,9 +34492,7 @@ fn str_family_payload_slice_len_annotates_someinteger() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &n)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &n), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -34833,7 +34653,7 @@ fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
                             window_place(serde_json::json!({"Local": 2}), &utf8_const),
                             {"Cast": [
                                 "PtrToPtr",
-                                {"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_mut)},
+                                {"Read": window_place(serde_json::json!({"Local": 1}), &utf8_mut)},
                                 utf8_const.clone()
                             ]}
                         ]}
@@ -34844,9 +34664,7 @@ fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &utf8_const)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &utf8_const)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -34857,9 +34675,7 @@ fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &n)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &n), "target": 3, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -35040,7 +34856,7 @@ fn str_family_getitem_option_none_annotates_somestring_can_be_none() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &idx_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 2}), &idx_ty)},
                         "targets": {"SwitchInt": [
                             null,
                             [[{"Scalar": {"Signed": ["I64", "0"]}}, 2]],
@@ -35054,7 +34870,7 @@ fn str_family_getitem_option_none_annotates_somestring_can_be_none() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             window_place(serde_json::json!({"Local": 0}), &utf8_ptr),
-                            {"Use": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}, "No"]}
+                            {"Use": [{"Read": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}, "No"]}
                         ]}
                     }],
                     "kind": "Regular",
@@ -35068,9 +34884,7 @@ fn str_family_getitem_option_none_annotates_somestring_can_be_none() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &utf8_ptr)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": []}, "dest": window_place(serde_json::json!({"Local": 0}), &utf8_ptr), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]

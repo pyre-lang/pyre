@@ -119,7 +119,7 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
-    // Measured on Charon 0.1.301 (nightly-2026.10.29) with
+    // Measured on Charon 0.1.315 (nightly-2026.11.09) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
     // longer its own local item, and this artefact holds 105.
     assert_eq!(local_count, 105, "105 local fns expected");
@@ -162,7 +162,7 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
-    assert_eq!(u.body.len(), 7);
+    assert_eq!(u.body.len(), 8);
     assert!(
         u.body.iter().any(|bb| bb.is_cleanup),
         "cleanup blocks stay in the body the reader returns"
@@ -423,7 +423,8 @@ fn tail_len_inlines_promoted_empty_array() {
 
 /// A body that never reads a promoted constant keeps its block and
 /// statement counts after the splice pass. The counts are the body
-/// Charon wrote, cleanup blocks included.
+/// the reader returns after the checked-binop rewrite, cleanup blocks
+/// included.
 #[test]
 fn straight_line_add_unchanged_without_promoted_read() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
@@ -431,11 +432,14 @@ fn straight_line_add_unchanged_without_promoted_read() {
         .local_fn("straight_line_add")
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
-    assert_eq!(u.body.len(), 7);
+    assert_eq!(u.body.len(), 8);
     let stmt_counts: Vec<usize> = u.body.iter().map(|bb| bb.statements.len()).collect();
-    assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0, 0, 0]);
+    assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0, 0, 0, 0]);
     assert!(
-        u.body[4].is_cleanup && u.body[5].is_cleanup && u.body[6].is_cleanup,
+        u.body[4].is_cleanup
+            && u.body[5].is_cleanup
+            && u.body[6].is_cleanup
+            && u.body[7].is_cleanup,
         "cleanup blocks stay in the body the reader returns"
     );
 }

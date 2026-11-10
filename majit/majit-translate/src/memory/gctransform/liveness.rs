@@ -621,9 +621,9 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
                 out.insert(l);
             }
         }
-        Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _, _, _) | Rvalue::ShallowInitBox(o, _) => {
-            use_operand(o, out)
-        }
+        Rvalue::Cast(_, o, _)
+        | Rvalue::Repeat { operand: o, .. }
+        | Rvalue::ShallowInitBox(o, _) => use_operand(o, out),
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
@@ -901,7 +901,7 @@ fn rvalue_value_loads(
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => {
             out.extend(operand_value_loads(op, address_locals, defs, mut_borrow_of));
         }
@@ -4379,9 +4379,7 @@ mod tests {
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
-                        "args": args,
-                        "dest": place(dest, dest_ty)
-                    },
+                        "args": args}, "dest": place(dest, dest_ty),
                     "target": target,
                     "on_unwind": 3
                 }}}
@@ -4399,7 +4397,7 @@ mod tests {
                     {"index": 2, "name": "payload", "span": span.clone(), "ty": payload_ty.clone()}
                 ]},
                 "body": [
-                    call(2, serde_json::json!([{"Copy": place(2, &payload_ty)}]), 1, &scalar, 1),
+                    call(2, serde_json::json!([{"Read": place(2, &payload_ty)}]), 1, &scalar, 1),
                     call(1, serde_json::json!([]), 0, &scalar, 2),
                     {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Drop": {
                         "place": place(2, &payload_ty),
@@ -4695,9 +4693,7 @@ mod tests {
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
-                        "args": [],
-                        "dest": place(dest, dest_ty)
-                    },
+                        "args": []}, "dest": place(dest, dest_ty),
                     "target": target,
                     "on_unwind": on_unwind
                 }}}
@@ -4858,9 +4854,7 @@ mod tests {
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
-                        "args": args,
-                        "dest": place(dest, dest_ty)
-                    },
+                        "args": args}, "dest": place(dest, dest_ty),
                     "target": target,
                     "on_unwind": 5
                 }}}
@@ -4894,7 +4888,7 @@ mod tests {
                     call_bb(3, serde_json::json!([]), 1, &scope_ty, 1, serde_json::json!([])),
                     call_bb(
                         2,
-                        serde_json::json!([{"Copy": place(pin_arg, &gc_ty)}]),
+                        serde_json::json!([{"Read": place(pin_arg, &gc_ty)}]),
                         pin_arg,
                         &gc_ty,
                         2,
@@ -4910,7 +4904,7 @@ mod tests {
                     ),
                     call_bb(
                         4,
-                        serde_json::json!([{"Copy": place(assign_dest, &gc_ty)}]),
+                        serde_json::json!([{"Read": place(assign_dest, &gc_ty)}]),
                         4,
                         &scalar,
                         4,
@@ -4998,7 +4992,7 @@ mod tests {
         let stats = short_bracket_after_pin_assign(
             2,
             3,
-            serde_json::json!({"Use": [{"Copy": field}, null]}),
+            serde_json::json!({"Use": [{"Read": field}, null]}),
             serde_json::json!([]),
         );
         assert_eq!(stats.withheld_under_a_bracket, 1);
@@ -5079,9 +5073,7 @@ mod tests {
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
-                        "args": args,
-                        "dest": place(dest, dest_ty)
-                    },
+                        "args": args}, "dest": place(dest, dest_ty),
                     "target": target,
                     "on_unwind": 5
                 }}}
@@ -5103,7 +5095,7 @@ mod tests {
                     call_bb(3, serde_json::json!([]), 1, &scope_ty, 1),
                     call_bb(
                         2,
-                        serde_json::json!([{"Copy": place(2, &gc_ty)}]),
+                        serde_json::json!([{"Read": place(2, &gc_ty)}]),
                         2,
                         &gc_ty,
                         2
@@ -5111,7 +5103,7 @@ mod tests {
                     call_bb(1, serde_json::json!([]), 3, &scalar, 3),
                     call_bb(
                         4,
-                        serde_json::json!([{"Copy": place(2, &gc_ty)}]),
+                        serde_json::json!([{"Read": place(2, &gc_ty)}]),
                         3,
                         &scalar,
                         4

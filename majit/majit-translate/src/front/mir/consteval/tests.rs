@@ -552,9 +552,7 @@ fn call_init_body() -> serde_json::Value {
                         "kind": {"Fun": 2},
                         "generics": empty_generics()
                     }},
-                    "args": [],
-                    "dest": {"kind": {"Local": 0}, "ty": ty}
-                },
+                    "args": []}, "dest": {"kind": {"Local": 0}, "ty": ty},
                 "target": 1,
                 "on_unwind": 1
             }}}
@@ -626,9 +624,7 @@ fn size_of_init_body(size_of_id: u64, arg_ty: serde_json::Value) -> serde_json::
                             "trait_refs": []
                         }
                     }},
-                    "args": [],
-                    "dest": {"kind": {"Local": 0}, "ty": dest_ty}
-                },
+                    "args": []}, "dest": {"kind": {"Local": 0}, "ty": dest_ty},
                 "target": 2,
                 "on_unwind": 1
             }}}
@@ -705,9 +701,7 @@ fn two_times_size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
                             "trait_refs": []
                         }
                     }},
-                    "args": [],
-                    "dest": {"kind": {"Local": 1}, "ty": ty}
-                },
+                    "args": []}, "dest": {"kind": {"Local": 1}, "ty": ty},
                 "target": 1,
                 "on_unwind": 1
             }}}
@@ -719,7 +713,7 @@ fn two_times_size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
                     {"BinaryOp": [
                         "Mul",
                         {"Const": unsigned_usize_const("2")},
-                        {"Copy": {"kind": {"Local": 1}, "ty": ty}}
+                        {"Read": {"kind": {"Local": 1}, "ty": ty}}
                     ]}
                 ]}
             }],
@@ -743,7 +737,7 @@ fn add_named_const_init_body(global_id: u64, rhs: &str) -> serde_json::Value {
                     {"kind": {"Local": 0}, "ty": ty},
                     {"BinaryOp": [
                         "Add",
-                        {"Copy": {"kind": {"Global": {
+                        {"Read": {"kind": {"Global": {
                             "generics": empty_generics(),
                             "id": global_id
                         }}, "ty": ty}},
@@ -772,7 +766,7 @@ fn reader_usize_fun(path: &[&str], global_id: u64) -> serde_json::Value {
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
                             "ty": ty
                         }}, "No"]}
@@ -888,9 +882,7 @@ fn discover_foldable_const_lits_folds_bitflag_from_element_bits() {
             "terminator": {"span": span_json(), "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                    "args": [{"Move": {"kind": {"Local": 1}, "ty": u8_ty}}],
-                    "dest": {"kind": {"Local": 2}, "ty": u8_ty}
-                },
+                    "args": [{"Move": {"kind": {"Local": 1}, "ty": u8_ty}}]}, "dest": {"kind": {"Local": 2}, "ty": u8_ty},
                 "target": 1,
                 "on_unwind": 3
             }}}
@@ -922,9 +914,7 @@ fn discover_foldable_const_lits_folds_bitflag_from_element_bits() {
             "terminator": {"span": span_json(), "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": 3}, "generics": generics}},
-                    "args": [{"Move": {"kind": {"Local": 4}, "ty": u8_ty}}],
-                    "dest": {"kind": {"Local": 0}, "ty": u8_ty}
-                },
+                    "args": [{"Move": {"kind": {"Local": 4}, "ty": u8_ty}}]}, "dest": {"kind": {"Local": 0}, "ty": u8_ty},
                 "target": 2,
                 "on_unwind": 3
             }}}
@@ -1733,7 +1723,7 @@ fn fnptrcell_global_llbc(kind: serde_json::Value) -> majit_charon_reader::Llbc {
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": cell_ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": 1}},
                             "ty": cell_ty
                         }}, "No"]}
@@ -1889,9 +1879,7 @@ fn fnptrcell_get_llbc() -> majit_charon_reader::Llbc {
                     {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                            "args": [{"Copy": {"kind": {"Local": 1}, "ty": cell_ref}}],
-                            "dest": {"kind": {"Local": 0}, "ty": option_fn}
-                        },
+                            "args": [{"Read": {"kind": {"Local": 1}, "ty": cell_ref}}]}, "dest": {"kind": {"Local": 0}, "ty": option_fn},
                         "target": 1,
                         "on_unwind": 2
                     }}}},
@@ -2026,7 +2014,7 @@ fn oncelock_fn_global_llbc(
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": cell_ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": 1}},
                             "ty": cell_ty
                         }}, "No"]}
@@ -2165,7 +2153,7 @@ fn oncelock_usize_global_llbc() -> majit_charon_reader::Llbc {
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": cell_ty},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": 1}},
                             "ty": cell_ty
                         }}, "No"]}
@@ -2255,9 +2243,7 @@ fn oncelock_fn_get_llbc_with_layout(
                     {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                            "args": [{"Copy": {"kind": {"Local": 1}, "ty": cell_ref}}],
-                            "dest": {"kind": {"Local": 0}, "ty": option_fn}
-                        },
+                            "args": [{"Read": {"kind": {"Local": 1}, "ty": cell_ref}}]}, "dest": {"kind": {"Local": 0}, "ty": option_fn},
                         "target": 1,
                         "on_unwind": 2
                     }}}},
@@ -2565,12 +2551,12 @@ fn const_struct_fold_requires_field_reads_only() {
     };
 
     let reads = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+        "Assign": [place_local(2), {"Use": [{"Read": field_place(1, 0)}, "No"]}]
     }))]);
     assert!(accepts(&reads, 1), "field reads only");
 
     let store = body_of(vec![stmt(serde_json::json!({
-        "Assign": [field_place(1, 0), {"Use": [{"Copy": place_local(2)}, "No"]}]
+        "Assign": [field_place(1, 0), {"Use": [{"Read": place_local(2)}, "No"]}]
     }))]);
     assert!(!accepts(&store, 1), "projected store");
 
@@ -2588,10 +2574,10 @@ fn const_struct_fold_requires_field_reads_only() {
 
     let copy_then_field = body_of(vec![
         stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+            "Assign": [place_local(2), {"Use": [{"Read": place_local(1)}, "No"]}]
         })),
         stmt(serde_json::json!({
-            "Assign": [place_local(0), {"Use": [{"Copy": field_place(2, 0)}, "No"]}]
+            "Assign": [place_local(0), {"Use": [{"Read": field_place(2, 0)}, "No"]}]
         })),
     ]);
     assert!(
@@ -2600,7 +2586,7 @@ fn const_struct_fold_requires_field_reads_only() {
     );
 
     let copy_to_ret = body_of(vec![stmt(serde_json::json!({
-        "Assign": [place_local(0), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        "Assign": [place_local(0), {"Use": [{"Read": place_local(1)}, "No"]}]
     }))]);
     assert!(
         !accepts(&copy_to_ret, 1),

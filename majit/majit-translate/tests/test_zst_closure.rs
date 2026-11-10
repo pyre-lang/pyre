@@ -67,8 +67,7 @@ fn zst_closure_and_then() -> Llbc {
                          "kind": "Regular",
                          "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Move": place(1, &option_ty)}, {"Move": place(2, &closure_ty)}],
-                                "dest": place(0, &option_ty)},
+                                "args": [{"Move": place(1, &option_ty)}, {"Move": place(2, &closure_ty)}]}, "dest": place(0, &option_ty),
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},

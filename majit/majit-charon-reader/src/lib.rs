@@ -1674,7 +1674,7 @@ mod tests {
                 "body": {"Unstructured": {"span": span, "locals": {"arg_count": 0, "locals": []}, "body": body}}
             })
         };
-        let scrut = serde_json::json!({"Value": {"Copy": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}}}});
+        let scrut = serde_json::json!({"Value": {"Read": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}}}});
         let bool_term = serde_json::json!({"Switch": {"data": {
             "scrutinee": scrut,
             "branches": [[{"Deduplicated": 7}, 0], [{"Deduplicated": 8}, 1]],

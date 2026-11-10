@@ -788,7 +788,7 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                         "place": word, "kind": kind, "ptr_metadata": null
                     }}]}}),
                 ],
-                vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
+                vec![json!({"Read": place(1, &flag)}), json!({"Move": borrow})],
                 place(4, &ret),
                 ret_local,
             )
@@ -798,7 +798,7 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             (
                 vec![],
                 vec![
-                    json!({"Copy": place(1, &flag)}),
+                    json!({"Read": place(1, &flag)}),
                     json!({"Move": place(2, word_ty)}),
                 ],
                 place(3, &ret),
@@ -816,13 +816,13 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                 vec![
                     json!({"span": span, "kind": {"Assign": [
                         place(3, word_ty),
-                        {"Use": [{"Copy": word.clone()}, "Yes"]}
+                        {"Use": [{"Read": word.clone()}, "Yes"]}
                     ]}}),
                     json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
                         "place": word, "kind": "Mut", "ptr_metadata": null
                     }}]}}),
                 ],
-                vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
+                vec![json!({"Read": place(1, &flag)}), json!({"Move": borrow})],
                 place(5, &ret),
                 3,
             )
@@ -835,7 +835,7 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             let raw = place(3, &ptr_ty);
             (
                 vec![raw_mut_assign(3, &ptr_ty, word)],
-                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                vec![json!({"Read": place(1, &flag)}), json!({"Move": raw})],
                 place(4, &ret),
                 ret_local,
             )
@@ -856,7 +856,7 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                     }}]}}),
                     raw_mut_assign(4, &ptr_ty, deref_place(borrow, word_ty)),
                 ],
-                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                vec![json!({"Read": place(1, &flag)}), json!({"Move": raw})],
                 place(5, &ret),
                 ret_local,
             )
@@ -877,7 +877,7 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                     }}]}}),
                     assign_to(raw.clone(), ptr_cast(borrow, &borrowed, &ptr_ty)),
                 ],
-                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                vec![json!({"Read": place(1, &flag)}), json!({"Move": raw})],
                 place(5, &ret),
                 ret_local,
             )
@@ -903,12 +903,12 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
         json!({"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": locals}, "body": [
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args, "dest": dest},
+                    "args": call_args}, "dest": dest,
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret_place_ty)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret_place_ty)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -1251,12 +1251,12 @@ fn inlined_wrapper_forwards_i64_ref_to_residual_as_raw_cell() {
         "body": {"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": wrapper_locals}, "body": [
             {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Copy": place(1, &key_ty)}], "dest": place(2, &word)},
+                    "args": [{"Read": place(1, &key_ty)}]}, "dest": place(2, &word),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+                {"Use": [{"Read": place(2, &word)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}
@@ -1302,12 +1302,12 @@ fn inlined_wrapper_forwards_i64_value_to_residual_ref_as_raw_cell() {
         "body": {"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": wrapper_locals}, "body": [
             {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Copy": place(1, &word)}], "dest": place(2, &word)},
+                    "args": [{"Read": place(1, &word)}]}, "dest": place(2, &word),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+                {"Use": [{"Read": place(2, &word)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}
@@ -1363,14 +1363,14 @@ fn inlined_wrapper_forwards_i64_ref_beside_another_ref_as_raw_cell() {
             {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [
-                        {"Copy": place(1, &key_ty)},
-                        {"Copy": place(2, &ctx_ref)}
-                    ], "dest": place(3, &word)},
+                        {"Read": place(1, &key_ty)},
+                        {"Read": place(2, &ctx_ref)}
+                    ]}, "dest": place(3, &word),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": place(3, &word)}, "Yes"]}
+                {"Use": [{"Read": place(3, &word)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}
@@ -1455,12 +1455,12 @@ fn opaque_residual_ref_of_struct_field_uses_function_scope_cell() {
                 }}]}}
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Move": borrow}], "dest": place(3, &ret)},
+                    "args": [{"Move": borrow}]}, "dest": place(3, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(3, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(3, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}
@@ -1697,7 +1697,7 @@ fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
                 vec![
                     json!({"span": span, "kind": {"Assign": [
                         copy.clone(),
-                        {"Use": [{"Copy": word_place.clone()}, "Yes"]}
+                        {"Use": [{"Read": word_place.clone()}, "Yes"]}
                     ]}}),
                     json!({"span": span, "kind": {"Assign": [borrow_word.clone(), {"Ref": {
                         "place": word_place, "kind": "Shared", "ptr_metadata": null
@@ -1728,12 +1728,12 @@ fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
         json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args, "dest": dest},
+                    "args": call_args}, "dest": dest,
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret_ty)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret_ty)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -2164,7 +2164,7 @@ fn lower_raw_alias(
                         "place": word_place, "kind": "Mut", "ptr_metadata": null
                     }}]}}),
                 ],
-                vec![json!({"Move": borrow}), json!({"Copy": q})],
+                vec![json!({"Move": borrow}), json!({"Read": q})],
                 json!([]),
                 ptr.clone(),
             )
@@ -2374,12 +2374,12 @@ fn lower_raw_alias(
         json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args, "dest": place(ret_local, &ret)},
+                    "args": call_args}, "dest": place(ret_local, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -2676,7 +2676,7 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(3, &ptr)})]),
                 ),
             ],
             ptr_tuple.clone(),
@@ -2699,7 +2699,7 @@ fn lower_packed_alias(
                 raw_mut_assign(4, &ptr, place(2, &word)),
                 assign_to(
                     place(5, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(4, &ptr)})]),
                 ),
             ],
             ptr_tuple.clone(),
@@ -2722,11 +2722,11 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(3, &ptr)})]),
                 ),
                 assign_to(
                     place(5, &nested_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &ptr_tuple)})]),
+                    tuple_of(vec![json!({"Read": place(4, &ptr_tuple)})]),
                 ),
             ],
             nested_tuple.clone(),
@@ -2748,7 +2748,7 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &struct_ty),
-                    json!({"Aggregate": [{"Adt": [0, null]}, [json!({"Copy": place(3, &ptr)})]]}),
+                    json!({"Aggregate": [{"Adt": [0, null]}, [json!({"Read": place(3, &ptr)})]]}),
                 ),
             ],
             struct_ty.clone(),
@@ -2776,7 +2776,7 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(3, &ptr)})]),
                 ),
                 assign_to(place(5, &ptr_tuple), copy_use(place(4, &ptr_tuple))),
             ],
@@ -2824,7 +2824,7 @@ fn lower_packed_alias(
                 assign_scalar_cast(4, 3, &ptr, &bits),
                 assign_to(
                     place(5, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(4, &bits)})]),
                 ),
             ],
             usize_tuple.clone(),
@@ -2849,7 +2849,7 @@ fn lower_packed_alias(
                 assign_scalar_cast(5, 4, &borrowed, &bits),
                 assign_to(
                     place(6, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(5, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(5, &bits)})]),
                 ),
             ],
             usize_tuple.clone(),
@@ -2890,7 +2890,7 @@ fn lower_packed_alias(
                 ref_assign_mut(3, &borrowed, place(1, &word)),
                 assign_to(
                     place(4, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(2, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(2, &ptr)})]),
                 ),
             ],
             ptr_tuple.clone(),
@@ -2912,7 +2912,7 @@ fn lower_packed_alias(
                 assign_scalar_cast(3, 2, &borrowed, &narrow),
                 assign_to(
                     place(4, &narrow_tuple),
-                    tuple_of(vec![json!({"Copy": place(3, &narrow)})]),
+                    tuple_of(vec![json!({"Read": place(3, &narrow)})]),
                 ),
             ],
             narrow_tuple.clone(),
@@ -2935,7 +2935,7 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(3, &ptr)})]),
                 ),
                 ref_assign(5, &pair_ref, place(4, &ptr_tuple)),
             ],
@@ -2961,7 +2961,7 @@ fn lower_packed_alias(
                 raw_mut_assign(5, &ptr, place(1, &word)),
                 assign_to(
                     place(6, &ptr_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &ptr)})]),
+                    tuple_of(vec![json!({"Read": place(4, &ptr)})]),
                 ),
                 assign_to(
                     field_place(6, &ptr_tuple, 0, &ptr),
@@ -2987,7 +2987,7 @@ fn lower_packed_alias(
                 raw_mut_assign(3, &ptr, place(1, &word)),
                 assign_to(
                     place(4, &array),
-                    array_of(&ptr, vec![json!({"Copy": place(3, &ptr)})]),
+                    array_of(&ptr, vec![json!({"Read": place(3, &ptr)})]),
                 ),
             ],
             array.clone(),
@@ -3011,13 +3011,12 @@ fn lower_packed_alias(
         json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Move": place(if arg_count == 1 { 2 } else { 3 }, &borrowed)}, {"Move": place(pair_local, &second_ty)}],
-                    "dest": place(ret_local, &ret)},
+                    "args": [{"Move": place(if arg_count == 1 { 2 } else { 3 }, &borrowed)}, {"Move": place(pair_local, &second_ty)}]}, "dest": place(ret_local, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -3214,7 +3213,7 @@ fn lower_traced_int(
                     assign_scalar_cast(4, 3, &ptr, &bits),
                     assign_to(
                         place(5, &usize_tuple),
-                        tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                        tuple_of(vec![json!({"Read": place(4, &bits)})]),
                     ),
                 ];
                 if matches!(kind, TracedInt::SameStore) {
@@ -3250,7 +3249,7 @@ fn lower_traced_int(
                 assign_scalar_cast(5, 4, &borrowed, &bits),
                 assign_to(
                     place(6, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(5, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(5, &bits)})]),
                 ),
             ],
             vec![
@@ -3295,7 +3294,7 @@ fn lower_traced_int(
             vec![ref_assign_mut(3, &borrowed, place(1, &word))],
             vec![
                 json!({"Move": place(3, &borrowed)}),
-                json!({"Copy": place(2, &bits)}),
+                json!({"Read": place(2, &bits)}),
             ],
             bits.clone(),
         ),
@@ -3347,7 +3346,7 @@ fn lower_traced_int(
                 ref_assign_mut(3, &borrowed, place(1, &word)),
                 assign_to(
                     place(4, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(2, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(2, &bits)})]),
                 ),
             ],
             vec![
@@ -3378,12 +3377,12 @@ fn lower_traced_int(
                 assign_scalar_cast(4, 3, &ptr, &bits),
                 assign_to(
                     place(5, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(4, &bits)})]),
                 ),
                 assign_to(
                     place(6, &usize_tuple),
                     tuple_of(vec![json!({
-                        "Copy": field_place(5, &usize_tuple, 0, &bits)
+                        "Read": field_place(5, &usize_tuple, 0, &bits)
                     })]),
                 ),
             ],
@@ -3442,7 +3441,7 @@ fn lower_traced_int(
                 assign_scalar_cast(4, 3, &ptr, &bits),
                 assign_to(
                     place(5, &usize_tuple),
-                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                    tuple_of(vec![json!({"Read": place(4, &bits)})]),
                 ),
                 assign_to(
                     place(6, &bits),
@@ -3523,7 +3522,7 @@ fn lower_traced_int(
     };
     let sink_call = json!({"statements": statements, "terminator": {"span": span, "kind": {"Call": {
         "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics.clone()}},
-            "args": call_args, "dest": place(ret_local, &ret)},
+            "args": call_args}, "dest": place(ret_local, &ret),
         "target": if matches!(kind, TracedInt::CallResult) { 2 } else { 1 },
         "on_unwind": if matches!(kind, TracedInt::CallResult) { 3 } else { 2 }
     }}}});
@@ -3531,13 +3530,13 @@ fn lower_traced_int(
         json!([
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics.clone()}},
-                    "args": [], "dest": place(3, &bits)},
+                    "args": []}, "dest": place(3, &bits),
                 "target": 1, "on_unwind": 3
             }}}},
             sink_call,
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ])
@@ -3546,7 +3545,7 @@ fn lower_traced_int(
             sink_call,
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(ret_local, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ])
@@ -3741,12 +3740,12 @@ fn lower_field_out() -> FunctionGraph {
                 }}]}}
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Move": borrow}], "dest": place(3, &ret)},
+                    "args": [{"Move": borrow}]}, "dest": place(3, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(3, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(3, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -3922,12 +3921,12 @@ fn lower_returned_address_sink(
                 }}]}}
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Move": borrow}], "dest": place(3, result_ty)},
+                    "args": [{"Move": borrow}]}, "dest": place(3, result_ty),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, result_ty),
-                {"Use": [{"Copy": place(3, result_ty)}, "Yes"]}
+                {"Use": [{"Read": place(3, result_ty)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -4384,7 +4383,7 @@ fn dest_only_cast_kind(src_ty: &Value, dest_ty: &Value) -> Value {
     } else if is_ptr(dest_ty) {
         json!({"PtrWithExposedProvenance": dest_ty})
     } else if is_ptr(src_ty) {
-        json!("PtrExposeProvenance")
+        json!({"PtrExposeProvenance": {"Unsigned": "Usize"}})
     } else if let Some(scalar) = dest_ty.get("Scalar") {
         json!({"Scalar": scalar})
     } else {
@@ -4398,7 +4397,7 @@ fn assign_scalar_cast(dest: u64, src: u64, src_ty: &Value, dest_ty: &Value) -> V
         place(dest, dest_ty),
         {"UnaryOp": [
             {"Cast": dest_only_cast_kind(src_ty, dest_ty)},
-            {"Copy": place(src, src_ty)}
+            {"Read": place(src, src_ty)}
         ]}
     ]}})
 }
@@ -4445,7 +4444,7 @@ fn returned_pointer_cast_through_a_local_is_not_lowered() {
             assign_scalar_cast(2, 1, &ptr, &result),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
-                {"Use": [{"Copy": place(2, &result)}, "Yes"]}
+                {"Use": [{"Read": place(2, &result)}, "Yes"]}
             ]}}),
         ],
     );
@@ -4467,7 +4466,7 @@ fn loaded_pointee_still_frees_the_spill() {
         &ptr,
         vec![json!({"span": span, "kind": {"Assign": [
             place(0, &word),
-            {"Use": [{"Copy": loaded}, "Yes"]}
+            {"Use": [{"Read": loaded}, "Yes"]}
         ]}})],
     );
     assert_sink_frees(&word, &body);
@@ -4486,7 +4485,7 @@ fn load_through_a_copied_spill_pointer_still_frees() {
             assign_to(place(2, &ptr), copy_use(place(1, &ptr))),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": deref_place(place(2, &ptr), &word)}, "Yes"]}
+                {"Use": [{"Read": deref_place(place(2, &ptr), &word)}, "Yes"]}
             ]}}),
         ],
     );
@@ -4507,12 +4506,12 @@ fn load_through_a_derived_pointer_is_not_lowered() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             json!({"span": span, "kind": {"Assign": [
                 place(2, &bits),
-                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+                {"BinaryOp": ["Add", {"Read": place(2, &bits)}, {"Const": zero_const()}]}
             ]}}),
             assign_scalar_cast(3, 2, &bits, &ptr),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": deref_place(place(3, &ptr), &word)}, "Yes"]}
+                {"Use": [{"Read": deref_place(place(3, &ptr), &word)}, "Yes"]}
             ]}}),
         ],
     );
@@ -4556,7 +4555,7 @@ fn call_into_return(result: &Value, ptr: &Value, callee: u64) -> Value {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": callee}, "generics": generics}},
-                "args": [{"Move": place(1, ptr)}], "dest": place(0, result)},
+                "args": [{"Move": place(1, ptr)}]}, "dest": place(0, result),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -4584,7 +4583,7 @@ fn assign_binop(op: &str, src_ty: &Value) -> Value {
     let word = i64_ty();
     json!({"span": span, "kind": {"Assign": [
         place(0, &word),
-        {"BinaryOp": [op, {"Copy": place(1, src_ty)}, {"Const": null}]}
+        {"BinaryOp": [op, {"Read": place(1, src_ty)}, {"Const": null}]}
     ]}})
 }
 
@@ -4593,7 +4592,7 @@ fn assign_compare(op: &str, src_ty: &Value, rhs: Value) -> Value {
     let word = i64_ty();
     json!({"span": span, "kind": {"Assign": [
         place(0, &word),
-        {"BinaryOp": [op, {"Copy": place(1, src_ty)}, {"Const": rhs}]}
+        {"BinaryOp": [op, {"Read": place(1, src_ty)}, {"Const": rhs}]}
     ]}})
 }
 
@@ -4675,7 +4674,7 @@ fn pointer_compared_with_another_pointer_is_not_lowered() {
         vec![local(2, Some("q"), &ptr)],
         vec![json!({"span": span, "kind": {"Assign": [
             place(0, &word),
-            {"BinaryOp": ["Eq", {"Copy": place(1, &ptr)}, {"Copy": place(2, &ptr)}]}
+            {"BinaryOp": ["Eq", {"Read": place(1, &ptr)}, {"Read": place(2, &ptr)}]}
         ]}})],
     );
     assert_sink_escapes(&word, &body);
@@ -4740,7 +4739,7 @@ fn cast_pointer_compared_with_zero_still_frees() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(
                 place(0, &word),
-                json!({"BinaryOp": ["Eq", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}),
+                json!({"BinaryOp": ["Eq", {"Read": place(2, &bits)}, {"Const": zero_const()}]}),
             ),
         ],
     );
@@ -4761,7 +4760,7 @@ fn usize_pointer_compared_with_zero_still_frees() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(
                 place(0, &word),
-                json!({"BinaryOp": ["Eq", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}),
+                json!({"BinaryOp": ["Eq", {"Read": place(2, &bits)}, {"Const": zero_const()}]}),
             ),
         ],
     );
@@ -4784,7 +4783,7 @@ fn narrowed_pointer_byte_compared_with_zero_is_not_lowered() {
             assign_scalar_cast(3, 2, &bits, &low),
             assign_to(
                 place(0, &word),
-                json!({"BinaryOp": ["Eq", {"Copy": place(3, &low)}, {"Const": zero_const()}]}),
+                json!({"BinaryOp": ["Eq", {"Read": place(3, &low)}, {"Const": zero_const()}]}),
             ),
         ],
     );
@@ -4810,13 +4809,13 @@ fn masked_pointer_compared_with_zero_is_not_lowered() {
                 place(3, &bits),
                 json!({"BinaryOp": [
                     "BitAnd",
-                    {"Copy": place(2, &bits)},
+                    {"Read": place(2, &bits)},
                     {"Const": int_const("7")}
                 ]}),
             ),
             assign_to(
                 place(0, &word),
-                json!({"BinaryOp": ["Eq", {"Copy": place(3, &bits)}, {"Const": zero_const()}]}),
+                json!({"BinaryOp": ["Eq", {"Read": place(3, &bits)}, {"Const": zero_const()}]}),
             ),
         ],
     );
@@ -4837,7 +4836,7 @@ fn reborrow_compared_with_zero_still_frees() {
             ref_assign(2, &r_ty, deref_place(place(1, &ptr), &word)),
             assign_to(
                 place(0, &word),
-                json!({"BinaryOp": ["Eq", {"Copy": place(2, &r_ty)}, {"Const": zero_const()}]}),
+                json!({"BinaryOp": ["Eq", {"Read": place(2, &r_ty)}, {"Const": zero_const()}]}),
             ),
         ],
     );
@@ -4901,7 +4900,7 @@ fn store_through_a_derived_pointer_is_not_lowered() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             json!({"span": span, "kind": {"Assign": [
                 place(2, &bits),
-                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+                {"BinaryOp": ["Add", {"Read": place(2, &bits)}, {"Const": zero_const()}]}
             ]}}),
             assign_scalar_cast(3, 2, &bits, &ptr),
             assign_deref(3, &ptr, const_use()),
@@ -5010,8 +5009,8 @@ fn reference_overwrite_then_the_reload_still_frees() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": deref_place(place(2, &q_ty), &ptr)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": deref_place(place(2, &q_ty), &ptr)}
                 ]}
             ]}}),
         ],
@@ -5079,8 +5078,8 @@ fn store_of_the_address_through_the_pointer_is_not_lowered() {
             let (span, _, _, _) = probe_parts();
             let _ = span;
             json!({"UnaryOp": [
-                {"Cast": "PtrExposeProvenance"},
-                {"Copy": place(1, &ptr)}
+                {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                {"Read": place(1, &ptr)}
             ]})
         })],
     );
@@ -5116,8 +5115,8 @@ fn out_param_case(
     let stored = json!({"kind": {"Projection": [place(1, &bits_ref), "Deref"]}, "ty": word});
     let stored_value = if store_address {
         json!({"UnaryOp": [
-            {"Cast": "PtrExposeProvenance"},
-            {"Copy": place(2, &ptr)}
+            {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+            {"Read": place(2, &ptr)}
         ]})
     } else {
         const_use()
@@ -5158,14 +5157,13 @@ fn out_param_case(
             ]}}
         ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(3, &bits_ref)}, {"Copy": place(1, &ptr)}],
-                "dest": place(4, &word)},
+                "args": [{"Move": place(3, &bits_ref)}, {"Read": place(1, &ptr)}]}, "dest": place(4, &word),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [
             {"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+                {"Use": [{"Read": place(2, &word)}, "Yes"]}
             ]}}
         ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -5186,7 +5184,7 @@ fn opaque_call_then_a_status_is_not_lowered() {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
+                "args": [{"Move": place(1, &ptr)}]}, "dest": place(2, &word),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [
@@ -5327,7 +5325,7 @@ fn read_through_clean_alias(kind: AliasCallee) -> (Value, Value) {
     body["Unstructured"]["body"] = json!([
         {"statements": early, "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Copy": place(3, &q_ty)}], "dest": place(0, &result)},
+                "args": [{"Read": place(3, &q_ty)}]}, "dest": place(0, &result),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": late, "terminator": {"span": span, "kind": "Return"}},
@@ -5416,7 +5414,7 @@ fn compare_through_clean_alias(op: &str) -> (Value, Value) {
             compare_with_zero(op, 2, &word, 1, &ptr)
         ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Copy": place(3, &ptr)}], "dest": place(0, &word)},
+                "args": [{"Read": place(3, &ptr)}]}, "dest": place(0, &word),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -5495,7 +5493,7 @@ fn pair_holding_clean_alias(kind: PackedAlias) -> (Value, Option<Value>) {
         assign_to(
             place(4, &pair_ty),
             tuple_of(vec![
-                json!({"Copy": place(3, &q_ty)}),
+                json!({"Read": place(3, &q_ty)}),
                 json!({"Const": null}),
             ]),
         ),
@@ -5549,7 +5547,7 @@ fn pair_holding_clean_alias(kind: PackedAlias) -> (Value, Option<Value>) {
         body["Unstructured"]["body"] = json!([
             {"statements": call_statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                    "args": [{"Copy": place(4, &pair_ty)}], "dest": place(0, &result)},
+                    "args": [{"Read": place(4, &pair_ty)}]}, "dest": place(0, &result),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -5636,8 +5634,8 @@ fn address_reloaded_through_a_reference_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": deref_place(place(2, &q_ty), &ptr)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": deref_place(place(2, &q_ty), &ptr)}
                 ]}
             ]}}),
         ],
@@ -5660,13 +5658,13 @@ fn address_reloaded_through_a_copied_reference_is_not_lowered() {
             ref_assign(2, &q_ty, place(1, &ptr)),
             json!({"span": span, "kind": {"Assign": [
                 place(3, &q_ty),
-                {"Use": [{"Copy": place(2, &q_ty)}, "Yes"]}
+                {"Use": [{"Read": place(2, &q_ty)}, "Yes"]}
             ]}}),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": deref_place(place(3, &q_ty), &ptr)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": deref_place(place(3, &q_ty), &ptr)}
                 ]}
             ]}}),
         ],
@@ -5692,8 +5690,8 @@ fn address_reloaded_through_two_references_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": deref_place(deref_place(place(3, &s_ty), &q_ty), &ptr)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": deref_place(deref_place(place(3, &s_ty), &q_ty), &ptr)}
                 ]}
             ]}}),
         ],
@@ -5719,14 +5717,14 @@ fn integer_reloaded_through_a_reference_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(2, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": place(1, &ptr)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": place(1, &ptr)}
                 ]}
             ]}}),
             ref_assign(3, &bits_ref, place(2, &result)),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
-                {"Use": [{"Copy": deref_place(place(3, &bits_ref), &result)}, "Yes"]}
+                {"Use": [{"Read": deref_place(place(3, &bits_ref), &result)}, "Yes"]}
             ]}}),
         ],
     );
@@ -5767,8 +5765,8 @@ fn address_of_the_pointer_local_still_frees() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": "PtrExposeProvenance"},
-                    {"Copy": place(2, &q_ty)}
+                    {"Cast": {"PtrExposeProvenance": {"Unsigned": "Usize"}}},
+                    {"Read": place(2, &q_ty)}
                 ]}
             ]}}),
         ],
@@ -5790,7 +5788,7 @@ fn reborrow_then_loaded_pointee_still_frees() {
             ref_assign(2, &r_ty, deref_place(place(1, &ptr), &word)),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &word),
-                {"Use": [{"Copy": deref_place(place(2, &r_ty), &word)}, "Yes"]}
+                {"Use": [{"Read": deref_place(place(2, &r_ty), &word)}, "Yes"]}
             ]}}),
         ],
     );
@@ -5816,7 +5814,7 @@ fn ptr_cast(src: Value, src_ty: &Value, dest_ty: &Value) -> Value {
     let _ = src_ty;
     json!({"UnaryOp": [
         {"Cast": {"RawPtr": dest_ty}},
-        {"Copy": src}
+        {"Read": src}
     ]})
 }
 
@@ -6013,7 +6011,7 @@ fn compare_with_zero(op: &str, dest: u64, dest_ty: &Value, src: u64, src_ty: &Va
     let (span, _, _, _) = probe_parts();
     json!({"span": span, "kind": {"Assign": [
         place(dest, dest_ty),
-        {"BinaryOp": [op, {"Copy": place(src, src_ty)}, {"Const": zero_const()}]}
+        {"BinaryOp": [op, {"Read": place(src, src_ty)}, {"Const": zero_const()}]}
     ]}})
 }
 
@@ -6033,7 +6031,7 @@ fn pointer_comparison_used_as_a_switch_is_not_lowered() {
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
         {"statements": [comparison_assign(2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind": {
-            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
+            "Switch": {"discr": {"Read": place(2, &word)}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
@@ -6056,7 +6054,7 @@ fn null_check_used_as_a_switch_still_frees() {
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
         {"statements": [compare_with_zero("Eq", 2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind": {
-            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
+            "Switch": {"discr": {"Read": place(2, &word)}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
@@ -6087,7 +6085,7 @@ fn assertion_of_the_address_is_not_lowered() {
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
         {"statements": [comparison_assign(2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind":
-            assert_term(json!({"Copy": place(2, &word)}), 1, 2)
+            assert_term(json!({"Read": place(2, &word)}), 1, 2)
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
@@ -6108,7 +6106,7 @@ fn statement_assertion_of_the_address_is_not_lowered() {
         vec![
             comparison_assign(2, &word, 1, &ptr),
             json!({"span": span, "kind": {"Assert": {
-                "cond": {"Copy": place(2, &word)},
+                "cond": {"Read": place(2, &word)},
                 "expected": true,
                 "check_kind": null
             }}}),
@@ -6130,7 +6128,7 @@ fn null_check_used_as_an_assertion_still_frees() {
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
         {"statements": [compare_with_zero("Ne", 2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind":
-            assert_term(json!({"Copy": place(2, &word)}), 1, 2)
+            assert_term(json!({"Read": place(2, &word)}), 1, 2)
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
@@ -6151,7 +6149,7 @@ fn statement_assertion_of_a_null_check_still_frees() {
         vec![
             compare_with_zero("Eq", 2, &word, 1, &ptr),
             json!({"span": span, "kind": {"Assert": {
-                "cond": {"Copy": place(2, &word)},
+                "cond": {"Read": place(2, &word)},
                 "expected": true,
                 "check_kind": null
             }}}),
@@ -6180,7 +6178,7 @@ fn assertion_of_a_status_still_frees() {
 
 fn zero_arg_call(func: Value, dest: Value) -> Value {
     json!({"Call": {
-        "call": {"func": func, "args": [], "dest": dest},
+        "call": {"func": func, "args": []}, "dest": dest,
         "target": 1,
         "on_unwind": 2
     }})
@@ -6228,7 +6226,7 @@ fn dynamic_call_through_the_address_is_not_lowered() {
     let word = i64_ty();
     let body = indirect_call_body(
         true,
-        json!({"Dynamic": [{"Copy": place(4, &word)}, {"regions": []}]}),
+        json!({"Dynamic": [{"Read": place(4, &word)}, {"regions": []}]}),
     );
     assert_sink_escapes(&word, &body);
 }
@@ -6238,7 +6236,7 @@ fn dynamic_call_through_a_clean_pointer_still_frees() {
     let word = i64_ty();
     let body = indirect_call_body(
         false,
-        json!({"Dynamic": [{"Copy": place(4, &word)}, {"regions": []}]}),
+        json!({"Dynamic": [{"Read": place(4, &word)}, {"regions": []}]}),
     );
     assert_sink_frees(&word, &body);
 }
@@ -6249,7 +6247,7 @@ fn pointer_call_through_the_address_is_not_lowered() {
     let word = i64_ty();
     let body = indirect_call_body(
         true,
-        json!({"Regular": {"kind": {"Ptr": {"Copy": place(4, &word)}}, "generics": generics}}),
+        json!({"Regular": {"kind": {"Ptr": {"Read": place(4, &word)}}, "generics": generics}}),
     );
     assert_sink_escapes(&word, &body);
 }
@@ -6260,7 +6258,7 @@ fn pointer_call_through_a_clean_pointer_still_frees() {
     let word = i64_ty();
     let body = indirect_call_body(
         false,
-        json!({"Regular": {"kind": {"Ptr": {"Copy": place(4, &word)}}, "generics": generics}}),
+        json!({"Regular": {"kind": {"Ptr": {"Read": place(4, &word)}}, "generics": generics}}),
     );
     assert_sink_frees(&word, &body);
 }
@@ -6279,7 +6277,7 @@ fn arithmetic_on_a_pointer_comparison_is_not_lowered() {
             comparison_assign(2, &word, 1, &ptr),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
-                {"BinaryOp": ["Add", {"Copy": place(2, &word)}, {"Const": null}]}
+                {"BinaryOp": ["Add", {"Read": place(2, &word)}, {"Const": null}]}
             ]}}),
         ],
     );
@@ -6302,7 +6300,7 @@ fn null_check_plus_one(op: &str) -> Value {
                 place(0, &result),
                 json!({"BinaryOp": [
                     "Add",
-                    {"Copy": place(3, &result)},
+                    {"Read": place(3, &result)},
                     {"Const": int_const("1")}
                 ]}),
             ),
@@ -6338,12 +6336,12 @@ fn field_of_pair_passed_to_helper(field: u64) -> (Value, Value) {
         {"statements": [
             assign_scalar_cast(2, 1, &ptr, &result),
             assign_to(place(3, &result), tuple_of(vec![
-                json!({"Copy": place(2, &result)}),
+                json!({"Read": place(2, &result)}),
                 json!({"Const": null})
             ]))
         ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(3, &result)}], "dest": place(0, &result)},
+                "args": [{"Move": place(3, &result)}]}, "dest": place(0, &result),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -6397,11 +6395,11 @@ fn comparison_helper_switch(op: &str) -> (Value, Value) {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
+                "args": [{"Move": place(1, &ptr)}]}, "dest": place(2, &word),
             "target": 1, "on_unwind": 3
         }}}},
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
-            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [2, 2]}}
+            "Switch": {"discr": {"Read": place(2, &word)}, "targets": {"If": [2, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
@@ -6462,8 +6460,8 @@ fn comparison_aggregate_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &word),
                 {"Aggregate": ["Tuple", [
-                    {"Copy": place(2, &word)},
-                    {"Copy": place(3, &word)}
+                    {"Read": place(2, &word)},
+                    {"Read": place(3, &word)}
                 ]]}
             ]}}),
         ],
@@ -6482,7 +6480,7 @@ fn store_of_a_comparison_into_a_global_is_not_lowered() {
         vec![
             json!({"span": span, "kind": {"Assign": [
                 global_place(&word),
-                {"BinaryOp": ["Lt", {"Copy": place(1, &ptr)}, {"Const": null}]}
+                {"BinaryOp": ["Lt", {"Read": place(1, &ptr)}, {"Const": null}]}
             ]}}),
             assign_to(place(0, &word), const_use()),
         ],
@@ -6501,7 +6499,7 @@ fn store_of_a_comparison_through_the_pointer_is_not_lowered() {
             assign_deref(
                 1,
                 &ptr,
-                json!({"BinaryOp": ["Lt", {"Copy": place(1, &ptr)}, {"Const": null}]}),
+                json!({"BinaryOp": ["Lt", {"Read": place(1, &ptr)}, {"Const": null}]}),
             ),
             assign_to(place(0, &word), const_use()),
         ],
@@ -6534,14 +6532,14 @@ fn index_place(base: u64, base_ty: &Value, index: u64, index_ty: &Value, elem_ty
     json!({
         "kind": {"Projection": [
             place(base, base_ty),
-            {"Index": {"offset": {"Copy": place(index, index_ty)}, "from_end": false}}
+            {"Index": {"offset": {"Read": place(index, index_ty)}, "from_end": false}}
         ]},
         "ty": elem_ty
     })
 }
 
 fn copy_use(src: Value) -> Value {
-    json!({"Use": [{"Copy": src}, "Yes"]})
+    json!({"Use": [{"Read": src}, "Yes"]})
 }
 
 #[test]
@@ -6742,7 +6740,7 @@ fn indexed_comparison_or_is_not_lowered() {
             ),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
-                {"BinaryOp": ["BitOr", {"Copy": place(4, &result)}, {"Copy": place(5, &result)}]}
+                {"BinaryOp": ["BitOr", {"Read": place(4, &result)}, {"Read": place(5, &result)}]}
             ]}}),
         ],
     );
@@ -6921,7 +6919,7 @@ fn drop_glue_switching_on(
         ]},
         "body": [
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Switch": {
-                "discr": {"Copy": deref_place(place(1, &slot), &word)},
+                "discr": {"Read": deref_place(place(1, &slot), &word)},
                 "targets": {"If": [1, 2]}
             }}}},
             {"statements": [assign_to(place(0, &word), const_use())],
@@ -7007,7 +7005,7 @@ fn combined_discriminants_of_the_address_are_not_lowered() {
             discriminant_assign(4, &result, 2, &result),
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
-                {"BinaryOp": ["BitOr", {"Copy": place(3, &result)}, {"Copy": place(4, &result)}]}
+                {"BinaryOp": ["BitOr", {"Read": place(3, &result)}, {"Read": place(4, &result)}]}
             ]}}),
         ],
     );
@@ -7053,7 +7051,7 @@ fn discriminant_of_a_narrowed_address_tag_is_not_lowered() {
                 place(3, &bits),
                 json!({"BinaryOp": [
                     "BitAnd",
-                    {"Copy": place(2, &bits)},
+                    {"Read": place(2, &bits)},
                     {"Const": int_const("3")}
                 ]}),
             ),
@@ -7120,7 +7118,7 @@ fn call_through(dest: Value, inner_returns_address: bool) -> (Value, Value) {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": dest},
+                "args": [{"Move": place(1, &ptr)}]}, "dest": dest,
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
@@ -7289,7 +7287,7 @@ fn clean_aggregate_field_still_frees() {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7320,13 +7318,13 @@ fn nested_pair_body(leaf: u64) -> Value {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
             assign_to(
                 place(4, &result),
-                tuple_of(vec![json!({"Copy": place(3, &result)})]),
+                tuple_of(vec![json!({"Read": place(3, &result)})]),
             ),
             assign_to(
                 place(0, &result),
@@ -7369,7 +7367,7 @@ fn array_of(elem: &Value, operands: Vec<Value>) -> Value {
 fn unsize_to_slice(src: Value, src_ty: &Value, dest_ty: &Value) -> Value {
     json!({"UnaryOp": [
         {"Cast": {"Unsize": [src_ty, dest_ty, {"Length": null}]}},
-        {"Copy": src}
+        {"Read": src}
     ]})
 }
 
@@ -7425,7 +7423,7 @@ fn len_of_an_address_array_still_frees() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(
                 place(3, &array),
-                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+                array_of(&bits, vec![json!({"Read": place(2, &bits)})]),
             ),
             assign_to(place(0, &bits), len_of(place(3, &array))),
         ],
@@ -7453,7 +7451,7 @@ fn len_of_a_reference_to_an_address_array_still_frees() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(
                 place(3, &array),
-                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+                array_of(&bits, vec![json!({"Read": place(2, &bits)})]),
             ),
             ref_assign(4, &array_ref, place(3, &array)),
             assign_to(place(0, &bits), len_of(place(4, &array_ref))),
@@ -7486,7 +7484,7 @@ fn len_of_an_unsized_address_array_still_frees() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(
                 place(3, &array),
-                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+                array_of(&bits, vec![json!({"Read": place(2, &bits)})]),
             ),
             ref_assign(4, &array_ref, place(3, &array)),
             assign_to(
@@ -7552,7 +7550,7 @@ fn mixed_address_join(return_pair: bool) -> Value {
         {"statements": [
             assign_scalar_cast(2, 1, &ptr, &result),
             assign_to(place(3, &result), tuple_of(vec![
-                json!({"Copy": place(2, &result)}),
+                json!({"Read": place(2, &result)}),
                 json!({"Const": null})
             ]))
         ], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
@@ -7594,7 +7592,7 @@ fn address_aggregate_field_is_not_lowered() {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7619,7 +7617,7 @@ fn deref_of_a_direct_field_still_frees() {
         vec![
             assign_to(
                 place(2, &word),
-                tuple_of(vec![json!({"Copy": place(1, &ptr)})]),
+                tuple_of(vec![json!({"Read": place(1, &ptr)})]),
             ),
             assign_to(
                 place(0, &word),
@@ -7650,14 +7648,14 @@ fn deref_of_an_offset_field_is_not_lowered() {
                 place(2, &bits),
                 json!({"BinaryOp": [
                     "Add",
-                    {"Copy": place(2, &bits)},
+                    {"Read": place(2, &bits)},
                     {"Const": zero_const()}
                 ]}),
             ),
             assign_scalar_cast(3, 2, &bits, &ptr),
             assign_to(
                 place(4, &word),
-                tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                tuple_of(vec![json!({"Read": place(3, &ptr)})]),
             ),
             assign_to(
                 place(0, &word),
@@ -7692,7 +7690,7 @@ fn constant_index_of_pair(index: i64) -> Value {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7730,7 +7728,7 @@ fn dynamic_index_of_an_address_aggregate_is_not_lowered() {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7768,7 +7766,7 @@ fn copied_aggregate_body(field: u64, mov: bool) -> Value {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7818,14 +7816,14 @@ fn projected_aggregate_body(field: u64) -> Value {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
             assign_to(
                 place(4, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(3, &result)}),
+                    json!({"Read": place(3, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -7866,7 +7864,7 @@ fn union_field_body(address: bool) -> (Value, Value) {
         ]}),
     );
     let operand = if address {
-        json!({"Copy": place(1, &ptr)})
+        json!({"Read": place(1, &ptr)})
     } else {
         json!({"Const": null})
     };
@@ -7932,12 +7930,12 @@ fn repeat_clean_alias(count: Value, index: u64, reload_after: bool) -> Value {
         raw_const_assign(3, &q_ty, place(2, &result)),
         assign_to(
             place(4, &aliases_ty),
-            json!({"Repeat": [
-                json!({"Copy": place(3, &q_ty)}),
-                q_ty,
-                count,
-                null
-            ]}),
+            json!({"Repeat": {
+                "operand": json!({"Read": place(3, &q_ty)}),
+                "count": count,
+                "elem_is_copy": null,
+                "elem_is_sized": null
+            }}),
         ),
     ];
     if reload_after {
@@ -8009,12 +8007,12 @@ fn repeat_of_a_constant_still_frees() {
         vec![
             assign_to(
                 place(2, &aliases_ty),
-                json!({"Repeat": [
-                    json!({"Const": null}),
-                    result,
-                    usize_repeat_count("1"),
-                    null
-                ]}),
+                json!({"Repeat": {
+                    "operand": json!({"Const": null}),
+                    "count": usize_repeat_count("1"),
+                    "elem_is_copy": null,
+                    "elem_is_sized": null
+                }}),
             ),
             assign_to(place(0, &result), const_use()),
         ],
@@ -8047,7 +8045,7 @@ fn union_clean_alias(reload_after: bool) -> (Value, Value) {
             place(4, &union_ty),
             json!({"Aggregate": [
                 {"Adt": [1, null]},
-                [json!({"Copy": place(3, &q_ty)})]
+                [json!({"Read": place(3, &q_ty)})]
             ]}),
         ),
     ];
@@ -8158,7 +8156,7 @@ fn set_discriminant_through_a_derived_pointer_is_not_lowered() {
             assign_scalar_cast(2, 1, &ptr, &bits),
             json!({"span": span, "kind": {"Assign": [
                 place(2, &bits),
-                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+                {"BinaryOp": ["Add", {"Read": place(2, &bits)}, {"Const": zero_const()}]}
             ]}}),
             assign_scalar_cast(3, 2, &bits, &ptr),
             bare_stmt(json!({
@@ -8280,9 +8278,7 @@ fn call_with_an_unknown_place_is_not_lowered() {
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Copy": unknown_place(&word)}],
-                "dest": place(0, &word)
-            },
+                "args": [{"Read": unknown_place(&word)}]}, "dest": place(0, &word),
             "target": 1,
             "on_unwind": 2
         }}}},
@@ -8379,13 +8375,13 @@ fn nested_leaf_store_body(store: bool, field: u64) -> Value {
         assign_to(
             place(3, &result),
             tuple_of(vec![
-                json!({"Copy": place(2, &result)}),
+                json!({"Read": place(2, &result)}),
                 json!({"Const": null}),
             ]),
         ),
         assign_to(
             place(4, &result),
-            tuple_of(vec![json!({"Copy": place(3, &result)})]),
+            tuple_of(vec![json!({"Read": place(3, &result)})]),
         ),
     ];
     if store {
@@ -8459,7 +8455,7 @@ fn constant_expr_index_of_pair(text: &str) -> Value {
             assign_to(
                 place(3, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &result)}),
+                    json!({"Read": place(2, &result)}),
                     json!({"Const": null}),
                 ]),
             ),
@@ -8507,7 +8503,7 @@ fn cast_into(dest: Value, src: u64, src_ty: &Value, dest_ty: &Value) -> Value {
         dest,
         json!({"UnaryOp": [
             {"Cast": dest_only_cast_kind(src_ty, dest_ty)},
-            {"Copy": place(src, src_ty)}
+            {"Read": place(src, src_ty)}
         ]}),
     )
 }
@@ -8628,8 +8624,8 @@ fn clear_named_field_through_alias(field: u64) -> Value {
             assign_to(
                 place(2, &result),
                 tuple_of(vec![
-                    json!({"Copy": place(4, &result)}),
-                    json!({"Copy": place(4, &result)}),
+                    json!({"Read": place(4, &result)}),
+                    json!({"Read": place(4, &result)}),
                 ]),
             ),
             assign_to(
@@ -8671,7 +8667,7 @@ fn alias_in_wrapper_drop(store_address: bool) -> Value {
         raw_const_assign(3, &q_ty, place(2, &bits)),
         assign_to(
             place(4, &word),
-            tuple_of(vec![json!({"Copy": place(3, &q_ty)})]),
+            tuple_of(vec![json!({"Read": place(3, &q_ty)})]),
         ),
     ];
     if store_address {
@@ -8785,7 +8781,7 @@ fn dynamic_store_into_repeat(stored_alias: bool, alias_elements: bool) -> Value 
     let q_ty = raw_ptr(&result, "Const");
     let aliases_ty = array_ty(&q_ty);
     let element = if alias_elements {
-        json!({"Copy": place(3, &q_ty)})
+        json!({"Read": place(3, &q_ty)})
     } else {
         json!({"Const": null})
     };
@@ -8808,7 +8804,12 @@ fn dynamic_store_into_repeat(stored_alias: bool, alias_elements: bool) -> Value 
             raw_const_assign(3, &q_ty, place(2, &result)),
             assign_to(
                 place(4, &aliases_ty),
-                json!({"Repeat": [element, q_ty, usize_repeat_count("1"), null]}),
+                json!({"Repeat": {
+                    "operand": element,
+                    "count": usize_repeat_count("1"),
+                    "elem_is_copy": null,
+                    "elem_is_sized": null
+                }}),
             ),
             assign_to(place(5, &result), const_use()),
             assign_to(index_place(4, &aliases_ty, 5, &result, &q_ty), stored),
@@ -8851,11 +8852,11 @@ fn nested_alias_in_wrapper_drop(store_address: bool) -> Value {
         raw_const_assign(3, &q_ty, place(2, &bits)),
         assign_to(
             place(4, &word),
-            tuple_of(vec![json!({"Copy": place(3, &q_ty)})]),
+            tuple_of(vec![json!({"Read": place(3, &q_ty)})]),
         ),
         assign_to(
             place(5, &word),
-            tuple_of(vec![json!({"Copy": place(4, &word)})]),
+            tuple_of(vec![json!({"Read": place(4, &word)})]),
         ),
     ];
     if store_address {
@@ -8959,7 +8960,7 @@ fn pair_field_return(field: u64) -> (Value, Value) {
         "body": [{"statements": [
             assign_scalar_cast(2, 1, &ptr, &bits),
             assign_to(place(0, &bits), tuple_of(vec![
-                json!({"Copy": place(2, &bits)}),
+                json!({"Read": place(2, &bits)}),
                 json!({"Const": null})
             ]))
         ], "kind": "Regular", "terminator": {"span": helper_span, "kind": "Return"}}]
@@ -8986,7 +8987,7 @@ fn pair_assigned_in_a_later_block() -> Value {
             {"statements": [
                 assign_scalar_cast(2, 1, &ptr, &bits),
                 assign_to(place(0, &bits), tuple_of(vec![
-                    json!({"Copy": place(2, &bits)}),
+                    json!({"Read": place(2, &bits)}),
                     json!({"Const": null})
                 ]))
             ], "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}}
@@ -9007,7 +9008,7 @@ fn pair_field_against(field: u64, helper_body: Value) -> (Value, Value) {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &bits)},
+                "args": [{"Move": place(1, &ptr)}]}, "dest": place(2, &bits),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [assign_to(
@@ -9105,7 +9106,7 @@ fn returned_pointer_against(op: &str, helper_body: Value) -> (Value, Value) {
     body["Unstructured"]["body"] = json!([
         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &ptr)},
+                "args": [{"Move": place(1, &ptr)}]}, "dest": place(2, &ptr),
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [compare_with_zero(op, 0, &word, 2, &ptr)],
@@ -9220,8 +9221,8 @@ fn two_returned_comparisons(second: &str) -> Value {
             assign_to(
                 place(0, &word),
                 tuple_of(vec![
-                    json!({"Copy": place(2, &word)}),
-                    json!({"Copy": place(3, &word)}),
+                    json!({"Read": place(2, &word)}),
+                    json!({"Read": place(3, &word)}),
                 ]),
             ),
         ],
@@ -9357,12 +9358,12 @@ fn lower_fresh_cell_into_sink(
         ));
     }
     let mut call_args = vec![
-        json!({"Copy": place(1, &tid_ty)}),
-        json!({"Copy": place(2, &size_ty)}),
+        json!({"Read": place(1, &tid_ty)}),
+        json!({"Read": place(2, &size_ty)}),
         json!({"Move": place(borrow_local, &borrowed)}),
     ];
     if let Some(ty) = extra_caller_param {
-        call_args.push(json!({"Copy": place(3, ty)}));
+        call_args.push(json!({"Read": place(3, ty)}));
     }
     let mut caller_inputs = vec![tid_ty.clone(), size_ty.clone()];
     if let Some(ty) = extra_caller_param {
@@ -9376,12 +9377,12 @@ fn lower_fresh_cell_into_sink(
         json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
             {"statements": statements, "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args, "dest": place(dest_local, &ret)},
+                    "args": call_args}, "dest": place(dest_local, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(dest_local, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(dest_local, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -9659,9 +9660,8 @@ fn fresh_cell_gcref_function_pointer_hook_lowers() {
             {"statements": [assign_to(place(4, &fp_ty), const_use())],
                 "kind": "Regular",
                 "terminator": {"span": span, "kind": {"Call": {
-                    "call": {"func": {"Regular": {"kind": {"Ptr": {"Copy": place(4, &fp_ty)}}, "generics": generics}},
-                        "args": [{"Copy": place(3, &raw_flag)}],
-                        "dest": place(0, &ret)},
+                    "call": {"func": {"Regular": {"kind": {"Ptr": {"Read": place(4, &fp_ty)}}, "generics": generics}},
+                        "args": [{"Read": place(3, &raw_flag)}]}, "dest": place(0, &ret),
                     "target": 1, "on_unwind": 2
                 }}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -9755,7 +9755,7 @@ fn scoped_bool_cell_storage_live_frees_on_early_return() {
                 bare_stmt(json!({"StorageLive": 3})),
                 assign_to(place(3, &flag_ty), bool_true_use())
             ], "kind": "Regular", "terminator": {"span": span, "kind": {
-                "Switch": {"discr": {"Copy": place(3, &flag_ty)}, "targets": {"If": [1, 2]}}
+                "Switch": {"discr": {"Read": place(3, &flag_ty)}, "targets": {"If": [1, 2]}}
             }}},
             {"statements": [assign_to(place(0, &ret), json!({"Use": [i64_const_operand("0"), "Yes"]}))],
                 "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -9763,10 +9763,10 @@ fn scoped_bool_cell_storage_live_frees_on_early_return() {
                 "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                         "args": [
-                            {"Copy": place(1, &tid_ty)},
-                            {"Copy": place(2, &size_ty)},
+                            {"Read": place(1, &tid_ty)},
+                            {"Read": place(2, &size_ty)},
                             {"Move": place(4, &borrowed)}
-                        ], "dest": place(5, &ret)},
+                        ]}, "dest": place(5, &ret),
                     "target": 3, "on_unwind": 4
                 }}}},
             {"statements": [
@@ -9859,15 +9859,15 @@ fn scoped_bool_cell_storage_live_in_a_loop_mallocs_per_iteration() {
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [
-                        {"Copy": place(1, &tid_ty)},
-                        {"Copy": place(2, &size_ty)},
+                        {"Read": place(1, &tid_ty)},
+                        {"Read": place(2, &size_ty)},
                         {"Move": place(5, &borrowed)}
-                    ], "dest": place(6, &ret)},
+                    ]}, "dest": place(6, &ret),
                 "target": 2, "on_unwind": 4
             }}}},
             {"statements": [bare_stmt(json!({"StorageDead": 4}))],
                 "kind": "Regular", "terminator": {"span": span, "kind": {
-                    "Switch": {"discr": {"Copy": place(3, &again)}, "targets": {"If": [1, 3]}}
+                    "Switch": {"discr": {"Read": place(3, &again)}, "targets": {"If": [1, 3]}}
                 }}},
             {"statements": [assign_to(place(0, &ret), copy_use(place(6, &ret)))],
                 "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
@@ -9971,15 +9971,15 @@ fn lower_fresh_cell_raw_reborrow() -> Result<FunctionGraph, majit_translate::fro
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [
-                        {"Copy": place(1, &tid_ty)},
-                        {"Copy": place(2, &size_ty)},
+                        {"Read": place(1, &tid_ty)},
+                        {"Read": place(2, &size_ty)},
                         {"Move": place(5, &raw_flag)}
-                    ], "dest": place(6, &ret)},
+                    ]}, "dest": place(6, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
-                {"Use": [{"Copy": place(6, &ret)}, "Yes"]}
+                {"Use": [{"Read": place(6, &ret)}, "Yes"]}
             ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -10032,10 +10032,10 @@ fn scoped_bool_cell_address_returned_beyond_scope_stays_unlowered() {
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [
-                        {"Copy": place(1, &tid_ty)},
-                        {"Copy": place(2, &size_ty)},
+                        {"Read": place(1, &tid_ty)},
+                        {"Read": place(2, &size_ty)},
                         {"Move": place(4, &borrowed)}
-                    ], "dest": place(5, &ret)},
+                    ]}, "dest": place(5, &ret),
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [assign_to(place(0, &ret), copy_use(place(4, &borrowed)))],

@@ -58,8 +58,7 @@ fn fixture(ordering: Option<&str>) -> Llbc {
                     "body": [
                         {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Copy": place(1, &receiver)}, {"Copy": place(2, &adt(1))}],
-                                "dest": place(0, &word)}, "target": 1, "on_unwind": 2
+                                "args": [{"Read": place(1, &receiver)}, {"Read": place(2, &adt(1))}]}, "dest": place(0, &word), "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -433,7 +432,7 @@ fn quasi_atomic_u64_field_fixture(
         json!({
             "kind": {"Projection": [
                 field_proj,
-                {"Index": {"offset": {"Copy": place(index_local, &usize_ty)}, "from_end": false}}
+                {"Index": {"offset": {"Read": place(index_local, &usize_ty)}, "from_end": false}}
             ]},
             "ty": atomic
         })
@@ -510,11 +509,11 @@ fn quasi_atomic_u64_field_fixture(
         locals.push(json!({"index": extra_local, "name": "_b", "span": span, "ty": owner_ref}));
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(extra_local, &owner_ref),
-            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(1, &owner_ref)}, "Yes"]}]}}),
         );
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(extra_local, &owner_ref),
-            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(1, &owner_ref)}, "Yes"]}]}}),
         );
     }
     if matches!(receiver, Receiver::ReborrowedOwner) {
@@ -545,7 +544,7 @@ fn quasi_atomic_u64_field_fixture(
     {
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
-                {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+                {"Use": [{"Read": place(1, &owner_ref)}, "Yes"]}]}}),
         );
     }
     if matches!(receiver, Receiver::CopiedFromCopiesOfAReassignedOwner) {
@@ -554,19 +553,19 @@ fn quasi_atomic_u64_field_fixture(
         let owner_b = extra_local + 5;
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(o, &owner_ref),
-            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(1, &owner_ref)}, "Yes"]}]}}),
         );
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(owner_a, &owner_ref),
-            {"Use": [{"Copy": place(o, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(o, &owner_ref)}, "Yes"]}]}}),
         );
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(o, &owner_ref),
-            {"Use": [{"Copy": place(extra_data_param, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(extra_data_param, &owner_ref)}, "Yes"]}]}}),
         );
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(owner_b, &owner_ref),
-            {"Use": [{"Copy": place(o, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(o, &owner_ref)}, "Yes"]}]}}),
         );
     }
     if dynamic_index && !index_param {
@@ -758,7 +757,7 @@ fn quasi_atomic_u64_field_fixture(
                     {"kind": {"Projection": [place(1, &owner_ref), "Deref"]}, "ty": owner_adt},
                     {"Field": [null, 0]}
                 ]}, "ty": json!({"Array": [row_adt.clone(), array_len.clone(), null]})},
-                {"Index": {"offset": {"Copy": place(extra_local, &usize_ty)}, "from_end": false}}
+                {"Index": {"offset": {"Read": place(extra_local, &usize_ty)}, "from_end": false}}
             ]},
             "ty": row_adt
         });
@@ -772,7 +771,7 @@ fn quasi_atomic_u64_field_fixture(
                     {"kind": {"Projection": [place(s, &row_ref), "Deref"]}, "ty": row_adt},
                     {"Field": [null, 0]}
                 ]}, "ty": array_ty.clone()},
-                {"Index": {"offset": {"Copy": place(extra_local, &usize_ty)}, "from_end": false}}
+                {"Index": {"offset": {"Read": place(extra_local, &usize_ty)}, "from_end": false}}
             ]},
             "ty": atomic
         });
@@ -834,7 +833,7 @@ fn quasi_atomic_u64_field_fixture(
     ) {
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(1, &owner_ref),
-            {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(2, &owner_ref)}, "Yes"]}]}}),
         );
     }
     let recv_local = if matches!(
@@ -884,20 +883,20 @@ fn quasi_atomic_u64_field_fixture(
             locals.push(json!({"index": x, "name": "x", "span": span, "ty": recv_ty}));
             locals.push(json!({"index": y, "name": "y", "span": span, "ty": recv_ty}));
             statements.push(json!({"span": span, "kind": {"Assign": [place(x, &recv_ty),
-                {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}));
+                {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}));
             statements.push(json!({"span": span, "kind": {"Assign": [place(y, &recv_ty),
-                {"Use": [{"Copy": place(x, &recv_ty)}, "Yes"]}]}}));
+                {"Use": [{"Read": place(x, &recv_ty)}, "Yes"]}]}}));
             extra_local
         } else {
             if !merge {
                 statements.push(
                     json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
+                    {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
                 );
                 if matches!(receiver, Receiver::CopiedTwice) {
                     statements.push(
                         json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                        {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
+                        {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
                     );
                 }
                 if matches!(
@@ -912,13 +911,13 @@ fn quasi_atomic_u64_field_fixture(
                 ) {
                     statements.push(
                         json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                        {"Use": [{"Copy": place(recv2, &recv_ty)}, "Yes"]}]}}),
+                        {"Use": [{"Read": place(recv2, &recv_ty)}, "Yes"]}]}}),
                     );
                 }
                 if matches!(receiver, Receiver::CopiedThenOverwritten) {
                     statements.push(
                         json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                        {"Use": [{"Copy": place(arg_count, &recv_ty)}, "Yes"]}]}}),
+                        {"Use": [{"Read": place(arg_count, &recv_ty)}, "Yes"]}]}}),
                     );
                 }
             }
@@ -928,7 +927,7 @@ fn quasi_atomic_u64_field_fixture(
                     .push(json!({"index": alias2, "name": "alias2", "span": span, "ty": recv_ty}));
                 statements.push(
                     json!({"span": span, "kind": {"Assign": [place(alias2, &recv_ty),
-                    {"Use": [{"Copy": place(extra_local, &recv_ty)}, "Yes"]}]}}),
+                    {"Use": [{"Read": place(extra_local, &recv_ty)}, "Yes"]}]}}),
                 );
                 alias2
             } else {
@@ -948,7 +947,7 @@ fn quasi_atomic_u64_field_fixture(
     if matches!(receiver, Receiver::CopiedThenOwnerReassigned) {
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(1, &owner_ref),
-            {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}),
+            {"Use": [{"Read": place(2, &owner_ref)}, "Yes"]}]}}),
         );
     }
     if matches!(receiver, Receiver::CopiedFromCopiesOfAReassignedOwner) {
@@ -998,14 +997,14 @@ fn quasi_atomic_u64_field_fixture(
     }
     let call_args = if is_store {
         json!([
-            {"Copy": place(recv_local, &recv_ty)},
-            {"Copy": place(value_local, &word)},
-            {"Copy": place(ordering_local, &adt_ord)}
+            {"Read": place(recv_local, &recv_ty)},
+            {"Read": place(value_local, &word)},
+            {"Read": place(ordering_local, &adt_ord)}
         ])
     } else {
         json!([
-            {"Copy": place(recv_local, &recv_ty)},
-            {"Copy": place(ordering_local, &adt_ord)}
+            {"Read": place(recv_local, &recv_ty)},
+            {"Read": place(ordering_local, &adt_ord)}
         ])
     };
     let (atomic_method, atomic_inputs, atomic_output) = if is_store {
@@ -1019,10 +1018,10 @@ fn quasi_atomic_u64_field_fixture(
     };
     let return_statements = if param_copied_after_call {
         json!([{"span": span, "kind": {"Assign": [place(arg_count, &recv_ty),
-            {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}])
+            {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}])
     } else if matches!(receiver, Receiver::OwnerReassignedAfterCall) {
         json!([{"span": span, "kind": {"Assign": [place(1, &owner_ref),
-            {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}])
+            {"Use": [{"Read": place(2, &owner_ref)}, "Yes"]}]}}])
     } else if index_param {
         json!([{"span": span, "kind": {"Assign": [place(extra_data_param, &usize_ty),
             {"Use": [{"Const": [{"Integer": {"Unsigned": ["Usize", "2"]}}, usize_ty.clone()]}, "Yes"]}]}}])
@@ -1038,7 +1037,7 @@ fn quasi_atomic_u64_field_fixture(
             {"Ref": {"place": inner_place, "kind": "Shared", "ptr_metadata": null}}]}}])
     } else if let Some(keep) = keep {
         json!([{"span": span, "kind": {"Assign": [place(keep, &owner_ref),
-            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}])
+            {"Use": [{"Read": place(1, &owner_ref)}, "Yes"]}]}}])
     } else {
         json!([])
     };
@@ -1054,13 +1053,11 @@ fn quasi_atomic_u64_field_fixture(
         json!([
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                    "args": [],
-                    "dest": place(recv_local, &recv_ty)}, "target": 1, "on_unwind": 3
+                    "args": []}, "dest": place(recv_local, &recv_ty), "target": 1, "on_unwind": 3
             }}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args,
-                    "dest": place(0, &dest_ty)}, "target": 2, "on_unwind": 3
+                    "args": call_args}, "dest": place(0, &dest_ty), "target": 2, "on_unwind": 3
             }}}},
             {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -1073,16 +1070,14 @@ fn quasi_atomic_u64_field_fixture(
         json!([
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                    "args": [],
-                    "dest": place(extra_local, &recv_ty)}, "target": 1, "on_unwind": 3
+                    "args": []}, "dest": place(extra_local, &recv_ty), "target": 1, "on_unwind": 3
             }}}},
             {"statements": [
                 {"span": span, "kind": {"Assign": [place(recv_bind, &recv_ty),
                     {"Ref": {"place": call_deref, "kind": "Shared", "ptr_metadata": null}}]}}
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args,
-                    "dest": place(0, &dest_ty)}, "target": 2, "on_unwind": 3
+                    "args": call_args}, "dest": place(0, &dest_ty), "target": 2, "on_unwind": 3
             }}}},
             {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -1096,21 +1091,18 @@ fn quasi_atomic_u64_field_fixture(
         json!([
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                    "args": [{"Copy": place(1, &owner_ref)}],
-                    "dest": place(extra_local, &recv_ty)}, "target": 1, "on_unwind": 4
+                    "args": [{"Read": place(1, &owner_ref)}]}, "dest": place(extra_local, &recv_ty), "target": 1, "on_unwind": 4
             }}}},
             {"statements": [
                 {"span": span, "kind": {"Assign": [place(extra_local + 1, &raw_ty),
                     {"RawPtr": {"place": call_deref, "kind": "Const", "ptr_metadata": null}}]}}
             ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 3}, "generics": generics}},
-                    "args": [{"Copy": place(extra_local + 1, &raw_ty)}],
-                    "dest": place(recv_bind, &recv_ty)}, "target": 2, "on_unwind": 4
+                    "args": [{"Read": place(extra_local + 1, &raw_ty)}]}, "dest": place(recv_bind, &recv_ty), "target": 2, "on_unwind": 4
             }}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args,
-                    "dest": place(0, &dest_ty)}, "target": 3, "on_unwind": 4
+                    "args": call_args}, "dest": place(0, &dest_ty), "target": 3, "on_unwind": 4
             }}}},
             {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -1121,9 +1113,9 @@ fn quasi_atomic_u64_field_fixture(
             let y = extra_local + 2;
             (
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(x, &recv_ty)}, "Yes"]}]}}]),
+                    {"Use": [{"Read": place(x, &recv_ty)}, "Yes"]}]}}]),
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(y, &recv_ty)}, "Yes"]}]}}]),
+                    {"Use": [{"Read": place(y, &recv_ty)}, "Yes"]}]}}]),
             )
         } else if matches!(
             receiver,
@@ -1145,14 +1137,14 @@ fn quasi_atomic_u64_field_fixture(
                 };
             (
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}]),
+                    {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}]),
                 json!([
                     {"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
-                        {"Use": [{"Copy": place(owner2_src, &owner_ref)}, "Yes"]}]}},
+                        {"Use": [{"Read": place(owner2_src, &owner_ref)}, "Yes"]}]}},
                     {"span": span, "kind": {"Assign": [place(recv2, &recv_ty),
                         {"Ref": {"place": recv2_place, "kind": "Shared", "ptr_metadata": null}}]}},
                     {"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                        {"Use": [{"Copy": place(recv2, &recv_ty)}, "Yes"]}]}}
+                        {"Use": [{"Read": place(recv2, &recv_ty)}, "Yes"]}]}}
                 ]),
             )
         } else if matches!(receiver, Receiver::PinnedLocalsInTwoBranches) {
@@ -1196,21 +1188,20 @@ fn quasi_atomic_u64_field_fixture(
         } else {
             (
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}]),
+                    {"Use": [{"Read": place(recv_bind, &recv_ty)}, "Yes"]}]}}]),
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
-                    {"Use": [{"Copy": place(recv2, &recv_ty)}, "Yes"]}]}}]),
+                    {"Use": [{"Read": place(recv2, &recv_ty)}, "Yes"]}]}}]),
             )
         };
         json!([
             {"statements": statements, "kind": "Regular", "terminator": {"span": span, "kind": {
-                "Switch": {"discr": {"Copy": place(arg_count, &bool_ty)}, "targets": {"If": [1, 2]}}
+                "Switch": {"discr": {"Read": place(arg_count, &bool_ty)}, "targets": {"If": [1, 2]}}
             }}},
             {"statements": branch_a, "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
             {"statements": branch_b, "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args,
-                    "dest": place(0, &dest_ty)}, "target": 4, "on_unwind": 5
+                    "args": call_args}, "dest": place(0, &dest_ty), "target": 4, "on_unwind": 5
             }}}},
             {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -1219,8 +1210,7 @@ fn quasi_atomic_u64_field_fixture(
         json!([
             {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": call_args,
-                    "dest": place(0, &dest_ty)}, "target": 1, "on_unwind": 2
+                    "args": call_args}, "dest": place(0, &dest_ty), "target": 1, "on_unwind": 2
             }}}},
             {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -3002,13 +2992,11 @@ fn quasi_atomic_u64_field_fixture_with_owner_call() -> Llbc {
                                 {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}
                         ], "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                                "args": [{"Copy": place(1, &owner_ref)}],
-                                "dest": place(4, &unit)}, "target": 1, "on_unwind": 3
+                                "args": [{"Read": place(1, &owner_ref)}]}, "dest": place(4, &unit), "target": 1, "on_unwind": 3
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Copy": place(3, &recv_ty)}, {"Copy": place(2, &adt_ord)}],
-                                "dest": place(0, &word)}, "target": 2, "on_unwind": 3
+                                "args": [{"Read": place(3, &recv_ty)}, {"Read": place(2, &adt_ord)}]}, "dest": place(0, &word), "target": 2, "on_unwind": 3
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -3539,11 +3527,10 @@ fn atomic_u64_field_store_fixture(
                         ], "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [
-                                    {"Copy": place(4, &recv_ty)},
-                                    {"Copy": place(2, &word)},
-                                    {"Copy": place(3, &adt_ord)}
-                                ],
-                                "dest": place(0, &unit)}, "target": 1, "on_unwind": 2
+                                    {"Read": place(4, &recv_ty)},
+                                    {"Read": place(2, &word)},
+                                    {"Read": place(3, &adt_ord)}
+                                ]}, "dest": place(0, &unit), "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
@@ -3608,17 +3595,15 @@ fn atomic_from_ptr_store_release_fixture() -> Llbc {
                                 {"Aggregate": [{"Adt": [1, 3, null, generics]}, []]}]}}
                         ], "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                                "args": [{"Copy": place(1, &slot_ty)}],
-                                "dest": place(4, &recv_ty)}, "target": 1, "on_unwind": 3
+                                "args": [{"Read": place(1, &slot_ty)}]}, "dest": place(4, &recv_ty), "target": 1, "on_unwind": 3
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [
-                                    {"Copy": place(4, &recv_ty)},
-                                    {"Copy": place(2, &word)},
-                                    {"Copy": place(3, &adt_ord)}
-                                ],
-                                "dest": place(0, &unit)}, "target": 2, "on_unwind": 3
+                                    {"Read": place(4, &recv_ty)},
+                                    {"Read": place(2, &word)},
+                                    {"Read": place(3, &adt_ord)}
+                                ]}, "dest": place(0, &unit), "target": 2, "on_unwind": 3
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}

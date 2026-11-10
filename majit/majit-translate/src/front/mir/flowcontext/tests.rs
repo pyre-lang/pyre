@@ -2274,17 +2274,17 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
         &cell_ptr_adt,
     );
     let (unwind, ret) = window_unwind_and_return_blocks();
-    let call_get =
-        |fun: u64, arg_ty: &serde_json::Value, arg_local: u64, dest_ty: &serde_json::Value| {
-            serde_json::json!({"Call": {"call": {
+    let call_get = |fun: u64,
+                    arg_ty: &serde_json::Value,
+                    arg_local: u64,
+                    dest_ty: &serde_json::Value| {
+        serde_json::json!({"Call": {"call": {
             "func": {"Regular": {
                 "kind": {"Fun": fun},
                 "generics": window_empty_generics()
             }},
-            "args": [{"Copy": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}],
-            "dest": window_place(serde_json::json!({"Local": 0}), dest_ty)
-        }, "target": 2, "on_unwind": 1}})
-        };
+            "args": [{"Read": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), dest_ty), "target": 2, "on_unwind": 1}})
+    };
     let f = serde_json::json!({
         "def_id": 0,
         "item_meta": window_meta(&["fixture", "f"], true),
@@ -6225,7 +6225,7 @@ fn window_join_empty_array_unsize_and_str_view_is_ccharp() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -6255,9 +6255,7 @@ fn window_join_empty_array_unsize_and_str_view_is_ccharp() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &str_ty)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &str_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -6349,9 +6347,7 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &box_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &box_ref)}]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 {
@@ -6362,9 +6358,7 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                             "kind": {"Fun": 2},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
-                        "dest": window_place(serde_json::json!({"Local": 4}), &n)
-                    }, "target": 3, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 4}), &n), "target": 3, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -6375,11 +6369,9 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 5}), &u8_ty)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &shared)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 5}), &u8_ty), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [{
@@ -6388,8 +6380,8 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                             window_place(serde_json::json!({"Local": 0}), &bool_ty),
                             {"BinaryOp": [
                                 "Lt",
-                                {"Copy": window_place(serde_json::json!({"Local": 5}), &u8_ty)},
-                                {"Copy": window_place(serde_json::json!({"Local": 4}), &n)}
+                                {"Read": window_place(serde_json::json!({"Local": 5}), &u8_ty)},
+                                {"Read": window_place(serde_json::json!({"Local": 4}), &n)}
                             ]}
                         ]}
                     }],
@@ -6498,7 +6490,7 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                         "span": window_span(),
                         "kind": {"Assign": [
                             window_place(serde_json::json!({"Local": 2}), &field_box_ty),
-                            {"Use": [{"Copy": kinds_place}, "No"]}
+                            {"Use": [{"Read": kinds_place}, "No"]}
                         ]}
                     }],
                     "kind": "Regular",
@@ -6507,9 +6499,7 @@ fn list_view_box_u8_slice_len_index_stays_the_list() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &field_box_ty)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &usize_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &field_box_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &usize_ty), "target": 2, "on_unwind": 1}}}
                 },
                 field_unwind,
                 {
@@ -6586,7 +6576,7 @@ fn window_join_str_view_and_from_raw_parts_is_ccharp() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -6600,11 +6590,9 @@ fn window_join_str_view_and_from_raw_parts_is_ccharp() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)},
-                            {"Copy": window_place(serde_json::json!({"Local": 3}), &n)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)},
+                            {"Read": window_place(serde_json::json!({"Local": 3}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [],
@@ -6614,9 +6602,7 @@ fn window_join_str_view_and_from_raw_parts_is_ccharp() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 4}), &str_ty)}],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 4}), &str_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &shared), "target": 4, "on_unwind": 1}}}
                 },
                 ret
             ]
@@ -7269,7 +7255,7 @@ fn closure_capturing_fieldless_enum_annotates() {
                                 place(0, &closure_adt),
                                 {"Aggregate": [
                                     {"Adt": [2, null, null, generics.clone()]},
-                                    [{"Copy": place(1, &borrowed_enum)}]
+                                    [{"Read": place(1, &borrowed_enum)}]
                                 ]}
                             ]}
                         }],
@@ -9935,7 +9921,7 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -9952,9 +9938,7 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -10108,7 +10092,7 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
     // A `(len + 0, len + 1, len + 2)` tuple whose fields feed the
     // gets names the same pins as the separate-local spelling.
     let field = |i: u64, f: u64| {
-        serde_json::json!({"Copy": {
+        serde_json::json!({"Read": {
             "kind": {"Projection": [place(i), {"Field": [null, f]}]},
             "ty": ty()
         }})
@@ -10243,7 +10227,7 @@ fn root_bracket_erasure_erases_free_pins_indexed_by_len_after_open() {
     };
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -10254,9 +10238,7 @@ fn root_bracket_erasure_erases_free_pins_indexed_by_len_after_open() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})

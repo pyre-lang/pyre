@@ -26,7 +26,7 @@ scripts/install-charon.py
 ../.pyre-build/charon/<platform>/<version>/charon toolchain-path  # one-time nightly install (~1 min)
 ```
 
-The script pins `CHARON_VERSION_DEFAULT="nightly-2026.10.29"` and installs
+The script pins `CHARON_VERSION_DEFAULT="nightly-2026.11.09"` and installs
 to a shared cache at `../.pyre-build/charon/<platform>/<version>` by default,
 so sibling worktrees on the same pin reuse the binary and an older pin keeps
 its own directory. Override with `PYRE_SHARED_BUILD=/path/to/cache` or
@@ -74,11 +74,11 @@ out in issue #97:
 
 | Function            | Shape                                       | ULLBC BBs |
 |---------------------|---------------------------------------------|-----------|
-| `straight_line_add` | straight-line arithmetic                    | 7         |
-| `branch_loop_sum`   | `for` loop + `if/else` branch               | 16        |
-| `strategy_len`      | enum `match` (dict-strategy stand-in)       | 5         |
-| `parse_one`         | `match` with guards, internal helper for #4 | 8         |
-| `desugar_mix`       | `?` + `for` + `match` + `break`             | 29        |
+| `straight_line_add` | straight-line arithmetic                    | 11        |
+| `branch_loop_sum`   | `for` loop + `if/else` branch               | 17        |
+| `strategy_len`      | enum `match` (dict-strategy stand-in)       | 6         |
+| `parse_one`         | `match` with guards, internal helper for #4 | 9         |
+| `desugar_mix`       | `?` + `for` + `match` + `break`             | 27        |
 
 The corpus also includes a header-first object model. These functions pin
 lowering decisions that otherwise fail by leaving a residual call or an

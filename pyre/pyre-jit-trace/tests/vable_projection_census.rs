@@ -319,7 +319,7 @@ fn walk_rvalue(
         Rvalue::Use(operand, _)
         | Rvalue::UnaryOp(_, operand)
         | Rvalue::Cast(_, operand, _)
-        | Rvalue::Repeat(operand, _, _, _)
+        | Rvalue::Repeat { operand, .. }
         | Rvalue::ShallowInitBox(operand, _) => {
             walk_operand(operand, fn_name, llbc, pyframe_ids, vable, census);
         }
@@ -576,7 +576,7 @@ fn assign_stmt(dest: Value, rvalue: Value) -> Value {
 }
 
 fn copy_use(place: Value) -> Value {
-    serde_json::json!({"Use": [{"Copy": place}, "No"]})
+    serde_json::json!({"Use": [{"Read": place}, "No"]})
 }
 
 fn fn_decl(def_id: u64, name: Vec<Value>, arg_ty: Value, stmts: Vec<Value>) -> Value {

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 
-CHARON_VERSION_DEFAULT = "nightly-2026.10.29"
+CHARON_VERSION_DEFAULT = "nightly-2026.11.09"
 
 
 def default_charon_dest(shared: Path, platform_key: str, version: str) -> Path:

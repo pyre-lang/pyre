@@ -76,7 +76,7 @@ fn local_place(index: u64, ty: &Value) -> Value {
 }
 
 fn copy_of(place: Value) -> Value {
-    json!({"Copy": place})
+    json!({"Read": place})
 }
 
 fn assign(dest: Value, rvalue: Value) -> Value {
@@ -126,7 +126,7 @@ fn switch_int(discr: Value, arms: &[(i64, u64)], default_bb: u64) -> Value {
         .map(|(disc, bb)| json!([{"Scalar": {"Signed": ["Isize", disc.to_string()]}}, bb]))
         .collect();
     json!({"Switch": {
-        "discr": {"Copy": discr},
+        "discr": {"Read": discr},
         "targets": {"SwitchInt": [null, pairs, default_bb]}
     }})
 }
@@ -259,7 +259,7 @@ fn match_body(scrutinee: Value, scrutinee_ty: &Value, c_arm_place: Value) -> Val
             ret_block(vec![assign(ret.clone(), const_usize_use("1"))]),
             ret_block(vec![assign(
                 ret.clone(),
-                json!({"Use": [{"Copy": c_arm_place}, "No"]}),
+                json!({"Use": [{"Read": c_arm_place}, "No"]}),
             )]),
             ret_block(vec![assign(ret.clone(), const_usize_use("3"))]),
             ret_block(vec![assign(ret, const_usize_use("4"))]),
@@ -312,7 +312,7 @@ fn classify_fun(e_adt: &Value, e_ref: &Value) -> Value {
                 ret_block(vec![assign(ret.clone(), const_usize_use("1"))]),
                 ret_block(vec![assign(
                     ret.clone(),
-                    json!({"Use": [{"Copy": field}, "No"]}),
+                    json!({"Use": [{"Read": field}, "No"]}),
                 )]),
                 ret_block(vec![assign(ret.clone(), const_usize_use("3"))]),
                 ret_block(vec![assign(ret, const_usize_use("4"))]),
@@ -343,9 +343,7 @@ fn call_classify_fun(e_ref: &Value) -> Value {
                             "kind": {"Fun": 7},
                             "generics": super::window_empty_generics()
                         }},
-                        "args": [{"Copy": arg}],
-                        "dest": dest
-                    }, "target": 2, "on_unwind": 1}}),
+                        "args": [{"Read": arg}]}, "dest": dest, "target": 2, "on_unwind": 1}}),
                 ),
                 unwind,
                 ret,
@@ -368,7 +366,7 @@ fn copy_through(id: u64, name: &str, arg_ty: &Value) -> Value {
             ],
             vec![ret_block(vec![assign(
                 local_place(0, arg_ty),
-                json!({"Use": [{"Copy": local_place(1, arg_ty)}, "No"]}),
+                json!({"Use": [{"Read": local_place(1, arg_ty)}, "No"]}),
             )])],
         ),
     )
@@ -1022,9 +1020,7 @@ fn call_regular(fun_id: u64, arg: Value, dest: Value, target: u64, unwind: u64) 
             "kind": {"Fun": fun_id},
             "generics": super::window_empty_generics()
         }},
-        "args": [{"Copy": arg}],
-        "dest": dest
-    }, "target": target, "on_unwind": unwind}})
+        "args": [{"Read": arg}]}, "dest": dest, "target": target, "on_unwind": unwind}})
 }
 
 fn enum_string_field_llbc(leaf: &str, marked: bool, funs: Vec<Value>) -> majit_charon_reader::Llbc {

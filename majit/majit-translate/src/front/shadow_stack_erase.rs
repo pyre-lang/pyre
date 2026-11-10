@@ -49,7 +49,7 @@ use std::collections::{HashMap, VecDeque};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     CallFunc, FunDecl, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, SpanRef,
-    StmtKind, TermKind, TyRef, Unstructured, UnwindKind,
+    StmtKind, TermKind, TyRef, Unstructured, UnwindKind, operand_json_place,
 };
 use serde_json::{Value, json};
 
@@ -578,18 +578,14 @@ fn binop_is_index_arith(op: &Value) -> Option<IndexArith> {
 }
 
 fn copy_operand_json(op: &Value) -> Value {
-    match op.as_object() {
-        Some(m) if m.contains_key("Move") => json!({ "Copy": m["Move"].clone() }),
-        _ => op.clone(),
+    match operand_json_place(op) {
+        Some(place) => json!({ "Read": place.clone() }),
+        None => op.clone(),
     }
 }
 
 fn operand_json_ty(value: &Value) -> Option<Value> {
-    value
-        .as_object()
-        .and_then(|m| m.values().next())
-        .and_then(|p| p.get("ty"))
-        .cloned()
+    operand_json_place(value).and_then(|p| p.get("ty")).cloned()
 }
 
 fn local_place_json(local: usize, ty: &Value) -> Value {
@@ -685,8 +681,7 @@ fn json_slot_array_len(
 }
 
 fn json_operand_local(v: &Value) -> Option<usize> {
-    v.get("Copy")
-        .or_else(|| v.get("Move"))
+    operand_json_place(v)
         .and_then(|p| p.get("kind"))
         .and_then(|k| k.get("Local"))
         .and_then(Value::as_u64)
@@ -1508,7 +1503,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &forward_blocks,
                         &mut getter_cache,
                     ) {
-                        let dest_json = &term_json["Call"]["call"]["dest"];
+                        let dest_json = &term_json["Call"]["dest"];
                         let stmts = match answer {
                             GetterAnswer::Scalar(k) => {
                                 if k >= depth {
@@ -1517,7 +1512,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                 let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
                                 vec![assign_json(
                                     dest_json.clone(),
-                                    json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                                    json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
                                 )]
                             }
                             GetterAnswer::Slice { slice_local, k } => {
@@ -1580,7 +1575,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     continue;
                 };
                 let args_json = &term_json["Call"]["call"]["args"];
-                let dest_json = &term_json["Call"]["call"]["dest"];
+                let dest_json = &term_json["Call"]["dest"];
                 let dest = place_local(&call.dest);
                 let arg0 = usize::from(method);
                 let guard = if method {
@@ -1808,7 +1803,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                     .ok_or("get-before-any-pin")?;
                                 stmts.push(assign_json(
                                     dest_json.clone(),
-                                    json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                                    json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
                                 ));
                             }
                             Some(Special::SliceBase { slice_local }) => {
@@ -1858,7 +1853,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             .ok_or("get-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(slot), &ty) }, "Yes"] }),
+                            json!({ "Use": [{ "Read": local_place_json(slot_local(slot), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::AnchorGet => {
@@ -1882,7 +1877,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             .ok_or("get-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                            json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::Set => {
@@ -1913,7 +1908,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             .ok_or("reload-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(depth - 1), &ty) }, "Yes"] }),
+                            json!({ "Use": [{ "Read": local_place_json(slot_local(depth - 1), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::Unmodeled
@@ -2277,7 +2272,7 @@ fn slice_elem_use(
         },
         "ty": elem_ty
     });
-    Ok(json!({ "Use": [{ "Copy": index_place }, "Yes"] }))
+    Ok(json!({ "Use": [{ "Read": index_place }, "Yes"] }))
 }
 
 /// Unique forward `Assign` of `local`, with its block and statement index.
@@ -4034,9 +4029,7 @@ mod tests {
         let open = json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": 1}, "generics": {}}},
-                "args": [],
-                "dest": place(1)
-            },
+                "args": []}, "dest": place(1),
             "target": 1,
             "on_unwind": 2
         }});
@@ -4188,9 +4181,7 @@ mod tests {
             json!({"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
-                    "args": args,
-                    "dest": place(dest)
-                },
+                    "args": args}, "dest": place(dest),
                 "target": target,
                 "on_unwind": on_unwind
             }})
@@ -4317,9 +4308,7 @@ mod tests {
         json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
-                "args": args,
-                "dest": place(dest)
-            },
+                "args": args}, "dest": place(dest),
             "target": target,
             "on_unwind": 99
         }})
@@ -4361,9 +4350,9 @@ mod tests {
             3,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(json!({"Switch": {
-                    "discr": {"Copy": place(0)},
+                    "discr": {"Read": place(0)},
                     "targets": {"If": [3, 4]}
                 }})),
                 bb(drop_local(1, 5)),
@@ -4386,7 +4375,7 @@ mod tests {
                 bb(call_fun(1, vec![], 1, 1)),
                 bb(call_fun(3, vec![], 2, 2)),
                 // Local 0 is not a Len/Base index: untracked, so index-not-own.
-                bb(call_fun(2, vec![json!({"Copy": place(0)})], 3, 3)),
+                bb(call_fun(2, vec![json!({"Read": place(0)})], 3, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
             ],
@@ -4422,7 +4411,7 @@ mod tests {
             3,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(drop_local(1, 3)),
                 bb(json!("Return")),
             ],
@@ -4507,7 +4496,7 @@ mod tests {
     #[test]
     fn local_def_counts_skips_cleanup_reassign() {
         let llbc = fixture_llbc();
-        let use_copy0 = json!({"Use": [{"Copy": place(0)}, "Yes"]});
+        let use_copy0 = json!({"Use": [{"Read": place(0)}, "Yes"]});
         let body = body_of(
             2,
             vec![
@@ -4527,7 +4516,7 @@ mod tests {
     /// `zip_two_tuple_next` / `tuple_iter_descr_next`: pin, then name the
     /// slot as `shadow_stack_len() - 1`, then get it.
     fn len_minus_one_body(sub_op: Value) -> Unstructured {
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         body_of(
             6,
             vec![
@@ -4550,7 +4539,7 @@ mod tests {
     #[test]
     fn analyze_accepts_frame_anchor_push_live_release() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let body = body_of(
             5,
             vec![
@@ -4569,6 +4558,22 @@ mod tests {
             is_neutral(&body, &llbc),
             "FrameAnchor push/live/release must be depth-neutral"
         );
+        let fd: FunDecl =
+            serde_json::from_value(opaque_fun(9, &["other", "subject"], json!("Opaque")))
+                .expect("subject FunDecl");
+        let erased = match erase_shadow_stack(&fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        for (bb, block) in erased.body.iter().enumerate() {
+            for stmt in &block.statements {
+                assert!(
+                    stmt.stmt_kind_ref().is_ok(),
+                    "erased block {bb} statement failed to parse"
+                );
+            }
+        }
     }
 
     /// `eval::{from_raw,live,drop}` without a `FrameAnchor` path segment:
@@ -4615,9 +4620,9 @@ mod tests {
             json!({"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
-                    "args": args,
-                    "dest": {"kind": {"Local": dest}, "ty": dest_ty}
+                    "args": args
                 },
+                "dest": {"kind": {"Local": dest}, "ty": dest_ty},
                 "target": target,
                 "on_unwind": 99
             }})
@@ -4627,12 +4632,12 @@ mod tests {
             vec![
                 bb(call(
                     1,
-                    vec![json!({"Copy": place(1)})],
+                    vec![json!({"Read": place(1)})],
                     2,
                     anchor.clone(),
                     1,
                 )),
-                bb(call(2, vec![json!({"Copy": place_a(2)})], 3, ty(), 2)),
+                bb(call(2, vec![json!({"Read": place_a(2)})], 3, ty(), 2)),
                 bb(call(3, vec![json!({"Move": place_a(2)})], 4, ty(), 3)),
                 bb(json!("Return")),
             ],
@@ -4733,7 +4738,7 @@ mod tests {
     #[test]
     fn anchor_close_inside_root_scope_keeps_scope_open() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let body = body_of_args(
             1,
             8,
@@ -4776,7 +4781,7 @@ mod tests {
     #[test]
     fn analyze_accepts_return_with_slots_when_unwind_resume_is_not_last() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let body = body_of(
             3,
             vec![
@@ -4800,7 +4805,7 @@ mod tests {
     #[test]
     fn analyze_refuses_returning_the_len_minus_one_slot_index() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let body = body_of(
             4,
             vec![
@@ -4838,7 +4843,7 @@ mod tests {
     #[test]
     fn analyze_accepts_len_minus_one_subchecked_after_pin() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let field0 = json!({
             "kind": {"Projection": [place(4), {"Field": [null, 0]}]},
             "ty": ty()
@@ -4894,7 +4899,7 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(drop_local(1, 3)),
                 bb(call_fun(5, vec![], 4, 4)),
                 bb(json!("Return")),
@@ -4914,7 +4919,7 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(5, vec![], 3, 3)),
                 bb(call_fun(5, vec![], 3, 4)),
                 bb(drop_local(1, 5)),
@@ -4935,7 +4940,7 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(5, vec![], 3, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
@@ -4954,7 +4959,7 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(7, vec![], 3, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
@@ -4977,7 +4982,7 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(11, vec![], 3, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
@@ -5013,7 +5018,7 @@ mod tests {
             3,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(12, vec![json!({"Move": place(1)})], 3, 3)),
                 bb(json!("Return")),
             ],
@@ -5037,7 +5042,7 @@ mod tests {
             1,
             3,
             vec![
-                bb(call_fun(2, vec![json!({"Copy": place(1)})], 2, 1)),
+                bb(call_fun(2, vec![json!({"Read": place(1)})], 2, 1)),
                 bb(json!("Return")),
             ],
         );
@@ -5055,9 +5060,9 @@ mod tests {
             5,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(3, vec![], 3, 3)),
-                bb(call_fun(8, vec![json!({"Copy": place(3)})], 4, 4)),
+                bb(call_fun(8, vec![json!({"Read": place(3)})], 4, 4)),
                 bb(drop_local(1, 5)),
                 bb(json!("Return")),
             ],
@@ -5076,8 +5081,8 @@ mod tests {
             4,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
-                bb(call_fun(8, vec![json!({"Copy": place(0)})], 3, 3)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(8, vec![json!({"Read": place(0)})], 3, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
             ],
@@ -5102,9 +5107,9 @@ mod tests {
                 bb_stmts(
                     vec![assign_local(
                         2,
-                        json!({"BinaryOp": ["Add", json!({"Copy": place(1)}), json!({"Copy": place(3)})]}),
+                        json!({"BinaryOp": ["Add", json!({"Read": place(1)}), json!({"Read": place(3)})]}),
                     )],
-                    call_fun(2, vec![json!({"Copy": place(2)})], 3, 1),
+                    call_fun(2, vec![json!({"Read": place(2)})], 3, 1),
                 ),
                 bb(json!("Return")),
             ],
@@ -5120,14 +5125,14 @@ mod tests {
             6,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
-                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
                 bb(call_fun(3, vec![], 3, 3)),
                 bb_stmts(
                     vec![assign_local(
                         4,
-                        json!({"BinaryOp": ["Add", json!({"Copy": place(3)}), json!({"Copy": place(5)})]}),
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), json!({"Read": place(5)})]}),
                     )],
-                    call_fun(2, vec![json!({"Copy": place(4)})], 5, 4),
+                    call_fun(2, vec![json!({"Read": place(4)})], 5, 4),
                 ),
                 bb(drop_local(1, 5)),
                 bb(json!("Return")),
@@ -5143,7 +5148,7 @@ mod tests {
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
                 bb(call_fun(9, vec![], 3, 2)),
-                bb(call_fun(2, vec![json!({"Copy": place(3)})], 4, 3)),
+                bb(call_fun(2, vec![json!({"Read": place(3)})], 4, 3)),
                 bb(drop_local(1, 4)),
                 bb(json!("Return")),
             ],
@@ -5157,7 +5162,7 @@ mod tests {
     #[test]
     fn pin_style_body_returns_own_index_at_entry_depth() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         // Len into the return place, then Pin: every Return yields Known(0).
         let pin_style = body_of(
             3,
@@ -5192,7 +5197,7 @@ mod tests {
     #[test]
     fn option_wrap_of_own_index_stays_own() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let some = json!({"Adt": [
             {"builtin": null, "generics": {
                 "const_generics": [], "regions": [], "trait_refs": [], "types": [ty()]
@@ -5215,7 +5220,7 @@ mod tests {
                 bb_stmts(
                     vec![
                         assign_local(4, json!({"Aggregate": [some, [copy(3)]]})),
-                        assign_local(5, json!({"Use": [{"Copy": payload}, "No"]})),
+                        assign_local(5, json!({"Use": [{"Read": payload}, "No"]})),
                     ],
                     call_fun(2, vec![copy(5)], 6, 4),
                 ),
@@ -5243,8 +5248,8 @@ mod tests {
             4,
             vec![
                 bb_stmts(
-                    vec![assign_local(2, json!({"Use": [{"Copy": field0}, "No"]}))],
-                    call_fun(2, vec![json!({"Copy": place(2)})], 3, 1),
+                    vec![assign_local(2, json!({"Use": [{"Read": field0}, "No"]}))],
+                    call_fun(2, vec![json!({"Read": place(2)})], 3, 1),
                 ),
                 bb(json!("Return")),
             ],
@@ -5269,9 +5274,9 @@ mod tests {
                 bb_stmts(
                     vec![assign_local(
                         2,
-                        json!({"Use": [{"Copy": deref_field}, "No"]}),
+                        json!({"Use": [{"Read": deref_field}, "No"]}),
                     )],
-                    call_fun(2, vec![json!({"Copy": place(2)})], 3, 1),
+                    call_fun(2, vec![json!({"Read": place(2)})], 3, 1),
                 ),
                 bb(json!("Return")),
             ],
@@ -5287,7 +5292,7 @@ mod tests {
     #[test]
     fn struct_return_with_index_field_is_returns_index() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Copy": place(i)});
+        let copy = |i| json!({"Read": place(i)});
         let adt = json!({"Adt": [
             {"builtin": null, "generics": {
                 "const_generics": [], "regions": [], "trait_refs": [], "types": []
@@ -5386,15 +5391,15 @@ mod tests {
         ]});
         let unknown = json!({"Assign": [
             place(5),
-            {"Use": [{"Copy": place(6)}, "Yes"]}
+            {"Use": [{"Read": place(6)}, "Yes"]}
         ]});
         let assert_term = json!({"Assert": {
             "assert": {
-                "cond": {"Copy": place(3)},
+                "cond": {"Read": place(3)},
                 "expected": true,
                 "check_kind": {"BoundsCheck": {
-                    "len": {"Copy": place(5)},
-                    "index": {"Copy": place(3)}
+                    "len": {"Read": place(5)},
+                    "index": {"Read": place(3)}
                 }}
             },
             "target": 6,
@@ -5409,7 +5414,7 @@ mod tests {
                     call_fun(6, vec![json!({"Move": place(2)})], 3, 2),
                 ),
                 bb(json!({"Switch": {
-                    "discr": {"Copy": place(0)},
+                    "discr": {"Read": place(0)},
                     "targets": {"If": [3, 4]}
                 }})),
                 bb_stmts(vec![stmt(len_of_array)], json!({"Goto": {"target": 5}})),
@@ -5436,11 +5441,11 @@ mod tests {
     fn bounds_check_against_unrelated_length_is_refused() {
         let specials = HashMap::from([(5usize, Special::Index(0))]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
-            "cond": {"Copy": place(5)},
+            "cond": {"Read": place(5)},
             "expected": true,
             "check_kind": {"BoundsCheck": {
-                "len": {"Copy": place(9)},
-                "index": {"Copy": place(5)}
+                "len": {"Read": place(9)},
+                "index": {"Read": place(5)}
             }}
         }))
         .expect("assert");
@@ -5459,11 +5464,11 @@ mod tests {
     fn bounds_check_of_erased_slot_index_against_slot_len_is_accepted() {
         let specials = HashMap::from([(5usize, Special::Index(0)), (6usize, Special::Index(3))]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
-            "cond": {"Copy": place(5)},
+            "cond": {"Read": place(5)},
             "expected": true,
             "check_kind": {"BoundsCheck": {
-                "len": {"Copy": place(6)},
-                "index": {"Copy": place(5)}
+                "len": {"Read": place(6)},
+                "index": {"Read": place(5)}
             }}
         }))
         .expect("assert");
@@ -5482,7 +5487,7 @@ mod tests {
                     "locals": (0..4).map(local_decl).collect::<Vec<_>>()
                 },
                 "body": [
-                    bb(call_fun(3, vec![json!({"Copy": place(1)})], 0, 1)),
+                    bb(call_fun(3, vec![json!({"Read": place(1)})], 0, 1)),
                     bb(json!("Return"))
                 ]
             }
@@ -5504,7 +5509,7 @@ mod tests {
                             3,
                             json!({"BinaryOp": [
                                 "AddChecked",
-                                {"Copy": place(1)},
+                                {"Read": place(1)},
                                 usize_lit(1)
                             ]}),
                         )],
@@ -5517,7 +5522,7 @@ mod tests {
                                 "expected": false,
                                 "check_kind": {"Overflow": [
                                     {"Add": "Wrap"},
-                                    {"Copy": place(1)},
+                                    {"Read": place(1)},
                                     usize_lit(1)
                                 ]}
                             },
@@ -5556,7 +5561,7 @@ mod tests {
     }
 
     fn copy_local(i: u64) -> Value {
-        json!({"Copy": place(i)})
+        json!({"Read": place(i)})
     }
 
     fn move_local(i: u64) -> Value {
@@ -5652,7 +5657,7 @@ mod tests {
             rewrite0.stmts,
             vec![json!({"Assign": [
                 place(30),
-                {"Use": [{"Copy": slot0}, "Yes"]}
+                {"Use": [{"Read": slot0}, "Yes"]}
             ]})],
             "|| shadow_stack_get(base) is a copy of slot 0"
         );
@@ -5661,7 +5666,7 @@ mod tests {
             rewrite1.stmts,
             vec![json!({"Assign": [
                 place(31),
-                {"Use": [{"Copy": slot1}, "Yes"]}
+                {"Use": [{"Read": slot1}, "Yes"]}
             ]})],
             "|| shadow_stack_get(base + 1) is a copy of slot 1"
         );
@@ -5746,7 +5751,7 @@ mod tests {
         });
         json!({"Assign": [
             place(dest),
-            {"Use": [{"Copy": {
+            {"Use": [{"Read": {
                 "kind": {"Projection": [deref, {"Index": {
                     "offset": {"Const": [
                         {"Integer": {"Unsigned": ["Usize", k.to_string()]}},
@@ -5803,7 +5808,7 @@ mod tests {
             rewrite_len.stmts,
             vec![json!({"Assign": [
                 place(7),
-                {"Use": [{"Copy": slot0}, "Yes"]}
+                {"Use": [{"Read": slot0}, "Yes"]}
             ]})],
             "get(len) after pin_root is scalar slot 0; the slice adds no depth"
         );
@@ -5887,7 +5892,7 @@ mod tests {
                 bb(call_fun(5, vec![copy_local(1)], 3, 2)),
                 bb(call_fun(2, vec![copy_local(3)], 4, 3)),
                 bb(json!({"Switch": {
-                    "discr": {"Copy": place(4)},
+                    "discr": {"Read": place(4)},
                     "targets": {"If": [4, 5]}
                 }})),
                 bb(json!({"Goto": {"target": 8}})),

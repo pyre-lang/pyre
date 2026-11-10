@@ -6831,7 +6831,7 @@ pub(in crate::front::mir) fn rvalue_moves_local(rvalue: &Rvalue, local: usize) -
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::Repeat { operand: op, .. }
         | Rvalue::ShallowInitBox(op, _) => operand_moves_local(op, local),
         Rvalue::BinaryOp(_, lhs, rhs) => {
             operand_moves_local(lhs, local) || operand_moves_local(rhs, local)

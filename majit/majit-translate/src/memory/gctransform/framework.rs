@@ -854,7 +854,7 @@ fn rvalue_label(r: &majit_charon_reader::ullbc::Rvalue) -> &'static str {
         R::Discriminant(_) => "Discriminant",
         R::Cast(..) => "Cast",
         R::Len(_) => "Len",
-        R::Repeat(..) => "Repeat",
+        R::Repeat { .. } => "Repeat",
         R::ShallowInitBox(..) => "ShallowInitBox",
         R::RawPtr { .. } => "RawPtr",
         R::NullaryOp(..) => "NullaryOp",
@@ -1272,9 +1272,7 @@ mod tests {
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
-                        "args": [],
-                        "dest": place(0)
-                    },
+                        "args": []}, "dest": place(0),
                     "target": target,
                     "on_unwind": on_unwind
                 }}}
@@ -1436,9 +1434,7 @@ mod tests {
                     {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {"kind": {"Fun": 1}, "generics": gens.clone()}},
-                            "args": [],
-                            "dest": place(0)
-                        },
+                            "args": []}, "dest": place(0),
                         "target": 2,
                         "on_unwind": 2
                     }}}},
@@ -1526,7 +1522,7 @@ mod tests {
                 "statements": [],
                 "kind": "Regular",
                 "terminator": {"span": span.clone(), "kind": {"Call": {
-                    "call": {"func": func, "args": [], "dest": place(0)},
+                    "call": {"func": func, "args": []}, "dest": place(0),
                     "target": target,
                     "on_unwind": on_unwind
                 }}}

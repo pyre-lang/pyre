@@ -8604,10 +8604,10 @@ fn rewrite_index_elem_to_local(elem: &ProjectionElem, slot: usize) -> Option<Pro
     let mut value = value.clone();
     let index = value.get_mut("Index")?.as_object_mut()?;
     let offset = index.get_mut("offset")?;
-    let inner = offset.get("Copy").or_else(|| offset.get("Move"))?.clone();
+    let inner = majit_charon_reader::ullbc::operand_json_place(offset)?.clone();
     let mut place = inner;
     place["kind"] = serde_json::json!({"Local": slot as u64});
-    *offset = serde_json::json!({"Copy": place});
+    *offset = serde_json::json!({"Read": place});
     Some(ProjectionElem::Tagged(value))
 }
 
