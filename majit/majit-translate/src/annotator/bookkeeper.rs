@@ -3483,9 +3483,9 @@ impl Bookkeeper {
     /// `obj_key = Constant(pyobj)`). HostObject constants reuse
     /// [`Self::getdesc`]; a `Repr` constant (`Repr._freeze_`) is the
     /// frozen-PBC fallback, cached under `ConstValue::Repr`.
-    /// `ConstValue::Function` wraps [`HostObject::new_user_function`]
-    /// the same way [`Self::immutablevalue`] does (bytecode
-    /// `MAKE_FUNCTION`). A Charon `__fn_const` must reuse
+    /// `ConstValue::Function` is cached under that same `descs` map
+    /// keyed by the Function constant (`GraphFunc.id` via
+    /// `_hashable_identity`). A Charon `__fn_const` must reuse
     /// `CallRegistry.entry.host_object` instead of this arm — two
     /// HostObjects for one GraphStore funcobj are two `FunctionDesc`s.
     pub(crate) fn getdesc_for_const(
@@ -3495,8 +3495,23 @@ impl Bookkeeper {
         match x {
             ConstValue::HostObject(obj) => self.getdesc(obj),
             ConstValue::Function(func) => {
+                // bookkeeper.py `getdesc`: `obj_key = Constant(pyobj)` then
+                // `self.descs[obj_key]`. One Python function object is one
+                // desc. `ConstValue::Function` equality/hash is `GraphFunc.id`
+                // (`_hashable_identity`), the stable function-object identity
+                // (same path / same graph). Populate `descs` under that
+                // ConstValue so two requests share one FunctionDesc. A fresh
+                // `HostObject::new_user_function` per call would not:
+                // HostObject equality is allocation identity.
+                if let Some(existing) = self.descs.borrow().get_const(x) {
+                    return Ok(existing.clone());
+                }
                 let host = HostObject::new_user_function((**func).clone());
-                self.getdesc(&host)
+                let entry = self.getdesc(&host)?;
+                self.descs
+                    .borrow_mut()
+                    .insert_const(x.clone(), entry.clone());
+                Ok(entry)
             }
             ConstValue::Repr(_) => {
                 if let Some(existing) = self.descs.borrow().get_const(x) {
@@ -6945,9 +6960,12 @@ impl Bookkeeper {
             ConstValue::List(items) => self.immutable_list_with_key(None, x, items.as_slice()),
             ConstValue::Dict(_) => self.immutable_dict_with_key(None, x),
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
-            ConstValue::Function(func) => {
-                let host = HostObject::new_user_function((**func).clone());
-                self.immutablevalue_hostobject(&host, &ConstValue::HostObject(host.clone()))
+            ConstValue::Function(_) => {
+                // Same `descs` cache as `getdesc_for_const` (`bookkeeper.py`
+                // `getdesc`): one `GraphFunc.id` → one FunctionDesc. Minting
+                // a HostObject here would allocate a second desc.
+                let entry = self.getdesc_for_const(x)?;
+                Ok(SomeValue::PBC(SomePBC::new(vec![entry], false)))
             }
             ConstValue::LLPtr(_) => {
                 assert!(crate::translator::rtyper::extregistry::is_registered(x));
@@ -17405,6 +17423,90 @@ mod tests {
         // Bytecode MAKE_FUNCTION mints a HostObject per code object.
         // A Charon __fn_const must reuse CallRegistry.entry.host_object
         // so the desc is the same one direct calls already use.
+    }
+
+    #[test]
+    fn getdesc_for_const_function_same_constant_reuses_function_desc() {
+        use crate::annotator::model::DescKind;
+        use crate::flowspace::model::{Constant, GraphFunc};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        let x1 = ConstValue::Function(Box::new(func.clone()));
+        let x2 = ConstValue::Function(Box::new(func));
+        let d1 = bk
+            .getdesc_for_const(&x1)
+            .expect("first equal Function constant");
+        let d2 = bk
+            .getdesc_for_const(&x2)
+            .expect("second equal Function constant");
+        assert_eq!(d1.kind(), DescKind::Function);
+        let f1 = d1.as_function().expect("FunctionDesc");
+        let f2 = d2.as_function().expect("FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&f1, &f2),
+            "equal Function constants must share one FunctionDesc"
+        );
+    }
+
+    #[test]
+    fn immutablevalue_function_same_constant_reuses_function_desc() {
+        use crate::flowspace::model::{Constant, GraphFunc};
+
+        let bk = bk();
+        let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        let x = ConstValue::Function(Box::new(func));
+        let s1 = bk
+            .immutablevalue(&x)
+            .expect("first immutablevalue of Function constant");
+        let s2 = bk
+            .immutablevalue(&x)
+            .expect("second immutablevalue of Function constant");
+        match (s1, s2) {
+            (SomeValue::PBC(a), SomeValue::PBC(b)) => {
+                let d1 = a
+                    .descriptions
+                    .values()
+                    .next()
+                    .expect("first SomePBC desc")
+                    .as_function()
+                    .expect("FunctionDesc");
+                let d2 = b
+                    .descriptions
+                    .values()
+                    .next()
+                    .expect("second SomePBC desc")
+                    .as_function()
+                    .expect("FunctionDesc");
+                assert!(
+                    Rc::ptr_eq(&d1, &d2),
+                    "immutablevalue twice on the same Function constant must share one FunctionDesc"
+                );
+            }
+            other => panic!("expected two SomePBCs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getdesc_for_const_different_functions_get_different_descs() {
+        use crate::flowspace::model::{Constant, GraphFunc};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        // Distinct GraphFunc::new allocations even with the same name:
+        // identity is GraphFunc.id, not the function name.
+        let x1 = ConstValue::Function(Box::new(GraphFunc::new("f", globals.clone())));
+        let x2 = ConstValue::Function(Box::new(GraphFunc::new("f", globals)));
+        let d1 = bk.getdesc_for_const(&x1).expect("first function");
+        let d2 = bk.getdesc_for_const(&x2).expect("second function");
+        let f1 = d1.as_function().expect("FunctionDesc");
+        let f2 = d2.as_function().expect("FunctionDesc");
+        assert!(
+            !Rc::ptr_eq(&f1, &f2),
+            "different GraphFunc objects must get different FunctionDescs"
+        );
     }
 
     #[test]
