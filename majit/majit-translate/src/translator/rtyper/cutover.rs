@@ -4722,6 +4722,24 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self"],
         LowLevelType::Address,
     ),
+    // `exceptiontransform.py` `rpyexc_occurred`: an opaque Bool-returning
+    // helper (`build_func("RPyExceptionOccurred", rpyexc_occurred, [],
+    // lltype.Bool)`).
+    (
+        &["majit_gc", "gc_alloc_failed_pending"],
+        &[],
+        LowLevelType::Bool,
+    ),
+    (
+        &["gc_hook", "gc_alloc_failed_pending"],
+        &[],
+        LowLevelType::Bool,
+    ),
+    (
+        &["pyre_object", "gc_hook", "gc_alloc_failed_pending"],
+        &[],
+        LowLevelType::Bool,
+    ),
     // `OnceLock<fn(...)>` for the `sys.exc_info` JIT-direct helper.
     (
         &["pyre_interpreter", "function", "SYS_EXC_INFO_DIRECT_FN"],

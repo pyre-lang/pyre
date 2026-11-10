@@ -617,6 +617,9 @@ pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
         hash: 0,
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // Header alloc failed after the value box: rebuild a fully immortal
         // string rather than pair a `malloc_typed` header with a GC value box it
         // cannot grey. `gc_alloc_storage_box` may have returned a GC-owned
@@ -674,11 +677,13 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
             &mut needs_write_barrier,
         )
     };
-    let raw = match raw {
-        Some(p) if !p.is_null() => p,
-        _ => std::ptr::null_mut(),
-    };
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_raise()
+        .unwrap_or(std::ptr::null_mut());
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         let recovered = unsafe { utf8_payload_wtf8(unicode.value).to_owned() };
         return w_str_from_wtf8_immortal(recovered);
     }
@@ -817,6 +822,9 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // Keep the subclass header. An immortal holder cannot grey a
         // GC value box, so copy the bytes into `malloc_raw` first.
         // Unit tests have no GC hook: `gc_alloc_storage_box` already
@@ -890,11 +898,15 @@ pub fn intern_locks_after_fork_child() {
 
 fn intern_dict(
     table: &mut WeakInternTable,
-) -> &mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey> {
+) -> Option<&mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>> {
     if table.0.is_null() {
-        table.0 = crate::rweakvaldict::ll_new_weakdict();
+        let dict = crate::rweakvaldict::ll_new_weakdict();
+        if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
+            return None;
+        }
+        table.0 = dict;
     }
-    unsafe { &mut *table.0 }
+    Some(unsafe { &mut *table.0 })
 }
 
 /// `interned_strings.get` (`ObjSpace.new_interned_str` / `new_interned_w_str`).
@@ -930,17 +942,30 @@ fn intern_lookup_wtf8_prebuilt(value: &Wtf8) -> Option<PyObjectRef> {
 /// `ll_new_weakdict` for `interned_strings`. Called after the WEAKDICT type
 /// ids are registered and the collector singleton is live. `ObjSpace.__init__`
 /// builds this table once; a later thread entry must not replace it.
-pub fn init_interned_strings() {
+pub fn init_interned_strings() -> bool {
     let mut table = lock_intern();
-    intern_dict(&mut table);
+    intern_dict(&mut table).is_some()
+}
+
+/// `ObjSpace.__init__` must finish `interned_strings` (`ll_new_weakdict`)
+/// before the space is usable. Bootstrap has no Python error channel.
+pub fn init_interned_strings_or_alloc_failed() -> ! {
+    crate::gc_hook::gc_alloc_failed(std::mem::size_of::<
+        crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
+    >())
 }
 
 /// Tests that install a fresh collector replace the table so its blocks
 /// belong to that heap (`intern_dict_is_prebuilt_stable_across_minor_and_major`
 /// in pyre-interpreter eval.rs tests).
-pub fn replace_interned_strings_dict() {
+pub fn replace_interned_strings_dict() -> bool {
+    let dict = crate::rweakvaldict::ll_new_weakdict();
+    if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
+        return false;
+    }
     let mut table = lock_intern();
-    table.0 = crate::rweakvaldict::ll_new_weakdict();
+    table.0 = dict;
+    true
 }
 
 /// The interned_strings `WEAKDICT` pointer (`WEAK_INTERN.0`).
@@ -988,7 +1013,9 @@ fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef 
     let valueref = prebuilt_weakref(obj);
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
     let mut table = lock_intern();
-    let dict = intern_dict(&mut table);
+    let Some(dict) = intern_dict(&mut table) else {
+        return obj;
+    };
     if let Some(existing) = dict.ll_get(key)
         && (!replace_managed || dict.ll_valueref_is_prebuilt(key))
     {
@@ -1019,22 +1046,29 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     // `ll_set_nonnull`: `valueref = weakref_create(llvalue)` first.
     let valueref = unsafe { crate::weakref::w_weakref_new(obj) };
+    if crate::gc_hook::gc_alloc_failed_pending() && valueref.is_null() {
+        return PY_NULL;
+    }
     let valueref_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(valueref as PyObjectRef);
     let mut table = lock_intern();
     // A GET miss on a still-null table does not allocate it; `intern_dict`
     // may collect here. Reload `obj` before reading its STR key.
-    let dict = intern_dict(&mut table);
+    let Some(dict) = intern_dict(&mut table) else {
+        return PY_NULL;
+    };
     let key = crate::celldict::StrKey(unsafe {
         w_str_storage(crate::gc_roots::shadow_stack_get(obj_slot))
     });
     if let Some(existing) = dict.ll_get(key) {
         return existing;
     }
-    dict.ll_set_nonnull_valueref(
+    if !dict.ll_set_nonnull_valueref(
         key,
         crate::gc_roots::shadow_stack_get(valueref_slot) as *mut crate::weakref::Weakref,
-    );
+    ) {
+        return PY_NULL;
+    }
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 

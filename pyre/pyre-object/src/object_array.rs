@@ -719,6 +719,9 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
     let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return block;
+        }
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let block =
             crate::gc_roots::shadow_stack_get(values_base + values.len()) as *mut ItemsBlock;
@@ -755,6 +758,9 @@ pub unsafe fn grow_instance_items_block(
         let old_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(old as PyObjectRef);
         let fresh = alloc_mapdict_storage_block(new_cap);
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
+            return fresh;
+        }
         let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock;
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);
@@ -795,6 +801,9 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
         unsafe { (*block).capacity = cap };
         return block;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
+    }
     unsafe { alloc_items_block(cap) }
 }
 
@@ -828,7 +837,11 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// one, and it is why the entry point here stays the no-collect one until the
 /// root-set census is re-graded for liveness rather than for movement.
 unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
-    unsafe { try_alloc_items_block_gc(cap).unwrap_or_else(|| items_block_alloc_failed(cap)) }
+    match unsafe { try_alloc_items_block_gc(cap) } {
+        Some(pair) => pair,
+        None if crate::gc_hook::gc_alloc_failed_pending() => (std::ptr::null_mut(), false),
+        None => items_block_alloc_failed(cap),
+    }
 }
 
 /// [`alloc_items_block_gc`] for a capacity that came from Python.
@@ -837,27 +850,34 @@ unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
 unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)> {
     if itemsblock_gc_enabled() {
         let payload = try_items_block_layout(cap)?.size();
-        if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)
-            && !raw.is_null()
+        match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+            PY_OBJECT_ARRAY_GC_TYPE_ID,
+            payload,
+        ))
+        .allocated_or_raise()
         {
-            let block = raw as *mut ItemsBlock;
-            unsafe {
-                // IncrementalMiniMark does not zero-fill. Publish
-                // `capacity` only after the payload is NULL: the type-9
-                // walker traces `items[0..capacity]` as soon as this
-                // block is a root, and callers `pin_root` it before
-                // `try_gc_owns_object`. Zeroing the whole payload first
-                // leaves a 0 length header so a concurrent walk cannot
-                // follow dirty nursery words
-                // (`rlist.py` `_ll_list_resize_hint_really` mallocs
-                // through `gc_malloc_array`, which leaves GCREF slots
-                // NULL).
-                // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
-                // on the GCREF itself writes no bytes. Zero through `*mut u8`.
-                std::ptr::write_bytes(raw as *mut u8, 0, payload);
-                (*block).capacity = cap;
+            Some(raw) => {
+                let block = raw as *mut ItemsBlock;
+                unsafe {
+                    // IncrementalMiniMark does not zero-fill. Publish
+                    // `capacity` only after the payload is NULL: the type-9
+                    // walker traces `items[0..capacity]` as soon as this
+                    // block is a root, and callers `pin_root` it before
+                    // `try_gc_owns_object`. Zeroing the whole payload first
+                    // leaves a 0 length header so a concurrent walk cannot
+                    // follow dirty nursery words
+                    // (`rlist.py` `_ll_list_resize_hint_really` mallocs
+                    // through `gc_malloc_array`, which leaves GCREF slots
+                    // NULL).
+                    // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
+                    // on the GCREF itself writes no bytes. Zero through `*mut u8`.
+                    std::ptr::write_bytes(raw as *mut u8, 0, payload);
+                    (*block).capacity = cap;
+                }
+                return Some((block, true));
             }
-            return Some((block, true));
+            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
+            None => {}
         }
     }
     unsafe { try_alloc_items_block(cap).map(|block| (block, false)) }
@@ -883,6 +903,9 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let save = crate::gc_roots::pin_roots(values);
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
+    if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+        return std::ptr::null_mut();
+    }
     // `alloc_items_block_gc` returns a fresh GCREF.  RPython's
     // gct_fv_gc_malloc pop_roots makes that result live before the next
     // collecting operation, so the fresh array is published here rather than
@@ -955,6 +978,9 @@ pub unsafe fn grow_list_items_block_gc(
     let base = roots.base();
     let _ = roots.pin_root(old as PyObjectRef);
     let newitems = unsafe { ll_new_items_array(new_cap as i64) };
+    if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
+        return std::ptr::null_mut();
+    }
     if live_len > 0 {
         let _ = roots.pin_root(newitems as PyObjectRef);
         unsafe {
@@ -984,6 +1010,9 @@ pub(crate) unsafe fn ll_new_items_array(count: i64) -> *mut ItemsBlock {
     let count = count as usize;
     unsafe {
         let (block, _) = alloc_items_block_gc(count);
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return block;
+        }
         let base = items_block_items_base(block);
         for i in 0..count {
             *base.add(i) = PY_NULL;
@@ -1072,6 +1101,9 @@ pub unsafe fn try_grow_list_items_block_gc(
 pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut ItemsBlock {
     if !itemsblock_gc_enabled() {
         let block = unsafe { alloc_items_block(cap) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return block;
+        }
         if cap > 0 {
             let dst = unsafe { std::slice::from_raw_parts_mut(items_block_items_base(block), cap) };
             crate::gc_roots::shadow_stack_copy_range(save_point, dst);
@@ -1081,6 +1113,9 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
     let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
+    if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+        return std::ptr::null_mut();
+    }
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     // Barrier before the fill — see `alloc_list_items_block_gc`.
     // `owns_block` is the placement `try_alloc_items_block_gc` already knew.
@@ -1125,10 +1160,11 @@ pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsB
         return None;
     }
     let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    let raw = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)?;
-    if raw.is_null() {
-        return None;
-    }
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+        PY_OBJECT_ARRAY_GC_TYPE_ID,
+        payload,
+    ))
+    .allocated_or_raise()?;
     let block = raw as *mut ItemsBlock;
     unsafe {
         (*block).capacity = cap;
@@ -1157,6 +1193,9 @@ pub fn _ll_fixed_alloc_and_set_nonnull_r_trampoline(
     let _ = crate::gc_roots::pin_root(item);
     unsafe {
         let (block, _) = alloc_items_block_gc(count);
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return block;
+        }
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let block = crate::gc_roots::shadow_stack_get(item_slot + 1) as *mut ItemsBlock;
         let n = items_block_capacity(block).min(count);
@@ -1185,7 +1224,11 @@ pub fn _ll_fixed_alloc_and_set_nonnull_r_trampoline(
 /// holds only the 8-byte capacity header (used by tuple — see
 /// [`alloc_tuple_items_block`] — for empty tuples).
 unsafe fn alloc_items_block(cap: usize) -> *mut ItemsBlock {
-    unsafe { try_alloc_items_block(cap).unwrap_or_else(|| items_block_alloc_failed(cap)) }
+    match unsafe { try_alloc_items_block(cap) } {
+        Some(block) => block,
+        None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => items_block_alloc_failed(cap),
+    }
 }
 
 /// [`alloc_items_block`] for a capacity that came from Python, where the
@@ -1361,8 +1404,11 @@ unsafe fn grow_items_block(
     live_len: usize,
 ) -> *mut ItemsBlock {
     unsafe {
-        try_grow_items_block(old, new_cap, live_len)
-            .unwrap_or_else(|| items_block_alloc_failed(new_cap))
+        match try_grow_items_block(old, new_cap, live_len) {
+            Some(block) => block,
+            None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+            None => items_block_alloc_failed(new_cap),
+        }
     }
 }
 
@@ -1445,9 +1491,10 @@ const _: () = assert!(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBlock {
-    unsafe {
-        try_alloc_typed_items_block(cap, tid)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
+    match unsafe { try_alloc_typed_items_block(cap, tid) } {
+        Some(block) => block,
+        None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()),
     }
 }
 
@@ -1466,8 +1513,10 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     if itemsblock_gc_enabled() {
         match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(
             tid, payload,
-        )) {
-            crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
+        ))
+        .allocated_or_raise()
+        {
+            Some(raw) => {
                 let block = raw as *mut TypedItemsBlock;
                 unsafe {
                     (*block).capacity = cap;
@@ -1479,16 +1528,8 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
                 }
                 return Some(block);
             }
-            // `try_gc_alloc_stable_raw` ends the process on this answer,
-            // because its callers meet a null by allocating outside the heap
-            // and a block holding managed references must never live there.  A
-            // typed block holds unboxed words and its capacity comes from
-            // Python, so the refusal is reported instead: nothing is allocated
-            // anywhere on this path and the caller raises `MemoryError`.
-            crate::gc_hook::GcAllocOutcome::Failed => return None,
-            // No heap owns the request -- before the GC is up, or in a unit
-            // test -- so the plain allocation below is the whole heap.
-            crate::gc_hook::GcAllocOutcome::NoRoute => {}
+            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
+            None => {}
         }
     }
     unsafe {
@@ -1598,6 +1639,9 @@ macro_rules! typed_items_block_grow {
                 let base = roots.base();
                 let _ = roots.pin_root(old as crate::PyObjectRef);
                 let newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
+                if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
+                    return std::ptr::null_mut();
+                }
                 // Nothing on the heap names `newitems` until the caller's
                 // `l.items = newitems`, so it stays rooted across the release
                 // below as well as the copy.
@@ -1982,10 +2026,12 @@ unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut F
                 &mut needs_write_barrier,
             )
         })
-        .allocated_or_abort(payload)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
         let block = if !raw.is_null() {
             raw as *mut FixedObjectArray
+        } else if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
         } else {
             let layout = mro_block_layout(len);
             (unsafe { std_alloc_gc_array(layout, false) })
@@ -2027,6 +2073,8 @@ unsafe fn fill_mro_block(
     let len = values.len();
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
     } else {
         // Bootstrap / no-hook fallback: a header-prefixed `std::alloc` block
         // ([`std_alloc_gc_array`]); the collector does not own it.
@@ -2223,10 +2271,12 @@ pub fn allocate_array_struct_at_typed(
         .checked_add(items_size)
         .expect("GcTypedArray allocation size overflow");
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, total);
-    assert!(
-        !raw.is_null(),
-        "allocate_array_struct_at_typed: collector installed but allocation had no route"
-    );
+    if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
+        panic!("allocate_array_struct_at_typed: collector installed but allocation had no route");
+    }
     // `try_gc_alloc_stable_raw` is uninitialized. A virtual
     // `DICTENTRYARRAY` rebuild is `bh_new_array_clear`; leave
     // `f_valid` and the value word 0 like

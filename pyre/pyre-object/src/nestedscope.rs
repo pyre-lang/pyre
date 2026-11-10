@@ -187,6 +187,9 @@ pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef 
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
+    }
     Cell::allocate(Cell {
         ob: header,
         contents: value,

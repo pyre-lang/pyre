@@ -338,7 +338,12 @@ fn cached_extension_handle(path: &Path) -> Option<usize> {
     EXTENSIONS.lock().get(path).map(|entry| entry._handle)
 }
 
-fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) {
+fn fixup_extension(
+    module: PyObjectRef,
+    name: &str,
+    path: &Path,
+    handle: usize,
+) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let module = roots.pin_root(module);
@@ -346,6 +351,12 @@ fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) 
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
     let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let dict_copy = unsafe { pyre_object::dictmultiobject::w_dict_copy(dict) };
+    // `State.fixup_extension` copies the module dict before inserting the
+    // cache entry; `DictStrategy.copy` / `W_DictObject.copy` propagate
+    // construction failure.
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && dict_copy.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     EXTENSIONS.lock().insert(
         path.to_path_buf(),
         ExtensionCacheEntry {
@@ -354,6 +365,7 @@ fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) 
         },
     );
     EXTENSIONS_ACTIVE.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Which entry point an extension published, and under which protocol.
@@ -570,7 +582,7 @@ pub fn load_extension_module(
     if let (Some(address), Some(hooks)) = (cffi_address, crate::importing::optional_module_hooks())
     {
         let module = (hooks.load_cffi1_module)(name, path, address)?;
-        fixup_extension(module, name, path, handle);
+        fixup_extension(module, name, path, handle)?;
         return Ok(module);
     }
     let Some((protocol, address)) = found else {
@@ -621,7 +633,7 @@ pub fn load_extension_module(
             name,
             path,
             handle,
-        ),
+        )?,
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }

@@ -425,7 +425,7 @@ pub fn w_getset_property_instantiate(
             &mut needs_write_barrier,
         )
     })
-    .allocated_or_abort(W_GETSET_PROPERTY_OBJECT_SIZE)
+    .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let value = GetSetProperty {
         ob: PyObject {
@@ -443,6 +443,9 @@ pub fn w_getset_property_instantiate(
         use_closure,
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         return crate::lltype::malloc_typed(value) as PyObjectRef;
     }
     unsafe {

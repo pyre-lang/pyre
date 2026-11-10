@@ -86,7 +86,9 @@ impl DictStrategy for ClassDictStrategySlot {
         CLASS_DICT_METHODS.clear(w_dict)
     }
 
-    unsafe fn switch_to_object_strategy(&self, _w_dict: PyObjectRef) {}
+    unsafe fn switch_to_object_strategy(&self, _w_dict: PyObjectRef) -> bool {
+        true
+    }
 
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         CLASS_DICT_METHODS.walk_gc_refs(w_dict, visitor)

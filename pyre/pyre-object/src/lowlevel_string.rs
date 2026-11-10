@@ -154,7 +154,12 @@ fn alloc_lowlevel_string(
         // so the next minor can free it, and non-moving so a caller that
         // still holds the operands as i64 can copy them after the call.
         // A raw `alloc_zeroed` fallback is never reclaimed.
+        // rstr.mallocstr: Failed stops; only NoRoute tries the non-moving
+        // young allocator.
         let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size);
+        if crate::gc_hook::gc_alloc_failed_pending() && young.is_null() {
+            return 0;
+        }
         if young.is_null() {
             crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, total_size)
         } else {
@@ -173,6 +178,8 @@ fn alloc_lowlevel_string(
             unsafe { std::ptr::write_bytes(ptr, 0, total_size) };
         }
         ptr
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        return 0;
     } else {
         // Host fallback of `rstr.mallocstr` (`malloc(STR, length)`): reclaimable
         // `malloc_varsize`, not a prebuilt. The leaf still stamps

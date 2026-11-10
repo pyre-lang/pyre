@@ -182,13 +182,17 @@ impl SetStrategyKind {
     }
 }
 
-/// Failure modes of `ObjectSetStrategy.update`'s table merge.
+/// Failure modes of a set table insert or merge (`W_BaseSetObject.add`,
+/// `AbstractUnwrappedSetStrategy.update`).
 pub enum SetUpdateError {
     /// An equality callback raised; its concrete exception is parked in the
     /// interpreter's pending dict-key error slot.
     Key(crate::dictmultiobject::DictKeyError),
     /// A callback changed one of the tables while it was being traversed.
     ChangedSize,
+    /// Collector allocation failed during `ll_dict_setitem` growth or
+    /// `ll_dict_copy`. The pending exception is still in the shared channel.
+    Memory,
 }
 
 /// `setobject.py SetStrategy`. `EmptySetStrategy`, `BytesSetStrategy`,
@@ -931,7 +935,11 @@ unsafe fn wrap_shared_utf8(block: *mut crate::unicodeobject::Utf8Str) -> PyObjec
         hash: 0,
     };
     if raw.is_null() {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut crate::W_UnicodeObject, body) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);
@@ -1164,6 +1172,9 @@ where
         (),
         crate::dictmultiobject::ObjectKeyBuildHasher,
     >::from_preserved_slots(&slot_keys, &snap.live, index_len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
     // `from_preserved_slots` pins the wrapped keys across `_ll_malloc_entries`.
     // The box malloc below is stable and does not collect; the keys stay on
     // the shadow stack until that box, which traces them, is installed.
@@ -1188,8 +1199,13 @@ where
 
 /// `AbstractUnwrappedSetStrategy.add`'s correct-type arm,
 /// `d[self.unwrap(w_key)] = None`, on the set pinned at `obj_slot`. The table
-/// insert may allocate, so the set is read back from its slot.
-unsafe fn unwrapped_store<S>(strategy: &S, obj_slot: usize, unwrapped: S::Key)
+/// insert may allocate (`ll_dict_setitem`), so the set is read back from its
+/// slot. A collector failure leaves the length unpublished.
+unsafe fn unwrapped_store<S>(
+    strategy: &S,
+    obj_slot: usize,
+    unwrapped: S::Key,
+) -> Result<(), SetUpdateError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1199,9 +1215,13 @@ where
             unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
         unsafe { (*strategy.storage_ptr(set)).insert(unwrapped, ()).is_none() }
     };
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err(SetUpdateError::Memory);
+    }
     if inserted {
         publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(obj_slot));
     }
+    Ok(())
 }
 
 /// `AbstractUnwrappedSetStrategy.add`.
@@ -1222,7 +1242,7 @@ where
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
         let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, key.hash) };
-        unsafe { unwrapped_store(strategy, obj_slot, unwrapped) };
+        unsafe { unwrapped_store(strategy, obj_slot, unwrapped)? };
         return Ok(());
     }
     // Wrong type: `switch_to_object_strategy`, then `w_set.add`.
@@ -1407,6 +1427,12 @@ where
     let src_slot = dst_slot + 1;
     let src = crate::gc_roots::shadow_stack_get(src_slot);
     let copied = unsafe { (*strategy.storage_ptr(&*(src as *const W_SetObject))).clone() };
+    // `RDict::clone` is `ll_dict_copy` and has no error channel; a failed
+    // entries/index allocation leaves an empty table and the pending flag.
+    // Drop that table unboxed so the destination keeps its prior storage.
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
     let len = copied.len();
     let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     {
@@ -1518,19 +1544,28 @@ where
         }
         keys
     };
-    let grew = {
+    let (grew, failed) = {
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
         let storage = unsafe { &mut *strategy.storage_ptr(&*(dst as *mut W_SetObject)) };
         let mut grew = false;
+        let mut failed = false;
         for key in keys {
-            if storage.insert(key, ()).is_none() {
+            let fresh = storage.insert(key, ()).is_none();
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                failed = true;
+                break;
+            }
+            if fresh {
                 grew = true;
             }
         }
-        grew
+        (grew, failed)
     };
     if grew {
         publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(dst_slot));
+    }
+    if failed {
+        return Err(SetUpdateError::Memory);
     }
     Ok(())
 }
@@ -2372,16 +2407,20 @@ pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
     }
 }
 
+/// `ll_dict_setitem` allocation failure from [`jit_int_set_add`]. `0` stores
+/// the key (including a duplicate); `-1` falls back to `strategy.add`.
+pub const JIT_INT_SET_ADD_MEMORY: i64 = -3;
+
 /// `IntegerSetStrategy.add` for a key that `is_correct_type`:
 /// `self.unerase(w_set.sstorage)[self.unwrap(w_key)] = None`. On an empty set
 /// this is `EmptySetStrategy.add`'s `is_plain_int1` arm first: the set
 /// switches to `IntegerSetStrategy` with its empty storage, then `w_set.add`
-/// takes the same store. The int-keyed store runs no `__hash__` or `__eq__`,
-/// so this cannot raise or force.
+/// takes the same store. The int-keyed store runs no `__hash__` or `__eq__`.
 ///
 /// Answers `0` once the key is stored. `-1` means the set holds neither
 /// `EmptySetStrategy` nor `IntegerSetStrategy`, or its stripe is contended;
 /// the caller then takes `strategy.add` with the wrapped key.
+/// [`JIT_INT_SET_ADD_MEMORY`] is table allocation failure.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
     unsafe {
@@ -2406,8 +2445,11 @@ pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
                 crate::gc_roots::shadow_stack_get(obj_slot),
             );
         }
-        unwrapped_store(&INTEGER_SET_STRATEGY, obj_slot, key);
-        0
+        match unwrapped_store(&INTEGER_SET_STRATEGY, obj_slot, key) {
+            Ok(()) => 0,
+            Err(SetUpdateError::Memory) => JIT_INT_SET_ADD_MEMORY,
+            Err(_) => -1,
+        }
     }
 }
 
@@ -2774,7 +2816,11 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     }
 }
 
@@ -2821,7 +2867,11 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     }
 }
 
@@ -3019,7 +3069,7 @@ pub unsafe fn w_set_insert_key_checked(
 ///
 /// `Ok(())` and `Ok(false)` share the zero payload. `Ok(true)` stores 1.
 /// `Err(DictKeyError)` stores the address of one static unit. `SetUpdateError`
-/// is its `u8` tag (`Key` = 0, `ChangedSize` = 1).
+/// is its `u8` tag (`Key` = 0, `ChangedSize` = 1, `Memory` = 2).
 #[repr(C)]
 struct StrategyResultShell {
     discriminant: i64,
@@ -3065,6 +3115,10 @@ static STRATEGY_RESULT_ERR_CHANGED_SIZE: StrategyResultShell = StrategyResultShe
     discriminant: 1,
     payload: 1,
 };
+static STRATEGY_RESULT_ERR_MEMORY: StrategyResultShell = StrategyResultShell {
+    discriminant: 1,
+    payload: 2,
+};
 
 fn strategy_result_ptr<T>(shell: &'static T) -> crate::gc_hook::GCREF {
     std::ptr::from_ref(shell) as crate::gc_hook::GCREF
@@ -3075,6 +3129,7 @@ fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> crate::gc_hook:
         Ok(()) => &STRATEGY_RESULT_OK_ZERO,
         Err(SetUpdateError::Key(_)) => &STRATEGY_RESULT_ERR_KEY,
         Err(SetUpdateError::ChangedSize) => &STRATEGY_RESULT_ERR_CHANGED_SIZE,
+        Err(SetUpdateError::Memory) => &STRATEGY_RESULT_ERR_MEMORY,
     };
     strategy_result_ptr(shell)
 }
@@ -3440,6 +3495,9 @@ unsafe fn difference_update_object_storage(
             crate::gc_roots::shadow_stack_get(dst_slot),
             crate::gc_roots::shadow_stack_get(result_slot),
         );
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return Err(SetUpdateError::Memory);
+        }
         return Ok(());
     }
     // `src` is a distinct storage, so removing from `dst` cannot renumber it.
@@ -3582,6 +3640,9 @@ unsafe fn w_set_insert_key_into(
         true
     }) {
         if result.map_err(SetUpdateError::Key)? {
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return Err(SetUpdateError::Memory);
+            }
             // The key landed in `items`, which a probing `clear` may already
             // have detached from `dst`. Barrier that box, not the set body.
             // The live length stays the 0 `clear` published.
@@ -3601,6 +3662,9 @@ unsafe fn w_set_insert_key_into(
     // repeat its comparisons — the ones that can re-enter this table.  Place it
     // on the digest alone (`ll_call_insert_clean_function`).
     (*items).insert_known_absent(key, ());
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err(SetUpdateError::Memory);
+    }
     // Same box the scan captured. A `clear` inside that scan has already
     // nulled `dst.sstorage`; the new key lives here, and the live length
     // stays the 0 `clear` published.
@@ -3972,8 +4036,9 @@ pub unsafe fn w_set_contains_with_hash(obj: *mut PyObject, key: *mut PyObject, h
 /// placing `None` as the set value.
 ///
 /// Returns `0` on success, `-1` when user `__eq__` raised (the exception is
-/// in the pending dict-key slot), and `-2` when a callback resized the table
-/// (`SetUpdateError::ChangedSize`). Absence was
+/// in the pending dict-key slot), `-2` when a callback resized the table
+/// (`SetUpdateError::ChangedSize`), and `-3` on collector allocation failure
+/// (`SetUpdateError::Memory` / `ll_dict_setitem`). Absence was
 /// already decided by [`w_set_contains_with_hash`]; insertion still probes,
 /// because a callback may have changed the table, and that probe is
 /// [`w_set_insert_key_checked`] (callback-free, then
@@ -3988,6 +4053,7 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
         Ok(()) => 0,
         Err(SetUpdateError::Key(_)) => -1,
         Err(SetUpdateError::ChangedSize) => -2,
+        Err(SetUpdateError::Memory) => -3,
     }
 }
 
@@ -4172,6 +4238,9 @@ impl SetStrategy for EmptySetStrategy {
     ) -> Result<(), SetUpdateError> {
         if (*(w_other as *const W_SetObject)).strategy.kind != SetStrategyKind::Empty {
             w_set_copy_storage_from(w_set, w_other);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return Err(SetUpdateError::Memory);
+            }
         }
         Ok(())
     }
@@ -4312,6 +4381,12 @@ impl SetStrategy for ObjectSetStrategy {
         let src_slot = dst_slot + 1;
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         let copied = (*object_set_storage_ptr(&*(src as *const W_SetObject))).clone();
+        // `RDict::clone` is `ll_dict_copy` and has no error channel; a failed
+        // entries/index allocation leaves an empty table and the pending flag.
+        // Drop that table unboxed so the destination keeps its prior storage.
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return;
+        }
         // `gc_alloc_storage_box` is a stable allocation and never collects.
         // `RDict::clone` above already did: write into the forwarded `dst`.
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
@@ -4954,12 +5029,15 @@ mod tests {
         let ok_true = super::set_strategy_bool_shell(Ok(true));
         let err_key = super::set_strategy_add_shell(Err(SetUpdateError::Key(DictKeyError)));
         let err_size = super::set_strategy_add_shell(Err(SetUpdateError::ChangedSize));
+        let err_memory = super::set_strategy_add_shell(Err(SetUpdateError::Memory));
         let err_dict = super::set_strategy_bool_shell(Err(DictKeyError));
 
         assert_eq!(ok_unit, ok_false);
         assert_ne!(ok_true, ok_false);
         assert_ne!(err_key, ok_unit);
         assert_ne!(err_size, err_key);
+        assert_ne!(err_memory, err_key);
+        assert_ne!(err_memory, err_size);
         assert_ne!(err_dict, err_key);
         assert_ne!(err_dict, ok_true);
 
@@ -4967,6 +5045,7 @@ mod tests {
         assert_eq!(shell_words(ok_true), (0, 1));
         assert_eq!(shell_words(err_key), (1, 0));
         assert_eq!(shell_words(err_size), (1, 1));
+        assert_eq!(shell_words(err_memory), (1, 2));
         let (discriminant, payload) = shell_words(err_dict);
         assert_eq!(discriminant, 1);
         assert_eq!(

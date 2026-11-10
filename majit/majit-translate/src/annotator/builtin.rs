@@ -464,6 +464,50 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_rlib.jit.we_are_jitted",
         majit_metainterp_bool_flag,
     );
+    // `exceptiontransform.py` `rpyexc_occurred` is inserted only in
+    // `genc.py CBuilder.build_database`. The source-level test is the
+    // constant `False` here (`objectmodel.py we_are_translated`
+    // `Entry.compute_result_annotation` / `immutablevalue(True)`).
+    // CallRegistry residual stubs name the leaf; harvested graphs use
+    // Charon `name_path()` (`::`); HOST_ENV / `new_builtin_callable`
+    // use the dotted qualname. `immutablevalue_hostobject` consults
+    // this table before the user-function PBC arm, so the residual
+    // `FunctionDesc` does not keep the pending branch.
+    analyzer_for(
+        &mut reg,
+        "gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_gc.gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "gc_hook.gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "pyre_object.gc_hook.gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_gc::gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "gc_hook::gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
+    analyzer_for(
+        &mut reg,
+        "pyre_object::gc_hook::gc_alloc_failed_pending",
+        gc_alloc_failed_pending_const,
+    );
     analyzer_for(
         &mut reg,
         "majit_rlib.jit.isconstant",
@@ -2759,6 +2803,21 @@ fn majit_metainterp_bool_flag(
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
 }
 
+/// `exceptiontransform.py` inserts the `rpyexc_occurred` test after a NULL
+/// malloc only in `genc.py CBuilder.build_database`
+/// (`translator.getexceptiontransformer()`), which `driver.py` runs after
+/// `task_pyjitpl_lltype`; the codewriter's graphs never hold that branch.
+/// The source-level test is therefore the constant `False` here, the shape
+/// of `objectmodel.py we_are_translated`'s
+/// `Entry.compute_result_annotation` (`immutablevalue(True)`).
+fn gc_alloc_failed_pending_const(
+    bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    bk.immutablevalue(&ConstValue::Bool(false))
+}
+
 /// `rlib/nonconst.py EntryNonConstant.compute_result_annotation`:
 ///
 /// ```python
@@ -4820,12 +4879,110 @@ mod tests {
         assert!(is_registered("pdb.set_trace"));
         assert!(is_registered("std.alloc.alloc"));
         assert!(is_registered("std.alloc.alloc_zeroed"));
+        assert!(is_registered("gc_alloc_failed_pending"));
+        assert!(is_registered("majit_gc.gc_alloc_failed_pending"));
+        assert!(is_registered("gc_hook.gc_alloc_failed_pending"));
+        assert!(is_registered("pyre_object.gc_hook.gc_alloc_failed_pending"));
+        assert!(is_registered("majit_gc::gc_alloc_failed_pending"));
+        assert!(is_registered("gc_hook::gc_alloc_failed_pending"));
+        assert!(is_registered(
+            "pyre_object::gc_hook::gc_alloc_failed_pending"
+        ));
     }
 
     #[test]
     fn registry_rejects_unknown_qualname() {
         assert!(!is_registered("completely.made.up.name"));
         assert!(lookup("completely.made.up.name").is_none());
+    }
+
+    /// `if gc_alloc_failed_pending() { A } else { B }` keeps only the
+    /// `B` exit: the analyser is `immutablevalue(False)`, and
+    /// `annrpython.py flowin` drops the other arm of a constant
+    /// exitswitch.
+    #[test]
+    fn gc_alloc_failed_pending_annotates_constant_false() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue,
+            HostObject, Link, LinkKey, SpaceOperation, Variable,
+        };
+
+        let residual = HostObject::new_user_function(GraphFunc::new(
+            "gc_alloc_failed_pending",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        let callables = [
+            HostObject::new_builtin_callable("majit_gc.gc_alloc_failed_pending"),
+            HostObject::new_builtin_callable("pyre_object.gc_hook.gc_alloc_failed_pending"),
+            residual,
+        ];
+        for callable in callables {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let startblock = Block::shared(vec![]);
+            let graph = Rc::new(RefCell::new(FunctionGraph::new(
+                "gc_alloc_failed_pending_annotates_constant_false",
+                startblock.clone(),
+            )));
+            let pending = Hlvalue::Variable(Variable::named("pending"));
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "simple_call",
+                vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                    callable.clone(),
+                )))],
+                pending.clone(),
+            ));
+            startblock.borrow_mut().exitswitch = Some(pending.clone());
+
+            let true_target = Block::shared(vec![]);
+            let false_target = Block::shared(vec![]);
+            let true_link = Rc::new(RefCell::new(Link::new(
+                vec![],
+                Some(true_target),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+            )));
+            let false_link = Rc::new(RefCell::new(Link::new(
+                vec![],
+                Some(false_target),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+            )));
+            startblock.closeblock(vec![true_link.clone(), false_link.clone()]);
+
+            ann.processblock(&graph, &startblock)
+                .expect("annotate gc_alloc_failed_pending switch");
+            let sv = match &startblock.borrow().operations[0].result {
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+                other => panic!("call result is not Variable: {other:?}"),
+            };
+            match sv {
+                Some(SomeValue::Bool(b)) => {
+                    assert!(
+                        b.is_constant(),
+                        "gc_alloc_failed_pending must be constant False, got {b:?}"
+                    );
+                    match b.base.const_box.as_ref().map(|c| &c.value) {
+                        Some(ConstValue::Bool(false)) => {}
+                        other => panic!("gc_alloc_failed_pending const is False, got {other:?}"),
+                    }
+                }
+                other => panic!("expected constant SomeBool(false), got {other:?}"),
+            }
+            assert!(
+                !ann.links_followed
+                    .borrow()
+                    .contains_key(&LinkKey::of(&true_link)),
+                "constant False must drop the A (true) exit for {:?}",
+                callable.qualname()
+            );
+            assert!(
+                ann.links_followed
+                    .borrow()
+                    .contains_key(&LinkKey::of(&false_link)),
+                "constant False must keep the B (false) exit for {:?}",
+                callable.qualname()
+            );
+        }
     }
 
     #[test]

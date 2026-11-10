@@ -869,7 +869,13 @@ impl W_Pickler {
         let w_dict = if PicklerMemoProxy::from_obj(w_value).is_some() {
             call_meth(w_value, "copy", &[])?
         } else if unsafe { pyre_object::is_dict(w_value) } {
-            unsafe { pyre_object::dictmultiobject::w_dict_copy(w_value) }
+            let copy = unsafe { pyre_object::dictmultiobject::w_dict_copy(w_value) };
+            // `DictStrategy.copy` / `W_DictObject.copy` propagate construction
+            // failure; do not install pickle memo state from a null copy.
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && copy.is_null() {
+                return Err(pyre_interpreter::runtime_ops::fetch_memory_error());
+            }
+            copy
         } else {
             return Err(PyError::type_error(format!(
                 "'memo' attribute must be a PicklerMemoProxy object or dict, not {}",

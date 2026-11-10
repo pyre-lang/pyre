@@ -2767,7 +2767,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     return Err(crate::PyError::type_error(message));
                 }
-                Ok(unsafe { pyre_object::unicodeobject::intern_exact_str(s) })
+                crate::runtime_ops::obj_or_memory_error(unsafe {
+                    pyre_object::unicodeobject::intern_exact_str(s)
+                })
             },
             1,
         ),
@@ -5274,7 +5276,7 @@ mod tests {
     fn traceback_needed_after(source: &str) -> bool {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile::compile_exec(source).expect("compile failed");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         let call_pc = frame
             .getcode()
             .instructions

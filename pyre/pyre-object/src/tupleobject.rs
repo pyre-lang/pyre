@@ -333,11 +333,15 @@ pub unsafe fn w_tuple_adopt_fixed_items(block: *mut ItemsBlock) -> PyObjectRef {
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
     // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
-    crate::lltype::malloc_typed(W_TupleObject {
-        ob_header: header(),
-        hash: AtomicI64::new(TUPLE_HASH_UNSET),
-        wrappeditems: block,
-    }) as PyObjectRef
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::PY_NULL
+    } else {
+        crate::lltype::malloc_typed(W_TupleObject {
+            ob_header: header(),
+            hash: AtomicI64::new(TUPLE_HASH_UNSET),
+            wrappeditems: block,
+        }) as PyObjectRef
+    }
 }
 
 /// `tupleobject.py wraptuple`. Length 2 is `wraptuple2`. Every other
@@ -516,6 +520,11 @@ fn w_tuple_new_array_backed_impl(
     // snapshot taken here would still hold pre-move addresses across that
     // allocation. Gate off it is the std::alloc block.
     let items_block = unsafe { alloc_tuple_items_block_gc(save_point, len) };
+    // W_TupleObject.__init__: a refused wrappeditems block is not stored
+    // into an already allocated header.
+    if crate::gc_hook::gc_alloc_failed_pending() && items_block.is_null() {
+        return crate::PY_NULL;
+    }
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
         .unwrap_or(std::ptr::null_mut()) as crate::gc_hook::GCREF;
@@ -560,21 +569,29 @@ fn w_tuple_new_array_backed_impl(
     // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
     // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
     if user_layout {
-        crate::lltype::malloc_typed(W_TupleObjectUser {
-            base: W_TupleObject {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(W_TupleObjectUser {
+                base: W_TupleObject {
+                    ob_header: header(),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
+                    wrappeditems: items_block,
+                },
+                map: 0,
+                storage: std::ptr::null_mut(),
+            }) as PyObjectRef
+        }
+    } else {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(W_TupleObject {
                 ob_header: header(),
                 hash: AtomicI64::new(TUPLE_HASH_UNSET),
                 wrappeditems: items_block,
-            },
-            map: 0,
-            storage: std::ptr::null_mut(),
-        }) as PyObjectRef
-    } else {
-        crate::lltype::malloc_typed(W_TupleObject {
-            ob_header: header(),
-            hash: AtomicI64::new(TUPLE_HASH_UNSET),
-            wrappeditems: items_block,
-        }) as PyObjectRef
+            }) as PyObjectRef
+        }
     }
 }
 

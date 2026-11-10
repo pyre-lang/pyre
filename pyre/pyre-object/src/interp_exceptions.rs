@@ -1166,7 +1166,7 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
                 &mut needs_write_barrier,
             )
         })
-        .allocated_or_abort(T::SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
@@ -1186,6 +1186,9 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
             crate::gc_hook::try_gc_write_barrier(raw);
         }
         return crate::gc_roots::shadow_stack_get(slot);
+    }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
 }

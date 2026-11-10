@@ -134,6 +134,9 @@ fn alloc_raw(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
         crate::gc_hook::try_gc_write_barrier_managed(gc_ptr);
         return gc_ptr;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
+    }
     let layout = std::alloc::Layout::from_size_align(bytes, std::mem::align_of::<usize>())
         .expect("weakdict layout");
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -173,8 +176,11 @@ fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
             )
         };
         let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-            .allocated_or_abort(bytes)
+            .allocated_or_raise()
             .unwrap_or(std::ptr::null_mut());
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         if !raw.is_null() {
             // Collecting malloc stamps the header only. `_ll_malloc_entries`
             // is `zero=True`. `GCREF` is `*mut GCREFOpaque` (`size_of` 0), so
@@ -390,12 +396,18 @@ fn store_entry<K>(entries: *mut WeakDictEntries<K>, i: usize, key: K, value: *mu
 #[majit_macros::dont_look_inside]
 pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
     let raw = alloc_raw(weakdict_gc_type_id(), std::mem::size_of::<WeakDict<K>>());
+    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
+        return std::ptr::null_mut();
+    }
     // `_ll_malloc_entries` may collect (`framework.py` `push_roots`). `d` is
     // the livevar across that malloc (`_rweakvaldict.py` `ll_new_weakdict`).
     // The table is `alloc_raw` old-gen (`WEAKDICT`); `d` does not move.
     let _roots = crate::gc_roots::push_roots();
     let _ = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
     let entries = alloc_entries::<K>(DICT_INITSIZE);
+    if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
+        return std::ptr::null_mut();
+    }
     let d = raw as *mut WeakDict<K>;
     barrier_dict(d);
     unsafe {
@@ -574,11 +586,12 @@ impl WeakDict<StrKey> {
     /// `WeakValueDictRepr.ll_set`. A null `llvalue` is `None` and
     /// dispatches to `ll_set_null`.
     #[majit_macros::dont_look_inside]
-    pub fn ll_set(&mut self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) {
+    pub fn ll_set(&mut self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
         if !llvalue.is_null() {
-            self.ll_set_nonnull(llkey, llvalue);
+            self.ll_set_nonnull(llkey, llvalue)
         } else {
             self.ll_set_null(llkey);
+            true
         }
     }
 
@@ -599,7 +612,7 @@ impl WeakDict<StrKey> {
     /// `llvalue` are livevars across that malloc (`framework.py`
     /// `push_roots`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) {
+    pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
         let _roots = crate::gc_roots::push_roots();
         // `write_barrier` first (not a collect), then `d` / `llvalue` /
         // `llkey` as one livevar set (`framework.py` `push_roots`) across
@@ -615,12 +628,15 @@ impl WeakDict<StrKey> {
         };
         let valueref =
             unsafe { crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(val_slot)) };
+        if crate::gc_hook::gc_alloc_failed_pending() && valueref.is_null() {
+            return false;
+        }
         let key = if has_key {
             StrKey(crate::gc_roots::shadow_stack_get(val_slot + 1) as *mut Utf8Str)
         } else {
             key
         };
-        self.ll_set_nonnull_valueref(key, valueref);
+        self.ll_set_nonnull_valueref(key, valueref)
     }
 
     /// Lookup/insert half of `WeakValueDictRepr.ll_set_nonnull` after
@@ -628,8 +644,10 @@ impl WeakDict<StrKey> {
     /// weakref_create(llvalue)` then lookup/store. The intern table has
     /// no GIL, so `unicodeobject.rs` `intern_publish` takes its mutex only
     /// around this half and must not run `weakref_create` under that lock.
+    /// A failed `ll_dict_resize` leaves MemoryError pending and returns false
+    /// (`ll_set_nonnull`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_nonnull_valueref(&mut self, key: StrKey, valueref: *mut Weakref) {
+    pub fn ll_set_nonnull_valueref(&mut self, key: StrKey, valueref: *mut Weakref) -> bool {
         debug_assert!(!valueref.is_null());
         let hash = key.ll_keyhash();
         let found = ll_dict_lookup(self, key, hash);
@@ -644,8 +662,12 @@ impl WeakDict<StrKey> {
                 // `valueref` are already in `entries` and dead afterwards;
                 // `framework.py` `push_roots` emits only livevars.
                 self.ll_weakdict_resize();
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return false;
+                }
             }
         }
+        true
     }
 }
 
@@ -731,6 +753,9 @@ fn ll_dict_resize<K: WeakDictKey>(d: &mut WeakDict<K>) {
     let _roots = crate::gc_roots::push_roots();
     let old_entries_slot = pin_table_and_entries(d as *mut WeakDict<K>, old_entries);
     let new_entries = alloc_entries::<K>(new_size);
+    if crate::gc_hook::gc_alloc_failed_pending() && new_entries.is_null() {
+        return;
+    }
     old_entries = crate::gc_roots::shadow_stack_get(old_entries_slot) as *mut WeakDictEntries<K>;
     barrier_dict(d as *mut WeakDict<K>);
     d.entries = new_entries;

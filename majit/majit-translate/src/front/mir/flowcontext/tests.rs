@@ -10995,13 +10995,14 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
-            .iter_local_fns()
-            .find(|fd| {
-                fd.item_meta.source_text.as_deref().is_some_and(|text| {
-                    text.starts_with("fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame")
-                })
-            })
-            .expect("build_snapshot_frame");
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("fn build_snapshot_frame("))
+        })
+        .expect("build_snapshot_frame");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower build_snapshot_frame");
         assert!(

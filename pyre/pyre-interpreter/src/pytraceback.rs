@@ -175,14 +175,15 @@ pub fn w_pytraceback_new(
     // `malloc_typed` block.
     let mut allocation_root = roots.get(inputs) as pyre_object::gc_hook::GCREF;
     let mut needs_write_barrier = true;
-    let raw = unsafe {
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
         pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
             PYTRACEBACK_GC_TYPE_ID,
             PYTRACEBACK_OBJECT_SIZE,
             &mut allocation_root,
             &mut needs_write_barrier,
         )
-    }
+    })
+    .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let tb_slot = if raw.is_null() {
         None
@@ -210,6 +211,9 @@ pub fn w_pytraceback_new(
     };
 
     let Some(tb_slot) = tb_slot else {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return pyre_object::PY_NULL;
+        }
         return pyre_object::lltype::malloc_typed(value) as PyObjectRef;
     };
     let raw = pyre_object::gc_roots::shadow_stack_get(tb_slot) as *mut PyTraceback;
@@ -532,9 +536,9 @@ pub unsafe fn record_application_traceback(
     w_exc_object: PyObjectRef,
     frame: *mut crate::pyframe::PyFrame,
     last_instruction: i64,
-) {
+) -> bool {
     if w_exc_object.is_null() || frame.is_null() {
-        return;
+        return true;
     }
     unsafe {
         // `pycode.py self.hidden_applevel` — pyre's
@@ -542,10 +546,10 @@ pub unsafe fn record_application_traceback(
         // gateway / app_main bridge frames from the traceback.
         let pycode_ptr = (*frame).pycode as *const crate::pycode::PyCode;
         if !pycode_ptr.is_null() && (*pycode_ptr).hidden_applevel {
-            return;
+            return true;
         }
         if !pyre_object::is_exception(w_exc_object) {
-            return;
+            return true;
         }
         // `PyTraceback.__init__` allocates. `OperationError.set_traceback`
         // writes the operror, a GC object. The instance here is a native
@@ -576,10 +580,31 @@ pub unsafe fn record_application_traceback(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
         );
         let new_tb = w_pytraceback_for_frame(frame, last_instruction, prev_tb);
+        // `record_application_traceback`: `PyTraceback.__init__` raises before
+        // `operror.set_traceback(tb)`. A failed constructor does not store
+        // into the traceback field. Callers fetch that allocation exception
+        // (`fetch_traceback_alloc_error`) and replace the exception that was
+        // in flight.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && new_tb.is_null() {
+            return false;
+        }
         let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
         crate::eval::set_in_flight_exception(w_exc_object);
     }
+    true
+}
+
+/// `PyTraceback.__init__` raises before `operror.set_traceback`, so a failed
+/// node allocation replaces the exception `record_application_traceback` was
+/// attaching a frame to. Fetch that value
+/// (`ExceptionTransformer.rpyexc_fetch_exception`) and install it as the
+/// exception now in flight; the caller then returns it through its existing
+/// error channel.
+pub fn fetch_traceback_alloc_error() -> crate::PyError {
+    let mut err = crate::runtime_ops::fetch_memory_error();
+    crate::eval::set_in_flight_exception(err.to_exc_object());
+    err
 }
 
 #[cfg(test)]

@@ -58,6 +58,9 @@ fn w_slice_new_in(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> P
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
+    }
     W_SliceObject::allocate(W_SliceObject {
         ob: header,
         start,

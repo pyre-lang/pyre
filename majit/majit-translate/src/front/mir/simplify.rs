@@ -148,22 +148,33 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
     // pins the aggregate (`remove_simple_mallocs`, malloc.py).
     dirty |= crate::model::remove_dead_aggregates(graph) > 0;
-    // Bring the raise into the shape `remove_assertion_errors` matches: the
-    // MIR front builds the exception in a block of its own, where upstream's
-    // flow space links straight to `exceptblock`.
-    dirty |= crate::model::retarget_assert_raise_blocks(graph) > 0;
-    dirty |= crate::model::remove_assertion_errors(graph) > 0;
     // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
     // config const folded by `const_eval_global`) collapse to the
     // taken link and the dead arm is emptied — the registry lift
     // (`translate_op`) walks blocks by index, so a disconnected arm
     // reading an unliftable static (`SMALL_INTS`) would otherwise
-    // still fail the whole graph.  `constant_fold_graph` link
-    // folding (backendopt/constfold.py).
-    if crate::model::fold_constant_exitswitch(graph) > 0 {
+    // still fail the whole graph.  `constant_fold_graph` link folding
+    // is a fixpoint (`backendopt/constfold.py`): rewiring one
+    // constant switch can make a nested guard single-predecessor, so
+    // fold, `eliminate_empty_blocks`, and `clear_unreachable_blocks`
+    // repeat until an iteration folds nothing.  This runs before
+    // `remove_assertion_errors` so a ConstBool(false) match-guard
+    // selects the abort arm; pruning the abort first would keep the
+    // null_mut arm as the only remaining exit.
+    loop {
+        crate::model::eliminate_empty_blocks(graph);
+        crate::model::clear_unreachable_blocks(graph);
+        if crate::model::fold_constant_exitswitch(graph) == 0 {
+            break;
+        }
         crate::model::clear_unreachable_blocks(graph);
         dirty = true;
     }
+    // Bring the raise into the shape `remove_assertion_errors` matches: the
+    // MIR front builds the exception in a block of its own, where upstream's
+    // flow space links straight to `exceptblock`.
+    dirty |= crate::model::retarget_assert_raise_blocks(graph) > 0;
+    dirty |= crate::model::remove_assertion_errors(graph) > 0;
     // `transform_dead_op_vars` is the first entry in `all_passes`
     // (simplify.py) and `simplify_graph` (:1080-1086) applies every
     // pass to every graph — there is no "only if something was removed"

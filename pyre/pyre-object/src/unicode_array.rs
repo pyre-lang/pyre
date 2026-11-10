@@ -91,10 +91,14 @@ impl UnicodeArray {
         if capacity == 0 {
             return Self::empty();
         }
+        let block = unsafe {
+            crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
+        };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         Self {
-            block: unsafe {
-                crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
-            },
+            block,
             len: crate::object_array::length_cell(0),
         }
     }

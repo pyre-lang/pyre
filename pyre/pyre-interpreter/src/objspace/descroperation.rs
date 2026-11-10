@@ -2853,6 +2853,11 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
     let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
+    // `AbstractUnwrappedStrategy.getitems_copy`: wrap failure stays pending
+    // and the snapshot is empty; fetch before treating that as a real empty list.
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     // The snapshot is a plain `Vec` and roots nothing, and the resize below
     // allocates: publish both the receiver -- a `W_List` header, one of the two
     // kinds a minor collection relocates -- and the snapshot, then address them

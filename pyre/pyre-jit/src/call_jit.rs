@@ -547,17 +547,28 @@ fn alloc_callee_frame(
     w_globals: PyObjectRef,
     execution_context: *const pyre_interpreter::PyExecutionContext,
 ) -> *mut PyFrame {
-    let ptr = pyre_interpreter::pyframe::FrameBox::new(
-        PyFrame::new_for_call_with_closure_and_globals_obj(
-            code,
-            args,
-            w_globals,
-            execution_context,
-            PY_NULL,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-        ),
-    )
-    .into_raw();
+    let frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        code,
+        args,
+        w_globals,
+        execution_context,
+        PY_NULL,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+    ) {
+        Ok(frame) => frame,
+        Err(mut e) => {
+            publish_residual_call_exception(e.to_exc_object());
+            return std::ptr::null_mut();
+        }
+    };
+    let boxed = match pyre_interpreter::pyframe::FrameBox::new(frame) {
+        Ok(boxed) => boxed,
+        Err(mut e) => {
+            publish_residual_call_exception(e.to_exc_object());
+            return std::ptr::null_mut();
+        }
+    };
+    let ptr = boxed.into_raw();
     LIVE_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
     ptr
 }
@@ -991,21 +1002,36 @@ fn get_current_qmut_instance(field_addr: i64) -> Arc<dyn majit_ir::QuasiImmutHan
     Arc::new(HostQuasiImmut(field.get_current_qmut_instance()))
 }
 
-pub(crate) extern "C" fn record_caught_blackhole_traceback(
+/// `record_application_traceback` returned false: `PyTraceback.__init__`
+/// raised before `operror.set_traceback`. Publish that allocation exception
+/// on the residual/blackhole channels so compiled `GUARD_NO_EXCEPTION` and
+/// `BH_LAST_EXC_VALUE` see it in place of the original exception.
+fn publish_residual_traceback_alloc_error() {
+    let mut err = pyre_interpreter::pytraceback::fetch_traceback_alloc_error();
+    publish_residual_call_exception(err.to_exc_object());
+}
+
+/// `pytraceback.py record_application_traceback` for a blackhole frame.
+///
+/// `true` when the node was recorded, skipped as a duplicate of a node that
+/// is already the chain head, or skipped as a forwarding reraise. `false`
+/// when `PyTraceback.__init__` failed to allocate; the caller fetches that
+/// exception and replaces the one in flight.
+fn try_record_caught_blackhole_traceback(
     exc_value: i64,
     frame_value: i64,
     jitcode_index: i64,
     opcode_position: i64,
-) {
+) -> bool {
     let Ok(jitcode_index) = i32::try_from(jitcode_index) else {
-        return;
+        return true;
     };
     let Ok(opcode_position) = i32::try_from(opcode_position) else {
-        return;
+        return true;
     };
     let frame_ptr = frame_value as *mut PyFrame;
     if frame_ptr.is_null() || exc_value == 0 {
-        return;
+        return true;
     }
     // Both operands are raw i64 copies of GC refs. The blackhole roots the
     // interpreter's `virtualizable_ptr` / `exception_last_value` slots, not
@@ -1046,7 +1072,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
                 )
             });
         if explicit_reraise {
-            return;
+            return true;
         }
         let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
         let frame_ptr = frame_anchor.live();
@@ -1071,7 +1097,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
                 frame_ptr as usize,
                 last_instr as isize,
             );
-            return;
+            return true;
         }
     }
     let resolved = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
@@ -1109,7 +1135,8 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     // frame at this instruction.  A genuine repeat (the same frame raising
     // again at the same offset) always attaches to a fresh exception, and a
     // bare reraise, which does legitimately re-record one frame, is skipped
-    // above.
+    // above.  Duplicate suppression is only this already-recorded head; a
+    // failed `PyTraceback.__init__` does not count as a recorded node.
     unsafe {
         let head =
             pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
@@ -1118,7 +1145,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
             && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
             && pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) == last_instruction * 2
         {
-            return;
+            return true;
         }
     }
     unsafe {
@@ -1126,8 +1153,62 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
             exc_value as PyObjectRef,
             frame_ptr,
             last_instruction,
-        );
+        )
     }
+}
+
+pub(crate) extern "C" fn record_caught_blackhole_traceback(
+    exc_value: i64,
+    frame_value: i64,
+    jitcode_index: i64,
+    opcode_position: i64,
+) {
+    if !try_record_caught_blackhole_traceback(
+        exc_value,
+        frame_value,
+        jitcode_index,
+        opcode_position,
+    ) {
+        publish_residual_traceback_alloc_error();
+    }
+}
+
+/// Record a traceback node for a blackhole frame that is leaving with
+/// `guard_exc` live. Indexed jitcodes go through the guarded recorder;
+/// a frame with no jitcode index uses `record_application_traceback`
+/// directly. `true` unless `PyTraceback.__init__` failed to allocate.
+fn record_blackhole_frame_traceback(
+    guard_exc: i64,
+    frame_ptr: *mut PyFrame,
+    jitcode_index: Option<i32>,
+    last_opcode_position: usize,
+) -> bool {
+    if frame_ptr.is_null() {
+        return true;
+    }
+    match jitcode_index {
+        Some(jitcode_index) => try_record_caught_blackhole_traceback(
+            guard_exc,
+            frame_ptr as i64,
+            i64::from(jitcode_index),
+            last_opcode_position as i64,
+        ),
+        None => unsafe {
+            pyre_interpreter::pytraceback::record_application_traceback(
+                guard_exc as PyObjectRef,
+                frame_ptr,
+                (*frame_ptr).last_instr as i64,
+            )
+        },
+    }
+}
+
+/// `PyTraceback.__init__` raised before `operror.set_traceback`. Park the
+/// fetched allocation exception in `GUARD_EXC_VALUE` so the remainder of
+/// this blackhole unwind propagates MemoryError rather than the original.
+fn install_traceback_alloc_error_as_guard_exc() {
+    let mut err = pyre_interpreter::pytraceback::fetch_traceback_alloc_error();
+    majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
 }
 
 /// `pypy/interpreter/error.py record_context` for an exception whose
@@ -1230,12 +1311,15 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
-    unsafe {
+    let recorded = unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
             frame_ptr,
             last_instruction,
-        );
+        )
+    };
+    if !recorded {
+        publish_residual_traceback_alloc_error();
     }
 }
 
@@ -1306,12 +1390,15 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
-    unsafe {
+    let recorded = unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
             frame_ptr,
             last_instruction,
-        );
+        )
+    };
+    if !recorded {
+        publish_residual_traceback_alloc_error();
     }
 }
 
@@ -3565,24 +3652,14 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     // no interpreter frame ever runs for it.  The helper
                     // resolves the raise coordinate and honours a bare reraise,
                     // as it does for the sibling propagation loop.
-                    if !frame_ptr.is_null() {
-                        // Re-read past `leave_resumed_blackhole_frame`.
-                        let guard_exc = guard_exc_root.get();
-                        match jitcode_index {
-                            Some(jitcode_index) => record_caught_blackhole_traceback(
-                                guard_exc,
-                                frame_ptr as i64,
-                                i64::from(jitcode_index),
-                                last_opcode_position as i64,
-                            ),
-                            None => unsafe {
-                                pyre_interpreter::pytraceback::record_application_traceback(
-                                    guard_exc as PyObjectRef,
-                                    frame_ptr,
-                                    (*frame_ptr).last_instr as i64,
-                                )
-                            },
-                        }
+                    // Re-read past `leave_resumed_blackhole_frame`.
+                    if !record_blackhole_frame_traceback(
+                        guard_exc_root.get(),
+                        frame_ptr,
+                        jitcode_index,
+                        last_opcode_position,
+                    ) {
+                        install_traceback_alloc_error_as_guard_exc();
                     }
                     bh = caller;
                 }
@@ -3596,27 +3673,17 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     // across the record is left naming the pre-collection
                     // copy.  The parked exception is read back past the
                     // record, as the sibling propagation loop reads its pin.
-                    if !frame_ptr.is_null() {
-                        let guard_exc = guard_exc_root.get();
-                        match jitcode_index {
-                            // Every indexed frame recorded during blackhole
-                            // propagation goes through the guarded recorder;
-                            // `pyopcode.py handle_operation_error` is
-                            // upstream's single traceback attach point.
-                            Some(jitcode_index) => record_caught_blackhole_traceback(
-                                guard_exc,
-                                frame_ptr as i64,
-                                i64::from(jitcode_index),
-                                last_opcode_position as i64,
-                            ),
-                            None => unsafe {
-                                pyre_interpreter::pytraceback::record_application_traceback(
-                                    guard_exc as PyObjectRef,
-                                    frame_ptr,
-                                    (*frame_ptr).last_instr as i64,
-                                );
-                            },
-                        }
+                    // Every indexed frame recorded during blackhole
+                    // propagation goes through the guarded recorder;
+                    // `pyopcode.py handle_operation_error` is
+                    // upstream's single traceback attach point.
+                    if !record_blackhole_frame_traceback(
+                        guard_exc_root.get(),
+                        frame_ptr,
+                        jitcode_index,
+                        last_opcode_position,
+                    ) {
+                        install_traceback_alloc_error_as_guard_exc();
                     }
                     let err = exit_frame_exception_ref(
                         guard_exc_root.get(),
@@ -3800,23 +3867,18 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             if !keeps_existing_traceback {
                 let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
                 let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
-                if !frame_ptr.is_null() {
-                    if let Some(jitcode_index) = jitcode_index {
-                        record_caught_blackhole_traceback(
-                            exc_value,
-                            frame_ptr as i64,
-                            i64::from(jitcode_index),
-                            last_opcode_position as i64,
-                        );
-                    } else {
-                        unsafe {
-                            pyre_interpreter::pytraceback::record_application_traceback(
-                                exc_value as PyObjectRef,
-                                frame_ptr,
-                                (*frame_ptr).last_instr as i64,
-                            );
-                        }
-                    }
+                if !record_blackhole_frame_traceback(
+                    exc_value,
+                    frame_ptr,
+                    jitcode_index,
+                    last_opcode_position,
+                ) {
+                    // `PyTraceback.__init__` raised before `operror.set_traceback`.
+                    // Replace the pinned exception so `ExitFrameWithExceptionRef`
+                    // and the caller's `exception_last_value` carry MemoryError
+                    // rather than the original with a missing node.
+                    let mut err = pyre_interpreter::pytraceback::fetch_traceback_alloc_error();
+                    pyre_object::gc_roots::shadow_stack_set(exc_slot, err.to_exc_object());
                 }
             }
             bh.virtualizable_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as i64;
@@ -4902,7 +4964,14 @@ fn trace_and_compile_from_bridge_body(
     // after the walk so the post-bridge interpreter resumes at the guard
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
-    let resume_state = bridge_frame_root.frame().snapshot_for_tracing();
+    let resume_state = match bridge_frame_root.frame().snapshot_for_tracing() {
+        Ok(frame) => frame,
+        Err(mut err) => {
+            return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+                err.to_exc_object(),
+            ));
+        }
+    };
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
     // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
@@ -4941,6 +5010,7 @@ fn trace_and_compile_from_bridge_body(
         let (driver, _) = crate::eval::driver_pair();
         driver.set_bridge_entered_at_guard_resume(true);
     }
+    let mut snapshot_error = None;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -4957,7 +5027,15 @@ fn trace_and_compile_from_bridge_body(
                 // as the previous segment left it, so the snapshot is taken
                 // here rather than once outside — `FrameBox` owns a shadow
                 // stack root guard and cannot be cloned.
-                let trace_frame = bridge_frame_root.frame().snapshot_for_tracing();
+                let trace_frame = match bridge_frame_root.frame().snapshot_for_tracing() {
+                    Ok(frame) => frame,
+                    Err(mut err) => {
+                        snapshot_error = Some(pyre_jit_trace::state::ConcreteValue::Ref(
+                            err.to_exc_object(),
+                        ));
+                        return majit_metainterp::TraceAction::Abort;
+                    }
+                };
                 // `sym.set_live_vable_frame_addr` records this word as the
                 // virtualizable the walk writes back through, so it has to be
                 // the frame's address as of this entry: the driver re-enters
@@ -4999,6 +5077,27 @@ fn trace_and_compile_from_bridge_body(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
+
+    if let Some(err) = snapshot_error {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        // `merge_point` stages `pending_abort_blackhole` on Abort
+        // (`run_blackhole_interp_to_cancel_tracing`). Snapshot failure
+        // returns before that convert, so drop the parked handoff.
+        driver.discard_pending_abort_blackhole();
+        return BridgeResolution::FinishedException(err);
+    }
+    if let Some(mut err) = pyre_jit_trace::trace::take_walk_end_propagated_exception() {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            err.to_exc_object(),
+        ));
+    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
@@ -8535,8 +8634,8 @@ pub extern "C" fn bh_delete_name_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef
 /// `LOAD_LOCALS` residual using the frame receiver.
 /// `pyopcode.py` — `pushvalue(getorcreatedebug().w_locals)`, which
 /// must hand back the frame's own mapping so a metaclass `__prepare__` result
-/// keeps its type. Infallible, so unlike the name residuals there is no
-/// exception-publishing arm.
+/// keeps its type. A refused mapping is published through the residual
+/// exception cells so `GUARD_NO_EXCEPTION` takes the handler.
 pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     assert!(
         !frame_ptr.is_null(),
@@ -8544,7 +8643,13 @@ pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
          site must thread portal_frame_reg as its ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    frame.get_or_create_w_locals()
+    match frame.get_or_create_w_locals() {
+        Ok(value) => value,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// `LOAD_BUILD_CLASS` residual using the frame receiver.
@@ -9650,7 +9755,7 @@ mod tests_bh_normalize_raise {
             pyre_interpreter::builtins::__majit_wrap_builtin_len,
         );
         let code = compile_exec("").expect("empty module should compile");
-        let frame = pyre_interpreter::PyFrame::new(code);
+        let frame = pyre_interpreter::PyFrame::new(code).expect("frame allocation");
 
         let frame_ptr = &*frame as *const pyre_interpreter::PyFrame;
         let result =

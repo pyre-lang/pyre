@@ -123,12 +123,16 @@ pub fn w_sre_match_new(
     // `do_flatten_marks`: `[0] * (num_groups * 2)` of unboxed integers, one
     // word per span edge. The block holds no GC pointer, so nothing is rooted
     // across filling it.
+    // W_SRE_Match.__init__ / do_flatten_marks: a refused span table is not filled.
     let flatten_cache = unsafe {
         crate::object_array::alloc_typed_items_block_nursery(
             spans.len() * 2,
             crate::object_array::gc_int_array_gc_type_id(),
         )
     };
+    if crate::gc_hook::gc_alloc_failed_pending() && flatten_cache.is_null() {
+        return PY_NULL;
+    }
     unsafe {
         let items = crate::object_array::typed_items_block_items_base(flatten_cache) as *mut i64;
         for (group, &(start, end)) in spans.iter().enumerate() {

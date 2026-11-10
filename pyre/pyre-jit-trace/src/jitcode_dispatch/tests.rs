@@ -930,7 +930,7 @@ fn generator_resume_finished_arm_descends_frame_is_finished() {
 
     fbw_foriter_inflight_clear();
     let code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
     frame.set_frame_finished_execution(true);
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::PyFrame;
     let pycode = frame.pycode as pyre_object::PyObjectRef;
@@ -2674,7 +2674,7 @@ fn portal_may_force_records_the_callee_execution_context() {
     }
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
 
     let jitcode_index = test_outer_resume_jitcode_index();
@@ -2833,7 +2833,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
     }
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
@@ -3000,7 +3000,7 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
     }
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
 
     let jitcode_index = test_outer_resume_jitcode_index();
@@ -3261,7 +3261,7 @@ fn with_unarmed_call_trace_walk<R>(
     let _pair = crate::state::ensure_trace_test_driver();
     let cpu = CallTraceFieldLoadCpu;
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
@@ -4103,7 +4103,7 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
     }
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let w_code = frame.pycode;
     assert!(!w_code.is_null(), "compile_exec installs a code object");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -4301,7 +4301,7 @@ fn loop_callee_portal_none_init_records_the_none_check() {
     }
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let w_code = frame.pycode;
     assert!(!w_code.is_null(), "compile_exec installs a code object");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -4491,7 +4491,7 @@ fn constructor_call_assembler_guard_snapshot_keeps_the_immediate_caller() {
     let _restore = RestorePortal(saved_runners);
 
     let raw_code = compile_exec("None").expect("test code should compile");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let w_code = frame.pycode;
     assert!(!w_code.is_null(), "compile_exec installs a code object");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -5970,7 +5970,7 @@ fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
             _ => None,
         })
         .expect("function code");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code_obj);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code_obj).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let sentinel = pyre_object::w_none();
     {
@@ -6735,7 +6735,8 @@ fn null_live_vable_slot_reads_null_not_the_shadow() {
         module.varnames.is_empty(),
         "a module assignment is not a fast local"
     );
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let mut frame =
+        pyre_interpreter::pyframe::PyFrame::new(code.clone()).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
     assert!(raw.is_null(), "a fresh fast local starts as NULL");
@@ -25080,7 +25081,8 @@ fn with_carrier_abort_ctx<R>(
         1,
         "slot 0 must be inside the local region"
     );
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let mut frame =
+        pyre_interpreter::pyframe::PyFrame::new(code.clone()).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
     assert!(raw.is_null(), "the fixture must start from a NULL slot");
@@ -25250,7 +25252,8 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
         1,
         "slot 0 must be inside the local region"
     );
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let mut frame =
+        pyre_interpreter::pyframe::PyFrame::new(code.clone()).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
     assert!(raw.is_null(), "the fixture must start from a NULL slot");
@@ -25621,7 +25624,8 @@ fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
         1,
         "slot 0 must be inside the local region"
     );
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let mut frame =
+        pyre_interpreter::pyframe::PyFrame::new(code.clone()).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
 
     let published = pyre_object::w_none();
@@ -29921,7 +29925,8 @@ fn publish_callee_locals_region_accepts_an_alias_register_of_the_same_frame() {
         1,
         "slot 0 must be inside the local region"
     );
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let mut frame =
+        pyre_interpreter::pyframe::PyFrame::new(code.clone()).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
     assert!(raw.is_null(), "the fixture must start from a NULL slot");
@@ -30006,7 +30011,7 @@ fn residual_preflight_declines_when_callee_locals_cannot_publish() {
             _ => None,
         })
         .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     frame.fix_array_ptrs();
     let callee_frame = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let nlocals = crate::state::concrete_nlocals(callee_frame).expect("callee nlocals");
@@ -32341,7 +32346,7 @@ fn flush_known_virtualizable_writes_every_static_and_array_item() {
             _ => None,
         })
         .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     frame.fix_array_ptrs();
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let array_len = crate::state::concrete_frame_array_len(frame_ptr)
@@ -32449,7 +32454,7 @@ fn walk_start_undo_restores_value_stack_slot_above_nlocals() {
             _ => None,
         })
         .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     frame.fix_array_ptrs();
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let array_len = crate::state::concrete_frame_array_len(frame_ptr)
@@ -32523,7 +32528,7 @@ fn flush_known_virtualizable_writes_aliased_inputarg_array_items() {
             _ => None,
         })
         .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     frame.fix_array_ptrs();
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let array_len = crate::state::concrete_frame_array_len(frame_ptr)
@@ -32653,7 +32658,7 @@ fn flush_known_virtualizable_unreadable_array_item_leaves_frame_untouched() {
             _ => None,
         })
         .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     frame.fix_array_ptrs();
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
     let array_len = crate::state::concrete_frame_array_len(frame_ptr)

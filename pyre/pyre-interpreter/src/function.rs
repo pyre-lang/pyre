@@ -940,8 +940,8 @@ pub(crate) fn function_new_impl(
     let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
     // `function.py` `Function` is one GC object whether or not its code is a
-    // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null only when no
-    // collector hook is installed (`gc_hook.rs`); that call does not collect.
+    // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null when no collector
+    // hook is installed, or when `_ll_malloc_fixedsize` stored MemoryError.
     let raw =
         pyre_object::gc_hook::try_gc_alloc_stable_raw(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE);
     let managed = !raw.is_null();
@@ -974,6 +974,9 @@ pub(crate) fn function_new_impl(
         // Nothing collectable runs in between.
         function_write_barrier(raw as PyObjectRef);
         return raw as PyObjectRef;
+    }
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return PY_NULL;
     }
 
     // Immortal holder with the prebuilt header (`init_gc_object_immortal`):
@@ -1371,9 +1374,10 @@ pub unsafe fn demote_module_function_to_builtin(obj: PyObjectRef) {
 /// `demote_module_function_to_builtin` tags them. Allocation is the
 /// GC-managed arm of `function_new_impl` (`try_gc_alloc_stable_raw` of
 /// `FUNCTION_GC_TYPE_ID` / `FUNCTION_OBJECT_SIZE`, then `ptr::write` and
-/// `function_write_barrier`). A null result means no GC hook is installed;
-/// the call then falls back to `demote_module_function_to_builtin` and
-/// returns `func`.
+/// `function_write_barrier`). `GcAllocOutcome::Failed` already stored
+/// MemoryError (`_ll_malloc_fixedsize`); this returns `PY_NULL`.
+/// `NoRoute` (no GC hook) falls back to `demote_module_function_to_builtin`
+/// and returns `func`.
 ///
 /// # Safety
 /// `func` must be a live `Function` carrier (`FUNCTION_TYPE` or
@@ -1414,6 +1418,9 @@ pub unsafe fn builtin_function_new_managed(func: PyObjectRef) -> PyObjectRef {
     let raw =
         pyre_object::gc_hook::try_gc_alloc_stable_raw(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE);
     if raw.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return pyre_object::PY_NULL;
+        }
         unsafe { demote_module_function_to_builtin(func) };
         return func;
     }
@@ -1432,8 +1439,8 @@ pub unsafe fn builtin_function_new_managed(func: PyObjectRef) -> PyObjectRef {
 /// object exists (`builtin_function_set_module_obj`).
 ///
 /// Install runs once per name, so the `_builtinversion_` cache is not kept.
-/// A failed managed allocation returns `func` unchanged (`demote` does not
-/// retag a function that still has globals).
+/// `NoRoute` leaves `func` unchanged (`demote` does not retag a function
+/// that still has globals). `Failed` returns `PY_NULL`.
 ///
 /// # Safety
 /// `func` must be a live plain `Function`. `w_module` must be the module-name
@@ -1449,6 +1456,9 @@ pub unsafe fn builtin_function_from_function(
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_module);
     let bltin = builtin_function_new_managed(pyre_object::gc_roots::shadow_stack_get(func_slot));
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && bltin.is_null() {
+        return pyre_object::PY_NULL;
+    }
     if !py_type_check(bltin, &BUILTIN_FUNCTION_TYPE) {
         return pyre_object::gc_roots::shadow_stack_get(func_slot);
     }
@@ -4294,7 +4304,7 @@ fn funccall_flat_from_args(
             _roots.get(env_base + 1),
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )
-    })?);
+    })?)?;
 
     // funccallunrolling: `for i in unrolling_iterable(range(4)): if i < nargs`
     match nargs {
@@ -4663,7 +4673,7 @@ fn _flat_pycall(
     // FrameBox: the callee runs through the JIT, so it must be a
     // header-bearing heap frame (write barrier reads a valid header at
     // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
-    let mut new_frame = crate::pyframe::FrameBox::new(
+    let mut new_frame = match crate::pyframe::FrameBox::new(
         match pyre_object::with_roots!(func =>
             crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 code as *const (),
@@ -4680,7 +4690,13 @@ fn _flat_pycall(
                 return pyre_object::PY_NULL;
             }
         },
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
 
     // createframe is a nursery safepoint.  RPython reloads `frame` here via
     // the GC transform; read the forwarded caller for peekvalue / dropvalues
@@ -4758,7 +4774,7 @@ fn _flat_pycall_defaults(
     let closure = unsafe { function_get_closure(func) };
 
     // FrameBox: header-bearing heap frame for the JIT write barrier.
-    let mut new_frame = crate::pyframe::FrameBox::new(
+    let mut new_frame = match crate::pyframe::FrameBox::new(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code as *const (),
             &[], // locals filled below
@@ -4773,7 +4789,13 @@ fn _flat_pycall_defaults(
                 return pyre_object::PY_NULL;
             }
         },
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
 
     // createframe is a nursery safepoint; reload the caller the way the GC
     // transform reloads `frame` after `space.createframe` in
@@ -5030,7 +5052,7 @@ except TypeError as e:
     r_g0 = str(e)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("methodcall arity snippet");
         let w_globals = frame.get_w_globals();
         let get = |name: &str| {
@@ -5100,7 +5122,7 @@ except TypeError as e:
     r_self_named = str(e)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .expect("CALL_KW methodcall arity snippet");

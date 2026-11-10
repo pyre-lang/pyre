@@ -158,6 +158,11 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(get_instantiate(&BYTEARRAY_TYPE));
     let raw =
         crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
+    // `W_BytearrayObject.__init__` completes or raises; a failed body
+    // allocation is not pinned, accounted, or published.
+    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
+        return crate::PY_NULL;
+    }
     let data = crate::gc_roots::shadow_stack_get(data_slot) as *mut Vec<u8>;
     let body = W_BytearrayObject {
         ob_header: PyObject {
@@ -228,17 +233,19 @@ pub fn w_bytearray_new(size: usize) -> PyObjectRef {
 }
 
 /// [`w_bytearray_new`] for a `size` that came from Python, returning `None`
-/// when the buffer cannot be reserved.
+/// when the buffer cannot be reserved or the body allocation failed.
 ///
 /// `bytearray(sys.maxsize)` reaches the allocator with an unsatisfiable
 /// request; an infallible `vec!` aborts the process there, while the caller
-/// needs to raise `MemoryError`.
+/// needs to raise `MemoryError`. A collector failure is `None` rather than
+/// `Some` of a null object (`W_BytearrayObject.__init__`).
 #[majit_macros::dont_look_inside]
 pub fn w_bytearray_try_new(size: usize) -> Option<PyObjectRef> {
     let mut buf = Vec::new();
     buf.try_reserve_exact(size).ok()?;
     buf.resize(size, 0);
-    Some(w_bytearray_alloc(buf))
+    let obj = w_bytearray_alloc(buf);
+    if obj.is_null() { None } else { Some(obj) }
 }
 
 /// Allocate a new bytearray from a byte slice.
@@ -293,7 +300,11 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
-        crate::lltype::malloc_typed(payload) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(payload) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytearrayObjectUser, payload) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);

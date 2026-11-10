@@ -337,11 +337,13 @@ fn publish_cpython_module(ns: PyObjectRef) {
 
 fn compress_type() -> PyObjectRef {
     COMPRESS_RUNTIME_TYPE.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
-            "Compress",
-            init_compress_type,
-            pyre_interpreter::typedef::w_object(),
-            <W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        let tp = pyre_interpreter::typedef::builtin_type_or_alloc_failed(
+            pyre_interpreter::typedef::make_builtin_type_with_layout(
+                "Compress",
+                init_compress_type,
+                pyre_interpreter::typedef::w_object(),
+                <W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            ),
         );
         // CPython 3.14 Modules/zlibmodule.c:zlib_exec creates Comptype from a
         // mutable heap spec.
@@ -581,11 +583,13 @@ fn allocate_compress(
 
 fn decompress_type() -> PyObjectRef {
     DECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
-            "Decompress",
-            init_decompress_type,
-            pyre_interpreter::typedef::w_object(),
-            <W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        let tp = pyre_interpreter::typedef::builtin_type_or_alloc_failed(
+            pyre_interpreter::typedef::make_builtin_type_with_layout(
+                "Decompress",
+                init_decompress_type,
+                pyre_interpreter::typedef::w_object(),
+                <W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            ),
         );
         // `zlib_exec` creates Decomptype from a mutable heap spec.
         pyre_interpreter::typedef::mark_cpython_heap_type(tp, false);
@@ -877,11 +881,13 @@ fn allocate_decompress(
 
 fn zdecompress_type() -> PyObjectRef {
     ZDECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
-            "_ZlibDecompressor",
-            init_zdecompress_type,
-            pyre_interpreter::typedef::w_object(),
-            <W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        let tp = pyre_interpreter::typedef::builtin_type_or_alloc_failed(
+            pyre_interpreter::typedef::make_builtin_type_with_layout(
+                "_ZlibDecompressor",
+                init_zdecompress_type,
+                pyre_interpreter::typedef::w_object(),
+                <W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            ),
         );
         // `zlib_exec` creates ZlibDecompressorType from an immutable heap
         // spec, unlike Compress and Decompress.

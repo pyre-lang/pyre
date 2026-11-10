@@ -1908,6 +1908,9 @@ fn expand_pyre_class(
                         // dies with its class instead of pinning it to the
                         // next major from the remembered set.
                         let obj = Self::allocate(payload);
+                        if obj.is_null() {
+                            return obj;
+                        }
                         // objspace.py `allocate_instance`: hasuserdel types
                         // enqueue the fresh instance after the malloc.
                         ::pyre_object::gc_hook::maybe_register_finalizer(obj);
@@ -1938,6 +1941,9 @@ fn expand_pyre_class(
                         storage: ::std::ptr::null_mut(),
                     };
                     let obj = if raw.is_null() {
+                        if ::pyre_object::gc_hook::gc_alloc_failed_pending() {
+                            return ::pyre_object::PY_NULL;
+                        }
                         ::pyre_object::lltype::malloc_typed(user)
                             as ::pyre_object::PyObjectRef
                     } else {

@@ -582,6 +582,9 @@ impl ObjectConverter {
                     majit_metainterp::jit::we_are_jitted(),
                 )
             };
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
             for index in 0..items.len() {
@@ -760,12 +763,16 @@ impl ObjectConverter {
                 class_name(value)
             )));
         }
-        Ok(unsafe {
+        let items = unsafe {
             pyre_object::w_list_items_copy_as_vec_mode(
                 value,
                 majit_metainterp::jit::we_are_jitted(),
             )
-        })
+        };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        Ok(items)
     }
 
     fn with_list<T>(
@@ -905,12 +912,16 @@ impl ObjectConverter {
             )));
         }
         let mut out = Vec::new();
-        for mut item in unsafe {
+        let items = unsafe {
             pyre_object::w_list_items_copy_as_vec_mode(
                 value,
                 majit_metainterp::jit::we_are_jitted(),
             )
-        } {
+        };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        for mut item in items {
             if unsafe { pyre_object::is_none(item) } {
                 continue;
             }
@@ -1575,6 +1586,9 @@ impl ObjectConverter {
                 majit_metainterp::jit::we_are_jitted(),
             )
         };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         if values.is_empty() {
             return Ok(None);
         }
@@ -3532,15 +3546,16 @@ impl Converter<'_> {
                     } else {
                         // The members come out of the list as bare pointers, so
                         // each is published before the next clause allocates.
-                        orelse = unsafe {
+                        let items = unsafe {
                             pyre_object::w_list_items_copy_as_vec_mode(
                                 body.get(),
                                 majit_metainterp::jit::we_are_jitted(),
                             )
+                        };
+                        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                            return Err(crate::runtime_ops::fetch_memory_error());
                         }
-                        .into_iter()
-                        .map(|item| self.pin(item))
-                        .collect();
+                        orelse = items.into_iter().map(|item| self.pin(item)).collect();
                     }
                 }
                 self.node(

@@ -1613,7 +1613,7 @@ fn do_match(
     };
 
     if matched {
-        Ok(make_match(
+        crate::runtime_ops::obj_or_memory_error(make_match(
             pat(),
             string(),
             w_buffer(),
@@ -2021,26 +2021,26 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         }
         last = mend;
         if let Some(items) = &template {
-            let m = make_match_from_snapshot(
+            let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
                 pyre_object::gc_roots::shadow_stack_get(pat_slot),
                 string(),
                 w_buffer(),
                 snap,
                 0,
                 endpos as i64,
-            );
+            ))?;
             expand_into(&mut out, items, m as *const W_SRE_Match, subject_now());
         } else {
             // interp_sre.py:505-513 — callable filter; None means "no
             // piece" (treated as empty), otherwise the returned string.
-            let m = make_match_from_snapshot(
+            let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
                 pyre_object::gc_roots::shadow_stack_get(pat_slot),
                 string(),
                 w_buffer(),
                 snap,
                 0,
                 endpos as i64,
-            );
+            ))?;
             let w_piece = crate::call::call_function_impl_result(w_repl(), &[m])?;
             if !unsafe { is_none(w_piece) } {
                 match subj {
@@ -3041,14 +3041,14 @@ fn sre_scanner_step(
         (*sc).must_advance = new_must_advance as i64;
         (*sc).pos = state.cursor.position as i64;
     }
-    Ok(Some(make_match(
+    Ok(Some(crate::runtime_ops::obj_or_memory_error(make_match(
         w_srepat,
         string,
         w_buffer,
         &state,
         original_pos,
         endpos as i64,
-    )))
+    ))?))
 }
 
 /// Release the buffer export owned by a lazy finditer/scanner.

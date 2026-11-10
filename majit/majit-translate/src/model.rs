@@ -3661,17 +3661,26 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         }
     }
 
-    // Resolve `v` to its defining `OpKind` — first in `block`, then, when
+    enum ResolvedSwitch {
+        Bool(bool),
+        Int(i64),
+        UInt(u64),
+        UnaryBool(Variable),
+    }
+
+    // Resolve `v` to a switch constant — first in `block`, then, when
     // `v` is one of `block`'s inputargs, through a chain of
     // single-predecessor links (positional inputarg ↔ link-arg).  A
     // single predecessor dominates the block, so a `LinkArg::Value` whose
     // backing Variable is defined in the predecessor propagates soundly.
-    fn resolve_def<'g>(
-        graph: &'g FunctionGraph,
+    // `LinkArg::Const` is accepted too: `constant_fold_graph` replaces
+    // link args by `Constant` (`constfold.py`).
+    fn resolve_def(
+        graph: &FunctionGraph,
         preds: &HashMap<BlockId, Vec<BlockId>>,
         mut block: BlockId,
         mut v: Variable,
-    ) -> Option<&'g OpKind> {
+    ) -> Option<ResolvedSwitch> {
         let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
         loop {
             let b = &graph.blocks[block.0];
@@ -3680,7 +3689,15 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
                 .iter()
                 .find(|op| op.result.as_ref() == Some(&v))
             {
-                return Some(&op.kind);
+                return match &op.kind {
+                    OpKind::ConstBool(flag) => Some(ResolvedSwitch::Bool(*flag)),
+                    OpKind::ConstInt(n) => Some(ResolvedSwitch::Int(*n)),
+                    OpKind::ConstUInt(n) => Some(ResolvedSwitch::UInt(*n)),
+                    OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
+                        Some(ResolvedSwitch::UnaryBool(operand.clone()))
+                    }
+                    _ => None,
+                };
             }
             // `v` is not defined by an op here; if it is an inputarg and the
             // block has exactly one predecessor, hop to the link arg feeding
@@ -3694,16 +3711,20 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
             };
             let pred_block = &graph.blocks[pred.0];
             let link = pred_block.exits.iter().find(|e| e.target == block)?;
-            // Only a `LinkArg::Value` threads a variable identity onward; an
-            // inline `LinkArg::Const` literal is not a `ConstBool`/`ConstInt`
-            // op def (the front folds `we_are_jitted()` to a `ConstBool` op
-            // whose result is threaded as a `Value`, so the value chain
-            // covers it) — decline the rarer inline-const shape here.
-            let LinkArg::Value(pv) = link.args.get(slot)? else {
-                return None;
-            };
-            v = pv.clone();
-            block = *pred;
+            match link.args.get(slot)? {
+                LinkArg::Value(pv) => {
+                    v = pv.clone();
+                    block = *pred;
+                }
+                LinkArg::Const(c) => {
+                    return match &c.value {
+                        ConstValue::Bool(flag) => Some(ResolvedSwitch::Bool(*flag)),
+                        ConstValue::Int(n) => Some(ResolvedSwitch::Int(*n)),
+                        ConstValue::UInt(n) => Some(ResolvedSwitch::UInt(*n)),
+                        _ => None,
+                    };
+                }
+            }
         }
     }
 
@@ -3715,21 +3736,17 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         };
         let block_id = block.id;
         let mut kind = resolve_def(graph, &preds, block_id, sw.clone());
-        if let Some(OpKind::UnaryOp { op, operand, .. }) = kind
-            && op == "bool"
-        {
-            kind = resolve_def(graph, &preds, block_id, operand.clone());
+        if let Some(ResolvedSwitch::UnaryBool(operand)) = kind {
+            kind = resolve_def(graph, &preds, block_id, operand);
         }
         // The matched exitcase spellings: an `If` branch carries
         // `ExitCase::Bool` (`set_branch`), a MIR `SwitchInt` carries
         // `ExitCase::Const(Int)` plus the `"default"` catch-all arm
         // (`front::mir` terminator lowering).
         let (bool_case, int_case) = match kind {
-            Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
-            Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n)),
-            Some(OpKind::ConstUInt(n)) => {
-                ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n as i64))
-            }
+            Some(ResolvedSwitch::Bool(b)) => (Some(b), Some(i64::from(b))),
+            Some(ResolvedSwitch::Int(n)) => ((n == 0 || n == 1).then_some(n != 0), Some(n)),
+            Some(ResolvedSwitch::UInt(n)) => ((n == 0 || n == 1).then_some(n != 0), Some(n as i64)),
             _ => continue,
         };
         let block = &graph.blocks[block_idx];

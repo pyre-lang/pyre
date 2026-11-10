@@ -194,6 +194,9 @@ pub fn w_weakref_user_new(
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
@@ -279,7 +282,7 @@ impl crate::lltype::GcType for Weakref {
 /// back to a Box-immortal `Weakref`: a never-collected slot whose `weakptr`
 /// stays valid — the rweakref-off strong-ref mode. When a GC owns the heap
 /// and cannot satisfy the malloc (`Some(null)` / `GcAllocOutcome::Failed`),
-/// abort (`gc_alloc_failed`, `incminimark.py` `collect_and_reserve`): an
+/// `_ll_malloc_fixedsize` stores MemoryError and this returns null: an
 /// unmanaged Weakref is invisible to `invalidate_young_weakrefs`.
 ///
 /// # Safety
@@ -306,12 +309,13 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
             &mut needs_write_barrier,
         )
     };
-    if let Some(payload) =
-        crate::gc_hook::GcAllocOutcome::from_hook(payload).allocated_or_abort(SIZEOF_WEAKREF)
-    {
+    if let Some(payload) = crate::gc_hook::GcAllocOutcome::from_hook(payload).allocated_or_raise() {
         let wref = payload as *mut Weakref;
         unsafe { (*wref).weakptr = rooted_target };
         return wref;
+    }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
     }
 
     crate::lltype::malloc_typed(Weakref {

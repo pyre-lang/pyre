@@ -2353,6 +2353,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "w_list_new_empty",
         pyre_object::listobject::w_list_new_empty
     );
+    // `rpyexc_fetch_exception` is a `dont_look_inside` residual.
+    p0!(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::rpyexc_fetch_exception",
+        crate::runtime_ops::rpyexc_fetch_exception,
+    );
+    p0!(
+        &mut entries,
+        "runtime_ops::rpyexc_fetch_exception",
+        crate::runtime_ops::rpyexc_fetch_exception,
+    );
     pa1!(
         &mut entries,
         "pyre_object::listobject::w_list_allocate_instance",
@@ -9439,7 +9450,7 @@ mod tests {
     fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 
-        let clear_references: fn(&mut crate::pyframe::PyFrame) =
+        let clear_references: fn(&mut crate::pyframe::PyFrame) -> bool =
             crate::pyframe::PyFrame::clear_references;
         let clear_references = occupied_published_addr(
             "pyre_interpreter::pyframe::PyFrame::clear_references",

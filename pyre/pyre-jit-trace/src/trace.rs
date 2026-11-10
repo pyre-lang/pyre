@@ -416,6 +416,10 @@ pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError>
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+pub fn set_walk_end_propagated_exception(err: pyre_interpreter::PyError) {
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
+}
+
 /// Capture this mutator's raw walk-end carrier address for STW root walking.
 pub fn capture_walk_end_root_area() -> *const () {
     WALK_END_ROOT_AREA.with(|area| area as *const _ as *const ())
@@ -918,9 +922,18 @@ fn try_commit_midbody_abort_inner(
         pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
         Ok(frame) => frame,
-        Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
+        Err(err) => {
+            set_walk_end_propagated_exception(err);
+            return Err(MidBodyDecline::BeforeRun("callee frame allocation failed"));
+        }
     };
-    let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
+    let mut frame = match pyre_interpreter::pyframe::FrameBox::new(frame) {
+        Ok(frame) => frame,
+        Err(err) => {
+            set_walk_end_propagated_exception(err);
+            return Err(MidBodyDecline::BeforeRun("callee frame allocation failed"));
+        }
+    };
     frame.fix_array_ptrs();
     let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
 
@@ -9405,7 +9418,7 @@ mod tests {
         pyre_interpreter::typedef::init_typeobjects();
         let _pins = pyre_object::gc_roots::push_roots();
         let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
-        let mut live = PyFrame::new(code);
+        let mut live = PyFrame::new(code).expect("frame allocation");
         live.fix_array_ptrs();
         let w_code = live.pycode as usize;
         let array_len = pyre_interpreter::locals_w!(live).len();
@@ -9425,7 +9438,7 @@ mod tests {
         live.valuestackdepth = live_vsd;
         pyre_interpreter::locals_w_mut!(live)[table_vsd] = sentinel;
 
-        let mut snap = live.snapshot_for_tracing();
+        let mut snap = live.snapshot_for_tracing().expect("frame allocation");
         snap.fix_array_ptrs();
         snap.valuestackdepth = 0;
         snap.last_instr = -1;
@@ -9461,7 +9474,7 @@ mod tests {
         let _pins = pyre_object::gc_roots::push_roots();
 
         let raw_code = compile_exec("pass").expect("test code should compile");
-        let mut frame = PyFrame::new(raw_code);
+        let mut frame = PyFrame::new(raw_code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();

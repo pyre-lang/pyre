@@ -318,8 +318,9 @@ impl DictStrategy for KwargsDictStrategy {
     /// `kwargsdict.py switch_to_object_strategy` — walk
     /// parallel arrays, rebuild `IndexMap<ObjectKey, PyObjectRef>`,
     /// retire the typed parallel-array box.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         w_dict_switch_kwargs_to_object_strategy(w_dict);
+        true
     }
 
     /// `kwargsdict.py getitem` — `is_correct_type` →

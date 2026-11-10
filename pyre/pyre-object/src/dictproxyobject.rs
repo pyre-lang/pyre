@@ -97,10 +97,14 @@ pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    crate::lltype::malloc_typed(W_DictProxyObject {
-        ob_header: header,
-        w_mapping,
-    }) as PyObjectRef
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::PY_NULL
+    } else {
+        crate::lltype::malloc_typed(W_DictProxyObject {
+            ob_header: header,
+            w_mapping,
+        }) as PyObjectRef
+    }
 }
 
 /// Get the wrapped mapping.

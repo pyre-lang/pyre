@@ -5680,28 +5680,26 @@ impl<'a> Transformer<'a> {
                 } else {
                     rhs
                 };
-                // `rnone.py` `rtype_is_None`: a `Ptr` tests `ptr_iszero`; an
-                // `Address` (a raw pointer held in an int register) is
-                // `adr_eq(v, NULL)`, which the rename table sends to
-                // `int_eq` and `_rewrite_equality` folds to `int_is_zero`.
-                let opname = match self.get_value_kind_var(operand) {
-                    'r' => "ptr_iszero",
-                    'i' => "int_is_zero",
-                    _ => return RewriteResult::Keep,
-                };
+                // `rnone.py` `rtype_is_None` emits `ptr_iszero` for a `Ptr`
+                // (`adr_eq` for an `Address`); `jtransform.py` then runs
+                // `_rewrite_cmp_ptrs`, which keeps a GC pointer's
+                // `ptr_iszero` and turns a non-GC one into `int_is_zero`.
+                // The operand is resolved through `aliases` first because a
+                // preceding identity cast may have renamed it.
+                let operand = resolve_alias(operand, &self.aliases);
                 if let Some(result) = &op.result {
                     result.set_concretetype(Some(
                         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
                     ));
                 }
-                RewriteResult::Replace(vec![SpaceOperation {
+                self.rewrite_cmp_ptrs(SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::UnaryOp {
-                        op: opname.into(),
-                        operand: operand.clone(),
+                        op: "ptr_iszero".into(),
+                        operand,
                         result_ty: ValueType::Int,
                     },
-                }])
+                })
             }
             // jtransform.py's generated `rewrite_op_uint_eq` & co.: the
             // unsigned and char spellings re-enter `rewrite_operation` under
@@ -5759,6 +5757,13 @@ impl<'a> Transformer<'a> {
                         result_ty: result_ty.clone(),
                     },
                 }])
+            }
+            // `jtransform.py`: `rewrite_op_ptr_iszero = _rewrite_cmp_ptrs`,
+            // `rewrite_op_ptr_nonzero = _rewrite_cmp_ptrs`.
+            OpKind::UnaryOp { op: unop_name, .. }
+                if unop_name == "ptr_iszero" || unop_name == "ptr_nonzero" =>
+            {
+                self.rewrite_cmp_ptrs(op.clone())
             }
             // `rbool.py BoolRepr.rtype_bool`:
             //
@@ -11348,21 +11353,18 @@ impl<'a> Transformer<'a> {
                     crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
                 ));
             }
-            // `_rewrite_cmp_ptrs`: a pointer that is not a GC ref (an item
-            // address held as an integer word) tests with `int_is_zero`.
-            let opname = if self.get_value_kind_var(&args[0]) == 'i' {
-                "int_is_zero"
-            } else {
-                "ptr_iszero"
-            };
-            return RewriteResult::Replace(vec![SpaceOperation {
+            // Emit `ptr_iszero` and run `_rewrite_cmp_ptrs` on the aliased
+            // operand: a GC pointer stays `ptr_iszero`, a non-GC one becomes
+            // `int_is_zero` (`jtransform.py` `rewrite_op_ptr_iszero`).
+            let operand = resolve_alias(&args[0], &self.aliases);
+            return self.rewrite_cmp_ptrs(SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::UnaryOp {
-                    op: opname.into(),
-                    operand: args[0].clone(),
+                    op: "ptr_iszero".into(),
+                    operand,
                     result_ty: ValueType::Int,
                 },
-            }]);
+            });
         }
         // `core::ptr::eq(a, b)` — raw-pointer identity comparison.  Like
         // `is_null` above, `front::mir` leaves it as a `FunctionPath` residual
@@ -22021,6 +22023,88 @@ mod tests {
                         },
                         args: crate::model::call_args(vec![p.clone()]),
                         result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            let if_true = graph.create_block();
+            let if_false = graph.create_block();
+            graph.set_return(if_true, None);
+            graph.set_return(if_false, None);
+            graph.set_branch(start, t, if_true, vec![], if_false, vec![]);
+
+            let config = GraphTransformConfig::default();
+            let transformed = Transformer::new(&config).transform(&graph);
+            match &transformed.graph.blocks[start.0].exitswitch {
+                Some(ExitSwitch::Fused { opname: got, args }) => {
+                    assert_eq!(got, opname, "case {name}");
+                    assert_eq!(args, &vec![p], "case {name}");
+                }
+                other => panic!("case {name}: expected a fused {opname} exitswitch, got {other:?}"),
+            }
+        }
+    }
+
+    /// `jtransform.py` `rewrite_op_ptr_iszero = _rewrite_cmp_ptrs`,
+    /// `rewrite_op_ptr_nonzero = _rewrite_cmp_ptrs`. An already-formed
+    /// unary over a non-GC operand becomes `int_is_zero` / `int_is_true`;
+    /// a GC ref stays `ptr_iszero` / `ptr_nonzero`.
+    #[test]
+    fn rewrite_op_ptr_iszero_routes_through_rewrite_cmp_ptrs() {
+        use crate::model::ExitSwitch;
+
+        let cases = [
+            (
+                "ptr_iszero_ref",
+                "ptr_iszero",
+                ValueType::Ref(None),
+                ConcreteType::GcRef,
+                "ptr_iszero",
+            ),
+            (
+                "ptr_iszero_int",
+                "ptr_iszero",
+                ValueType::Unsigned,
+                ConcreteType::Signed,
+                "int_is_zero",
+            ),
+            (
+                "ptr_nonzero_ref",
+                "ptr_nonzero",
+                ValueType::Ref(None),
+                ConcreteType::GcRef,
+                "ptr_nonzero",
+            ),
+            (
+                "ptr_nonzero_int",
+                "ptr_nonzero",
+                ValueType::Unsigned,
+                ConcreteType::Signed,
+                "int_is_true",
+            ),
+        ];
+        for (name, unop, ty, concrete, opname) in cases {
+            let mut graph = FunctionGraph::new(name);
+            let start = graph.startblock;
+            let p = graph
+                .push_op_var(
+                    start,
+                    OpKind::Input {
+                        name: "p".into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&p, concrete);
+            let t = graph
+                .push_op_var(
+                    start,
+                    OpKind::UnaryOp {
+                        op: unop.to_string(),
+                        operand: p.clone(),
+                        result_ty: ValueType::Int,
                     },
                     true,
                 )

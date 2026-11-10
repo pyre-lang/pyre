@@ -593,7 +593,13 @@ pub fn init_typeobjects() {
         // `type` is itself an immediate subclass of `object`; static type
         // construction does not pass through heaptype subclass registration,
         // so record this edge explicitly for `object.__subclasses__()`.
-        unsafe { pyre_object::with_roots!(object_type, type_type => pyre_object::typeobject::w_type_add_subclass(object_type, type_type)) };
+        // `W_TypeObject.add_subclass` allocates a WEAKREF; bootstrap has no
+        // Python error channel.
+        if !unsafe {
+            pyre_object::with_roots!(object_type, type_type => pyre_object::typeobject::w_type_add_subclass(object_type, type_type))
+        } {
+            pyre_object::gc_hook::gc_alloc_failed(pyre_object::weakref::SIZEOF_WEAKREF);
+        }
         // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
         // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
         // typeobject.py W_TypeObject._lifeline_/getweakref/setweakref/
@@ -847,10 +853,10 @@ pub fn init_typeobjects() {
         // function — PyPy: funcobject.py
         // Functions are descriptors: function.__get__ returns a bound method.
         // typedef.py Function.typedef declares method_descriptor=True.
-        let function_type = pyre_object::with_roots!(object_type => new_typeobject_with_metatype_and_layout(
+        let function_type = pyre_object::with_roots!(object_type => builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
             "function", init_function_type, object_type, &INSTANCE_TYPE,
             PY_NULL, std::ptr::null(), true,
-        ));
+        )));
         // typedef.py:742 Function.typedef.acceptable_as_base_class = False
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
         // typedef.py:735/740 — Function exposes __dict__ and __weakref__.
@@ -888,10 +894,10 @@ pub fn init_typeobjects() {
         // CPython `wrapper_descriptor`: slot wrappers bind their receiver and
         // are callable, but are not Python functions. Their Rust payload is
         // the immutable BuiltinCode-backed Function carrier.
-        let slot_wrapper_type = pyre_object::with_roots!(object_type => new_typeobject_with_metatype_and_layout(
+        let slot_wrapper_type = pyre_object::with_roots!(object_type => builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
             "wrapper_descriptor", init_slot_wrapper_type, object_type, &INSTANCE_TYPE,
             PY_NULL, std::ptr::null(), true,
-        ));
+        )));
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
@@ -902,7 +908,7 @@ pub fn init_typeobjects() {
             slot_wrapper_type as usize,
         );
 
-        let method_descriptor_type = pyre_object::with_roots!(object_type => new_typeobject_with_metatype_and_layout(
+        let method_descriptor_type = pyre_object::with_roots!(object_type => builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
             "method_descriptor",
             init_method_descriptor_type,
             object_type,
@@ -910,7 +916,7 @@ pub fn init_typeobjects() {
             PY_NULL,
             std::ptr::null(),
             true,
-        ));
+        )));
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(method_descriptor_type, false);
             pyre_object::w_type_set_disallow_instantiation(method_descriptor_type);
@@ -3071,6 +3077,27 @@ pub(crate) fn init_builtin_typeobject(
     pyre_object::gc_roots::shadow_stack_get(save_point)
 }
 
+/// Size of a typical builtin MRO block (`[self, object]`) or a
+/// `weak_subclasses` WEAKREF, whichever is larger.
+///
+/// Bootstrap constructors pass this to `gc_alloc_failed` when
+/// `W_TypeObject.__init__` / `compute_default_mro` / `add_subclass` cannot
+/// publish a type and there is no Python error channel.
+fn builtin_type_failed_alloc_size() -> usize {
+    let mro = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
+        + 2 * std::mem::size_of::<PyObjectRef>();
+    mro.max(pyre_object::weakref::SIZEOF_WEAKREF)
+}
+
+/// `W_TypeObject.__init__` / `compute_default_mro` leave a published type
+/// or raise. Closures with no error channel stop here on collector failure.
+pub fn builtin_type_or_alloc_failed(w_type: PyObjectRef) -> PyObjectRef {
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && w_type.is_null() {
+        pyre_object::gc_hook::gc_alloc_failed(builtin_type_failed_alloc_size());
+    }
+    w_type
+}
+
 /// Create the root `object` type. MRO = [object].
 fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -3111,11 +3138,13 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         pyre_object::w_type_set_weakrefable(type_obj, false);
         crate::objspace::std::mapdict::install_type_terminator(type_obj);
     }
-    unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    if !unsafe { w_type_set_mro(type_obj, vec![type_obj]) } {
+        return builtin_type_or_alloc_failed(PY_NULL);
+    }
     let type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
-    type_obj
+    builtin_type_or_alloc_failed(type_obj)
 }
 
 /// Create a builtin type with a single base. MRO = [self] + base.mro().
@@ -3540,7 +3569,7 @@ fn new_typeobject_with_base_and_layout(
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    new_typeobject_with_metatype_and_layout(
+    builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
         name,
         init,
         base,
@@ -3548,7 +3577,7 @@ fn new_typeobject_with_base_and_layout(
         PY_NULL,
         std::ptr::null(),
         false,
-    )
+    ))
 }
 
 /// [`new_typeobject_with_base_and_layout`] for a type whose own type is not
@@ -3713,16 +3742,20 @@ fn new_typeobject_with_metatype_and_layout(
     } else {
         mro.push(pyre_object::gc_roots::shadow_stack_get(param_base));
     }
-    unsafe { w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(type_slot), mro) };
+    if !unsafe { w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(type_slot), mro) } {
+        return PY_NULL;
+    }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, pyre_object::gc_roots::shadow_stack_get(type_slot)) };
-    // `typeobject.py TypeCache.ready(w_type)` runs `w_type.ready()`
+    // `TypeCache.ready(w_type)` runs `W_TypeObject.ready()`
     // for every builtin typedef the space cache builds, exactly as
-    // `_type_new` (typeobject.py:970) does for a heap type — so a builtin
+    // `_type_new` does for a heap type — so a builtin
     // shows up in `base.__subclasses__()` too.
-    unsafe {
+    if !unsafe {
         pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(type_slot))
-    };
+    } {
+        return PY_NULL;
+    }
     pyre_object::gc_roots::shadow_stack_get(type_slot)
 }
 
@@ -3835,14 +3868,18 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
 
     // MRO = C3 linearization over the recorded `__bases__`.
     let mro = unsafe { crate::baseobjspace::compute_default_mro(type_obj) };
-    unsafe { w_type_set_mro(type_obj, mro) };
+    if !unsafe { w_type_set_mro(type_obj, mro) } {
+        return builtin_type_or_alloc_failed(PY_NULL);
+    }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
     // Readying registers the new type on every entry of `__bases__`, so a
     // multi-base builtin such as `io.UnsupportedOperation(OSError, ValueError)`
     // reaches both `OSError.__subclasses__()` and `ValueError.__subclasses__()`.
-    unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
-    pyre_object::gc_roots::shadow_stack_get(type_slot)
+    if !unsafe { pyre_object::typeobject::w_type_ready(type_obj) } {
+        return builtin_type_or_alloc_failed(PY_NULL);
+    }
+    builtin_type_or_alloc_failed(pyre_object::gc_roots::shadow_stack_get(type_slot))
 }
 
 /// Create a named builtin type inheriting from `object`.
@@ -3887,7 +3924,7 @@ pub(crate) fn make_builtin_type_with_layout_owner(
     layout_pytype: *const PyType,
     overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
-    new_typeobject_with_metatype_and_layout(
+    builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
         name,
         init,
         base,
@@ -3895,7 +3932,7 @@ pub(crate) fn make_builtin_type_with_layout_owner(
         PY_NULL,
         overridetypedef,
         false,
-    )
+    ))
 }
 
 /// PyPy `TypeCache.build`: construct a builtin type using an explicit
@@ -3909,7 +3946,7 @@ pub fn make_builtin_type_with_overridetypedef(
     overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
     let layout_pytype = unsafe { (*overridetypedef).instance_type };
-    new_typeobject_with_metatype_and_layout(
+    builtin_type_or_alloc_failed(new_typeobject_with_metatype_and_layout(
         name,
         init,
         base,
@@ -3917,7 +3954,7 @@ pub fn make_builtin_type_with_overridetypedef(
         PY_NULL,
         overridetypedef,
         false,
-    )
+    ))
 }
 
 /// [3.14-spec] Project a CPython `PyType_From*Spec` owner onto a PyPy builtin
@@ -7330,6 +7367,9 @@ fn set_init_from_iterable_impl(
 ) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_set_or_frozenset(w_iterable) } {
         unsafe { pyre_object::w_set_copy_storage_from(w_set, w_iterable) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         return Ok(());
     }
     // RPython's shadowstack transformation keeps `self` live across
@@ -9594,6 +9634,9 @@ fn dict_fromkeys_impl(
                     pyre_object::w_frozendict_copy_from(src)
                 }
             };
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && work.is_null() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             let work_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(work);
             let items =
@@ -10414,6 +10457,9 @@ fn frozendict_or_binop(
                 pyre_object::w_frozendict_copy_from(src)
             }
         };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && new.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let new_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(new);
         crate::type_methods::dict_update1(
@@ -10448,11 +10494,15 @@ fn frozendict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let src = crate::type_methods::resolve_dict_backing(self_);
     unsafe {
-        if src.is_null() {
-            Ok(pyre_object::w_frozendict_new())
+        let copied = if src.is_null() {
+            pyre_object::w_frozendict_new()
         } else {
-            Ok(pyre_object::w_frozendict_copy_from(src))
+            pyre_object::w_frozendict_copy_from(src)
+        };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
+        Ok(copied)
     }
 }
 
@@ -10468,6 +10518,9 @@ fn frozendict_getnewargs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             pyre_object::w_dict_copy(src)
         }
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && d.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     let d_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(d);
     Ok(pyre_object::w_tuple_new(vec![
@@ -11207,7 +11260,7 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let next = pyre_object::gc_roots::shadow_stack_get(next_slot);
     let w_code = unsafe { (*frame).fget_f_code() };
 
-    Ok(crate::pytraceback::w_pytraceback_new(
+    crate::runtime_ops::obj_or_memory_error(crate::pytraceback::w_pytraceback_new(
         frame, lasti, next, lineno, w_code,
     ))
 }
@@ -14219,12 +14272,12 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
         // `INSTANCE_TYPE`).  `make_builtin_type_with_layout`
         // wires the layout so `setup_builtin_type` records the
         // explicit typedef per `typeobject.py:1273-1280`.
-        let tp = make_builtin_type_with_layout(
+        let tp = builtin_type_or_alloc_failed(make_builtin_type_with_layout(
             "getset_descriptor",
             init_getset_descriptor_type,
             w_object(),
             &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE as *const PyType,
-        );
+        ));
         // typedef.py assert not GetSetProperty.typedef.acceptable_as_base_class
         // No `__new__` in the typedef either, so `tp_new` is NULL.
         unsafe {
@@ -16769,9 +16822,8 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
         crate::baseobjspace::mutated_absent(w_type);
         // Unlink w_type from its old bases' subclass lists before switching to
-        // the new bases (typeobject.py `remove_subclass`); the new
-        // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
-        // `add_subclass`).
+        // the new bases (`W_TypeObject.remove_subclass`); the new
+        // bases are relinked by `W_TypeObject.ready` / `add_subclass`.
         let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_root);
         if !saved_bases.is_null() {
             let old_n = pyre_object::w_tuple_len(saved_bases);
@@ -16787,8 +16839,19 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
         let w_value = pyre_object::gc_roots::shadow_stack_get(new_bases_root);
         pyre_object::typeobject::w_type_set_bases(w_type, w_value);
-        pyre_object::typeobject::w_type_ready(w_type);
-        // typeobject.py:1132-1153 — recompute through the full custom-MRO
+        // `W_TypeObject.ready` / `add_subclass`: WEAKREF allocation can fail
+        // after bases are written. Revert `bases_w` the same way the
+        // `mro_subclasses` error path does (`descr_set__bases__`).
+        if !pyre_object::typeobject::w_type_ready(w_type) {
+            let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+            let w_value = pyre_object::gc_roots::shadow_stack_get(new_bases_root);
+            if pyre_object::typeobject::w_type_get_bases(w_type) == w_value {
+                let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_root);
+                pyre_object::typeobject::w_type_set_bases(w_type, saved_bases);
+            }
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        // `descr_set__bases__` — recompute through the full custom-MRO
         // path.  If any class fails, restore only entries that still contain
         // the MRO/bases installed by this call; a reentrant assignment owns
         // any values that have since replaced them.
@@ -26706,8 +26769,14 @@ fn bytearray_descr_init_value(
         // through to the buffer path below. (bytearray does NOT honour
         // `__bytes__`, so there is no invoke_bytes_method here.)
         if let Some(count) = pyre_object::with_roots!(arg, target => bytes_count_from_index(arg))? {
-            return pyre_object::bytearrayobject::w_bytearray_try_new(count)
-                .ok_or_else(crate::builtins::reservation_failed);
+            let obj = pyre_object::bytearrayobject::w_bytearray_try_new(count);
+            // `W_BytearrayObject.__init__` completes or raises; collector
+            // failure is the pending exception, reserve failure is the size
+            // error.
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && obj.is_none() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            return obj.ok_or_else(crate::builtins::reservation_failed);
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
@@ -32034,6 +32103,9 @@ fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
             w_frozenset,
             pyre_object::gc_roots::shadow_stack_get(src_slot),
         );
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Some(pyre_object::PY_NULL);
+        }
         Some(w_frozenset)
     }
 }
@@ -32071,9 +32143,14 @@ pub(crate) fn set_descr_contains(
             if !set_type_error_matched(&mut e) {
                 return Err(e);
             }
-            let Some(w_f) =
-                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(other_slot))
-            else {
+            let converted =
+                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(other_slot));
+            if pyre_object::gc_hook::gc_alloc_failed_pending()
+                && converted.is_some_and(|p| p.is_null())
+            {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            let Some(w_f) = converted else {
                 return Err(e);
             };
             crate::type_methods::set_contains_checked(
@@ -32117,9 +32194,14 @@ fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool,
             if !set_type_error_matched(&mut e) {
                 return Err(e);
             }
-            let Some(w_f) =
-                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(item_slot))
-            else {
+            let converted =
+                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(item_slot));
+            if pyre_object::gc_hook::gc_alloc_failed_pending()
+                && converted.is_some_and(|p| p.is_null())
+            {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            let Some(w_f) = converted else {
                 return Err(e);
             };
             set_remove(pyre_object::gc_roots::shadow_stack_get(set_slot), w_f)
@@ -32196,7 +32278,11 @@ fn setlike_descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE) } {
         return Ok(args[0]);
     }
-    Ok(set_copy_real(args[0]))
+    let copied = set_copy_real(args[0]);
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    Ok(copied)
 }
 
 macro_rules! setlike_wrapper_gateways {
@@ -32841,6 +32927,9 @@ pub(crate) fn set_method_union(
         return Ok(pyre_object::w_set_new());
     }
     let result = set_copy_real(args[0]);
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && result.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     // `collect_iterable` runs a user `__iter__`/`__next__` and
     // `builtin_set_add_items` a user `__hash__`/`__eq__`, so the set being
     // built stays live across every operand — with two non-set operands it
@@ -32902,6 +32991,9 @@ fn set_copy_real(w_set: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(result_slot),
             pyre_object::gc_roots::shadow_stack_get(src_slot),
         );
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return pyre_object::PY_NULL;
+        }
         pyre_object::gc_roots::shadow_stack_get(result_slot)
     }
 }
@@ -33132,6 +33224,9 @@ pub(crate) fn set_method_intersection(
                 w_frozenset,
                 pyre_object::gc_roots::shadow_stack_get(result_slot),
             );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             return Ok(w_frozenset);
         }
     }
@@ -33152,6 +33247,9 @@ pub(crate) fn set_method_difference(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let result = set_copy_real(pyre_object::gc_roots::shadow_stack_get(base));
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && result.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let result = pyre_object::gc_roots::pin_root(result);
     let mut update_args: Vec<pyre_object::PyObjectRef> = vec![result];
@@ -33206,6 +33304,9 @@ pub(crate) fn set_method_symmetric_difference(
                 w_frozenset,
                 pyre_object::gc_roots::shadow_stack_get(new_slot),
             );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             return Ok(w_frozenset);
         }
     }
@@ -33550,6 +33651,9 @@ fn set_method_intersection_update(
             pyre_object::gc_roots::shadow_stack_get(result_slot),
         )
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     Ok(pyre_object::w_none())
 }
 
@@ -33579,17 +33683,22 @@ fn set_method_symmetric_difference_update(
             pyre_object::gc_roots::shadow_stack_get(new_slot),
         )
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     Ok(pyre_object::w_none())
 }
 
 /// Map a `w_set_setitem_with_hash` result: `-1` is the pending `__eq__` /
-/// `__hash__` exception, `-2` a table resized by a callback.
+/// `__hash__` exception, `-2` a table resized by a callback, `-3` collector
+/// allocation failure (`SetUpdateError::Memory` / `ll_dict_setitem`).
 fn set_setitem_with_hash_result(rc: i64) -> Result<(), crate::PyError> {
     match rc {
         0 => Ok(()),
         -2 => Err(crate::PyError::runtime_error(
             "Set changed size during iteration",
         )),
+        -3 => Err(crate::runtime_ops::fetch_memory_error()),
         _ => Err(crate::baseobjspace::take_pending_hash_error()),
     }
 }
@@ -40638,7 +40747,7 @@ mod tests {
     fn run_exec(source: &str) {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile failed");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).unwrap_or_else(|err| {
             panic!("{}", err.message_text());
         });

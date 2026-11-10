@@ -363,8 +363,13 @@ pub(crate) fn unsupported(message: &str) -> crate::PyError {
 /// `PyBytes_FromStringAndSize(NULL, n)` and `_buffered_init`'s `PyMem_Malloc`
 /// answer `MemoryError`.
 pub(crate) fn try_new_buffer(size: usize) -> Result<PyObjectRef, crate::PyError> {
-    pyre_object::bytearrayobject::w_bytearray_try_new(size)
-        .ok_or_else(crate::builtins::reservation_failed)
+    let obj = pyre_object::bytearrayobject::w_bytearray_try_new(size);
+    // `W_BytearrayObject.__init__` completes or raises; collector failure
+    // is the pending exception, reserve failure is the size error.
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && obj.is_none() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    obj.ok_or_else(crate::builtins::reservation_failed)
 }
 
 pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {

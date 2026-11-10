@@ -656,12 +656,20 @@ fn lookup_typer(func: &HostObject) -> Option<BuiltinTyperFn> {
 /// annotator's qualname-keyed `string_constructor` registrations
 /// (`annotator/builtin.rs` — `String.new` / `String.with_capacity` /
 /// `Wtf8Buf.new` / `Wtf8Buf.with_capacity`), keeping the annotate and rtype
-/// stages in agreement on the empty-`SomeString` shell.
+/// stages in agreement on the empty-`SomeString` shell.  It also carries
+/// the rtyper twin of qualname-keyed annotator constants.
 fn lookup_typer_by_qualname(qualname: &str) -> Option<BuiltinTyperFn> {
     match qualname {
         "String.new" | "String.with_capacity" | "Wtf8Buf.new" | "Wtf8Buf.with_capacity" => {
             Some(rtype_empty_string_ctor)
         }
+        "gc_alloc_failed_pending"
+        | "majit_gc.gc_alloc_failed_pending"
+        | "gc_hook.gc_alloc_failed_pending"
+        | "pyre_object.gc_hook.gc_alloc_failed_pending"
+        | "majit_gc::gc_alloc_failed_pending"
+        | "gc_hook::gc_alloc_failed_pending"
+        | "pyre_object::gc_hook::gc_alloc_failed_pending" => Some(rtype_gc_alloc_failed_pending),
         _ => None,
     }
 }
@@ -1631,6 +1639,29 @@ pub(super) fn rtype_we_are_jitted(
         result_lltype,
     );
     Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// `objectmodel.py we_are_translated` `Entry.specialize_call`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     hop.exception_cannot_occur()
+///     return hop.inputconst(lltype.Bool, True)
+/// ```
+///
+/// Twin of [`crate::annotator::builtin`]'s `gc_alloc_failed_pending_const`:
+/// the `rpyexc_occurred` test `exceptiontransform.py` adds after a NULL
+/// malloc does not exist in the graphs `task_pyjitpl_lltype` reads, so the
+/// source-level test lowers to the constant `False`.
+pub(super) fn rtype_gc_alloc_failed_pending(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    Ok(Some(Hlvalue::Constant(HighLevelOp::inputconst(
+        &LowLevelType::Bool,
+        &ConstValue::Bool(false),
+    )?)))
 }
 
 /// RPython `rlib/nonconst.py specialize_call`
@@ -5394,6 +5425,12 @@ mod tests {
             err.to_string()
                 .contains("don't know about built-in function")
         );
+    }
+
+    #[test]
+    fn gc_alloc_failed_pending_rtypes_to_constant_false() {
+        assert!(lookup_typer_by_qualname("gc_alloc_failed_pending").is_some());
+        assert!(lookup_typer_by_qualname("pyre_object.gc_hook.gc_alloc_failed_pending").is_some());
     }
 
     fn dummy_hop() -> HighLevelOp {

@@ -1222,22 +1222,36 @@ impl<'a> Lowering<'a> {
                 // `baseobjspace::METHOD_CACHE` behind
                 // `lookup_where_with_method_cache`) would otherwise fail the
                 // phaseA lift and drop the whole graph to the legacy walker.
+                //
+                // `gc_alloc_failed_pending()` is `exceptiontransform.py` `rpyexc_occurred`,
+                // which `ExceptionTransformer.gen_exc_check` inserts only after the
+                // codewriter has read the graphs, so the JIT's graph has no such branch;
+                // folding it to False here also covers graphs the rtyper skips.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
-                    && path_ends_with_segments(&fd.item_meta.name_path(), "jit::we_are_jitted")
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ConstBool(true),
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let path = fd.item_meta.name_path();
+                    let folded = if path_ends_with_segments(&path, "jit::we_are_jitted") {
+                        Some(true)
+                    } else if path_ends_with_segments(&path, "majit_gc::gc_alloc_failed_pending") {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    if let Some(value) = folded {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::ConstBool(value),
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `gc_alloc_storage_box(Wtf8Buf, tid) -> *mut Wtf8Buf` is
                 // only the Rust ownership spelling of PyPy's direct `_utf8`

@@ -6015,7 +6015,11 @@ pub fn init_gc_subsystem() {
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
     pyre_interpreter::baseobjspace::publish_method_cache_container();
-    pyre_object::unicodeobject::init_interned_strings();
+    // `ObjSpace.__init__` builds `interned_strings` (`ll_new_weakdict`)
+    // before the space is usable; bootstrap has no Python error channel.
+    if !pyre_object::unicodeobject::init_interned_strings() {
+        pyre_object::unicodeobject::init_interned_strings_or_alloc_failed();
+    }
     // The root walkers belong to the same bootstrap as the collector they feed:
     // interpreter startup fills interned strings and the immortal stores
     // (`walk_interpreter_global_roots`, `walk_immortal_store_roots`) before
@@ -13414,6 +13418,8 @@ fn compile_and_run_once(
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
+    let mut snapshot_error = None;
+    let mut snapshot_saved_last_instr = None;
     let mut published_abort_image = false;
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
@@ -13474,12 +13480,26 @@ fn compile_and_run_once(
                 // (`own_frame_array_store_target`); only `last_instr` /
                 // `valuestackdepth` need a start-of-trace copy for a declined
                 // abort that replays from the merge point.
-                let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
-                let traced_on_live = pinned.is_some();
-                let concrete_frame =
-                    pinned.unwrap_or_else(|| frame_root.frame().snapshot_for_tracing());
+                //
+                // `handle_operation_error` looks up the exception table at
+                // `last_instr`. Save it before `snapshot_for_tracing` so a
+                // failed allocation can restore the hot-backedge instruction
+                // and `bound_reached` can return into that dispatch.
                 let saved_last_instr = frame_root.frame().last_instr;
                 let saved_valuestackdepth = frame_root.frame().valuestackdepth;
+                let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
+                let traced_on_live = pinned.is_some();
+                let concrete_frame = match pinned {
+                    Some(frame) => frame,
+                    None => match frame_root.frame().snapshot_for_tracing() {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            snapshot_saved_last_instr = Some(saved_last_instr);
+                            snapshot_error = Some(err);
+                            return majit_metainterp::TraceAction::Abort;
+                        }
+                    },
+                };
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
                 let (action, executed_frame, walk_end_flushed) = trace_bytecode(
                     meta,
@@ -13585,6 +13605,15 @@ fn compile_and_run_once(
     // the walk staged without publishing an abort image has no driver on
     // this leg; `finish_cancel_tracing` drops it with the scope.
     driver.meta_interp_mut().finish_cancel_tracing();
+    if let Some(err) = snapshot_error {
+        // Snapshot allocation failure is a MemoryError this frame can
+        // catch. `ExitFrameWithException` offers it to
+        // `handle_operation_error` and the same-frame exception table.
+        if let Some(last_instr) = snapshot_saved_last_instr {
+            frame_root.frame().last_instr = last_instr;
+        }
+        return Some(LoopResult::ExitFrameWithException(err));
+    }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished && dynasm_exec_diag_enabled() {
@@ -17204,7 +17233,7 @@ mod tests {
         let module =
             compile_exec("def f(x):\n    return (x, x)\nf(1)\n").expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let depth = frame.valuestackdepth;
         assert!(
             locals_w!(&*frame).len() > depth,
@@ -17830,7 +17859,7 @@ mod tests {
         let module = compile_exec("def f(a, b):\n    c = a\n    return c\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let array_len = locals_w!(frame).as_slice().len();
@@ -18508,7 +18537,7 @@ mod tests {
         ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         init(&mut frame);
         frame.fix_array_ptrs();
 
@@ -18544,7 +18573,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18638,7 +18667,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18748,7 +18777,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18815,7 +18844,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18925,7 +18954,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_int_new(11);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -19083,7 +19112,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_int_new(11);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);

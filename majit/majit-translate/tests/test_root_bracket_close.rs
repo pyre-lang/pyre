@@ -36,7 +36,9 @@ use common::{
     object_llbc, with_llbc_link_state, with_shared_lowering, with_shared_lowering_many,
 };
 use majit_charon_reader::Llbc;
-use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
+use majit_charon_reader::ullbc::{
+    CallFunc, CallKind, FunId, Operand, PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured,
+};
 use majit_translate::CallPath;
 use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
@@ -439,8 +441,104 @@ fn guard_drop_sites<'a>(
     })
 }
 
+/// Trailing-segment suffix, matching `Llbc::local_fn`.
+fn name_path_ends_with(path: &str, suffix: &str) -> bool {
+    path == suffix || path.ends_with(&format!("::{suffix}"))
+}
+
+/// Locals whose Call dest the MIR front folds to a constant bool
+/// (`jit::we_are_jitted` → true, `majit_gc::gc_alloc_failed_pending` → false).
+fn folded_switch_bools(llbc: &Llbc, body: &Unstructured) -> Vec<Option<bool>> {
+    let mut folded = Vec::new();
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            continue;
+        };
+        let PlaceKind::Local(n) = call.dest.kind else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(decl) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        let path = decl.item_meta.name_path();
+        let value = if name_path_ends_with(&path, "jit::we_are_jitted") {
+            true
+        } else if name_path_ends_with(&path, "majit_gc::gc_alloc_failed_pending") {
+            false
+        } else {
+            continue;
+        };
+        let idx = n as usize;
+        if idx >= folded.len() {
+            folded.resize(idx + 1, None);
+        }
+        folded[idx] = Some(value);
+    }
+    folded
+}
+
+/// Whether a `SwitchInt` arm scalar is the integer 0. `None` if the JSON
+/// is not a scalar we can read.
+fn switch_int_arm_is_zero(scalar: &serde_json::Value) -> Option<bool> {
+    if let Some(b) = scalar.get("Bool").and_then(serde_json::Value::as_bool) {
+        return Some(!b);
+    }
+    let inner = scalar.get("Scalar").or_else(|| scalar.get("Integer"))?;
+    let obj = inner.as_object()?;
+    for payload in obj.values() {
+        let value = match payload {
+            serde_json::Value::Array(items) if items.len() >= 2 => &items[1],
+            other => other,
+        };
+        if let Some(n) = value.as_i64() {
+            return Some(n == 0);
+        }
+        if let Some(n) = value.as_u64() {
+            return Some(n == 0);
+        }
+        if let Some(text) = value.as_str() {
+            return text.parse::<i128>().ok().map(|n| n == 0);
+        }
+        if let Some(b) = value.as_bool() {
+            return Some(!b);
+        }
+    }
+    None
+}
+
+/// Target of the 0 arm, or `default` when every readable arm is nonzero.
+/// `None` when no 0 arm is visible and at least one scalar is unreadable.
+fn switch_int_zero_target(arms: &[(serde_json::Value, u64)], default: u64) -> Option<u64> {
+    let mut zero = None;
+    let mut unreadable = false;
+    for (scalar, target) in arms {
+        match switch_int_arm_is_zero(scalar) {
+            Some(true) => zero = Some(*target),
+            Some(false) => {}
+            None => unreadable = true,
+        }
+    }
+    if let Some(target) = zero {
+        Some(target)
+    } else if unreadable {
+        None
+    } else {
+        Some(default)
+    }
+}
+
 /// MIR blocks reachable from the entry without taking an unwind edge.
+/// Blocks reachable only through the constant arm the MIR front folds away
+/// (`gc_alloc_failed_pending()` is `false`, `we_are_jitted()` is `true`) owe
+/// no close, because the lowered graph does not contain them.
 fn reachable_without_unwind(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
+    let folded = folded_switch_bools(llbc, body);
     let mut seen = vec![false; body.body.len()];
     let mut stack = vec![0usize];
     while let Some(b) = stack.pop() {
@@ -456,13 +554,36 @@ fn reachable_without_unwind(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
             | TermKind::Call { target, .. }
             | TermKind::Assert { target, .. }
             | TermKind::Drop { target, .. } => stack.push(target as usize),
-            TermKind::Switch { targets, .. } => match targets {
-                SwitchTargets::If(a, b) => stack.extend([a as usize, b as usize]),
-                SwitchTargets::SwitchInt(_, arms, default) => {
-                    stack.extend(arms.into_iter().map(|(_, t)| t as usize));
-                    stack.push(default as usize);
+            TermKind::Switch { discr, targets } => {
+                let folded_discr = match &discr {
+                    Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                        PlaceKind::Local(n) => folded.get(n as usize).copied().flatten(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match targets {
+                    SwitchTargets::If(then_bb, else_bb) => match folded_discr {
+                        Some(true) => stack.push(then_bb as usize),
+                        Some(false) => stack.push(else_bb as usize),
+                        None => stack.extend([then_bb as usize, else_bb as usize]),
+                    },
+                    SwitchTargets::SwitchInt(_, arms, default) => match folded_discr {
+                        Some(true) => stack.push(default as usize),
+                        Some(false) => match switch_int_zero_target(&arms, default) {
+                            Some(target) => stack.push(target as usize),
+                            None => {
+                                stack.extend(arms.into_iter().map(|(_, t)| t as usize));
+                                stack.push(default as usize);
+                            }
+                        },
+                        None => {
+                            stack.extend(arms.into_iter().map(|(_, t)| t as usize));
+                            stack.push(default as usize);
+                        }
+                    },
                 }
-            },
+            }
             _ => {}
         }
     }

@@ -2271,7 +2271,7 @@ mod callee_ref_owner_tests {
                 _ => None,
             })
             .expect("function code");
-        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
         (frame, frame_ptr)
     }

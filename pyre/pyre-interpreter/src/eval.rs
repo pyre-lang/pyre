@@ -2187,7 +2187,14 @@ pub fn handle_exception_with_context(
             let saved_trace_slot = pyre_object::gc_roots::shadow_stack_len();
             let saved_trace = pyre_object::gc_roots::pin_root(saved_trace);
             if !saved_trace.is_null() {
-                frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+                match frame.getorcreatedebug(-1) {
+                    Ok(d) => d.w_f_trace = pyre_object::PY_NULL,
+                    Err(debug_err) => {
+                        *err = debug_err;
+                        err_slot = err.pin(&_exc_roots);
+                        return false;
+                    }
+                }
             }
             let after_exc_result =
                 unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
@@ -2197,7 +2204,14 @@ pub fn handle_exception_with_context(
             let frame = unsafe { &mut *frame_anchor.live() };
             let saved_trace = pyre_object::gc_roots::shadow_stack_get(saved_trace_slot);
             if !saved_trace.is_null() {
-                frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+                match frame.getorcreatedebug(-1) {
+                    Ok(d) => d.w_f_trace = saved_trace,
+                    Err(debug_err) => {
+                        *err = debug_err;
+                        err_slot = err.pin(&_exc_roots);
+                        return false;
+                    }
+                }
             }
             match after_exc_result {
                 // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
@@ -2246,12 +2260,17 @@ pub fn handle_exception_with_context(
         } else {
             frame.last_instr as i64
         };
-        unsafe {
+        let recorded = unsafe {
             crate::pytraceback::record_application_traceback(
                 pyre_object::gc_roots::shadow_stack_get(exc_slot),
                 frame as *mut PyFrame,
                 last_instruction,
-            );
+            )
+        };
+        if !recorded {
+            *err = crate::runtime_ops::fetch_memory_error();
+            err_slot = err.pin(&_exc_roots);
+            return false;
         }
         err.reload(&_exc_roots, err_slot);
         err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
@@ -2968,6 +2987,9 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
         unsafe { w_list_append(list, value) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         Ok(())
     }
 
@@ -3128,7 +3150,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // slot is not realized.  The popped value's only name is this word.
         let roots = pyre_object::gc_roots::push_roots();
         let _ = roots.pin_root(value);
-        let w_locals = self.get_or_create_w_locals();
+        let w_locals = self.get_or_create_w_locals()?;
         let w_code = self.getcode_w();
         let value = roots.get(roots.base());
         let base = roots.pin_roots(&[value, w_locals, w_code]);
@@ -3400,7 +3422,7 @@ pub unsafe fn store_name_value_w(
     let _ = roots.pin_root(w_name);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(value);
-    let w_locals = frame.get_or_create_w_locals();
+    let w_locals = frame.get_or_create_w_locals()?;
     let locals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_locals);
     let w_name = roots.get(name_slot);
@@ -3433,7 +3455,7 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
     let roots = pyre_object::gc_roots::push_roots();
     let name_slot = roots.base();
     let _ = roots.pin_root(w_name);
-    let w_locals = frame.get_or_create_w_locals();
+    let w_locals = frame.get_or_create_w_locals()?;
     crate::baseobjspace::delitem(w_locals, roots.get(name_slot)).map_err(|err| {
         if matches!(err.kind, PyErrorKind::KeyError) {
             let w_name = roots.get(name_slot);
@@ -4563,7 +4585,7 @@ impl OpcodeStepExecutor for PyFrame {
         // them and the key after the dict.
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
-        let _ = roots.pin_root(self.get_or_create_w_locals());
+        let _ = roots.pin_root(self.get_or_create_w_locals()?);
         if crate::baseobjspace::finditem_str(roots.get(locals_slot), "__annotations__")?.is_none() {
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(unsafe { pyre_object::w_str_new("__annotations__") });
@@ -5302,12 +5324,15 @@ impl OpcodeStepExecutor for PyFrame {
             // the entry made here.  Both values are on the value stack already,
             // so the node allocation cannot collect them.
             let frame = unsafe { &mut *anchor.live() };
-            unsafe {
+            let recorded = unsafe {
                 crate::pytraceback::record_application_traceback(
                     matching(),
                     frame as *mut PyFrame,
                     frame.last_instr as i64,
-                );
+                )
+            };
+            if !recorded {
+                return Err(crate::runtime_ops::fetch_memory_error());
             }
             // `record_application_traceback` publishes a propagating error in
             // `IN_FLIGHT_EXCEPTION`. This wrapper is no longer propagating:
@@ -5699,7 +5724,7 @@ impl OpcodeStepExecutor for PyFrame {
         // read, so the mapping crosses an allocation before the delete.
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
-        let _ = roots.pin_root(self.get_or_create_w_locals());
+        let _ = roots.pin_root(self.get_or_create_w_locals()?);
         let key =
             unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
         crate::baseobjspace::delitem(roots.get(locals_slot), key).map_err(|err| {
@@ -6335,7 +6360,7 @@ impl OpcodeStepExecutor for PyFrame {
         // globals into the class namespace and make LOAD_FROM_DICT_OR_DEREF
         // select a global over its closure cell.
         let anchor = FrameAnchor::new(self);
-        let w_locals = self.get_or_create_w_locals();
+        let w_locals = self.get_or_create_w_locals()?;
         Self::push_anchored(&anchor, w_locals)
     }
 
@@ -6472,7 +6497,7 @@ mod tests {
         // seed the builtins.
         crate::test_hooks::install_hash_hook();
         let code = compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let result = frame.execute_frame(None);
         (result, frame)
     }
@@ -6508,7 +6533,7 @@ mod tests {
             .iter()
             .position(|constant| matches!(constant, crate::bytecode::ConstantData::Code { .. }))
             .expect("nested code constant");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let enclosing = frame.code().clone();
         for idx in [str_idx, tuple_idx, code_idx] {
             let index = crate::bytecode::oparg::ConstIdx::from_u32(idx as u32);
@@ -6537,7 +6562,7 @@ mod tests {
     fn test_install_current_frame_does_not_own_an_already_entered_chain() {
         let _ = run_exec_frame("pass");
         let code = compile_exec("pass").expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let frame_ptr = frame.as_mut_ptr();
         // The frame no longer carries its context, so resolve the thread's.
         // Read it AFTER building the frame: `PyFrame::new` re-stamps
@@ -6738,7 +6763,7 @@ mod tests {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
             code.instructions.replace_op(1, Instruction::EndFor);
         }
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let err = frame
             .execute_frame(None)
             .expect_err("expected bytecode corruption");
@@ -7779,7 +7804,7 @@ result = (
         let dead_before = dead.0;
 
         let code = compile_exec("x = 1").expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         unsafe {
             let frame_ptr = frame.as_mut_ptr();
             let arr = (*frame_ptr).locals_cells_stack_w;

@@ -136,6 +136,9 @@ pub fn w_method_new(
         }
         return raw as PyObjectRef;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
+    }
     let w_function = crate::gc_roots::shadow_stack_get(save_point);
     let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
     let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
@@ -298,6 +301,9 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         }
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
+    }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
     }
     StaticMethod::allocate(StaticMethod {
         ob: header,
@@ -508,6 +514,9 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         }
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
+    }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
     }
     ClassMethod::allocate(ClassMethod {
         ob: header,

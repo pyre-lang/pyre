@@ -11380,16 +11380,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `FrameBox::new` also collect (`maybe_collect_for_external_malloc`).
         let inline_w_code = callee_state.borrow().inline_w_code;
         let inline_w_globals = callee_state.borrow().inline_w_globals;
-        let mut frame = pyre_interpreter::pyframe::FrameBox::new(
-            pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut frame = match pyre_interpreter::pyframe::FrameBox::new(
+            match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                 &concrete_args,
                 inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 live_closure(),
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-            ),
-        );
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    crate::trace::set_walk_end_propagated_exception(err);
+                    return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+                }
+            },
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                crate::trace::set_walk_end_propagated_exception(err);
+                return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+            }
+        };
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;

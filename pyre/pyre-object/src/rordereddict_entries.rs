@@ -260,6 +260,9 @@ where
             crate::gc_hook::try_gc_write_barrier_managed(raw);
             return entries;
         }
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
     }
     // `tid == 0` or no hook (unit tests, `pyre-wasm-test`): immortal
     // `alloc_zeroed`, the same contract as `malloc_typed`. Never freed.

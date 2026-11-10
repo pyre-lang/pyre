@@ -205,7 +205,11 @@ fn w_generator_or_coroutine_new(
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    crate::lltype::malloc_typed(value) as PyObjectRef
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        PY_NULL
+    } else {
+        crate::lltype::malloc_typed(value) as PyObjectRef
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

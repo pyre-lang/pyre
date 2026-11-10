@@ -85,8 +85,17 @@ pub(crate) fn stdframe_binop_shortcut_apply(
                     pyre_object::w_list_getitem_inner(a, idx)
                 };
                 match item {
+                    Some(w) if pyre_object::gc_hook::gc_alloc_failed_pending() && w.is_null() => {
+                        Err(crate::runtime_ops::fetch_memory_error())
+                    }
                     Some(w) => Ok(w),
-                    None => Err(PyError::index_error("list index out of range")),
+                    None => {
+                        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                            Err(crate::runtime_ops::fetch_memory_error())
+                        } else {
+                            Err(PyError::index_error("list index out of range"))
+                        }
+                    }
                 }
             }
             StdFrameShortcut::None => unreachable!(),
@@ -474,6 +483,9 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
                 value,
                 majit_metainterp::jit::we_are_jitted(),
             );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
             let live: Vec<PyObjectRef> = (0..items.len())
@@ -907,13 +919,17 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // and needs no `try_hash_value` first. The helper reads the
             // strategy under the set's stripe lock and answers -1 for any
             // other.
-            if pyre_object::listobject::is_plain_int1(value)
-                && pyre_object::setobject::jit_int_set_add(
+            if pyre_object::listobject::is_plain_int1(value) {
+                let status = pyre_object::setobject::jit_int_set_add(
                     set,
                     pyre_object::listobject::plain_int_w(value),
-                ) >= 0
-            {
-                return Ok(());
+                );
+                if status >= 0 {
+                    return Ok(());
+                }
+                if status == pyre_object::setobject::JIT_INT_SET_ADD_MEMORY {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
             }
             // `try_hash_value` may run a user `__hash__` that allocates and
             // triggers a moving minor collection; `set`/`value` must be
@@ -975,10 +991,14 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
             }
         } else if pyre_object::is_list(set) {
             let items = if pyre_object::is_list(iterable) {
-                pyre_object::w_list_items_copy_as_vec_mode(
+                let items = pyre_object::w_list_items_copy_as_vec_mode(
                     iterable,
                     majit_metainterp::jit::we_are_jitted(),
-                )
+                );
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
+                items
             } else if pyre_object::is_tuple(iterable) {
                 pyre_object::w_tuple_items_copy_as_vec(iterable)
             } else {

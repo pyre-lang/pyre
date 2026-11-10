@@ -97,8 +97,12 @@ impl IntArray {
 
     pub fn from_vec(values: Vec<i64>) -> Self {
         let len = values.len();
+        let block = unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(len),
         };
         unsafe {
@@ -145,8 +149,12 @@ impl IntArray {
         if capacity == 0 {
             return Self::empty();
         }
+        let block = unsafe { alloc_typed_items_block(capacity, gc_int_array_gc_type_id()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         Self {
-            block: unsafe { alloc_typed_items_block(capacity, gc_int_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(0),
         }
     }
@@ -158,8 +166,12 @@ impl IntArray {
         if len == 0 {
             return Self::empty();
         }
+        let block = unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         Self {
-            block: unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(len),
         }
     }
@@ -280,12 +292,19 @@ impl IntArray {
             .saturating_add(extra)
             .saturating_add(min_cap >> 3)
             .max(INT_ARRAY_INLINE_CAP);
-        self.block = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
+        let fresh = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
+            return;
+        }
+        self.block = fresh;
     }
 
     pub fn push(&mut self, value: i64) {
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             *self.base().add(self.len_relaxed()) = value;
@@ -319,6 +338,9 @@ impl IntArray {
         assert!(index <= self.len_relaxed());
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             let p = self.base().add(index);
@@ -359,6 +381,9 @@ impl IntArray {
         if len2 > slicelength {
             if new_len > self.capacity() {
                 self.grow(new_len);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
             }
             unsafe {
                 let base = self.base();

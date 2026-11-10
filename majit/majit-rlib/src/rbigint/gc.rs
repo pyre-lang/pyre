@@ -222,7 +222,7 @@ pub(crate) fn alloc_rbigint_nursery_impl(
                 &mut needs_write_barrier,
             )
         })
-        .allocated_or_abort(RBIGINT_PAYLOAD_SIZE)
+        .allocated_or_raise()
     {
         unsafe {
             std::ptr::write(raw as *mut RBigInt, value);
@@ -235,6 +235,9 @@ pub(crate) fn alloc_rbigint_nursery_impl(
             majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
         }
         return raw as *mut RBigInt;
+    }
+    if majit_gc::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
     }
     crate::malloc_raw(value)
 }
@@ -288,7 +291,7 @@ fn alloc_rbigint_nursery_collecting_impl(
                 &mut needs_write_barrier,
             )
         })
-        .allocated_or_abort(RBIGINT_PAYLOAD_SIZE);
+        .allocated_or_raise();
         if let Some(raw) = raw {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);
@@ -301,6 +304,11 @@ fn alloc_rbigint_nursery_collecting_impl(
                 majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             }
             return raw as *mut RBigInt;
+        }
+        if majit_gc::gc_alloc_failed_pending() {
+            // rbigint.add / rbigint.divmod box through this leaf; a refused
+            // payload is fatal, matching the co_consts array allocator.
+            majit_gc::gc_alloc_failed(RBIGINT_PAYLOAD_SIZE);
         }
     }
     alloc_rbigint_nursery_impl(value, canonicalize_prebuilt)
@@ -330,9 +338,10 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
     let tid = rbigint_gc_type_id();
     if tid != 0 {
         // `NoRoute` leaves `raw` null and falls through to `malloc_raw`; a
-        // `Failed` aborts inside `allocated_or_abort`.
+        // `Failed` raises MemoryError (`_ll_malloc_fixedsize`) and returns
+        // null.
         let raw = GcAllocOutcome::classify(majit_gc::alloc_oldgen_typed(tid, RBIGINT_PAYLOAD_SIZE))
-            .allocated_or_abort(RBIGINT_PAYLOAD_SIZE)
+            .allocated_or_raise()
             .unwrap_or(std::ptr::null_mut());
         if !raw.is_null() {
             unsafe {
@@ -344,6 +353,9 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
             // digit array behind W_LongObject.
             majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             return raw as *mut RBigInt;
+        }
+        if majit_gc::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
         }
     }
     crate::malloc_raw(value)
@@ -415,9 +427,17 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
     let item0 = RBigIntGcRoot::new(item0);
     let item1 = RBigIntGcRoot::new(item1);
 
+    // rbigint.divmod allocates each half before the tuple2; a failed half is
+    // not published and the second half is not allocated.
     let mut item0 = alloc_rbigint_nursery_collecting(item0.translated_alias());
+    if majit_gc::gc_alloc_failed_pending() && item0.is_null() {
+        return std::ptr::null_mut();
+    }
     let _item0_root = unsafe { PendingPairItemRoot::new(&mut item0) };
     let mut item1 = alloc_rbigint_nursery_collecting(item1.translated_alias());
+    if majit_gc::gc_alloc_failed_pending() && item1.is_null() {
+        return std::ptr::null_mut();
+    }
     let _item1_root = unsafe { PendingPairItemRoot::new(&mut item1) };
 
     let tid = rbigint_pair_gc_type_id();
@@ -431,10 +451,14 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
             tid,
             RBIGINT_PAIR_SIZE,
         ))
-        .allocated_or_abort(RBIGINT_PAIR_SIZE)
+        .allocated_or_raise()
         .or_else(|| {
-            GcAllocOutcome::classify(majit_gc::alloc_nursery_typed(tid, RBIGINT_PAIR_SIZE))
-                .allocated_or_abort(RBIGINT_PAIR_SIZE)
+            if majit_gc::gc_alloc_failed_pending() {
+                None
+            } else {
+                GcAllocOutcome::classify(majit_gc::alloc_nursery_typed(tid, RBIGINT_PAIR_SIZE))
+                    .allocated_or_raise()
+            }
         });
         if let Some(raw) = raw {
             unsafe {
@@ -448,6 +472,9 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
             // `propagate_no_write_barrier_needed` removes.
             majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             return raw as *mut RBigIntPair;
+        }
+        if majit_gc::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
         }
     }
     crate::malloc_raw(RBigIntPair { item0, item1 })

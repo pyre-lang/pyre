@@ -91,6 +91,11 @@ impl crate::lltype::GcType for W_FloatObjectUser {
 pub fn w_float_new(value: f64) -> PyObjectRef {
     if crate::gc_interp::enabled() {
         let boxed = w_float_gc_alloc(value);
+        // `GCBase.malloc` / `ExceptionTransformer.gen_exc_check`: a failed
+        // collector allocation raises; a second allocator is not a fallback.
+        if crate::gc_hook::gc_alloc_failed_pending() && boxed.is_null() {
+            return crate::PY_NULL;
+        }
         if !boxed.is_null() {
             return boxed;
         }
@@ -174,7 +179,11 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
         std::mem::size_of::<W_FloatObjectUser>(),
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(obj) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(obj) as PyObjectRef
+        }
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_FloatObjectUser, obj);

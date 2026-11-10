@@ -8440,14 +8440,18 @@ impl PyreJitState {
         self.set_pycode(value);
     }
 
-    pub fn set_namespace(&mut self, value: usize) {
+    /// `PyFrame.set_w_globals` / `PyFrame.getorcreatedebug`: a debugdata
+    /// allocation failure is returned. `ExecutionContext.settrace` reaches
+    /// the same debug block through frame force.
+    pub fn set_namespace(&mut self, value: usize) -> Result<(), pyre_interpreter::PyError> {
         let frame_ptr = self
             .frame_ptr()
             .expect("PyreJitState.frame must point to a valid PyFrame");
         unsafe {
             (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
-                .set_w_globals(value as pyre_object::PyObjectRef);
+                .set_w_globals(value as pyre_object::PyObjectRef)?;
         }
+        Ok(())
     }
 
     /// pyframe.py:82 debugdata — read from heap frame.
@@ -13457,7 +13461,7 @@ mod tests {
     #[test]
     fn materialized_inline_frame_slots_are_symbolic_heap_reads() {
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
-        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), pyre_object::w_none(), w_int_new(33)];
         for (index, value) in values.iter().copied().enumerate() {
             locals_w_mut!(frame)[index] = value;
@@ -13512,7 +13516,7 @@ mod tests {
     #[test]
     fn materialized_inline_frame_consumes_pending_ref_array_write() {
         let code = compile_function_body("def f(a, b):\n    return a\n");
-        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), w_int_new(22)];
         for (index, value) in values.iter().copied().enumerate() {
             locals_w_mut!(frame)[index] = value;
@@ -13559,7 +13563,7 @@ mod tests {
         // for it: the caller's `overlay_stream_ref_slots` owns that slot and
         // would otherwise be overwriting a stale array entry.
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
-        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), w_int_new(22), w_int_new(33)];
         for (index, value) in values.iter().copied().enumerate() {
             locals_w_mut!(frame)[index] = value;
@@ -14479,8 +14483,8 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_function_body("def f(xs):\n    for x in xs:\n        pass\n");
-        let mut live = PyFrame::new(code);
-        let mut snapshot = live.snapshot_for_tracing();
+        let mut live = PyFrame::new(code).expect("frame allocation");
+        let mut snapshot = live.snapshot_for_tracing().expect("frame allocation");
         let stack_base = snapshot.stack_base();
         let iterator = pyre_object::w_none();
         let item = pyre_object::w_bool_from(true);
@@ -14860,7 +14864,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -15072,7 +15076,7 @@ mod tests {
             })
             .expect("test source should contain function code");
 
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -15301,7 +15305,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
@@ -15331,7 +15335,7 @@ mod tests {
 
         ensure_test_callbacks();
         let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
@@ -15404,7 +15408,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let full_len = locals_w!(frame).len();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -15595,7 +15599,7 @@ mod tests {
         ensure_test_callbacks();
 
         let raw_code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = PyFrame::new(raw_code);
+        let mut frame = PyFrame::new(raw_code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();
@@ -15848,7 +15852,7 @@ mod tests {
 
         ensure_test_callbacks();
         let raw_code = compile_exec("None").expect("test code should compile");
-        let mut frame = PyFrame::new(raw_code);
+        let mut frame = PyFrame::new(raw_code).expect("frame allocation");
         frame.fix_array_ptrs();
         // Compiled-loop leftover on the live frame (pathlib 24-over-23 shape).
         frame.valuestackdepth = 24;
@@ -15936,7 +15940,7 @@ mod tests {
         pyre_interpreter::module::thread::ensure_runtime_thread();
         ensure_test_callbacks();
         let code = compile_function_body("def f(x):\n    return x\n");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();
@@ -16454,7 +16458,7 @@ mod tests {
         ensure_test_callbacks();
 
         let raw_code = compile_exec("x = 1").expect("test code should compile");
-        let frame = PyFrame::new(raw_code);
+        let frame = PyFrame::new(raw_code).expect("frame allocation");
         let code_ref = frame.pycode as *const ();
 
         // A CALL/residual operation start can be a valid JitCode coordinate
@@ -16578,7 +16582,7 @@ mod tests {
 
         ensure_test_callbacks();
         let code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_int_new(41);
         locals_w_mut!(frame)[1] = w_int_new(7);
         frame.fix_array_ptrs();
@@ -16752,7 +16756,7 @@ mod tests {
 
         ensure_test_callbacks();
         let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let w_code = frame.pycode as usize;
@@ -18099,16 +18103,28 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let current_closure = closure_root
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(closure);
-        let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
-            pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut concrete_frame = match pyre_interpreter::pyframe::FrameBox::new(
+            match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 current_code,
                 &concrete_locals,
                 current_globals,
                 execution_context,
                 current_closure,
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ),
-        );
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    crate::trace::set_walk_end_propagated_exception(err);
+                    return None;
+                }
+            },
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                crate::trace::set_walk_end_propagated_exception(err);
+                return None;
+            }
+        };
         // The `drop(concrete_frame)` below relinquishes only the host handle for a
         // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the
         // stable allocator answers null, and that box's `drop` FREES the frame —

@@ -1091,7 +1091,11 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn freeze_dict(&self, source: Self::Value) -> Result<Rooted, wire::MarshalError> {
-        Ok(Rooted::new(unsafe { w_frozendict_copy_from(source.get()) }))
+        let copied = unsafe { w_frozendict_copy_from(source.get()) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
+            return Err(self.remember_python_error(crate::runtime_ops::fetch_memory_error()));
+        }
+        Ok(Rooted::new(copied))
     }
 
     fn insert_dict_item(

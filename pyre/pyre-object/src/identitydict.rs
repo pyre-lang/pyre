@@ -303,8 +303,9 @@ impl DictStrategy for IdentityDictStrategy {
     /// instantiation for IdentityDictStrategy — `wrap` is identity
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
     /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         w_dict_switch_identity_to_object_strategy(w_dict);
+        true
     }
 
     /// `identitydict.py get_empty_storage` — erased `{}` with

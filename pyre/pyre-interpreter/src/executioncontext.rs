@@ -1693,7 +1693,7 @@ impl ExecutionContext {
         if self.profilefunc.is_none() {
             if !frame.is_null() {
                 unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = false;
                 }
             }
             return Ok(());
@@ -1734,7 +1734,7 @@ impl ExecutionContext {
         if self.profilefunc.is_none() {
             if !frame.is_null() {
                 unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = false;
                 }
             }
             return Ok(());
@@ -1751,7 +1751,7 @@ impl ExecutionContext {
             let frame = anchor.live();
             if self.profilefunc.is_some() && !frame.is_null() {
                 unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = true;
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = true;
                 }
             }
         }
@@ -1944,7 +1944,7 @@ impl ExecutionContext {
             // `get_w_f_trace()` is non-null, so the debug block already exists
             // and the seed is dead.  Passing `lineno` here would seed
             // `f_lineno` with the line whose novelty decides the event.
-            let d = (*anchor.live()).getorcreatedebug(-1);
+            let d = (*anchor.live()).getorcreatedebug(-1)?;
             let lastline = d.f_lineno;
             // Persistent, so the next invocation compares against this line —
             // but only for an instruction that names one, or a `RESUME` would
@@ -1963,7 +1963,7 @@ impl ExecutionContext {
         // the line event: a line callback can set `frame.f_trace_opcodes`.
         // `_trace` runs Python and can move the frame, so re-fetch
         // `getorcreatedebug(-1)` from `anchor.live()`.
-        let want_opcode = unsafe { (*anchor.live()).getorcreatedebug(-1).f_trace_opcodes };
+        let want_opcode = unsafe { (*anchor.live()).getorcreatedebug(-1)?.f_trace_opcodes };
         if want_opcode {
             self._trace(anchor.live(), "opcode", pyre_object::w_none(), None)?;
         }
@@ -1972,7 +1972,7 @@ impl ExecutionContext {
         // so a line callback that jumped via `f_lineno` writes the sentinel
         // from the live `last_instr`.
         unsafe {
-            (*frame).getorcreatedebug(-1).instr_prev_plus_one = (*frame).last_instr + 1;
+            (*frame).getorcreatedebug(-1)?.instr_prev_plus_one = (*frame).last_instr + 1;
         }
         Ok(())
     }
@@ -2137,7 +2137,7 @@ impl ExecutionContext {
         let _roots = pyre_object::gc_roots::push_roots();
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_func);
-        self.force_all_frames(false);
+        let _ = self.force_all_frames(false);
         let w_func = pyre_object::gc_roots::shadow_stack_get(func_slot);
         pyre_object::gc_hook::try_gc_write_barrier(
             self as *const Self as pyre_object::gc_hook::GCREF,
@@ -2208,7 +2208,7 @@ impl ExecutionContext {
             let _roots = pyre_object::gc_roots::push_roots();
             let arg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_arg);
-            self.force_all_frames(true);
+            self.force_all_frames(true)?;
             pyre_object::gc_roots::shadow_stack_get(arg_slot)
         } else {
             w_arg
@@ -2238,7 +2238,7 @@ impl ExecutionContext {
     /// names the frame directly instead of a vref — the identity force again,
     /// on precisely the frame "running in assembler" that this consumer exists
     /// for.  Hence the direct call.
-    pub fn force_all_frames(&mut self, is_being_profiled: bool) {
+    pub fn force_all_frames(&mut self, is_being_profiled: bool) -> Result<(), crate::PyError> {
         let mut frame = self.gettopframe_nohidden();
         while !frame.is_null() {
             let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
@@ -2246,11 +2246,12 @@ impl ExecutionContext {
             frame = anchor.live();
             if is_being_profiled {
                 unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = true;
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = true;
                 }
             }
             frame = Self::getnextframe_nohidden(frame);
         }
+        Ok(())
     }
 
     pub fn call_tracing(&mut self, w_func: PyObjectRef, w_args: PyObjectRef) -> PyObjectRef {
@@ -2368,7 +2369,7 @@ impl ExecutionContext {
                 -1
             };
             let had_locals = unsafe {
-                let d = (*frame).getorcreatedebug(init_lineno);
+                let d = (*frame).getorcreatedebug(init_lineno)?;
                 !d.w_locals.is_null()
             };
             if had_locals {
@@ -2376,7 +2377,7 @@ impl ExecutionContext {
             }
             let frame = frame_anchor.live();
             let (prev_line_tracing, old_lineno) = unsafe {
-                let d = (*frame).getorcreatedebug(init_lineno);
+                let d = (*frame).getorcreatedebug(init_lineno)?;
                 (d.is_in_line_tracing, d.f_lineno)
             };
 
@@ -2384,7 +2385,7 @@ impl ExecutionContext {
             self.is_tracing += 1;
             let mut call_result = (|| {
                 unsafe {
-                    let d = (*frame).getorcreatedebug(init_lineno);
+                    let d = (*frame).getorcreatedebug(init_lineno)?;
                     if event == "line" {
                         d.is_in_line_tracing = true;
                     }
@@ -2426,7 +2427,7 @@ impl ExecutionContext {
                 let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
                 if w_result != pyre_object::w_none() {
                     unsafe {
-                        (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
+                        (*frame).getorcreatedebug(init_lineno)?.w_f_trace = w_result;
                     }
                 }
                 Ok::<(), crate::PyError>(())
@@ -2436,14 +2437,14 @@ impl ExecutionContext {
                 self.settrace(pyre_object::w_none());
                 unsafe {
                     (*frame_anchor.live())
-                        .getorcreatedebug(init_lineno)
+                        .getorcreatedebug(init_lineno)?
                         .w_f_trace = pyre_object::PY_NULL;
                 }
             }
             let frame = frame_anchor.live();
 
             unsafe {
-                let d = (*frame).getorcreatedebug(init_lineno);
+                let d = (*frame).getorcreatedebug(init_lineno)?;
                 if d.f_lineno == lineno {
                     // executioncontext.py:397-404 — for generator/coroutine
                     // resumptions (`event == 'call'` while `last_instr >= 0`)
@@ -2463,7 +2464,7 @@ impl ExecutionContext {
             // cleared w_locals.  Re-read here instead of caching
             // `had_locals` from before the call.
             let post_had_locals = unsafe {
-                let d = (*frame).getorcreatedebug(init_lineno);
+                let d = (*frame).getorcreatedebug(init_lineno)?;
                 !d.w_locals.is_null()
             };
             if post_had_locals {
@@ -3951,20 +3952,24 @@ impl UserDelAction {
             }
             if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
                 let mut error = error;
-                let err_slot = error.pin(&_roots);
+                let mut err_slot = error.pin(&_roots);
                 // CPython 3.14 `_PyGen_Finalize` reports close failures with
                 // `PyErr_FormatUnraisable`, whose hook object is None and
                 // whose message names the generator itself.
                 let w_exc = error.to_exc_object();
                 let frame = crate::eval::current_frame();
                 if !frame.is_null() {
-                    unsafe {
+                    let recorded = unsafe {
                         crate::pytraceback::record_application_traceback(
                             w_exc,
                             frame,
                             (*frame).last_instr as i64,
                         )
                     };
+                    if !recorded {
+                        error = crate::runtime_ops::fetch_memory_error();
+                        err_slot = error.pin(&_roots);
+                    }
                 }
                 let repr = unsafe { crate::display::py_repr_wtf8(current()) }
                     .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));

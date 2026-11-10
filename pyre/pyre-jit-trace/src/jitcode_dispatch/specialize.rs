@@ -5197,18 +5197,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
         let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
         let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete_obj) };
-        match value_pin {
-            StoreAttrAddValuePin::Boxed => {
-                crate::helpers::emit_mapdict_add_attr_inline(
-                    ctx.trace_ctx,
-                    obj,
-                    add.storageindex,
-                    new_map_const,
-                    value,
-                    map_descr,
-                    storage_descr,
-                );
-            }
+        let unboxed_raw = match value_pin {
+            StoreAttrAddValuePin::Boxed => None,
             StoreAttrAddValuePin::UnboxedInt(canonical) => {
                 // Only an exactly-`int` runtime value may unbox: the tag
                 // guard pins a tagged operand, the `w_class` pin a heap one
@@ -5226,6 +5216,44 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 } else {
                     walker_unbox_int(ctx, op_pc, value, int_type_addr)?
                 };
+                Some(raw)
+            }
+        };
+        // The walk is the authoritative execution path, so apply the resolved
+        // transition now; the emitted operations reproduce it in compiled code.
+        // Commit before emit: a failed grow must not leave a successful
+        // STORE_ATTR in the trace (`MapdictStorageMixin._set_mapdict_increase_storage1`).
+        // The shape guard and the holder pins can minor-collect. Both pointers
+        // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_value = live_box_ref(ctx, value, concrete_value);
+        let committed = unsafe {
+            pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
+                concrete_obj,
+                &add,
+                concrete_value,
+            )
+        };
+        if !committed {
+            // The declined walk falls back to the generic STORE_ATTR, which
+            // retries the transition and raises its own MemoryError; drop the
+            // pending one so no stale flag survives a retry that succeeds.
+            drop(pyre_interpreter::runtime_ops::fetch_memory_error());
+            return Ok(None);
+        }
+        match unboxed_raw {
+            None => {
+                crate::helpers::emit_mapdict_add_attr_inline(
+                    ctx.trace_ctx,
+                    obj,
+                    add.storageindex,
+                    new_map_const,
+                    value,
+                    map_descr,
+                    storage_descr,
+                );
+            }
+            Some(raw) => {
                 crate::helpers::emit_mapdict_add_unboxed_attr_inline(
                     ctx.trace_ctx,
                     obj,
@@ -5237,19 +5265,6 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 );
             }
         }
-        // The walk is the authoritative execution path, so apply the resolved
-        // transition now; the emitted operations reproduce it in compiled code.
-        // The shape guard and the holder pins can minor-collect. Both pointers
-        // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
-        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-        let concrete_value = live_box_ref(ctx, value, concrete_value);
-        unsafe {
-            pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
-                concrete_obj,
-                &add,
-                concrete_value,
-            )
-        };
         return Ok(Some(()));
     }
 

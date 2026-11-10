@@ -7655,6 +7655,9 @@ fn type_create_new_type(
                 pyre_object::w_dict_copy(pyre_object::gc_roots::shadow_stack_get(backing_root))
             }
         };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && class_ns.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(class_ns);
         // type_new_classcell — capture the `__classcell__` cell and keep
@@ -7818,12 +7821,19 @@ fn type_create_new_type(
         // side-effecting `__hash__` an extra time (and dropping any error it
         // raised, since the store cannot propagate one).
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && dict_obj.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
         let w_type = pyre_object::w_type_new(
             &name,
             pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
             dict_obj as pyre_object::gc_hook::GCREF,
         );
+        // `W_TypeObject.__init__` does not expose a null type.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && w_type.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         // Nothing refers to a class this young — the classcell is optional and
         // `weak_subclasses` is weak — while the passes below allocate, so a
         // major cycle sweeps it out from under `create_all_slots` and the
@@ -7867,7 +7877,9 @@ fn type_create_new_type(
         // typeobject.py ready() — link self into each base's
         // `weak_subclasses` so `mutated()` and `__subclasses__()`
         // observe this class.
-        unsafe { pyre_object::typeobject::w_type_ready(w_type()) };
+        if !unsafe { pyre_object::typeobject::w_type_ready(w_type()) } {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
 
         // CPython type_new_set_classdict precedes type_new_set_names: lazy
         // annotation thunks invoked by __set_name__ must resolve class-local
@@ -9644,6 +9656,9 @@ fn attribute_error_getstate_value(w_self: PyObjectRef) -> PyObjectRef {
     } else {
         unsafe { pyre_object::w_dict_copy(stored) }
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && state.is_null() {
+        return pyre_object::PY_NULL;
+    }
     let _ = pyre_object::gc_roots::pin_root(state);
     let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_name = unsafe {
@@ -9681,7 +9696,11 @@ fn attribute_error_getstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__getstate__() missing 1 required positional argument: 'self'")
     })?;
-    Ok(attribute_error_getstate_value(w_self))
+    let state = attribute_error_getstate_value(w_self);
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && state.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    Ok(state)
 }
 
 /// CPython 3.14 `AttributeError_reduce` — always return the three-item form
@@ -9707,6 +9726,9 @@ fn attribute_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let _ = pyre_object::gc_roots::pin_root(w_args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let state = attribute_error_getstate_value(pyre_object::gc_roots::shadow_stack_get(base));
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && state.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     let _ = pyre_object::gc_roots::pin_root(state);
     let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::w_tuple_new(vec![
@@ -23473,6 +23495,12 @@ pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
         if pyre_object::listobject::w_list_sort_range(list, reverse) {
             return true;
         }
+        // `BaseRangeListStrategy.sort`: materialisation failure stays pending
+        // for the `Result` caller (`sort_list_in_place`); this helper cannot
+        // raise (`dont_look_inside_cannot_raise`).
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return false;
+        }
         if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
             return true;
         }
@@ -23522,10 +23550,16 @@ pub fn sort_list_in_place(
     // unwrapped, so there is no boxing, no comparison dunder, and no need to
     // empty the receiver first — no user code can run to observe it.
     if key_fn.is_none() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe {
             if pyre_object::listobject::w_list_sort_range(list, reverse) {
                 return Ok(());
+            }
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
             }
             let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
             if sort_integer_list_storage(list, reverse) {

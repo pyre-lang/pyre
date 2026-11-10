@@ -79,8 +79,12 @@ impl FloatArray {
 
     pub fn from_vec(values: Vec<f64>) -> Self {
         let len = values.len();
+        let block = unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(len),
         };
         unsafe {
@@ -126,8 +130,12 @@ impl FloatArray {
         if capacity == 0 {
             return Self::empty();
         }
+        let block = unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+            return Self::empty();
+        }
         Self {
-            block: unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(0),
         }
     }
@@ -210,12 +218,19 @@ impl FloatArray {
             .saturating_add(extra)
             .saturating_add(min_cap >> 3)
             .max(FLOAT_ARRAY_INLINE_CAP);
-        self.block = unsafe { grow_float_items_block(self.block, target_cap, self.len_relaxed()) };
+        let fresh = unsafe { grow_float_items_block(self.block, target_cap, self.len_relaxed()) };
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
+            return;
+        }
+        self.block = fresh;
     }
 
     pub fn push(&mut self, value: f64) {
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             *self.base().add(self.len_relaxed()) = value;
@@ -249,6 +264,9 @@ impl FloatArray {
         assert!(index <= self.len_relaxed());
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             let p = self.base().add(index);
@@ -289,6 +307,9 @@ impl FloatArray {
         if len2 > slicelength {
             if new_len > self.capacity() {
                 self.grow(new_len);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
             }
             unsafe {
                 let base = self.base();

@@ -2782,7 +2782,7 @@ mod foriter_delivery_tests {
         let outer_body = crate::pyjitpl::semantic_fallthrough_pc(&code, outer);
         let inner_body = crate::pyjitpl::semantic_fallthrough_pc(&code, inner);
         let not_a_header = 0;
-        let frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let lf = LoopFrame {
             frame,
             outer_header,
@@ -3210,7 +3210,7 @@ mod foriter_delivery_tests {
             start -= 1;
         }
         let body = crate::pyjitpl::semantic_fallthrough_pc(&code, unit);
-        let frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let addr = &*frame as *const pyre_interpreter::pyframe::PyFrame as usize;
         assert_eq!(super::super::foriter_unit_at(addr, start), Some(unit));
         reset();

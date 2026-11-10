@@ -233,9 +233,10 @@ pub fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut TypedItemsBlock {
-    unsafe {
-        try_alloc_typed_items_block_nursery(cap, tid)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
+    match unsafe { try_alloc_typed_items_block_nursery(cap, tid) } {
+        Some(block) => block,
+        None if majit_gc::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()),
     }
 }
 

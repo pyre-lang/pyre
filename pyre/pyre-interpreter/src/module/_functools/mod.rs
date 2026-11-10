@@ -393,9 +393,15 @@ fn partial_call_impl(
             copy_range(values_base, n_call_kw),
         )
     } else {
-        let merged_slot = pin_new(unsafe {
+        let copied = unsafe {
             pyre_object::w_dict_copy(pyre_object::gc_roots::shadow_stack_get(pto_kw_slot))
-        });
+        };
+        // `DictStrategy.copy` / `W_DictObject.copy` propagate construction
+        // failure before keyword merging stores into the copy.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        let merged_slot = pin_new(copied);
         for i in 0..n_call_kw {
             pyre_interpreter::baseobjspace::setitem(
                 pyre_object::gc_roots::shadow_stack_get(merged_slot),

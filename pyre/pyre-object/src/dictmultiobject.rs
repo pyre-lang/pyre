@@ -888,9 +888,10 @@ unsafe fn _never_equal_to_int(key: PyObjectRef) -> bool {
 }
 
 /// Marker error returned by checked dict operations when the key's
-/// `__hash__` fails.  The concrete `PyError` is stored in a
-/// thread-local on the `pyre-interpreter` side; the caller converts
-/// this marker to a real exception via `take_pending_hash_error()`.
+/// `__hash__` fails, or when `AbstractTypedStrategy.switch_to_object_strategy`
+/// returns before installing object storage.  The collector exception stays
+/// pending in the latter case; the caller converts this marker through
+/// `take_pending_dict_key_error` / `take_pending_mapping_key_error`.
 #[derive(Debug)]
 pub struct DictKeyError;
 
@@ -1623,14 +1624,30 @@ pub fn w_frozendict_new() -> PyObjectRef {
 /// `obj` must be a live `W_DictObject` (dict or frozendict storage).
 pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
-        return w_frozendict_new();
+        let dst = w_frozendict_new();
+        if crate::gc_hook::gc_alloc_failed_pending() && dst.is_null() {
+            return crate::PY_NULL;
+        }
+        return dst;
     }
     let _roots = crate::gc_roots::push_roots();
     let src_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
+    // Frozen destination header is allocated first
+    // (`from_storage_and_strategy`); do not copy or adopt into a failed
+    // header.
+    let dst = w_frozendict_new();
+    if crate::gc_hook::gc_alloc_failed_pending() && dst.is_null() {
+        return crate::PY_NULL;
+    }
     let dst_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_frozendict_new());
+    let _ = crate::gc_roots::pin_root(dst);
     let copied = w_dict_copy(crate::gc_roots::shadow_stack_get(src_slot));
+    // `DictStrategy.copy` / `W_DictObject.copy` propagate construction
+    // failure; do not adopt a null regular copy onto the frozendict.
+    if crate::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
+        return crate::PY_NULL;
+    }
     let copied_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(copied);
     w_dict_adopt_regular_copy_for_empty_update(
@@ -1665,6 +1682,12 @@ pub fn w_dict_new_nonmoving() -> PyObjectRef {
         W_DICT_GC_TYPE_ID,
         W_DICT_OBJECT_SIZE,
     );
+    // `ll_dict_resize` / `GCBase.malloc`: allocation failure propagates;
+    // do not retry on a second allocator while the collector exception is
+    // pending.
+    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
+        return crate::PY_NULL;
+    }
     if raw.is_null() {
         // Stable (old) header: the caller hands this pointer into an `init`
         // closure by value, so a moving nursery fallback would recreate the
@@ -1742,6 +1765,9 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// strategy + a freshly cloned typed storage box.  Length is computed
 /// on demand by `strategy.length(self)` from the typed storage shape.
 pub fn w_dict_new_with(strategy: &'static DictStrategyRef, dstorage: GCREF) -> PyObjectRef {
+    if crate::gc_hook::gc_alloc_failed_pending() && dstorage.is_null() {
+        return crate::PY_NULL;
+    }
     // The clone filled the host table before the box existed, so no entry
     // store ran `dict_write_barrier`. Remember the box before
     // `alloc_dict_object`, which can collect.
@@ -1879,7 +1905,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
             W_DICT_GC_TYPE_ID,
             W_DICT_OBJECT_SIZE,
         ))
-        .allocated_or_abort(W_DICT_OBJECT_SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut())
     };
     value.dstorage = crate::gc_roots::shadow_stack_get(save_point) as GCREF;
@@ -1892,6 +1918,8 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
         // traces the box and its entries dangle. No-op for a young header.
         crate::gc_hook::try_gc_write_barrier(raw);
         raw as PyObjectRef
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::PY_NULL
     } else {
         crate::lltype::malloc_typed(value) as PyObjectRef
     }
@@ -3014,6 +3042,22 @@ pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
     strategy_is(dstrategy, StrategyKind::Empty) || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
 }
 
+/// `AbstractTypedStrategy.switch_to_object_strategy` completes or raises
+/// before redispatch.  A failed migration leaves the collector exception
+/// pending; `DictKeyError` is the sentinel `w_dict_store_checked` already
+/// returns so the conversion owner can fetch it.
+#[inline]
+unsafe fn switch_or_dict_key_error(
+    strategy: &'static dyn DictStrategy,
+    w_dict: PyObjectRef,
+) -> Result<(), DictKeyError> {
+    if strategy.switch_to_object_strategy(w_dict) {
+        Ok(())
+    } else {
+        Err(DictKeyError)
+    }
+}
+
 /// Fallible variant of [`w_dict_lookup`].  Propagates hash errors
 /// via [`DictKeyError`]; the caller recovers the concrete exception
 /// from the interpreter-side thread-local error slot.
@@ -3049,7 +3093,7 @@ pub unsafe fn w_dict_lookup_checked(
         if _never_equal_to_string(key) {
             return Ok(None);
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
@@ -3070,7 +3114,7 @@ pub unsafe fn w_dict_lookup_checked(
         if _never_equal_to_int(key) {
             return Ok(None);
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
@@ -3078,7 +3122,7 @@ pub unsafe fn w_dict_lookup_checked(
         if key_compares_by_identity(key) {
             return Ok(nullable_to_option(strategy.getitem(obj, key)));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
@@ -3086,7 +3130,7 @@ pub unsafe fn w_dict_lookup_checked(
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return Ok(nullable_to_option(strategy.getitem(obj, key)));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
@@ -3505,7 +3549,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_bytes_strategy(obj, key, value);
             return Ok(());
         }
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
         return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Unicode) {
@@ -3519,7 +3563,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_int_strategy(obj, key, value);
             return Ok(());
         }
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
         return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
@@ -3527,7 +3571,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
         return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
@@ -3535,7 +3579,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
         return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy.strategy_kind() == StrategyKind::Map {
@@ -3550,7 +3594,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
         return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     strategy.setitem(obj, key, value);
@@ -3696,7 +3740,7 @@ pub unsafe fn w_dict_setdefault_checked(
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return Ok(strategy.setdefault(obj, key, value));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_setdefault_checked(obj, key, value);
     }
@@ -3776,7 +3820,7 @@ pub unsafe fn w_dict_pop_checked(
         let (mut obj, mut key) = (obj, key);
         if pop_switches_to_object_strategy(dstrategy, key) {
             let obj_slot = crate::gc_roots::pin_roots(&[obj, key]);
-            strategy.switch_to_object_strategy(obj);
+            switch_or_dict_key_error(strategy, obj)?;
             obj = crate::gc_roots::shadow_stack_get(obj_slot);
             key = crate::gc_roots::shadow_stack_get(obj_slot + 1);
             dstrategy = (*(obj as *const W_DictObject)).dstrategy;
@@ -4539,7 +4583,11 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
             let dict = &mut *(obj as *mut W_DictObject);
             return dict.dstrategy.delitem(obj, w_key);
         }
-        _ => dict.dstrategy.switch_to_object_strategy(obj),
+        _ => {
+            if !dict.dstrategy.switch_to_object_strategy(obj) {
+                return false;
+            }
+        }
     }
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
@@ -4621,7 +4669,7 @@ pub unsafe fn w_dict_delitem_checked(
         if crate::is_bytes(key) {
             return Ok(w_dict_delitem_bytes_strategy(obj, key));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
@@ -4636,7 +4684,7 @@ pub unsafe fn w_dict_delitem_checked(
         if crate::listobject::is_plain_int1(key) {
             return Ok(w_dict_delitem_int_strategy(obj, key));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
@@ -4644,12 +4692,12 @@ pub unsafe fn w_dict_delitem_checked(
         if key_compares_by_identity(key) {
             return Ok(strategy.delitem(obj, key));
         }
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
@@ -4728,7 +4776,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
     let strategy = dstrategy.imp;
     if strategy.strategy_kind() != StrategyKind::Object {
-        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => switch_or_dict_key_error(strategy, obj))?;
     }
     let object_key = crate::with_roots!(obj, value => object_key_for_checked(key))?;
     if let Some(result) = callback_free_dict_op!({
@@ -4929,7 +4977,7 @@ pub unsafe fn w_dict_move_to_end_checked(
     // store reached with a non-native key, or a Kwargs/Map store) is converted;
     // the empty strategies are handled above.
     if kind != StrategyKind::Object && kind != StrategyKind::Unicode {
-        strategy.switch_to_object_strategy(obj);
+        switch_or_dict_key_error(strategy, obj)?;
     }
     let object_key = object_key_for_checked(key)?;
     let obj = _dict_guard.root(0);
@@ -5372,6 +5420,9 @@ pub unsafe fn w_dict_copy_object_strategy(
     // this path (`w_dict_copy`); a born-old clone kept discarded types
     // alive at every minor.
     let new_storage = storage.clone_to_young_box(object_dict_storage_gc_type_id());
+    if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
+        return crate::PY_NULL;
+    }
     w_dict_new_with(strategy, new_storage as GCREF)
 }
 
@@ -5390,6 +5441,9 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
     let entries = &mut *(dict.dstorage as *mut IntDictStorage);
     let k = crate::listobject::plain_int_w(key);
     let fresh = entries.insert(k, value).is_none();
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
     if fresh {
         let dict = &mut *(_dict_guard.root(0) as *mut W_DictObject);
         dict.keys_version = dict.keys_version.wrapping_add(1);
@@ -5657,13 +5711,17 @@ pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
 /// RPython dict primitive the JIT models (`ll_newdict`,
 /// `ll_dict_setitem`'s `look_inside_iff(isvirtual)`), whereas the whole body is
 /// `IndexMap` — an external crate with no lowering at all — so the last
-/// modellable point is the call itself.  The `()` return crosses the residual
-/// boundary the way `setobject::w_set_copy_storage_from` does.
+/// modellable point is the call itself.
+///
+/// Returns `true` only after `install_object_dict_storage`.  A failed wrap,
+/// table, box, or fill leaves the typed strategy/storage in place and returns
+/// `false` with the collector exception pending
+/// (`AbstractTypedStrategy.switch_to_object_strategy`).
 ///
 /// # Safety
 /// `w_dict` must be a valid `W_DictObject` on `INT_DICT_STRATEGY`.
 #[majit_macros::dont_look_inside]
-pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
+pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) -> bool {
     // Three separate hazards, one bracket.  The receiver moves, so the field
     // stores at the end must go through a reloaded word.  Each wrapped key is
     // minted inside the loop and is reachable from nothing the collector walks
@@ -5688,6 +5746,9 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     while let Some(i) = old.next_valid_slot(next) {
         let k = *old.get_slot(i).unwrap().0;
         let w_key = crate::w_int_new(k);
+        if crate::gc_hook::gc_alloc_failed_pending() && w_key.is_null() {
+            return false;
+        }
         let object_key = object_key_for(w_key);
         // Take the value only now: the old table is traced, so re-reading the
         // slot after this iteration's allocations yields the current word.
@@ -5698,10 +5759,15 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     }
     // The empty box is allocated before the fill so the last collection point
     // is behind the pairs being copied out of their slots.
-    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-        object_dict_storage_with_capacity(len),
-        object_dict_storage_gc_type_id(),
-    );
+    let table = object_dict_storage_with_capacity(len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return false;
+    }
+    let new_storage =
+        crate::gc_storage::gc_alloc_young_storage_box(table, object_dict_storage_gc_type_id());
+    if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
+        return false;
+    }
     let new_map = &mut *new_storage;
     // `ll_getitem_fast` on the hash/pair arrays, not `Enumerate`.
     let hash_p = hashes.as_ptr();
@@ -5716,9 +5782,13 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
             },
             value,
         );
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return false;
+        }
         i += 1;
     }
     install_object_dict_storage(roots.get(dict_slot), new_storage);
+    true
 }
 
 /// Internal helper: `BytesDictStrategy::setitem` body —
@@ -5737,7 +5807,11 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut BytesDictStorage);
     let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
-    if entries.insert(k, value).is_none() {
+    let fresh = entries.insert(k, value).is_none();
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
+    if fresh {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
 }
@@ -5863,10 +5937,15 @@ pub unsafe fn w_dict_clear_bytes_strategy(obj: PyObjectRef) {
 /// [`w_dict_switch_int_to_object_strategy`] for `BytesDictStrategy`, refilling
 /// with `newbytes(key)` keys.  Residualised for the same reason.
 ///
+/// Returns `true` only after `install_object_dict_storage`.  A failed wrap,
+/// table, box, or fill leaves the typed strategy/storage in place and returns
+/// `false` with the collector exception pending
+/// (`AbstractTypedStrategy.switch_to_object_strategy`).
+///
 /// # Safety
 /// `w_dict` must be a valid `W_DictObject` on `BYTES_DICT_STRATEGY`.
 #[majit_macros::dont_look_inside]
-pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
+pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) -> bool {
     // Rooted exactly as [`w_dict_switch_int_to_object_strategy`] is, for the
     // same three reasons.
     let roots = crate::gc_roots::push_roots();
@@ -5880,16 +5959,24 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     let mut next = 0;
     while let Some(i) = old.next_valid_slot(next) {
         let w_key = crate::w_bytes_from_block(old.get_slot(i).unwrap().0.0);
+        if crate::gc_hook::gc_alloc_failed_pending() && w_key.is_null() {
+            return false;
+        }
         let object_key = object_key_for(w_key);
         let v = *old.get_slot(i).unwrap().1;
         hashes.push(object_key.hash);
         roots.publish(&[object_key.obj, v]);
         next = i + 1;
     }
-    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-        object_dict_storage_with_capacity(len),
-        object_dict_storage_gc_type_id(),
-    );
+    let table = object_dict_storage_with_capacity(len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return false;
+    }
+    let new_storage =
+        crate::gc_storage::gc_alloc_young_storage_box(table, object_dict_storage_gc_type_id());
+    if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
+        return false;
+    }
     let new_map = &mut *new_storage;
     let hash_p = hashes.as_ptr();
     let mut i = 0usize;
@@ -5903,9 +5990,13 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
             },
             value,
         );
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return false;
+        }
         i += 1;
     }
     install_object_dict_storage(roots.get(dict_slot), new_storage);
+    true
 }
 
 /// Internal helper: `ObjectDictStrategy::items` body for pyre's
@@ -6463,7 +6554,11 @@ fn w_dict_view_iterator_new_direction(
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(value) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(value) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
         // The shell is a livevar across the barrier: that call is a `gc_op`,
@@ -7080,13 +7175,23 @@ pub trait DictStrategy {
         for &(k, v) in &items {
             roots.publish(&[k, v]);
         }
-        let new_slot = roots.publish(&[crate::dictmultiobject::w_dict_new()]);
+        // `DictStrategy.copy` allocates via `allocate_and_init_instance`
+        // before `rev_update1_dict_dict`; a failed header must not be stored
+        // into.
+        let copy = crate::dictmultiobject::w_dict_new();
+        if crate::gc_hook::gc_alloc_failed_pending() && copy.is_null() {
+            return crate::PY_NULL;
+        }
+        let new_slot = roots.publish(&[copy]);
         for i in 0..items.len() {
             crate::dictmultiobject::w_dict_store(
                 roots.get(new_slot),
                 roots.get(pairs_base + 2 * i),
                 roots.get(pairs_base + 2 * i + 1),
             );
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return crate::PY_NULL;
+            }
         }
         roots.get(new_slot)
     }
@@ -7100,23 +7205,25 @@ pub trait DictStrategy {
     unsafe fn clear(&self, w_dict: PyObjectRef);
 
     /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
-    /// (plus `:732 EmptyDictStrategy.switch_to_object_strategy`,
-    /// `:1195+ ObjectDictStrategy` no-op).  Polymorphic dispatch lets
+    /// (plus `EmptyDictStrategy.switch_to_object_strategy`,
+    /// `ObjectDictStrategy` no-op).  Polymorphic dispatch lets
     /// callers that hold only `&dyn DictStrategy` (e.g. the storage
     /// back-mirror `*_no_proxy` helpers) demote typed storage to
     /// ObjectDictStrategy without inspecting strategy identity.
     ///
+    /// Returns `true` after the transition is installed.  Typed layouts
+    /// that rebuild storage return `false` when an allocation stage leaves
+    /// the collector exception pending, and must not redispatch on `false`.
     /// Default just relabels the strategy pointer: correct for
     /// `ObjectDictStrategy` (already object) and `UnicodeDictStrategy`
     /// (storage shape matches `Vec<(PyObjectRef, PyObjectRef)>`).
-    /// Strategies with typed storage layouts override to rebuild the
-    /// object Vec before swapping the pointer.
     ///
     /// # Safety
     /// `w_dict` must point at a valid `W_DictObject` whose
     /// `dstrategy` is `self`.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         crate::dictmultiobject::w_dict_set_strategy(w_dict, object_dict_strategy_ref());
+        true
     }
 
     /// `dictmultiobject.py listview_bytes` — default returns
@@ -7702,8 +7809,8 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     /// `w_dict_new_kwargs` is replaced by ObjectDictStrategy's empty
     /// Vec — without this, the typed parent's relabel-only default
     /// would leave the null pointer in place.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        EMPTY_DICT_STRATEGY.switch_to_object_strategy(w_dict);
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
+        EMPTY_DICT_STRATEGY.switch_to_object_strategy(w_dict)
     }
 
     /// `kwargsdict.py EmptyKwargsDictStrategy` inherits empty-dict behavior: copying an
@@ -7745,8 +7852,9 @@ impl DictStrategy for EmptyDictStrategy {
     /// so subclasses whose `dstorage` is null (`w_dict_new_kwargs`)
     /// don't end up with an OBJECT_DICT_STRATEGY label over a null
     /// pointer.  The field overwrite is a `setfield_gc`.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         install_empty_strategy(w_dict, object_dict_strategy_ref());
+        true
     }
 
     unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
@@ -8109,8 +8217,8 @@ impl DictStrategy for BytesDictStrategy {
     /// instantiation for BytesDictStrategy — `wrap` shares the unwrapped
     /// `str` (`w_bytes_from_block`). Walks the typed `RDict<BytesKey, _>`,
     /// rebuilds `RDict<ObjectKey, _>`, drops the typed box.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        crate::dictmultiobject::w_dict_switch_bytes_to_object_strategy(w_dict);
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
+        crate::dictmultiobject::w_dict_switch_bytes_to_object_strategy(w_dict)
     }
 
     /// `dictmultiobject.py get_empty_storage` — erased `{}`
@@ -8140,8 +8248,10 @@ impl DictStrategy for BytesDictStrategy {
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
             return PY_NULL;
         }
-        // `:1101-1103` switch + re-dispatch.
-        self.switch_to_object_strategy(w_dict);
+        // `AbstractTypedStrategy.getitem` switch + re-dispatch.
+        if !self.switch_to_object_strategy(w_dict) {
+            return PY_NULL;
+        }
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
@@ -8151,7 +8261,9 @@ impl DictStrategy for BytesDictStrategy {
             crate::dictmultiobject::w_dict_store_bytes_strategy(w_dict, w_key, w_value);
             return;
         }
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return;
+        }
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
@@ -8159,7 +8271,9 @@ impl DictStrategy for BytesDictStrategy {
     /// — BytesDictStrategy promotes to object on str setitem_str
     /// because str ≠ bytes.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return;
+        }
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
@@ -8168,7 +8282,9 @@ impl DictStrategy for BytesDictStrategy {
         if crate::is_bytes(w_key) {
             return crate::dictmultiobject::w_dict_delitem_bytes_strategy(w_dict, w_key);
         }
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return false;
+        }
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
     }
 
@@ -8280,6 +8396,9 @@ impl DictStrategy for BytesDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::bytes_dict_storage_gc_type_id());
+        if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
+            return crate::PY_NULL;
+        }
         crate::dictmultiobject::w_dict_new_with(bytes_dict_strategy_ref(), new_storage as GCREF)
     }
 }
@@ -8592,11 +8711,11 @@ impl DictStrategy for IntDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`:
-    /// wraps each i64 key via `wrap = newint` (`:1342`), produces a
+    /// wraps each i64 key via `wrap = newint`, produces a
     /// fresh `IndexMap<ObjectKey, PyObjectRef>` and drops the old typed
     /// `IndexMap<i64, PyObjectRef>` box.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        crate::dictmultiobject::w_dict_switch_int_to_object_strategy(w_dict);
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
+        crate::dictmultiobject::w_dict_switch_int_to_object_strategy(w_dict)
     }
 
     /// `dictmultiobject.py IntDictStrategy.get_empty_storage`
@@ -8623,7 +8742,9 @@ impl DictStrategy for IntDictStrategy {
         if Self::never_equal_to(w_key) {
             return PY_NULL;
         }
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return PY_NULL;
+        }
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
@@ -8633,14 +8754,18 @@ impl DictStrategy for IntDictStrategy {
             crate::dictmultiobject::w_dict_store_int_strategy(w_dict, w_key, w_value);
             return;
         }
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return;
+        }
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
     /// `dictmultiobject.py setitem_str` — int strategy
     /// promotes on str setitem_str.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return;
+        }
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
@@ -8649,7 +8774,9 @@ impl DictStrategy for IntDictStrategy {
         if Self::is_correct_type(w_key) {
             return crate::dictmultiobject::w_dict_delitem_int_strategy(w_dict, w_key);
         }
-        self.switch_to_object_strategy(w_dict);
+        if !self.switch_to_object_strategy(w_dict) {
+            return false;
+        }
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
     }
 
@@ -8758,6 +8885,9 @@ impl DictStrategy for IntDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::int_dict_storage_gc_type_id());
+        if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
+            return crate::PY_NULL;
+        }
         crate::dictmultiobject::w_dict_new_with(int_dict_strategy_ref(), new_storage as GCREF)
     }
 }

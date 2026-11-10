@@ -200,8 +200,8 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
         return;
     }
     {
-        let mut pending = PENDING.lock();
-        if !pending.remove(&(raw as usize)) {
+        let pending = PENDING.lock();
+        if !pending.contains(&(raw as usize)) {
             return;
         }
     }
@@ -217,29 +217,50 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     let base = roots.base();
     let _ = roots.pin_root(w_code);
     let _ = roots.pin_root(w_globals);
-    // `frameobject.py:72 space.FrameClass(space, code, w_globals,
+    // `frameobject.py frame_realize` `space.FrameClass(space, code, w_globals,
     // outer_func=None)` — no arguments and no closure, so the locals array is
     // whatever the code object's own counts ask for.
-    let Ok(frame) = crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+    let frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         roots.get(base) as *const (),
         &[],
         roots.get(base + 1),
         crate::call::take_last_exec_ctx(),
         PY_NULL,
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-    ) else {
-        return;
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+            return;
+        }
     };
-    let mut boxed = crate::pyframe::FrameBox::new(frame);
-    // `frameobject.py:75 d.f_lineno = rffi.getintfield(py_frame,
-    // 'c_f_lineno')` — the line the extension wrote before handing the frame
-    // on, which is the whole reason it asked for one.
-    boxed.getorcreatedebug(-1).f_lineno = unsafe { (*py_frame).f_lineno } as isize;
+    let mut boxed = match crate::pyframe::FrameBox::new(frame) {
+        Ok(boxed) => boxed,
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+            return;
+        }
+    };
+    // `frameobject.py frame_realize` copies `c_f_lineno` — the line the
+    // extension wrote before handing the frame on, which is the whole reason
+    // it asked for one.
+    let debug = match boxed.getorcreatedebug(-1) {
+        Ok(debug) => debug,
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+            return;
+        }
+    };
+    debug.f_lineno = unsafe { (*py_frame).f_lineno } as isize;
     if !boxed.is_gc_owned() {
         // A frame the collector does not own is freed when this handle dies,
         // and the mirror would outlive it.  Only the pre-hook bootstrap window
         // allocates that way, and no extension is loaded in it.
         return;
+    }
+    {
+        let mut pending = PENDING.lock();
+        pending.remove(&(raw as usize));
     }
     let refcnt = unsafe { (*raw).ob_refcnt };
     pyobject::link_allocated(
@@ -319,12 +340,20 @@ pub unsafe extern "C" fn PyTraceBack_Here(frame: *mut CPyFrameObject) -> c_int {
     let Some(w_exception) = super::pyerrors::pending_exception() else {
         return -1;
     };
-    unsafe {
+    let recorded = unsafe {
         crate::pytraceback::record_application_traceback(
             w_exception,
             w_frame as *mut crate::pyframe::PyFrame,
             0,
         )
     };
+    if !recorded {
+        // `record_application_traceback`: `PyTraceback.__init__` raises
+        // before `operror.set_traceback`. Install that allocation
+        // exception on the C pending-error owner (`State.set_exception`)
+        // and answer `-1`, matching `frameobject.py PyTraceBack_Here`.
+        super::pyerrors::set_pending_error(crate::pytraceback::fetch_traceback_alloc_error());
+        return -1;
+    }
     0
 }

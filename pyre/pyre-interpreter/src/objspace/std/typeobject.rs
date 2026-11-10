@@ -230,8 +230,11 @@ impl SpaceCacheBuild<usize, usize> for TypeCache {
     }
 
     fn ready(&self, value: &usize) -> Result<(), CacheError<Self::Error>> {
-        unsafe { typeobject::w_type_ready(*value as PyObjectRef) };
+        let ready = unsafe { typeobject::w_type_ready(*value as PyObjectRef) };
         gc_roots::mark_prebuilt_roots_dirty();
+        if !ready {
+            return Err(CacheError::Build(crate::runtime_ops::fetch_memory_error()));
+        }
         Ok(())
     }
 }

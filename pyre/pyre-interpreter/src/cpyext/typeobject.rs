@@ -2711,10 +2711,13 @@ fn descriptor_type(
     init: fn(PyObjectRef),
 ) -> PyObjectRef {
     cell.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type(name, |ns| {
-            init(ns);
-            super::methodobject::install_attribute_fence(ns);
-        });
+        let tp = crate::typedef::builtin_type_or_alloc_failed(crate::typedef::make_builtin_type(
+            name,
+            |ns| {
+                init(ns);
+                super::methodobject::install_attribute_fence(ns);
+            },
+        ));
         unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
@@ -5604,6 +5607,11 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         instance_layout(pyre_object::gc_roots::shadow_stack_get(base_slot)),
         pyre_object::gc_roots::shadow_stack_get(metatype_slot),
     );
+    // `W_TypeObject.__init__` / `compute_default_mro` / `ready` propagate
+    // collector failure; the C-extension entry fetches and returns null.
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && w_type.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(
             w_type,

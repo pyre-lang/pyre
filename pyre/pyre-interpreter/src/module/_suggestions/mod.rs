@@ -32,6 +32,9 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interp
     let items = unsafe {
         w_list_items_copy_as_vec_mode(candidates, majit_metainterp::jit::we_are_jitted())
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     for element in &items {
         if !unsafe { is_str(*element) } {
             return Err(pyre_interpreter::PyError::type_error(

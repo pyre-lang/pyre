@@ -370,7 +370,11 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     }
 }
 
@@ -396,7 +400,11 @@ pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
         ctypes_keepalive_refs: 0,
     };
     if raw.is_null() {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytesObject, body) };
         // The creation barrier the GC transform emits after a `SETFIELD_GC`
@@ -447,7 +455,11 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
-        crate::lltype::malloc_typed(payload) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(payload) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytesObjectUser, payload) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);

@@ -246,7 +246,11 @@ pub fn w_long_subclass_from_raw(value: *mut BigInt) -> PyObjectRef {
         std::mem::size_of::<W_LongObjectUser>(),
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(obj) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(obj) as PyObjectRef
+        }
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_LongObjectUser, obj);

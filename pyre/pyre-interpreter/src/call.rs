@@ -1267,7 +1267,7 @@ fn make_user_call_frame(
         closure,
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     )?;
-    Ok(crate::pyframe::FrameBox::new(frame))
+    crate::pyframe::FrameBox::new(frame)
 }
 
 enum PreparedUserCall {
@@ -1438,7 +1438,7 @@ pub fn call_user_function_resolved(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        );
+        )?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -1452,7 +1452,7 @@ pub fn call_user_function_resolved(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame, None)
@@ -2873,7 +2873,7 @@ pub fn call_user_function_plain_with_ctx(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        );
+        )?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -2885,7 +2885,7 @@ pub fn call_user_function_plain_with_ctx(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -4672,7 +4672,7 @@ fn call_with_kwargs_in_ctx_impl(
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
                 )?,
-            );
+            )?;
             func_frame.fix_array_ptrs();
             // Generator/coroutine function: return a generator object
             // instead of running the body, matching the positional call
@@ -5760,7 +5760,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
+        let gen_frame = match crate::pyframe::FrameBox::new(
             match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
@@ -5775,7 +5775,13 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                     return PY_NULL;
                 }
             },
-        );
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        };
         return match frame_into_generator_for_function(gen_frame, func) {
             Ok(v) => v,
             Err(e) => {
@@ -5785,7 +5791,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
         };
     }
 
-    let mut frame = crate::pyframe::FrameBox::new(
+    let mut frame = match crate::pyframe::FrameBox::new(
         match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             &final_args,
@@ -5800,7 +5806,13 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                 return PY_NULL;
             }
         },
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     // `function.py Function.call_args` delegates every application-level
     // function to `PyCode.funcrun` (`pycode.py`), which builds the
@@ -5859,16 +5871,28 @@ fn call_user_function_resolved_frameless(
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
-    let mut frame = crate::pyframe::FrameBox::new(
-        pyre_object::with_roots!(func => PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut frame = match crate::pyframe::FrameBox::new(
+        match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             args,
             w_globals,
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )),
-    );
+        )) {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        },
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame_into_generator_for_function(frame, func) {
@@ -6573,7 +6597,7 @@ mod function_call_args_tests {
         crate::test_hooks::install_hash_hook();
         let source = "def f(a, b=2, *, c=3):\n    return (a, b, c)\n";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("define f");
         let w_globals = frame.get_w_globals();
         let f = unsafe { pyre_object::w_dict_getitem_str(w_globals, "f") }.expect("f");
@@ -6621,7 +6645,7 @@ c = C(1, k=2)
 r = (c.a, c.k)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("construct C");
         let w_globals = frame.get_w_globals();
         let r = unsafe { pyre_object::w_dict_getitem_str(w_globals, "r") }.expect("r");
@@ -6648,7 +6672,7 @@ mod forgotten_self_hint_tests {
     fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("forgotten-self snippet");
         frame.get_w_globals()
     }
@@ -6843,7 +6867,7 @@ mod call_kw_parse_into_scope_tests {
     fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .expect("call_kw parse_into_scope snippet");
@@ -7073,11 +7097,11 @@ except TypeError as e:
     ) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         // `initialize_frame_scopes` already aliased `w_locals` to this
         // frame's own globals. Point both at the caller's dict so
         // LOAD_NAME / STORE_NAME see the function `f` defined there.
-        frame.set_w_globals(globals);
+        frame.set_w_globals(globals).expect("frame allocation");
         let globals = frame.get_w_globals();
         frame.setdictscope(globals, false).expect("setdictscope");
         frame
@@ -7598,7 +7622,7 @@ fn build_class_inner(
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)?;
     // compiling.py `build_class`: `frame.setdictscope(w_namespace)` then
     // `frame.run()`.  The body executes against a namespace OBJECT so
     // STORE_NAME / LOAD_NAME route through the object form, not the raw
@@ -7755,6 +7779,9 @@ fn build_class_inner(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && dict_obj.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let _ = pyre_object::gc_roots::pin_root(dict_obj);
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let classcell = unsafe { pyre_object::w_dict_getitem_str(class_dict, "__classcell__") };
@@ -7816,6 +7843,10 @@ fn build_class_inner(
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             pyre_object::gc_roots::shadow_stack_get(dict_root) as pyre_object::gc_hook::GCREF,
         );
+        // `W_TypeObject.__init__` does not expose a null type.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && w.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let _ = pyre_object::gc_roots::pin_root(w);
         // typeobject.py `_store_type_in_classcell` after `allocate_instance`,
         // before `W_TypeObject.__init__` / `ready` / `_set_names`.
@@ -7884,12 +7915,16 @@ fn build_class_inner(
         // typeobject.py `ready` is a later livevar use of that same `w_self`;
         // `gct_fv_gc_malloc` reloads it, so every use after the malloc rereads
         // the slot rather than the pre-collection word.
-        unsafe {
+        if !unsafe {
             pyre_object::w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(w_root), mro)
-        };
-        unsafe {
+        } {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        if !unsafe {
             pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(w_root))
-        };
+        } {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         // CPython type_new_set_classdict binds __classdict__ before
         // type_new_set_names.  A descriptor's __set_name__ may mutate the
         // completed type dict and immediately materialize lazy annotations;

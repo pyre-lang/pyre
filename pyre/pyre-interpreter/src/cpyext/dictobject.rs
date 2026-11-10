@@ -258,7 +258,12 @@ pub unsafe extern "C" fn PyDict_Copy(object: *mut CPyObject) -> *mut CPyObject {
     let Some(dict) = dict_argument(object, "PyDict_Copy") else {
         return std::ptr::null_mut();
     };
-    pyobject::make_ref(unsafe { pyre_object::dictmultiobject::w_dict_copy(dict) })
+    let copy = unsafe { pyre_object::dictmultiobject::w_dict_copy(dict) };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && copy.is_null() {
+        super::pyerrors::set_pending_error(crate::runtime_ops::fetch_memory_error());
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(copy)
 }
 
 /// `PyDict_DelItemString(dict, key)`.
