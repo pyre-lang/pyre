@@ -6886,14 +6886,22 @@ pub(in crate::front::mir) fn vec_transfer_stmt(
 }
 
 /// [`term_dropped_local`] of each block's terminator, by block index.
+///
+/// Blocks off the forward-reachable set (`on_unwind` cleanup) drop nothing here: no normal edge
+/// reaches them and the lowering never emits them, so their terminators are not projected.
 pub(in crate::front::mir) fn block_dropped_locals(
     body: &Unstructured,
     llbc: &Llbc,
 ) -> Vec<Option<u64>> {
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let forward = forward_reachable_mask(llbc, body);
     body.body
         .iter()
-        .map(|block| {
+        .enumerate()
+        .map(|(bb, block)| {
+            if !forward[bb] {
+                return None;
+            }
             block
                 .term_ref(llbc)
                 .ok()
@@ -7039,12 +7047,13 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
     // `(block, dropped local, Drop/Call target)` for every block whose terminator drops a local.
     let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body.len())
         .filter_map(|bb_idx| {
+            let dropped_local = dropped[bb_idx]?;
             let term = body.body[bb_idx].term_ref(llbc).ok()?;
             let target = match term {
                 TermKind::Drop { target, .. } | TermKind::Call { target, .. } => Some(*target),
                 _ => None,
             };
-            Some((bb_idx, dropped[bb_idx]?, target))
+            Some((bb_idx, dropped_local, target))
         })
         .collect();
     let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();

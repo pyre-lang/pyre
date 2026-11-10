@@ -1355,7 +1355,7 @@ pub struct RwKey {
     index: u32,
     owner_id: Option<majit_ir::descr::StructId>,
     array_id: Option<u64>,
-    unconsidered: Option<RwUnconsidered>,
+    unconsidered: Option<std::sync::Arc<RwUnconsidered>>,
 }
 
 impl RwKey {
@@ -1398,7 +1398,7 @@ impl RwKey {
             index: 0,
             owner_id: None,
             array_id: None,
-            unconsidered: Some(unconsidered),
+            unconsidered: Some(std::sync::Arc::new(unconsidered)),
         }
     }
 
@@ -1454,17 +1454,21 @@ pub enum RwOperand {
 
 /// `readwrite_analyzer.analyze(op)` result (`writeanalyze.py`): `top_set`,
 /// or a set of effect tuples. The set keeps insertion order, and the first
-/// operand stored for a key stays.
+/// operand stored for a key stays. The operands (and an unconsidered
+/// container in the key) are shared `Arc`s, so merging a callee's set into
+/// a caller's copies references, as `writeanalyze.py`'s sets of tuples do.
 #[derive(Clone, Debug)]
 pub enum ReadWriteEffects {
     Top,
-    Set(std::sync::Arc<indexmap::IndexMap<RwKey, RwOperand>>),
+    Set(std::sync::Arc<indexmap::IndexMap<RwKey, std::sync::Arc<RwOperand>>>),
 }
 
 impl ReadWriteEffects {
     fn insert(&mut self, key: RwKey, operand: RwOperand) {
         if let Self::Set(set) = self {
-            std::sync::Arc::make_mut(set).entry(key).or_insert(operand);
+            std::sync::Arc::make_mut(set)
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(operand));
         }
     }
 
@@ -3222,14 +3226,23 @@ impl StoreCore {
     /// building a graph: the `code` object each `FunctionDesc` is made
     /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
     /// Same `CallPath.display_name` order as [`Self::iter`].
+    /// Aliases of one funcobj share one declaration `Rc`.
     pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
         let path_to_key = self.path_to_key.borrow();
         let graphs = self.graphs.borrow();
+        // Every spelling of one funcobj shares its declaration
+        // (`bookkeeper.py getdesc`: one desc per function object), so the
+        // header is built once per `GraphKey`, not once per alias.
+        let mut declarations: HashMap<&GraphKey, Option<std::rc::Rc<FunctionGraph>>> =
+            HashMap::new();
         let mut entries: Vec<_> = path_to_key
             .iter()
             .filter_map(|(path, key)| {
-                let declared = self.slot_declaration(graphs.get(key)?)?;
+                let declared = declarations
+                    .entry(key)
+                    .or_insert_with(|| graphs.get(key).and_then(|slot| self.slot_declaration(slot)))
+                    .clone()?;
                 Some((path.clone(), declared))
             })
             .collect();
@@ -14049,7 +14062,7 @@ pub fn effectinfo_from_writeanalyze(
 
     // a read or a write to an interiorfield, inside an array of structs, is
     // additionally recorded as a read or write of the array itself
-    let mut extraef: Vec<(RwKey, RwOperand)> = Vec::new();
+    let mut extraef: Vec<(RwKey, std::sync::Arc<RwOperand>)> = Vec::new();
     for (key, operand) in effects.iter() {
         let tag = match key.tag {
             RwTag::InteriorField => RwTag::Array,
@@ -14062,7 +14075,7 @@ pub fn effectinfo_from_writeanalyze(
             len_offset,
             consider,
             ..
-        } = operand
+        } = &**operand
         else {
             unreachable!("interiorfield effect {operand:?} carries no interior field");
         };
@@ -14080,13 +14093,13 @@ pub fn effectinfo_from_writeanalyze(
             if !effects.contains_key(&val) {
                 extraef.push((
                     val,
-                    RwOperand::Array {
+                    std::sync::Arc::new(RwOperand::Array {
                         array: Some(arr.clone()),
                         array_type_id: None,
                         ir_type: majit_ir::value::Type::Ref,
                         len_offset: *len_offset,
                         consider: true,
-                    },
+                    }),
                 ));
             }
             continue;
@@ -14100,13 +14113,13 @@ pub fn effectinfo_from_writeanalyze(
         if !effects.contains_key(&val) {
             extraef.push((
                 val,
-                RwOperand::Array {
+                std::sync::Arc::new(RwOperand::Array {
                     array: None,
                     array_type_id: array_type_id.clone(),
                     ir_type: majit_ir::value::Type::Ref,
                     len_offset: *len_offset,
                     consider: true,
-                },
+                }),
             ));
         }
     }
@@ -14138,7 +14151,7 @@ pub fn effectinfo_from_writeanalyze(
                 &mut write_descrs_fields,
                 &mut field_write_descrs,
                 index,
-                operand,
+                &**operand,
                 cc,
             ),
             RwTag::ReadStruct => {
@@ -14147,7 +14160,7 @@ pub fn effectinfo_from_writeanalyze(
                         &mut readonly_descrs_fields,
                         &mut field_read_descrs_raw,
                         index,
-                        operand,
+                        &**operand,
                         cc,
                     );
                 }
@@ -14156,7 +14169,7 @@ pub fn effectinfo_from_writeanalyze(
                 &mut write_descrs_interiorfields,
                 &mut interior_write_descrs,
                 index,
-                operand,
+                &**operand,
                 cc,
             ),
             RwTag::ReadInteriorField => {
@@ -14165,7 +14178,7 @@ pub fn effectinfo_from_writeanalyze(
                         &mut readonly_descrs_interiorfields,
                         &mut interior_read_descrs_raw,
                         index,
-                        operand,
+                        &**operand,
                         cc,
                     );
                 }
@@ -14174,7 +14187,7 @@ pub fn effectinfo_from_writeanalyze(
                 &mut write_descrs_arrays,
                 &mut array_write_descrs,
                 index,
-                operand,
+                &**operand,
                 cc,
             ),
             RwTag::ReadArray => {
@@ -14183,7 +14196,7 @@ pub fn effectinfo_from_writeanalyze(
                         &mut readonly_descrs_arrays,
                         &mut array_read_descrs_raw,
                         index,
-                        operand,
+                        &**operand,
                         cc,
                     );
                 }
@@ -17701,7 +17714,7 @@ mod tests {
             assert_eq!(key.tag, RwTag::ReadArray);
             assert!(
                 matches!(
-                    operand,
+                    &**operand,
                     RwOperand::Array {
                         consider: false,
                         ..
@@ -17709,7 +17722,7 @@ mod tests {
                 ),
                 "STR is not consider_array, got {operand:?}"
             );
-            add_array(&mut indices, &mut descrs, key.index, operand, &cc);
+            add_array(&mut indices, &mut descrs, key.index, &**operand, &cc);
         }
         assert!(indices.is_empty(), "add_array publishes no index");
         assert!(descrs.is_empty(), "add_array publishes no descr");
@@ -29220,7 +29233,7 @@ mod tests {
         assert_eq!(set.len(), 1);
         let (key, operand) = set.first().unwrap();
         assert_eq!(key.tag, RwTag::Struct);
-        assert!(matches!(operand, RwOperand::Field { name, .. } if name == "c"));
+        assert!(matches!(&**operand, RwOperand::Field { name, .. } if name == "c"));
     }
 
     /// `FreshMallocs.__init__` / `WriteAnalyzer.analyze_simple_operation`
@@ -30016,7 +30029,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::InteriorField);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::InteriorField {
                     consider: false,
                     field_name,
@@ -30031,7 +30044,7 @@ mod tests {
             &mut indices,
             &mut descrs,
             key.index,
-            operand,
+            &**operand,
             &CallControl::new(),
         );
         assert!(indices.is_empty(), "add_interiorfield publishes no index");
@@ -30076,7 +30089,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::Array);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::Array {
                     array: Some(a),
                     consider: true,
@@ -30165,7 +30178,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::Array);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::Array {
                     consider: false,
                     ..
@@ -30179,7 +30192,7 @@ mod tests {
             &mut indices,
             &mut descrs,
             key.index,
-            operand,
+            &**operand,
             &CallControl::new(),
         );
         assert!(indices.is_empty(), "add_array publishes no index");
@@ -30232,7 +30245,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::InteriorField);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::InteriorField {
                     consider: true,
                     field_is_void: true,
@@ -30248,7 +30261,7 @@ mod tests {
             &mut indices,
             &mut descrs,
             key.index,
-            operand,
+            &**operand,
             &CallControl::new(),
         );
         assert!(indices.is_empty(), "add_interiorfield publishes no index");
@@ -30352,7 +30365,7 @@ mod tests {
         let ifield_array = set
             .iter()
             .find(|(key, _)| key.tag == RwTag::InteriorField)
-            .map(|(_, operand)| match operand {
+            .map(|(_, operand)| match &**operand {
                 RwOperand::InteriorField {
                     array: Some(arr), ..
                 } => arr.clone(),
@@ -30403,7 +30416,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::Array);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::Array {
                     consider: false,
                     ..
@@ -30449,7 +30462,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::Array);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::Array {
                     consider: false,
                     ..
@@ -30498,7 +30511,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::InteriorField);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::InteriorField {
                     consider: false,
                     field_is_void: false,
@@ -30548,7 +30561,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::ReadInteriorField);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::InteriorField {
                     field_name,
                     consider: true,
@@ -30591,7 +30604,7 @@ mod tests {
             let ReadWriteEffects::Set(set) = &effects else {
                 panic!("{name} ArrayItemsOffset is not top");
             };
-            match set.first().map(|(_, operand)| operand) {
+            match set.first().map(|(_, operand)| &**operand) {
                 Some(RwOperand::Array { len_offset, .. }) => *len_offset,
                 other => panic!("{name} expected RwOperand::Array, got {other:?}"),
             }
@@ -30695,7 +30708,7 @@ mod tests {
         assert_eq!(key.tag, RwTag::InteriorField);
         assert!(
             matches!(
-                operand,
+                &**operand,
                 RwOperand::InteriorField {
                     len_offset: None,
                     consider: true,

@@ -2427,6 +2427,7 @@ impl<'l> CrateLowering<'l> {
         let Some(mut body) = fd.unstructured() else {
             return Err(DeclBuildError::NoBody);
         };
+        clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
         let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
@@ -2535,6 +2536,7 @@ impl<'l> CrateLowering<'l> {
                 .push((req.leaf, "no substituted unstructured body".into()));
             return None;
         };
+        clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
         let signature = crate::front::clause_spec::substituted_signature(
@@ -7678,6 +7680,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
         lo.graph.fixeggblocks();
         reject_rust_heap_string_attr_call(lo)?;
+        // The graph is finished and is stored for the rest of the
+        // translation; release what the lowering's pushes over-allocated.
+        lo.graph.shrink_to_fit();
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
@@ -8125,6 +8130,21 @@ fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool)
 /// `on_unwind` cleanup block cannot.
 pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
     reachable_mask(llbc, body, true)
+}
+
+/// Empty every block outside [`forward_reachable_mask`]: its statements are
+/// dropped and its terminator becomes `UnwindResume`. Block indices stay as
+/// they are, so every edge into such a block still resolves. The lowering
+/// never emits these blocks; emptying them keeps the whole-body passes that
+/// run before it from projecting their terminators.
+pub(crate) fn clear_unreachable_blocks(llbc: &Llbc, body: &mut Unstructured) {
+    let forward = forward_reachable_mask(llbc, body);
+    for (block, reached) in body.body.iter_mut().zip(forward) {
+        if !reached {
+            block.statements = Vec::new();
+            block.set_terminator_kind(serde_json::Value::String("UnwindResume".into()));
+        }
+    }
 }
 
 /// Blocks reachable from bb0 along the edges the lowering emits.

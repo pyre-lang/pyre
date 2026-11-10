@@ -912,12 +912,17 @@ pub(crate) fn finish_helper_abort_latch(
     false
 }
 
-/// After `run_one_step`, `blackhole_if_trace_too_long` (`pyjitpl.py`
-/// `_interpret`). A SubReturn / SubRaise is `finishframe` /
+/// After `MIFrame.run_one_step` returns, `blackhole_if_trace_too_long`
+/// (`pyjitpl.py` `_interpret`). A SubReturn / SubRaise is `finishframe` /
 /// `finishframe_exception` first. A complete helper+ancestor image raises
 /// `SwitchToBlackhole(ABORT_TOO_LONG)`. A declined latch with nothing
 /// executed lets the enclosing Python CALL latch. An effectful walk without
 /// an image keeps executing (`execute_varargs`).
+///
+/// `HelperReturn::CalleePrologue` uses this same table: there is no
+/// helper-identity exemption from the trace limit. Helper sub-walks
+/// consult it at `ChangeFrame` (a nested call or a return), not after
+/// every walker instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelperTooLongDecision {
     DeliverOutcome,
@@ -936,28 +941,6 @@ pub(crate) fn helper_too_long_decision(
         HelperTooLongDecision::Abort
     } else {
         HelperTooLongDecision::KeepExecuting
-    }
-}
-
-/// `blackhole_if_trace_too_long` (`pyjitpl.py` `_interpret`) for the
-/// helper walk currently on top.
-///
-/// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
-/// aborting the helper walk returns `TraceTooLong` to the enclosing CALL
-/// and never enters the callee; `_interpret` would still be inside
-/// `execute_frame` and continue past the helper. Deliver the step so the
-/// helper can finish; the Python walk checks the limit after that CALL.
-/// Every other helper uses [`helper_too_long_decision`].
-pub(crate) fn helper_too_long_walk_decision<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    snapshot_safe: bool,
-    latched_complete: bool,
-    executed_effects: usize,
-) -> HelperTooLongDecision {
-    if helper_blackhole_resumes_at_call(ctx) {
-        HelperTooLongDecision::DeliverOutcome
-    } else {
-        helper_too_long_decision(snapshot_safe, latched_complete, executed_effects)
     }
 }
 
@@ -1702,9 +1685,12 @@ pub(crate) fn abort_latch_resume_pc<Sym: WalkSym>(
 ///
 /// `HelperReturn::CalleePrologue` (`call_trace` / nested `gettrace`):
 /// `pyframe.py execute_frame` runs the helper before the body; its void
-/// return is not the CALL's result. Finishing it as innermost dest-writes
-/// a generic object into the CALL. Converted helpers latch as their own
-/// frames (`blackhole.py convert_and_run_from_pyjitpl`).
+/// return is not the CALL's result. The helper is not latched as innermost
+/// (`blackhole.py convert_and_run_from_pyjitpl` would dest-write a generic
+/// object into the CALL). Too-long still uses [`helper_too_long_decision`];
+/// a declined latch with nothing executed Aborts so the enclosing Python
+/// CALL latches the CALL-entry image. Converted helpers latch as their own
+/// frames.
 pub(crate) fn helper_blackhole_resumes_at_call<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
@@ -1722,7 +1708,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         return false;
     }
     if helper_blackhole_resumes_at_call(ctx) {
-        latchdbg!("origin={origin} converted-call-entry");
+        latchdbg!("origin={origin} callee-prologue-call-entry");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {
@@ -10745,6 +10731,39 @@ fn try_load_global_descent<Sym: WalkSym>(
     )
 }
 
+/// Write a finished `perform_call` outcome into the residual dest.
+/// `finishframe` / `make_result_of_lastop` deliver the value before
+/// `_interpret` checks the trace limit.
+fn deliver_perform_call_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    next_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    outcome: DispatchOutcome,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let delivered = match outcome {
+        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+            let _ = finish_inline_callee_return(ctx, None);
+            Some((DispatchOutcome::Continue, next_pc))
+        }
+        DispatchOutcome::SubReturn { result } => {
+            let result = finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+            Some((DispatchOutcome::Continue, next_pc))
+        }
+        DispatchOutcome::Continue => {
+            return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc });
+        }
+        other => Some((other, next_pc)),
+    };
+    if matches!(delivered, Some((DispatchOutcome::Continue, _))) {
+        super::helper_blackhole_after_no_driver_finishframe(ctx, next_pc, op_pc)?;
+    }
+    Ok(delivered)
+}
+
 /// `pyjitpl.py MIFrame.perform_call`: enter one generated helper body with
 /// its own typed register banks. Shared by address-resolved calls and the
 /// interpreter-source body selected by an opcode lowering.
@@ -10813,20 +10832,9 @@ fn try_perform_call<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before)? {
-        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
-            let _ = finish_inline_callee_return(ctx, None);
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::SubReturn { result } => {
-            let result = finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-        other => Ok(Some((other, next_pc))),
-    }
+    let walk_outcome = promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before)?;
+    let delivered = deliver_perform_call_result(ctx, op_pc, next_pc, dst, dst_bank, walk_outcome)?;
+    Ok(delivered)
 }
 
 struct RecordedResidual {
@@ -11416,7 +11424,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_pop(ctx, code, op, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
     // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
@@ -11835,7 +11843,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::StoreSubscr
     {
         if try_walker_orthodox_store_subscr(ctx, op.pc, &r_args)?.is_some() {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
         // #171 setslice inline: `target[const_slice] = source` for a
         // same-length, step-1, Integer↔Integer slice — fold the assignment
@@ -11915,7 +11923,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(item_op) =
             try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            write_no_driver_finishframe_dest(ctx, op.pc, op.next_pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         if let Some(inlined) = spec_gate(SpecFold::InstanceNext, || {
@@ -12055,7 +12063,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
     // #171 ORTHODOX descent for the LIST_APPEND opcode (comprehension append,
@@ -12079,7 +12087,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // pre-append length before running `jit_list_append`. The decline
         // point is side-effect-free — it declines BEFORE emitting any IR.
         if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
     }
 
@@ -12092,7 +12100,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && try_walker_orthodox_proxy_list_append(ctx, code, op, funcptr, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
     // PyPy traces through builtin `getattr` into a property's Python getter.

@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=29
-# After `_opimpl_recursive_call` / FBW inline screens dropped (#2600), CI
-# cranelift reads 21-25x and linux dynasm 20x. 29 is 15% over the slower
-# ubuntu cranelift reading (25.1x, pyre-lang #2604).
+# pyre-check: max-pypy-ratio=9
+# Current CI reads 2.9-7.4x (slowest: windows dynasm 7.4x, pyre-lang #2616
+# / #2619). 9 is ~20% over that reading; 9/4 stays under the fastest 2.9x.
 # A fresh empty list promoted by append takes RPython's first 0 -> 4 backing
 # grow. The following subscript revisits that block through
 # W_ListObject.int_items.block after the grow helper updates the owner field.

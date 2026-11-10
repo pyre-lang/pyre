@@ -9733,6 +9733,22 @@ impl FunctionGraph {
         }
     }
 
+    /// Drop the spare capacity a builder that pushes onto the graph leaves
+    /// behind: the block list, the notes, and each block's input
+    /// arguments, operations, exits and exit-link arguments.
+    pub fn shrink_to_fit(&mut self) {
+        self.blocks.shrink_to_fit();
+        self.notes.shrink_to_fit();
+        for block in &mut self.blocks {
+            block.inputargs.shrink_to_fit();
+            block.operations.shrink_to_fit();
+            block.exits.shrink_to_fit();
+            for link in &mut block.exits {
+                link.args.shrink_to_fit();
+            }
+        }
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         let entry = BlockId(0);
         let returnblock = BlockId(1);

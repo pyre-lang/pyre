@@ -6102,14 +6102,6 @@ pub unsafe fn w_list_is_empty_strategy(obj: PyObjectRef) -> bool {
     (*(obj as *const W_ListObject)).strategy == ListStrategy::Empty
 }
 
-/// Whether `obj` uses either compact `BaseRangeListStrategy` storage shape.
-pub unsafe fn w_list_is_range_strategy(obj: PyObjectRef) -> bool {
-    matches!(
-        (*(obj as *const W_ListObject)).strategy,
-        ListStrategy::SimpleRange | ListStrategy::Range
-    )
-}
-
 /// SizeListStrategy.get_sizehint; `None` for every other strategy.
 pub unsafe fn w_list_sizehint(obj: PyObjectRef) -> Option<i64> {
     let _roots = crate::gc_roots::push_roots();
