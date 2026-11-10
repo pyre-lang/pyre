@@ -8428,7 +8428,11 @@ fn follow_hops_to_result_match(
                 shell_at_match: var,
                 hops,
                 forwarded_disc,
-                flag_true_is_err: found.flag_true_is_err,
+                // Polarity of the forwarded disc/flag, before the match
+                // composes `bool` / `eq`. Passing `found.flag_true_is_err`
+                // here would compose twice on the second
+                // `match_discriminant_from`.
+                flag_true_is_err,
             });
         }
         if let Some(prep) = result_disc_prep_hop(graph, target, &bound) {
@@ -11115,6 +11119,9 @@ fn collapse_rebuilt_shell_match(
     let plumbing = found.plumbing_indices();
     match_block_extra_ops_ok(graph, m, &plumbing)?;
     match_restore_ops_are_copyable(graph, m, &plumbing)?;
+    let restore_indices = restore_op_indices_besides(graph, m, &plumbing);
+    restore_const_inputs_projectable(graph, m, &restore_indices, &n_path.into_match.args)?;
+    restore_const_inputs_projectable(graph, m, &restore_indices, &e_path.into_match.args)?;
     let (ok_link, err_link) =
         split_result_match_exits(&graph.blocks[m].exits, found.flag_true_is_err)?;
     let ok_arm = ok_link.target.0;
@@ -11209,6 +11216,77 @@ fn collapse_rebuilt_shell_match(
         )
     });
     let err_build = shell_build_ops(graph, handler, err_shell, err_shell_is_unit)?;
+    // Last hops are rewritten onto the arms. An earlier hop keeps its
+    // exit, so stripping discriminant plumbing there would leave a use of
+    // a deleted variable (`model.py` `checkgraph` `usevar`).
+    for (hops, last) in [(&n_path.hops[..], n_last), (&e_path.hops[..], e_last)] {
+        for &hop in hops {
+            if stripped_disc_still_used(graph, hop, hop != last) {
+                return Err(format!(
+                    "block {hop} is not this shape: a stripped discriminant is still used"
+                ));
+            }
+        }
+    }
+    let merged_inputs: Vec<Variable> = graph.blocks[m]
+        .inputargs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !merge.kills.contains(i))
+        .map(|(_, arg)| rename_through(arg, &merge.renaming))
+        .collect();
+    let n_check_payload = if n_path.hops.is_empty() {
+        ok_payload.clone()
+    } else {
+        n_path.shell_at_match.clone()
+    };
+    let e_check_payload = if e_path.hops.is_empty() {
+        err_payload.clone()
+    } else {
+        e_path.shell_at_match.clone()
+    };
+    let derived_ok = disc_derived_arm_consts(&found, &graph.blocks[m].operations, 0);
+    let derived_err = disc_derived_arm_consts(&found, &graph.blocks[m].operations, 1);
+    let restore_identity: Vec<(Variable, Variable)> = restore_indices
+        .iter()
+        .filter_map(|&i| {
+            graph.blocks[m].operations[i]
+                .result
+                .clone()
+                .map(|r| (r.clone(), r))
+        })
+        .collect();
+    let shell_proj = rename_through(&found.shell, &merge.renaming);
+    let disc_proj = rename_through(&found.disc, &merge.renaming);
+    let switch_proj = rename_through(&found.switch_var, &merge.renaming);
+    project_arm_args(
+        &n_args,
+        &merged_inputs,
+        &ok_args_renamed,
+        &shell_proj,
+        &n_check_payload,
+        &disc_proj,
+        &switch_proj,
+        0,
+        found.bool_switch,
+        found.flag_true_is_err,
+        &restore_identity,
+        &derived_ok,
+    )?;
+    project_arm_args(
+        &e_args,
+        &merged_inputs,
+        &err_args_renamed,
+        &shell_proj,
+        &e_check_payload,
+        &disc_proj,
+        &switch_proj,
+        1,
+        found.bool_switch,
+        found.flag_true_is_err,
+        &restore_identity,
+        &derived_err,
+    )?;
     // Every check has run. The edits below do not fail.
     apply_remove_identical_inputargs(graph, m, &merge);
     let n_exit = single_exit(graph, normal).expect("normal still has one exit");
@@ -11276,26 +11354,22 @@ fn collapse_rebuilt_shell_match(
     } else {
         e_path.shell_at_match.clone()
     };
-    let n_input_map: Vec<(Variable, Variable)> = graph.blocks[m]
+    let n_input_map: Vec<(Variable, LinkArg)> = graph.blocks[m]
         .inputargs
         .iter()
-        .zip(n_path.into_match.args.iter())
-        .filter_map(|(input, arg)| match arg {
-            LinkArg::Value(var) => Some((input.clone(), var.clone())),
-            _ => None,
-        })
+        .cloned()
+        .zip(n_path.into_match.args.iter().cloned())
         .collect();
-    let e_input_map: Vec<(Variable, Variable)> = graph.blocks[m]
+    let e_input_map: Vec<(Variable, LinkArg)> = graph.blocks[m]
         .inputargs
         .iter()
-        .zip(e_path.into_match.args.iter())
-        .filter_map(|(input, arg)| match arg {
-            LinkArg::Value(var) => Some((input.clone(), var.clone())),
-            _ => None,
-        })
+        .cloned()
+        .zip(e_path.into_match.args.iter().cloned())
         .collect();
     let n_restore = apply_copy_restore_ops(graph, m, n_last, &restore_indices, &n_input_map);
     let e_restore = apply_copy_restore_ops(graph, m, e_last, &restore_indices, &e_input_map);
+    let derived_ok = disc_derived_arm_consts(&found, &graph.blocks[m].operations, 0);
+    let derived_err = disc_derived_arm_consts(&found, &graph.blocks[m].operations, 1);
     let ok_args = project_arm_args(
         &n_path.into_match.args,
         &graph.blocks[m].inputargs,
@@ -11306,7 +11380,9 @@ fn collapse_rebuilt_shell_match(
         &disc,
         0,
         bool_switch,
+        found.flag_true_is_err,
         &n_restore,
+        &derived_ok,
     )
     .expect("merged Ok args still project onto the Ok arm");
     let err_args = project_arm_args(
@@ -11319,7 +11395,9 @@ fn collapse_rebuilt_shell_match(
         &disc,
         1,
         bool_switch,
+        found.flag_true_is_err,
         &e_restore,
+        &derived_err,
     )
     .expect("merged Err args still project onto the Err arm");
     delete_ops(graph, normal, ok_build);
@@ -11655,10 +11733,14 @@ struct ResultMatchDisc {
     bool_idx: Option<usize>,
     const_idx: Option<usize>,
     eq_idx: Option<usize>,
+    eq_against: Option<i64>,
     disc: Variable,
     switch_var: Variable,
     shell: Variable,
     bool_switch: bool,
+    /// Polarity of `disc` itself: `true` means a true/1 disc is Err.
+    /// A forwarded `eq(disc, 0)` flag arrives with this `false`.
+    disc_true_is_err: bool,
     /// `true` when the switch flag's true arm is Err (`eq(disc, 1)` /
     /// `bool(disc)` / raw disc `1`). `eq(disc, 0)` inverts it.
     flag_true_is_err: bool,
@@ -11743,25 +11825,36 @@ fn match_discriminant_from(
         .exits
         .iter()
         .any(|link| matches!(link.exitcase, Some(ExitCase::Bool(_))));
+    let disc_true_is_err = if forwarded {
+        forwarded_flag_true_is_err
+    } else {
+        true
+    };
     let (switch_var, bool_switch, bool_idx, flag_true_is_err) = if switch_on_bool {
         let (idx, flag) = bool_hit.expect("bool switch requires bool(disc)");
-        (flag, true, Some(idx), true)
+        // `bool` of a flag keeps its polarity.
+        (flag, true, Some(idx), disc_true_is_err)
     } else if switch_on_eq {
         let eq = eq_hit.as_ref().expect("eq switch requires eq(disc)");
-        (eq.flag.clone(), true, None, eq.against == 1)
+        (
+            eq.flag.clone(),
+            true,
+            None,
+            compose_flag_true_is_err(disc_true_is_err, eq.against),
+        )
     } else if forwarded && bool_cases {
         (
             disc.clone(),
             true,
             bool_hit.map(|(idx, _)| idx),
-            forwarded_flag_true_is_err,
+            disc_true_is_err,
         )
     } else {
         (
             disc.clone(),
             false,
             bool_hit.map(|(idx, _)| idx),
-            forwarded_flag_true_is_err,
+            disc_true_is_err,
         )
     };
     Ok(ResultMatchDisc {
@@ -11769,12 +11862,20 @@ fn match_discriminant_from(
         bool_idx,
         const_idx: eq_hit.as_ref().map(|eq| eq.const_idx),
         eq_idx: eq_hit.as_ref().map(|eq| eq.eq_idx),
+        eq_against: eq_hit.as_ref().map(|eq| eq.against),
         disc,
         switch_var,
         shell,
         bool_switch,
+        disc_true_is_err,
         flag_true_is_err,
     })
+}
+
+/// Polarity of a bool derived from `incoming` (`true` means Err).
+/// `eq(flag, 1)` keeps it; `eq(flag, 0)` inverts it.
+fn compose_flag_true_is_err(incoming: bool, against: i64) -> bool {
+    incoming == (against == 1)
 }
 
 fn split_result_match_exits(
@@ -11844,22 +11945,91 @@ fn restore_op_indices_besides(
         .collect()
 }
 
+fn lookup_restore_arg(map: &[(Variable, LinkArg)], var: &Variable) -> Option<LinkArg> {
+    map.iter()
+        .rev()
+        .find(|(from, _)| from == var)
+        .map(|(_, arg)| arg.clone())
+}
+
+fn remap_copied_restore_kind(kind: &OpKind, map: &[(Variable, LinkArg)]) -> OpKind {
+    let mut kind = kind.clone();
+    if let OpKind::Call { args, .. } = &mut kind {
+        for arg in args {
+            let LinkArg::Value(v) = arg else {
+                continue;
+            };
+            if let Some(LinkArg::Const(c)) = lookup_restore_arg(map, v) {
+                *arg = LinkArg::Const(c);
+            }
+        }
+    }
+    let remap_var = |var: &Variable| match lookup_restore_arg(map, var) {
+        Some(LinkArg::Value(v)) => v,
+        _ => var.clone(),
+    };
+    crate::inline::remap_op_kind(&kind, &remap_var)
+}
+
+/// True when `operand` is a mixed `LinkArg` on `kind`, so a constant-supplied
+/// match input can be substituted (`SpaceOperation.args` hold Constants).
+fn restore_operand_holds_const(kind: &OpKind, operand: &Variable) -> bool {
+    let OpKind::Call { args, .. } = kind else {
+        return false;
+    };
+    args.iter()
+        .any(|arg| matches!(arg, LinkArg::Value(v) if v == operand))
+}
+
+/// A restore copied onto the predecessor must not name a match inputarg
+/// the incoming edge supplied as a constant (`checkgraph` `usevar`).
+fn restore_const_inputs_projectable(
+    graph: &FunctionGraph,
+    block: usize,
+    restore_indices: &[usize],
+    pred_args: &[LinkArg],
+) -> Result<(), String> {
+    let inputs = &graph.blocks[block].inputargs;
+    if inputs.len() != pred_args.len() {
+        return Err(format!(
+            "link to match block {block} arity does not match inputargs"
+        ));
+    }
+    for &idx in restore_indices {
+        let kind = &graph.blocks[block].operations[idx].kind;
+        for operand in op_operand_vars(kind) {
+            let Some(pos) = inputs.iter().position(|var| var == &operand) else {
+                continue;
+            };
+            if !matches!(pred_args[pos], LinkArg::Const(_)) {
+                continue;
+            }
+            if !restore_operand_holds_const(kind, &operand) {
+                return Err(format!(
+                    "block {block} is not this shape: a restore operand is a \
+                     constant-supplied match input"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_copy_restore_ops(
     graph: &mut FunctionGraph,
     src: usize,
     dest: usize,
     restore_indices: &[usize],
-    input_map: &[(Variable, Variable)],
+    input_map: &[(Variable, LinkArg)],
 ) -> Vec<(Variable, Variable)> {
     let mut map = input_map.to_vec();
     let mut result_map = Vec::new();
     for &idx in restore_indices {
         let op = graph.blocks[src].operations[idx].clone();
-        let remap = |var: &Variable| linear_remap(&map, var);
-        let kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        let kind = remap_copied_restore_kind(&op.kind, &map);
         let result = op.result.as_ref().map(|_| graph.alloc_value_var());
         if let (Some(old), Some(fresh)) = (&op.result, &result) {
-            map.push((old.clone(), fresh.clone()));
+            map.push((old.clone(), LinkArg::Value(fresh.clone())));
             result_map.push((old.clone(), fresh.clone()));
         }
         graph.blocks[dest]
@@ -11869,10 +12039,14 @@ fn apply_copy_restore_ops(
     result_map
 }
 
-fn strip_result_disc_plumbing(graph: &mut FunctionGraph, block: usize) {
+/// Discriminant FieldRead / `bool` / `eq` indices and the variables those
+/// ops define. `ConstInt` can sit before the FieldRead (`is_forwarding_restore_op`),
+/// so the index list is not sorted.
+fn result_disc_plumbing_to_strip(ops: &[SpaceOperation]) -> (Vec<usize>, Vec<Variable>) {
     let mut remove = Vec::new();
     let mut disc_vars = Vec::new();
-    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+    let mut removed = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
         if let OpKind::FieldRead { field, .. } = &op.kind
             && field.name == "__discriminant"
             && field
@@ -11883,23 +12057,72 @@ fn strip_result_disc_plumbing(graph: &mut FunctionGraph, block: usize) {
             remove.push(i);
             if let Some(result) = &op.result {
                 disc_vars.push(result.clone());
+                removed.push(result.clone());
             }
         }
     }
-    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+    for (i, op) in ops.iter().enumerate() {
         if let OpKind::UnaryOp { op: o, operand, .. } = &op.kind
             && o == "bool"
             && disc_vars.iter().any(|disc| disc == operand)
         {
             remove.push(i);
+            if let Some(result) = &op.result {
+                removed.push(result.clone());
+            }
         }
     }
     for disc in &disc_vars {
-        if let Some(eq) = eq_flag_of_disc(&graph.blocks[block].operations, disc) {
+        if let Some(eq) = eq_flag_of_disc(ops, disc) {
             remove.push(eq.const_idx);
             remove.push(eq.eq_idx);
+            if let Some(result) = &ops[eq.const_idx].result {
+                removed.push(result.clone());
+            }
+            if let Some(result) = &ops[eq.eq_idx].result {
+                removed.push(result.clone());
+            }
         }
     }
+    (remove, removed)
+}
+
+fn stripped_disc_still_used(graph: &FunctionGraph, block: usize, check_exits: bool) -> bool {
+    let ops = &graph.blocks[block].operations;
+    let (remove, removed) = result_disc_plumbing_to_strip(ops);
+    if removed.is_empty() {
+        return false;
+    }
+    for (i, op) in ops.iter().enumerate() {
+        if remove.contains(&i) {
+            continue;
+        }
+        if op_operand_vars(&op.kind)
+            .iter()
+            .any(|var| removed.iter().any(|gone| gone == var))
+        {
+            return true;
+        }
+    }
+    if !check_exits {
+        return false;
+    }
+    let body = &graph.blocks[block];
+    if let Some(ExitSwitch::Value(sw)) = &body.exitswitch
+        && removed.iter().any(|gone| gone == sw)
+    {
+        return true;
+    }
+    body.exits.iter().any(|link| {
+        link.args.iter().any(|arg| match arg {
+            LinkArg::Value(var) => removed.iter().any(|gone| gone == var),
+            _ => false,
+        })
+    })
+}
+
+fn strip_result_disc_plumbing(graph: &mut FunctionGraph, block: usize) {
+    let (remove, _) = result_disc_plumbing_to_strip(&graph.blocks[block].operations);
     delete_ops(graph, block, remove);
 }
 
@@ -12091,8 +12314,60 @@ fn shell_pos0_reads(
     Ok(ShellPos0Walk { reads, visited })
 }
 
+/// `bool` / `eq` / `ConstInt` defined beside the discriminant, projected
+/// to the constants that arm would see. `replace_exitswitch_by_constant`
+/// keeps the selected link's argument values.
+fn disc_derived_arm_consts(
+    found: &ResultMatchDisc,
+    ops: &[SpaceOperation],
+    disc_case: i64,
+) -> Vec<(Variable, crate::flowspace::model::ConstValue)> {
+    let mut out = Vec::new();
+    let flag_value = (disc_case != 0) == found.disc_true_is_err;
+    if let Some(idx) = found.bool_idx
+        && let Some(var) = ops.get(idx).and_then(|op| op.result.clone())
+    {
+        out.push((var, crate::flowspace::model::ConstValue::Bool(flag_value)));
+    }
+    if let Some(idx) = found.eq_idx
+        && let Some(var) = ops.get(idx).and_then(|op| op.result.clone())
+    {
+        let against = found.eq_against.unwrap_or(1);
+        let eq_true = if against == 1 {
+            flag_value
+        } else {
+            !flag_value
+        };
+        out.push((var, crate::flowspace::model::ConstValue::Bool(eq_true)));
+    }
+    if let Some(idx) = found.const_idx
+        && let Some(op) = ops.get(idx)
+        && let Some(var) = op.result.clone()
+    {
+        match &op.kind {
+            OpKind::ConstInt(v) => {
+                out.push((var, crate::flowspace::model::ConstValue::Int(*v)));
+            }
+            OpKind::ConstUInt(v) => {
+                out.push((var, crate::flowspace::model::ConstValue::UInt(*v)));
+            }
+            OpKind::ConstBool(v) => {
+                out.push((var, crate::flowspace::model::ConstValue::Bool(*v)));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Rebuild `arm_args` from the predecessor's exit. A match input becomes
 /// the predecessor arg that bound it; the shell input becomes `payload`.
+///
+/// A bool switch flag is the arm's tag under `flag_true_is_err`:
+/// `eq(disc, 1)` / `bool(disc)` is true on Err; `eq(disc, 0)` is true on
+/// Ok. The raw discriminant stays `Int(disc_case)`.
+/// `constfold_exitswitch` / `replace_exitswitch_by_constant` keep the
+/// selected link's argument values.
 fn project_arm_args(
     pred_args: &[LinkArg],
     match_inputs: &[Variable],
@@ -12103,7 +12378,9 @@ fn project_arm_args(
     switch_var: &Variable,
     disc_case: i64,
     bool_switch: bool,
+    flag_true_is_err: bool,
     extra: &[(Variable, Variable)],
+    derived: &[(Variable, crate::flowspace::model::ConstValue)],
 ) -> Result<Vec<LinkArg>, String> {
     arm_args
         .iter()
@@ -12114,7 +12391,7 @@ fn project_arm_args(
             // through the discriminant block, so pass the tag as a constant.
             LinkArg::Value(var) if var == switch_var => {
                 let value = if bool_switch {
-                    crate::flowspace::model::ConstValue::Bool(disc_case != 0)
+                    crate::flowspace::model::ConstValue::Bool((disc_case != 0) == flag_true_is_err)
                 } else {
                     crate::flowspace::model::ConstValue::Int(disc_case)
                 };
@@ -12125,6 +12402,13 @@ fn project_arm_args(
             LinkArg::Value(var) if var == disc => {
                 Ok(LinkArg::Const(crate::flowspace::model::Constant::new(
                     crate::flowspace::model::ConstValue::Int(disc_case),
+                )))
+            }
+            LinkArg::Value(var)
+                if let Some((_, value)) = derived.iter().find(|(from, _)| from == var) =>
+            {
+                Ok(LinkArg::Const(crate::flowspace::model::Constant::new(
+                    value.clone(),
                 )))
             }
             LinkArg::Value(var) if extra.iter().any(|(from, _)| from == var) => {
@@ -12189,6 +12473,10 @@ pub(crate) fn shell_build_ops(
 }
 
 pub(crate) fn delete_ops(graph: &mut FunctionGraph, block: usize, indices: Vec<usize>) {
+    // `transform_dead_op_vars_in_blocks` deletes in descending index order.
+    let mut indices = indices;
+    indices.sort_unstable();
+    indices.dedup();
     for index in indices.into_iter().rev() {
         graph.blocks[block].operations.remove(index);
     }
@@ -19365,6 +19653,26 @@ mod rebuilt_shell_collapse_tests {
             .expect("shadow_stack_get")
     }
 
+    /// `checkgraph` `usevar`: every GC-restore operand in `block` is defined
+    /// there (an inputarg or an earlier result). Constants on Call.args are
+    /// not SSA uses.
+    fn gc_restore_operands_defined(graph: &FunctionGraph, block: usize) -> bool {
+        let mut defined = graph.blocks[block].inputargs.clone();
+        for op in &graph.blocks[block].operations {
+            if is_gc_root_reload(&op.kind) {
+                for operand in op_operand_vars(&op.kind) {
+                    if !defined.iter().any(|known| known == &operand) {
+                        return false;
+                    }
+                }
+            }
+            if let Some(result) = &op.result {
+                defined.push(result.clone());
+            }
+        }
+        true
+    }
+
     /// `match` lowered as `d = r.__discriminant; m = bool(d); switch m`.
     #[test]
     fn bool_of_discriminant_match_drops_the_rebuilt_shells() {
@@ -19451,6 +19759,35 @@ mod rebuilt_shell_collapse_tests {
                 .iter()
                 .any(|op| is_gc_root_reload(&op.kind)),
             "the restore is copied onto the normal edge"
+        );
+    }
+
+    /// Incoming `LinkArg::Const` for a restore operand must be substituted
+    /// (or the collapse refused). Dropping Const from the copy map leaves
+    /// the match inputarg in the predecessor (`checkgraph` `usevar`).
+    #[test]
+    fn const_match_input_restore_operand_is_defined_in_predecessor() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let idx = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs.push(idx.clone());
+        let slot = crate::flowspace::model::Constant::new(ConstValue::Int(0));
+        fix.graph.blocks[fix.normal].exits[0]
+            .args
+            .push(LinkArg::Const(slot.clone()));
+        fix.graph.blocks[fix.handler].exits[0]
+            .args
+            .push(LinkArg::Const(slot));
+        let _ = push_shadow_stack_get(&mut fix.graph, match_id, &idx);
+        collapse(&mut fix).expect("const-supplied restore input collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        assert!(
+            gc_restore_operands_defined(&fix.graph, fix.normal),
+            "copied restore operands are defined in the predecessor"
+        );
+        assert!(
+            gc_restore_operands_defined(&fix.graph, fix.handler),
+            "copied restore operands are defined on the except edge"
         );
     }
 
@@ -19576,6 +19913,441 @@ mod rebuilt_shell_collapse_tests {
             }),
             "disc FieldRead and eq are stripped from the hop"
         );
+    }
+
+    /// `eq(disc, 0)` is true on Ok. An arm that receives the flag must
+    /// get `Bool(true)` on Ok and `Bool(false)` on Err.
+    #[test]
+    fn eq_disc_zero_flag_forwarded_to_arm_keeps_polarity() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let disc = fix.graph.blocks[match_id.0].operations[0]
+            .result
+            .clone()
+            .expect("disc");
+        let zero = fix
+            .graph
+            .push_op_var(match_id, OpKind::ConstInt(0), true)
+            .expect("0");
+        let flag = fix
+            .graph
+            .push_op_var(
+                match_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: zero,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag.clone()));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(true));
+            exits[0].args.push(LinkArg::Value(flag.clone()));
+            exits[1].exitcase = Some(ExitCase::Bool(false));
+            exits[1].args.push(LinkArg::Value(flag));
+        }
+        let ok_flag = fix.graph.alloc_value_var();
+        let err_flag = fix.graph.alloc_value_var();
+        fix.graph.blocks[fix.ok_arm].inputargs.push(ok_flag);
+        fix.graph.blocks[fix.err_arm].inputargs.push(err_flag);
+        collapse(&mut fix).expect("eq(disc, 0) match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let ok_exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(ok_exit.target.0, fix.ok_arm);
+        assert!(
+            matches!(&ok_exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
+            "the normal edge carries the unwrapped payload"
+        );
+        assert!(
+            matches!(&ok_exit.args[1], LinkArg::Const(c) if matches!(c.value, ConstValue::Bool(true))),
+            "eq(disc, 0) is true on Ok"
+        );
+        let err_exit = &fix.graph.blocks[fix.handler].exits[0];
+        assert_eq!(err_exit.target.0, fix.err_arm);
+        assert!(
+            matches!(&err_exit.args[1], LinkArg::Const(c) if matches!(c.value, ConstValue::Bool(false))),
+            "eq(disc, 0) is false on Err"
+        );
+    }
+
+    /// Prep hop forwards `eq(disc, 0)` (true on Ok). `bool` of that flag
+    /// keeps the polarity; resetting it to "true is Err" routes the normal
+    /// edge onto the Err arm.
+    #[test]
+    fn bool_of_forwarded_eq_zero_flag_keeps_polarity() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let zero = fix
+            .graph
+            .push_op_var(hop_id, OpKind::ConstInt(0), true)
+            .expect("0");
+        let flag = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: zero,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, flag_in.clone()];
+        let as_bool = push_bool(&mut fix.graph, match_id, &flag_in);
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(as_bool));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            // `eq(disc, 0)` is true on Ok, and `bool` keeps that polarity.
+            exits[0].exitcase = Some(ExitCase::Bool(true));
+            exits[1].exitcase = Some(ExitCase::Bool(false));
+        }
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        collapse(&mut fix).expect("bool of forwarded eq(disc, 0) collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(
+            fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm,
+            "true on the forwarded eq(disc, 0) flag is the Ok arm"
+        );
+        let err_hop = fix.graph.blocks[fix.handler].exits[0].target.0;
+        assert_eq!(
+            fix.graph.blocks[err_hop].exits[0].target.0, fix.err_arm,
+            "false on the forwarded eq(disc, 0) flag is the Err arm"
+        );
+    }
+
+    /// Prep hop forwards `eq(disc, 0)`; the match then `eq(flag, 0)`, which
+    /// inverts polarity back to "true is Err".
+    #[test]
+    fn eq_zero_of_forwarded_eq_zero_flag_inverts_polarity() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let hop_zero = fix
+            .graph
+            .push_op_var(hop_id, OpKind::ConstInt(0), true)
+            .expect("0");
+        let flag = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: hop_zero,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, flag_in.clone()];
+        let zero = fix
+            .graph
+            .push_op_var(match_id, OpKind::ConstInt(0), true)
+            .expect("0");
+        let inverted = fix
+            .graph
+            .push_op_var(
+                match_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: flag_in,
+                    rhs: zero,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(inverted));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        collapse(&mut fix).expect("eq(flag, 0) of forwarded eq(disc, 0) collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(
+            fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm,
+            "eq(flag, 0) inverts the forwarded eq(disc, 0) polarity"
+        );
+        let err_hop = fix.graph.blocks[fix.handler].exits[0].target.0;
+        assert_eq!(
+            fix.graph.blocks[err_hop].exits[0].target.0, fix.err_arm,
+            "true on the inverted flag is the Err arm"
+        );
+    }
+
+    /// Switch on the raw discriminant, but the arms also receive the `eq`
+    /// result and its constant. Those are plumbing, not match inputargs.
+    #[test]
+    fn eq_result_and_const_as_arm_args_project_to_constants() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let disc = fix.graph.blocks[match_id.0].operations[0]
+            .result
+            .clone()
+            .expect("disc");
+        let one = fix
+            .graph
+            .push_op_var(match_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let flag = fix
+            .graph
+            .push_op_var(
+                match_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].args.push(LinkArg::Value(flag.clone()));
+            exits[0].args.push(LinkArg::Value(one.clone()));
+            exits[1].args.push(LinkArg::Value(flag));
+            exits[1].args.push(LinkArg::Value(one));
+        }
+        let ok_flag = fix.graph.alloc_value_var();
+        let ok_one = fix.graph.alloc_value_var();
+        let err_flag = fix.graph.alloc_value_var();
+        let err_one = fix.graph.alloc_value_var();
+        fix.graph.blocks[fix.ok_arm].inputargs.push(ok_flag);
+        fix.graph.blocks[fix.ok_arm].inputargs.push(ok_one);
+        fix.graph.blocks[fix.err_arm].inputargs.push(err_flag);
+        fix.graph.blocks[fix.err_arm].inputargs.push(err_one);
+        collapse(&mut fix).expect("eq plumbing forwarded to arms collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let ok_exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(ok_exit.target.0, fix.ok_arm);
+        assert!(
+            matches!(&ok_exit.args[1], LinkArg::Const(c) if matches!(c.value, ConstValue::Bool(false))),
+            "eq(disc, 1) is false on Ok"
+        );
+        assert!(
+            matches!(&ok_exit.args[2], LinkArg::Const(c) if matches!(c.value, ConstValue::Int(1))),
+            "the eq constant is still 1 on Ok"
+        );
+        let err_exit = &fix.graph.blocks[fix.handler].exits[0];
+        assert_eq!(err_exit.target.0, fix.err_arm);
+        assert!(
+            matches!(&err_exit.args[1], LinkArg::Const(c) if matches!(c.value, ConstValue::Bool(true))),
+            "eq(disc, 1) is true on Err"
+        );
+        assert!(
+            matches!(&err_exit.args[2], LinkArg::Const(c) if matches!(c.value, ConstValue::Int(1))),
+            "the eq constant is still 1 on Err"
+        );
+    }
+
+    /// `ConstInt` is a restore op, so it may precede the FieldRead.
+    /// Unsorted plumbing indices `[FieldRead, const, eq]` used to delete
+    /// the wrong ops.
+    #[test]
+    fn const_before_disc_read_still_strips_eq_plumbing() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let one = fix
+            .graph
+            .push_op_var(hop_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let flag = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, flag_in.clone()];
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag_in));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        collapse(&mut fix).expect("const-before-FieldRead hop collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm);
+        assert!(
+            !fix.graph.blocks[hop].operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                ) || matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")
+                    || matches!(&op.kind, OpKind::ConstInt(1))
+            }),
+            "ConstInt, FieldRead, and eq are stripped in descending index order"
+        );
+    }
+
+    /// A disc-prep hop that forwards the flag, then another hop that only
+    /// forwards it, would keep the deleted flag on the earlier exit.
+    #[test]
+    fn disc_prep_then_unread_forwarding_hop_declines() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (prep_id, prep_args) = fix.graph.create_block_with_arg_vars(1);
+        let prep_shell = prep_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                prep_id,
+                OpKind::FieldRead {
+                    base: prep_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("prep disc");
+        let one = fix
+            .graph
+            .push_op_var(prep_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let flag = fix
+            .graph
+            .push_op_var(
+                prep_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        let (mid_id, mid_args) = fix.graph.create_block_with_arg_vars(2);
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, flag_in.clone()];
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag_in));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        fix.graph.set_goto_mixed(
+            mid_id,
+            match_id,
+            vec![
+                LinkArg::Value(mid_args[0].clone()),
+                LinkArg::Value(mid_args[1].clone()),
+            ],
+        );
+        fix.graph.set_goto_mixed(
+            prep_id,
+            mid_id,
+            vec![LinkArg::Value(prep_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), prep_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), prep_id, vec![fix.err_shell.clone()]);
+        let err = collapse(&mut fix).expect_err("prep then forwarder declines");
+        assert!(
+            err.contains("not this shape") || err.contains("stripped discriminant"),
+            "{err}"
+        );
+        assert_eq!(shell_ctors(&fix.graph), 2, "decline leaves the shells");
     }
 
     /// `Ok(())` arm that does not receive the shell (`_trace`
