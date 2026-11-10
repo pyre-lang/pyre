@@ -21892,7 +21892,7 @@ fn helper_void_return_already_over_budget_aborts_at_frame_entry() {
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -21929,7 +21929,7 @@ fn helper_void_return_already_over_budget_aborts_at_frame_entry() {
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(&caller_code, 0, &mut wc);
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     assert!(
         matches!(result, Err(DispatchError::TraceTooLong { pc: 0, .. })),
@@ -22659,7 +22659,7 @@ fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
     descr_pool[7] = make_jitcode_descr(7);
     descr_pool[8] = make_jitcode_descr(8);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (_direct_before, replay_before) = super::subwalk_resume_counts();
+    let (_direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -22700,7 +22700,7 @@ fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(&caller_code, 0, &mut wc);
-    let (_direct_after, replay_after) = super::subwalk_resume_counts();
+    let (_direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     assert!(
         matches!(result, Err(DispatchError::TraceTooLong { .. })),
         "a nested helper too-long must stay TraceTooLong: {result:?}"
@@ -22813,7 +22813,7 @@ fn helper_dest_write_delivers_the_result_before_the_limit_check() {
     descr_pool[7] = make_jitcode_descr(7);
     descr_pool[8] = make_jitcode_descr(8);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -22850,7 +22850,7 @@ fn helper_dest_write_delivers_the_result_before_the_limit_check() {
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(&caller_code, 0, &mut wc);
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let ops_after = tc.num_recorded_ops();
     let latched = latched_multi_frame_view();
@@ -22997,7 +22997,7 @@ fn helper_caught_subraise_checks_the_limit_at_handler_entry() {
     descr_pool[7] = make_jitcode_descr(7);
     descr_pool[8] = make_jitcode_descr(8);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -23034,7 +23034,7 @@ fn helper_caught_subraise_checks_the_limit_at_handler_entry() {
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(&caller_code, 0, &mut wc);
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let latched = latched_multi_frame_view();
     assert!(
@@ -23240,7 +23240,7 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[8] = make_jitcode_descr(8);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -23281,7 +23281,7 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(parent_code, 0, &mut wc);
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let latched = latched_multi_frame_view();
     assert!(
@@ -23369,7 +23369,7 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     reset_single_frame_blackhole();
     let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -23435,7 +23435,7 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
         site,
         None,
     );
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let latched = latched_multi_frame_view();
     assert!(
@@ -23698,7 +23698,7 @@ fn helper_residual_replay_checks_the_limit_after_the_child_returns() {
     let mut mode = test_fbw_mode();
     mode.snapshot_sym = &snapshot_sym;
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (direct_before, replay_before) = super::subwalk_resume_counts();
+    let (direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -23744,7 +23744,7 @@ fn helper_residual_replay_checks_the_limit_after_the_child_returns() {
         &[ConcreteValue::Null],
         &[],
     );
-    let (direct_after, replay_after) = super::subwalk_resume_counts();
+    let (direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let latched = latched_multi_frame_view();
     assert!(
@@ -23931,7 +23931,7 @@ fn probe_nested_helper_later_abort(
     descr_pool[7] = make_jitcode_descr(7);
     descr_pool[8] = make_jitcode_descr(8);
     let session = std::cell::RefCell::new(WalkSession::default());
-    let (_direct_before, replay_before) = super::subwalk_resume_counts();
+    let (_direct_before, replay_before) = super::subwalk_resume_counts_this_thread();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
@@ -23972,7 +23972,7 @@ fn probe_nested_helper_later_abort(
         live_after_jit_pc: usize::MAX,
     };
     let result = walk(&caller_code, 0, &mut wc);
-    let (_direct_after, replay_after) = super::subwalk_resume_counts();
+    let (_direct_after, replay_after) = super::subwalk_resume_counts_this_thread();
     drop(wc);
     let latched = take_multi_frame_blackhole();
     fbw_store_journal_reset();

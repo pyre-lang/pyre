@@ -21698,12 +21698,27 @@ static SUBWALK_DIRECT_RESUME: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static SUBWALK_CALL_REPLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUBWALK_HEAP_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Per-thread mirror of `SUBWALK_DIRECT_RESUME` / `SUBWALK_CALL_REPLAY`. A unit
+// test walks on its own thread and asserts a before/after delta; the
+// process-wide atomics also count the walks of tests running in parallel.
+#[cfg(test)]
+thread_local! {
+    static SUBWALK_RESUME_COUNTS_THIS_THREAD: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Nested-helper dest-write resumes, CALL replays, and heap-cache clones.
 pub fn subwalk_resume_counts() -> (u64, u64) {
     (
         SUBWALK_DIRECT_RESUME.load(std::sync::atomic::Ordering::Relaxed),
         SUBWALK_CALL_REPLAY.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// [`subwalk_resume_counts`] restricted to the walks run on this thread.
+#[cfg(test)]
+pub fn subwalk_resume_counts_this_thread() -> (u64, u64) {
+    SUBWALK_RESUME_COUNTS_THIS_THREAD.with(|counts| counts.get())
 }
 
 pub fn subwalk_heap_clone_count() -> u64 {
@@ -21900,6 +21915,11 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 };
                 if applied {
                     SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(test)]
+                    SUBWALK_RESUME_COUNTS_THIS_THREAD.with(|counts| {
+                        let (direct, replay) = counts.get();
+                        counts.set((direct + 1, replay));
+                    });
                     finishframe_error_pc = Some(pending.caller_pc);
                     None
                 } else {
@@ -22289,6 +22309,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         return result.map(|outcome| (outcome, class_state));
                     }
                     SUBWALK_CALL_REPLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(test)]
+                    SUBWALK_RESUME_COUNTS_THIS_THREAD.with(|counts| {
+                        let (direct, replay) = counts.get();
+                        counts.set((direct, replay + 1));
+                    });
                     parent.pc = caller_pc;
                     debug_assert!(
                         parent
