@@ -2105,6 +2105,11 @@ fn expand_pyre_class(
                             "::",
                             ::core::stringify!(#user_pytype_static),
                         ),
+                        gc_type_id_path: ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            ::core::stringify!(#user_gc_type_id_cell),
+                        ),
                         struct_path: ::core::concat!(
                             ::core::module_path!(),
                             "::",
@@ -2245,6 +2250,11 @@ fn expand_pyre_class(
                     ::core::module_path!(),
                     "::",
                     ::core::stringify!(#pytype_static),
+                ),
+                gc_type_id_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#gc_type_id_cell),
                 ),
                 struct_path: ::core::concat!(
                     ::core::module_path!(),
