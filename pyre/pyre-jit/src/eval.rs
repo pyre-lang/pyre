@@ -10396,6 +10396,13 @@ fn eval_with_jit_inner(
     // through the frame — compiled, JIT eval loop, or declined to the plain
     // evaluator — passes exactly once.
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    // `PYRE_JIT_PROCESS_SETUP.call_once` collects on the first frame
+    // (`init_gc_root_walkers` / `install_jit_call_bridge`). The EvalFn
+    // `&mut PyFrame` is a register snapshot of a `FrameBox` DerefMut;
+    // `FrameRoot` is the shadow-stack livevar (`shadowstack.py`
+    // `push_roots` / `pop_roots`) re-read after that collect
+    // (`framework.py` `gct_direct_call`).
+    let mut frame_root = FrameRoot::new(frame);
     // Process-global JIT/eval setup. The walkers, reverse hooks, call
     // bridge, callback table and cranelift deopt latch are each
     // idempotent; running them on every frame paid the call and the
@@ -10437,7 +10444,7 @@ fn eval_with_jit_inner(
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| env_var("PYRE_JIT").as_deref() == Some("0")) {
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
-        return frame.execute_frame_plain(resume);
+        return frame_root.frame().execute_frame_plain(resume);
     }
     // This door tests only `frame_tracing_active`, which is true when the
     // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
@@ -10449,11 +10456,10 @@ fn eval_with_jit_inner(
     // `is_being_profiled` is a green on
     // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
     // and is not tested here.
-    if pyre_interpreter::pyframe::frame_tracing_active(frame) {
+    if pyre_interpreter::pyframe::frame_tracing_active(frame_root.frame()) {
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
-        return frame.execute_frame_plain(resume);
+        return frame_root.frame().execute_frame_plain(resume);
     }
-    let mut frame_root = FrameRoot::new(frame);
     let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let jit_shape = cached_unsupported_jit_shape(w_code, code);

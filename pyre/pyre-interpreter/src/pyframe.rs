@@ -1750,11 +1750,14 @@ struct GcFramePrefix {
 const _: () = assert!(std::mem::offset_of!(GcFramePrefix, frame) == GC_HEADER_SIZE);
 
 /// Owning handle to a heap [`PyFrame`] allocated with a leading GC header.
-/// Dereferences to the inner `PyFrame`; the header lives at
-/// `self.ptr - GC_HEADER_SIZE`. Replaces the bare `Box<PyFrame>` so the
-/// frame the JIT treats as the virtualizable is a real GC object with a
-/// valid header at `frame - GC_HEADER_SIZE`.
+/// Dereferences to the inner `PyFrame` through [`Self::frame_ptr`]; the
+/// header lives at `frame_ptr() - GC_HEADER_SIZE`. Replaces the bare
+/// `Box<PyFrame>` so the frame the JIT treats as the virtualizable is a
+/// real GC object with a valid header at `frame - GC_HEADER_SIZE`.
 pub struct FrameBox {
+    /// Birth address of a [`Self::new_boxed`] fallback only. A collector-owned
+    /// frame's live address is the `owner_root` slot (`shadowstack.py`
+    /// `push_roots` / `pop_roots`); this field is `null` on that path.
     ptr: *mut PyFrame,
     /// RPython's translated Rust local is a shadow-stack livevar for the
     /// complete lifetime of the owning handle.  In particular it remains a
@@ -1952,7 +1955,9 @@ impl FrameBox {
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
             return Ok(FrameBox {
-                ptr,
+                // Birth address is only valid for `new_boxed`. The live
+                // address is `owner_root` (`shadowstack.py` `pop_roots`).
+                ptr: std::ptr::null_mut(),
                 owner_root: Some(owner_root),
             });
         }
@@ -2005,15 +2010,21 @@ impl FrameBox {
     fn frame_ptr(&self) -> *mut PyFrame {
         match &self.owner_root {
             Some(owner_root) => owner_root.get().0 as *mut PyFrame,
-            None => self.ptr,
+            None => {
+                debug_assert!(
+                    !self.ptr.is_null(),
+                    "FrameBox.ptr is the new_boxed birth address"
+                );
+                self.ptr
+            }
         }
     }
 
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
     pub fn into_raw(mut self) -> *mut PyFrame {
-        // Read the slot before releasing it — afterwards the handle has no
-        // root to answer from and only the stale field remains.
+        // Read `frame_ptr` before releasing the slot. Afterwards the handle
+        // has no `owner_root`, and `ptr` is null on the managed path.
         let ptr = self.frame_ptr();
         drop(self.owner_root.take());
         std::mem::forget(self);
@@ -2038,7 +2049,7 @@ impl FrameBox {
             return None;
         }
         Some(FrameBox {
-            ptr,
+            ptr: std::ptr::null_mut(),
             owner_root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(
                 majit_ir::GcRef(ptr as usize),
             )),
@@ -2058,11 +2069,15 @@ impl FrameBox {
         let owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
         if pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF) {
             FrameBox {
-                ptr,
+                ptr: std::ptr::null_mut(),
                 owner_root: Some(owner_root),
             }
         } else {
             drop(owner_root);
+            debug_assert!(
+                !pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF),
+                "FrameBox.ptr is the new_boxed birth address"
+            );
             FrameBox {
                 ptr,
                 owner_root: None,
@@ -2326,22 +2341,29 @@ impl std::ops::Deref for FrameBox {
 impl std::ops::DerefMut for FrameBox {
     #[inline]
     fn deref_mut(&mut self) -> &mut PyFrame {
+        // `frame_ptr` re-reads `owner_root` (`shadowstack.py` `pop_roots`).
+        // The returned `&mut PyFrame` is a register snapshot; a collecting
+        // call invalidates it (`framework.py` `gct_direct_call`).
         unsafe { &mut *self.frame_ptr() }
     }
 }
 
 impl Drop for FrameBox {
     fn drop(&mut self) {
-        // GC-managed (old-gen) frames are reclaimed by a major mark-sweep
-        // when no root reaches them (`pyframe.py class PyFrame(W_Root)`;
-        // `executioncontext.py leave` frees nothing).  Their
-        // The collector reclaims their GC-managed locals array, debug data,
-        // and block chain with the frame, so no manual cleanup runs here.
+        // GC-managed frames are reclaimed by a major mark-sweep when no
+        // root reaches them (`pyframe.py class PyFrame(W_Root)`;
+        // `executioncontext.py leave` frees nothing). The collector
+        // reclaims their GC-managed locals array, debug data, and block
+        // chain with the frame, so no manual cleanup runs here.
         // Only a `std::alloc` snapshot / bootstrap fallback box is freed
         // manually — reconstruct and drop it, which runs `PyFrame::drop`.
         if self.owner_root.take().is_some() {
             return;
         }
+        debug_assert!(
+            !self.ptr.is_null(),
+            "FrameBox.ptr is the new_boxed birth address"
+        );
         unsafe {
             let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
             drop(Box::from_raw(prefix));
@@ -4214,7 +4236,9 @@ impl PyFrame {
         let _ = roots.pin_root(w_globals);
         let debug = self.getorcreate_debug_data(-1)?;
         debug.w_globals = roots.get(slot);
-        remember_frame_debug_data(self.debugdata);
+        // `getorcreatedebug` reloads the frame (`shadowstack.py` `pop_roots`);
+        // remember the live payload, not `self.debugdata` on this register.
+        remember_frame_debug_data(debug as *mut FrameDebugData);
         Ok(())
     }
 
@@ -4394,6 +4418,12 @@ impl PyFrame {
         if flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 {
             return Ok(());
         }
+        // `space.newdict` / `getorcreatedebug` collect. Pin the frame
+        // (`shadowstack.py` `push_roots` / `pop_roots`) and store through
+        // the reloaded address (`pyframe.py` `initialize_frame_scopes`).
+        let roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = roots.base();
+        let _ = roots.pin_root(self as *mut PyFrame as PyObjectRef);
         if flags & crate::astcompiler::consts::CO_NEWLOCALS != 0 {
             // `build_class` replaces this with the `__prepare__` namespace via
             // `setdictscope`; an orphan NEWLOCALS frame still has a usable
@@ -4403,10 +4433,22 @@ impl PyFrame {
             if pyre_object::gc_hook::gc_alloc_failed_pending() && w_locals.is_null() {
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
-            self.getorcreate_debug_data(-1)?.w_locals = w_locals;
+            let locals_slot = frame_slot + 1;
+            let _ = roots.pin_root(w_locals);
+            unsafe {
+                (*(roots.get(frame_slot) as *mut PyFrame))
+                    .getorcreate_debug_data(-1)?
+                    .w_locals = roots.get(locals_slot);
+            }
         } else {
-            let w_globals = self.get_w_globals();
-            self.getorcreate_debug_data(-1)?.w_locals = w_globals;
+            let w_globals = unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).get_w_globals() };
+            let globals_slot = frame_slot + 1;
+            let _ = roots.pin_root(w_globals);
+            unsafe {
+                (*(roots.get(frame_slot) as *mut PyFrame))
+                    .getorcreate_debug_data(-1)?
+                    .w_locals = roots.get(globals_slot);
+            }
         }
         Ok(())
     }
@@ -4428,30 +4470,42 @@ impl PyFrame {
         outer_func: PyObjectRef,
         _code: *const (),
     ) -> Result<(), crate::PyError> {
-        self.bind_unoptimized_locals_scope()?;
+        // `pyframe.py initialize_frame_scopes` keeps `self` / `outer_func`
+        // as GCREF locals (`shadowstack.py` `push_roots` / `pop_roots`).
+        // `bind_unoptimized_locals_scope` and `w_cell_new` collect.
+        let roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = roots.base();
+        let _ = roots.pin_root(self as *mut PyFrame as PyObjectRef);
+        let outer_slot = frame_slot + 1;
+        let _ = roots.pin_root(outer_func);
+        unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).bind_unoptimized_locals_scope()? };
 
         // `pyframe.py initialize_frame_scopes` reads the `code` argument,
         // which is this frame's `self.pycode`. The compiler `CodeObject` is
         // not a GC object; take a pointer so the borrow does not keep
         // `self` frozen across `set_locals_w`.
-        let code = unsafe { &*(self.code() as *const CodeObject) };
+        let code =
+            unsafe { &*((*(roots.get(frame_slot) as *mut PyFrame)).code() as *const CodeObject) };
         let npure = npure_cellvars(code);
         let nfreevars = code.freevars.len();
         if npure == 0 && nfreevars == 0 {
             return Ok(());
         }
 
+        let outer_func = roots.get(outer_slot);
         let closure = if !outer_func.is_null() && unsafe { crate::is_function(outer_func) } {
             unsafe { crate::function_get_closure(outer_func) }
         } else {
             PY_NULL
         };
-        let closure_size = if closure.is_null() {
+        let closure_slot = frame_slot + 2;
+        let _ = roots.pin_root(closure);
+        let closure_size = if roots.get(closure_slot).is_null() {
             0
         } else {
-            unsafe { w_tuple_len(closure) }
+            unsafe { w_tuple_len(roots.get(closure_slot)) }
         };
-        if nfreevars > 0 && outer_func.is_null() {
+        if nfreevars > 0 && roots.get(outer_slot).is_null() {
             return Err(crate::PyError::type_error(
                 "directly executed code object may not contain free variables",
             ));
@@ -4463,25 +4517,29 @@ impl PyFrame {
             ));
         }
 
-        // CPython 3.11+ unified slot layout: only cellvars NOT in
-        // varnames take a fresh slot.  See `npure_cellvars` and
-        // `new_for_call_with_closure` for the call-site mirror.
+        // Unified slot layout: only cellvars NOT in varnames take a fresh
+        // slot.  See `npure_cellvars` and `new_for_call_with_closure` for
+        // the call-site mirror.
         let mut index = code.varnames.len();
         for _ in 0..npure {
             // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(None, self.pycode.cell_families[i])`.
             let family = unsafe {
-                crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, index)
+                crate::pycode::w_code_cell_family(
+                    (*(roots.get(frame_slot) as *mut PyFrame)).pycode as pyre_object::PyObjectRef,
+                    index,
+                )
             };
             let cell = pyre_object::w_cell_new(PY_NULL, family);
             if pyre_object::gc_hook::gc_alloc_failed_pending() && cell.is_null() {
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
-            self.set_locals_w(index, cell);
+            unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).set_locals_w(index, cell) };
             index += 1;
         }
         for i in 0..nfreevars {
-            let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap_or(PY_NULL) };
-            self.set_locals_w(index, cell);
+            let cell =
+                unsafe { w_tuple_getitem(roots.get(closure_slot), i as i64).unwrap_or(PY_NULL) };
+            unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).set_locals_w(index, cell) };
             index += 1;
         }
         Ok(())
@@ -4507,12 +4565,15 @@ impl PyFrame {
         // frame it is called on; `w_locals` is the caller's word and nothing
         // else names it, and an assignment evaluates its value before its
         // place, so writing it directly would store a pre-collection address.
+        // `locals2fast` also collects (`finditem_str`); re-read the frame
+        // after `getorcreatedebug` (`shadowstack.py` `pop_roots`).
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
         let _ = roots.pin_root(w_locals);
-        let debug = self.getorcreate_debug_data(-1)?;
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        let debug = unsafe { (*frame_anchor.live()).getorcreate_debug_data(-1)? };
         debug.w_locals = roots.get(locals_slot);
-        self.locals2fast(skip_free_vars)
+        unsafe { (*frame_anchor.live()).locals2fast(skip_free_vars) }
     }
 
     /// Read the frame's locals mapping registered by `setdictscope`
@@ -4541,19 +4602,22 @@ impl PyFrame {
             return Ok(existing);
         }
         // `w_dict_new` returns a movable nursery object, while allocating the
-        // debug payload below may collect.  CPython's frame owns both through
-        // traced references; mirror that lifetime by pinning the dict until
-        // the payload has been installed and then reload its forwarded value.
+        // debug payload below may collect. Pin the frame and the dict
+        // (`shadowstack.py` `push_roots` / `pop_roots`) and store through the
+        // reloaded frame.
         let roots = pyre_object::gc_roots::push_roots();
-        let slot = roots.base();
+        let frame_slot = roots.base();
+        let _ = roots.pin_root(self as *mut PyFrame as PyObjectRef);
         let w_extra = unsafe { pyre_object::w_dict_new() };
         if pyre_object::gc_hook::gc_alloc_failed_pending() && w_extra.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
+        let extra_slot = frame_slot + 1;
         let _ = roots.pin_root(w_extra);
-        let debug = self.getorcreate_debug_data(-1)?;
-        debug.w_extra_locals = roots.get(slot);
-        Ok(roots.get(slot))
+        let debug =
+            unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).getorcreate_debug_data(-1)? };
+        debug.w_extra_locals = roots.get(extra_slot);
+        Ok(roots.get(extra_slot))
     }
 
     /// `f_extra_locals` on the frame debug payload. `PY_NULL` when the
