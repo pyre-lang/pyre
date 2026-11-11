@@ -32572,7 +32572,7 @@ fn layout_scalar_constant(id: u64, n: u64) -> serde_json::Value {
 }
 
 /// Nested `inhabited` proof Charon stores beside size/align. Depth 140
-/// exceeds serde's default recursion limit of 128 so `layout_values`
+/// exceeds serde's default recursion limit of 128 so `layout_exprs`
 /// must parse it with the limit disabled (`llmemory.sizeof`).
 fn deep_inhabited(depth: usize) -> serde_json::Value {
     let mut v = serde_json::json!("True");

@@ -779,10 +779,10 @@ pub struct TypeDecl {
     /// is absent or does not parse.
     #[serde(skip)]
     layout_entries: std::sync::OnceLock<Option<Vec<TargetLayout>>>,
-    /// [`Self::layout`] parsed as plain JSON values on first use, for the layout expressions
-    /// [`TargetLayout`] does not keep; `None` when absent or unparsable.
+    /// [`Self::layout`]'s unresolved expressions, parsed on first use; `None` when the layout
+    /// is absent or does not parse.
     #[serde(skip)]
-    layout_values: std::sync::OnceLock<Option<Vec<Value>>>,
+    layout_exprs: std::sync::OnceLock<Option<Vec<TargetLayoutExprs>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
     /// closure environment is the object `{"Closure": …}`; an ordinary ADT
     /// is the string `"Normal"`. Kept raw so an
@@ -808,6 +808,28 @@ pub struct TypeDecl {
 pub struct TargetLayout {
     pub key: String,
     pub value: TypeLayout,
+}
+
+/// The layout expressions [`TargetLayout`] does not resolve: `size`, `align` and each variant's
+/// `field_offsets`, kept as JSON for [`layout_u64_resolved`]. Every other layout key is skipped.
+#[derive(Debug, Deserialize)]
+struct TargetLayoutExprs {
+    key: String,
+    value: LayoutExprs,
+}
+#[derive(Debug, Deserialize)]
+struct LayoutExprs {
+    #[serde(default)]
+    size: Option<Value>,
+    #[serde(default)]
+    align: Option<Value>,
+    #[serde(default)]
+    variant_layouts: Vec<VariantLayoutExprs>,
+}
+#[derive(Debug, Deserialize)]
+struct VariantLayoutExprs {
+    #[serde(default)]
+    field_offsets: Option<Value>,
 }
 
 /// Resolved memory layout of a single concrete type for one target.
@@ -880,8 +902,8 @@ impl TypeDecl {
             .as_deref()
     }
 
-    fn layout_values(&self) -> Option<&[Value]> {
-        self.layout_values
+    fn layout_exprs(&self) -> Option<&[TargetLayoutExprs]> {
+        self.layout_exprs
             .get_or_init(|| {
                 let raw = self.layout.as_ref()?;
                 parse_layout_json(raw.get())
@@ -901,12 +923,12 @@ impl TypeDecl {
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
             layout.size = self
-                .layout_values()
+                .layout_exprs()
                 .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
             layout.align = self
-                .layout_values()
+                .layout_exprs()
                 .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         if layout
@@ -914,7 +936,7 @@ impl TypeDecl {
             .iter()
             .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
             && let Some(rows) = self
-                .layout_values()
+                .layout_exprs()
                 .and_then(|v| resolved_field_offset_rows(llbc, v, target))
             && rows.len() == layout.variant_layouts.len()
         {
@@ -944,12 +966,12 @@ impl TypeDecl {
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
             layout.size = self
-                .layout_values()
+                .layout_exprs()
                 .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
             layout.align = self
-                .layout_values()
+                .layout_exprs()
                 .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         (layout.size.is_some() || layout.align.is_some()).then_some((layout.size, layout.align))
@@ -1046,17 +1068,16 @@ fn de_layout_offsets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>,
 /// [`layout_measure`] resolves `size` / `align`.
 fn resolved_field_offset_rows(
     llbc: &crate::Llbc,
-    entries: &[Value],
+    entries: &[TargetLayoutExprs],
     target: &str,
 ) -> Option<Vec<Vec<u64>>> {
     let entry = entries
         .iter()
-        .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
+        .find(|e| e.key == target)
         .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
-    let variants = entry.get("value")?.get("variant_layouts")?.as_array()?;
-    let mut rows = Vec::with_capacity(variants.len());
-    for variant in variants {
-        let Some(offsets) = variant.get("field_offsets").and_then(Value::as_array) else {
+    let mut rows = Vec::with_capacity(entry.value.variant_layouts.len());
+    for variant in &entry.value.variant_layouts {
+        let Some(offsets) = variant.field_offsets.as_ref().and_then(Value::as_array) else {
             rows.push(Vec::new());
             continue;
         };
@@ -1069,12 +1090,22 @@ fn resolved_field_offset_rows(
     Some(rows)
 }
 
-fn layout_measure(llbc: &crate::Llbc, entries: &[Value], target: &str, field: &str) -> Option<u64> {
+fn layout_measure(
+    llbc: &crate::Llbc,
+    entries: &[TargetLayoutExprs],
+    target: &str,
+    field: &str,
+) -> Option<u64> {
     let entry = entries
         .iter()
-        .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
+        .find(|e| e.key == target)
         .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
-    layout_u64_resolved(llbc, entry.get("value")?.get(field)?, 0)
+    let v = match field {
+        "size" => entry.value.size.as_ref()?,
+        "align" => entry.value.align.as_ref()?,
+        _ => return None,
+    };
+    layout_u64_resolved(llbc, v, 0)
 }
 
 /// A layout expression (`size` / `align`). Its `Deduplicated` ids index the
@@ -1717,7 +1748,6 @@ pub enum NameSeg {
 
 #[derive(Debug, Deserialize)]
 pub struct AttrInfo {
-    pub attributes: Vec<Value>,
     /// `"Hint"` / `"Always"` / `"Never"` for explicit `#[inline*]` ;
     /// `null` for functions without any inline attribute.
     pub inline: Option<String>,
