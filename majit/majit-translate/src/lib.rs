@@ -5793,4 +5793,33 @@ mod harvested_funcobj_hints_tests {
         let target = CallTarget::function_path(["rordereddict", "dict_count_py_div"]);
         assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"));
     }
+
+    /// `int_ll_newlist` harvests as `listobject::int_ll_newlist`. The
+    /// callsite in `_orig_ll_list_int_resize_hint_really` spells
+    /// `pyre_object::listobject::int_ll_newlist`. With the defining crate
+    /// registered as an alias root, `get_oopspec` must see `newlist(length)`
+    /// so jtransform emits `NewArray` instead of residual `CallR(4)`.
+    #[test]
+    fn harvested_int_ll_newlist_oopspec_is_visible_on_crate_prefixed_callsite() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/llbc/pyre-object.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = crate::test_support::load_ullbc(path);
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            let mut cc = CallControl::new();
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+            let target = CallTarget::function_path(["pyre_object", "listobject", "int_ll_newlist"]);
+            assert_eq!(
+                cc.get_oopspec(&target).as_deref(),
+                Some("newlist(length)"),
+                "callsite pyre_object::listobject::int_ll_newlist must see the harvested spec"
+            );
+        });
+    }
 }
