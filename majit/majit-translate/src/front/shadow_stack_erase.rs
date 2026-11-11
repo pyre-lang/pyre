@@ -112,7 +112,8 @@ fn classify_call(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
-    let path = callee_path(call, llbc)?;
+    let fd = callee_fun_decl(call, llbc)?;
+    let path = fd.item_meta.name_path();
     let segments: Vec<&str> = path.split("::").collect();
     let leaf = *segments.last()?;
     if let Some(class) = classify_frame_anchor(leaf, &segments, call, llbc) {
@@ -1810,15 +1811,14 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
-                    if let Some(path) = callee_path(call, llbc)
-                        && callee_effect_of(llbc, &path).observes
-                        && depth == 0
-                    {
+                    let effect =
+                        resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+                    if effect.observes && depth == 0 {
                         if crate::decline::enabled() {
                             eprintln!(
                                 "[erase] observes-at-entry {} as {}",
-                                path,
-                                callee_effect_of(llbc, &path).as_str()
+                                callee_path(call, llbc).as_deref().unwrap_or(""),
+                                effect.as_str()
                             );
                         }
                         return Err("calls-stack-sensitive-fn");
@@ -2290,17 +2290,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && let Some(path) = callee_path(call, llbc)
-            && callee_effect_of(llbc, &path).refuses_erase()
         {
-            if crate::decline::enabled() {
-                eprintln!(
-                    "[erase] refuses_erase {} as {}",
-                    path,
-                    callee_effect_of(llbc, &path).as_str()
-                );
+            let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+            if effect.refuses_erase() {
+                if crate::decline::enabled() {
+                    eprintln!(
+                        "[erase] refuses_erase {} as {}",
+                        callee_path(call, llbc).as_deref().unwrap_or(""),
+                        effect.as_str()
+                    );
+                }
+                return Err("calls-stack-sensitive-fn");
             }
-            return Err("calls-stack-sensitive-fn");
         }
     }
     if classified
@@ -3060,17 +3061,18 @@ pub(super) fn erase_or_keep(fd: &FunDecl, body: Unstructured, llbc: &Llbc) -> Un
 /// effects must equal the registered effect. A registered Observes
 /// whose own walk is clean (`why=-`) is the sticky-fixpoint bug.
 fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
-    let effect = |path: &str| callee_effect_of(llbc, path);
+    let effect = |identity: &str| callee_effect_of(llbc, identity);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        let name = fd.item_meta.name_path();
-        let registered = effect(&name);
+        let identity = super::scope_owner_identity(llbc, fd);
+        let registered = effect(&identity);
         let walked = stack_walk(&body, llbc, &effect).effect();
         if registered != walked {
+            let name = fd.item_meta.name_path();
             panic!(
-                "stack-effect invariant: {name} registered {} rewalk {} why={}",
+                "stack-effect invariant: {name} identity={identity} registered {} rewalk {} why={}",
                 registered.as_str(),
                 walked.as_str(),
                 stack_walk(&body, llbc, &effect)
@@ -3101,7 +3103,7 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
         };
         let name = fd.item_meta.name_path();
         if detail {
-            let walk = stack_walk(&body, llbc, &|path| callee_effect_of(llbc, path));
+            let walk = stack_walk(&body, llbc, &|identity| callee_effect_of(llbc, identity));
             let callee = first_non_none_callee(&body, llbc);
             eprintln!(
                 "[census-detail] {name}:{bucket} why={} callee={} effect={}",
@@ -3275,28 +3277,36 @@ fn resolved_callee_is_origportal_alias(llbc: &Llbc, path: &str) -> bool {
     llbc.is_rewritten_origportal_fn(&crate::front::mir::strip_crate_prefix(path))
 }
 
-/// Registered effect of `path`: `None` if not sensitive or proven
+/// Origportal is a property of the FunDecl, matched by the configured
+/// jitdriver path (`rewritten_origportal_fns`).
+fn is_origportal_alias_fd(llbc: &Llbc, fd: &FunDecl) -> bool {
+    resolved_callee_is_origportal_alias(llbc, &fd.item_meta.name_path())
+}
+
+/// Registered effect of `identity`: `None` if not sensitive or proven
 /// neutral; otherwise the union of the sets it was registered in. A
-/// sensitive path in none of them comes from an artefact that did not
-/// classify it, and is taken at its worst.
-fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
-    if llbc.is_stack_depth_neutral_fn(path) {
+/// sensitive identity in none of them comes from an artefact that did
+/// not classify it, and is taken at its worst. `identity` is
+/// [`super::scope_owner_identity`], matching
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` keyed by
+/// graph, never by `ItemMeta::name_path`. Origportal aliases are
+/// answered as none by [`resolved_callee_effect`] / [`is_origportal_alias_fd`],
+/// not here: identities are not config paths.
+fn callee_effect_of(llbc: &Llbc, identity: &str) -> CalleeEffect {
+    if llbc.is_stack_depth_neutral_fn(identity) {
         return CalleeEffect::none();
     }
-    if resolved_callee_is_origportal_alias(llbc, path) {
-        return CalleeEffect::none();
-    }
-    let param_slots = llbc.stack_param_slots(path).unwrap_or_default();
-    let leaves = llbc.is_stack_leaves_above_fn(path);
-    let returns_index = llbc.is_stack_returns_index_fn(path);
-    let observes = llbc.is_stack_observes_fn(path);
+    let param_slots = llbc.stack_param_slots(identity).unwrap_or_default();
+    let leaves = llbc.is_stack_leaves_above_fn(identity);
+    let returns_index = llbc.is_stack_returns_index_fn(identity);
+    let observes = llbc.is_stack_observes_fn(identity);
     let effect = CalleeEffect {
         observes,
         leaves_above: leaves,
         param_slots,
         returns_index,
     };
-    if effect.is_none() && llbc.is_stack_sensitive_fn(path) {
+    if effect.is_none() && llbc.is_stack_sensitive_fn(identity) {
         return CalleeEffect::worst();
     }
     effect
@@ -3310,24 +3320,56 @@ fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, Ca
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && let Some(path) = callee_path(call, llbc)
+            && let Some(identity) = callee_identity(call, llbc)
         {
-            let effect = callee_effect_of(llbc, &path);
+            let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
             if !effect.is_none() {
-                return Some((path, effect));
+                return Some((identity, effect));
             }
         }
     }
     None
 }
 
-/// The callee path a call terminator names, for a statically resolved callee.
-fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+fn callee_fun_decl<'a>(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &'a Llbc,
+) -> Option<&'a FunDecl> {
     let majit_charon_reader::ullbc::CallFunc::Regular(reg) = &call.func else {
         return None;
     };
     let id = super::regular_call_fun_decl_id(&reg.kind)?;
-    llbc.fn_by_id(id).map(|fd| fd.item_meta.name_path())
+    llbc.fn_by_id(id)
+}
+
+/// The callee's `ItemMeta::name_path()`, for a statically resolved callee.
+/// Name consumers (`mem_drop_scope_local`, observes-at-entry logging)
+/// use this. Stack-effect tables key by [`callee_identity`].
+fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+    callee_fun_decl(call, llbc).map(|fd| fd.item_meta.name_path())
+}
+
+/// [`super::scope_owner_identity`] of the resolved callee FunDecl.
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` key by graph;
+/// this is that graph's existing identity string.
+fn callee_identity(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+    callee_fun_decl(call, llbc).map(|fd| super::scope_owner_identity(llbc, fd))
+}
+
+/// Shared Call → effect resolution. An origportal-alias callee is none
+/// before identity-keyed tables or `effect` are consulted.
+fn resolved_callee_effect(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    effect: &dyn Fn(&str) -> CalleeEffect,
+) -> CalleeEffect {
+    let Some(fd) = callee_fun_decl(call, llbc) else {
+        return CalleeEffect::none();
+    };
+    if is_origportal_alias_fd(llbc, fd) {
+        return CalleeEffect::none();
+    }
+    effect(&super::scope_owner_identity(llbc, fd))
 }
 
 /// Result of the per-path shadow-stack walk.
@@ -3869,10 +3911,7 @@ fn stack_walk(
                                 depth = d;
                             }
                         }
-                        let callee = path
-                            .as_deref()
-                            .map(effect)
-                            .unwrap_or_else(CalleeEffect::none);
+                        let callee = resolved_callee_effect(call, llbc, effect);
                         if callee.observes {
                             // Unproven stack-sensitive callee. At
                             // Known(0) every live slot is the caller's,
@@ -4104,7 +4143,8 @@ fn resolve_published_array_len(
 /// The functions of `llbc` whose shadow-stack effect a caller cannot see
 /// past.  Callees from artefacts linked earlier are answered by what they
 /// registered on `llbc` ([`Llbc::is_stack_sensitive_fn`],
-/// [`Llbc::is_stack_leaves_above_fn`]).
+/// [`Llbc::is_stack_leaves_above_fn`]), keyed by
+/// [`super::scope_owner_identity`].
 pub fn discover_stack_sensitive_fns(llbc: &Llbc) -> Vec<String> {
     discover_stack_fn_effects(llbc).0
 }
@@ -4151,6 +4191,11 @@ pub fn discover_stack_fn_effects(
 /// yet in the previous map; processing Observes first lets that caller
 /// drop once the callee's summary is live. A revisit cap freezes still-
 /// changing bodies as Observes.
+///
+/// `class`, `identities[i]`, and `callers` are keyed by
+/// [`super::scope_owner_identity`], matching
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` which key
+/// by graph object. `ItemMeta::name_path` is a label, not an identity.
 fn discover_stack_effects(
     llbc: &Llbc,
 ) -> (
@@ -4164,19 +4209,20 @@ fn discover_stack_effects(
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .collect();
-    let names: Vec<String> = fds.iter().map(|fd| fd.item_meta.name_path()).collect();
-    let local: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let identities: Vec<String> = fds
+        .iter()
+        .map(|fd| super::scope_owner_identity(llbc, fd))
+        .collect();
+    let local: std::collections::HashSet<&str> = identities.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
     let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
         vec![None; fds.len()];
-    let none_effect = |path: &str| {
-        if resolved_callee_is_origportal_alias(llbc, path) {
-            CalleeEffect::none()
-        } else if local.contains(path) {
+    let none_effect = |identity: &str| {
+        if local.contains(identity) {
             CalleeEffect::none()
         } else {
-            callee_effect_of(llbc, path)
+            callee_effect_of(llbc, identity)
         }
     };
     let mut queued = vec![false; fds.len()];
@@ -4192,21 +4238,21 @@ fn discover_stack_effects(
                 continue;
             }
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
-                && let Some(path) = callee_path(call, llbc)
+                && let Some(identity) = callee_identity(call, llbc)
             {
-                callers.entry(path).or_default().push(i);
+                callers.entry(identity).or_default().push(i);
             }
         }
-        let new = if resolved_callee_is_origportal_alias(llbc, &names[i]) {
+        let new = if is_origportal_alias_fd(llbc, fd) {
             CalleeEffect::none()
         } else {
             let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                let answer = none_effect(path);
-                if local.contains(path) {
+            let effect = |identity: &str| {
+                let answer = none_effect(identity);
+                if local.contains(identity) {
                     queried
                         .borrow_mut()
-                        .push((path.to_string(), answer.clone()));
+                        .push((identity.to_string(), answer.clone()));
                 }
                 answer
             };
@@ -4220,7 +4266,7 @@ fn discover_stack_effects(
             other_ids.push(i);
         }
         if !new.is_none() {
-            class.insert(names[i].clone(), new);
+            class.insert(identities[i].clone(), new);
         }
     }
     let mut queue: VecDeque<usize> = VecDeque::new();
@@ -4234,12 +4280,12 @@ fn discover_stack_effects(
         queued[i] = false;
         if visits[i] >= VISIT_CAP {
             let old = class
-                .get(&names[i])
+                .get(&identities[i])
                 .cloned()
                 .unwrap_or_else(CalleeEffect::none);
-            class.insert(names[i].clone(), CalleeEffect::worst());
+            class.insert(identities[i].clone(), CalleeEffect::worst());
             if old != CalleeEffect::worst() {
-                for &caller in callers.get(&names[i]).into_iter().flatten() {
+                for &caller in callers.get(&identities[i]).into_iter().flatten() {
                     if queued[caller] {
                         continue;
                     }
@@ -4251,28 +4297,33 @@ fn discover_stack_effects(
         }
         visits[i] = visits[i].saturating_add(1);
         let new = if let Some((queried, prev)) = &last_walk[i]
-            && queried.iter().all(|(path, answer)| {
-                class.get(path).cloned().unwrap_or_else(CalleeEffect::none) == *answer
+            && queried.iter().all(|(identity, answer)| {
+                class
+                    .get(identity)
+                    .cloned()
+                    .unwrap_or_else(CalleeEffect::none)
+                    == *answer
             }) {
             prev.clone()
-        } else if resolved_callee_is_origportal_alias(llbc, &names[i]) {
+        } else if is_origportal_alias_fd(llbc, fds[i]) {
             CalleeEffect::none()
         } else {
             let Some(body) = fds[i].unstructured_shared() else {
                 continue;
             };
             let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                if resolved_callee_is_origportal_alias(llbc, path) {
-                    CalleeEffect::none()
-                } else if local.contains(path) {
-                    let answer = class.get(path).cloned().unwrap_or_else(CalleeEffect::none);
+            let effect = |identity: &str| {
+                if local.contains(identity) {
+                    let answer = class
+                        .get(identity)
+                        .cloned()
+                        .unwrap_or_else(CalleeEffect::none);
                     queried
                         .borrow_mut()
-                        .push((path.to_string(), answer.clone()));
+                        .push((identity.to_string(), answer.clone()));
                     answer
                 } else {
-                    callee_effect_of(llbc, path)
+                    callee_effect_of(llbc, identity)
                 }
             };
             let new = stack_walk(&body, llbc, &effect).effect();
@@ -4280,18 +4331,18 @@ fn discover_stack_effects(
             new
         };
         let old = class
-            .get(&names[i])
+            .get(&identities[i])
             .cloned()
             .unwrap_or_else(CalleeEffect::none);
         if new == old {
             continue;
         }
         if new.is_none() {
-            class.remove(&names[i]);
+            class.remove(&identities[i]);
         } else {
-            class.insert(names[i].clone(), new.clone());
+            class.insert(identities[i].clone(), new.clone());
         }
-        for &caller in callers.get(&names[i]).into_iter().flatten() {
+        for &caller in callers.get(&identities[i]).into_iter().flatten() {
             if queued[caller] {
                 continue;
             }
@@ -4310,22 +4361,22 @@ fn discover_stack_effects(
     let mut param_slots: Vec<(String, Vec<u8>)> = Vec::new();
     let mut returns_index: Vec<String> = Vec::new();
     let mut observes: Vec<String> = Vec::new();
-    for (name, effect) in class {
+    for (identity, effect) in class {
         if effect.is_none() {
             continue;
         }
-        sensitive.push(name.clone());
+        sensitive.push(identity.clone());
         if effect.leaves_above {
-            leaves.push(name.clone());
+            leaves.push(identity.clone());
         }
         if effect.observes {
-            observes.push(name.clone());
+            observes.push(identity.clone());
         }
         if !effect.param_slots.is_empty() {
-            param_slots.push((name.clone(), effect.param_slots));
+            param_slots.push((identity.clone(), effect.param_slots));
         }
         if effect.returns_index {
-            returns_index.push(name);
+            returns_index.push(identity);
         }
     }
     sensitive.sort();
@@ -4340,29 +4391,37 @@ fn discover_stack_effects(
 /// depth, no caller-owned slot is read, Observes callees are refused,
 /// and LeavesAbove callees are allowed (fixpoint, pessimistic start).
 /// Harvested in link order like [`discover_stack_sensitive_fns`].
-/// A body whose last failed check queried no newly proven path is not re-checked.
+/// A body whose last failed check queried no newly proven identity is not re-checked.
+/// Keys are [`super::scope_owner_identity`], the same identity
+/// [`discover_stack_effects`] publishes (`GraphAnalyzer` keys by graph).
 pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
     let fds: Vec<&FunDecl> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .collect();
-    // Proven name -> how many names were proven up to and including it.
+    // Proven identity -> how many identities were proven up to and including it.
     let mut proven: HashMap<String, usize> = HashMap::new();
-    // Per body: the proven count at its last failed check and the callee paths that check
-    // queried. Only a newly proven queried path can change the answer.
+    // Per body: the proven count at its last failed check and the callee identities that check
+    // queried. Only a newly proven queried identity can change the answer.
     let mut last_check: Vec<Option<(usize, Vec<String>)>> = vec![None; fds.len()];
     let mut changed = true;
     while changed {
         changed = false;
         for (i, fd) in fds.iter().enumerate() {
-            let name = fd.item_meta.name_path();
-            if proven.contains_key(&name) {
+            let identity = super::scope_owner_identity(llbc, fd);
+            if proven.contains_key(&identity) {
+                continue;
+            }
+            if is_origportal_alias_fd(llbc, fd) {
+                let n = proven.len() + 1;
+                proven.insert(identity, n);
+                changed = true;
                 continue;
             }
             if let Some((at, queried)) = &last_check[i]
                 && queried
                     .iter()
-                    .all(|path| proven.get(path).is_none_or(|&n| n <= *at))
+                    .all(|identity| proven.get(identity).is_none_or(|&n| n <= *at))
             {
                 continue;
             }
@@ -4371,17 +4430,17 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
                 continue;
             };
             let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                queried.borrow_mut().push(path.to_string());
-                if resolved_callee_is_origportal_alias(llbc, path) || proven.contains_key(path) {
+            let effect = |identity: &str| {
+                queried.borrow_mut().push(identity.to_string());
+                if proven.contains_key(identity) {
                     CalleeEffect::none()
                 } else {
-                    callee_effect_of(llbc, path)
+                    callee_effect_of(llbc, identity)
                 }
             };
             if body_is_depth_neutral(&body, llbc, &effect) {
                 let n = proven.len() + 1;
-                proven.insert(name, n);
+                proven.insert(identity, n);
                 changed = true;
             } else {
                 last_check[i] = Some((proven.len(), queried.into_inner()));
@@ -4929,30 +4988,35 @@ mod tests {
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let id = |suffix: &str| stack_fn_identity(&llbc, suffix);
         llbc.register_stack_sensitive_fns([
-            "other::unproven_callee".into(),
-            "other::leaves_above_callee".into(),
-            "other::reload_slot".into(),
-            "other::pin_helper".into(),
-            "other::storage_helper".into(),
-            "other::observes_and_leaves".into(),
+            id("unproven_callee"),
+            id("leaves_above_callee"),
+            id("reload_slot"),
+            id("pin_helper"),
+            id("storage_helper"),
+            id("observes_and_leaves"),
         ]);
-        llbc.register_stack_observes_fns([
-            "other::unproven_callee".into(),
-            "other::observes_and_leaves".into(),
-        ]);
+        llbc.register_stack_observes_fns([id("unproven_callee"), id("observes_and_leaves")]);
         llbc.register_stack_leaves_above_fns([
-            "other::leaves_above_callee".into(),
-            "other::pin_helper".into(),
-            "other::observes_and_leaves".into(),
+            id("leaves_above_callee"),
+            id("pin_helper"),
+            id("observes_and_leaves"),
         ]);
-        llbc.register_stack_param_slots_fns([("other::reload_slot".into(), vec![0])]);
-        llbc.register_stack_returns_index_fns([
-            "other::pin_helper".into(),
-            "other::storage_helper".into(),
-        ]);
+        llbc.register_stack_param_slots_fns([(id("reload_slot"), vec![0])]);
+        llbc.register_stack_returns_index_fns([id("pin_helper"), id("storage_helper")]);
         llbc.mark_stack_sensitive_fns_complete();
         llbc
+    }
+
+    fn stack_fn_identity(llbc: &Llbc, suffix: &str) -> String {
+        llbc.iter_fun_decls()
+            .find(|fd| {
+                let path = fd.item_meta.name_path();
+                path == suffix || path.ends_with(&format!("::{suffix}"))
+            })
+            .map(|fd| super::super::scope_owner_identity(llbc, fd))
+            .unwrap_or_else(|| panic!("missing FunDecl ending with {suffix}"))
     }
 
     fn bb_stmts(statements: Vec<Value>, kind: Value) -> Value {
@@ -5430,8 +5494,9 @@ mod tests {
     #[test]
     fn depth_neutral_refuses_unproven_stack_sensitive_callee() {
         let llbc = stack_ops_llbc_with_callee();
-        let observes = |path: &str| {
-            if path.ends_with("unproven_callee") {
+        let unproven = stack_fn_identity(&llbc, "unproven_callee");
+        let observes = |identity: &str| {
+            if identity == unproven {
                 CalleeEffect::observes()
             } else {
                 CalleeEffect::none()
@@ -5479,7 +5544,7 @@ mod tests {
     #[test]
     fn open_pin_callee_close_observes_vs_leaves_above() {
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         let observes_inside = body_of(
             4,
             vec![
@@ -5581,7 +5646,7 @@ mod tests {
     #[test]
     fn param_slots_callee_own_index_is_neutral_untracked_is_observes() {
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         let callee = body_of_args(
             1,
             3,
@@ -5866,7 +5931,7 @@ mod tests {
             walk.effect()
         );
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         // Caller treats the dest as an own-index carrier and passes it
         // to a ParamSlots callee.
         let caller = body_of(

@@ -257,8 +257,10 @@ fn build_semantic_program_via_active_frontend(
             // published, so a call into one of them reads that body's answer.
             let mut root_stack_crates: Vec<String> = Vec::new();
             let mut root_stack_touching: Vec<String> = Vec::new();
-            // Paths are in dependency order, so a crate's callees from
-            // earlier artefacts are already classified when it is.
+            // Identities (`scope_owner_identity`) are in dependency
+            // order, so a crate's callees from earlier artefacts are
+            // already classified when it is. `GraphAnalyzer` keys by
+            // graph, never by `ItemMeta::name_path`.
             let mut stack_sensitive: Vec<String> = Vec::new();
             let mut stack_depth_neutral: Vec<String> = Vec::new();
             let mut stack_leaves_above: Vec<String> = Vec::new();

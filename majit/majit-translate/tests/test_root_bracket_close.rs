@@ -649,10 +649,8 @@ fn ll_listslice_inner_is_depth_neutral() {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
-            names
-                .iter()
-                .any(|n| n.ends_with("::ll_listslice_inner") || n.ends_with("ll_listslice_inner")),
-            "ll_listslice_inner must be depth-neutral, got {names:?}"
+            names.iter().any(|id| id.contains("ll_listslice_inner")),
+            "ll_listslice_inner must be depth-neutral"
         );
     });
 }
@@ -696,10 +694,8 @@ fn eval_slice_index_is_depth_neutral() {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
-            names
-                .iter()
-                .any(|n| n.ends_with("::eval_slice_index") || n.ends_with("eval_slice_index")),
-            "eval_slice_index must be depth-neutral, got {names:?}"
+            names.iter().any(|id| id.contains("eval_slice_index")),
+            "eval_slice_index must be depth-neutral"
         );
         let graph = lower_named(llbc, "eval_slice_index");
         for leaf in [
@@ -774,6 +770,7 @@ fn binary_slice_values_inner_bracket_is_scalar_replaced() {
 /// The linked translation publishes `pyre-object`'s sensitive set onto
 /// the interpreter artefact. Inner still erases: its object callees that
 /// open-and-close a `RootScope` are depth-neutral, not a name exemption.
+/// Harvested strings are `scope_owner_identity`.
 #[test]
 fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -836,6 +833,285 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
             }
         })
     });
+}
+
+/// `scope_owner_identity` splits the `<Impl>` homonyms that
+/// `ItemMeta::name_path` collapses. `GraphAnalyzer.analyze_direct_call`
+/// / `DependencyTracker` key by graph, never by a rendered name.
+#[test]
+fn stack_effect_identity_splits_impl_homonyms() {
+    use majit_translate::front::mir::scope_owner_identity;
+    let Some(object) = object_llbc() else {
+        return;
+    };
+    assert_scope_owner_identity_injective(object, "pyre-object");
+    let get_ids: Vec<String> = object
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some())
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            path.ends_with("::get") && path.contains("gc_roots::<Impl>")
+        })
+        .map(|fd| scope_owner_identity(object, fd))
+        .collect();
+    let mut unique = get_ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        get_ids.len(),
+        "gc_roots::<Impl>::get identities must be injective, got {get_ids:?}"
+    );
+    let root_scope = unique
+        .iter()
+        .find(|id| {
+            id.starts_with("pyre_object::gc_roots::<impl pyre_object::gc_roots::RootScope>::get|")
+        })
+        .cloned();
+    let rooted_items = unique
+        .iter()
+        .find(|id| {
+            id.starts_with("pyre_object::gc_roots::<impl pyre_object::gc_roots::RootedItems>::get|")
+        })
+        .cloned();
+    let rooted_once = unique
+        .iter()
+        .find(|id| {
+            id.starts_with(
+                "pyre_object::gc_roots::<impl pyre_object::gc_roots::RootedOnceRef>::get|",
+            )
+        })
+        .cloned();
+    assert!(
+        root_scope.is_some(),
+        "missing RootScope identity in {unique:?}"
+    );
+    assert!(
+        rooted_items.is_some(),
+        "missing RootedItems identity in {unique:?}"
+    );
+    assert!(
+        rooted_once.is_some(),
+        "missing RootedOnceRef identity in {unique:?}"
+    );
+    assert_ne!(root_scope, rooted_items);
+    assert_ne!(root_scope, rooted_once);
+    assert_ne!(rooted_items, rooted_once);
+    let Some(interpreter) = interpreter_llbc() else {
+        return;
+    };
+    assert_scope_owner_identity_injective(interpreter, "pyre-interpreter");
+    if let Some(module) = module_llbc() {
+        assert_scope_owner_identity_injective(module, "pyre-module");
+    }
+    let release_ids: Vec<String> = interpreter
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some())
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            path.ends_with("::release") && path.contains("baseobjspace::<Impl>")
+        })
+        .map(|fd| scope_owner_identity(interpreter, fd))
+        .collect();
+    let mut unique_release = release_ids.clone();
+    unique_release.sort();
+    unique_release.dedup();
+    assert_eq!(
+        unique_release.len(),
+        release_ids.len(),
+        "baseobjspace::<Impl>::release identities must be injective, got {release_ids:?}"
+    );
+    let simple_buf = unique_release
+        .iter()
+        .find(|id| {
+            id.starts_with(
+                "pyre_interpreter::baseobjspace::<impl pyre_interpreter::baseobjspace::SimpleBufferBytes>::release|",
+            )
+        })
+        .cloned();
+    let lock = unique_release
+        .iter()
+        .find(|id| {
+            id.starts_with(
+                "pyre_interpreter::baseobjspace::<impl pyre_interpreter::baseobjspace::Lock>::release|",
+            )
+        })
+        .cloned();
+    assert!(
+        simple_buf.is_some(),
+        "missing SimpleBufferBytes identity in {unique_release:?}"
+    );
+    assert!(
+        lock.is_some(),
+        "missing Lock identity in {unique_release:?}"
+    );
+    assert_ne!(simple_buf, lock);
+    let saturating: Vec<String> = object
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some())
+        .filter(|fd| fd.item_meta.name_path().ends_with("::saturating_add"))
+        .map(|fd| scope_owner_identity(object, fd))
+        .collect();
+    let mut unique_sat = saturating.clone();
+    unique_sat.sort();
+    unique_sat.dedup();
+    assert_eq!(
+        unique_sat.len(),
+        saturating.len(),
+        "saturating_add identities must be injective, got {saturating:?}"
+    );
+    assert!(
+        saturating.len() >= 2,
+        "expected at least two saturating_add bodies, got {saturating:?}"
+    );
+    assert!(
+        unique_sat
+            .iter()
+            .any(|id| id.starts_with("core::num::<impl usize>::saturating_add|")),
+        "missing usize saturating_add in {unique_sat:?}"
+    );
+    assert!(
+        unique_sat
+            .iter()
+            .any(|id| id.starts_with("core::num::<impl i64>::saturating_add|")),
+        "missing i64 saturating_add in {unique_sat:?}"
+    );
+    let drops: Vec<String> = object
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some())
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            path.ends_with("::drop_in_place") || path.contains("drop_in_place")
+        })
+        .map(|fd| scope_owner_identity(object, fd))
+        .collect();
+    let mut unique_drops = drops.clone();
+    unique_drops.sort();
+    unique_drops.dedup();
+    assert_eq!(
+        unique_drops.len(),
+        drops.len(),
+        "drop_in_place identities must be injective, got {drops:?}"
+    );
+    assert!(
+        unique_drops
+            .iter()
+            .any(|id| id.starts_with("core::ptr::drop_in_place|")),
+        "missing core::ptr::drop_in_place in {unique_drops:?}"
+    );
+    assert!(
+        unique_drops
+            .iter()
+            .any(|id| id.contains("::<impl ") && id.contains("::drop_in_place|")),
+        "missing impl drop_in_place in {unique_drops:?}"
+    );
+    let owners: Vec<String> = interpreter
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some())
+        .filter(|fd| {
+            fd.item_meta
+                .name_path()
+                .contains("typedef::method_owner::OWNER")
+        })
+        .map(|fd| scope_owner_identity(interpreter, fd))
+        .collect();
+    let mut unique_owners = owners.clone();
+    unique_owners.sort();
+    unique_owners.dedup();
+    assert_eq!(
+        unique_owners.len(),
+        owners.len(),
+        "typedef OWNER identities must be injective, got {owners:?}"
+    );
+    assert!(
+        unique_owners
+            .iter()
+            .any(|id| id.starts_with("pyre_interpreter::typedef::method_owner::OWNER|")),
+        "missing OWNER in {unique_owners:?}"
+    );
+    assert!(
+        unique_owners
+            .iter()
+            .any(|id| id.contains("method_owner::OWNER#1|")),
+        "missing OWNER#1 in {unique_owners:?}"
+    );
+    let extern_root_scope: Vec<String> = interpreter
+        .iter_fun_decls()
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            path.contains("gc_roots::<Impl>") && path.ends_with("::get")
+        })
+        .map(|fd| scope_owner_identity(interpreter, fd))
+        .filter(|id| id.contains("RootScope"))
+        .collect();
+    let Some(local) = root_scope.as_ref() else {
+        panic!("RootScope::get local identity missing");
+    };
+    assert!(
+        extern_root_scope.iter().any(|id| id == local),
+        "extern RootScope::get {extern_root_scope:?} must equal defining {local}"
+    );
+    eprintln!("identity RootScope::get = {local}");
+    eprintln!(
+        "identity RootedItems::get = {}",
+        rooted_items.as_deref().unwrap_or("-")
+    );
+    eprintln!(
+        "identity RootedOnceRef::get = {}",
+        rooted_once.as_deref().unwrap_or("-")
+    );
+    eprintln!(
+        "identity SimpleBufferBytes::release = {}",
+        simple_buf.as_deref().unwrap_or("-")
+    );
+    eprintln!(
+        "identity Lock::release = {}",
+        lock.as_deref().unwrap_or("-")
+    );
+    for (i, id) in saturating.iter().take(2).enumerate() {
+        eprintln!("identity saturating_add[{i}] = {id}");
+    }
+    for (i, id) in drops.iter().take(2).enumerate() {
+        eprintln!("identity drop_in_place[{i}] = {id}");
+    }
+    for (i, id) in owners.iter().take(2).enumerate() {
+        eprintln!("identity OWNER[{i}] = {id}");
+    }
+    eprintln!("identity RootScope::get extern = {local}");
+}
+
+fn assert_scope_owner_identity_injective(llbc: &Llbc, crate_label: &str) {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for fd in llbc.iter_local_fns().filter(|fd| fd.body.is_some()) {
+        let identity = majit_translate::front::mir::scope_owner_identity(llbc, fd);
+        let segs = format!("{:?}", fd.item_meta.name);
+        groups
+            .entry(identity)
+            .or_default()
+            .push((fd.item_meta.name_path(), segs));
+    }
+    let collisions: Vec<(String, Vec<(String, String)>)> = groups
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .collect();
+    if !collisions.is_empty() {
+        eprintln!(
+            "{crate_label} scope_owner_identity collision groups: {}",
+            collisions.len()
+        );
+        for (identity, names) in &collisions {
+            eprintln!("{crate_label} collision identity={identity}");
+            for (name, segs) in names {
+                eprintln!("{crate_label} collision body name={name} segs={segs}");
+            }
+        }
+    }
+    assert!(
+        collisions.is_empty(),
+        "{crate_label} scope_owner_identity collisions: {} groups",
+        collisions.len()
+    );
 }
 
 /// `|| shadow_stack_get(len)` after `pin_root` is a RootSlotGetter
