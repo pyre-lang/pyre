@@ -18,18 +18,19 @@ use crate::model::{
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    adt_node, boxing_cluster_ctor_new_counts, boxing_cluster_with_nested_header, calls_leaf,
-    code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site, empty_llbc,
-    empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field,
-    ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
-    interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
-    llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape, option_adt_node, option_enum,
-    option_int_arg, option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node,
-    result_enum, rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph,
-    struct_ctor_ops, struct_decl, struct_news, type_decl_struct, tyref_to_attr_value_type,
-    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
-    window_meta, window_mut_u8_ptr, window_opaque_fun, window_place, window_shared_slice,
-    window_slice, window_span, window_u8, window_unwind_and_return_blocks, window_usize,
+    adt_node, boxing_cluster_ctor_new_counts, boxing_cluster_with_nested_header, c_layout,
+    calls_leaf, code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site,
+    empty_llbc, empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops,
+    i64_field, ident_path, interior_bb, interior_caller, interior_i64, interior_local,
+    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_usize,
+    leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape,
+    option_adt_node, option_enum, option_int_arg, option_ok_or_else_site, push_fn_const,
+    replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count, some_ctor_ops,
+    some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
+    type_decl_struct, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
+    window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
+    window_place, window_shared_slice, window_slice, window_span, window_u8,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -1979,7 +1980,8 @@ fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
 #[test]
 fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
     use std::collections::{HashMap, HashSet};
-    let owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
+    let mut owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
+    owner["layout"] = c_layout();
     let fun = |def_id: u64, leaf: &str, output: serde_json::Value| {
         serde_json::json!({
             "def_id": def_id,
@@ -8942,7 +8944,7 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             "is_local": true
         })
     };
-    let ffi_type = serde_json::json!({
+    let mut ffi_type = serde_json::json!({
         "def_id": 1,
         "item_meta": meta(&["libffi_sys", "ffi_type"]),
         "kind": {"Struct": [{
@@ -8951,7 +8953,8 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             "attr_info": null
         }]}
     });
-    let cif = serde_json::json!({
+    ffi_type["layout"] = c_layout();
+    let mut cif = serde_json::json!({
         "def_id": 0,
         "item_meta": meta(&["libffi_sys", "ffi_cif"]),
         "kind": {"Struct": [
@@ -8972,6 +8975,7 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             }
         ]}
     });
+    cif["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![cif, ffi_type], vec![]);
     let body: Unstructured = serde_json::from_value(serde_json::json!({
         "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
@@ -11860,15 +11864,7 @@ fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
         }]),
         false,
     );
-    raw["layout"] = serde_json::json!([{
-        "key": "fixture-target",
-        "value": {
-            "size": 4,
-            "align": 4,
-            "variant_layouts": [{"field_offsets": [0]}],
-            "repr": {"transparent": false}
-        }
-    }]);
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}

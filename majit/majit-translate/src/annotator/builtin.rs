@@ -2485,6 +2485,8 @@ fn cast_instance_intrinsic(
     // `raw_struct_ptr_annotation` (`rclass.py` `ll_cast_to_object`:
     // dest is the target class annotation). Operand `can_be_none` is
     // applied on the instance arm below, unchanged.
+    // A Rust-repr aggregate is `rclass.py` `getinstancerepr` and takes
+    // the ClassDef arm below.
     let payload_dest = bk.by_value_payload_annotation(&root);
     if matches!(&payload_dest, SomeValue::Ptr(_)) {
         return match operand {

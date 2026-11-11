@@ -6444,13 +6444,12 @@ pub(crate) fn derive_subject_inputcells(
                         bk.registered_struct_root_key(&root)
                     };
                     if let Some(root) = resolved_root.as_deref() {
-                        // A `&RawStruct` is the address of that struct
-                        // (`Ptr` of a raw `Struct`, `history.getkind`).
-                        // FieldRead of the same owner already seeds
-                        // SomePtr (`project_struct_field_type`); minting
-                        // SomeInstance here made mergeinputargs raise
-                        // Instance(X) ∪ Ptr(X) (`llannotation.py`
-                        // pairtype(SomePtr, SomeObject).union).
+                        // A `&CStruct` is the address of that struct
+                        // (`rffi.py` `CStruct` / `Ptr` of a raw `Struct`,
+                        // `history.getkind`). FieldRead of the same owner
+                        // already seeds SomePtr (`project_struct_field_type`).
+                        // A Rust-repr aggregate is `rclass.py`
+                        // `getinstancerepr` (SomeInstance).
                         if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
                             cells.push(cell);
                             continue;

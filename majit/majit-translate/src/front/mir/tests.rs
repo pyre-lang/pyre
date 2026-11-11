@@ -2548,7 +2548,7 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
             }
         })
     };
-    let ffi_type = struct_decl(
+    let mut ffi_type = struct_decl(
         1,
         ident_path(&["libffi_sys", "ffi_type"]),
         serde_json::json!([{
@@ -2558,7 +2558,8 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
         }]),
         false,
     );
-    let cif = struct_decl(
+    ffi_type["layout"] = c_layout();
+    let mut cif = struct_decl(
         0,
         ident_path(&["libffi_sys", "ffi_cif"]),
         serde_json::json!([
@@ -2580,6 +2581,7 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
         ]),
         false,
     );
+    cif["layout"] = c_layout();
     let dest = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
     let llbc = int_as_ptr_cast_llbc(vec![cif, ffi_type], dest);
     for name in ["unary_cast", "rvalue_cast"] {
@@ -9278,6 +9280,18 @@ pub(in crate::front::mir) fn type_decl_struct(
     })
 }
 
+/// `rffi.py` `CStruct` fixture: same as [`type_decl_struct`] plus
+/// `repr_algo: "C"` so `adt_def_is_raw_storage` admits it.
+pub(in crate::front::mir) fn type_decl_c_struct(
+    id: u64,
+    path: &[&str],
+    fields: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let mut decl = type_decl_struct(id, path, fields);
+    decl["layout"] = c_layout();
+    decl
+}
+
 #[test]
 fn trait_clone_of_build_hasher_default_is_identity() {
     let hasher = named_adt(0, vec![named_adt(1, vec![])]);
@@ -9635,7 +9649,7 @@ fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let raw_graph = lower_raw_ptr_is_null(
         raw_ptr,
-        vec![type_decl_struct(
+        vec![type_decl_c_struct(
             0,
             &["fixture", "RawStruct"],
             vec![struct_field_json("word", i64_ty)],
@@ -14155,6 +14169,19 @@ pub(in crate::front::mir) fn transparent_layout() -> serde_json::Value {
     }])
 }
 
+/// One-word `repr_algo: "C"` layout (`rffi.py` `CStruct`).
+pub(in crate::front::mir) fn c_layout() -> serde_json::Value {
+    serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "C", "transparent": false}
+        }
+    }])
+}
+
 pub(in crate::front::mir) fn struct_decl(
     def_id: u64,
     name: serde_json::Value,
@@ -17548,9 +17575,10 @@ fn map_or_value_bank(ty: &ValueType) -> char {
     }
 }
 
-/// Payload enum used as a raw-address niche (`Option<&RawEnum>`): not
-/// fieldless, no GcType, one word of layout so the shared-ref Option is
-/// the null-pointer niche.
+/// Payload enum used as a raw-address niche (`Option<&RawEnum>`):
+/// `rffi.py` `CStruct` analogue (`repr_algo: "C"`), not fieldless, no
+/// GcType, one word of layout so the shared-ref Option is the
+/// null-pointer niche.
 fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -17579,7 +17607,7 @@ fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
                 "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
             }
         ]},
-        "layout": interior_layout(8, &[0], false)
+        "layout": interior_c_layout(8, &[0], false)
     })
 }
 
@@ -18473,7 +18501,7 @@ fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
 /// intern'd T as an Instance (GcRef) against a Signed overlay.
 #[test]
 fn interned_result_of_mut_ref_payload_is_pointer() {
-    let native = interior_struct(
+    let native = interior_c_struct(
         1,
         &["pyre_module", "module", "mmap", "interp_mmap", "NativeMMap"],
         &[(
@@ -19503,7 +19531,7 @@ fn map_or_niche_raw_struct_is_operands_agree() {
         vec![payload_ty.clone()],
         interior_i64(),
     );
-    let owned = interior_struct(
+    let owned = interior_c_struct(
         1,
         &["fixture", "OwnedFd"],
         &[(
@@ -20801,7 +20829,7 @@ fn null_mut_of_raw_struct_is_null_raw_without_cast() {
     let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
     let llbc = llbc_with_types(
         "fixture",
-        vec![interior_struct(
+        vec![interior_c_struct(
             0,
             &["fixture", "RawStruct"],
             &[("word", interior_i64())],
@@ -33970,13 +33998,56 @@ fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json:
     }])
 }
 
-fn interior_struct(
+fn interior_c_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
+    serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": size,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": offsets}],
+            "repr": {"repr_algo": "C", "transparent": transparent}
+        }
+    }])
+}
+
+pub(in crate::front::mir) fn interior_struct(
     def_id: u64,
     path: &[&str],
     fields: &[(&str, serde_json::Value)],
     size: u64,
     offsets: &[u64],
     transparent: bool,
+) -> serde_json::Value {
+    interior_struct_with_layout(
+        def_id,
+        path,
+        fields,
+        interior_layout(size, offsets, transparent),
+    )
+}
+
+/// Same as [`interior_struct`] with `repr_algo: "C"` (`rffi.py` `CStruct`).
+pub(in crate::front::mir) fn interior_c_struct(
+    def_id: u64,
+    path: &[&str],
+    fields: &[(&str, serde_json::Value)],
+    size: u64,
+    offsets: &[u64],
+    transparent: bool,
+) -> serde_json::Value {
+    interior_struct_with_layout(
+        def_id,
+        path,
+        fields,
+        interior_c_layout(size, offsets, transparent),
+    )
+}
+
+fn interior_struct_with_layout(
+    def_id: u64,
+    path: &[&str],
+    fields: &[(&str, serde_json::Value)],
+    layout: serde_json::Value,
 ) -> serde_json::Value {
     let fields: Vec<_> = fields
         .iter()
@@ -33986,7 +34057,7 @@ fn interior_struct(
         "def_id": def_id,
         "item_meta": interior_meta(path, true),
         "kind": {"Struct": fields},
-        "layout": interior_layout(size, offsets, transparent)
+        "layout": layout
     })
 }
 

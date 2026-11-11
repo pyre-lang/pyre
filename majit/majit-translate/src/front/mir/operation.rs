@@ -4867,6 +4867,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         )?;
         let id = adt_node_def_id(node)?;
         let decl = self.llbc.type_by_id(id)?;
@@ -4920,7 +4921,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// PTRTYPE of a niche-Option payload that is a pointer to a storage-raw
-    /// ADT (`Option<&MappedObj>`, `Option<&OwnedFd>`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
+    /// ADT (`Option<&OwnedFd>`, `rffi.py` `CStruct`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
     /// returns `SomePtr(PTRTYPE)` (`lltype.py` `ann_cast_int_to_ptr`). The
     /// Option word itself stays the Address `rnone.py` `rtype_is_None`
     /// compares for an int-bank enum; a raw-struct borrow Option is already
@@ -4931,7 +4932,7 @@ impl<'a> Lowering<'a> {
     /// `ty_is_raw_address`. Struct PTRTYPE is the overlay `Ptr(Struct)` of
     /// a pointee whose declared `_gckind` is Raw (`declared_raw_adt_node` /
     /// `history.getkind` of `Ptr(TO)` from `TO._gckind`). A GcType seed
-    /// stays Instance (`rclass.py` `InstanceRepr._setup_repr`).
+    /// stays Instance (`rclass.py` `getinstancerepr`).
     pub(in crate::front::mir) fn payload_storage_raw_ptr_lltype(
         &self,
         option_ty: &TyRef,
@@ -4980,6 +4981,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         )?;
         let id = adt_node_def_id(adt)?;
         let decl = self.llbc.type_by_id(id)?;
@@ -6854,8 +6856,8 @@ impl<'a> Lowering<'a> {
                     // `call_once` Args tuple sees `SomeInstance(T)` rather
                     // than a classdef-less word (`rclass.py`
                     // `InstanceRepr._setup_repr`). An int-bank raw-address
-                    // niche (`Option<&MappedObj>`, `Option<fn>`,
-                    // `Option<&RawStruct>`) keeps the Address / SomePtr
+                    // niche (`Option<&OwnedFd>`, `Option<fn>`,
+                    // `Option<&CStruct>`) keeps the Address / SomePtr
                     // word for Discriminant / `is_` / `null_raw`
                     // (`rnone.py` `rtype_is_None`). The Some payload of a
                     // storage-raw enum pointer is that same word retyped as
@@ -7006,7 +7008,12 @@ impl<'a> Lowering<'a> {
                                 // host offset. A cast onto the gc shell is the Gc
                                 // pointee's narrow.
                                 if stripped.as_ref().is_some_and(|n| {
-                                    raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
+                                    raw_ptr_node_is_declared_raw(
+                                        n,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        &self.raw_alloc_flavor_structs,
+                                    )
                                 }) {
                                     None
                                 } else {

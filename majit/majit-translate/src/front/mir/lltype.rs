@@ -2040,6 +2040,16 @@ pub(in crate::front::mir) fn no_immutable_fields() -> &'static ImmutableFieldsTa
     EMPTY.get_or_init(ImmutableFieldsTable::new)
 }
 
+/// Empty `_alloc_flavor_ = raw` set for paint calls outside a crate
+/// lowering. Production [`adt_def_is_raw_storage`] reads the program-wide
+/// harvest (`rclass.py` `getgcflavor`).
+#[cfg(test)]
+pub(in crate::front::mir) fn no_raw_alloc_flavor() -> &'static std::collections::HashSet<String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashSet::new)
+}
+
 /// `_immutable_fields_` rows for `td`, keyed the same way the GC-struct
 /// schema path looks them up (`harvest_immutable_fields_from_llbcs`:
 /// crate-stripped path, then leaf, then the full path).
@@ -2298,7 +2308,15 @@ pub(in crate::front::mir) fn container_declared_gc(
     // The same raw-storage test as the dest overlay: a GC pointer field
     // in `_immutable_fields_` is a pure raw word (`rewrite_op_getfield`
     // refuses only a non-pure `getfield_raw_r`).
-    if declared_raw_adt_node(pointee, llbc, gc_struct_ids, immutable_fields).is_some() {
+    if declared_raw_adt_node(
+        pointee,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
+    {
         return Some(false);
     }
     Some(true)
@@ -2347,6 +2365,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     llbc: &'a Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<&'a serde_json::Value> {
     let node = strip_ty_indirections(node, llbc)?;
     if node_is_string_value(node, llbc) {
@@ -2382,22 +2401,44 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     // still raw storage (`MapNodeTerminatorView.w_cls`).
     let def_id = adt_node_def_id(node)?;
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+    if !adt_def_is_raw_storage(
+        def_id,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        &mut stack,
+    ) {
         return None;
     }
     Some(node)
 }
 
-/// The ADT's fields are raw words: scalars, nested raw structs, or one
-/// address pointing at those. A `Vec` / `String` / other GC field is not.
+/// lltype raw storage (`lltype.Struct._gckind = 'raw'` / `rffi.py` `CStruct`).
+///
+/// True when the TypeDecl is not a flavor-raw class (`rclass.py`
+/// `getgcflavor`) and one of: `repr_algo == "C"` whose fields pass the
+/// raw-word field test; a zero-variant enum (FFI opaque); a fieldless
+/// enum (discriminant integer); a `repr(transparent)` wrapper whose
+/// fields pass that same test. A Rust-repr data-carrying struct/enum is
+/// `rclass.py` `getinstancerepr` (default gc).
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     stack: &mut Vec<u64>,
 ) -> bool {
-    adt_def_is_raw_storage_at(def_id, None, llbc, gc_struct_ids, immutable_fields, stack)
+    adt_def_is_raw_storage_at(
+        def_id,
+        None,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        stack,
+    )
 }
 
 /// [`adt_def_is_raw_storage`] of `def_id`, with TypeDecl TypeVars replaced
@@ -2412,6 +2453,7 @@ fn adt_def_is_raw_storage_at(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     stack: &mut Vec<u64>,
 ) -> bool {
     if stack.contains(&def_id) {
@@ -2425,7 +2467,6 @@ fn adt_def_is_raw_storage_at(
     };
     // A marked exception-class enum is the minted class, not a raw word
     // bag. `&E` must stay `Ref` so the parameter carries the class root.
-    // An unmarked enum keeps the raw-storage answer below.
     if matches!(&td.kind, TypeDeclKind::Enum(_)) {
         let path = td.item_meta.name_path();
         let canon = strip_crate_prefix(&path);
@@ -2445,6 +2486,40 @@ fn adt_def_is_raw_storage_at(
     if !carrier.is_empty() && td.item_meta.name_path() == carrier {
         return false;
     }
+    // Flavor-raw stays `InstanceRepr` with malloc flavor raw
+    // (`rclass.py` `getinstancerepr` / `getgcflavor`).
+    if crate::front::llbc_hints::alloc_flavor_raw_contains(
+        raw_alloc_flavor_structs,
+        &td.item_meta.name_path(),
+    ) {
+        return false;
+    }
+    // Fieldless enum: the discriminant integer, not a struct.
+    if type_decl_is_fieldless_enum(td, llbc) {
+        return true;
+    }
+    // Zero-variant enum: FFI opaque with no constructible value
+    // (`libc::DIR`; `tyref_decl_is_uninhabited`).
+    if matches!(&td.kind, TypeDeclKind::Enum(variants) if variants.is_empty()) {
+        return true;
+    }
+    // Registered transparent scalar: the inner word
+    // (`IntegerRepr.rtype_or_`). `CodeFlags` layout records
+    // `transparent: false`; the registry is that missing flag
+    // (`discover_transparent_scalar_kinds` /
+    // `external_transparent_scalar_kinds`).
+    let path = td.item_meta.name_path();
+    let stripped = strip_crate_prefix(&path);
+    if llbc.transparent_scalar_kind(&path).is_some()
+        || (stripped != path
+            && stripped.contains("::")
+            && llbc.transparent_scalar_kind(&stripped).is_some())
+    {
+        return true;
+    }
+    if !td.is_repr_c() && !td.is_repr_transparent() {
+        return false;
+    }
     let container = instantiation.map(|node| TyRef::Other(node.clone()));
     stack.push(def_id);
     let ok = match &td.kind {
@@ -2455,6 +2530,7 @@ fn adt_def_is_raw_storage_at(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
                 stack,
                 container.as_ref(),
             )
@@ -2466,6 +2542,7 @@ fn adt_def_is_raw_storage_at(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
                 stack,
                 container.as_ref(),
             )
@@ -2473,7 +2550,14 @@ fn adt_def_is_raw_storage_at(
         TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
             .and_then(adt_node_def_id)
             .is_some_and(|id| {
-                adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack)
+                adt_def_is_raw_storage(
+                    id,
+                    llbc,
+                    gc_struct_ids,
+                    immutable_fields,
+                    raw_alloc_flavor_structs,
+                    stack,
+                )
             }),
         _ => false,
     };
@@ -2490,6 +2574,7 @@ fn adt_fields_are_raw_storage_in(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     stack: &mut Vec<u64>,
     container: Option<&TyRef>,
 ) -> bool {
@@ -2503,11 +2588,24 @@ fn adt_fields_are_raw_storage_in(
         if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) {
             return true;
         }
-        if field_ty_is_raw_word(&ty, llbc, gc_struct_ids, immutable_fields, stack) {
+        if field_ty_is_raw_word(
+            &ty,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            stack,
+        ) {
             return true;
         }
-        field_ty_is_gc_pointer(&ty, llbc, gc_struct_ids)
-            && field_declared_immutable(owner, &field_decl_name(i, field), immutable_fields)
+        field_ty_is_gc_pointer(
+            &ty,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            stack,
+        ) && field_declared_immutable(owner, &field_decl_name(i, field), immutable_fields)
     })
 }
 
@@ -2515,6 +2613,7 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
@@ -2527,6 +2626,7 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
         llbc,
         gc_struct_ids,
         no_immutable_fields(),
+        raw_alloc_flavor_structs,
         &mut Vec::new(),
     )
 }
@@ -2536,6 +2636,7 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
@@ -2565,12 +2666,20 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
                 stack,
             );
         }
     }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
-        return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
+        return pointee_is_raw_word(
+            pointee,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            stack,
+        );
     }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
@@ -2596,6 +2705,7 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
                     llbc,
                     gc_struct_ids,
                     immutable_fields,
+                    raw_alloc_flavor_structs,
                     &mut Vec::new(),
                 );
             }
@@ -2604,10 +2714,18 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
                 &mut Vec::new(),
             );
         }
-        return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
+        return adt_def_is_raw_storage(
+            def_id,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            stack,
+        );
     }
     false
 }
@@ -2623,6 +2741,7 @@ fn atomic_ptr_pointee_is_storage_raw(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = strip_ty_indirections(pointee, llbc) else {
@@ -2637,14 +2756,28 @@ fn atomic_ptr_pointee_is_storage_raw(
             llbc,
             gc_struct_ids,
             immutable_fields,
+            raw_alloc_flavor_structs,
             stack,
         );
     }
     let Some(def_id) = adt_node_def_id(node) else {
         return false;
     };
-    pointee_is_raw_word(node, llbc, gc_struct_ids)
-        && adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack)
+    pointee_is_raw_word(
+        node,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        stack,
+    ) && adt_def_is_raw_storage(
+        def_id,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        stack,
+    )
 }
 
 /// Whether a field type is a GC pointer (`TO._gckind == 'gc'`).
@@ -2652,6 +2785,9 @@ pub(in crate::front::mir) fn field_ty_is_gc_pointer(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
@@ -2659,17 +2795,27 @@ pub(in crate::front::mir) fn field_ty_is_gc_pointer(
     let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
         return false;
     };
-    !pointee_is_raw_word(pointee, llbc, gc_struct_ids)
+    !pointee_is_raw_word(
+        pointee,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        stack,
+    )
 }
 
 /// `Ptr(TO)` is a raw address when `TO._gckind` is raw: a scalar, or an ADT
-/// that is not a GC container, the exception carrier, or a `GcType` seed.
-/// Recursing into the pointee's fields would treat a raw pointer to a
-/// non-GC struct that itself holds a GC word as a GC pointer.
+/// [`adt_def_is_raw_storage`] accepts. Recursing into the pointee's fields
+/// would treat a raw pointer to a non-GC struct that itself holds a GC
+/// word as a GC pointer.
 pub(in crate::front::mir) fn pointee_is_raw_word(
     node: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = strip_ty_indirections(node, llbc) else {
         return false;
@@ -2681,7 +2827,14 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
     // `rffi.py` `VOIDPP`) are one address word. Peel and ask again;
     // do not walk the pointee struct's fields (comment above).
     if let Some(inner) = one_level_pointer_pointee(node, llbc) {
-        return pointee_is_raw_word(inner, llbc, gc_struct_ids);
+        return pointee_is_raw_word(
+            inner,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            stack,
+        );
     }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
@@ -2711,9 +2864,26 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
             return false;
         }
         return match &td.kind {
-            TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) | TypeDeclKind::Union(_) => true,
-            TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
-                .is_some_and(|n| pointee_is_raw_word(n, llbc, gc_struct_ids)),
+            TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) | TypeDeclKind::Union(_) => {
+                adt_def_is_raw_storage(
+                    def_id,
+                    llbc,
+                    gc_struct_ids,
+                    immutable_fields,
+                    raw_alloc_flavor_structs,
+                    stack,
+                )
+            }
+            TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc).is_some_and(|n| {
+                pointee_is_raw_word(
+                    n,
+                    llbc,
+                    gc_struct_ids,
+                    immutable_fields,
+                    raw_alloc_flavor_structs,
+                    stack,
+                )
+            }),
             _ => false,
         };
     }
@@ -2760,8 +2930,8 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
 /// (`rewrite_op_getfield`). Storage-raw (`declared_raw_adt_node`) answers
 /// true for a one-word pointer. A flavor-raw pointee (`rclass.py
 /// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
-/// `cast_ptr_to_int` for it. A borrow of a storage-raw struct that is
-/// not a raw enum stays `Ref` (`RootScope::get`).
+/// `cast_ptr_to_int` for it. A borrow of a storage-raw struct
+/// (`rffi.py` `CStruct`) stays `Ref`.
 pub(in crate::front::mir) fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2772,26 +2942,34 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     else {
         return false;
     };
-    if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
+    if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return true;
     }
     if let Some(pointee) = one_word_pointer_bank_pointee(node, llbc) {
         let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
         // Non-borrow one-word pointer to a storage-raw ADT (`Box` /
-        // `NonNull` / `Arc` of a C struct). A `Ref` of a raw struct
-        // stays `Ref` (`RootScope::get`).
+        // `NonNull` / `Arc` of a `rffi.py` `CStruct`). A `Ref` of a
+        // raw struct stays `Ref`.
         if !is_borrow
-            && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+            && declared_raw_adt_node(
+                pointee,
+                llbc,
+                gc_struct_ids,
+                no_immutable_fields(),
+                raw_alloc_flavor_structs,
+            )
+            .is_some()
         {
             return true;
         }
         // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-        // struct borrow stays `Ref`. Classifying it as an address makes
-        // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
-        // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
-        // `Rvalue::Ref` is the identity on that word, so the borrow is not
-        // an address (`rclass.py` has no `cast_pointer` of an int).
-        if is_borrow && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids) {
+        // struct borrow stays `Ref`. A fieldless enum is the tag integer
+        // (`type_decl_is_fieldless_enum`); `Rvalue::Ref` is the identity
+        // on that word, so the borrow is not an address (`rclass.py` has
+        // no `cast_pointer` of an int).
+        if is_borrow
+            && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        {
             return true;
         }
         // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
@@ -2829,6 +3007,7 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     pointee: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
         return false;
@@ -2841,7 +3020,14 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     };
     matches!(td.kind, TypeDeclKind::Enum(_))
         && !type_decl_is_fieldless_enum(td, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+        && declared_raw_adt_node(
+            pointee,
+            llbc,
+            gc_struct_ids,
+            no_immutable_fields(),
+            raw_alloc_flavor_structs,
+        )
+        .is_some()
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
@@ -2858,8 +3044,14 @@ pub(in crate::front::mir) fn raw_address_owner_root(
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_word_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-    let pointee = if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields())
-        .is_some()
+    let pointee = if declared_raw_adt_node(
+        pointee,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
         || flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs)
     {
         pointee
@@ -2919,6 +3111,7 @@ pub(in crate::front::mir) fn raw_ptr_node_is_declared_raw(
     node: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(pointee) = node
         .as_object()
@@ -2928,7 +3121,14 @@ pub(in crate::front::mir) fn raw_ptr_node_is_declared_raw(
     else {
         return false;
     };
-    declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+    declared_raw_adt_node(
+        pointee,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
 }
 
 pub(in crate::front::mir) fn tyref_to_value_type_with(
@@ -3528,8 +3728,8 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             // A by-value raw struct such as `Position` is not a GC
             // pointer. `getkind` of that word is int, so the load is
             // `getfield_raw_i`. A mutable `getfield_raw_r` is refused.
-            if tyref_is_raw_value(place_ty, llbc, gc_struct_ids)
-                || tyref_is_raw_value(field_ty, llbc, gc_struct_ids)
+            if tyref_is_raw_value(place_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+                || tyref_is_raw_value(field_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
             {
                 return ValueType::Int;
             }
@@ -3537,15 +3737,23 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             // (`tyref_is_raw_value` declines a pointer). Intern ROW is
             // `*mut T`; dest overlay `Ref(None)` unioned Instance with
             // that SomePtr (`history.getkind` of `Ptr`).
-            if (tyref_is_raw_storage_borrow(place_ty, llbc, gc_struct_ids)
-                || tyref_is_raw_storage_borrow(field_ty, llbc, gc_struct_ids))
-                && flavor_raw_pointer_class_root(
-                    place_ty,
-                    llbc,
-                    tombstoned,
-                    raw_alloc_flavor_structs,
-                )
-                .is_none()
+            if (tyref_is_raw_storage_borrow(
+                place_ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ) || tyref_is_raw_storage_borrow(
+                field_ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )) && flavor_raw_pointer_class_root(
+                place_ty,
+                llbc,
+                tombstoned,
+                raw_alloc_flavor_structs,
+            )
+            .is_none()
                 && flavor_raw_pointer_class_root(
                     field_ty,
                     llbc,
@@ -3752,7 +3960,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     // `RootScope::get`); wrapping `Result::ok` of that payload into the
     // niche Option then unions `Ref(None)` with the Option dest `Int`.
     // A flavor-raw pointer stays `Ref(Some(root))`.
-    if tyref_is_raw_storage_borrow(ty, llbc, gc_struct_ids)
+    if tyref_is_raw_storage_borrow(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
         && flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs).is_none()
     {
         return ValueType::Int;
@@ -6129,20 +6337,18 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
     if niche_option_storage_raw_struct_root(option_ty, llbc, no_tombstoned_leaves()).is_some() {
         return None;
     }
-    // Raw-enum borrow (`Option<&MappedObj>`). `storage_raw_struct_root`
-    // requires `TypeDeclKind::Struct` + layout. Intern's layout gckind
-    // does not noneify an undeclared uppercase `&T`; stamp still keeps
-    // a raw-enum borrow off the GC Option spelling. `ty_is_raw_address`
-    // / `borrowed_pointee_is_raw_enum` already classify this as
-    // int-bank. Classed Instance ∪ Ptr is a UnionError; rtype then
-    // fails `cast_int_to_ptr` InstanceRepr → IntegerRepr on
-    // `map_or__spec_MappedObj`.
+    // Raw-enum borrow of a `rffi.py` `CStruct` payload enum.
+    // `storage_raw_struct_root` requires `TypeDeclKind::Struct` + layout,
+    // so an Enum pointee would otherwise hit the intern predicate's
+    // uppercase `&T` heuristic and noneify. `ty_is_raw_address` /
+    // `borrowed_pointee_is_raw_enum` classify this as int-bank.
+    // A Rust-repr enum is `rclass.py` `getinstancerepr`.
     if let Some(payload_node) =
         tyref_node(&payload, llbc).and_then(|n| type_node_peel_aliases(n, llbc))
         && let Some(pointee) = one_level_pointer_pointee(payload_node, llbc)
     {
         let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-        if borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids) {
+        if borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
             return None;
         }
     }
@@ -9916,7 +10122,13 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
         return None;
     }
     let inputs = value_type_inputs(llbc);
-    let adt = declared_raw_adt_node(pointee, llbc, &inputs.gc_struct_ids, no_immutable_fields())?;
+    let adt = declared_raw_adt_node(
+        pointee,
+        llbc,
+        &inputs.gc_struct_ids,
+        no_immutable_fields(),
+        &inputs.raw_alloc_flavor_structs,
+    )?;
     let id = adt_node_def_id(adt)?;
     let decl = llbc.type_by_id(id)?;
     if !matches!(decl.kind, TypeDeclKind::Struct(_)) || decl.layout.is_none() {
@@ -14195,11 +14407,12 @@ fn tyref_is_raw_storage_borrow(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
         return false;
     };
-    type_arg_referent_is_raw_storage(node, llbc, gc_struct_ids)
+    type_arg_referent_is_raw_storage(node, llbc, gc_struct_ids, raw_alloc_flavor_structs)
 }
 
 /// Keep `&` / `&mut` on a generic ADT type argument when the referent is
@@ -14213,6 +14426,7 @@ fn type_arg_referent_is_raw_storage(
     t: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let node = strip_ty_indirections(t, llbc).unwrap_or(t);
     let Some(r) = node.as_object().and_then(|o| o.get("Ref")) else {
@@ -14260,6 +14474,7 @@ fn type_arg_referent_is_raw_storage(
             llbc,
             gc_struct_ids,
             no_immutable_fields(),
+            raw_alloc_flavor_structs,
             &mut Vec::new(),
         );
     }
@@ -14268,6 +14483,7 @@ fn type_arg_referent_is_raw_storage(
         llbc,
         gc_struct_ids,
         no_immutable_fields(),
+        raw_alloc_flavor_structs,
         &mut Vec::new(),
     )
 }
@@ -14295,11 +14511,12 @@ pub(in crate::front::mir) fn render_adt_type_args(
     // during the fill treats a declared-GC seed as a field walk; the
     // harvest path only compares the spelling to `()`.
     let empty_gc_struct_ids = std::collections::HashSet::new();
-    let gc_struct_ids = llbc_derived(llbc)
+    let empty_raw_alloc_flavor = std::collections::HashSet::new();
+    let (gc_struct_ids, raw_alloc_flavor_structs) = llbc_derived(llbc)
         .value_type_inputs
         .get()
-        .map(|inputs| &inputs.gc_struct_ids)
-        .unwrap_or(&empty_gc_struct_ids);
+        .map(|inputs| (&inputs.gc_struct_ids, &inputs.raw_alloc_flavor_structs))
+        .unwrap_or((&empty_gc_struct_ids, &empty_raw_alloc_flavor));
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
@@ -14313,8 +14530,12 @@ pub(in crate::front::mir) fn render_adt_type_args(
                     // Top-level `&T` still strips in
                     // [`charon_type_value_to_ast_string`].
                     let node = strip_ty_indirections(t, llbc).unwrap_or(t);
-                    let rendered = if type_arg_referent_is_raw_storage(t, llbc, gc_struct_ids)
-                        && let Some(r) = node.as_object().and_then(|o| o.get("Ref"))
+                    let rendered = if type_arg_referent_is_raw_storage(
+                        t,
+                        llbc,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                    ) && let Some(r) = node.as_object().and_then(|o| o.get("Ref"))
                     {
                         render_charon_ref(r, |inner| {
                             charon_type_value_to_ast_string(inner, llbc, depth + 1)
