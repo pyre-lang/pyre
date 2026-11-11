@@ -7407,8 +7407,13 @@ impl<'a> Lowering<'a> {
         {
             return true;
         }
-        if container_declared_gc(ty, self.llbc, self.gc_struct_ids, self.immutable_fields)
-            == Some(false)
+        if container_declared_gc(
+            ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
+        ) == Some(false)
         {
             return false;
         }

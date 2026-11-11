@@ -2199,12 +2199,28 @@ pub(in crate::front::mir) fn container_declared_gc(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<bool> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_level_pointer_pointee(node, llbc)
         .and_then(|pointee| strip_ty_indirections(pointee, llbc))
         .unwrap_or(node);
     declared_adt_struct_id(pointee, llbc)?;
+    // rclass.py getgcflavor / history.py getkind: an explicit raw flavor
+    // determines STRUCT._gckind even when the struct contains GC-shaped
+    // fields. Use the same declaration as the argument/calldescr classifier;
+    // jtransform.py rewrite_op_getfield must not promote its Int base to Ref.
+    if adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            crate::front::llbc_hints::alloc_flavor_raw_contains(
+                raw_alloc_flavor_structs,
+                &td.item_meta.name_path(),
+            )
+        })
+    {
+        return Some(false);
+    }
     // The same raw-storage test as the dest overlay: a GC pointer field
     // in `_immutable_fields_` is a pure raw word (`rewrite_op_getfield`
     // refuses only a non-pure `getfield_raw_r`).

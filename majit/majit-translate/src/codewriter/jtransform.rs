@@ -37528,6 +37528,35 @@ mod tests {
         }
     }
 
+    /// `bytecode::CodeObject` is `_alloc_flavor_ = "raw"` and holds a boxed
+    /// slice. `rclass.py getgcflavor` makes the flavor decide `_gckind`, so
+    /// both words of `localspluskinds` are raw field reads
+    /// (`jtransform.py rewrite_op_getfield` → `getfield_raw_*`).
+    #[test]
+    fn raw_flavored_struct_slice_fields_are_raw_reads() {
+        let llbc =
+            crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+        let graph = crate::test_support::lower_function(llbc, "cell_slot")
+            .expect("raw-flavored slice query lowers");
+        let reads: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "localspluskinds" => Some(field),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reads.len() >= 2,
+            "slice length and data pointer must both be read: {}",
+            graph.dump()
+        );
+        for field in reads {
+            assert_eq!(field.owner_declared_gc, Some(false), "{field:?}");
+        }
+    }
+
     /// Looked-inside `PyFrame::code` returns front `Ref(Some(CodeObject))`.
     /// Residual/regular rewrite must stamp that dest Signed (`history.getkind`
     /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.

@@ -2728,6 +2728,11 @@ pub(in crate::front::mir) fn const_eval_init_body_with_locals(
                         if elem.label() == "Deref" {
                             return const_eval_borrowed_flag(llbc, locals, inner);
                         }
+                        if let Some((field, _)) = tyref_transparent_nonzst_field(&inner.ty, llbc)
+                            && const_tuple_field_index(elem) == Some(field as u64)
+                        {
+                            return const_eval_borrowed_flag(llbc, locals, inner);
+                        }
                         let PlaceKind::Local(n) = inner.kind else {
                             return None;
                         };
@@ -2763,6 +2768,15 @@ pub(in crate::front::mir) fn const_eval_init_body_with_locals(
                         Rvalue::Use(op, _) => eval_operand(&locals, op)?,
                         Rvalue::UnaryOp(kind, op) => {
                             const_eval_unop(kind, eval_operand(&locals, op)?)?
+                        }
+                        Rvalue::Discriminant(place) => {
+                            let PlaceKind::Local(local) = place.kind else {
+                                return None;
+                            };
+                            let ConstLit::EnumDisc(value) = locals.get(&local).copied()? else {
+                                return None;
+                            };
+                            ConstLit::UInt(value)
                         }
                         Rvalue::BinaryOp(kind, lhs, rhs) => const_eval_binop(
                             kind,
@@ -2805,6 +2819,15 @@ pub(in crate::front::mir) fn const_eval_init_body_with_locals(
         match block.term_ref(llbc).ok()? {
             TermKind::Return => return locals.get(&0).copied(),
             TermKind::Goto { target } => bb = *target as usize,
+            TermKind::Switch { discr, targets } => {
+                let ConstLit::Bool(cond) = eval_operand(&locals, discr)? else {
+                    return None;
+                };
+                let SwitchTargets::If(then_bb, else_bb) = targets else {
+                    return None;
+                };
+                bb = *(if cond { then_bb } else { else_bb }) as usize;
+            }
             TermKind::Assert { assert, target, .. } => {
                 let ConstLit::Bool(cond) = eval_operand(&locals, &assert.cond)? else {
                     return None;

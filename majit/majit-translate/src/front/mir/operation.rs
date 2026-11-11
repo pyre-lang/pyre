@@ -290,6 +290,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         );
         let item_ty = adt_field_read_value_type(
             place_ty,
@@ -1110,6 +1111,7 @@ impl<'a> Lowering<'a> {
                                         self.llbc,
                                         self.gc_struct_ids,
                                         self.immutable_fields,
+                                        &self.raw_alloc_flavor_structs,
                                     ))
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index)
@@ -1173,6 +1175,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.gc_struct_ids,
                                 self.immutable_fields,
+                                &self.raw_alloc_flavor_structs,
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
@@ -3917,6 +3920,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     self.immutable_fields,
+                    &self.raw_alloc_flavor_structs,
                 );
                 let recast_tagged_sum =
                     crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
@@ -4384,6 +4388,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.gc_struct_ids,
                         self.immutable_fields,
+                        &self.raw_alloc_flavor_structs,
                     );
                     if let Some(raw) =
                         raw_field_address_value_type(&place.ty, &place.ty, owner_gc, self.llbc)
@@ -6772,6 +6777,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.gc_struct_ids,
                         self.immutable_fields,
+                        &self.raw_alloc_flavor_structs,
                     );
                     // Captured before `resolve_place` moves `inner`. A
                     // by-value `String` attr of a marked exception class
