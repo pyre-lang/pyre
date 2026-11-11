@@ -2382,35 +2382,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::__pyre_put_new!(ns_slot, _name, pyre_object::w_int_new(val as i64));
             }
         }
-        // `<sched.h>`, read as `rposix.py` reads it: present where the
-        // header defines it, and with the host's own numbering rather than a
-        // shared one — the three disagree between Linux, the BSDs and Darwin.
-        // The Apple targets declare them in `<pthread/pthread_impl.h>`, which
-        // the `libc` crate does not mirror.
+        // `rposix.py` `CConfig` `SCHED_*` (`DefinedConstantInteger`);
+        // `moduledef.py` publishes each name when `getattr(rposix, _name)` is
+        // not None. `SCHED_IDLE` / `SCHED_NORMAL` / `SCHED_DEADLINE` /
+        // `SCHED_RESET_ON_FORK` are not in that CConfig.
         for (name, val) in [
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_OTHER", libc::SCHED_OTHER as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_OTHER", 1i64),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_FIFO", libc::SCHED_FIFO as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_FIFO", 4i64),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_RR", libc::SCHED_RR as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_RR", 2i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            ("SCHED_BATCH", libc::SCHED_BATCH as i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ("SCHED_OTHER", majit_rlib::rposix::SCHED_OTHER),
+            ("SCHED_FIFO", majit_rlib::rposix::SCHED_FIFO),
+            ("SCHED_RR", majit_rlib::rposix::SCHED_RR),
+            ("SCHED_BATCH", majit_rlib::rposix::SCHED_BATCH),
+        ] {
+            if let Some(val) = val {
+                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for (name, val) in [
             ("SCHED_IDLE", libc::SCHED_IDLE as i64),
             // `<linux/sched.h>` names these two; `SCHED_RESET_ON_FORK` is a
             // flag OR-ed into a policy rather than a policy of its own.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             ("SCHED_NORMAL", libc::SCHED_NORMAL as i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             ("SCHED_DEADLINE", libc::SCHED_DEADLINE as i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             ("SCHED_RESET_ON_FORK", libc::SCHED_RESET_ON_FORK as i64),
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
@@ -2464,12 +2456,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
         for (name, val) in [
-            ("F_ULOCK", libc::F_ULOCK as i64),
-            ("F_LOCK", libc::F_LOCK as i64),
-            ("F_TLOCK", libc::F_TLOCK as i64),
-            ("F_TEST", libc::F_TEST as i64),
+            ("F_ULOCK", majit_rlib::rposix::F_ULOCK),
+            ("F_LOCK", majit_rlib::rposix::F_LOCK),
+            ("F_TLOCK", majit_rlib::rposix::F_TLOCK),
+            ("F_TEST", majit_rlib::rposix::F_TEST),
         ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+            if let Some(val) = val {
+                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+            }
         }
         // The two `whence` values beyond the three os.py fixes itself: they
         // seek to the next hole or the next data in a sparse file. A host that
@@ -2841,7 +2835,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             if flags < 0 {
                 return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
-            Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0))
+            Ok(pyre_object::w_bool_from(
+                flags & majit_rlib::rposix::O_NONBLOCK.unwrap() == 0,
+            ))
         }
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
@@ -2915,9 +2911,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
             let flags = if blocking {
-                flags & !libc::O_NONBLOCK
+                flags & !majit_rlib::rposix::O_NONBLOCK.unwrap()
             } else {
-                flags | libc::O_NONBLOCK
+                flags | majit_rlib::rposix::O_NONBLOCK.unwrap()
             };
             let result = pyre_object::with_roots!(w_blocking => unsafe {
                 majit_rlib::rposix::c_set_status_flags(fd, flags)
@@ -3117,7 +3113,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     #[cfg(windows)]
     type TruncateLen = i64;
     #[cfg(not(windows))]
-    type TruncateLen = libc::off_t;
+    type TruncateLen = majit_rlib::rposix::OFF_T;
 
     /// `space.int_w` over the `r_longlong` half of `interp_posix.py:404`.
     ///
@@ -5565,7 +5561,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         pyre_object::with_roots!(w_fd => unsafe {
                             majit_rlib::rposix::c_ioctl_voidp(
                                 fd,
-                                majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                                majit_rlib::rposix::TIOCGWINSZ.unwrap() as majit_rlib::rffi::UINT,
                                 &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
                             )
                         })
@@ -5573,7 +5569,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         unsafe {
                             majit_rlib::rposix::c_ioctl_voidp(
                                 fd,
-                                majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                                majit_rlib::rposix::TIOCGWINSZ.unwrap() as majit_rlib::rffi::UINT,
                                 &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
                             )
                         }
@@ -7995,7 +7991,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let length =
                         pyre_object::with_roots!(w_offset => crate::baseobjspace::int_w(w_length))?;
-                    let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
+                    let offset = crate::baseobjspace::int_w(w_offset)? as majit_rlib::rposix::OFF_T;
                     if length < 0 {
                         return Err(crate::PyError::os_error_with_errno(
                             libc::EINVAL,
@@ -8053,7 +8049,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let data = pyre_object::with_roots!(w_offset => unsafe {
                         crate::builtins::file_write_buffer_bytes(w_data)
                     })?;
-                    let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
+                    let offset = crate::baseobjspace::int_w(w_offset)? as majit_rlib::rposix::OFF_T;
                     // `rposix.c_pwrite` releases the GIL and saves errno.
                     let written = loop {
                         let n = unsafe {
@@ -8104,10 +8100,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let offset = pyre_object::with_roots!(w_fd, w_offset, w_length =>
                         crate::baseobjspace::int_w(w_offset))?
-                        as libc::off_t;
+                        as majit_rlib::rposix::OFF_T;
                     let length = pyre_object::with_roots!(w_fd, w_offset, w_length =>
                         crate::baseobjspace::int_w(w_length))?
-                        as libc::off_t;
+                        as majit_rlib::rposix::OFF_T;
                     let ret = loop {
                         let ret = pyre_object::with_roots!(w_fd, w_offset, w_length => unsafe {
                             majit_rlib::rposix::c_posix_fallocate(fd, offset, length)
@@ -8159,10 +8155,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let offset = pyre_object::with_roots!(w_fd, w_offset, w_length, w_advice =>
                         crate::baseobjspace::int_w(w_offset))?
-                        as libc::off_t;
+                        as majit_rlib::rposix::OFF_T;
                     let length = pyre_object::with_roots!(w_fd, w_offset, w_length, w_advice =>
                         crate::baseobjspace::int_w(w_length))?
-                        as libc::off_t;
+                        as majit_rlib::rposix::OFF_T;
                     let advice = pyre_object::with_roots!(w_fd, w_offset, w_length, w_advice =>
                         crate::baseobjspace::int_w(w_advice))?
                         as majit_rlib::rffi::INT;
@@ -9763,9 +9759,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // `rposix.getpgrp`. `GETPGRP_HAVE_ARG` is false, so `rposix.c_getpgrp`
-        // takes no argument. It saves errno, and `handle_posix_error` reports
-        // a negative result.
+        // `rposix.getpgrp`. `GETPGRP_HAVE_ARG` selects `c_getpgrp(0)` vs
+        // `c_getpgrp()`. The wrapper maps a negative result through
+        // `handle_posix_error`.
         #[cfg(not(feature = "sandbox"))]
         crate::__pyre_put_new!(
             ns_slot,
@@ -9773,13 +9769,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "getpgrp",
                 |_| {
-                    let pgrp = unsafe { majit_rlib::rposix::c_getpgrp() };
-                    if pgrp < 0 {
-                        return Err(io_err(
-                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
-                            "",
-                        ));
-                    }
+                    let pgrp = majit_rlib::rposix::getpgrp()
+                        .map_err(|errno| io_err(std::io::Error::from_raw_os_error(errno), ""))?;
                     Ok(pyre_object::w_int_new(pgrp as i64))
                 },
                 0,
@@ -9850,8 +9841,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // `interp_posix.setpgrp` -> `rposix.setpgrp`. `SETPGRP_HAVE_ARG` is
-        // false, so `rposix.c_setpgrp` takes no argument. The wrapper returns
+        // `interp_posix.setpgrp` -> `rposix.setpgrp`. `SETPGRP_HAVE_ARG`
+        // selects `c_setpgrp(0, 0)` vs `c_setpgrp()`. The wrapper returns
         // None.
         #[cfg(not(feature = "sandbox"))]
         crate::__pyre_put_new!(
@@ -9860,13 +9851,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "setpgrp",
                 |_| {
-                    let ret = unsafe { majit_rlib::rposix::c_setpgrp() };
-                    if ret < 0 {
-                        return Err(io_err(
-                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
-                            "",
-                        ));
-                    }
+                    majit_rlib::rposix::setpgrp()
+                        .map_err(|errno| io_err(std::io::Error::from_raw_os_error(errno), ""))?;
                     Ok(pyre_object::w_none())
                 },
                 0,
@@ -10576,7 +10562,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         fn ftruncate_retry(
             fd: libc::c_int,
-            length: libc::off_t,
+            length: majit_rlib::rposix::OFF_T,
             wrap: impl Fn(i32) -> crate::PyError,
         ) -> Result<(), crate::PyError> {
             // `rposix.c_ftruncate` is `macro=libc::ftruncate`. It releases
@@ -12079,7 +12065,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| {
                     // `rposix.c_times` uses `RFFI_FULL_ERRNO_ZERO` because a
                     // clock_t of -1 is also a successful elapsed count.
-                    let mut tms = std::mem::MaybeUninit::<libc::tms>::zeroed();
+                    let mut tms = std::mem::MaybeUninit::<majit_rlib::rposix::TMS>::zeroed();
                     let ticks = unsafe { majit_rlib::rposix::c_times(tms.as_mut_ptr()) } as i64;
                     if ticks == -1 {
                         let err = majit_rlib::rposix::get_saved_errno();
@@ -12096,10 +12082,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         ));
                     }
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_float_new(tms.tms_utime as f64 / clk));
-                    fields.push(pyre_object::w_float_new(tms.tms_stime as f64 / clk));
-                    fields.push(pyre_object::w_float_new(tms.tms_cutime as f64 / clk));
-                    fields.push(pyre_object::w_float_new(tms.tms_cstime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.c_tms_utime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.c_tms_stime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.c_tms_cutime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.c_tms_cstime as f64 / clk));
                     fields.push(pyre_object::w_float_new(ticks as f64 / clk));
                     Ok(crate::_structseq::new_instance(
                         super::times_result_seq_type(),
@@ -12366,7 +12352,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             // the retry sits above it holding that argument
                             // unchanged, so what a failed call left behind here is
                             // not what the next one starts from.
-                            let mut offset: libc::off_t = offset_i64 as libc::off_t;
+                            let mut offset: majit_rlib::rposix::OFF_T = offset_i64 as majit_rlib::rposix::OFF_T;
                             let res = pyre_object::with_roots!(
                                 w_out_fd, w_in_fd, w_offset, w_count => unsafe {
                                 majit_rlib::rposix::c_sendfile(out_fd, in_fd, &mut offset, count)
@@ -12488,8 +12474,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                     majit_rlib::rposix::sendfile(
                                         out_fd,
                                         in_fd,
-                                        offset_i64 as libc::off_t,
-                                        count_raw as libc::off_t,
+                                        offset_i64 as majit_rlib::rposix::OFF_T,
+                                        count_raw as majit_rlib::rposix::OFF_T,
                                     )
                                 }) {
                                     Ok(n) => {
@@ -12560,8 +12546,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 majit_rlib::rposix::sendfile_hdtr(
                                     out_fd,
                                     in_fd,
-                                    offset_i64 as libc::off_t,
-                                    count as libc::off_t,
+                                    offset_i64 as majit_rlib::rposix::OFF_T,
+                                    count as majit_rlib::rposix::OFF_T,
                                     header_iovs.as_deref(),
                                     trailer_iovs.as_deref(),
                                     flags,
@@ -13451,17 +13437,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "PRIO_PROCESS",
-            pyre_object::w_int_new(libc::PRIO_PROCESS as i64)
+            pyre_object::w_int_new(
+                majit_rlib::rposix::PRIO_PROCESS.expect("missing PRIO_PROCESS") as i64
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
             "PRIO_PGRP",
-            pyre_object::w_int_new(libc::PRIO_PGRP as i64)
+            pyre_object::w_int_new(majit_rlib::rposix::PRIO_PGRP.expect("missing PRIO_PGRP") as i64)
         );
         crate::__pyre_put_new!(
             ns_slot,
             "PRIO_USER",
-            pyre_object::w_int_new(libc::PRIO_USER as i64)
+            pyre_object::w_int_new(majit_rlib::rposix::PRIO_USER.expect("missing PRIO_USER") as i64)
         );
 
         // `posixmodule.c` `pathconf_names` — the `_PC_*` table

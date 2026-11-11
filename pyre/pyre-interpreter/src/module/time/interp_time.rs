@@ -800,10 +800,10 @@ fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef
                     + majit_rlib::rtime::decode_timeval(&rusage.c_ru_stime),
             ));
         }
-        let mut tms = unsafe { std::mem::zeroed::<libc::tms>() };
+        let mut tms = unsafe { std::mem::zeroed::<majit_rlib::rposix::TMS>() };
         let ret = unsafe { majit_rlib::rposix::c_times(&mut tms) };
         if ret as i64 != -1 {
-            let cpu_time = tms.tms_utime as i64 + tms.tms_stime as i64;
+            let cpu_time = tms.c_tms_utime as i64 + tms.c_tms_stime as i64;
             let ticks_per_second = *majit_rlib::rposix::CLOCK_TICKS_PER_SECOND;
             if !w_info.is_null() {
                 setinfo(

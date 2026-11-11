@@ -1,6 +1,7 @@
 //! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
 //! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
-//! `DefinedConstantInteger` CLOCK_*), and `dup3` (`rposix.py` `HAVE_DUP3`)
+//! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
+//! `configure(CConfig)`), and `dup3` (`rposix.py` `HAVE_DUP3`)
 //! probes go through `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -8,7 +9,8 @@
 
 use majit_eci::ExternalCompilationInfo;
 use majit_eci::rffi_platform::{
-    CConfig, CConfigEntry, CConfigSingleEntry, ConfigValue, FieldType, StructLayout, configure,
+    CConfig, CConfigEntry, CConfigSingleEntry, ConfigValue, FieldType, IntType, StructLayout,
+    configure,
 };
 
 /// `clibffi.py` `base_names`.
@@ -39,6 +41,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rtime_have_gettimeofday)");
     println!("cargo:rustc-check-cfg=cfg(rtime_gettimeofday_no_tz)");
     println!("cargo:rustc-check-cfg=cfg(rtime_have_ftime)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_utimes)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_getpgrp_have_arg)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_setpgrp_have_arg)");
     let have_dup3 = have_dup3();
     majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
@@ -52,6 +57,7 @@ fn main() {
     }
     if target_is_unix_or_windows() {
         write_rdynload_cconfig();
+        write_rposix_cconfig();
     }
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
@@ -71,6 +77,33 @@ const RDYNLOAD_RTLD_NAMES: &[&str] = &[
     "RTLD_NODELETE",
     "RTLD_NOLOAD",
     "RTLD_DEEPBIND",
+];
+
+/// `rposix.py` `CConfig` `DefinedConstantInteger` names (unix and Windows).
+const RPOSIX_DEFINED_CONSTANTS: [&str; 15] = [
+    "SEEK_SET",
+    "SEEK_CUR",
+    "SEEK_END",
+    "PRIO_PROCESS",
+    "PRIO_PGRP",
+    "PRIO_USER",
+    "SCHED_FIFO",
+    "SCHED_RR",
+    "SCHED_OTHER",
+    "SCHED_BATCH",
+    "O_NONBLOCK",
+    "F_LOCK",
+    "F_TLOCK",
+    "F_ULOCK",
+    "F_TEST",
+];
+
+/// `rposix.py` `CConfig` `Has` names (unix and Windows).
+const RPOSIX_HAVE_NAMES: [&str; 4] = [
+    "HAVE_UTIMES",
+    "HAVE_D_TYPE",
+    "HAVE_FALLOCATE",
+    "HAVE_FADVISE",
 ];
 
 /// `rdynload.py` `CConfig` / `configure(CConfig)`. The probe ECI is
@@ -127,6 +160,234 @@ fn write_rdynload_cconfig() {
     }
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rdynload_cconfig.rs");
+    std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+}
+
+/// `rposix.py` `_ptyh`.
+fn rposix_ptyh(target_os: &str) -> &'static str {
+    match target_os {
+        "macos" | "ios" | "netbsd" | "openbsd" => "util.h",
+        "freebsd" => "libutil.h",
+        _ => "pty.h",
+    }
+}
+
+/// `rposix.py` `CConfig` / `configure(CConfig)` / `globals().update(config)`.
+/// The probe ECI is `rposix.eci`.
+fn write_rposix_cconfig() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
+    let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
+    let (includes, libraries) = if windows {
+        (
+            vec![
+                "io.h".into(),
+                "sys/utime.h".into(),
+                "sys/types.h".into(),
+                "process.h".into(),
+                "time.h".into(),
+                "direct.h".into(),
+                "Windows.h".into(),
+            ],
+            vec![],
+        )
+    } else {
+        let mut includes = vec![
+            "unistd.h".into(),
+            "sys/types.h".into(),
+            "sys/wait.h".into(),
+            "utime.h".into(),
+            "sys/time.h".into(),
+            "sys/times.h".into(),
+            "sys/resource.h".into(),
+            "sched.h".into(),
+            "grp.h".into(),
+            "dirent.h".into(),
+            "sys/stat.h".into(),
+            "fcntl.h".into(),
+            "signal.h".into(),
+            "sys/utsname.h".into(),
+            rposix_ptyh(&target_os).into(),
+        ];
+        if target_os == "linux" || target_os == "android" {
+            includes.push("sys/sysmacros.h".into());
+        }
+        if target_os == "freebsd" || target_os == "openbsd" {
+            includes.push("sys/ttycom.h".into());
+        }
+        (includes, vec!["util".into()])
+    };
+
+    let mut entries = Vec::new();
+    for name in RPOSIX_DEFINED_CONSTANTS {
+        entries.push((
+            name.to_string(),
+            CConfigEntry::DefinedConstantInteger(name.into()),
+        ));
+    }
+    entries.push(("OFF_T".into(), CConfigEntry::simple_type("off_t")));
+    entries.push(("OFF_T_SIZE".into(), CConfigEntry::SizeOf("off_t".into())));
+    // `UNDERSCORE_ON_WIN32`: `struct _utimbuf` on Windows, `struct utimbuf` else.
+    let utimbuf_c_name = if windows {
+        "struct _utimbuf"
+    } else {
+        "struct utimbuf"
+    };
+    entries.push((
+        "UTIMBUF".into(),
+        CConfigEntry::struct_type(
+            utimbuf_c_name,
+            vec![
+                ("actime".into(), FieldType::int()),
+                ("modtime".into(), FieldType::int()),
+            ],
+            None,
+        ),
+    ));
+    entries.push(("CLOCK_T".into(), CConfigEntry::simple_type("clock_t")));
+    entries.push((
+        "_HAVE_STRUCT_TERMIOS_C_ISPEED".into(),
+        CConfigEntry::Defined("_HAVE_STRUCT_TERMIOS_C_ISPEED".into()),
+    ));
+    entries.push((
+        "_HAVE_STRUCT_TERMIOS_C_OSPEED".into(),
+        CConfigEntry::Defined("_HAVE_STRUCT_TERMIOS_C_OSPEED".into()),
+    ));
+    if unix {
+        entries.push(("UID_T".into(), CConfigEntry::simple_type("uid_t")));
+        entries.push(("GID_T".into(), CConfigEntry::simple_type("gid_t")));
+        entries.push(("ID_T".into(), CConfigEntry::simple_type("id_t")));
+        entries.push((
+            "TIOCGWINSZ".into(),
+            CConfigEntry::DefinedConstantInteger("TIOCGWINSZ".into()),
+        ));
+        entries.push((
+            "NCCS".into(),
+            CConfigEntry::DefinedConstantInteger("NCCS".into()),
+        ));
+        entries.push((
+            "TMS".into(),
+            CConfigEntry::struct_type(
+                "struct tms",
+                vec![
+                    ("tms_utime".into(), FieldType::int()),
+                    ("tms_stime".into(), FieldType::int()),
+                    ("tms_cutime".into(), FieldType::int()),
+                    ("tms_cstime".into(), FieldType::int()),
+                ],
+                None,
+            ),
+        ));
+    }
+
+    let cconfig = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes,
+            libraries,
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![
+            (
+                "HAVE_UTIMES".into(),
+                CConfigSingleEntry::Has("utimes".into()),
+            ),
+            (
+                "HAVE_D_TYPE".into(),
+                CConfigSingleEntry::Has("DT_UNKNOWN".into()),
+            ),
+            (
+                "HAVE_FALLOCATE".into(),
+                CConfigSingleEntry::Has("posix_fallocate".into()),
+            ),
+            (
+                "HAVE_FADVISE".into(),
+                CConfigSingleEntry::Has("posix_fadvise".into()),
+            ),
+            (
+                "GETPGRP_HAVE_ARG".into(),
+                CConfigSingleEntry::Has("getpgrp(0)".into()),
+            ),
+            (
+                "SETPGRP_HAVE_ARG".into(),
+                CConfigSingleEntry::Has("setpgrp(0, 0)".into()),
+            ),
+        ],
+    };
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
+    let mut text = String::from(
+        "// rposix.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
+    );
+    for name in RPOSIX_DEFINED_CONSTANTS {
+        emit_option_i32(&mut text, name, cconfig_lookup(&results, name));
+    }
+    emit_simple_type(&mut text, "OFF_T", cconfig_lookup(&results, "OFF_T"));
+    emit_size(
+        &mut text,
+        "OFF_T_SIZE",
+        cconfig_lookup(&results, "OFF_T_SIZE"),
+    );
+    for name in RPOSIX_HAVE_NAMES {
+        emit_bool(&mut text, name, cconfig_lookup(&results, name));
+    }
+    text.push_str(
+        &struct_layout("UTIMBUF", cconfig_lookup(&results, "UTIMBUF"))
+            .rust_struct_source("UTIMBUF", &[]),
+    );
+    emit_simple_type(&mut text, "CLOCK_T", cconfig_lookup(&results, "CLOCK_T"));
+    emit_bool(
+        &mut text,
+        "_HAVE_STRUCT_TERMIOS_C_ISPEED",
+        cconfig_lookup(&results, "_HAVE_STRUCT_TERMIOS_C_ISPEED"),
+    );
+    emit_bool(
+        &mut text,
+        "_HAVE_STRUCT_TERMIOS_C_OSPEED",
+        cconfig_lookup(&results, "_HAVE_STRUCT_TERMIOS_C_OSPEED"),
+    );
+    if unix {
+        emit_simple_type(&mut text, "UID_T", cconfig_lookup(&results, "UID_T"));
+        emit_simple_type(&mut text, "GID_T", cconfig_lookup(&results, "GID_T"));
+        emit_simple_type(&mut text, "ID_T", cconfig_lookup(&results, "ID_T"));
+        emit_option_i32(
+            &mut text,
+            "TIOCGWINSZ",
+            cconfig_lookup(&results, "TIOCGWINSZ"),
+        );
+        emit_option_i32(&mut text, "NCCS", cconfig_lookup(&results, "NCCS"));
+        text.push_str(
+            &struct_layout("TMS", cconfig_lookup(&results, "TMS")).rust_struct_source("TMS", &[]),
+        );
+    }
+    emit_bool(
+        &mut text,
+        "GETPGRP_HAVE_ARG",
+        cconfig_lookup(&results, "GETPGRP_HAVE_ARG"),
+    );
+    emit_bool(
+        &mut text,
+        "SETPGRP_HAVE_ARG",
+        cconfig_lookup(&results, "SETPGRP_HAVE_ARG"),
+    );
+
+    match cconfig_lookup(&results, "HAVE_UTIMES") {
+        ConfigValue::Bool(true) => println!("cargo:rustc-cfg=rposix_have_utimes"),
+        ConfigValue::Bool(false) => {}
+        other => panic!("HAVE_UTIMES: {other:?}"),
+    }
+    match cconfig_lookup(&results, "GETPGRP_HAVE_ARG") {
+        ConfigValue::Bool(true) => println!("cargo:rustc-cfg=rposix_getpgrp_have_arg"),
+        ConfigValue::Bool(false) => {}
+        other => panic!("GETPGRP_HAVE_ARG: {other:?}"),
+    }
+    match cconfig_lookup(&results, "SETPGRP_HAVE_ARG") {
+        ConfigValue::Bool(true) => println!("cargo:rustc-cfg=rposix_setpgrp_have_arg"),
+        ConfigValue::Bool(false) => {}
+        other => panic!("SETPGRP_HAVE_ARG: {other:?}"),
+    }
+
+    let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("rposix_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
 }
 
@@ -406,6 +667,27 @@ fn emit_option_i32(text: &mut String, name: &str, value: &ConfigValue) {
 fn emit_bool(text: &mut String, name: &str, value: &ConfigValue) {
     match value {
         ConfigValue::Bool(b) => text.push_str(&format!("pub const {name}: bool = {b};\n")),
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+fn emit_simple_type(text: &mut String, name: &str, value: &ConfigValue) {
+    match value {
+        ConfigValue::Type(IntType { signed, bits }) => {
+            let ty = if *signed {
+                format!("i{bits}")
+            } else {
+                format!("u{bits}")
+            };
+            text.push_str(&format!("pub type {name} = {ty};\n"));
+        }
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+fn emit_size(text: &mut String, name: &str, value: &ConfigValue) {
+    match value {
+        ConfigValue::Size(n) => text.push_str(&format!("pub const {name}: usize = {n};\n")),
         other => panic!("{name}: {other:?}"),
     }
 }

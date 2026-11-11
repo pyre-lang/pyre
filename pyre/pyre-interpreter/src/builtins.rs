@@ -25768,7 +25768,8 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         {
             // `rposix.c_ftruncate` is `macro=libc::ftruncate`. It releases
             // the GIL and saves errno. `SuppressIPH` is empty on unix.
-            let result = unsafe { majit_rlib::rposix::c_ftruncate(fd, size as libc::off_t) };
+            let result =
+                unsafe { majit_rlib::rposix::c_ftruncate(fd, size as majit_rlib::rposix::OFF_T) };
             if result < 0 {
                 return Err(fd_errno_err(majit_rlib::rposix::get_saved_errno()));
             }
