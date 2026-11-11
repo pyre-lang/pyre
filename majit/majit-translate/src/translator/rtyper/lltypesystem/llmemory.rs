@@ -923,7 +923,11 @@ fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
     primitive_byte_size_for(ty, word, crate::layout::target_signed_size() as i64)
 }
 
-fn primitive_byte_size_for(ty: &LowLevelType, word: i64, signed: i64) -> Result<i64, String> {
+pub(crate) fn primitive_byte_size_for(
+    ty: &LowLevelType,
+    word: i64,
+    signed: i64,
+) -> Result<i64, String> {
     match ty {
         LowLevelType::Signed | LowLevelType::Unsigned => Ok(signed),
         LowLevelType::Address => Ok(word),

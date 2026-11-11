@@ -16430,7 +16430,7 @@ fn array_of_lltype_identity(
     array_of_lltype_identity_for(of, crate::layout::target_signed_size())
 }
 
-fn array_of_lltype_identity_for(
+pub(crate) fn array_of_lltype_identity_for(
     of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     signed_size: usize,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
@@ -16662,6 +16662,14 @@ fn try_array_item_spelling(
         },
         _ => return None,
     })
+}
+
+/// Spelling [`try_array_item_spelling`] gives `ARRAY.OF`. A scalar field
+/// uses the same map (`Signed` → `isize`, `SignedLongLong` → `i64`).
+pub(crate) fn lltype_item_spelling(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<String> {
+    try_array_item_spelling(of)
 }
 
 /// `ARRAY = op.args[0].concretetype.TO` (`Transformer.rewrite_op_getarrayitem`).
