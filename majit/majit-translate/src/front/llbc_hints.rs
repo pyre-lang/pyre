@@ -974,81 +974,96 @@ fn push_minted_exception_row(
     hosts.push(host.clone());
 }
 
-/// Rust source for `$OUT_DIR/minted_exception_classes.rs`.
+/// `NameManager` `global_prefix` (`gensupp.py` `NameManager.__init__`).
+/// A first claim of an intern key is this prefix plus the key after
+/// `C_IDENTIFIER`.
+const MINTED_EXC_PREFIX: &str = "MINTED_EXC_";
+
+/// `NameManager.uniquename` `lenmax` (`gensupp.py`). Upstream's default
+/// is 50. The render-test keys (`synth::E::B`, `Arg::TooManyMethod`)
+/// and a `_destructor` companion are shorter than that. A longer key is
+/// cut by `basename[:lenmax]` before `C_IDENTIFIER`.
+/// `NameManager._ensure_unique` still separates two keys that share the
+/// truncated basename.
+const MINTED_EXC_NAME_LENMAX: usize = 50;
+
+/// Rust source for the minted exception class table.
 ///
-/// Included inside the module that defines `MintedExceptionClass`, so
-/// the table uses that short name. An empty `rows` is an empty table.
-/// Two keys that sanitize to one ident panic here, in the build script.
+/// Included in the module that defines `MintedExceptionClass`, so the
+/// table uses that short name. An empty `rows` is an empty table.
+/// One `NameManager` (`gensupp.py`) claims each static and each
+/// `_destructor` companion, walking `rows` in order. `global_prefix`
+/// is `MINTED_EXC_` and `number_sep` is `_`. `C_IDENTIFIER` folds every
+/// non-identifier byte to `_` inside `NameManager.uniquename`.
+/// `with_number` is false: these basenames are not the `v` / `w_`
+/// generated-variable prefixes. A basename already in `seennames` — a
+/// sanitized collision or an earlier companion — comes back with the
+/// `_N` suffix from `NameManager._ensure_unique`.
+///
+/// Every emitted `static` and `fn` name is `MINTED_EXC_` plus a
+/// `NameManager.uniquename` claim. The including module defines no
+/// `MINTED_EXC_`-prefixed item, so the table and the module's names
+/// sit outside the claimed namespace.
 pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> String {
     if rows.is_empty() {
         return "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n".to_string();
     }
-    let mut idents = Vec::with_capacity(rows.len());
-    let mut out = String::new();
+    let mut names = crate::translator::gensupp::NameManager::new(MINTED_EXC_PREFIX, "_");
+    let mut defs = String::new();
+    let mut table =
+        String::from("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
     for row in rows {
-        let ident = minted_exception_class_ident(&row.name);
-        if ident == "MINTED_EXCEPTION_CLASSES" || idents.iter().any(|existing| existing == &ident) {
-            panic!(
-                "minted exception class ident collision: {ident} from `{}`",
-                row.name
-            );
-        }
-        idents.push(ident);
-    }
-    for (row, ident) in rows.iter().zip(&idents) {
-        let destructor = format!("{ident}_destructor");
-        if destructor == "MINTED_EXCEPTION_CLASSES"
-            || idents.iter().any(|existing| existing == &destructor)
-        {
-            panic!(
-                "minted exception class ident collision: {destructor} from `{}`",
-                row.name
-            );
-        }
-        out.push_str(&format!(
+        // `NameManager.uniquename` (`gensupp.py`). The companion is
+        // claimed for every row, emitted or not, so a later ident
+        // cannot take `{bare}_destructor`.
+        let (bare, ident) = names.uniquename_bare(&row.name, Some(false), MINTED_EXC_NAME_LENMAX);
+        let destructor_name = names.uniquename(
+            &format!("{bare}_destructor"),
+            Some(false),
+            MINTED_EXC_NAME_LENMAX,
+        );
+        defs.push_str(&format!(
             "static {ident}: pyre_object::PyType = pyre_object::pyobject::new_pytype(\"{}\");\n",
             escape_rust_string(&row.name)
         ));
-        if row.raw_owned.is_empty() {
-            continue;
-        }
-        out.push_str(&format!(
-            "unsafe fn {destructor}(obj_addr: usize) {{\n    unsafe {{\n"
-        ));
-        for raw in &row.raw_owned {
-            if raw.type_path.is_empty() {
-                panic!(
-                    "minted exception class `{}` raw-owned attr has an empty type path",
-                    row.name
-                );
-            }
-            out.push_str(&format!(
-                "        drop_raw_owned_attr::<{}>(obj_addr, {});\n",
-                raw.type_path, raw.offset
+        let emit_destructor = !row.raw_owned.is_empty();
+        if emit_destructor {
+            defs.push_str(&format!(
+                "unsafe fn {destructor_name}(obj_addr: usize) {{\n    unsafe {{\n"
             ));
+            for raw in &row.raw_owned {
+                if raw.type_path.is_empty() {
+                    panic!(
+                        "minted exception class `{}` raw-owned attr has an empty type path",
+                        row.name
+                    );
+                }
+                defs.push_str(&format!(
+                    "        drop_raw_owned_attr::<{}>(obj_addr, {});\n",
+                    raw.type_path, raw.offset
+                ));
+            }
+            defs.push_str("    }\n}\n");
         }
-        out.push_str("    }\n}\n");
-    }
-    out.push_str("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
-    for (row, ident) in rows.iter().zip(&idents) {
+        let destructor_field = if emit_destructor {
+            format!("Some({destructor_name})")
+        } else {
+            "None".to_string()
+        };
         let parent = match row.parent {
             None => "None".to_string(),
             Some(parent) => format!("Some({parent})"),
         };
-        let destructor = if row.raw_owned.is_empty() {
-            "None".to_string()
-        } else {
-            format!("Some({ident}_destructor)")
-        };
         let offsets = render_gc_ptr_offsets(&row.gc_ptr_offsets);
-        out.push_str(&format!(
-            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor} }},\n",
+        table.push_str(&format!(
+            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor_field} }},\n",
             escape_rust_string(&row.name),
             size = row.size,
         ));
     }
-    out.push_str("];\n");
-    out
+    defs.push_str(&table);
+    defs.push_str("];\n");
+    defs
 }
 
 /// `&[]` or `&[16, 32]`. The slice is a static promotion inside the
@@ -1063,21 +1078,6 @@ fn render_gc_ptr_offsets(offsets: &[usize]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{body}]")
-}
-
-/// `MINTED_EXC_` plus the intern key, with every non-alphanumeric byte
-/// replaced by `_`. Deterministic. The caller panics when two keys share
-/// the result.
-pub fn minted_exception_class_ident(name: &str) -> String {
-    let mut ident = String::from("MINTED_EXC_");
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            ident.push(ch);
-        } else {
-            ident.push('_');
-        }
-    }
-    ident
 }
 
 fn escape_rust_string(text: &str) -> String {
@@ -2598,6 +2598,144 @@ mod tests {
         extend_program_exception_class_hints(
             &mut acc,
             harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&second)),
+        );
+    }
+
+    fn minted_emit(name: &str, raw_owned: bool) -> super::MintedExceptionClassEmit {
+        super::MintedExceptionClassEmit {
+            name: name.to_string(),
+            parent: None,
+            size: 0,
+            gc_ptr_offsets: Vec::new(),
+            raw_owned: if raw_owned {
+                vec![super::MintedRawOwnedDrop {
+                    offset: 8,
+                    type_path: "fixture::Signature".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// `pkg::E::A` and `pkg::E__A` both sanitize to `pkg__E__A`.
+    /// `NameManager.uniquename` keeps the first claim and gives the
+    /// second the `_1` suffix from `NameManager._ensure_unique`.
+    #[test]
+    fn minted_exception_sanitized_collision_uses_uniquename_suffix() {
+        let rows = vec![
+            minted_emit("pkg::E::A", true),
+            minted_emit("pkg::E__A", true),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert_eq!(src, super::render_minted_exception_classes_rs(&rows));
+        let first = src
+            .find("static MINTED_EXC_pkg__E__A:")
+            .expect("first ident");
+        let second = src
+            .find("static MINTED_EXC_pkg__E__A_1:")
+            .expect("second ident");
+        assert!(first < second, "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A,"), "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A_1,"), "{src}");
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_1_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("destructor: Some(MINTED_EXC_pkg__E__A_destructor)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("destructor: Some(MINTED_EXC_pkg__E__A_1_destructor)"),
+            "{src}"
+        );
+    }
+
+    /// A later intern key that sanitizes to an earlier row's
+    /// `_destructor` companion gets its own `_1` suffix.
+    #[test]
+    fn minted_exception_destructor_claim_disambiguates_later_ident() {
+        let rows = vec![
+            minted_emit("pkg::E::A", true),
+            minted_emit("pkg::E::A_destructor", false),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("static MINTED_EXC_pkg__E__A_destructor_1:"),
+            "{src}"
+        );
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A,"), "{src}");
+        assert!(
+            src.contains("pytype: &MINTED_EXC_pkg__E__A_destructor_1,"),
+            "{src}"
+        );
+        assert!(
+            !src.contains("static MINTED_EXC_pkg__E__A_destructor:"),
+            "{src}"
+        );
+    }
+
+    /// Item name on a rendered `static` or `fn` line.
+    fn rendered_item_ident(line: &str) -> Option<&str> {
+        let rest = [
+            "pub unsafe fn ",
+            "pub static ",
+            "pub fn ",
+            "unsafe fn ",
+            "static ",
+            "fn ",
+        ]
+        .into_iter()
+        .find_map(|prefix| line.strip_prefix(prefix))?;
+        let end = rest.find(|ch: char| ch == ':' || ch == '(')?;
+        Some(&rest[..end])
+    }
+
+    /// `MINTED_EXCEPTION_CLASSES`, `MintedExceptionClass`, and
+    /// `EPTION_CLASSES` still emit only `MINTED_EXC_` `static` and `fn`
+    /// idents. `MINTED_EXCEPTION_CLASSES` is defined once, as the table.
+    #[test]
+    fn minted_exception_row_idents_keep_the_prefix() {
+        let rows = vec![
+            minted_emit("MINTED_EXCEPTION_CLASSES", true),
+            minted_emit("MintedExceptionClass", true),
+            minted_emit("EPTION_CLASSES", true),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        let mut statics = 0usize;
+        let mut fns = 0usize;
+        for line in src.lines() {
+            let Some(ident) = rendered_item_ident(line) else {
+                continue;
+            };
+            if line.starts_with("static ") {
+                statics += 1;
+            } else if line.starts_with("unsafe fn ") || line.starts_with("fn ") {
+                fns += 1;
+            } else {
+                continue;
+            }
+            assert!(ident.starts_with("MINTED_EXC_"), "{ident}\n{src}");
+        }
+        assert_eq!(statics, rows.len(), "{src}");
+        assert_eq!(fns, rows.len(), "{src}");
+        let definitions: Vec<&str> = src
+            .lines()
+            .filter(|line| rendered_item_ident(line) == Some("MINTED_EXCEPTION_CLASSES"))
+            .collect();
+        assert_eq!(
+            definitions,
+            ["pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &["],
+            "{src}"
         );
     }
 }
