@@ -1449,6 +1449,28 @@ jobs:
       run: |
         sudo sysctl -w vm.overcommit_memory=1 || echo "note: could not relax overcommit; fork-heavy modules may report ENOMEM"
         ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 600
+    - name: Print macOS crash reports
+      # A pyre binary killed by a signal leaves only `exited -11` in the
+      # runner output above. macOS's ReportCrash writes the faulting thread's
+      # frames, registers and the binary's load address to
+      # DiagnosticReports/<process>-<timestamp>.ips; print every pyre report
+      # the job produced so the crash can be located from the log alone.
+      if: ${{ failure() && runner.os == 'macOS' }}
+      shell: bash
+      run: |
+        shopt -s nullglob
+        reports=(~/Library/Logs/DiagnosticReports/pyre*.ips /Library/Logs/DiagnosticReports/pyre*.ips)
+        if [ ${#reports[@]} -eq 0 ]; then
+          echo "no pyre crash reports"
+          ls -la ~/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports 2>&1 || true
+          exit 0
+        fi
+        for report in "${reports[@]}"; do
+          echo "::group::$report"
+          cat "$report"
+          echo
+          echo "::endgroup::"
+        done
 
   pyre-check-macos:
     name: pyre/check.py ${{ matrix.label }} (macos-latest)
