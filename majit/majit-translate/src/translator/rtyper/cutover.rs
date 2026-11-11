@@ -4117,10 +4117,10 @@ fn declared_return_annotation(
     if let Some(cell) = bk.transparent_scalar_annotation(root) {
         return Some(cell);
     }
-    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
-    // the same shell FieldRead and a `raw:<owner>` token already use.
-    // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
-    // (`llannotation.py` pairtype(SomePtr, SomeObject).union).
+    // A by-value `rffi.py` `CStruct` is Ptr of that struct
+    // (`history.getkind`), the same shell FieldRead and a `raw:<owner>`
+    // token already use. A Rust-repr aggregate is `rclass.py`
+    // `getinstancerepr` (SomeInstance).
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
@@ -19329,7 +19329,16 @@ mod tests {
                 "ty": i64_ty(),
                 "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
             }]},
-            "src": "Normal"
+            "src": "Normal",
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "C", "transparent": false}
+                }
+            }]
         });
         let file = serde_json::json!({
             "charon_version": "0.1.201",

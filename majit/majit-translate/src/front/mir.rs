@@ -4647,18 +4647,27 @@ fn register_type_alias_struct(
     }
 }
 
-/// Record every spelling of an ADT whose fields are raw words.
-/// `GcKind::Raw` also covers classed structs that are not GC headers
-/// (a strategy singleton, a type object). Those stay instances.
+/// Record every spelling of an ADT that is lltype raw storage
+/// (`rffi.py` `CStruct` / `adt_def_is_raw_storage`). Flavor-raw
+/// classes (`rclass.py` `getgcflavor`) and Rust-repr aggregates
+/// (`rclass.py` `getinstancerepr`) stay instances.
 fn note_raw_word_owner(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     td: &TypeDecl,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+    if !adt_def_is_raw_storage(
+        td.def_id,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        &mut stack,
+    ) {
         return;
     }
     let name = td.item_meta.name_path();
@@ -5413,6 +5422,7 @@ fn derive_program_metadata(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
             );
             note_declared_gc_owner(&mut struct_fields, td, gc_struct_ids);
         }

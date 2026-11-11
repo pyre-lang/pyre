@@ -6,7 +6,7 @@ use super::{
     is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
     json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
     json_ty_packed_copy_struct_byte_size, json_ty_scalar_element_spelling, no_immutable_fields,
-    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
+    no_raw_alloc_flavor, no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
     raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
     tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
     tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
@@ -26,9 +26,10 @@ use majit_charon_reader::{
 };
 
 use crate::front::mir::tests::{
-    adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
-    code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span,
-    fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
+    adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, c_layout,
+    call_leafs, code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc,
+    fixture_span, fixture_ty, graph_ops, i64_field, i64_ty, ident_path, interior_c_struct,
+    interior_i64, interior_meta, interior_struct, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, opaque_type_decl, option_adt_node, option_adt_node_from_types,
     option_enum, option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node,
@@ -750,7 +751,14 @@ fn utf8str_pointee_is_not_a_raw_word() {
     });
     let gc = std::collections::HashSet::new();
     assert!(
-        !super::pointee_is_raw_word(&node, &llbc, &gc),
+        !super::pointee_is_raw_word(
+            &node,
+            &llbc,
+            &gc,
+            no_immutable_fields(),
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "Utf8Str pointee is rstr STR, not a raw word"
     );
 }
@@ -765,12 +773,18 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
         "kind": {"Struct": []}
     });
-    let lookalike = serde_json::json!({
-        "def_id": 1,
-        "item_meta": window_meta(&["other", "Utf8Str"], true),
-        "kind": {"Struct": []}
-    });
-    let owner_rstr = struct_decl(
+    let mut lookalike = struct_decl(
+        1,
+        ident_path(&["other", "Utf8Str"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    lookalike["layout"] = c_layout();
+    let mut owner_rstr = struct_decl(
         2,
         ident_path(&["fixture", "RstrOwner"]),
         serde_json::json!([{
@@ -780,7 +794,8 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         }]),
         false,
     );
-    let owner_other = struct_decl(
+    owner_rstr["layout"] = c_layout();
+    let mut owner_other = struct_decl(
         3,
         ident_path(&["fixture", "OtherOwner"]),
         serde_json::json!([{
@@ -790,6 +805,7 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         }]),
         false,
     );
+    owner_other["layout"] = c_layout();
     let llbc = window_llbc(vec![utf8, lookalike, owner_rstr, owner_other], vec![]);
     let adt = |id: u64| {
         serde_json::json!({
@@ -799,20 +815,34 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     assert!(
-        !super::pointee_is_raw_word(&adt(0), &llbc, &gc),
+        !super::pointee_is_raw_word(
+            &adt(0),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "unicodeobject::Utf8Str is rstr STR"
     );
     assert!(
-        super::pointee_is_raw_word(&adt(1), &llbc, &gc),
+        super::pointee_is_raw_word(
+            &adt(1),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "other::Utf8Str is not rstr STR"
     );
     assert!(
-        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of *mut unicodeobject::Utf8Str is not raw storage"
     );
     assert!(
-        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of *mut other::Utf8Str is classified by its own declaration"
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "repr(C) owner of *mut other::Utf8Str is raw storage"
     );
 }
 
@@ -5332,7 +5362,7 @@ fn charon_ref_renders_ampersand_prefix() {
 /// the prefix is erased. Top-level `&T` still strips.
 #[test]
 fn option_of_ref_to_raw_storage_keeps_ampersand() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5342,6 +5372,7 @@ fn option_of_ref_to_raw_storage_keeps_ampersand() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let opt_ref_raw = option_adt_node(0, option_shared_ref(adt_node(1)));
@@ -5381,7 +5412,7 @@ fn option_of_ref_to_raw_storage_keeps_ampersand() {
 /// `RootScope::get`).
 #[test]
 fn enum_payload_of_ref_to_raw_storage_is_int() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5391,6 +5422,7 @@ fn enum_payload_of_ref_to_raw_storage_is_int() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let tomb = no_tombstoned_leaves();
@@ -5428,7 +5460,7 @@ fn enum_payload_of_ref_to_raw_storage_is_int() {
 /// `call_once` read share `Tuple<&RawCell>` (`render_adt_type_args`).
 #[test]
 fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         0,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5438,6 +5470,7 @@ fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![raw], vec![]);
     let payload = TyRef::Other(option_shared_ref(adt_node(0)));
     assert_eq!(
@@ -5454,13 +5487,16 @@ fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
     );
 }
 
-/// Charon `monomorphize:false`: a field typed `Option<Raw>` is the
-/// Option template plus type args. The template (TypeVar payload) is
-/// not raw storage; the instantiation is, so the owner is too.
+/// Charon `monomorphize:false`: a field typed `Option<RawCell>` is the
+/// Option template plus type args. `rclass.py` `getinstancerepr`: a
+/// payload-carrying Rust-repr enum (the template and the `Option<CStruct>`
+/// instantiation) is a tagged class, not lltype raw storage. `rffi.py`
+/// `CStruct`: `RawCell` itself and a repr(C) owner whose only field is
+/// `*mut RawCell` are raw storage.
 #[test]
-fn option_instantiation_of_raw_payload_is_a_raw_word() {
+fn option_instantiation_of_c_struct_payload_is_a_tagged_instance() {
     let option = option_enum(0);
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5470,39 +5506,52 @@ fn option_instantiation_of_raw_payload_is_a_raw_word() {
         }]),
         false,
     );
-    let owner = struct_decl(
+    raw["layout"] = c_layout();
+    let mut owner = struct_decl(
         2,
         ident_path(&["fixture", "OwnerBag"]),
         serde_json::json!([{
             "name": "cell",
-            "ty": option_adt_node(0, adt_node(1)),
+            "ty": {"RawPtr": [adt_node(1), "Mut"]},
             "attr_info": null
         }]),
         false,
     );
+    owner["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option, raw, owner], vec![]);
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     assert!(
-        !adt_def_is_raw_storage(0, &llbc, &gc, immut, &mut Vec::new()),
-        "Option TypeDecl template (TypeVar payload) is not raw storage"
+        !adt_def_is_raw_storage(0, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "Option TypeDecl template (TypeVar payload) is getinstancerepr"
     );
     let inst = TyRef::Other(option_adt_node(0, adt_node(1)));
     assert!(
-        field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
-        "Option<RawCell> instantiation is a raw word"
+        !field_ty_is_raw_word(
+            &inst,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new()
+        ),
+        "Option<RawCell> instantiation is getinstancerepr, not a raw word"
     );
     assert!(
-        adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of Option<RawCell> is raw storage"
+        adt_def_is_raw_storage(1, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "RawCell is rffi.py CStruct raw storage"
+    );
+    assert!(
+        adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "repr(C) owner of *mut RawCell is raw storage"
     );
 }
 
 /// Nested `Option<Option<&T>>` re-enters the Option def by value.
-/// `lltype.py` `Struct._first_struct` classifies from the declared field
-/// types, so a GC referent is not raw storage and a raw referent is.
+/// `rclass.py` `getinstancerepr`: the payload-carrying instantiation is
+/// an instance for a GC referent and for a raw one.
 #[test]
-fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
+fn option_of_option_of_ref_is_not_raw_storage() {
     let option = option_enum(0);
     let gc_t = struct_decl(
         1,
@@ -5510,7 +5559,7 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
         serde_json::json!([]),
         false,
     );
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         2,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5520,6 +5569,7 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let nested = |inner: serde_json::Value| option_adt_node(0, option_adt_node(0, inner));
     let owner_gc = struct_decl(
         3,
@@ -5551,20 +5601,34 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
     let inst_gc = TyRef::Other(nested(option_shared_ref(adt_node(1))));
     let inst_raw = TyRef::Other(nested(option_shared_ref(adt_node(2))));
     assert!(
-        !field_ty_is_raw_word(&inst_gc, &llbc, &gc, immut, &mut Vec::new()),
+        !field_ty_is_raw_word(
+            &inst_gc,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "Option<Option<&PyObject>> is not a raw word"
     );
     assert!(
-        !adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Option<Option<&PyObject>> is not raw storage"
     );
     assert!(
-        field_ty_is_raw_word(&inst_raw, &llbc, &gc, immut, &mut Vec::new()),
-        "Option<Option<&RawCell>> is a raw word"
+        !field_ty_is_raw_word(
+            &inst_raw,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
+        "Option<Option<&RawCell>> is getinstancerepr, not a raw word"
     );
     assert!(
-        adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of Option<Option<&RawCell>> is raw storage"
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "Rust-repr owner of Option<Option<&RawCell>> is not raw storage"
     );
 }
 
@@ -5592,11 +5656,18 @@ fn option_instantiation_of_scalar_payload_is_not_a_raw_word() {
         serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
     ));
     assert!(
-        !field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        !field_ty_is_raw_word(
+            &inst,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new()
+        ),
         "Option<i64> instantiation stays the tagged Instance intern"
     );
     assert!(
-        !adt_def_is_raw_storage(1, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(1, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Option<i64> is not raw storage"
     );
 }
@@ -5635,7 +5706,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let raw_cell = struct_decl(
+    let mut raw_cell = struct_decl(
         3,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5645,6 +5716,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
+    raw_cell["layout"] = c_layout();
     let classed_ptr = serde_json::json!({"RawPtr": [adt_node(2), "Mut"]});
     let raw_ptr = serde_json::json!({"RawPtr": [adt_node(3), "Mut"]});
     let owner_of_classed = struct_decl(
@@ -5657,7 +5729,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let owner_of_raw = struct_decl(
+    let mut owner_of_raw = struct_decl(
         5,
         ident_path(&["fixture", "RawPtrOwner"]),
         serde_json::json!([{
@@ -5667,7 +5739,8 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let owner_of_scalar = struct_decl(
+    owner_of_raw["layout"] = c_layout();
+    let mut owner_of_scalar = struct_decl(
         6,
         ident_path(&["fixture", "ScalarAtomicOwner"]),
         serde_json::json!([{
@@ -5677,6 +5750,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
+    owner_of_scalar["layout"] = c_layout();
     let view = struct_decl(
         7,
         ident_path(&["fixture", "AtomicPtrView"]),
@@ -5711,7 +5785,14 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     let raw = |ty: serde_json::Value| {
-        field_ty_is_raw_word(&TyRef::Other(ty), &llbc, &gc, immut, &mut Vec::new())
+        field_ty_is_raw_word(
+            &TyRef::Other(ty),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        )
     };
     assert!(
         raw(atomic_of(1, u32_ty)),
@@ -5730,27 +5811,27 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         "&Atomic<*mut ClassedInst> is the same stored word as the Atomic"
     );
     assert!(
-        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "classed instance with a Vec field is not raw storage"
     );
     assert!(
-        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "RawCell of one integer is raw storage"
     );
     assert!(
-        !adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of AtomicPtr to a classed instance is not a raw-word owner"
     );
     assert!(
-        adt_def_is_raw_storage(5, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(5, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of AtomicPtr to a storage-raw ADT is a raw-word owner"
     );
     assert!(
-        adt_def_is_raw_storage(6, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(6, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Atomic<u32> is a raw-word owner"
     );
     assert!(
-        !adt_def_is_raw_storage(7, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(7, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "borrowed view of AtomicPtr to a classed instance is not a raw-word owner"
     );
 }
@@ -5781,7 +5862,7 @@ fn option_of_ref_to_integer_word_erases_ampersand() {
         }]),
         true,
     );
-    let raw_word = struct_decl(
+    let mut raw_word = struct_decl(
         3,
         ident_path(&["fixture", "RawWord"]),
         serde_json::json!([{
@@ -5791,6 +5872,7 @@ fn option_of_ref_to_integer_word_erases_ampersand() {
         }]),
         false,
     );
+    raw_word["layout"] = c_layout();
     let llbc = llbc_with_types(
         "fixture",
         vec![option_enum(0), inner, outer, raw_word],
@@ -11668,7 +11750,7 @@ fn raw_store_struct(def_id: u64) -> serde_json::Value {
             "size": 16,
             "align": 8,
             "variant_layouts": [{"field_offsets": [0, 8]}],
-            "repr": {"transparent": false}
+            "repr": {"repr_algo": "C", "transparent": false}
         }
     }]);
     decl
@@ -11694,7 +11776,7 @@ fn raw_storage_enum(def_id: u64, payload_id: u64) -> serde_json::Value {
             "size": 16,
             "align": 8,
             "variant_layouts": [{"field_offsets": [0]}],
-            "repr": {"transparent": false}
+            "repr": {"repr_algo": "C", "transparent": false}
         }
     }]);
     decl
@@ -11731,6 +11813,7 @@ fn tagged_outer_option_of_niche_raw_enum_borrow_is_not_raw_address() {
             &llbc,
             &empty_gc,
             super::no_immutable_fields(),
+            no_raw_alloc_flavor(),
             &mut stack
         ),
         "RawEnum with a raw-struct payload is storage-raw"
@@ -15956,7 +16039,13 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
             2,
             &["fixture", "Sized"],
             serde_json::json!({"Struct": []}),
-            Some(serde_json::json!([{"key": "any", "value": {"size": 8}}])),
+            Some(serde_json::json!([{
+                "key": "any",
+                "value": {
+                    "size": 8,
+                    "repr": {"repr_algo": "C", "transparent": false}
+                }
+            }])),
         ),
         ty(
             3,
@@ -16925,5 +17014,198 @@ fn struct_item_gcarray_unknown_pointer_field_declines() {
         )
         .is_none(),
         "undecidable pointer ITEM field must decline"
+    );
+}
+
+fn adt_is_raw_storage(
+    llbc: &Llbc,
+    def_id: u64,
+    flavor: &std::collections::HashSet<String>,
+) -> bool {
+    adt_def_is_raw_storage(
+        def_id,
+        llbc,
+        &std::collections::HashSet::new(),
+        no_immutable_fields(),
+        flavor,
+        &mut Vec::new(),
+    )
+}
+
+fn enum_type_decl(
+    def_id: u64,
+    path: &[&str],
+    variants: serde_json::Value,
+    repr_algo: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, true),
+        "kind": {"Enum": variants},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 1,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"repr_algo": repr_algo, "transparent": false}
+            }
+        }]
+    })
+}
+
+fn fieldless_variants() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": "A",
+            "fields": [],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        },
+        {
+            "name": "B",
+            "fields": [],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+        }
+    ])
+}
+
+/// A Rust-repr data-carrying struct is `rclass.py` `getinstancerepr`,
+/// not lltype raw storage.
+#[test]
+fn rust_repr_data_struct_is_not_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "RootedItems"],
+            &[("len", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "Rust-repr RootedItems must not be lltype raw storage"
+    );
+}
+
+/// `repr_algo == "C"` with raw-word fields is `rffi.py` `CStruct`.
+#[test]
+fn repr_c_struct_is_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_c_struct(
+            0,
+            &["fixture", "timespec"],
+            &[("tv_sec", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "repr(C) timespec must be lltype raw storage"
+    );
+}
+
+/// A fieldless enum is the discriminant integer, including under Rust repr.
+#[test]
+fn fieldless_enum_stays_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![enum_type_decl(
+            0,
+            &["fixture", "Ordering"],
+            fieldless_variants(),
+            "Rust",
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "fieldless enum stays the discriminant integer"
+    );
+}
+
+/// Zero-variant enum (`libc::DIR`) is an FFI opaque with no constructible value.
+#[test]
+fn zero_variant_enum_is_ffi_opaque_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![enum_type_decl(
+            0,
+            &["libc", "DIR"],
+            serde_json::json!([]),
+            "Rust",
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "Enum([]) FFI opaque is lltype raw storage"
+    );
+}
+
+/// `_alloc_flavor_ = raw` stays `InstanceRepr` (`rclass.py` `getgcflavor`)
+/// even when the TypeDecl is `repr(C)`.
+#[test]
+fn flavor_raw_class_is_excluded_from_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_c_struct(
+            0,
+            &["fixture", "MapNodeOverlay"],
+            &[("word", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "repr(C) overlay is storage-raw without the flavor set"
+    );
+    let mut flavor = std::collections::HashSet::new();
+    flavor.insert("fixture::MapNodeOverlay".to_string());
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, &flavor),
+        "flavor-raw class is excluded from lltype raw storage"
+    );
+}
+
+/// Registered transparent scalar (`external_transparent_scalar_kinds` /
+/// `CodeFlags`): Rust-repr struct whose Charon layout records
+/// `transparent: false`. The registry is that missing flag; the type
+/// stays the inner word (`IntegerRepr.rtype_or_`).
+#[test]
+fn registered_transparent_scalar_stays_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "CodeFlags"],
+            &[("bits", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "unregistered Rust-repr flag struct is getinstancerepr"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::CodeFlags".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "registered transparent scalar stays the inner word"
     );
 }

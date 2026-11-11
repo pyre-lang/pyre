@@ -758,10 +758,10 @@ pub(crate) fn raw_struct_ptr_from_layout(
     if registry.transparent_scalar_kind(class_root).is_some() {
         return None;
     }
-    // `GcKind::Raw` is every struct that is not on the GC field-0 chain.
-    // A dict strategy or a type object is still an instance; only a
-    // word-storage ADT is `SomePtr`. An empty set is a fixture that never
-    // harvested owners, so the gckind test below stays in force.
+    // Only lltype raw storage (`rffi.py` `CStruct`) is `SomePtr`. A
+    // Rust-repr class is `rclass.py` `getinstancerepr`. An empty set is
+    // a fixture that never harvested owners, so the gckind test below
+    // stays in force.
     if !registry.raw_word_owners.is_empty() && !registry.raw_word_owner_contains(class_root) {
         return None;
     }
@@ -781,12 +781,12 @@ pub(crate) fn raw_struct_ptr_from_layout(
 
 /// Interned `Ptr(Struct raw)` of a harvested storage-raw enum base.
 ///
-/// `derive_subject_inputcells` seeds `&MappedObj` (`as_ptr` / `len` `self`)
+/// `derive_subject_inputcells` seeds `&CStruct` (`rffi.py` `CStruct`)
 /// through [`raw_struct_ptr_from_layout`] → [`owner_ll_container`] once
 /// CallControl layouts exist. An enum base's only harvest row is
-/// `__discriminant` (`derive_program_metadata`; `rclass.py`
-/// `getinstancerepr`). Lowering holds that registry and not the layout
-/// table, so the intern is the tag row and `GcKind::Raw`.
+/// `__discriminant` (`derive_program_metadata`). Lowering holds that
+/// registry and not the layout table, so the intern is the tag row and
+/// `GcKind::Raw`. A Rust-repr enum is `rclass.py` `getinstancerepr`.
 pub(crate) fn raw_enum_base_ptr_lltype(
     registry: &crate::front::StructFieldRegistry,
     class_root: &str,
@@ -4598,6 +4598,9 @@ impl Bookkeeper {
             // named-field projection. Named raw fields (`mapped`,
             // `sin_addr`) and FUNC.ARGS `&Raw` are not positional and
             // stay SomePtr either way.
+            // Named `rffi.py` `CStruct` fields and FUNC.ARGS `&CStruct`
+            // stay SomePtr. A Rust-repr aggregate is `rclass.py`
+            // `getinstancerepr` (SomeInstance).
             //
             // A closure capture is the captured value, not a variant
             // constructor: `__cast_instance_intrinsic` / FUNC.ARGS of a
@@ -5935,17 +5938,12 @@ impl Bookkeeper {
             if is_direct_pointer_word_spelling(inner) && matches!(s_inner, SomeValue::Ptr(_)) {
                 return s_inner;
             }
-            // Leading `Option<…>` is the RPython nullable-payload field
-            // spelling. Charon path-qualified `option::Option<…>` is the
-            // tagged instantiation (`getuniqueclassdef`).
-            if !spelling_starts_with_adt(stripped, "Option") {
-                return self.project_tagged_enum_instantiation(stripped);
-            }
-            // The Option is the one-word nullable payload exactly when
-            // `union(payload, s_None)` succeeds (`model.py`
-            // `SomeObject.noneify` raising `UnionError` for annotations
-            // that cannot hold None); otherwise it is the split tagged
-            // enum instance.
+            // `Option<T>`, `option::Option<T>`, and `core::option::Option<T>`
+            // share one intern via `strip_generic_leaf`. The Option is the
+            // one-word nullable payload exactly when `union(payload, s_None)`
+            // succeeds (`model.py` `SomeObject.noneify` raising `UnionError`
+            // for annotations that cannot hold None); otherwise it is the
+            // split tagged enum instance (`getuniqueclassdef`).
             let s_none = super::model::s_none();
             match super::model::unionof([&s_inner, &s_none]) {
                 Ok(s) => return s,
@@ -6152,13 +6150,12 @@ impl Bookkeeper {
         if !registered {
             return SomeValue::Impossible;
         }
-        // A by-value raw struct is Ptr of a Raw Struct:
+        // A by-value `rffi.py` `CStruct` is Ptr of a Raw Struct
+        // (`lltype.Struct._gckind = 'raw'`):
         // `history.getkind` Ptr(raw) → "int";
         // `jtransform.rewrite_op_getfield` `_gckind=='raw'` → getfield_raw;
         // `rewrite_op_getsubstruct` → int_add(ptr, ofs).
-        // SomeInstance here made dual-gate report legacy=Signed, real=GcRef
-        // on a nested FieldRead (MappedObj payload, sockaddr_in.sin_addr,
-        // RootScope, StrKey).
+        // A Rust-repr aggregate is `rclass.py` `getinstancerepr` (default gc).
         if let Some(s_ptr) = self.raw_struct_ptr_annotation(named_root.as_ref()) {
             return s_ptr;
         }
@@ -8137,14 +8134,6 @@ fn strip_generic_leaf<'a>(input: &'a str, leaf: &str) -> Option<&'a str> {
     (head_leaf == leaf).then_some(&rest[..rest.len() - 1])
 }
 
-/// Payload of `Option<T>`, including `option::Option<…>` /
-/// `core::option::Option<…>`. `None` when the spelling is not that ADT
-/// or has no single type argument.
-fn option_payload_spelling(spelling: &str) -> Option<&str> {
-    let args = adt_generic_args(spelling, "Option")?;
-    (args.len() == 1).then_some(args[0].trim())
-}
-
 /// Type arguments of a `Result<T, E>` spelling, including
 /// `result::Result<…>` / `core::result::Result<…>`. `None` when the
 /// spelling is not that ADT.
@@ -8198,17 +8187,6 @@ fn adt_generic_args<'a>(spelling: &'a str, leaf: &str) -> Option<Vec<&'a str>> {
 /// `>` of a `->` token in a fn-pointer spelling, not a generic closer.
 fn is_thin_arrow_gt(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'>') && i > 0 && bytes[i - 1] == b'-'
-}
-
-/// `Leaf<…>` with no module path. Path-qualified Charon spellings
-/// (`option::Option<…>`) are a different constructor.
-fn spelling_starts_with_adt(spelling: &str, leaf: &str) -> bool {
-    let t = spelling
-        .trim()
-        .trim_start_matches('&')
-        .trim_start_matches("mut ")
-        .trim();
-    t.starts_with(leaf) && t.as_bytes().get(leaf.len()) == Some(&b'<')
 }
 
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
@@ -10072,23 +10050,23 @@ mod tests {
     #[test]
     fn option_and_result_spellings_peel_path_prefix_not_variant_suffix() {
         assert_eq!(
-            option_payload_spelling("Option<fn() -> i64>"),
+            strip_generic_leaf("Option<fn() -> i64>", "Option"),
             Some("fn() -> i64")
         );
         assert_eq!(
-            option_payload_spelling("option::Option<fn() -> i64>"),
+            strip_generic_leaf("option::Option<fn() -> i64>", "Option"),
             Some("fn() -> i64")
         );
         assert_eq!(
-            option_payload_spelling("core::option::Option<fn(&[u8]) -> i64>"),
+            strip_generic_leaf("core::option::Option<fn(&[u8]) -> i64>", "Option"),
             Some("fn(&[u8]) -> i64")
         );
         assert_eq!(
-            option_payload_spelling("core::option::Option<usize>"),
+            strip_generic_leaf("core::option::Option<usize>", "Option"),
             Some("usize")
         );
         assert_eq!(
-            option_payload_spelling("option::Option<Vec<u8>>::Some"),
+            strip_generic_leaf("option::Option<Vec<u8>>::Some", "Option"),
             None
         );
         assert!(result_generic_args("core::result::Result<(),PyError>").is_some());
@@ -18967,11 +18945,13 @@ mod tests {
     }
 
     #[test]
-    fn qualified_option_of_fn_ptr_is_someptr_not_integer() {
+    fn qualified_option_of_fn_ptr_field_is_impossible_not_integer() {
         // After `field_row_struct_identity` remaps Enum, `Option<fn>` is
-        // `option::Option<fn(...)>`. That spelling is the nullable
-        // `Ptr(FuncType)` (`lltype.py` `FuncType` / `getfunctionptr`), not
-        // the Int-bank FORCE shell (`valuetype_to_someshell(Int)`).
+        // `option::Option<fn(...)>`. `fn_ptr_somevalue_for_spelling` peels
+        // that to `Ptr(FuncType)` (`lltype.py` `FuncType` / `getfunctionptr`).
+        // A struct field of the same spelling is Impossible until setattr
+        // (`classdesc.py` `ClassDef.generalize_attr`), not Integer and not
+        // SomePtr, and not the Int-bank FORCE shell (`valuetype_to_someshell(Int)`).
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 
@@ -18988,11 +18968,14 @@ mod tests {
         );
         let bk = bk();
         let projected = bk.project_struct_field_type(spelling);
-        crate::annotator::model::union(&s, &projected)
-            .expect("project of option::Option<fn> unions with the fn-pointer seed");
         assert!(
-            matches!(bk.by_value_payload_annotation(spelling), SomeValue::Ptr(_)),
-            "dest CAST of option::Option<fn> intern's the same SomePtr"
+            matches!(projected, SomeValue::Impossible),
+            "project_struct_field_type of option::Option<fn> is Impossible (not Integer, not SomePtr), got {projected:?}"
+        );
+        let dest = bk.by_value_payload_annotation(spelling);
+        assert!(
+            matches!(dest, SomeValue::Impossible),
+            "by_value_payload_annotation of option::Option<fn> is Impossible (not Integer, not SomePtr), got {dest:?}"
         );
 
         crate::annotator::classdesc::register_struct_fields(
@@ -19013,9 +18996,18 @@ mod tests {
             .attrs
             .get("profilefunc")
             .expect("profilefunc attr present");
+        let force = crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Int,
+        );
         assert!(
-            matches!(slot.s_value, SomeValue::Ptr(_)),
-            "option::Option<fn> field must replace the Int FORCE shell with SomePtr, got {:?}",
+            matches!(slot.s_value, SomeValue::Impossible),
+            "option::Option<fn> field is Impossible, not an Integer FORCE shell, got {:?}",
+            slot.s_value
+        );
+        assert_ne!(
+            Some(&slot.s_value),
+            force.as_ref(),
+            "option::Option<fn> field is not an Integer FORCE shell, got {:?}",
             slot.s_value
         );
     }

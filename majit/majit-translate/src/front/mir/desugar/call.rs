@@ -10138,6 +10138,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     self.immutable_fields,
+                    &self.raw_alloc_flavor_structs,
                     &mut raw_stack,
                 ) {
                     let owner = td
