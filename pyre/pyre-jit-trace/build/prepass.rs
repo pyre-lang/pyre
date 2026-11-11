@@ -1415,6 +1415,7 @@ fn real_main() {
                     // `_do_extend_from_iterable` and cuts at `jit_merge_point`.
                     // The registered jitcode is `list_extend_portal_portal`.
                     split_portal: true,
+                    extends: None,
                 },
                 majit_translate::JitDriverSpec {
                     // `functional.py` `filter_jitdriver`.
@@ -1448,6 +1449,7 @@ fn real_main() {
                     // `_filter_jitdriver` and cuts at `jit_merge_point`.
                     // The registered jitcode is `filter_jitdriver_portal_portal`.
                     split_portal: true,
+                    extends: None,
                 },
                 majit_translate::JitDriverSpec {
                     // `generator.py` `_create_unpack_into` for `unpack_into_w`.
@@ -1473,6 +1475,7 @@ fn real_main() {
                     // `unpack_into_w` and cuts at `jit_merge_point`.
                     // The registered jitcode is `unpack_into_w_portal_portal`.
                     split_portal: true,
+                    extends: None,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

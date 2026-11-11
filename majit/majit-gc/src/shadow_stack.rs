@@ -1512,9 +1512,7 @@ pub fn depth() -> usize {
 }
 
 /// Collector corruption report: name whether `slot_addr` sits in the GcRef shadow stack
-/// buffer, `OWNER_ROOTS`, a `BH_REGS_STACK` bank, or a pooled `BH_INTERP_ROOTS`
-/// field. `walk_bh_regs` already holds those `RefCell`s, so BH matching uses
-/// `as_ptr()` — a nested `borrow()` would panic inside the GC BUG dump.
+/// buffer or in `OWNER_ROOTS`. Both walks share `extra_area=shadow_stack`.
 pub fn describe_root_slot(slot_addr: usize) -> String {
     let ss = SHADOW_STACK.with(|ss| {
         let base = ss.base.get() as usize;
@@ -1549,135 +1547,7 @@ pub fn describe_root_slot(slot_addr: usize) -> String {
         let in_or = ptr != 0 && slot_addr >= ptr && slot_addr < ptr.saturating_add(bytes);
         format!("or_ptr={ptr:#x} or_len={len} or_bytes={bytes} or_contains={in_or}")
     });
-    // KEEP-UNTIL-PRODUCT-FIX: jitframe+176 poison is a BH Ref slot;
-    // `blackhole.py` traces `registers_r` / `tmpreg_r` / `exception_last_value`
-    // / `virtualizable_ptr` for the interpreter object's whole life.
-    let bh = describe_bh_root_slot(slot_addr);
-    format!("{ss} {oroot} {bh}")
-}
-
-fn describe_bh_live_ctx(ctx: *const ()) -> String {
-    if ctx.is_null() {
-        return "ctx=null".to_string();
-    }
-    match BH_INTERP_DESCRIBE.get() {
-        Some(f) => f(ctx),
-        None => format!("ctx={ctx:p}"),
-    }
-}
-
-fn i64_slot_preview(ptr: *const i64, len: usize) -> String {
-    let n = len.min(12);
-    let mut s = String::new();
-    for i in 0..n {
-        if i > 0 {
-            s.push(',');
-        }
-        let v = unsafe { *ptr.add(i) };
-        s.push_str(&format!("{v:#x}"));
-    }
-    if len > n {
-        s.push_str(&format!(",+{}", len - n));
-    }
-    s
-}
-
-fn match_i64_range(slot_addr: usize, base: usize, len: usize, label: &str) -> Option<String> {
-    if len == 0 || base == 0 {
-        return None;
-    }
-    let bytes = len.saturating_mul(std::mem::size_of::<i64>());
-    if slot_addr >= base && slot_addr < base.saturating_add(bytes) {
-        let idx = (slot_addr - base) / std::mem::size_of::<i64>();
-        let val = unsafe { *(base as *const i64).add(idx) };
-        let preview = i64_slot_preview(base as *const i64, len);
-        Some(format!(
-            "{label}[{idx}] vec_len={len} val={val:#x} r=[{preview}]"
-        ))
-    } else {
-        None
-    }
-}
-
-fn match_i64_ptr(slot_addr: usize, ptr: *mut i64, label: &str) -> Option<String> {
-    if ptr.is_null() || slot_addr != ptr as usize {
-        return None;
-    }
-    let val = unsafe { *ptr };
-    Some(format!("{label} val={val:#x}"))
-}
-
-fn describe_bh_root_slot(slot_addr: usize) -> String {
-    let mut out = String::new();
-    BH_REGS_STACK.with(|ss| {
-        let entries = unsafe { &*ss.as_ptr() };
-        out.push_str(&format!("bh_regs_n={}", entries.len()));
-        for (e, entry) in entries.iter().enumerate() {
-            let ctx = describe_bh_live_ctx(entry.live_ctx);
-            if let Some(hit) = match_i64_range(
-                slot_addr,
-                entry.regs_ptr as usize,
-                entry.regs_len,
-                &format!("bh_regs[{e}].r"),
-            )
-            .or_else(|| match_i64_ptr(slot_addr, entry.tmpreg_ptr, &format!("bh_regs[{e}].tmpreg")))
-            .or_else(|| match_i64_ptr(slot_addr, entry.exc_ptr, &format!("bh_regs[{e}].exc")))
-            {
-                out.push(' ');
-                out.push_str(&hit);
-                out.push(' ');
-                out.push_str(&ctx);
-            }
-        }
-    });
-    BH_INTERP_ROOTS.with(|roots| {
-        let entries = unsafe { &*roots.as_ptr() };
-        out.push_str(&format!(" bh_interp_n={}", entries.len()));
-        let mut hit = false;
-        for (e, entry) in entries.iter().enumerate() {
-            let ctx = describe_bh_live_ctx(entry.live_ctx);
-            let mut found = None;
-            if !entry.regs.is_null() {
-                let regs = unsafe { &*entry.regs };
-                found = match_i64_range(
-                    slot_addr,
-                    regs.as_ptr() as usize,
-                    regs.len(),
-                    &format!("bh_interp[{e}].r"),
-                );
-            }
-            if found.is_none() {
-                found = match_i64_ptr(
-                    slot_addr,
-                    entry.tmpreg_ptr,
-                    &format!("bh_interp[{e}].tmpreg"),
-                )
-                .or_else(|| match_i64_ptr(slot_addr, entry.exc_ptr, &format!("bh_interp[{e}].exc")))
-                .or_else(|| {
-                    match_i64_ptr(slot_addr, entry.vable_ptr, &format!("bh_interp[{e}].vable"))
-                });
-            }
-            if let Some(found) = found {
-                hit = true;
-                out.push(' ');
-                out.push_str(&found);
-                out.push(' ');
-                out.push_str(&ctx);
-            }
-        }
-        if !hit {
-            for (e, entry) in entries.iter().take(4).enumerate() {
-                let vec_len = if entry.regs.is_null() {
-                    0
-                } else {
-                    unsafe { (*entry.regs).len() }
-                };
-                out.push_str(&format!(" interp[{e}].vec_r={vec_len} "));
-                out.push_str(&describe_bh_live_ctx(entry.live_ctx));
-            }
-        }
-    });
-    out
+    format!("{ss} {oroot}")
 }
 
 /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
@@ -2003,20 +1873,9 @@ pub type BhLiveRefsFn = unsafe fn(*const (), *mut i64, usize);
 
 static BH_LIVE_REFS: std::sync::OnceLock<BhLiveRefsFn> = std::sync::OnceLock::new();
 
-/// Panic-time dump of a pooled `BlackholeInterpreter` from `live_ctx`.
-/// KEEP-UNTIL-PRODUCT-FIX: names jitcode/pc when a BH slot is the GC BUG root.
-pub type BhInterpDescribeFn = fn(*const ()) -> String;
-
-static BH_INTERP_DESCRIBE: std::sync::OnceLock<BhInterpDescribeFn> = std::sync::OnceLock::new();
-
 /// Install the collection-time Ref liveness filter. First registration wins.
 pub fn register_bh_live_refs(f: BhLiveRefsFn) {
     let _ = BH_LIVE_REFS.set(f);
-}
-
-/// Install the panic-time BH interpreter dumper. First registration wins.
-pub fn register_bh_interp_describe(f: BhInterpDescribeFn) {
-    let _ = BH_INTERP_DESCRIBE.set(f);
 }
 
 fn apply_bh_live_refs(ctx: *const (), regs: *mut i64, len: usize) {

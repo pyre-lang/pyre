@@ -453,13 +453,6 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     match get_eval_fn()(frame, None) {
         Ok(value) => value,
         Err(error) => {
-            if std::env::var_os("PYRE_JD4_DEBUG").is_some() {
-                eprintln!(
-                    "[evalraw] plain={} frame={:p} err={error}",
-                    is_force_plain_eval(),
-                    frame as *mut PyFrame,
-                );
-            }
             set_call_error(error);
             PY_NULL
         }

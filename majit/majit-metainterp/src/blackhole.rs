@@ -2771,54 +2771,6 @@ fn sync_raise_position(bh: &mut BlackholeInterpreter, err: &DispatchError) {
     }
 }
 
-/// KEEP-UNTIL-PRODUCT-FIX: `describe_root_slot` live_ctx dumper.
-/// `live_ctx` is the `BlackholeInterpreter` `acquire_interp_new` registered.
-pub fn describe_bh_interp_ctx(ctx: *const ()) -> String {
-    if ctx.is_null() {
-        return "bh=null".to_string();
-    }
-    // SAFETY: `register_bh_interp_with_live` stores `&mut BlackholeInterpreter`
-    // until `Drop` unregisters the same box.
-    let bh = unsafe { &*(ctx as *const BlackholeInterpreter) };
-    let idx = bh.jitcode.try_index();
-    let last_live = if bh.last_live_pc == usize::MAX {
-        "none".to_string()
-    } else {
-        bh.last_live_pc.to_string()
-    };
-    let (n_r, n_i) = if bh.jitcode.try_body().is_some() {
-        (bh.jitcode.num_regs_r(), bh.jitcode.num_regs_i())
-    } else {
-        (0, 0)
-    };
-    let nprev = bh.registers_r.len().min(8);
-    let mut rprev = String::new();
-    for (i, v) in bh.registers_r.iter().take(nprev).enumerate() {
-        if i > 0 {
-            rprev.push(',');
-        }
-        rprev.push_str(&format!("{v:#x}"));
-    }
-    if bh.registers_r.len() > nprev {
-        rprev.push_str(&format!(",+{}", bh.registers_r.len() - nprev));
-    }
-    format!(
-        "jitcode={} idx={idx:?} pos={} last_op={} entry={} last_live={last_live} \
-         n_r={n_r} n_i={n_i} vec_r={} vec_i={} rooted={} vable={:#x} tmpreg_r={:#x} \
-         exc={:#x} r=[{rprev}]",
-        bh.jitcode.name(),
-        bh.position,
-        bh.last_opcode_position,
-        bh.entry_position,
-        bh.registers_r.len(),
-        bh.registers_i.len(),
-        bh.rooted,
-        bh.virtualizable_ptr as u64,
-        bh.tmpreg_r as u64,
-        bh.exception_last_value as u64,
-    )
-}
-
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
         Self {
@@ -13544,22 +13496,21 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (`assembler.py _genop_same_as` / `trace_cast_ptr_to_int`).
-/// Upstream `ll_assert((i & 1) == 1)` checks an AddressAsInt tagged
-/// immediate. pyre's codewriter also emits this op for untagged GCREF
-/// round-trips (`arith.rs` `CastPtrToInt`), which the walker and
-/// assembler already accept as a live heap pointer.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity on the bits.
+/// Upstream carries `ll_assert((i & 1) == 1)`: the op only ever sees a
+/// tagged immediate there. `jtransform.rs` `coerce_operand_to_int`
+/// also emits this op for an untagged GCREF at an integer site, and
+/// `generator_invoke_execute_frame` reaches one under blackhole resume,
+/// so the assert is not carried until that recovery helper is retired.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast
-/// (`assembler.py _genop_same_as` / `trace_cast_int_to_ptr`).
-/// Upstream `ll_assert((i & 1) == 1)` checks an AddressAsInt tagged
-/// immediate; pyre also round-trips untagged GCREF bits
-/// (`arith.rs` `CastIntToPtr`).
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
+/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
+/// before it is reinterpreted as a `GCREF`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
+    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

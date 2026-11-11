@@ -6358,11 +6358,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // `walk_bh_regs` drops Ref registers that marker does not name
     // (`cleanup_registers` runs only at `release_interp`).
     majit_gc::shadow_stack::register_bh_live_refs(pyre_jit_trace::state::retain_live_ref_registers);
-    // KEEP-UNTIL-PRODUCT-FIX: panic-time `describe_root_slot` names
-    // `bh_interp[e].r[idx]` plus jitcode/pc through this hook.
-    majit_gc::shadow_stack::register_bh_interp_describe(
-        majit_metainterp::blackhole::describe_bh_interp_ctx,
-    );
     // warmspot.py handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.
@@ -10320,48 +10315,10 @@ fn drive_list_extend_trace(
 
     let dbg = std::env::var_os("PYRE_JD3_DEBUG").is_some();
     if dbg {
-        let pinned = pyre_object::gc_roots::shadow_stack_get(portal_root_base as usize);
-        unsafe {
-            let ob_type = if w_iterator.is_null() {
-                std::ptr::null()
-            } else {
-                (*w_iterator).ob_type
-            };
-            let word0 = if w_iterator.is_null() {
-                0usize
-            } else {
-                *(w_iterator as *const usize)
-            };
-            eprintln!(
-                "[jd3] root_base={portal_root_base} count={count} \
-                 w_iterator={:p} itype={} is_list={} is_range={} is_dict_view={} \
-                 get(root)={:p} gtype={} same_ptr={} \
-                 ob_type={:p} word0={:x} LIST_ITER={:p} RANGE_ONE={:p} DICT_ITEM={:p} \
-                 word0_eq_ob_type={} ob_type_eq_range_one={}",
-                w_iterator,
-                pyre_object::type_name_of(w_iterator),
-                pyre_object::is_list_iter(w_iterator),
-                pyre_object::is_range_iter(w_iterator),
-                pyre_object::dictmultiobject::is_dict_view_iterator(w_iterator),
-                pinned,
-                if pinned.is_null() {
-                    "<null>"
-                } else {
-                    pyre_object::type_name_of(pinned)
-                },
-                pinned == w_iterator,
-                ob_type,
-                word0,
-                std::ptr::from_ref(&pyre_object::iterobject::LIST_ITER_TYPE),
-                std::ptr::from_ref(&pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE),
-                std::ptr::from_ref(&pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE),
-                word0 == ob_type as usize,
-                std::ptr::eq(
-                    ob_type,
-                    std::ptr::from_ref(&pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE,)
-                ),
-            );
-        }
+        eprintln!(
+            "[jd3] root_base={portal_root_base} count={count} \
+             w_iterator={w_iterator:p} w_list={w_list:p}"
+        );
     }
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
@@ -10819,15 +10776,6 @@ fn drive_filter_trace(
         pyre_jit_trace::state::install_build_time_jitcode_at(drain_index, payload);
     }
     if std::env::var_os("PYRE_JD4_DUMP").is_some() {
-        eprintln!(
-            "[jd4dump] name={} global_pool={}",
-            jitcode.name(),
-            jitcode.uses_global_descr_pool()
-        );
-        eprintln!(
-            "[jd4dump] regs_i={} regs_r={} constants_i={:x?}",
-            canonical.c_num_regs_i, canonical.c_num_regs_r, canonical.constants_i
-        );
         for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
             let end = op.next_pc.min(canonical.code.len());
             let operands = &canonical.code[(op.pc + 1).min(end)..end];
@@ -10835,77 +10783,6 @@ fn drive_filter_trace(
                 "[jd4dump] pc={} {} /{} operands={:?}",
                 op.pc, op.opname, op.argcodes, operands
             );
-            if !(op.opname.contains("residual_call") || op.opname.contains("inline_call")) {
-                continue;
-            }
-            let mut cursor = 0usize;
-            let mut chars = op.argcodes.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    'i' | 'c' | 'r' | 'f' => cursor += 1,
-                    'd' | 'j' => {
-                        if cursor + 1 < operands.len() {
-                            let idx =
-                                operands[cursor] as usize | ((operands[cursor + 1] as usize) << 8);
-                            let label = match jitcode.descr_at(idx) {
-                                Some(majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc)) => {
-                                    format!("JitCode {}", jc.name())
-                                }
-                                Some(
-                                    majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(w),
-                                ) => format!(
-                                    "JitCodeBackEdge {}",
-                                    w.upgrade()
-                                        .map(|j| j.name().to_string())
-                                        .unwrap_or_default()
-                                ),
-                                Some(d) => match d.as_bh_descr() {
-                                    Some(majit_metainterp::jitcode::CanonicalBhDescr::Call {
-                                        calldescr,
-                                    }) => format!(
-                                        "Call args={} result={} oopspec={:?}",
-                                        calldescr.arg_classes,
-                                        calldescr.result_type,
-                                        calldescr.extra_info.oopspecindex
-                                    ),
-                                    Some(
-                                        majit_metainterp::jitcode::CanonicalBhDescr::JitCode {
-                                            jitcode_index,
-                                            calldescr,
-                                            ..
-                                        },
-                                    ) => {
-                                        let name =
-                                            pyre_jit_trace::jitcode_runtime::get_jitcode_by_index(
-                                                *jitcode_index,
-                                            )
-                                            .map(|j| j.name.clone())
-                                            .unwrap_or_else(|| "<unloaded>".into());
-                                        format!(
-                                            "BhJitCode idx={jitcode_index} name={name} args={}",
-                                            calldescr.arg_classes
-                                        )
-                                    }
-                                    Some(other) => format!("{other:?}"),
-                                    None => format!("{d:?}"),
-                                },
-                                None => "missing".into(),
-                            };
-                            eprintln!("[jd4dump]   descr[{idx}] {label}");
-                        }
-                        cursor += 2;
-                    }
-                    'I' | 'R' | 'F' => {
-                        let n = operands.get(cursor).copied().unwrap_or(0) as usize;
-                        cursor += 1 + n;
-                    }
-                    '>' => {
-                        let _ = chars.next();
-                        cursor += 1;
-                    }
-                    _ => break,
-                }
-            }
         }
         return None;
     }

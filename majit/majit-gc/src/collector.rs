@@ -6027,7 +6027,6 @@ impl MiniMarkGC {
             } else {
                 unsafe { (*header_of(holder_addr)).tid_and_flags }
             };
-            // KEEP-UNTIL-PRODUCT-FIX: leftover-B holder tid 868 had no name.
             let holder_layout = if holder_addr == 0 {
                 "layout=none".to_string()
             } else {

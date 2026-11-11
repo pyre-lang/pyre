@@ -7665,6 +7665,25 @@ impl<'a> ResumeDataDirectReader<'a> {
         self._prepare_next_section(info, bh, vinfo);
     }
 
+    /// resume.py `_prepare_next_section(self, info)`.
+    ///
+    /// ```python
+    /// def _prepare_next_section(self, info):
+    ///     from rpython.jit.codewriter.jitcode import enumerate_vars
+    ///     enumerate_vars(info,
+    ///             self.metainterp_sd.liveness_info,
+    ///             self._callback_i,
+    ///             self._callback_r,
+    ///             self._callback_f,
+    ///             self.unique_id)
+    /// ```
+    ///
+    /// `self.all_liveness` shadows `self.metainterp_sd.liveness_info` —
+    /// the shared packed buffer that `enumerate_vars` indexes with
+    /// `info`. The three callbacks still call `next_int`/`next_ref`/
+    /// `next_float` on this reader (resume.py), matching
+    /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
+    /// write_a_float` (resume.py).
     fn _prepare_next_section(
         &mut self,
         info: usize,
@@ -7713,8 +7732,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 // resume.py `_callback_r`: `write_a_ref(index, next_ref())`.
-                let tagged = self.resumecodereader.next_item_bound() as i16;
-                let value = self.finish_ref_slot(tagged);
+                let value = self.next_ref();
                 bh.registers_r[reg_idx as usize] = value;
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);

@@ -17755,11 +17755,10 @@ const filter_driver: FilterJitDriver = FilterJitDriver;
 /// `portal_runner`).
 ///
 /// `dont_look_inside`: `W_Filter.next_w` unrolls one iteration then *calls*
-/// `_filter_jitdriver`. Inlining this portal into a parent Python trace
-/// puts the search loop's GCREFs on that trace's JITFRAME (`gcmap` slot
-/// at byte 320 was a nursery-BAD after `filterfalse_hold` then
-/// `takewhile_hold`). The filter driver still traces
-/// `filter_jitdriver_portal_portal`.
+/// `_filter_jitdriver`, whose `while True` is a backedge without
+/// `_jit_unroll_safe_`. `policy.py look_inside_graph` rejects a graph that
+/// `contains_loop`, so a parent Python trace sees a residual call. The
+/// filter driver still traces `filter_jitdriver_portal_portal`.
 #[majit_macros::dont_look_inside]
 fn filter_jitdriver(w_iterable: PyObjectRef, w_predicate: PyObjectRef, reverse: bool) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();

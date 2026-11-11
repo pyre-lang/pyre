@@ -49,21 +49,6 @@ use crate::decline::gate::{
     WRAPPER_FAMILY as WRAPPER_FAMILY_GATE,
 };
 
-thread_local! {
-    static COMPILING_GRAPH: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Graph `jtransform` is rewriting on this thread. `getcalldescr`
-/// names it when FUNC.ARGS and the actuals disagree.
-pub(crate) fn set_compiling_graph(name: Option<String>) {
-    COMPILING_GRAPH.with(|slot| *slot.borrow_mut() = name);
-}
-
-fn compiling_graph_name() -> Option<String> {
-    COMPILING_GRAPH.with(|slot| slot.borrow().clone())
-}
-
 /// `specialize.py default_specialize` cache-key choice: the regular `key`
 /// versus `(AccessDirect, key)`. `cachedgraph` builds a distinct graph for
 /// the AccessDirect key under alt_name `{name}__AccessDirect_None`; that
@@ -13467,11 +13452,8 @@ impl CallControl {
                     // call.py `getcalldescr`: NON_VOID_ARGS != FUNC.ARGS
                     // (voids dropped) raises. Kinds, not only arity.
                     if arg_types != expected_arg_types {
-                        let caller = compiling_graph_name()
-                            .map(|name| format!(" from {name}"))
-                            .unwrap_or_default();
                         panic!(
-                            "operation calling {target}{caller}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                            "operation calling {target}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
                         );
                     }
                     // call.py `getcalldescr`: RESULT != FUNC.RESULT raises.

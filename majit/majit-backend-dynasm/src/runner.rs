@@ -1875,7 +1875,7 @@ fn dynasm_alloc_oldgen_varsize_typed_and_set_len(
     ptr as u64
 }
 
-/// The old-generation twin of [`dynasm_alloc_fixedsize_typed_or_raw`], for a
+/// The old-generation twin of [`dynasm_alloc_young_nonmoving_typed_or_raw`], for a
 /// size descr that demands a non-moving address at any size.  Same OOM contract.
 fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     let result = with_dynasm_active_gc_mut(|gc| {
@@ -1888,10 +1888,9 @@ fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     }
 }
 
-#[allow(dead_code)]
-fn dynasm_alloc_fixedsize_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
+fn dynasm_alloc_young_nonmoving_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     let result = with_dynasm_active_gc_mut(|gc| {
-        let obj = gc.alloc_nursery_typed(type_id, payload_size);
+        let obj = gc.alloc_young_nonmoving_typed(type_id, payload_size);
         if obj.is_null() { 0 } else { obj.0 as u64 }
     });
     // gc.py:51 contract: helper returns NULL on OOM so
@@ -1900,17 +1899,6 @@ fn dynasm_alloc_fixedsize_typed_or_raw(type_id: u32, payload_size: usize) -> u64
     // to a raw alloc; `Some(0)` (a real OOM from the registered
     // allocator) propagates as 0 unchanged, mirroring
     // `dynasm_nursery_slowpath` above.
-    match result {
-        None => dynasm_raw_fixedsize_alloc_typed(type_id, payload_size),
-        Some(v) => v,
-    }
-}
-
-fn dynasm_alloc_young_nonmoving_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
-    let result = with_dynasm_active_gc_mut(|gc| {
-        let obj = gc.alloc_young_nonmoving_typed(type_id, payload_size);
-        if obj.is_null() { 0 } else { obj.0 as u64 }
-    });
     match result {
         None => dynasm_raw_fixedsize_alloc_typed(type_id, payload_size),
         Some(v) => v,
@@ -2427,7 +2415,7 @@ impl DynasmBackend {
     /// here as `max_nursery_size: 0`, and `write_barrier_descr = None`
     /// (gc.py:156). Allocation then declines to the `dynasm_malloc_*`
     /// helpers, which already answer without a collector by falling back to
-    /// a raw alloc (`dynasm_alloc_fixedsize_typed_or_raw`). Note this default
+    /// a raw alloc (`dynasm_alloc_young_nonmoving_typed_or_raw`). Note this default
     /// differs deliberately from `dynasm_write_barrier_descr`, which
     /// substitutes the MiniMark layout when the *mutator thread* is not the
     /// one compiling; here `None` from `with_dynasm_active_gc` means no

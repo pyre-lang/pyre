@@ -3483,7 +3483,6 @@ impl<'a> Transformer<'a> {
     /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
     /// rewrites that object.
     pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
-        crate::call::set_compiling_graph(Some(graph.name.clone()));
         crate::translator::rtyper::cutover::stamp_rootscope_int_bank(&graph);
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
@@ -3492,7 +3491,6 @@ impl<'a> Transformer<'a> {
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             cc.analysis_cache = std::mem::take(&mut self.analysis_cache);
         }
-        crate::call::set_compiling_graph(None);
         result
     }
 

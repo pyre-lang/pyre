@@ -1079,7 +1079,7 @@ where
             let frame = self.frames.current_mut();
             frame.read_getfield_gc()
         };
-        let (offset, field_size, is_field_signed, fielddescr, field_name, field_owner) = {
+        let (offset, field_size, is_field_signed, fielddescr) = {
             let frame = self.frames.current_mut();
             let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                 panic!("BC_GETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
@@ -1087,37 +1087,12 @@ where
             let field_size = field_size_from_bh(bh, "BC_GETFIELD_GC");
             let is_field_signed = is_field_signed_from_bh(bh, "BC_GETFIELD_GC");
             let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
-            let (field_name, field_owner) = match bh {
-                crate::blackhole::BhDescr::Field { name, owner, .. } => {
-                    (name.clone(), owner.clone())
-                }
-                _ => ("?".to_string(), "?".to_string()),
-            };
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)
                 .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-            (
-                offset,
-                field_size,
-                is_field_signed,
-                fielddescr,
-                field_name,
-                field_owner,
-            )
+            (offset, field_size, is_field_signed, fielddescr)
         };
         let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
-        if std::env::var_os("PYRE_JD3_DEBUG").is_some() && (struct_ptr == 0 || offset < 8) {
-            let stack: String = self
-                .frames
-                .frames
-                .iter()
-                .map(|frame| format!("{}@{}", frame.jitcode.name, frame.last_opcode_position))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            eprintln!(
-                "[jd3dump-gf] stack=[{stack}] struct_ptr={struct_ptr:#x} off={offset} size={field_size} signed={is_field_signed} is_ref={is_ref} owner={field_owner} name={field_name}"
-            );
-        }
         // blackhole.py bhimpl_getfield_gc_i reads the field through the fielddescr,
         // which carries the field's byte width; a sub-word integer field
         // (`Char`/`Bool`/`INT` narrower than a word) must be read at that

@@ -4357,16 +4357,8 @@ fn active_runtime_alloc_oldgen_typed(type_id: u32, payload_size: usize) -> u64 {
 }
 
 /// The `malloc_big_fixedsize` twin of `active_runtime_alloc_oldgen_typed`:
-/// same OOM contract, but the collecting `malloc_fixedsize` entry point rather
-/// than the direct old-generation one.
-#[allow(dead_code)]
-fn active_runtime_alloc_fixedsize_typed(type_id: u32, payload_size: usize) -> u64 {
-    match with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, payload_size).0 as u64) {
-        None => raw_fixedsize_alloc_typed(type_id, payload_size),
-        Some(v) => v,
-    }
-}
-
+/// same OOM contract, but `external_malloc(alloc_young=True)` rather than
+/// the direct old-generation entry point.
 fn active_runtime_alloc_young_nonmoving_typed(type_id: u32, payload_size: usize) -> u64 {
     match with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, payload_size).0 as u64) {
         None => raw_fixedsize_alloc_typed(type_id, payload_size),
