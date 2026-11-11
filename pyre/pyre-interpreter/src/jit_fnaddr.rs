@@ -5554,6 +5554,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::space_decrement_ticker",
         crate::executioncontext::space_decrement_ticker_jit_abi,
     );
+    cp0!(
+        &mut entries,
+        "majit_rlib::rsignal::pypysig_getaddr_occurred",
+        majit_rlib::rsignal::pypysig_getaddr_occurred_jit_abi,
+    );
     // The `anchor` handler graph residualizes `FrameAnchor::new` itself
     // (its aggregate return keeps it out of inlining), and `push_anchored`
     // reads back through `FrameAnchor::live`; bind both under the exact
@@ -5634,6 +5639,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::execution_context_root_stack_slot_get",
         "pyre_interpreter::execution_context_root_stack_slot_get",
         crate::executioncontext::execution_context_root_stack_slot_get,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::executioncontext::execution_context_cache_root_stack_slot",
+        "pyre_interpreter::execution_context_cache_root_stack_slot",
+        crate::executioncontext::execution_context_cache_root_stack_slot,
     );
     cpa0!(
         &mut entries,
@@ -8781,6 +8792,16 @@ mod tests {
                         .strip_prefix("jit_")
                         .is_some_and(|rest| rest == leaf_a))
         }
+        /// Two instantiations of one generic item (`<path>__inst_<type args>`).
+        /// Instantiations whose bodies do not depend on the differing type
+        /// argument compile to identical code, and the compiler's function
+        /// merging gives them one address — `ll_dict_hash_of` never reads `V`.
+        fn instantiations_of_one_generic(a: &str, b: &str) -> bool {
+            match (a.split_once("__inst_"), b.split_once("__inst_")) {
+                (Some((generic_a, _)), Some((generic_b, _))) => generic_a == generic_b,
+                _ => false,
+            }
+        }
         // A crate-root re-export (`pyre_interpreter::PyFrame::clear_references`)
         // beside the crate-stripped defining module (`pyframe::PyFrame::
         // clear_references`) shares a tail after different first segments.
@@ -8814,6 +8835,7 @@ mod tests {
             || drops_one_segment(a, b)
             || jit_wrapper_leaf(a, b)
             || crate_root_and_defining_module(a, b)
+            || instantiations_of_one_generic(a, b)
         {
             return true;
         }

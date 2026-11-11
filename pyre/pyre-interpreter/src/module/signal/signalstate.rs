@@ -309,11 +309,11 @@ pub fn pypysig_reinstall(_signum: i32) {}
 /// (registered ticker, pending-signal set, `EB_ASYNC` / `EB_STW`). Libtest
 /// runs `#[test]`s in one process; a nursery collection's `set_stw` overlapping
 /// `action_dispatcher`'s still-check leaves the registered ticker at `-1`.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_support {
     static SIGNAL_EVAL_BREAKER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    pub(crate) fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    pub fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
         SIGNAL_EVAL_BREAKER_TEST_LOCK.lock()
     }
 }
@@ -333,6 +333,8 @@ mod tests {
             pypysig_default(libc::SIGINT);
             while signal_poll() >= 0 {}
             majit_ir::eval_breaker_word::clear_async();
+            let p = majit_rlib::rsignal::pypysig_getaddr_occurred();
+            unsafe { (*p).c_value.store(0, Ordering::Relaxed) };
         }
     }
 
@@ -355,9 +357,8 @@ mod tests {
     /// Those tests take [`test_support::signal_eval_breaker_test_guard`] with
     /// this one: if `EB_STW` is set when `action_dispatcher`'s still-check
     /// runs, it `reset_ticker(-1)` and the post-dispatch `get_ticker() >= 0`
-    /// assertion fails. Tests that merely build an `ActionFlag` are safe
-    /// alongside it: the async-bit mirror is gated on the registered ticker,
-    /// so an unregistered flag's `reset_ticker` never reaches the shared word.
+    /// assertion fails. Every `ActionFlag` shares `pypysig_counter`, so a
+    /// test that mutates the ticker must hold this guard for its whole body.
     #[test]
     fn signal_during_warmup_sets_async_bit() {
         let _lock = test_support::signal_eval_breaker_test_guard();

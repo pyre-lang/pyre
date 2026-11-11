@@ -4951,7 +4951,7 @@ fn write_traceback_chain_from_tb<W: Write>(
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
-            let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+            let code_obj = unsafe { crate::w_code_get_ptr(w_code) };
             if code_obj.is_null() {
                 (b"<unknown>".to_vec(), unknown_name(), None)
             } else {

@@ -45,7 +45,6 @@ pub mod rposix_environ;
 pub mod rposix_stat;
 #[cfg(unix)]
 pub mod rsandbox;
-#[cfg(unix)]
 pub mod rsignal;
 #[cfg(any(unix, windows))]
 pub mod rsocket;

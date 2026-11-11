@@ -648,17 +648,27 @@ fn report_ignored_signal(ec: &mut ExecutionContext, n: i32) {
     // `_PyErr_SetObject` captures the current frame as the traceback, which
     // is what names `__del__` in the unraisable report.  `write_unraisable`
     // prints that chain; it does not build one.
+    //
+    // `record_application_traceback` allocates a PyTraceback. `err` is a
+    // nursery handle the precise collector does not scan, so pin it first
+    // (`shadowstack.py expand_pop_roots`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let err_slot = err.pin(&roots);
     let frame = ec.gettopframe_nohidden();
     if !frame.is_null() {
         unsafe { (*frame).mark_as_escaped() };
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::executioncontext::force_frame(frame);
+        err.reload(&roots, err_slot);
         let exc = err.to_exc_object();
+        err.reload(&roots, err_slot);
+        let exc = roots.pin_root(exc);
         let frame = anchor.live();
         let last_instr = unsafe { (*frame).last_instr as i64 };
         unsafe {
             crate::pytraceback::record_application_traceback(exc, frame, last_instr);
         }
+        err.reload(&roots, err_slot);
     }
     err.write_unraisable_with_traceback(
         pyre_object::w_none(),
@@ -721,6 +731,11 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
     let Some(w_type) = crate::builtins::lookup_exc_class("OSError") else {
         return;
     };
+    // `os_error_errno_strerror` and `to_exc_object` allocate; `w_type` is
+    // live across both. Pin it first (`shadowstack.py expand_pop_roots`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
     let mut err = match crate::error::strerror(errno_val) {
         Ok(r) => crate::PyError::os_error_errno_strerror(
             errno_val,
@@ -732,9 +747,6 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
         Err(_) => return,
     };
     let w_exc = err.to_exc_object();
-    let roots = pyre_object::gc_roots::push_roots();
-    let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_type);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_exc);
     let frame = ec.gettopframe_nohidden();
@@ -856,12 +868,12 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // signal seen on a worker rearms the main ticker promptly.
         majit_gc::rgil::invoke_after_thread_switch(CheckSignalAction::after_thread_switch);
 
-        // Hand the ticker cell address to the OS handler
-        // (`pypysig_getaddr_occurred`).  The handler itself only arms the
-        // eval-breaker's async bit, which is a lock-free atomic RMW and so
-        // async-signal-safe; `ExecutionContext::bytecode_trace` is what turns
-        // that request into a negative ticker, under the GIL.  Writing this
-        // cell from the handler would not be signal-safe.
+        // Hand the ticker cell address (`pypysig_counter.c_value`) to the
+        // OS handler (`pypysig_getaddr_occurred`).  The handler itself only
+        // arms the eval-breaker's async bit, which is a lock-free atomic RMW
+        // and so async-signal-safe; `ExecutionContext::bytecode_trace` is
+        // what turns that request into a negative ticker, under the GIL.
+        // Writing this cell from the handler would not be signal-safe.
         let ticker_addr = ec.actionflag.ticker_addr();
         signalstate::register_ticker(ticker_addr);
 

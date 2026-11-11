@@ -2189,6 +2189,13 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
+    // A closure environment is the callable's instance, not a C struct
+    // (`rpbc.py FunctionsPBCRepr`). `note_raw_word_owner` and
+    // `raw_struct_ptr_from_layout` already leave it out.
+    let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+        return None;
+    }
     if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
         return None;
     }
@@ -2282,6 +2289,11 @@ pub(in crate::front::mir) fn adt_fields_are_raw_storage(
     stack: &mut Vec<u64>,
 ) -> bool {
     fields.iter().enumerate().all(|(i, field)| {
+        // A Void field occupies no storage (`lltype.py`
+        // `Struct._names_without_voids`).
+        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+            return true;
+        }
         if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
             return true;
         }
@@ -2322,6 +2334,16 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
     };
     if node.get("Scalar").is_some() {
         return true;
+    }
+    // `Atomic<T>` is Opaque in Charon; its stored word is `T`
+    // (`tyref_atomic_arg`). `history.getkind` of a `Signed` word is int.
+    if let Some(arg) = tyref_atomic_arg(ty, llbc) {
+        if arg.get("Scalar").is_some() {
+            return true;
+        }
+        if let Some(pointee) = one_level_pointer_pointee(arg, llbc) {
+            return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
+        }
     }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
         return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
@@ -5734,6 +5756,20 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     {
         return None;
     }
+    // A transparent wrapper over a scalar is that scalar's one-word field
+    // (`lltype.py` has no substruct for it), so it is not an inlined struct.
+    if matches!(
+        tyref_transparent_inner_value_type(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
+    ) {
+        return None;
+    }
     Some(td)
 }
 
@@ -6969,6 +7005,23 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                 } else {
                     return None;
                 };
+                let empty: &[serde_json::Value] = &[];
+                let generics = type_decl_ref_generics(node.get("Adt")?.as_object()?, llbc);
+                let types = generics
+                    .and_then(|g| g.get("types"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(empty);
+                let const_generics = generics
+                    .and_then(|g| g.get("const_generics"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(empty);
+                // The decl field is written over the wrapper's own type params;
+                // the instantiation's args are substituted first (the wrapper is
+                // monomorphic at the use site).
+                let field_ty =
+                    crate::front::clause_spec::subst_tyref(&field.ty, llbc, types, const_generics);
                 // The field's low-level value. A STR pointer (`*mut Utf8Str`,
                 // `*mut BytesBlock` — Charon erases the alias) is already
                 // `ValueType::Str`: `tyref_raw_ptr_pointee_is_string_value`
@@ -6987,7 +7040,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                 // Peeling that object would intern the allocated instance as
                 // its payload pointer.
                 let inner = tyref_to_value_type_with(
-                    &field.ty,
+                    &field_ty,
                     llbc,
                     tombstoned,
                     gc_struct_ids,
@@ -6997,7 +7050,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                     return Some(inner);
                 }
                 if registered_gc_ptr_class_root_with(
-                    &field.ty,
+                    &field_ty,
                     llbc,
                     tombstoned,
                     gc_struct_ids,

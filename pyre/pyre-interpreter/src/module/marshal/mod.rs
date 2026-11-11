@@ -244,8 +244,7 @@ unsafe fn write_code(
     depth: usize,
 ) -> Result<(), PyError> {
     let code_root = Rooted::new(w_code);
-    let code =
-        unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get()) as *const crate::CodeObject) };
+    let code = unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get())) };
     out.write_u32(code.arg_count);
     out.write_u32(code.posonlyarg_count);
     out.write_u32(code.kwonlyarg_count);
@@ -269,8 +268,7 @@ unsafe fn write_code(
 
     // A wrapped constant may have allocated and moved `w_code`; recover the
     // backing payload from the forwarded wrapper before touching later fields.
-    let code =
-        unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get()) as *const crate::CodeObject) };
+    let code = unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get())) };
     write_name_tuple(out, &code.names, version)?;
 
     let cell_only_names: Vec<&str> = code
@@ -550,7 +548,7 @@ fn write_object(
                 write_object(out, item_root.get(), refs, version, depth - 1)?;
             }
         } else if !is_heap_type && crate::pycode::is_code(obj) {
-            let ptr = crate::pycode::w_code_get_ptr(obj_root.get()) as *const crate::CodeObject;
+            let ptr = crate::pycode::w_code_get_ptr(obj_root.get());
             if ptr.is_null() {
                 return Err(PyError::value_error("unmarshallable object"));
             }

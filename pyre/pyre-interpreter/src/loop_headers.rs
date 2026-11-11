@@ -412,7 +412,7 @@ mod tests {
             "def run(n):\n    total = 0\n    for i in range(n):\n        try:\n            total += 1\n        except ValueError:\n            total += 2\n        try:\n            total += 3\n        except ValueError:\n            total += 7\n    return total\n",
         );
         let w_code = wrapper_for(&code);
-        let wrapped = unsafe { &*(crate::pycode::w_code_get_ptr(w_code) as *const CodeObject) };
+        let wrapped = unsafe { &*(crate::pycode::w_code_get_ptr(w_code)) };
         let succ = code_successors(&code);
         let mut no_interrupt_handler_only = 0;
         let mut ordinary_backedges = 0;

@@ -6200,8 +6200,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     let code_roots = pyre_object::gc_roots::push_roots();
     let code_slot = code_roots.base();
     let w_code = code_roots.pin_root(w_code);
-    let code_ptr =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code) } as *const pyre_interpreter::CodeObject;
+    let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
     if code_ptr.is_null() {
         return Ok(None);
     }
@@ -19145,11 +19144,9 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         } else {
             // `pyopcode.py PUSH_EXC_INFO` always reads `ec.current_exception()`.
             // Record that GETFIELD even when the nullity guard below cannot
-            // carry an anchored `-live-`: declining the whole lowering left
-            // the residual `current_exception_or_none` call without a matching
-            // `FBW_EXC_PREV` / `FBW_EXC_PENDING_PUSH_SET` pair, so the
-            // following SETFIELD was treated as a `POP_EXCEPT` restore and
-            // `sys.exc_info()` kept the caught exception after the handler.
+            // carry an anchored `-live-`.  The prev read flows through the
+            // frame value stack; `POP_EXCEPT` reads that slot back
+            // (`pyopcode.py PUSH_EXC_INFO` / `POP_EXCEPT`).
             let Some(ec) = walker_ensure_execution_context(ctx) else {
                 return Ok(None);
             };
@@ -19166,17 +19163,11 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
         );
-        // Only PUSH_EXC_INFO owns a matching set + POP_EXCEPT pair.  A covered
+        // Only PUSH_EXC_INFO applies the prev-or-None fold.  A covered
         // bare raise reads the same field to obtain the exception it
-        // re-raises, but has no following PUSH store.  Treating that read as a
-        // save arms the next POP as a PUSH and leaves the bare raise's value on
-        // this stack, so a second enclosing POP restores the inner exception.
-        // For PUSH_EXC_INFO, save the field (OpRef, concrete) for the matching
-        // restore and mark the immediately-following set as this PUSH's slot
-        // store.  The codewriter pushes `prev` then `exc` onto the operand
-        // stack and POP_EXCEPT pops them, but the walker resolves the popped
-        // `prev` operand to the caught exception, not the saved prev; the LIFO
-        // stack carries the authoritative value instead.
+        // re-raises and has no following PUSH store.  The prev read flows
+        // through the frame value stack; `POP_EXCEPT` reads that slot back
+        // (`pyopcode.py PUSH_EXC_INFO` / `POP_EXCEPT`).
         if !is_covered_bare_raise_read {
             // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
             // slot and the field otherwise.  Trace that test as the nullity
@@ -19186,9 +19177,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             // an exception-table target, so its block head is the handler
             // landing, which reads a `last_exception` value no guard failure
             // carries (`blackhole.py` `bhimpl_last_exc_value`).  Completing
-            // the save always records the GETFIELD and arms `FBW_EXC_PREV` so
-            // `POP_EXCEPT` (`pyframe.py _restore_exc_info` →
-            // `set_sys_exc_info3`) restores the saved prev.  Fold `w_prev`
+            // the save always records the GETFIELD.  Fold `w_prev`
             // only when that guard was actually recorded (`pyjitpl.py`
             // records a guard at every branch it specializes).  Without a
             // named later live (unit-test skeleton), bind dst to the GETFIELD
@@ -19201,8 +19190,6 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
                 OpCode::GuardNonnull
             };
             let guarded = walker_emit_anchored_fold_guard(ctx, op.pc, guard, &[prev])?;
-            FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
-            FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
             if !guarded {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
                 return Ok(Some(()));
@@ -19219,45 +19206,22 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // `SetCurrentException`: PUSH_EXC_INFO store (stores the caught EXC) or
-    // POP_EXCEPT restore (restores the saved prev).  The two are identical at
-    // the residual level; `FBW_EXC_PENDING_PUSH_SET` (set by the immediately-
-    // preceding PUSH_EXC_INFO prev save) tells them apart.
+    // `SetCurrentException`: PUSH_EXC_INFO's store passes the caught exc,
+    // POP_EXCEPT's restore passes the slot it popped; both are
+    // `set_sys_exc_info3` writes of their operand.
     if r_args.len() != 1 || dst_bank != 'v' {
         return Ok(None);
     }
     let Some(ec) = walker_ensure_execution_context(ctx) else {
         return Ok(None);
     };
-    let is_push_set = FBW_EXC_PENDING_PUSH_SET.with(|c| c.replace(false));
-    // POP_EXCEPT restore consumes the prev its matching PUSH_EXC_INFO saved.
-    // If unbalanced (no saved prev — e.g. a POP whose PUSH was not lowered),
-    // or this is the PUSH's own store, fall back to the operand value.
-    let restore = if is_push_set {
-        None
-    } else {
-        FBW_EXC_PREV.with(|s| s.borrow_mut().pop())
+    let exc_concrete = match read_ref_var_list_concrete(code, op, 1, ctx).first() {
+        Some(ConcreteValue::Ref(p)) => *p,
+        Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
+        _ => return Ok(None),
     };
-    let (mut store_op, mut store_concrete) = match restore {
-        // POP_EXCEPT: restore the saved prev, NOT the operand-stack value
-        // (which the walker resolves to the just-caught exception).  Restoring
-        // the saved prev makes the PUSH store + this restore a balanced no-op,
-        // so a locally-caught exception de-escapes and DCEs, and keeps the slot
-        // (`sys.exc_info()`) correct after the handler unwinds.
-        Some((prev_op, prev_concrete)) => (prev_op, prev_concrete),
-        None => {
-            let exc_concrete = match read_ref_var_list_concrete(code, op, 1, ctx).first() {
-                Some(ConcreteValue::Ref(p)) => *p,
-                Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
-                _ => return Ok(None),
-            };
-            if is_push_set {
-                (r_args[0], exc_concrete)
-            } else {
-                walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
-            }
-        }
-    };
+    let (mut store_op, mut store_concrete) =
+        walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?;
     // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
     // tracked active exception (`ctx.last_exc_value()`, the walker's mirror of
     // RPython `metainterp.last_exc_box`).  The graph-side codewriter binds the
@@ -19272,10 +19236,13 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     // reconstruction can also leave the slot NULL (a bare handler entry whose
     // caught-exception slot was filled with a null sentinel), which would
     // publish `set_current_exception(NULL)` and lose the active exception for a
-    // following bare `raise` / `sys.exc_info()`.  When the PUSH store's operand
-    // resolves to NULL or a non-exception, recover the authoritative exception
-    // from the tracked channel, matching the graph-side producer.
-    if is_push_set
+    // following bare `raise` / `sys.exc_info()`.  When the store operand
+    // resolves to NULL or a non-exception that is not `w_None`, recover the
+    // authoritative exception from the tracked channel, matching the graph-side
+    // producer.  `w_None` is the empty prev `POP_EXCEPT` restores
+    // (`pyframe.py _restore_exc_info`).
+    let operand_is_none = !exc_concrete.is_null() && unsafe { pyre_object::is_none(exc_concrete) };
+    if !operand_is_none
         && (store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) })
     {
         if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =

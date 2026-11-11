@@ -10426,10 +10426,15 @@ mod tests {
         }
         std::sync::LazyLock::force(&MODULE_USER_LAYOUT_DESCR_GROUPS);
         let gc = majit_ir::descr::gc_cache().lock();
+        // `descr.py get_size_descr` keys `cache[STRUCT]`. A raw STRUCT is
+        // interned under `path_hash_for_gc_kind(path, false)`; inspect that
+        // slot when it is occupied rather than the bare path hash.
         let is_unstamped = |def_path: &str| {
-            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+            let raw_key = majit_ir::descr::path_hash_for_gc_kind(def_path, false);
+            let gc_key = majit_ir::descr::path_hash_for_gc_kind(def_path, true);
             gc._cache_size
-                .get(&key)
+                .get(&majit_ir::descr::LLType::Struct(raw_key))
+                .or_else(|| gc._cache_size.get(&majit_ir::descr::LLType::Struct(gc_key)))
                 .and_then(|descr| descr.as_size_descr())
                 .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
         };
@@ -16637,11 +16642,27 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
 ];
 
 /// The [`DECLARED_GROUPS`] rows by the `GcCache` key each one owns.
+///
+/// `descr.py get_size_descr` keys `cache[STRUCT]`; a raw STRUCT is interned
+/// under `path_hash_for_gc_kind(path, false)` and a GcStruct under
+/// `path_hash_for_gc_kind(path, true)`; each row is reachable under both, so a
+/// lookup forces only the requested STRUCT's group.
 static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
     LazyLock::new(|| {
         DECLARED_GROUPS
             .iter()
-            .map(|(def_path, force)| (majit_ir::descr::path_hash(def_path), *force))
+            .flat_map(|(def_path, force)| {
+                [
+                    (
+                        majit_ir::descr::path_hash_for_gc_kind(def_path, false),
+                        *force,
+                    ),
+                    (
+                        majit_ir::descr::path_hash_for_gc_kind(def_path, true),
+                        *force,
+                    ),
+                ]
+            })
             .collect()
     });
 

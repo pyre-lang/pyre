@@ -8322,8 +8322,8 @@ fn jd1_trace_threshold() -> u32 {
 
 /// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
 /// type, drives one `JitCodeMachine` trace of the extracted
-/// `unpackiterable_portal` loop with `w_iterator`/`items` as the two
-/// `reds='auto'` values. Inert when jd1 is disabled (see
+/// `unpackiterable_portal` loop with the extracted `reds='auto'` banks.
+/// Inert when jd1 is disabled (see
 /// [`jd1_experiment_enabled`]).
 fn unpack_merge_point_jit(
     greenkey: pyre_object::PyObjectRef,
@@ -11656,9 +11656,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // shadow-stack cell is the `gc_enter_roots_frame` cache: resolved once
     // here, before the marker, so the pointer is not live across
     // `split_before_jit_merge_point`. Later opcodes load that cell.
-    if !marker_ec.is_null() {
-        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
-    }
+    pyre_interpreter::executioncontext::execution_context_cache_root_stack_slot(marker_ec);
 
     loop {
         // Frame may move at a collection point. Collection now happens inside
@@ -13516,7 +13514,8 @@ fn compile_and_run_once(
     }
 
     // pyjitpl.py `initialize_state_from_start`: `newframe(mainjitcode)`
-    // then, on the interpret arm, `setup_call(original_boxes)`.
+    // then `setup_call(original_boxes)`. The interpret arm starts at pc 0
+    // from that `setup_call`, as `_compile_and_run_once` does.
     // Virtualizable boxes were already seeded by `setup_tracing`.
     // The `trace_bytecode` arm keeps the previous seed: one root frame
     // and no `setup_call` (`rebuild_portal_framestack_from_resume`).
@@ -18580,10 +18579,8 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
         let canonical_code = unsafe { &*raw_code };
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }

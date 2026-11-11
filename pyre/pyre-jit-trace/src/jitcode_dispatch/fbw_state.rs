@@ -442,12 +442,6 @@ pub(crate) fn fbw_store_journal_reset() {
     // OpRef minted by this walk's recorder.
     FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
     FBW_CONTEXT_CHAINED.with(|s| s.borrow_mut().clear());
-    // Drop any unbalanced PUSH_EXC_INFO prev saves a
-    // prior aborted walk left (an exception that propagated out without its
-    // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an
-    // unrelated POP_EXCEPT in this walk.
-    FBW_EXC_PREV.with(|s| s.borrow_mut().clear());
-    FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(false));
     FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
     FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
     FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
@@ -482,8 +476,6 @@ pub struct ParkedWalkTls {
     abort_call_resume: Option<super::InlineAbortCarrier>,
     built_exc: std::collections::HashSet<OpRef>,
     context_chained: std::collections::HashSet<OpRef>,
-    exc_prev: Vec<(OpRef, pyre_object::PyObjectRef)>,
-    exc_pending_push_set: bool,
     exit_last_instr_undo: Vec<(usize, isize)>,
     locals_mirror_undo: Vec<FbwLocalsMirrorUndo>,
     frame_vsd_undo: Vec<(usize, usize)>,
@@ -569,8 +561,6 @@ pub fn park_walk_tls() {
         abort_call_resume: super::FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take()),
         built_exc: FBW_BUILT_EXC.with(|s| std::mem::take(&mut *s.borrow_mut())),
         context_chained: FBW_CONTEXT_CHAINED.with(|s| std::mem::take(&mut *s.borrow_mut())),
-        exc_prev: super::FBW_EXC_PREV.with(|s| std::mem::take(&mut *s.borrow_mut())),
-        exc_pending_push_set: super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.replace(false)),
         exit_last_instr_undo: FBW_EXIT_LAST_INSTR_UNDO
             .with(|c| std::mem::take(&mut *c.borrow_mut())),
         locals_mirror_undo: FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
@@ -625,8 +615,6 @@ pub fn restore_walk_tls() {
     super::FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = parked.abort_call_resume);
     FBW_BUILT_EXC.with(|s| *s.borrow_mut() = parked.built_exc);
     FBW_CONTEXT_CHAINED.with(|s| *s.borrow_mut() = parked.context_chained);
-    super::FBW_EXC_PREV.with(|s| *s.borrow_mut() = parked.exc_prev);
-    super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(parked.exc_pending_push_set));
     FBW_EXIT_LAST_INSTR_UNDO.with(|c| *c.borrow_mut() = parked.exit_last_instr_undo);
     FBW_LOCALS_MIRROR_UNDO.with(|c| *c.borrow_mut() = parked.locals_mirror_undo);
     FBW_FRAME_VSD_UNDO.with(|c| *c.borrow_mut() = parked.frame_vsd_undo);
@@ -771,10 +759,6 @@ pub(crate) fn walk_parked_walk_tls_stack(
         }
         if let Some(carrier) = parked.abort_call_resume.as_mut() {
             walk_parked_abort_resume(carrier, visitor);
-        }
-        for (op, prev) in &mut parked.exc_prev {
-            op.trace_const_ptr(visitor);
-            visit_pyobject_ref(prev, visitor);
         }
         // Frame identities in these undo lists are GC edges
         // (`executioncontext.py topframeref`). A nested-trace collection
