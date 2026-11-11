@@ -2423,9 +2423,8 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
         "args": [
             {"Move": window_place(serde_json::json!({"Local": 2}), &cell_ref)},
             {"Const": [{"Bool": true}, {"Scalar": "Bool"}]}
-        ],
-        "dest": window_place(serde_json::json!({"Local": 0}), &unit_ty)
-    }, "target": 2, "on_unwind": 1}});
+        ]
+    }, "dest": window_place(serde_json::json!({"Local": 0}), &unit_ty), "target": 2, "on_unwind": 1}});
     let set_flag = serde_json::json!({
         "def_id": 7,
         "item_meta": window_meta(&["fixture", "set_flag"], true),
