@@ -7796,8 +7796,19 @@ fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         // [3.15-spec] `list___sizeof___impl` (Py_GIL_DISABLED) reads
         // `ob_item` inside `Py_BEGIN_CRITICAL_SECTION(self)`.
         // ↔ PyPy has no list.__sizeof__
-        let _guard = pyre_object::listobject::w_list_lock(list);
-        pyre_object::listobject::w_list_allocated(list)
+        if pyre_object::gil_ready::gil_ready_word() != 0 {
+            // A contended stripe wait may collect: pin the list before the wait and reload after it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::pin_roots(&[list]);
+            let _guard = pyre_object::objlock::ObjectLockGuard::from_word(
+                pyre_object::listobject::w_list_lock_acquire(
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                ),
+            );
+            pyre_object::listobject::w_list_allocated(pyre_object::gc_roots::shadow_stack_get(slot))
+        } else {
+            pyre_object::listobject::w_list_allocated(list)
+        }
     } as usize;
     let size = (basicsize as usize)
         .wrapping_add(capacity.wrapping_mul(std::mem::size_of::<PyObjectRef>()));
