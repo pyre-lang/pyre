@@ -23203,7 +23203,6 @@ mod subwalk_checkpoint_tests {
                 snapshot_array_data_len: 5,
             },
             promote_journal_before: 6,
-            allocated_before: 8,
             len_before: 9,
         };
         set_list_append_suspend_bookmark(vec![bookmark.clone()]);
@@ -23222,7 +23221,6 @@ mod subwalk_checkpoint_tests {
             pc: 99,
             position: bookmark.position,
             promote_journal_before: 0,
-            allocated_before: 0,
             len_before: 0,
         }]);
 

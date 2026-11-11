@@ -11023,6 +11023,18 @@ mod tests {
     }
 
     #[test]
+    fn source_graph_func_sets_annspecialcase_from_specialize_ll_hint() {
+        // `rgc.py` `ll_arraycopy` `_annspecialcase_ = specialize:ll`.
+        // `source_graph_func` copies the first `specialize:` hint onto
+        // `GraphFunc.annspecialcase` so `Bookkeeper.newfuncdesc` installs
+        // `Specializer::Ll`.
+        let mut graph = LegacyGraph::new("jit_ll_arraycopy");
+        graph.hints.push("specialize:ll".into());
+        let func = source_graph_func(&graph);
+        assert_eq!(func.annspecialcase.as_deref(), Some("specialize:ll"));
+    }
+
+    #[test]
     fn registry_population_keeps_memo_source_policy_without_lifting_host_body() {
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));

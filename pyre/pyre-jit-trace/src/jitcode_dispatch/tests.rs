@@ -11826,7 +11826,7 @@ fn append_journal_rollback_rewinds_length() {
     // (the only shape the arm specializes).
     unsafe { w_list_append(list, w_int_new(40)) };
     let len_before = unsafe { w_list_len(list) };
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
+    let cap_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
@@ -11835,8 +11835,10 @@ fn append_journal_rollback_rewinds_length() {
 
     // Rollback path: journal push + eager append (production order, see
     // try_walker_orthodox_list_append), then a non-commit exit rewinds
-    // the length.
-    super::fbw_list_journal_push_append(list, len_before, allocated_before);
+    // the length. Spare-capacity in-place append leaves physical capacity
+    // unchanged (`rlist.py`: a rolled-back append leaves `len(l.items)` grown
+    // only when the append itself grew the backing).
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_int_new(50)) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();
@@ -11847,12 +11849,12 @@ fn append_journal_rollback_rewinds_length() {
     );
     assert_eq!(
         unsafe { pyre_object::listobject::w_list_allocated(list) },
-        allocated_before,
-        "non-commit walk must restore the logical allocation"
+        cap_before,
+        "in-place spare-capacity append leaves physical capacity unchanged"
     );
 
     // Commit path: the eager append stands; the log is dropped.
-    super::fbw_list_journal_push_append(list, len_before, allocated_before);
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_int_new(60)) };
     super::fbw_store_journal_commit();
     assert_eq!(
@@ -11869,8 +11871,7 @@ fn append_journal_rollback_rewinds_length() {
 #[test]
 fn pop_end_journal_rollback_restores_item_and_length() {
     use pyre_object::listobject::{
-        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
-        w_list_new_with_strategy,
+        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new_with_strategy,
     };
     use pyre_object::{w_int_new, w_list_pop_end};
 
@@ -11891,6 +11892,69 @@ fn pop_end_journal_rollback_restores_item_and_length() {
     assert_eq!(
         unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) },
         raw_item
+    );
+}
+
+#[test]
+fn pop_end_journal_rollback_grows_shrunken_integer_backing() {
+    // `ll_pop_default` ends in `_ll_resize_le`. A 1-element Integer list
+    // whose backing is at least 4 slots shrinks to the prebuilt empty array
+    // (`capacity 0`). Rollback must `_ll_resize_ge` before the fast store
+    // (`rlist.py ll_append`).
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
+        w_list_new_with_sizehint,
+    };
+    use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new_with_sizehint(4);
+    unsafe { w_list_append(list, w_int_new(7)) };
+    assert!(
+        unsafe { w_list_allocated(list) } >= 4,
+        "sizehint-4 Integer list must start with backing capacity >= 4"
+    );
+    let w_item = unsafe { w_list_pop_end(list) }.unwrap();
+    assert!(
+        unsafe { w_list_allocated(list) } < 1,
+        "shrinking last-item pop must drop the backing below length_before"
+    );
+    super::fbw_list_journal_push_pop_end(list, 1, w_item);
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, 1);
+    assert_eq!(
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), 0) },
+        7
+    );
+}
+
+#[test]
+fn pop_end_journal_rollback_grows_shrunken_object_backing() {
+    // Same shrink-then-reappend contract for Object storage: a 1-element
+    // Object list with capacity >= 4 is left on the prebuilt empty items
+    // block, so rollback must `_ll_resize_ge` before `ll_setitem_fast`.
+    use pyre_object::listobject::{w_list_allocated, w_list_len, w_list_new_object_with_sizehint};
+    use pyre_object::{w_list_append, w_list_getitem, w_list_pop_end, w_str_new};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new_object_with_sizehint(4);
+    unsafe { w_list_append(list, w_str_new("item")) };
+    assert!(
+        unsafe { w_list_allocated(list) } >= 4,
+        "sizehint-4 Object list must start with backing capacity >= 4"
+    );
+    let w_item = unsafe { w_list_pop_end(list) }.unwrap();
+    assert!(
+        unsafe { w_list_allocated(list) } < 1,
+        "shrinking last-item pop must drop the backing below length_before"
+    );
+    super::fbw_list_journal_push_pop_end(list, 1, w_item);
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, 1);
+    let restored = unsafe { w_list_getitem(list, 0) }.unwrap();
+    assert_eq!(
+        unsafe { pyre_object::w_str_get_value_opt(restored) },
+        Some("item")
     );
 }
 
@@ -11925,8 +11989,7 @@ fn pop_end_journal_rollback_after_strategy_switch() {
 #[test]
 fn interleaved_append_pop_journal_rollback_restores_original() {
     use pyre_object::listobject::{
-        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
-        w_list_new_with_strategy,
+        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new_with_strategy,
     };
     use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
 
@@ -11938,8 +12001,7 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     );
 
     let len_before_append = unsafe { w_list_len(list) };
-    let allocated_before_append = unsafe { w_list_allocated(list) };
-    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
+    super::fbw_list_journal_push_append(list, len_before_append);
     unsafe { w_list_append(list, w_int_new(40)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
@@ -11949,8 +12011,7 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     super::fbw_list_journal_push_pop_end(list, len_before_pop, w_int_new(raw_item));
 
     let len_before_append = unsafe { w_list_len(list) };
-    let allocated_before_append = unsafe { w_list_allocated(list) };
-    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
+    super::fbw_list_journal_push_append(list, len_before_append);
     unsafe { w_list_append(list, w_int_new(50)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
@@ -11990,14 +12051,13 @@ fn append_journal_rollback_rewinds_object_length() {
     // (the only shape the journal records).
     unsafe { w_list_append(list, w_none()) };
     let len_before = unsafe { w_list_len(list) };
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
         "post-grow object list must have spare capacity for the in-place append"
     );
 
-    super::fbw_list_journal_push_append(list, len_before, allocated_before);
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_none()) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();

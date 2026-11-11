@@ -737,9 +737,11 @@ fn mark(slot: usize) {
 /// previous stack.
 fn pop_mark(slot: usize) -> Result<PyObjectRef, PyError> {
     let me = cur(slot);
-    let items = me.w_stack;
-    let prev = unsafe { pyre_object::listobject::w_list_pop_end(me.w_metastack) }
-        .ok_or_else(|| unpickling_error("no items on stack"))?;
+    let mut items = me.w_stack;
+    let prev = pyre_object::with_roots!(items => unsafe {
+        pyre_object::listobject::w_list_pop_end(me.w_metastack)
+    })
+    .ok_or_else(|| unpickling_error("no items on stack"))?;
     let me = cur(slot);
     me.w_stack = prev;
     unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
@@ -779,9 +781,9 @@ fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
     let mut w_buf = top(slot, "READONLY_BUFFER")?;
     let w_memoryview = pyre_object::with_roots!(w_buf => memoryview_type())?;
     let w_mv = call_fn(w_memoryview, &[w_buf])?;
-    let w_readonly = call_meth(w_mv, "toreadonly", &[])?;
+    let mut w_readonly = call_meth(w_mv, "toreadonly", &[])?;
     // Replace the top of the stack (`stack[-1] = w_readonly`).
-    pop(slot)?;
+    pyre_object::with_roots!(w_readonly => pop(slot))?;
     push(slot, w_readonly);
     Ok(())
 }
@@ -1339,14 +1341,14 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             push(slot, pyre_object::tupleobject::w_tuple_new(vec![a]));
         }
         x if x == op::TUPLE2 => {
-            let b = pop(slot)?;
-            let a = pop(slot)?;
+            let mut b = pop(slot)?;
+            let a = pyre_object::with_roots!(b => pop(slot))?;
             push(slot, pyre_object::tupleobject::w_tuple_new(vec![a, b]));
         }
         x if x == op::TUPLE3 => {
-            let c = pop(slot)?;
-            let b = pop(slot)?;
-            let a = pop(slot)?;
+            let mut c = pop(slot)?;
+            let mut b = pyre_object::with_roots!(c => pop(slot))?;
+            let a = pyre_object::with_roots!(b, c => pop(slot))?;
             push(slot, pyre_object::tupleobject::w_tuple_new(vec![a, b, c]));
         }
         // ── list ──────────────────────────────────────────────────────
@@ -1413,7 +1415,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::SETITEM => {
             let mut value = pop(slot)?;
-            let mut key = pop(slot)?;
+            let mut key = pyre_object::with_roots!(value => pop(slot))?;
             let w_dict = pyre_object::with_roots!(key, value => top(slot, "SETITEM"))?;
             pyre_interpreter::baseobjspace::setitem(w_dict, key, value)?;
         }
@@ -1510,8 +1512,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             push(slot, v);
         }
         x if x == op::STACK_GLOBAL => {
-            let w_name = pop(slot)?;
-            let w_module = pop(slot)?;
+            let mut w_name = pop(slot)?;
+            let w_module = pyre_object::with_roots!(w_name => pop(slot))?;
             if !unsafe { pyre_object::is_str(w_name) } || !unsafe { pyre_object::is_str(w_module) }
             {
                 return Err(unpickling_error("STACK_GLOBAL requires str"));
@@ -1615,15 +1617,15 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             }
         }
         x if x == op::NEWOBJ => {
-            let w_args = pop(slot)?;
-            let w_cls = pop(slot)?;
+            let mut w_args = pop(slot)?;
+            let w_cls = pyre_object::with_roots!(w_args => pop(slot))?;
             let w_obj = new_instance_star(w_cls, w_args, None)?;
             push(slot, w_obj);
         }
         x if x == op::NEWOBJ_EX => {
-            let w_kwargs = pop(slot)?;
-            let w_args = pop(slot)?;
-            let w_cls = pop(slot)?;
+            let mut w_kwargs = pop(slot)?;
+            let mut w_args = pyre_object::with_roots!(w_kwargs => pop(slot))?;
+            let w_cls = pyre_object::with_roots!(w_args, w_kwargs => pop(slot))?;
             let w_obj = new_instance_star(w_cls, w_args, Some(w_kwargs))?;
             push(slot, w_obj);
         }
@@ -1691,8 +1693,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::INST => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let w_cls = call_find_class_names(slot, &module, &name)?;
-            let w_args = pop_mark(slot)?;
+            let mut w_cls = call_find_class_names(slot, &module, &name)?;
+            let w_args = pyre_object::with_roots!(w_cls => pop_mark(slot))?;
             let v = instantiate(w_cls, w_args)?;
             push(slot, v);
         }

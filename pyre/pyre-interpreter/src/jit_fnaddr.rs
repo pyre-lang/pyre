@@ -4515,9 +4515,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa3!(
         &mut entries,
-        "pyre_object::listobject::w_list_resync_allocated",
-        "pyre_object::w_list_resync_allocated",
-        pyre_object::listobject::__majit_call_target_w_list_resync_allocated,
+        "pyre_object::listobject::ll_list_bytes_resize_hint_really",
+        "pyre_object::ll_list_bytes_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_bytes_resize_hint_really,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::w_list_reserve_for_extend",
+        "pyre_object::w_list_reserve_for_extend",
+        pyre_object::listobject::__majit_call_target_w_list_reserve_for_extend,
     );
     up2!(
         &mut entries,
@@ -7888,6 +7894,31 @@ mod tests {
         assert_ne!(
             ascii_hint, raw_ascii as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
+
+        let bytes_hint =
+            pyre_object::listobject::__majit_call_target_ll_list_bytes_resize_hint_really
+                as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::ll_list_bytes_resize_hint_really"],
+            bytes_hint
+        );
+        assert_eq!(
+            bindings["pyre_object::ll_list_bytes_resize_hint_really"],
+            bytes_hint
+        );
+        let raw_bytes: unsafe fn(pyre_object::PyObjectRef, i64, bool) =
+            pyre_object::listobject::ll_list_bytes_resize_hint_really;
+        assert_ne!(
+            bytes_hint, raw_bytes as *const () as usize as i64,
+            "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
+        let bytes_tramp =
+            pyre_object::listobject::__majit_call_target_ll_list_bytes_resize_hint_really_trampoline
+                as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::ll_list_bytes_resize_hint_really_trampoline"],
+            bytes_tramp
         );
     }
 

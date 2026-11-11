@@ -26300,7 +26300,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             let len = w_list_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
             if idx >= 0 && idx < len {
-                w_list_pop(obj, idx);
+                pyre_object::listobject::w_list_pop(obj, idx, false);
                 return Ok(());
             }
             return Err(PyError::index_error("list index out of range"));

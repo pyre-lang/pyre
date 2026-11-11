@@ -23603,6 +23603,9 @@ pub fn sort_list_in_place(
         // `sorter.list`.  Pin each getitem result before the next box, then
         // TimSort only moves integer indices.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        // [3.15-spec] `list_sort_impl` restores `saved_ob_item`/`saved_allocated`
+        // so `__sizeof__` after sort equals before. Read the 3.15 allocation
+        // before the Empty detach; Empty/Range answer 0.
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
         // Snapshot through getitem + pin, not a bare Vec: integer/float/range
         // strategies box each element (`getitems_copy`), and a Rust Vec of
@@ -23619,15 +23622,17 @@ pub fn sort_list_in_place(
             let _ = pyre_object::gc_roots::pin_root(item);
         }
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        pyre_object::listobject::w_list_clear(list);
-        // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
-        // as -1. Any resizing mutation replaces the sentinel with a normal
-        // allocation, which is how the final modification check works.
-        pyre_object::listobject::w_list_set_allocated(list, -1);
+        // `descr_sort`: `self.__init__(space, [])` → EmptyListStrategy.
+        // `W_ListObject.clear` keeps a non-Empty strategy ([3.15-spec]), so
+        // the detach is `__init__` via `w_list_init_items`, not `w_list_clear`.
+        pyre_object::listobject::w_list_init_items(list, Vec::new());
 
         let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        let mucked = pyre_object::listobject::w_list_allocated(list) != -1;
+        // `descr_sort` `finally`: with list strategies, `mucked` is
+        // `self.strategy is not space.fromcache(EmptyListStrategy)`; without,
+        // `self.length() > 0`. pyre always has strategies.
+        let mucked = !pyre_object::listobject::w_list_is_empty_strategy(list);
 
         // `descr_sort`'s `finally` puts the items back unconditionally,
         // discarding whatever the user stored into the receiver meanwhile.
@@ -23636,7 +23641,12 @@ pub fn sort_list_in_place(
             .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
             .collect();
         pyre_object::listobject::w_list_init_items(list, restored);
-        pyre_object::listobject::w_list_set_allocated(list, saved_allocated);
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let live = pyre_object::listobject::w_list_len(list);
+        let saved = saved_allocated.max(0) as usize;
+        if saved != 0 || live != 0 {
+            pyre_object::listobject::w_list_publish_physical_capacity(list, saved.max(live));
+        }
         sorted?;
         if mucked {
             return Err(crate::PyError::new(
@@ -29330,7 +29340,9 @@ mod tests {
             );
             pyre_object::listobject::w_list_reverse(list);
             assert_eq!(
-                pyre_object::w_str_get_wtf8(pyre_object::listobject::w_list_pop(list, 0).unwrap()),
+                pyre_object::w_str_get_wtf8(
+                    pyre_object::listobject::w_list_pop(list, 0, true).unwrap(),
+                ),
                 "c"
             );
             assert_eq!(

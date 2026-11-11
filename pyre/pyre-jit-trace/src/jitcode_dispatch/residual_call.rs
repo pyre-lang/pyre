@@ -6717,7 +6717,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // augmented-assignment iteration at the trace-entry boundary.  Let the
     // normal residual dispatch execute user special methods; its existing
     // user-frame effect accounting handles any later abort.
-    let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize, isize)> =
+    let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize)> =
         if call_descr.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp
             && args.len() >= 3
             && pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(args[2])
@@ -6731,11 +6731,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     && pyre_object::pyobject::is_exact_list(rhs)
                     && pyre_object::listobject::w_list_is_integer_strategy(rhs)
                 {
-                    Some((
-                        lhs,
-                        pyre_object::w_list_len(lhs),
-                        pyre_object::listobject::w_list_allocated(lhs),
-                    ))
+                    Some((lhs, pyre_object::w_list_len(lhs)))
                 } else if pyre_object::pyobject::is_int_or_long(lhs)
                     || pyre_object::pyobject::is_bool(lhs)
                     || pyre_object::pyobject::is_float(lhs)
@@ -6768,7 +6764,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // rollback rewinds the one append and the deliver re-applies it exactly once
     // (the same `fbw_list_journal_push_append` contract the fold's own commit uses),
     // making the fall-through abort-safe instead of a silent double.
-    let list_append_journal: Option<(pyre_object::PyObjectRef, usize, isize)> =
+    let list_append_journal: Option<(pyre_object::PyObjectRef, usize)> =
         if call_descr.get_extra_info().runtime_helper
             == majit_ir::RuntimeHelperKind::ListAppendValue
         {
@@ -6776,13 +6772,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 .first()
                 .map(|&a| a as usize as pyre_object::PyObjectRef);
             list.filter(|&l| !l.is_null() && unsafe { pyre_object::pyobject::is_list(l) })
-                .map(|l| unsafe {
-                    (
-                        l,
-                        pyre_object::w_list_len(l),
-                        pyre_object::listobject::w_list_allocated(l),
-                    )
-                })
+                .map(|l| unsafe { (l, pyre_object::w_list_len(l)) })
         } else {
             None
         };
@@ -8332,9 +8322,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // the deliver re-applies it exactly once.  `result_i64 == lhs`
             // confirms the in-place mutation (list `__iadd__`/`__imul__` return
             // self) rather than a fresh-object op that merely shared the slot.
-            if let Some((lhs, len_before, allocated_before)) = inplace_list_journal {
+            if let Some((lhs, len_before)) = inplace_list_journal {
                 if result_i64 as usize == lhs as usize {
-                    fbw_list_journal_push_append(lhs, len_before, allocated_before);
+                    fbw_list_journal_push_append(lhs, len_before);
                 }
             }
             // A folded-decline `jit_list_append` fall-through (realloc-boundary
@@ -8342,8 +8332,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // the abort rollback rewinds it and the deliver re-applies exactly
             // once.  The append always mutates its receiver (void `0` result),
             // so no in-place `result == lhs` re-check is needed.
-            if let Some((list, len_before, allocated_before)) = list_append_journal {
-                fbw_list_journal_push_append(list, len_before, allocated_before);
+            if let Some((list, len_before)) = list_append_journal {
+                fbw_list_journal_push_append(list, len_before);
             }
             // `residual_locals_roots` is already closed. Re-read the slot
             // reserved above that bracket. The `i64` taken at `set` is

@@ -7096,7 +7096,7 @@ result = (
                            16, 16, 16, 16, 16, 16, 16, 16,
                            24, 24, 24, 24]
     and [allocation(item) for item in sources] == [6, 6, 6, 8, 8, 8, 8, 8, 8]
-    and allocation(list(HintTwenty())) == 8
+    and allocation(list(HintTwenty())) == 20
     and sort_seen == [(0, 56), (0, 56), (0, 56)]
     and sorted_value == [1, 2, 3]
     and allocation(sorted_value) == 4
@@ -7110,6 +7110,73 @@ result = (
 ";
         let (res, frame) = run_exec_frame(source);
         res.expect("CPython list allocation metadata failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.get_w_globals(), "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_list_sort_mucked_clear_and_sizeof() {
+        let source = "\
+def sort_with(callback):
+    L = [3, 2, 1]
+    def key(item):
+        if item == 3:
+            callback(L)
+        return item
+    try:
+        L.sort(key=key)
+    except ValueError as exc:
+        return ('mucked', str(exc) == 'list modified during sort' and L == [1, 2, 3])
+    return ('ok', L == [1, 2, 3])
+
+def append_pop(L):
+    L.append(9)
+    L.pop()
+
+def append_del(L):
+    L.append(9)
+    del L[:]
+
+def append_clear(L):
+    L.append(9)
+    L.clear()
+
+def append_assign_empty(L):
+    L.append(9)
+    L[:] = []
+
+def bare_clear(L):
+    L.clear()
+
+grown = []
+for i in range(19):
+    grown.append(i)
+sizeof_before = grown.__sizeof__()
+grown.sort(key=lambda item: item)
+sizeof_after = grown.__sizeof__()
+
+cleared = [1, 2, 3]
+cleared.clear()
+cleared.append('x')
+empty = []
+empty.clear()
+
+result = (
+    sort_with(append_pop) == ('mucked', True)
+    and sort_with(append_del) == ('mucked', True)
+    and sort_with(append_clear) == ('mucked', True)
+    and sort_with(append_assign_empty) == ('mucked', True)
+    and sort_with(bare_clear) == ('ok', True)
+    and sizeof_before == sizeof_after
+    and cleared == ['x']
+    and empty == []
+    and len(empty) == 0
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("list sort mucked/clear/sizeof failed");
         unsafe {
             let result = w_dict_getitem_str(frame.get_w_globals(), "result").unwrap();
             assert!(crate::baseobjspace::is_true(result).unwrap());

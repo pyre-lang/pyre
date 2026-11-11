@@ -15817,7 +15817,6 @@ fn rollback_list_append_attempt<Sym: WalkSym>(
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     list: pyre_object::PyObjectRef,
     len_before: usize,
-    allocated_before: isize,
     promote_journal_before: usize,
 ) {
     ctx.trace_ctx.cut_trace(pre_fold_pos);
@@ -15835,7 +15834,7 @@ fn rollback_list_append_attempt<Sym: WalkSym>(
     // pre-move reference (`w_list_switch_to_strategy_for` may relocate), so
     // it is not a safe target for a length store.
     if !promoted && unsafe { pyre_object::w_list_len(list) } > len_before {
-        fbw_rewind_unjournaled_list_append(list, len_before, allocated_before);
+        fbw_rewind_unjournaled_list_append(list, len_before);
     }
     // A declined inlined callee may have latched a blackhole image and
     // claimed the abort coordinate. This recovery continues the walk, so
@@ -15853,7 +15852,6 @@ fn list_append_capture_guard<Sym: WalkSym>(
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     list: pyre_object::PyObjectRef,
     len_before: usize,
-    allocated_before: isize,
     promote_journal_before: usize,
 ) -> Result<bool, DispatchError> {
     match walker_capture_snapshot_for_last_guard(ctx, op_pc) {
@@ -15864,7 +15862,6 @@ fn list_append_capture_guard<Sym: WalkSym>(
                 pre_fold_pos,
                 list,
                 len_before,
-                allocated_before,
                 promote_journal_before,
             );
             Ok(false)
@@ -15881,7 +15878,6 @@ pub(crate) struct ListAppendSuspendBookmark {
     pub(crate) pc: usize,
     pub(crate) position: majit_metainterp::recorder::TracePosition,
     pub(crate) promote_journal_before: usize,
-    pub(crate) allocated_before: isize,
     pub(crate) len_before: usize,
 }
 
@@ -15904,7 +15900,6 @@ fn begin_list_append_suspend_bookmark(
     pc: usize,
     position: majit_metainterp::recorder::TracePosition,
     promote_journal_before: usize,
-    allocated_before: isize,
     len_before: usize,
 ) {
     if !subwalk_driver_is_active() {
@@ -15915,7 +15910,6 @@ fn begin_list_append_suspend_bookmark(
             pc,
             position,
             promote_journal_before,
-            allocated_before,
             len_before,
         });
     });
@@ -15940,7 +15934,6 @@ fn finish_recorded_list_append<Sym: WalkSym>(
     list: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
     len_before: usize,
-    allocated_before: isize,
 ) -> Result<(), DispatchError> {
     match walk_outcome {
         DispatchOutcome::SubReturn { result } => {
@@ -15953,7 +15946,7 @@ fn finish_recorded_list_append<Sym: WalkSym>(
     // The sub-walk records the store. Apply it once when the concrete list
     // has not already grown (`w_list_append` still runs under the lock the
     // wrapper held; the body walk does not).
-    fbw_list_journal_push_append(list, len_before, allocated_before);
+    fbw_list_journal_push_append(list, len_before);
     if unsafe { pyre_object::w_list_len(list) } == len_before {
         unsafe { pyre_object::w_list_append(list, value) };
     }
@@ -15981,7 +15974,6 @@ fn take_list_append_replay<Sym: WalkSym>(
                     bookmark.position,
                     list,
                     bookmark.len_before,
-                    bookmark.allocated_before,
                     bookmark.promote_journal_before,
                 );
             }
@@ -15989,27 +15981,15 @@ fn take_list_append_replay<Sym: WalkSym>(
         }
         Err(error) => Err(error),
         Ok(outcome) => {
-            let (len_before, allocated_before, list) = match &bookmark {
+            let (len_before, list) = match &bookmark {
                 Some(bookmark) => {
                     let list = fbw_append_promote_journal_at(bookmark.promote_journal_before)
                         .unwrap_or(list);
-                    (bookmark.len_before, bookmark.allocated_before, list)
+                    (bookmark.len_before, list)
                 }
-                None => (
-                    unsafe { pyre_object::w_list_len(list) },
-                    unsafe { pyre_object::listobject::w_list_allocated(list) },
-                    list,
-                ),
+                None => (unsafe { pyre_object::w_list_len(list) }, list),
             };
-            finish_recorded_list_append(
-                ctx,
-                op.pc,
-                outcome,
-                list,
-                value,
-                len_before,
-                allocated_before,
-            )?;
+            finish_recorded_list_append(ctx, op.pc, outcome, list, value, len_before)?;
             Ok(Some(true))
         }
     }
@@ -16071,7 +16051,6 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // Sampled before any guard. The commit promotes and may store before a
     // later resume decline; these are the rewind inputs for that decline.
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
     let promote_journal_before = fbw_append_promote_journal_len();
 
     // ── tentative commit ──
@@ -16093,7 +16072,6 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
             pre_fold_pos,
             inner_self,
             len_before,
-            allocated_before,
             promote_journal_before,
         )? {
             return Ok(None);
@@ -16114,7 +16092,6 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
         pre_fold_pos,
         inner_self,
         len_before,
-        allocated_before,
         promote_journal_before,
     )? {
         return Ok(None);
@@ -16130,13 +16107,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
         crate::descr::method_w_self_descr(),
     );
 
-    begin_list_append_suspend_bookmark(
-        op.pc,
-        pre_fold_pos,
-        promote_journal_before,
-        allocated_before,
-        len_before,
-    );
+    begin_list_append_suspend_bookmark(op.pc, pre_fold_pos, promote_journal_before, len_before);
     let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, self_ref, value_op, inner_self, value, len_before,
     );
@@ -16155,7 +16126,6 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
                 pre_fold_pos,
                 inner_self,
                 len_before,
-                allocated_before,
                 promote_journal_before,
             );
             return Ok(None);
@@ -16984,7 +16954,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // deref (`record` → `_record_op`).
     inner_self = live_box_ref(ctx, self_ref, inner_self);
     value = live_box_ref(ctx, value_op, value);
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
     // Keep the original Ref box across the helper-frame boundary.  For a
     // virtual W_IntObject/W_FloatObject, its cached payload field is the live
     // SSA box recorded by `trace_box_int`/`trace_box_float`; the descended
@@ -17160,15 +17129,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // and the concrete append both dereference these objects.
     inner_self = live_box_ref(ctx, self_ref, inner_self);
     value = live_box_ref(ctx, value_op, value);
-    finish_recorded_list_append(
-        ctx,
-        op.pc,
-        walk_outcome,
-        inner_self,
-        value,
-        len_before,
-        allocated_before,
-    )
+    finish_recorded_list_append(ctx, op.pc, walk_outcome, inner_self, value, len_before)
 }
 
 /// Descend the Integer- or Object-strategy `w_list_pop_end_inner` body for a
@@ -17522,18 +17483,11 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     }
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     let promote_journal_before = fbw_append_promote_journal_len();
 
     // ── tentative commit ──
     // The receiver list OpRef + value OpRef are the residual's Ref operands.
-    begin_list_append_suspend_bookmark(
-        op.pc,
-        pre_fold_pos,
-        promote_journal_before,
-        allocated_before,
-        len_before,
-    );
+    begin_list_append_suspend_bookmark(op.pc, pre_fold_pos, promote_journal_before, len_before);
     let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
     );
@@ -17552,7 +17506,6 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
                 pre_fold_pos,
                 list,
                 len_before,
-                allocated_before,
                 promote_journal_before,
             );
             return Ok(None);
@@ -17620,16 +17573,9 @@ pub(crate) fn try_walker_orthodox_proxy_list_append<Sym: WalkSym>(
     }
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     let promote_journal_before = fbw_append_promote_journal_len();
 
-    begin_list_append_suspend_bookmark(
-        op.pc,
-        pre_fold_pos,
-        promote_journal_before,
-        allocated_before,
-        len_before,
-    );
+    begin_list_append_suspend_bookmark(op.pc, pre_fold_pos, promote_journal_before, len_before);
     let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
     );
@@ -17648,7 +17594,6 @@ pub(crate) fn try_walker_orthodox_proxy_list_append<Sym: WalkSym>(
                 pre_fold_pos,
                 list,
                 len_before,
-                allocated_before,
                 promote_journal_before,
             );
             return Ok(None);

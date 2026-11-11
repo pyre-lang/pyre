@@ -41,6 +41,19 @@ mod source_argtype {
     }
 }
 
+mod source_ll {
+    #[majit_macros::specialize_ll]
+    fn arraycopy(source: usize, dest: usize) -> usize {
+        let _ = _annspecialcase_ll_arraycopy;
+        source + dest
+    }
+
+    #[test]
+    fn ll_attribute_preserves_the_native_call() {
+        assert_eq!(arraycopy(1, 2), 3);
+    }
+}
+
 mod source_memo {
     #[majit_macros::specialize_memo]
     fn memo(value: usize) -> usize {
