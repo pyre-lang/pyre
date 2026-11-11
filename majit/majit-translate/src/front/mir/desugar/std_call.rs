@@ -162,7 +162,10 @@ fn closure_env_of_operand<'a>(op: &Operand, llbc: &'a Llbc) -> Option<&'a TypeDe
 }
 
 fn closure_call_fn_id(td: &TypeDecl, llbc: &Llbc) -> Option<u64> {
-    let info = td.src.as_ref()?.get("Closure")?.get("info")?;
+    let majit_charon_reader::TypeDeclSrc::Closure(Some(info)) = &td.src else {
+        return None;
+    };
+    let info: &serde_json::Value = info;
     if let Some(fn_id) = fn_mut_impl_method_id(info, llbc)
         && llbc
             .fn_by_id(fn_id)

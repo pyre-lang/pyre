@@ -862,14 +862,15 @@ pub struct TypeDecl {
     pub published_struct_copy: bool,
 }
 
-/// Origin of a [`TypeDecl`]: the first JSON key or string label. Closure /
-/// VTable payloads are skipped; a Builtin payload is kept only when it is
-/// a string (`"Box"`).
+/// Origin of a [`TypeDecl`]: the first JSON key or string label. A Closure
+/// keeps its payload's `info` (`kind`, `closure_body`, `fn_mut_impl`); a
+/// VTable payload is skipped; a Builtin payload is kept only when it is a
+/// string (`"Box"`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TypeDeclSrc {
     #[default]
     Normal,
-    Closure,
+    Closure(Option<Box<Value>>),
     Builtin(Option<String>),
     VTable,
     Other(String),
@@ -925,8 +926,8 @@ impl<'de> serde::de::Visitor<'de> for TypeDeclSrcVisitor {
         };
         let src = match key.as_str() {
             "Closure" => {
-                let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                TypeDeclSrc::Closure
+                let mut payload = map.next_value::<Value>()?;
+                TypeDeclSrc::Closure(payload.get_mut("info").map(|info| Box::new(info.take())))
             }
             "VTable" => {
                 let _ = map.next_value::<serde::de::IgnoredAny>()?;
@@ -4437,7 +4438,7 @@ mod tests {
         assert_eq!(parse(Value::Null), TypeDeclSrc::Normal);
         assert_eq!(
             parse(serde_json::json!({"Closure": {"info": {"kind": "FnOnce"}}})),
-            TypeDeclSrc::Closure
+            TypeDeclSrc::Closure(Some(Box::new(serde_json::json!({"kind": "FnOnce"}))))
         );
         assert_eq!(
             parse(serde_json::json!({"Builtin": "Box"})),

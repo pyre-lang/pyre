@@ -3353,7 +3353,7 @@ pub(in crate::front::mir) fn operand_const_u8(llbc: &Llbc, op: &Operand) -> Opti
 /// `"Normal"`.  Identified from that origin, never from the `closure` /
 /// `closure#N` name leaf.
 pub(in crate::front::mir) fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
-    matches!(td.src, TypeDeclSrc::Closure)
+    matches!(td.src, TypeDeclSrc::Closure(_))
 }
 
 /// A compiler-synthesised tuple, `str`, or `Box` declaration. Its `TypeDecl`
