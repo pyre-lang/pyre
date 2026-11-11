@@ -127,10 +127,10 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunId,
-        GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
-        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
-        const_fn_def_regular_id,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunGenerics,
+        FunId, GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
+        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, TypeDeclSrc,
+        Unstructured, const_fn_def_regular_id,
     },
 };
 
@@ -725,12 +725,31 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 /// Charon def id and qualified name, the concrete type arguments in
 /// generic-parameter order (`["Tuple", "PyError"]`), and the `<…>` suffix
 /// the per-instantiation classdef carries (`<Tuple,PyError>`).
+///
+/// Ordered by `(name_path, suffix, args, def_id)` so intern registration
+/// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+}
+
+impl PartialOrd for RefEnumInst {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RefEnumInst {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name_path
+            .cmp(&other.name_path)
+            .then_with(|| self.suffix.cmp(&other.suffix))
+            .then_with(|| self.args.cmp(&other.args))
+            .then_with(|| self.def_id.cmp(&other.def_id))
+    }
 }
 
 /// Physical layout identity for a concrete ADT use. The defining path supplies
@@ -896,7 +915,9 @@ fn collect_ref_enum_instantiations(
             intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
         }
     }
-    found.into_iter().collect()
+    let mut insts: Vec<RefEnumInst> = found.into_iter().collect();
+    insts.sort();
+    insts
 }
 
 fn intern_enum_from_ty(
@@ -7061,17 +7082,17 @@ pub(crate) use self::gcroot::{
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
-    adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
-    charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
-    collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
-    host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, seed_program_exception_class_hints,
-    strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
-    tyref_is_fat_dyn, unichr_call,
+    adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
+    charon_literal_to_ast_string, charon_type_value_to_ast_string,
+    collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
+    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
+    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt,
+    seed_program_exception_class_hints, strip_crate_prefix, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

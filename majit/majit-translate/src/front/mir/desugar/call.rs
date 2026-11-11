@@ -9630,11 +9630,7 @@ impl<'a> Lowering<'a> {
                 {
                     if self.spec_body
                         && let Some(fd) = self.llbc.fn_by_id(fn_id)
-                        && fd
-                            .src
-                            .as_ref()
-                            .and_then(|s| s.get("TraitDefault"))
-                            .is_none()
+                        && !fd.is_trait_default()
                     {
                         let combined =
                             merge_impl_and_method_generics(&impl_generics, &reg.generics);

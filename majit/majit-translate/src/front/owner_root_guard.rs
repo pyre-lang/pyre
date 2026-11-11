@@ -311,7 +311,7 @@ fn callee_stays_residual(
     let Some(fd) = llbc.fn_by_id(*id) else {
         return true;
     };
-    if fd.unstructured().is_none() {
+    if !fd.has_unstructured_body() {
         return true;
     }
     let path = super::strip_crate_prefix(&fd.item_meta.name_path());

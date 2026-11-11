@@ -372,30 +372,16 @@ def run_charon_target_dir(engine) -> int:
     return failures
 
 
-def run_llbc_store(engine) -> int:
-    """Content-addressed LLBC store: path, clone, publish, prune, disablement."""
-    failures = 0
-
-    def expect(name, condition):
-        nonlocal failures
-        if condition:
-            print(f"ok   {name}")
-        else:
-            failures += 1
-            print(f"FAIL {name}")
-
-    saved = {
-        key: os.environ.pop(key, None)
-        for key in (
-            "LLBC_STORE",
-            "CI",
-            "PYRE_SHARED_BUILD",
-            "LLBC_STORE_MAX_AGE_DAYS",
-        )
-    }
-    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+def _run_llbc_store_pass(engine, root, expect, *, compress: bool) -> None:
+    """One store layout: legacy (`LLBC_STORE_COMPRESS=off`) or compressed."""
     store = pathlib.Path(tempfile.mkdtemp()).resolve()
+    previous_compress = os.environ.get("LLBC_STORE_COMPRESS")
     try:
+        if compress:
+            os.environ.pop("LLBC_STORE_COMPRESS", None)
+        else:
+            os.environ["LLBC_STORE_COMPRESS"] = "off"
+
         fields = {key: f"{key}-v1" for key in engine.STAMP_KEYS}
         path1 = engine.llbc_store_entry_dir(store, fields)
         expect(
@@ -452,7 +438,7 @@ def run_llbc_store(engine) -> int:
             src.stat().st_ino != dst.stat().st_ino,
         )
 
-        dest_dir = root / "out"
+        dest_dir = root / ("out-compressed" if compress else "out")
         dest_dir.mkdir()
         artefact = dest_dir / "probe.ullbc"
         readfiles = dest_dir / "probe.ullbc.readfiles"
@@ -466,11 +452,20 @@ def run_llbc_store(engine) -> int:
         pub_fields["crate"] = "probe"
         pub_fields["source"] = "abc" * 8
         sources = [artefact, readfiles, fingerprint, provenance]
+
+        def published_ullbc_bytes(entry_dir: pathlib.Path, tag: str) -> bytes:
+            name = "probe.ullbc"
+            if compress:
+                decoded = dest_dir / f"{name}.{tag}"
+                engine.zstd_decompress_file(entry_dir / f"{name}.zst", decoded)
+                return decoded.read_bytes()
+            return (entry_dir / name).read_bytes()
+
         entry = engine.publish_llbc_store_entry(store, pub_fields, sources)
         expect("publish creates the entry dir", entry.is_dir())
         expect(
             "publish clones the artefact",
-            (entry / "probe.ullbc").read_bytes() == b"ULLBC-v1",
+            published_ullbc_bytes(entry, "after-publish") == b"ULLBC-v1",
         )
         expect("publish writes last-used", (entry / "last-used").is_file())
         leftover = list(entry.parent.glob("*.tmp-*"))
@@ -484,7 +479,7 @@ def run_llbc_store(engine) -> int:
         expect("second publish returns the existing entry", again == entry)
         expect(
             "publish does not overwrite an existing entry",
-            (entry / "probe.ullbc").read_bytes() == b"ULLBC-v1",
+            published_ullbc_bytes(entry, "after-second-publish") == b"ULLBC-v1",
         )
         expect(
             "existing publish only touches last-used",
@@ -523,9 +518,10 @@ def run_llbc_store(engine) -> int:
         expect("prune removes a 15-day-old entry", not old_entry.exists())
         expect("prune keeps a 1-day-old entry", new_entry.is_dir())
         expect("prune removes an old .tmp- dir", not tmp_dir.exists())
+        stale_platform = "goneplat.zst" if compress else "goneplat"
         expect(
             "prune removes empty parents of a stale platform",
-            not (store / "goneplat").exists(),
+            not (store / stale_platform).exists(),
         )
         expect(
             "prune removes the empty tmp bucket",
@@ -626,13 +622,52 @@ def run_llbc_store(engine) -> int:
             and "2026-01-01T00:00:00" in rendered,
         )
     finally:
+        if previous_compress is None:
+            os.environ.pop("LLBC_STORE_COMPRESS", None)
+        else:
+            os.environ["LLBC_STORE_COMPRESS"] = previous_compress
+        shutil.rmtree(store, ignore_errors=True)
+
+
+def run_llbc_store(engine) -> int:
+    """Content-addressed LLBC store: path, clone, publish, prune, disablement."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    saved = {
+        key: os.environ.pop(key, None)
+        for key in (
+            "LLBC_STORE",
+            "CI",
+            "PYRE_SHARED_BUILD",
+            "LLBC_STORE_MAX_AGE_DAYS",
+            "LLBC_STORE_MAX_BYTES",
+            "LLBC_STORE_COMPRESS",
+        )
+    }
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        compress_passes = [False]
+        if engine.zstd_available():
+            compress_passes.append(True)
+        else:
+            print("skip: llbc store compression (zstd unavailable)")
+        for compress in compress_passes:
+            _run_llbc_store_pass(engine, root, expect, compress=compress)
+    finally:
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
         shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(store, ignore_errors=True)
     return failures
 
 

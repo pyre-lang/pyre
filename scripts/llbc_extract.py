@@ -1831,6 +1831,14 @@ def llbc_store_max_age_days() -> int:
     return 3
 
 
+def llbc_store_max_bytes() -> int:
+    """Store size cap in bytes. `0` disables. Default 20 GiB."""
+    raw = os.environ.get("LLBC_STORE_MAX_BYTES")
+    if raw:
+        return int(raw)
+    return 20 * 1024**3
+
+
 def llbc_store_dir(root: Path) -> tuple[Path | None, str]:
     """`(store path or None, one-line status)`.
 
@@ -1857,10 +1865,21 @@ def llbc_store_bucket(fields: dict[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
-def llbc_store_entry_dir(store: Path, fields: dict[str, str]) -> Path:
+def llbc_store_entry_dir(
+    store: Path, fields: dict[str, str], *, compressed: bool = False
+) -> Path:
+    """Directory of one store entry.
+
+    Compressed entries live under `<platform>.zst/...` so a worktree whose
+    extractor still opens `<crate>.ullbc` in the legacy tree does not see a
+    directory that lacks that file.
+    """
+    platform = fields["platform"]
+    if compressed:
+        platform = f"{platform}.zst"
     return (
         store
-        / fields["platform"]
+        / platform
         / fields["crate"]
         / llbc_store_bucket(fields)
         / fields["source"]
@@ -1916,6 +1935,123 @@ def clone_file(src: Path, dst: Path) -> None:
         raise
 
 
+_ZSTD_CHUNK = 4 * 1024 * 1024
+
+
+def _zstd_stdlib():
+    try:
+        from compression import zstd
+    except ImportError:
+        return None
+    return zstd
+
+
+def _zstd_executable() -> str | None:
+    return shutil.which("zstd")
+
+
+def _zstd_codec_available() -> bool:
+    return _zstd_stdlib() is not None or _zstd_executable() is not None
+
+
+def zstd_available() -> bool:
+    """True when a new store entry can be written compressed.
+
+    `LLBC_STORE_COMPRESS=off` forces False so a publisher can keep writing
+    the legacy tree; a decoder, when present, still reads `.zst` entries.
+    """
+    if os.environ.get("LLBC_STORE_COMPRESS") == "off":
+        return False
+    return _zstd_codec_available()
+
+
+def zstd_compress_file(src: Path, dst: Path) -> None:
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sibling_staging(dst, "zstd")
+    try:
+        zstd = _zstd_stdlib()
+        if zstd is not None:
+            compressor = zstd.ZstdCompressor(level=1)
+            with open(src, "rb") as inf, open(tmp, "wb") as outf:
+                while True:
+                    chunk = inf.read(_ZSTD_CHUNK)
+                    if not chunk:
+                        break
+                    outf.write(compressor.compress(chunk))
+                outf.write(compressor.flush())
+        else:
+            exe = _zstd_executable()
+            if exe is None:
+                raise FileNotFoundError("llbc store: zstd codec unavailable")
+            subprocess.run(
+                [exe, "-1", "-q", "-f", "-o", str(tmp), str(src)],
+                check=True,
+            )
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def zstd_decompress_file(src: Path, dst: Path) -> None:
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sibling_staging(dst, "zstd")
+    try:
+        zstd = _zstd_stdlib()
+        if zstd is not None:
+            decompressor = zstd.ZstdDecompressor()
+            with open(src, "rb") as inf, open(tmp, "wb") as outf:
+                while True:
+                    chunk = inf.read(_ZSTD_CHUNK)
+                    if not chunk:
+                        break
+                    outf.write(decompressor.decompress(chunk))
+                while not decompressor.eof and not decompressor.needs_input:
+                    outf.write(decompressor.decompress(b""))
+            if not decompressor.eof:
+                raise ValueError(f"llbc store: truncated zstd payload: {src}")
+        else:
+            exe = _zstd_executable()
+            if exe is None:
+                raise FileNotFoundError("llbc store: zstd codec unavailable")
+            subprocess.run(
+                [exe, "-d", "-q", "-f", "-o", str(tmp), str(src)],
+                check=True,
+            )
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def store_put_file(src: Path, entry_tmp: Path, compress: bool) -> None:
+    src = Path(src)
+    if compress:
+        zstd_compress_file(src, entry_tmp / f"{src.name}.zst")
+    else:
+        clone_file(src, entry_tmp / src.name)
+
+
+def store_get_file(entry: Path, name: str, dst: Path, compressed: bool) -> None:
+    src = entry / (f"{name}.zst" if compressed else name)
+    if not src.is_file():
+        raise FileNotFoundError(f"llbc store entry missing {name}: {entry}")
+    if compressed:
+        zstd_decompress_file(src, dst)
+    else:
+        clone_file(src, dst)
+
+
+def _store_compress_name(name: str) -> bool:
+    # Big payloads end in `.ullbc`; sidecars end in `.readfiles` / `.fingerprint`
+    # / `.provenance` and stay uncompressed so they remain ordinary text.
+    return name.endswith(".ullbc")
+
+
 def touch_llbc_store_entry(entry: Path) -> None:
     marker = entry / "last-used"
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1942,8 +2078,17 @@ def publish_llbc_store_entry(
 
     Materialises under `<entry>.tmp-<pid>-<rand>` and `os.rename`s into
     place. An existing entry is left unchanged; only `last-used` is touched.
+    When a zstd codec is available, the big `.ullbc` payloads are stored
+    compressed under `<platform>.zst/`; a compressed entry that already
+    exists is only touched, and no legacy twin is created.
     """
-    entry = llbc_store_entry_dir(store, fields)
+    compress = zstd_available()
+    if not compress:
+        compressed_entry = llbc_store_entry_dir(store, fields, compressed=True)
+        if compressed_entry.exists():
+            touch_llbc_store_entry(compressed_entry)
+            return compressed_entry
+    entry = llbc_store_entry_dir(store, fields, compressed=compress)
     if entry.exists():
         touch_llbc_store_entry(entry)
         return entry
@@ -1956,7 +2101,9 @@ def publish_llbc_store_entry(
     try:
         tmp.mkdir()
         for src in present:
-            clone_file(src, tmp / src.name)
+            store_put_file(
+                src, tmp, compress=compress and _store_compress_name(src.name)
+            )
         (tmp / "last-used").touch()
         try:
             os.rename(tmp, entry)
@@ -2003,8 +2150,17 @@ def iter_llbc_store_entries(bucket: Path) -> list[Path]:
     return entries
 
 
-def prune_llbc_store(store: Path, *, max_age_days: int) -> None:
-    """Drop unused store entries, leftover tmp dirs, then empty parents."""
+def prune_llbc_store(
+    store: Path, *, max_age_days: int, max_bytes: int | None = None
+) -> None:
+    """Drop unused store entries, leftover tmp dirs, then empty parents.
+
+    After the age pass, `max_bytes` (default `LLBC_STORE_MAX_BYTES`, 20 GiB;
+    `0` disables) evicts least-recently-used non-tmp entries until the store
+    fits. Both the legacy and `.zst` trees are walked by the same glob.
+    """
+    if max_bytes is None:
+        max_bytes = llbc_store_max_bytes()
     if not store.is_dir():
         print("llbc store: pruned 0 entries, 0 bytes")
         return
@@ -2033,6 +2189,24 @@ def prune_llbc_store(store: Path, *, max_age_days: int) -> None:
         removed += 1
         total += size
         print(f"llbc store: pruned {child.relative_to(store)} ({size} bytes)")
+    if max_bytes > 0:
+        remaining = [
+            child
+            for child in store.glob("*/*/*/*")
+            if child.is_dir() and ".tmp-" not in child.name
+        ]
+        sizes = {child: _llbc_store_dir_size(child) for child in remaining}
+        total_size = sum(sizes.values())
+        remaining.sort(key=_llbc_store_entry_used_at)
+        for child in remaining:
+            if total_size <= max_bytes:
+                break
+            size = sizes[child]
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+            total += size
+            total_size -= size
+            print(f"llbc store: pruned {child.relative_to(store)} ({size} bytes)")
     for dirpath, _, _ in os.walk(store, topdown=False):
         path = Path(dirpath)
         if path == store:
@@ -2076,10 +2250,6 @@ def _llbc_store_on_skip(
     stamp_path: Path,
 ) -> None:
     recorded = parse_stamp(stamp_path.read_text(encoding="utf-8", errors="replace"))
-    entry = llbc_store_entry_dir(store, recorded)
-    if entry.exists():
-        touch_llbc_store_entry(entry)
-        return
     publish_llbc_store_entry(
         store, recorded, llbc_store_payload_files(eng, spec, dest_dir)
     )
@@ -2103,13 +2273,23 @@ def import_from_llbc_store(
     charon_flags: list[str],
     layout_flags: list[str],
 ) -> bool:
-    """Clone a matching store entry into `dest_dir`. True if the crate is done."""
+    """Copy a matching store entry into `dest_dir`. True if the crate is done.
+
+    Compressed entries are decompressed on import; legacy entries are cloned.
+    """
     fields = parse_stamp(stamp)
-    bucket = llbc_store_entry_dir(store, fields).parent
     layout_targets = crate_layout_targets(eng, spec)
     names = [spec.output_name]
     names += [spec.layout_sidecar_name(t) for t in layout_targets]
-    for entry in iter_llbc_store_entries(bucket):
+    candidates: list[tuple[Path, bool]] = []
+    if _zstd_codec_available():
+        zst_bucket = llbc_store_entry_dir(store, fields, compressed=True).parent
+        candidates.extend(
+            (entry, True) for entry in iter_llbc_store_entries(zst_bucket)
+        )
+    bucket = llbc_store_entry_dir(store, fields, compressed=False).parent
+    candidates.extend((entry, False) for entry in iter_llbc_store_entries(bucket))
+    for entry, compressed in candidates:
         entry_readfiles = entry / readfiles.name
         if not entry_readfiles.is_file():
             continue
@@ -2119,10 +2299,7 @@ def import_from_llbc_store(
         if digest != entry.name:
             continue
         for name in names:
-            src = entry / name
-            if not src.is_file():
-                raise FileNotFoundError(f"llbc store entry missing {name}: {entry}")
-            clone_file(src, dest_dir / name)
+            store_get_file(entry, name, dest_dir / name, compressed)
         clone_file(entry_readfiles, readfiles)
         forget_collected_inputs()
         current_stamp = stamp_for(
@@ -2184,6 +2361,111 @@ def prune_store_cli(eng: Engine, args: argparse.Namespace) -> None:
     print(status)
     if store is not None:
         prune_llbc_store(store, max_age_days=args.store_max_age_days)
+
+
+def _remove_empty_store_dirs(store: Path) -> None:
+    for dirpath, _, _ in os.walk(store, topdown=False):
+        path = Path(dirpath)
+        if path == store:
+            continue
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
+def _compact_llbc_store_entry(legacy: Path, compressed: Path) -> tuple[int, int]:
+    """Build the compressed twin of `legacy`. Returns (before, after) sizes."""
+    before = _llbc_store_dir_size(legacy)
+    if compressed.exists():
+        after = _llbc_store_dir_size(compressed)
+        shutil.rmtree(legacy)
+        return before, after
+    bucket = compressed.parent
+    bucket.mkdir(parents=True, exist_ok=True)
+    tmp = bucket / f"{compressed.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}"
+    last_used_at = None
+    try:
+        tmp.mkdir()
+        for item in legacy.iterdir():
+            if not item.is_file():
+                continue
+            if item.name.endswith(".ullbc"):
+                zstd_compress_file(item, tmp / f"{item.name}.zst")
+            else:
+                clone_file(item, tmp / item.name)
+            if item.name == "last-used":
+                last_used_at = item.stat().st_mtime
+        if last_used_at is not None:
+            os.utime(tmp / "last-used", (last_used_at, last_used_at))
+        try:
+            os.rename(tmp, compressed)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if compressed.exists():
+                after = _llbc_store_dir_size(compressed)
+                shutil.rmtree(legacy)
+                return before, after
+            raise
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    shutil.rmtree(legacy)
+    return before, _llbc_store_dir_size(compressed)
+
+
+def compact_llbc_store(store: Path) -> None:
+    """Convert legacy uncompressed entries into the `.zst` tree.
+
+    Each non-tmp directory at `<store>/<platform>/<crate>/<bucket>/<source>`
+    whose `<platform>` does not end in `.zst` is rewritten compressed, then
+    removed. Failures print `warn:` and leave that entry untouched.
+    """
+    if not zstd_available():
+        print("llbc store: compaction needs zstd", file=sys.stderr)
+        raise SystemExit(1)
+    if not store.is_dir():
+        print("llbc store: compacted 0 entries, 0 -> 0 bytes")
+        return
+    n = 0
+    before_total = 0
+    after_total = 0
+    for child in sorted(store.glob("*/*/*/*")):
+        if not child.is_dir() or ".tmp-" in child.name:
+            continue
+        rel = child.relative_to(store)
+        parts = rel.parts
+        if len(parts) != 4:
+            continue
+        platform, crate, bucket, source = parts
+        if platform.endswith(".zst"):
+            continue
+        compressed = store / f"{platform}.zst" / crate / bucket / source
+        try:
+            before, after = _compact_llbc_store_entry(child, compressed)
+        except Exception as exc:
+            print(f"warn: llbc store: compact {rel}: {exc}", file=sys.stderr)
+            continue
+        n += 1
+        before_total += before
+        after_total += after
+        print(f"llbc store: compacted {rel} {before} -> {after} bytes")
+    _remove_empty_store_dirs(store)
+    print(
+        f"llbc store: compacted {n} entries, {before_total} -> {after_total} bytes"
+    )
+
+
+def compact_store_cli(eng: Engine, args: argparse.Namespace) -> None:
+    store, status = llbc_store_dir(eng.root)
+    print(status)
+    if store is not None:
+        compact_llbc_store(store)
 
 
 def file_mtime(path: Path) -> str:
@@ -4087,6 +4369,156 @@ def self_test_nested_repo_detection() -> None:
     print("\nself-test passed: nested-repo refusal (hazard flagged, benign not)")
 
 
+def _self_test_store_fields(source: str) -> dict[str, str]:
+    fields = {key: "test" for key in STORE_BUCKET_KEYS}
+    fields["platform"] = "testplat"
+    fields["crate"] = "x"
+    fields["source"] = source
+    return fields
+
+
+def self_test_llbc_store_compression() -> None:
+    """Round-trip, publish, compact, and size-cap the compressed store."""
+    saved_compress = os.environ.pop("LLBC_STORE_COMPRESS", None)
+    saved_max = os.environ.pop("LLBC_STORE_MAX_BYTES", None)
+    try:
+        if not _zstd_codec_available():
+            print("self-test skip: llbc store compression (zstd unavailable)")
+            return
+        n = 9 * 1024 * 1024
+        block = bytes((i * 31 + 11) & 0xFF for i in range(4096))
+        payload = (block * (n // len(block) + 1))[:n]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            src = root / "payload.bin"
+            zst = root / "payload.bin.zst"
+            out = root / "payload.out"
+            src.write_bytes(payload)
+            zstd_compress_file(src, zst)
+            zstd_decompress_file(zst, out)
+            if out.read_bytes() != payload:
+                raise SystemExit(
+                    "self-test FAILED: zstd round-trip changed the 9 MiB payload"
+                )
+
+            store = root / "store"
+            fields = _self_test_store_fields("a" * 32)
+            artefacts = root / "artefacts"
+            artefacts.mkdir()
+            ullbc = artefacts / "x.ullbc"
+            layout = artefacts / "x.t.layouts.ullbc"
+            readfiles = artefacts / "x.ullbc.readfiles"
+            ullbc.write_bytes(payload)
+            layout.write_bytes(b"layout-sidecar\n")
+            readfiles.write_text("src/lib.rs\n", encoding="utf-8")
+            published = publish_llbc_store_entry(
+                store, fields, [ullbc, layout, readfiles]
+            )
+            zst_entry = llbc_store_entry_dir(store, fields, compressed=True)
+            legacy_entry = llbc_store_entry_dir(store, fields, compressed=False)
+            if published != zst_entry:
+                raise SystemExit(
+                    f"self-test FAILED: publish returned {published}, expected {zst_entry}"
+                )
+            missing = [
+                name
+                for name in (
+                    "x.ullbc.zst",
+                    "x.t.layouts.ullbc.zst",
+                    "x.ullbc.readfiles",
+                    "last-used",
+                )
+                if not (zst_entry / name).is_file()
+            ]
+            if missing:
+                raise SystemExit(
+                    f"self-test FAILED: compressed entry missing {missing}"
+                )
+            if (zst_entry / "x.ullbc.readfiles.zst").exists():
+                raise SystemExit(
+                    "self-test FAILED: readfiles was stored compressed"
+                )
+            if legacy_entry.exists():
+                raise SystemExit(
+                    "self-test FAILED: publish also created a legacy entry"
+                )
+            imported = root / "imported"
+            imported.mkdir()
+            store_get_file(zst_entry, "x.ullbc", imported / "x.ullbc", True)
+            if (imported / "x.ullbc").read_bytes() != payload:
+                raise SystemExit(
+                    "self-test FAILED: published .ullbc.zst did not round-trip"
+                )
+
+            compact_fields = _self_test_store_fields("b" * 32)
+            legacy = llbc_store_entry_dir(
+                store, compact_fields, compressed=False
+            )
+            legacy.mkdir(parents=True)
+            (legacy / "x.ullbc").write_bytes(payload)
+            (legacy / "x.t.layouts.ullbc").write_bytes(b"layout-sidecar\n")
+            (legacy / "x.ullbc.readfiles").write_text(
+                "src/lib.rs\n", encoding="utf-8"
+            )
+            (legacy / "last-used").touch()
+            past = time.time() - 12345
+            os.utime(legacy / "last-used", (past, past))
+            want_mtime = (legacy / "last-used").stat().st_mtime
+            compact_llbc_store(store)
+            if legacy.exists():
+                raise SystemExit(
+                    "self-test FAILED: compact left the legacy directory"
+                )
+            compacted = llbc_store_entry_dir(
+                store, compact_fields, compressed=True
+            )
+            if not (compacted / "x.ullbc.zst").is_file():
+                raise SystemExit(
+                    "self-test FAILED: compact did not write x.ullbc.zst"
+                )
+            got_mtime = (compacted / "last-used").stat().st_mtime
+            if got_mtime != want_mtime:
+                raise SystemExit(
+                    "self-test FAILED: compact did not preserve last-used mtime "
+                    f"(want {want_mtime}, got {got_mtime})"
+                )
+            roundtrip = root / "compacted.ullbc"
+            store_get_file(compacted, "x.ullbc", roundtrip, True)
+            if roundtrip.read_bytes() != payload:
+                raise SystemExit(
+                    "self-test FAILED: compacted payload did not round-trip"
+                )
+
+            cap_store = root / "cap-store"
+            older_fields = _self_test_store_fields("c" * 32)
+            newer_fields = _self_test_store_fields("d" * 32)
+            older = publish_llbc_store_entry(
+                cap_store, older_fields, [ullbc, layout, readfiles]
+            )
+            newer = publish_llbc_store_entry(
+                cap_store, newer_fields, [ullbc, layout, readfiles]
+            )
+            now = time.time()
+            os.utime(older / "last-used", (now - 100, now - 100))
+            os.utime(newer / "last-used", (now - 10, now - 10))
+            cap = _llbc_store_dir_size(older) + _llbc_store_dir_size(newer) - 1
+            prune_llbc_store(cap_store, max_age_days=3650, max_bytes=cap)
+            if older.exists():
+                raise SystemExit(
+                    "self-test FAILED: size-cap kept the older entry"
+                )
+            if not newer.exists():
+                raise SystemExit(
+                    "self-test FAILED: size-cap dropped the newer entry"
+                )
+        print("self-test passed: llbc store compression")
+    finally:
+        if saved_compress is not None:
+            os.environ["LLBC_STORE_COMPRESS"] = saved_compress
+        if saved_max is not None:
+            os.environ["LLBC_STORE_MAX_BYTES"] = saved_max
+
+
 def self_test_derived_include_closed(
     eng: Engine, crates: list[str], cargo_features: str
 ) -> None:
@@ -4241,6 +4673,11 @@ def run_cli(
         action="store_true",
         help="remove unused LLBC store entries; never extracts",
     )
+    modes.add_argument(
+        "--compact-store",
+        action="store_true",
+        help="compress legacy uncompressed LLBC store entries; never extracts",
+    )
     parser.add_argument(
         "--store-max-age-days",
         type=int,
@@ -4364,6 +4801,8 @@ def run_cli(
         # Same reason again: this one builds its own repository in a
         # temporary directory and never touches the worktree.
         self_test_nested_repo_detection()
+        # Same reason: a TemporaryDirectory store, never the machine-wide one.
+        self_test_llbc_store_compression()
         # Reads the worktree without writing to it, so it precedes the probe.
         self_test_derived_include_closed(eng, crates, cargo_features)
         self_test(eng, crates, cargo_features)
@@ -4375,6 +4814,9 @@ def run_cli(
         if args.store_max_age_days is None:
             args.store_max_age_days = llbc_store_max_age_days()
         prune_store_cli(eng, args)
+        return
+    if args.compact_store:
+        compact_store_cli(eng, args)
         return
     extract(eng, args)
 

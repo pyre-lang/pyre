@@ -28,24 +28,23 @@ pub struct FunDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub signature: Signature,
-    /// Generic-parameter context of the declaration. Each value keeps
-    /// only the paths the translator reads: `types`; `const_generics`;
+    /// Generic-parameter context of the declaration. Keeps only the
+    /// paths the translator reads: nonempty `types` / `const_generics`;
     /// `trait_clauses[].trait_.skip_binder.id`,
     /// `trait_clauses[].trait_.skip_binder.generics.types`.
-    /// `decl_is_generic` tests nonempty `types` / `trait_clauses` /
-    /// `const_generics`; `tyref_generic_trait_bound_root` projects the
-    /// bound. A new reader of another path must add it to
-    /// `FunGenericsRow`.
+    /// `decl_is_generic` tests those nonempty flags;
+    /// `tyref_generic_trait_bound_root` projects the bound. A new reader
+    /// of another path must add it to `FunGenericsRow`.
     #[serde(default, deserialize_with = "fun_generics")]
-    pub generics: Option<Value>,
-    /// Where the function comes from (`ItemSource`). Kept as a string
-    /// (`"Normal"`, `"AdtConstructor"`, `"VTableShim"`);
-    /// `GlobalInitializer.id`; `TraitDefault` presence.
-    /// [`FunDecl::is_global_initializer`], [`FunDecl::is_adt_constructor`],
+    pub generics: Option<FunGenerics>,
+    /// Where the function comes from (`ItemSource`): string labels
+    /// (`Normal`, `AdtConstructor`, `VTableShim`); `GlobalInitializer.id`;
+    /// `TraitDefault` presence. [`FunDecl::is_global_initializer`],
+    /// [`FunDecl::is_adt_constructor`], [`FunDecl::is_trait_default`],
     /// and `trait_default_call_segments` project these. A new reader of
     /// another path must add it to `FunSrcRow`.
     #[serde(default, deserialize_with = "fun_src")]
-    pub src: Option<Value>,
+    pub src: Option<FunSrc>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
     /// `{"Error": {...}}` otherwise. Kept as the raw JSON text (not an
@@ -91,41 +90,124 @@ pub struct FunDecl {
     pub returns_owned_scope: std::sync::atomic::AtomicBool,
 }
 
-fn fun_generics<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    Ok(Option::<FunGenericsRow>::deserialize(d)?.map(FunGenericsRow::into_value))
+fn fun_generics<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<FunGenerics>, D::Error> {
+    Ok(Option::<FunGenericsRow>::deserialize(d)?.map(FunGenericsRow::into_fun_generics))
 }
 
-fn fun_src<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    Ok(Option::<FunSrcRow>::deserialize(d)?.and_then(FunSrcRow::into_value))
+fn fun_src<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<FunSrc>, D::Error> {
+    Ok(Option::<FunSrcRow>::deserialize(d)?.and_then(FunSrcRow::into_src))
+}
+
+/// Generic-parameter context of a [`FunDecl`]: nonempty type / const
+/// parameters, and each trait-clause bound the translator projects.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FunGenerics {
+    pub has_types: bool,
+    pub has_const_generics: bool,
+    pub trait_clauses: Vec<TraitClauseBound>,
+}
+
+/// One `trait_clauses[]` bound: the trait id and its type arguments.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TraitClauseBound {
+    pub trait_id: Option<u64>,
+    pub types: Vec<Value>,
+}
+
+/// Origin of a [`FunDecl`]: string labels, a global initializer's id, or
+/// a provided trait-method body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunSrc {
+    Normal,
+    AdtConstructor,
+    VTableShim,
+    GlobalInitializer { id: Option<u64> },
+    TraitDefault,
+    Other(String),
 }
 
 /// A `FunDecl.generics` object reduced to the paths the translator reads.
 #[derive(Deserialize)]
 struct FunGenericsRow {
-    #[serde(default, deserialize_with = "crate::schema::present")]
-    types: Option<Value>,
-    #[serde(default, deserialize_with = "crate::schema::present")]
-    const_generics: Option<Value>,
+    #[serde(default, deserialize_with = "nonempty_json_array")]
+    types: bool,
+    #[serde(default, deserialize_with = "nonempty_json_array")]
+    const_generics: bool,
     #[serde(default, deserialize_with = "crate::schema::present_nullable")]
     trait_clauses: Option<crate::schema::Nullable<Vec<Option<TraitClause>>>>,
 }
 
 impl FunGenericsRow {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        crate::schema::insert_present(&mut map, "types", self.types);
-        crate::schema::insert_present(&mut map, "const_generics", self.const_generics);
-        crate::schema::insert_present(
-            &mut map,
-            "trait_clauses",
-            self.trait_clauses.map(|n| {
-                n.into_value(|es| {
-                    crate::schema::option_array_into_value(es, TraitClause::into_value)
-                })
-            }),
-        );
-        Value::Object(map)
+    fn into_fun_generics(self) -> FunGenerics {
+        let trait_clauses = match self.trait_clauses {
+            Some(crate::schema::Nullable::Some(clauses)) => clauses
+                .into_iter()
+                .filter_map(|clause| clause.map(TraitClause::into_bound))
+                .collect(),
+            _ => Vec::new(),
+        };
+        FunGenerics {
+            has_types: self.types,
+            has_const_generics: self.const_generics,
+            trait_clauses,
+        }
     }
+}
+
+fn nonempty_json_array<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    struct NonemptyArray;
+    impl<'de> serde::de::Visitor<'de> for NonemptyArray {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+            let mut nonempty = false;
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                nonempty = true;
+            }
+            Ok(nonempty)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(false)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<bool, E> {
+            Ok(false)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<bool, E> {
+            Ok(false)
+        }
+    }
+    d.deserialize_any(NonemptyArray)
 }
 
 #[derive(Deserialize)]
@@ -135,14 +217,22 @@ struct TraitClause {
 }
 
 impl TraitClause {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        crate::schema::insert_present(
-            &mut map,
-            "trait_",
-            self.trait_.map(|n| n.into_value(TraitPred::into_value)),
-        );
-        Value::Object(map)
+    fn into_bound(self) -> TraitClauseBound {
+        let Some(crate::schema::Nullable::Some(pred)) = self.trait_ else {
+            return TraitClauseBound::default();
+        };
+        let Some(crate::schema::Nullable::Some(binder)) = pred.skip_binder else {
+            return TraitClauseBound::default();
+        };
+        let trait_id = binder.id.and_then(|id| id.as_u64());
+        let types = match binder.generics {
+            Some(crate::schema::Nullable::Some(generics)) => match generics.types {
+                Some(Value::Array(items)) => items,
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        TraitClauseBound { trait_id, types }
     }
 }
 
@@ -150,19 +240,6 @@ impl TraitClause {
 struct TraitPred {
     #[serde(default, deserialize_with = "crate::schema::present_nullable")]
     skip_binder: Option<crate::schema::Nullable<TraitPredBinder>>,
-}
-
-impl TraitPred {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        crate::schema::insert_present(
-            &mut map,
-            "skip_binder",
-            self.skip_binder
-                .map(|n| n.into_value(TraitPredBinder::into_value)),
-        );
-        Value::Object(map)
-    }
 }
 
 #[derive(Deserialize)]
@@ -173,32 +250,10 @@ struct TraitPredBinder {
     generics: Option<crate::schema::Nullable<TraitPredGenerics>>,
 }
 
-impl TraitPredBinder {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        crate::schema::insert_present(&mut map, "id", self.id);
-        crate::schema::insert_present(
-            &mut map,
-            "generics",
-            self.generics
-                .map(|n| n.into_value(TraitPredGenerics::into_value)),
-        );
-        Value::Object(map)
-    }
-}
-
 #[derive(Deserialize)]
 struct TraitPredGenerics {
     #[serde(default, deserialize_with = "crate::schema::present")]
     types: Option<Value>,
-}
-
-impl TraitPredGenerics {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        crate::schema::insert_present(&mut map, "types", self.types);
-        Value::Object(map)
-    }
 }
 
 /// A `FunDecl.src` value reduced to the paths the translator reads.
@@ -224,22 +279,19 @@ struct GlobalInitSrc {
 }
 
 impl FunSrcRow {
-    fn into_value(self) -> Option<Value> {
+    fn into_src(self) -> Option<FunSrc> {
         match self {
-            FunSrcRow::Str(s) => Some(Value::String(s)),
+            FunSrcRow::Str(s) => Some(match s.as_str() {
+                "Normal" => FunSrc::Normal,
+                "AdtConstructor" => FunSrc::AdtConstructor,
+                "VTableShim" => FunSrc::VTableShim,
+                _ => FunSrc::Other(s),
+            }),
             FunSrcRow::Obj(obj) => {
                 if let Some(gi) = obj.global_initializer {
-                    let mut inner = serde_json::Map::new();
-                    if let Some(id) = gi.id {
-                        inner.insert("id".into(), Value::from(id));
-                    }
-                    let mut map = serde_json::Map::new();
-                    map.insert("GlobalInitializer".into(), Value::Object(inner));
-                    Some(Value::Object(map))
+                    Some(FunSrc::GlobalInitializer { id: gi.id })
                 } else if obj.trait_default.is_some() {
-                    let mut map = serde_json::Map::new();
-                    map.insert("TraitDefault".into(), Value::Object(Default::default()));
-                    Some(Value::Object(map))
+                    Some(FunSrc::TraitDefault)
                 } else {
                     None
                 }
@@ -265,11 +317,10 @@ impl FunDecl {
     /// exception slots that the flowspace adapter cannot lift.  `None`
     /// for ordinary function bodies.
     pub fn is_global_initializer(&self) -> Option<u64> {
-        self.src
-            .as_ref()?
-            .get("GlobalInitializer")?
-            .get("id")?
-            .as_u64()
+        match self.src {
+            Some(FunSrc::GlobalInitializer { id }) => id,
+            _ => None,
+        }
     }
 
     /// `true` for the function Charon synthesises for a tuple-struct or
@@ -277,7 +328,12 @@ impl FunDecl {
     /// Its output type is the ADT and its name ends in the variant (or
     /// struct) name.
     pub fn is_adt_constructor(&self) -> bool {
-        self.src.as_ref().and_then(Value::as_str) == Some("AdtConstructor")
+        matches!(self.src, Some(FunSrc::AdtConstructor))
+    }
+
+    /// `true` for a provided trait-method body (`src: {"TraitDefault": …}`).
+    pub fn is_trait_default(&self) -> bool {
+        matches!(self.src, Some(FunSrc::TraitDefault))
     }
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
@@ -370,19 +426,19 @@ impl FunDecl {
         if table.is_empty() {
             return;
         }
+        let mut table_ids: Vec<u64> = table.iter().map(|&(id, _)| id).collect();
+        if table_ids.windows(2).any(|w| w[0] > w[1]) {
+            table_ids.sort_unstable();
+        }
         let mut consumed: Vec<usize> = Vec::new();
         for i in 0..body.body.len() {
             let raw = body.body[i].terminator.kind.get();
             if raw_variant_name(raw) != Some("Call") {
                 continue;
             }
-            let Some((id, op)) = table
-                .iter()
-                .copied()
-                .find(|(id, _)| raw_fun_ids(raw.as_bytes()).any(|fun_id| fun_id == *id))
-            else {
+            if !raw_fun_ids(raw.as_bytes()).any(|fun_id| table_ids.binary_search(&fun_id).is_ok()) {
                 continue;
-            };
+            }
             let kind = body.body[i].terminator.kind_value().clone();
             let Some(call_term) = kind.get("Call") else {
                 continue;
@@ -390,15 +446,18 @@ impl FunDecl {
             let Some(inner) = call_term.get("call") else {
                 continue;
             };
-            let fun_id = inner
+            let Some(fun_id) = inner
                 .get("func")
                 .and_then(|f| f.get("Regular"))
                 .and_then(|r| r.get("kind"))
                 .and_then(|k| k.get("Fun"))
-                .and_then(Value::as_u64);
-            if fun_id != Some(id) {
+                .and_then(Value::as_u64)
+            else {
                 continue;
-            }
+            };
+            let Some((_, op)) = table.iter().copied().find(|(id, _)| *id == fun_id) else {
+                continue;
+            };
             let Some(args) = inner.get("args").and_then(Value::as_array) else {
                 continue;
             };
@@ -784,11 +843,11 @@ pub struct TypeDecl {
     #[serde(skip)]
     layout_exprs: std::sync::OnceLock<Option<Vec<TargetLayoutExprs>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
-    /// closure environment is the object `{"Closure": …}`; an ordinary ADT
-    /// is the string `"Normal"`. Kept raw so an
-    /// unmodelled origin cannot fail the load.
+    /// closure environment is `{"Closure": …}`; an ordinary ADT is the
+    /// string `"Normal"`. The first key (or string label) is kept; unread
+    /// payloads are skipped so an unmodelled origin cannot fail the load.
     #[serde(default)]
-    pub src: Option<Value>,
+    pub src: TypeDeclSrc,
     /// Thin vs fat pointer metadata for this type. Charon writes the
     /// string `"None"` when a pointer to the type is one address word;
     /// `"Length"`, `{"VTable": ..}`, or `{"InheritFrom": ..}` when the
@@ -801,6 +860,123 @@ pub struct TypeDecl {
     /// opaque import: the copy is not a second definition of the class.
     #[serde(skip)]
     pub published_struct_copy: bool,
+}
+
+/// Origin of a [`TypeDecl`]: the first JSON key or string label. Closure /
+/// VTable payloads are skipped; a Builtin payload is kept only when it is
+/// a string (`"Box"`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TypeDeclSrc {
+    #[default]
+    Normal,
+    Closure,
+    Builtin(Option<String>),
+    VTable,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for TypeDeclSrc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(TypeDeclSrcVisitor)
+    }
+}
+
+struct TypeDeclSrcVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TypeDeclSrcVisitor {
+    type Value = TypeDeclSrc;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a TypeDecl src tag")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(match v {
+            "Normal" => TypeDeclSrc::Normal,
+            other => TypeDeclSrc::Other(other.to_string()),
+        })
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(match v.as_str() {
+            "Normal" => TypeDeclSrc::Normal,
+            _ => TypeDeclSrc::Other(v),
+        })
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Some(key) = map.next_key::<String>()? else {
+            return Ok(TypeDeclSrc::Normal);
+        };
+        let src = match key.as_str() {
+            "Closure" => {
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                TypeDeclSrc::Closure
+            }
+            "VTable" => {
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                TypeDeclSrc::VTable
+            }
+            "Builtin" => {
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum BuiltinPayload {
+                    Str(String),
+                    Other(serde::de::IgnoredAny),
+                }
+                let payload = map.next_value::<BuiltinPayload>()?;
+                TypeDeclSrc::Builtin(match payload {
+                    BuiltinPayload::Str(s) => Some(s),
+                    BuiltinPayload::Other(_) => None,
+                })
+            }
+            _ => {
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                TypeDeclSrc::Other(key)
+            }
+        };
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(src)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(TypeDeclSrc::Normal)
+    }
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].
@@ -4212,18 +4388,12 @@ mod tests {
             "src": "Normal"
         }));
         let g = fd.generics.as_ref().expect("generics");
-        assert!(g.get("regions").is_none());
-        assert!(g.get("regions_outlive").is_none());
-        assert!(g.get("types_outlive").is_none());
-        assert!(g.get("trait_type_constraints").is_none());
-        assert_eq!(g["types"][0]["name"], "T");
-        assert_eq!(g["const_generics"][0]["name"], "N");
-        let pred = &g["trait_clauses"][0]["trait_"]["skip_binder"];
-        assert_eq!(pred["id"], 7);
-        assert!(pred["generics"].get("regions").is_none());
-        assert!(pred["generics"].get("trait_refs").is_none());
-        assert_eq!(pred["generics"]["types"][0]["TypeVar"]["Bound"][0], 0);
-        assert_eq!(fd.src.as_ref().and_then(Value::as_str), Some("Normal"));
+        assert!(g.has_types);
+        assert!(g.has_const_generics);
+        assert_eq!(g.trait_clauses.len(), 1);
+        assert_eq!(g.trait_clauses[0].trait_id, Some(7));
+        assert_eq!(g.trait_clauses[0].types[0]["TypeVar"]["Bound"][0], 0);
+        assert_eq!(fd.src, Some(FunSrc::Normal));
     }
 
     #[test]
@@ -4232,26 +4402,19 @@ mod tests {
             "src": {"GlobalInitializer": {"id": 9, "generics": {"types": [1]}}}
         }));
         assert_eq!(gi.is_global_initializer(), Some(9));
-        assert!(
-            gi.src.as_ref().unwrap()["GlobalInitializer"]
-                .get("generics")
-                .is_none()
-        );
+        assert_eq!(gi.src, Some(FunSrc::GlobalInitializer { id: Some(9) }));
 
         let td = parse_fun_decl(serde_json::json!({
             "src": {"TraitDefault": {"trait_ref": {"id": 1}, "item_id": 2}}
         }));
-        let marker = td.src.as_ref().unwrap().get("TraitDefault").unwrap();
-        assert!(marker.as_object().unwrap().is_empty());
+        assert!(td.is_trait_default());
+        assert_eq!(td.src, Some(FunSrc::TraitDefault));
 
         let adt = parse_fun_decl(serde_json::json!({"src": "AdtConstructor"}));
         assert!(adt.is_adt_constructor());
 
         let shim = parse_fun_decl(serde_json::json!({"src": "VTableShim"}));
-        assert_eq!(
-            shim.src.as_ref().and_then(Value::as_str),
-            Some("VTableShim")
-        );
+        assert_eq!(shim.src, Some(FunSrc::VTableShim));
 
         let impl_method = parse_fun_decl(serde_json::json!({
             "src": {
@@ -4264,6 +4427,38 @@ mod tests {
             }
         }));
         assert!(impl_method.src.is_none());
+    }
+
+    #[test]
+    fn type_decl_src_reads_first_key_and_skips_unread_payload() {
+        let parse =
+            |src: Value| serde_json::from_value::<TypeDeclSrc>(src).expect("TypeDeclSrc parses");
+        assert_eq!(parse(Value::String("Normal".into())), TypeDeclSrc::Normal);
+        assert_eq!(parse(Value::Null), TypeDeclSrc::Normal);
+        assert_eq!(
+            parse(serde_json::json!({"Closure": {"info": {"kind": "FnOnce"}}})),
+            TypeDeclSrc::Closure
+        );
+        assert_eq!(
+            parse(serde_json::json!({"Builtin": "Box"})),
+            TypeDeclSrc::Builtin(Some("Box".into()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"Builtin": {"id": 1}})),
+            TypeDeclSrc::Builtin(None)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"VTable": {"ty": 1}})),
+            TypeDeclSrc::VTable
+        );
+        assert_eq!(
+            parse(Value::String("AdtConstructor".into())),
+            TypeDeclSrc::Other("AdtConstructor".into())
+        );
+        assert_eq!(
+            parse(serde_json::json!({"Mystery": {"keep": false}})),
+            TypeDeclSrc::Other("Mystery".into())
+        );
     }
 
     fn bb(kind: Value, is_cleanup: bool, term_span: u64) -> Value {
@@ -4891,6 +5086,30 @@ mod tests {
     }
 
     #[test]
+    fn has_unstructured_body_matches_unstructured() {
+        let with_body = fun_decl_from_blocks(vec![bb(serde_json::json!("Return"), false, 0)]);
+        assert_eq!(
+            with_body.has_unstructured_body(),
+            with_body.unstructured().is_some()
+        );
+        assert!(with_body.has_unstructured_body());
+
+        let no_body = parse_fun_decl(serde_json::json!({"body": null}));
+        assert_eq!(
+            no_body.has_unstructured_body(),
+            no_body.unstructured().is_some()
+        );
+        assert!(!no_body.has_unstructured_body());
+
+        let structured = parse_fun_decl(serde_json::json!({"body": {"Structured": {}}}));
+        assert_eq!(
+            structured.has_unstructured_body(),
+            structured.unstructured().is_some()
+        );
+        assert!(!structured.has_unstructured_body());
+    }
+
+    #[test]
     fn raw_object_first_key_is_unstructured() {
         assert!(raw_object_first_key_is(
             r#"{"Unstructured":{}}"#,
@@ -5100,6 +5319,50 @@ mod tests {
             body.body[3].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
+    }
+
+    #[test]
+    fn rewrite_checked_binop_calls_looks_up_the_callee_id() {
+        let call_block = serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {
+                "span": span(0),
+                "kind": {
+                    "Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 9}, "generics": {}}},
+                            "args": [
+                                {"Const": [{"FnDef": {"kind": {"Fun": 7}, "generics": {}}}, {"Deduplicated": 0}]},
+                                {"Read": {"kind": {"Local": 2}, "ty": {"Deduplicated": 0}}}
+                            ]
+                        },
+                        "dest": {"kind": {"Local": 3}, "ty": {"Deduplicated": 1}},
+                        "target": 1,
+                        "on_unwind": 2
+                    }
+                }
+            }
+        });
+        let mut decl = fun_decl_from_blocks(vec![
+            call_block,
+            overflow_assert_block(2, 3),
+            bb(serde_json::json!("Return"), false, 0),
+            bb(serde_json::json!("UnwindResume"), true, 0),
+        ]);
+        let mut body = decl.unstructured().expect("Unstructured body");
+        decl.checked_binop_calls = Some(Arc::<[(u64, &'static str)]>::from([
+            (7u64, "AddChecked"),
+            (9u64, "MulChecked"),
+        ]));
+        decl.rewrite_checked_binop_calls(&mut body);
+        assert_eq!(body.body[0].statements.len(), 1);
+        match body.body[0].statements[0].stmt_kind().expect("typed") {
+            StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
+                assert_eq!(op, serde_json::json!("MulChecked"));
+            }
+            other => panic!("expected Assign(_, BinaryOp(MulChecked, ..)), got {other:?}"),
+        }
     }
 
     #[test]

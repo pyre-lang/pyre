@@ -143,10 +143,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// hint for a callee in this set so it routes as a `FunctionPath` the
     /// registry resolves to the same residual fnaddr.
     pub(in crate::front::mir) dont_look_inside: &'a std::collections::HashSet<String>,
-    /// FunDecl paths that carry an `oopspec:jit.*` marker. Residual
-    /// `&Scalar` spills skip those callees: jtransform rewrites them to
-    /// a box query instead of the rustc pointer ABI.
-    pub(in crate::front::mir) oopspec_fns: std::collections::HashSet<String>,
+    /// Membership of FunDecl paths that carry an `oopspec:jit.*` marker:
+    /// this artefact's marker consts, and the program-wide harvested set.
+    /// Residual `&Scalar` spills skip those callees: jtransform rewrites
+    /// them to a box query instead of the rustc pointer ABI.
+    pub(in crate::front::mir) oopspec_fns: OopspecFns<'a>,
     /// Leaves whose `struct_origins` entry `harden_duplicate_leaf_metadata`
     /// cleared. A duplicated leaf is not a class; [`adt_node_class_root_with`]
     /// paints the declaration path instead. Owned by the program build
@@ -688,7 +689,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     graph: &mut FunctionGraph,
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
-    generics: Option<&serde_json::Value>,
+    generics: Option<&FunGenerics>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_mut_ref_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -1348,6 +1349,12 @@ fn atomic_shadow_slot_count(shadows: &[AtomicShadow]) -> usize {
         .sum()
 }
 
+fn empty_program_oopspec() -> &'static std::collections::HashSet<String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashSet::new)
+}
+
 fn atomic_shadow_is_parent_slot(shadows: &[AtomicShadow], slot: usize) -> bool {
     shadows.iter().any(|shadow| shadow.parent == Some(slot))
 }
@@ -1365,7 +1372,7 @@ impl<'a> Lowering<'a> {
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
         jitdriver_receiver_roots: &'a [String],
-        generics: Option<&serde_json::Value>,
+        generics: Option<&FunGenerics>,
         dont_look_inside: &'a std::collections::HashSet<String>,
         tombstoned_leaves: &'a std::collections::HashSet<String>,
         gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
@@ -1392,7 +1399,7 @@ impl<'a> Lowering<'a> {
             root_stack,
             self_dont_look_inside,
             keep_zst_self,
-            &std::collections::HashSet::new(),
+            empty_program_oopspec(),
         )
     }
 
@@ -1402,7 +1409,7 @@ impl<'a> Lowering<'a> {
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
         jitdriver_receiver_roots: &'a [String],
-        generics: Option<&serde_json::Value>,
+        generics: Option<&FunGenerics>,
         dont_look_inside: &'a std::collections::HashSet<String>,
         tombstoned_leaves: &'a std::collections::HashSet<String>,
         gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
@@ -1412,7 +1419,7 @@ impl<'a> Lowering<'a> {
         root_stack: &RootStackAnalyzer<'_>,
         self_dont_look_inside: bool,
         keep_zst_self: bool,
-        program_oopspec: &std::collections::HashSet<String>,
+        program_oopspec: &'a std::collections::HashSet<String>,
     ) -> Result<Self, LowerError> {
         let gc_mut_ref_params = gc_mut_ref_param_locals(
             &body.locals,
@@ -1745,8 +1752,7 @@ impl<'a> Lowering<'a> {
         // (`lower_niche_option_switch`).
         let lowered = lowered_reachable_mask(llbc, body);
         let block_id = MirBlockMap::from_lowered(&mut graph, &lowered);
-        let mut oopspec_fns = oopspec_fn_paths(llbc);
-        oopspec_fns.extend(program_oopspec.iter().cloned());
+        let oopspec_fns = OopspecFns::new(oopspec_fn_paths(llbc), program_oopspec);
         let cell_plan = collect_cell_scalar_locals(
             llbc,
             body,

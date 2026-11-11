@@ -105,9 +105,11 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
   `--force` / `LLBC_FORCE_REEXTRACT=1` overrides. `pyre-interpreter.ullbc` is
   ~300 MB and takes minutes.
 - Worktrees share a content-addressed LLBC store (`<shared>/llbc-store`, or
-  `LLBC_STORE`) and import a matching artefact via clone/reflink instead of
-  re-running Charon. `LLBC_STORE=off` disables it; `--prune-store` drops unused
-  entries.
+  `LLBC_STORE`) and import a matching artefact (zstd-compressed, decompressed
+  on import; cloned when no zstd codec exists) instead of re-running Charon.
+  `LLBC_STORE=off` disables it; `--prune-store` drops unused entries.
+  `LLBC_STORE_MAX_BYTES` caps the store (default 20 GiB). `--compact-store`
+  converts older uncompressed entries.
 - `cargo clean` drops `target/llbc`; the next extract re-imports it from the
   LLBC store. The prepass cache lives in `<shared>/jit-trace-cache`.
 - **A Linux container never extracts into the host's `target/llbc`.** Mount a

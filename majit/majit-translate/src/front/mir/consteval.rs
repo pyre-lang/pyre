@@ -1909,7 +1909,7 @@ pub(in crate::front::mir) fn const_eval_opaque_bitflag_call(
     args: &[ConstLit],
 ) -> Option<ConstLit> {
     let fd = llbc.fn_by_id(fun_id)?;
-    if fd.unstructured().is_some() {
+    if fd.has_unstructured_body() {
         return None;
     }
     let leaf = fd.item_meta.name_path();

@@ -1979,28 +1979,15 @@ pub(in crate::front::mir) fn root_stack_api_is_neutral(path: &str) -> bool {
 /// method body, from the artefact's `trait_impls` rows.
 pub(in crate::front::mir) fn trait_method_bodies(llbc: &Llbc) -> TraitMethodBodies {
     let mut out = TraitMethodBodies::default();
-    for row in llbc.trait_impls_raw() {
+    for (row_index, row) in llbc.trait_impls_raw().iter().enumerate() {
         let Some(impl_id) = row.get("def_id").and_then(serde_json::Value::as_u64) else {
             continue;
         };
-        let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for method in methods {
-            let Some(key) = method
-                .get("kind")
-                .and_then(|kind| kind.get("TraitMethod"))
-                .and_then(serde_json::Value::as_array)
-            else {
+        for method in llbc.trait_impl_methods(row_index) {
+            let Some(method) = method.as_ref() else {
                 continue;
             };
-            let (Some(index), Some(body)) = (
-                key.get(1).and_then(serde_json::Value::as_u64),
-                method
-                    .get("skip_binder")
-                    .and_then(|b| b.get("id"))
-                    .and_then(serde_json::Value::as_u64),
-            ) else {
+            let (Some(index), Some(body)) = (method.method_idx, method.fn_id) else {
                 continue;
             };
             out.by_impl.insert((impl_id, index), body);
@@ -4287,7 +4274,7 @@ pub fn mark_foreign_scope_owners(llbc: &Llbc, identities: &[String]) {
         return;
     }
     for fd in llbc.iter_fun_decls() {
-        if fd.item_meta.is_local || fd.unstructured().is_some() {
+        if fd.item_meta.is_local || fd.has_unstructured_body() {
             continue;
         }
         let identity = scope_owner_identity(llbc, fd);

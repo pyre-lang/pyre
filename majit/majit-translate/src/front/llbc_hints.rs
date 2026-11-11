@@ -1506,6 +1506,12 @@ fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
 /// body assigns `Local(0) = Const(ConstantExpr)` whose kind is the
 /// string literal (`[{"Str": spec}, ty]`), mirroring [`global_marker_bool`]'s bool path.
 pub(crate) fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+    crate::front::mir::cached_global_marker_str(llbc, gd.def_id, || {
+        global_marker_str_uncached(llbc, gd)
+    })
+}
+
+fn global_marker_str_uncached(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     if let Some(value) = gd.rest.get("value")
         && let Some(spec) = decode_str_const(llbc, value)
     {

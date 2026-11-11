@@ -444,6 +444,7 @@ def main() -> None:
         "--list-inputs",
         "--self-test",
         "--prune-store",
+        "--compact-store",
     }
     if not modes_without_an_artefact.intersection(sys.argv[1:]):
         requested = [arg for arg in sys.argv[1:] if not arg.startswith("-")]

@@ -1115,15 +1115,11 @@ impl<'a> Lowering<'a> {
             if self.resolve_tyexpr_to_adt_def_id(self_ty) != Some(want) {
                 continue;
             }
-            let Some(methods) = ti.get("methods").and_then(serde_json::Value::as_array) else {
+            let Some(methods) = self.llbc.trait_impl_methods_of_def(impl_id) else {
                 continue;
             };
             for method in methods {
-                let Some(fid) = method
-                    .get("skip_binder")
-                    .and_then(|binder| binder.get("id"))
-                    .and_then(serde_json::Value::as_u64)
-                else {
+                let Some(fid) = method.as_ref().and_then(|method| method.fn_id) else {
                     continue;
                 };
                 let Some(fd) = self.llbc.fn_by_id(fid) else {
@@ -2830,7 +2826,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(fn_id) else {
             return false;
         };
-        if fd.unstructured().is_some() {
+        if fd.has_unstructured_body() {
             return false;
         }
         if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
@@ -7945,14 +7941,17 @@ impl<'a> Lowering<'a> {
                 }
             }
             let impl_id = traitref_impl_id(tref, self.llbc, 0)?;
-            let ti = self.llbc.trait_impls_raw().get(impl_id as usize)?;
-            let fn_id = ti.get("methods")?.as_array()?.iter().find_map(|m| {
-                let tm = m.get("kind")?.get("TraitMethod")?.as_array()?;
-                if tm.first()?.as_u64()? != decl_id {
-                    return None;
-                }
-                m.get("skip_binder")?.get("id")?.as_u64()
-            })?;
+            let fn_id = self
+                .llbc
+                .trait_impl_methods(impl_id as usize)
+                .iter()
+                .find_map(|m| {
+                    let m = m.as_ref()?;
+                    if m.trait_id != Some(decl_id) {
+                        return None;
+                    }
+                    m.fn_id
+                })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
             let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
             let identity = crate::front::clause_spec::render_trait_impl(self.llbc, impl_id)?;

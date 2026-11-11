@@ -117,7 +117,9 @@ pub(in crate::front::mir) fn trait_default_call_segments(
     fd: &FunDecl,
     generics: &serde_json::Value,
 ) -> Option<Vec<String>> {
-    fd.src.as_ref()?.get("TraitDefault")?;
+    if !fd.is_trait_default() {
+        return None;
+    }
     let self_ty = generics.get("types")?.as_array()?.first()?;
     let td = llbc.type_by_id(resolve_tyexpr_to_adt_def_id_free(llbc, self_ty)?)?;
     let owner = strip_crate_prefix(&td.item_meta.name_path());
@@ -1167,11 +1169,12 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // (`locals[1..=argc]`, the same source the regular lowering reads
         // at `local.name`); fall back to positional `arg{N}` when the body
         // is opaque or a local is unnamed.
-        let body = fd.unstructured();
+        let locals = fd.unstructured_locals();
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
             .map(|i| {
-                body.as_ref()
-                    .and_then(|u| u.locals.locals.get(i + 1))
+                locals
+                    .as_ref()
+                    .and_then(|l| l.locals.get(i + 1))
                     .and_then(|l| l.name.clone())
                     .unwrap_or_else(|| format!("arg{i}"))
             })
@@ -1342,11 +1345,12 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(in crate::front::mir) fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
-    let body = fd.unstructured();
+    let locals = fd.unstructured_locals();
     (0..fd.signature.inputs.len())
         .map(|i| {
-            body.as_ref()
-                .and_then(|u| u.locals.locals.get(i + 1))
+            locals
+                .as_ref()
+                .and_then(|l| l.locals.get(i + 1))
                 .and_then(|l| l.name.clone())
                 .unwrap_or_else(|| format!("arg{i}"))
         })
@@ -1777,7 +1781,7 @@ fn from_impl_conversions(
         ));
     };
     let mut found = Vec::new();
-    for row in llbc.trait_impls_raw() {
+    for (row_index, row) in llbc.trait_impls_raw().iter().enumerate() {
         let Some(impl_trait) = row.get("impl_trait") else {
             continue;
         };
@@ -1800,15 +1804,8 @@ fn from_impl_conversions(
         if !matches_impl(llbc, self_ty, arg_ty) {
             continue;
         }
-        let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for method in methods {
-            let Some(fn_id) = method
-                .get("skip_binder")
-                .and_then(|binder| binder.get("id"))
-                .and_then(serde_json::Value::as_u64)
-            else {
+        for method in llbc.trait_impl_methods(row_index) {
+            let Some(fn_id) = method.as_ref().and_then(|method| method.fn_id) else {
                 continue;
             };
             let Some(fd) = llbc.fn_by_id(fn_id) else {
@@ -3038,10 +3035,43 @@ pub(in crate::front::mir) struct LlbcDerived {
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
     /// Module of the unique type whose last path segment is `FrameAnchor`.
     pub(in crate::front::mir) frame_anchor_module: std::sync::OnceLock<Option<String>>,
+    /// FunDecl paths whose artefact-local `oopspec_*` marker consts spell
+    /// `jit.*`. Built from this `Llbc`'s global decls.
+    pub(in crate::front::mir) oopspec_fn_paths:
+        std::sync::OnceLock<std::collections::HashSet<String>>,
+    /// Decoded marker-const strings. The payload is a property of the artefact.
+    global_marker_strs:
+        std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<str>>>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
     llbc.derived(LlbcDerived::default)
+}
+
+/// Memoize [`crate::front::llbc_hints::global_marker_str`] per global def id.
+/// The decoded string does not depend on later `register_*` / `set_*` calls.
+pub(crate) fn cached_global_marker_str(
+    llbc: &Llbc,
+    def_id: u64,
+    compute: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let cache = &llbc_derived(llbc).global_marker_strs;
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = guard.get(&def_id) {
+            return hit.as_ref().map(|s| s.to_string());
+        }
+    }
+    let value = compute();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(def_id)
+        .or_insert_with(|| value.clone().map(std::sync::Arc::from));
+    value
 }
 
 pub(in crate::front::mir) fn value_type_inputs(llbc: &Llbc) -> &ValueTypeInputs {
@@ -3314,17 +3344,13 @@ pub(in crate::front::mir) fn operand_const_u8(llbc: &Llbc, op: &Operand) -> Opti
 /// `"Normal"`.  Identified from that origin, never from the `closure` /
 /// `closure#N` name leaf.
 pub(in crate::front::mir) fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
-    td.src
-        .as_ref()
-        .is_some_and(|src| src.get("Closure").is_some())
+    matches!(td.src, TypeDeclSrc::Closure)
 }
 
 /// A compiler-synthesised tuple, `str`, or `Box` declaration. Its `TypeDecl`
 /// exists so type refs can name it by id; it is not a user struct.
 pub(in crate::front::mir) fn type_decl_is_builtin_adt(td: &TypeDecl) -> bool {
-    td.src
-        .as_ref()
-        .is_some_and(|src| src.get("Builtin").is_some())
+    matches!(td.src, TypeDeclSrc::Builtin(_))
 }
 
 /// Whether `ty` resolves to a closure-env ADT, after peeling reference
@@ -6565,7 +6591,7 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
-    generics: Option<&serde_json::Value>,
+    generics: Option<&FunGenerics>,
 ) -> Option<String> {
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
@@ -9691,9 +9717,10 @@ pub(in crate::front::mir) fn type_node_box_pointee<'l>(
                 .and_then(|def_id| llbc.type_by_id(def_id))
                 .is_some_and(|td| {
                     td.item_meta.name_path() == "alloc::boxed::Box"
-                        || td.src.as_ref().is_some_and(|src| {
-                            src.get("Builtin").and_then(serde_json::Value::as_str) == Some("Box")
-                        })
+                        || matches!(
+                            &td.src,
+                            TypeDeclSrc::Builtin(Some(s)) if s == "Box"
+                        )
                 });
         if !is_box {
             return None;
@@ -10778,16 +10805,9 @@ pub(in crate::front::mir) fn typevar_bound_index(node: &serde_json::Value) -> Op
 /// rstr `STR` layout (`is_rstr_str_layout_declaration`).
 pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
     var_index: u64,
-    fn_generics: &serde_json::Value,
+    fn_generics: &FunGenerics,
     llbc: &Llbc,
 ) -> bool {
-    let Some(clauses) = fn_generics
-        .as_object()
-        .and_then(|g| g.get("trait_clauses"))
-        .and_then(|c| c.as_array())
-    else {
-        return false;
-    };
     fn strip<'a>(llbc: &'a Llbc, mut v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
         loop {
             let obj = v.as_object()?;
@@ -10804,32 +10824,16 @@ pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
             return Some(v);
         }
     }
-    for clause in clauses {
-        let Some(sb) = clause
-            .as_object()
-            .and_then(|c| c.get("trait_"))
-            .and_then(|t| t.as_object())
-            .and_then(|t| t.get("skip_binder"))
-            .and_then(|s| s.as_object())
-        else {
-            continue;
-        };
-        let is_into = sb
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
+    for clause in &fn_generics.trait_clauses {
+        let is_into = clause
+            .trait_id
             .and_then(|id| llbc.trait_by_id(id))
             .map(|td| td.item_meta.name_path())
             .is_some_and(|n| n.rsplit("::").next() == Some("Into"));
         if !is_into {
             continue;
         }
-        let Some(types) = sb
-            .get("generics")
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-        else {
-            continue;
-        };
+        let types = &clause.types;
         let subject_is_var = types
             .first()
             .and_then(|s| strip(llbc, s))
@@ -10872,7 +10876,7 @@ pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
 pub(in crate::front::mir) fn tyref_generic_trait_bound_root(
     ty: &TyRef,
     llbc: &Llbc,
-    generics: Option<&serde_json::Value>,
+    generics: Option<&FunGenerics>,
 ) -> Option<String> {
     let generics = generics?;
     let node = match ty {
@@ -10892,21 +10896,16 @@ pub(in crate::front::mir) fn tyref_generic_trait_bound_root(
     if typevar_bounded_by_into_string_value(param_index, generics, llbc) {
         return Some("String".to_string());
     }
-    for clause in generics.get("trait_clauses")?.as_array()? {
-        let Some(pred) = clause.get("trait_").and_then(|t| t.get("skip_binder")) else {
-            continue;
-        };
-        let subject_index = pred
-            .get("generics")
-            .and_then(|g| g.get("types"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|t| t.first())
+    for clause in &generics.trait_clauses {
+        let subject_index = clause
+            .types
+            .first()
             .and_then(|s| strip_ty_wrappers(s, llbc))
             .and_then(typevar_bound_index);
         if subject_index != Some(param_index) {
             continue;
         }
-        let Some(trait_id) = pred.get("id").and_then(serde_json::Value::as_u64) else {
+        let Some(trait_id) = clause.trait_id else {
             continue;
         };
         let Some(td) = llbc.trait_by_id(trait_id) else {
@@ -12342,6 +12341,43 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
     .to_string()
 }
 
+/// Rewrite a Path-form ADT TypeDeclRef (`{"id": {"Path": "crate::T"}}`)
+/// to the unique numeric def id of that path. Published field types keep
+/// Path ids when remap misses; intern's handle check reads only `id` as
+/// `u64`. Ambiguous paths stay Path so intern fails closed to the CAST
+/// leaf rather than picking a colliding decl.
+fn intern_adt_node_with_numeric_id(
+    t: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let adt = t.as_object()?.get("Adt")?.as_object()?;
+    if adt.get("id")?.as_u64().is_some() {
+        return None;
+    }
+    let path = adt.get("id")?.get("Path")?.as_str()?;
+    let def_id = unique_type_id_for_name_path(llbc, path)?;
+    let mut out = t.clone();
+    out.as_object_mut()?
+        .get_mut("Adt")?
+        .as_object_mut()?
+        .insert("id".into(), serde_json::json!(def_id));
+    Some(out)
+}
+
+fn unique_type_id_for_name_path(llbc: &Llbc, path: &str) -> Option<u64> {
+    let mut found = None;
+    for td in llbc.iter_type_decls() {
+        if td.item_meta.name_path() != path {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(td.def_id);
+    }
+    found
+}
+
 /// Intern payload-row spelling of one ADT type argument.
 ///
 /// The `<…>` CAST suffix stays the leaf render ([`render_adt_type_args`]).
@@ -12353,6 +12389,10 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
 /// strips `&`, so `Option<&T>` would otherwise intern as the tagged
 /// `Option<T>` class), a monomorphic named ADT is `strip_crate_prefix` of
 /// the TypeDecl path, and a generic instantiation keeps the CAST leaf render.
+///
+/// A `type T = Handle` alias and a published `{"id": {"Path": …}}` ADT
+/// name the same handle as a numeric `Adt` id; intern peels both so the
+/// ROW is `*mut {Deref::Target}` at every site, not a by-value class name.
 fn intern_type_arg_payload_spelling(
     t: &serde_json::Value,
     llbc: &Llbc,
@@ -12365,8 +12405,13 @@ fn intern_type_arg_payload_spelling(
     // `{"Deduplicated": id}`). CAST already peels those wrappers
     // ([`charon_type_value_to_ast_string`]); intern ROW must too, or
     // [`tyref_is_option`] / [`intern_adt_type_decl_identity`] see the
-    // wrapper node and the ROW falls through to the CAST leaf.
+    // wrapper node and the ROW falls through to the CAST leaf. A type
+    // alias and a Path-form TypeDeclRef are the same peel for a handle:
+    // without them the ROW is the alias / CAST leaf class name.
     let t = strip_ty_indirections(t, llbc).unwrap_or(t);
+    let t = type_node_peel_aliases(t, llbc).unwrap_or(t);
+    let numeric = intern_adt_node_with_numeric_id(t, llbc);
+    let t = numeric.as_ref().unwrap_or(t);
     let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
     if rendered == "Global" || rendered == "RandomState" {
         return None;

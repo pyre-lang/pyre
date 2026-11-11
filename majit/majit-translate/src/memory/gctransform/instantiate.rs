@@ -212,18 +212,16 @@ pub(crate) fn resolve_trait_call(llbc: &Llbc, payload: &Value, bindings: &[Value
 /// `impl_method_fn_id` indexes `trait_impls_raw` by def id. A hole or a
 /// shifted row misses; [`Llbc::trait_impl_by_id`] finds the row by id.
 fn impl_method_from_row(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
-    llbc.trait_impl_by_id(impl_id)?
-        .get("methods")?
-        .as_array()?
+    llbc.trait_impl_methods_of_def(impl_id)?
         .iter()
-        .find(|method| {
-            method
-                .pointer("/kind/TraitMethod/1")
-                .and_then(Value::as_u64)
-                == Some(method_idx)
-        })?
-        .pointer("/skip_binder/id")?
-        .as_u64()
+        .find_map(|method| {
+            let method = method.as_ref()?;
+            if method.method_idx == Some(method_idx) {
+                method.fn_id
+            } else {
+                None
+            }
+        })
 }
 
 /// Build the resolved ULLBC call graph, specializing Regular calls whose

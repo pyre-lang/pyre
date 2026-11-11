@@ -6467,6 +6467,67 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
     assert_handle_class(&llbc, &ty, Some("Handle"));
 }
 
+/// Intern ROW of a transparent handle is `*mut {Deref::Target}` for every
+/// type-argument shape CAST still spells as the handle leaf: numeric `Adt`,
+/// hash-cons `Value` / `Deduplicated` / `HashConsedValue`, a published
+/// Path-form id, and a `type T = Handle` alias. A bare class name would
+/// intern the payload as a by-value nested struct.
+#[test]
+fn intern_payload_handle_agrees_across_type_arg_shapes() {
+    let mut decls = pointer_handle_decls();
+    decls.push((
+        6,
+        type_decl_alias(6, &["fixture", "alias_mod", "PyError"], adt_body(3)),
+    ));
+    let (llbc, _) = load_handle(decls, serde_json::json!([pyerror_deref_impl(23, 2)]), 3);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    let tomb = no_tombstoned_leaves();
+    let payload = |arg: serde_json::Value| -> Vec<String> {
+        let adt = serde_json::json!({
+            "id": 0,
+            "generics": {"types": [arg]}
+        });
+        super::render_adt_payload_type_args(
+            adt.as_object().expect("adt map"),
+            &llbc,
+            0,
+            &gc_struct_ids,
+            &raw_alloc,
+            tomb,
+        )
+    };
+    let expected = payload(adt_body(3));
+    assert_eq!(
+        expected,
+        vec!["*mut PyErrorObject".to_string()],
+        "numeric Adt of the handle is *mut Deref::Target"
+    );
+    assert_eq!(
+        payload(serde_json::json!({"Value": [22, adt_body(3)]})),
+        expected,
+        "Value-wrapped handle Adt"
+    );
+    assert_eq!(
+        payload(serde_json::json!({"Deduplicated": 22})),
+        expected,
+        "Deduplicated handle Adt"
+    );
+    assert_eq!(
+        payload(serde_json::json!({"HashConsedValue": [22, adt_body(3)]})),
+        expected,
+        "HashConsedValue-wrapped handle Adt"
+    );
+    assert_eq!(
+        payload(serde_json::json!({
+            "Adt": {"id": {"Path": "fixture::PyError"}, "generics": {"types": []}}
+        })),
+        expected,
+        "Path-form TypeDeclRef of the handle"
+    );
+    assert_eq!(payload(adt_body(6)), expected, "type alias of the handle");
+}
+
 /// A `repr(transparent)` wrapper whose unique non-ZST field is a GC
 /// pointer peels to that `Ref`. Construction and `.0` are identity.
 /// The wrapper stays only when it is itself a registered GC class.
@@ -8027,17 +8088,14 @@ fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
     let generic_message = TyRef::Other(serde_json::json!({
         "TypeVar": {"Bound": [0, 0]}
     }));
-    let generics = serde_json::json!({
-        "trait_clauses": [{
-            "trait_": {"skip_binder": {
-                "id": 1,
-                "generics": {"types": [
-                    {"TypeVar": {"Bound": [1, 0]}},
-                    pointee
-                ]}
-            }}
-        }]
-    });
+    let generics = majit_charon_reader::FunGenerics {
+        has_types: false,
+        has_const_generics: false,
+        trait_clauses: vec![majit_charon_reader::TraitClauseBound {
+            trait_id: Some(1),
+            types: vec![serde_json::json!({"TypeVar": {"Bound": [1, 0]}}), pointee],
+        }],
+    };
     assert_eq!(
         super::tyref_generic_trait_bound_root(&generic_message, &llbc, Some(&generics),).as_deref(),
         Some("String"),

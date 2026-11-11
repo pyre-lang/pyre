@@ -24,10 +24,11 @@ pub mod schema;
 pub mod ullbc;
 
 pub use raw_body::RawBody;
-pub use schema::LlbcFile;
+pub use schema::{ImplMethod, LlbcFile};
 pub use ullbc::{
-    BasicBlock, FieldDecl, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TagEncoding,
-    TagLayout, TermKind, TraitDecl, TypeDecl, TypeDeclKind, Unstructured, VariantDecl,
+    BasicBlock, FieldDecl, FunDecl, FunGenerics, FunSrc, GlobalDecl, Locals, Statement, StmtKind,
+    TagEncoding, TagLayout, TermKind, TraitClauseBound, TraitDecl, TypeDecl, TypeDeclKind,
+    TypeDeclSrc, Unstructured, VariantDecl,
 };
 
 use serde::Deserialize;
@@ -1060,6 +1061,35 @@ impl Llbc {
         &self.file.translated.trait_impls
     }
 
+    /// Methods of the `trait_impls` row at `row_index`. Holes stay
+    /// `None`. A missing `methods` key, a null row, or an out-of-range
+    /// index is an empty slice.
+    pub fn trait_impl_methods(&self, row_index: usize) -> &[Option<ImplMethod>] {
+        self.file
+            .translated
+            .trait_impl_methods
+            .get(row_index)
+            .and_then(|row| row.as_deref())
+            .unwrap_or(&[])
+    }
+
+    /// [`Self::trait_impl_methods`] for the row [`Self::trait_impl_by_id`]
+    /// names. `None` when that impl is absent.
+    pub fn trait_impl_methods_of_def(&self, def_id: u64) -> Option<&[Option<ImplMethod>]> {
+        Some(self.trait_impl_methods(self.trait_impl_row_index(def_id)?))
+    }
+
+    fn trait_impl_row_index(&self, def_id: u64) -> Option<usize> {
+        let says_id = |row: &serde_json::Value| {
+            row.get("def_id").and_then(serde_json::Value::as_u64) == Some(def_id)
+        };
+        let rows = &self.file.translated.trait_impls;
+        match rows.get(def_id as usize) {
+            Some(row) if says_id(row) => Some(def_id as usize),
+            _ => rows.iter().position(says_id),
+        }
+    }
+
     /// [`Llbc::trait_impls_of`] with each row's index in [`Llbc::trait_impls_raw`], its impl id.
     pub fn trait_impl_rows_of(
         &self,
@@ -1197,14 +1227,10 @@ impl Llbc {
     /// another's, so the disagreement is checked rather than assumed
     /// away.
     pub fn trait_impl_by_id(&self, def_id: u64) -> Option<&serde_json::Value> {
-        let says_id = |row: &serde_json::Value| {
-            row.get("def_id").and_then(serde_json::Value::as_u64) == Some(def_id)
-        };
-        let rows = &self.file.translated.trait_impls;
-        match rows.get(def_id as usize) {
-            Some(row) if says_id(row) => Some(row),
-            _ => rows.iter().find(|row| says_id(row)),
-        }
+        self.file
+            .translated
+            .trait_impls
+            .get(self.trait_impl_row_index(def_id)?)
     }
 
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).
@@ -1907,5 +1933,36 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert_link_state_is_empty(&l);
+    }
+
+    #[test]
+    fn trait_impl_methods_sit_beside_the_json_row() {
+        let doc = r#"{
+            "charon_version":"t","has_errors":false,
+            "translated":{
+                "crate_name":"c","fun_decls":[],
+                "trait_impls":[{
+                    "def_id":0,
+                    "impl_trait":{"id":1},
+                    "methods":[
+                        null,
+                        {"kind":{"TraitMethod":[1,0]},"skip_binder":{"id":9,"generics":{}}}
+                    ]
+                }]
+            }
+        }"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        assert!(l.trait_impls_raw()[0].get("methods").is_none());
+        let methods = l.trait_impl_methods(0);
+        assert!(methods[0].is_none());
+        let method = methods[1].as_ref().expect("method 0");
+        assert_eq!(method.trait_id, Some(1));
+        assert_eq!(method.method_idx, Some(0));
+        assert_eq!(method.fn_id, Some(9));
+        assert_eq!(
+            l.trait_impl_methods_of_def(0)
+                .map(|row| row[1].as_ref().and_then(|m| m.fn_id)),
+            Some(Some(9))
+        );
     }
 }

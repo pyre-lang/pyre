@@ -88,16 +88,10 @@ pub(crate) fn decl_has_unstructured_body(fd: &FunDecl) -> bool {
 /// The declaration has type parameters or trait clauses, so one shared
 /// body is not one instantiation.
 pub(crate) fn decl_is_generic(fd: &FunDecl) -> bool {
-    let Some(generics) = fd.generics.as_ref().and_then(Value::as_object) else {
+    let Some(generics) = fd.generics.as_ref() else {
         return false;
     };
-    let nonempty = |key: &str| {
-        generics
-            .get(key)
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    };
-    nonempty("types") || nonempty("trait_clauses") || nonempty("const_generics")
+    generics.has_types || generics.has_const_generics || !generics.trait_clauses.is_empty()
 }
 
 /// `generics.trait_refs` when every ref is resolved (no `Clause`),
@@ -338,19 +332,16 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
 /// method is tagged `{"TraitMethod": [trait_id, method_idx]}`; a method the
 /// impl does not override is absent and answers `None`.
 pub(crate) fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
-    llbc.trait_impls_raw()
-        .get(impl_id as usize)?
-        .get("methods")?
-        .as_array()?
+    llbc.trait_impl_methods(impl_id as usize)
         .iter()
-        .find(|method| {
-            method
-                .pointer("/kind/TraitMethod/1")
-                .and_then(Value::as_u64)
-                == Some(method_idx)
-        })?
-        .pointer("/skip_binder/id")?
-        .as_u64()
+        .find_map(|method| {
+            let method = method.as_ref()?;
+            if method.method_idx == Some(method_idx) {
+                method.fn_id
+            } else {
+                None
+            }
+        })
 }
 
 enum RefClass {
