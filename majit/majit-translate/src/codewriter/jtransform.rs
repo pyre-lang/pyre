@@ -10992,6 +10992,29 @@ impl<'a> Transformer<'a> {
                         if matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
                             && let Some(n) = c.value.as_int()
                         {
+                            // `lltype.py cast_int_to_ptr`: `oddint == 0` is
+                            // `nullptr(PTRTYPE.TO)`. Residualize as
+                            // `ConstRefNull`, the same `rtype_const_result`
+                            // as `ptr::null_mut()` of a Ref dest. A residual
+                            // `cast_int_to_ptr/i>r` of 0 is not a tagged
+                            // immediate; `blackhole.py bhimpl_cast_int_to_ptr`
+                            // asserts odd because PyPy compiles this graph
+                            // (`call.py get_jitcode` / `getfunctionptr`) and
+                            // never interprets it. pyre's unpublished helper
+                            // stays a symbolic fnaddr and
+                            // `interpret_unresolved_inline_call` runs the
+                            // jitcode, so the residual must be a null GCREF.
+                            if n == 0 {
+                                self.stamp_value_kind_from_value_type(
+                                    graph,
+                                    op.result.clone(),
+                                    result_ty,
+                                );
+                                return RewriteResult::Replace(vec![SpaceOperation {
+                                    result: op.result.clone(),
+                                    kind: OpKind::ConstRefNull,
+                                }]);
+                            }
                             // A Constant integer is not a Variable slot.
                             // Materialize it, then the unary llop
                             // `rtype_cast_int_to_ptr` would have emitted.
@@ -37795,12 +37818,74 @@ mod tests {
         }
     }
 
-    /// `rbuiltin.py rtype_cast_int_to_ptr` drops the Void PTRTYPE
-    /// constant and genops unary `cast_int_to_ptr`. The 2-arg front-end
-    /// Call (`emit_typed_nullptr`: PTRTYPE + Const Int(0), result Ref)
-    /// must become that llop (kind r), not a residual symbolic fnaddr.
+    /// `emit_typed_nullptr` is a 2-arg Call with Const Int(0). `call_arg_vars`
+    /// drops that Constant; `cast_int_to_ptr_v_input` recovers it. The GC dest
+    /// residual is `ConstRefNull`, not unary `cast_int_to_ptr` of 0.
     #[test]
-    fn lltype_cast_int_to_ptr_two_arg_gc_nullptr_becomes_unop() {
+    fn lltype_cast_int_to_ptr_const_zero_gc_is_const_ref_null() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_int_to_ptr_const_zero");
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Unsigned)),
+        }));
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        result.set_concretetype(Some(ptr_ty.clone()));
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![
+                    LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                    LinkArg::from(ConstValue::Int(0)),
+                ],
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "cast_int_to_ptr_const_zero",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    matches!(
+                        ops.as_slice(),
+                        [SpaceOperation {
+                            kind: OpKind::ConstRefNull,
+                            ..
+                        }]
+                    ),
+                    "const-0 GC cast residual is ConstRefNull; ops={ops:?}"
+                );
+            }
+            _ => panic!("expected ConstRefNull rewrite"),
+        }
+    }
+
+    /// `lltype.py cast_int_to_ptr`: `oddint == 0` is `nullptr(PTRTYPE.TO)`.
+    /// The 2-arg front-end Call (`emit_typed_nullptr`: PTRTYPE + Const Int(0),
+    /// result Ref) must become `ConstRefNull`, not a residual Call and not a
+    /// `cast_int_to_ptr/i>r` of 0 (`blackhole.py bhimpl_cast_int_to_ptr`
+    /// asserts odd; PyPy never interprets this graph).
+    #[test]
+    fn lltype_cast_int_to_ptr_two_arg_gc_nullptr_becomes_const_ref_null() {
         use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, LowLevelType, Ptr, PtrTarget,
@@ -37852,15 +37937,16 @@ mod tests {
             "2-arg Call must not remain; ops={ops:?}"
         );
         assert!(
-            ops.iter().any(|op| matches!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstRefNull)),
+            "GC nullptr residual is ConstRefNull; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
                 &op.kind,
-                OpKind::UnaryOp {
-                    op,
-                    result_ty: ValueType::Ref(_),
-                    ..
-                } if op == "cast_int_to_ptr"
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
             )),
-            "GC 2-arg form becomes unary cast_int_to_ptr with Ref kind; ops={ops:?}"
+            "const-0 GC cast must not residualize as unary cast_int_to_ptr; ops={ops:?}"
         );
         assert_eq!(
             FunctionGraph::concretetype_of(&result),

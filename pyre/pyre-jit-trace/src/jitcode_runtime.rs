@@ -5478,6 +5478,35 @@ mod tests {
     }
 
     #[test]
+    fn array_empty_jitcodes_residualize_nullptr_as_ref_constant() {
+        // `IntArray::empty` / `FloatArray::empty` used to residualize
+        // `emit_typed_nullptr` as `int_copy 0` + `cast_int_to_ptr/i>r`.
+        // `blackhole.py bhimpl_cast_int_to_ptr` asserts odd, so a
+        // TraceTooLong abort that resumes inside those helpers panicked.
+        // `lltype.py cast_int_to_ptr` of 0 is `nullptr`; jtransform now
+        // emits `ConstRefNull` like `UnicodeArray::empty` / `BytesArray::empty`.
+        for path in [
+            "int_array::IntArray::empty",
+            "float_array::FloatArray::empty",
+            "unicode_array::UnicodeArray::empty",
+            "bytes_array::BytesArray::empty",
+        ] {
+            let jc = pathed_jitcode(path).unwrap_or_else(|| panic!("{path} jitcode"));
+            let ops: Vec<_> = decoded_ops(&jc.code).collect();
+            assert!(!ops.is_empty(), "{path} jitcode is empty");
+            let casts: Vec<_> = ops
+                .iter()
+                .filter(|op| op.opname == "cast_int_to_ptr")
+                .map(|op| op.key)
+                .collect();
+            assert!(
+                casts.is_empty(),
+                "{path} must residualize nullptr as a ref constant, not cast_int_to_ptr; ops={casts:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gil_ready_and_adapted_tick_helpers_are_in_the_production_prepass() {
         let ready_idx =
             gil_ready_word_jitcode_index().expect("production prepass must include gil_ready_word");
