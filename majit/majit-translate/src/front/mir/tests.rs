@@ -9473,6 +9473,348 @@ fn user_trait_named_fn_once_is_not_retargeted() {
     );
 }
 
+fn array_from_fn_empty_generics() -> serde_json::Value {
+    serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": []
+    })
+}
+
+fn array_from_fn_fn_mut_env(fields: Vec<serde_json::Value>) -> serde_json::Value {
+    let empty = array_from_fn_empty_generics();
+    let mut env = type_decl_struct(0, &["fixture", "Env"], fields);
+    env["src"] = serde_json::json!({"Closure": {"info": {
+        "kind": "FnMut",
+        "closure_body": {"id": 2, "generics": empty.clone()},
+        "fn_mut_impl": {
+            "regions": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "skip_binder": {"id": 0, "generics": empty}
+        },
+        "fn_once_impl": null,
+        "fn_impl": null
+    }}});
+    env
+}
+
+fn array_from_fn_fn_once_only_env() -> serde_json::Value {
+    let empty = array_from_fn_empty_generics();
+    let mut env = type_decl_struct(0, &["fixture", "Env"], vec![]);
+    env["src"] = serde_json::json!({"Closure": {"info": {
+        "kind": "FnOnce",
+        "closure_body": {"id": 2, "generics": empty.clone()},
+        "fn_mut_impl": null,
+        "fn_once_impl": {
+            "regions": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "skip_binder": {"id": 0, "generics": empty}
+        },
+        "fn_impl": null
+    }}});
+    env
+}
+
+fn array_from_fn_call_fixture(
+    n: u64,
+    env: serde_json::Value,
+    extra_types: Vec<serde_json::Value>,
+) -> Llbc {
+    let span = fixture_span();
+    let empty = array_from_fn_empty_generics();
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let i64 = i64_ty();
+    let closure_ty = named_adt(0, vec![]);
+    let n_str = n.to_string();
+    let array_ty = serde_json::json!({"Array": [
+        i64.clone(),
+        [{"Integer": {"Unsigned": ["Usize", n_str]}}, usize_ty.clone()],
+        null
+    ]});
+    let args_ty = serde_json::json!({"Adt": {
+        "builtin": "Tuple",
+        "generics": {
+            "regions": [],
+            "types": [usize_ty.clone()],
+            "const_generics": [],
+            "trait_refs": []
+        }
+    }});
+    let from_fn_generics = serde_json::json!({
+        "regions": [],
+        "types": [i64.clone(), closure_ty.clone()],
+        "const_generics": [[{"Integer": {"Unsigned": ["Usize", n.to_string()]}}, usize_ty.clone()]],
+        "trait_refs": []
+    });
+    let caller_leaf = format!("from_fn_n{n}");
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", caller_leaf.as_str()])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [closure_ty.clone()],
+            "output": array_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": array_ty.clone()},
+                    {"index": 1, "name": "f", "span": span, "ty": closure_ty.clone()}
+                ]
+            },
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {
+                        "span": span,
+                        "kind": {
+                            "Call": {
+                                "call": {
+                                    "func": {"Regular": {
+                                        "kind": {"Fun": 1},
+                                        "generics": from_fn_generics
+                                    }},
+                                    "args": [{"Move": {"kind": {"Local": 1}, "ty": closure_ty.clone()}}]
+                                },
+                                "dest": {"kind": {"Local": 0}, "ty": array_ty.clone()},
+                                "target": 2,
+                                "on_unwind": 1
+                            }
+                        }
+                    }
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let from_fn = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["core", "array", "from_fn"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [closure_ty.clone()],
+            "output": array_ty.clone()
+        },
+        "body": "Opaque"
+    });
+    let recv = serde_json::json!({"Ref": ["Erased", closure_ty.clone(), "Mut"]});
+    let call_mut = serde_json::json!({
+        "def_id": 2,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "call_mut"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [recv.clone(), args_ty.clone()],
+            "output": i64.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": i64.clone()},
+                {"index": 1, "name": null, "span": span, "ty": recv},
+                {"index": 2, "name": null, "span": span, "ty": args_ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let trait_impl = serde_json::json!({
+        "def_id": 0,
+        "methods": [{
+            "kind": {"TraitMethod": [0, 0]},
+            "skip_binder": {"id": 2, "generics": empty}
+        }]
+    });
+    let mut types = vec![env];
+    types.extend(extra_types);
+    llbc_with_types_impls(
+        "fixture",
+        types,
+        vec![caller, from_fn, call_mut],
+        vec![trait_impl],
+    )
+}
+
+fn array_from_fn_n3_fixture() -> Llbc {
+    array_from_fn_call_fixture(3, array_from_fn_fn_mut_env(vec![]), vec![])
+}
+
+fn array_from_fn_first_call(llbc: &Llbc) -> majit_charon_reader::ullbc::CallPayload {
+    use majit_charon_reader::ullbc::TermKind;
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .name_path()
+                .rsplit("::")
+                .next()
+                .is_some_and(|leaf| leaf.starts_with("from_fn_n"))
+        })
+        .expect("from_fn caller");
+    let body = fd.unstructured().expect("from_fn caller body");
+    match body.body[0].term(llbc).expect("from_fn terminator") {
+        TermKind::Call { call, .. } => call,
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
+/// `from_fn::<_, 3, _>(closure)` is three calls of the closure body and
+/// an Array aggregate `[f(0), f(1), f(2)]`.
+#[test]
+fn array_from_fn_lowers_to_n_closure_calls_and_array_aggregate() {
+    use crate::model::{CallTarget, OpKind};
+
+    let llbc = array_from_fn_n3_fixture();
+    let graph =
+        crate::test_support::lower_function(&llbc, "from_fn_n3").expect("lower from_fn::<_, 3, _>");
+    let ops = graph_ops(&graph);
+    let mut from_fn = 0usize;
+    let mut closure_calls = 0usize;
+    let mut array_ctors = 0usize;
+    let mut pos_writes = 0usize;
+    for op in &ops {
+        match &op.kind {
+            OpKind::Call { target, .. } => match target {
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("from_fn") =>
+                {
+                    from_fn += 1;
+                }
+                CallTarget::Method { name, .. }
+                    if matches!(name.as_str(), "call_mut" | "call_once") =>
+                {
+                    closure_calls += 1;
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments
+                        .last()
+                        .is_some_and(|leaf| matches!(leaf.as_str(), "call_mut" | "call_once")) =>
+                {
+                    closure_calls += 1;
+                }
+                CallTarget::SyntheticTransparentCtor { name, .. }
+                    if name == "Array" || name.starts_with("Array<") =>
+                {
+                    array_ctors += 1;
+                }
+                _ => {}
+            },
+            OpKind::FieldWrite { field, .. } if field.name.starts_with("__pos_") => {
+                pos_writes += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(from_fn, 0, "from_fn must not stay residual; ops={ops:?}");
+    assert_eq!(
+        closure_calls, 3,
+        "from_fn::<_, 3, _> must call the closure three times; ops={ops:?}"
+    );
+    assert_eq!(
+        array_ctors, 1,
+        "from_fn must build one Array aggregate; ops={ops:?}"
+    );
+    assert!(
+        pos_writes >= 3,
+        "Array aggregate must write three slots; ops={ops:?}"
+    );
+}
+
+/// `from_fn` requires `F: FnMut`. A closure that only has `call_once`
+/// is an ordinary residual call, not a plan.
+#[test]
+fn array_from_fn_fn_once_only_gives_no_plan() {
+    let llbc = array_from_fn_call_fixture(3, array_from_fn_fn_once_only_env(), vec![]);
+    let call = array_from_fn_first_call(&llbc);
+    assert!(
+        super::desugar::std_call::array_from_fn_plan(&call, &llbc).is_none(),
+        "FnOnce-only closure must not plan array::from_fn"
+    );
+}
+
+/// `from_fn::<_, 0, _>(f)` is the empty array and still drops `f`.
+#[test]
+fn array_from_fn_n0_lowers_to_empty_array() {
+    use crate::model::{CallTarget, OpKind};
+
+    let llbc = array_from_fn_call_fixture(0, array_from_fn_fn_mut_env(vec![]), vec![]);
+    let graph =
+        crate::test_support::lower_function(&llbc, "from_fn_n0").expect("lower from_fn::<_, 0, _>");
+    let ops = graph_ops(&graph);
+    let mut from_fn = 0usize;
+    let mut closure_calls = 0usize;
+    for op in &ops {
+        match &op.kind {
+            OpKind::Call { target, .. } => match target {
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("from_fn") =>
+                {
+                    from_fn += 1;
+                }
+                CallTarget::Method { name, .. }
+                    if matches!(name.as_str(), "call_mut" | "call_once") =>
+                {
+                    closure_calls += 1;
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments
+                        .last()
+                        .is_some_and(|leaf| matches!(leaf.as_str(), "call_mut" | "call_once")) =>
+                {
+                    closure_calls += 1;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_eq!(
+        from_fn, 0,
+        "from_fn::<_, 0, _> must not stay residual; ops={ops:?}"
+    );
+    assert_eq!(
+        closure_calls, 0,
+        "from_fn::<_, 0, _> must not call the closure; ops={ops:?}"
+    );
+}
+
+/// A closure that captures a type with drop glue is not a plan:
+/// `from_fn` owns `f` and this expansion does not emit that glue.
+#[test]
+fn array_from_fn_drop_capture_gives_no_plan() {
+    let cap_fields = vec![serde_json::json!({
+        "name": "cap",
+        "ty": named_adt(1, vec![]),
+        "attr_info": null
+    })];
+    let mut needs_drop = type_decl_struct(1, &["fixture", "NeedsDrop"], vec![]);
+    needs_drop["kind"] = serde_json::json!("Opaque");
+    let llbc =
+        array_from_fn_call_fixture(3, array_from_fn_fn_mut_env(cap_fields), vec![needs_drop]);
+    let call = array_from_fn_first_call(&llbc);
+    assert!(
+        super::desugar::std_call::array_from_fn_plan(&call, &llbc).is_none(),
+        "closure capturing a drop-glue value must not plan array::from_fn"
+    );
+}
+
 fn fn_item_call_once_gc_mut_ref_fixture() -> Llbc {
     let span = serde_json::json!({
         "data": {

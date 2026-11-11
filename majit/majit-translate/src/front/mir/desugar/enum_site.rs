@@ -1710,24 +1710,7 @@ impl<'a> Lowering<'a> {
         decl: &TypeDecl,
         depth: usize,
     ) -> bool {
-        if depth > 16 || self.type_decl_has_explicit_drop(decl.def_id) {
-            return false;
-        }
-        if decl.published_struct_copy {
-            return false;
-        }
-        match &decl.kind {
-            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
-                .iter()
-                .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1)),
-            TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1))
-            }),
-            TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
-        }
+        type_decl_is_trivially_dropless(decl, self.llbc, depth)
     }
 
     pub(in crate::front::mir) fn tyref_is_trivially_dropless(
@@ -1735,32 +1718,7 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
         depth: usize,
     ) -> bool {
-        if depth > 16 {
-            return false;
-        }
-        let Some(node) = tyref_node(ty, self.llbc) else {
-            return false;
-        };
-        if node.get("Scalar").is_some()
-            || node.get("Ref").is_some()
-            || node.get("RawPtr").is_some()
-            || node.get("FnDef").is_some()
-            || node.get("FnPtr").is_some()
-        {
-            return true;
-        }
-        let Some(def_id) = strip_ty_wrappers(node, self.llbc).and_then(adt_node_def_id) else {
-            return false;
-        };
-        self.llbc
-            .type_by_id(def_id)
-            .is_some_and(|decl| self.type_decl_is_trivially_dropless(decl, depth + 1))
-    }
-
-    pub(in crate::front::mir) fn type_decl_has_explicit_drop(&self, def_id: u64) -> bool {
-        self.llbc.has_explicit_drop_impl(def_id, |ty| {
-            resolve_tyexpr_to_adt_def_id_free(self.llbc, ty)
-        })
+        tyref_is_trivially_dropless(ty, self.llbc, depth)
     }
 
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
@@ -2449,4 +2407,63 @@ impl<'a> Lowering<'a> {
         self.graph
             .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())
     }
+}
+
+/// [`Llbc::has_explicit_drop_impl`] for `def_id`.
+pub(in crate::front::mir) fn type_decl_has_explicit_drop(llbc: &Llbc, def_id: u64) -> bool {
+    llbc.has_explicit_drop_impl(def_id, |ty| resolve_tyexpr_to_adt_def_id_free(llbc, ty))
+}
+
+/// Conservative `needs_drop::<T>() == false` projection. The same
+/// predicate a [`TermKind::Drop`] of a local of this type uses to
+/// decide the destructor is a no-op.
+pub(in crate::front::mir) fn type_decl_is_trivially_dropless(
+    decl: &TypeDecl,
+    llbc: &Llbc,
+    depth: usize,
+) -> bool {
+    if depth > 16 || type_decl_has_explicit_drop(llbc, decl.def_id) {
+        return false;
+    }
+    if decl.published_struct_copy {
+        return false;
+    }
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+            .iter()
+            .all(|field| tyref_is_trivially_dropless(&field.ty, llbc, depth + 1)),
+        TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .all(|field| tyref_is_trivially_dropless(&field.ty, llbc, depth + 1))
+        }),
+        TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+    }
+}
+
+pub(in crate::front::mir) fn tyref_is_trivially_dropless(
+    ty: &TyRef,
+    llbc: &Llbc,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if node.get("Scalar").is_some()
+        || node.get("Ref").is_some()
+        || node.get("RawPtr").is_some()
+        || node.get("FnDef").is_some()
+        || node.get("FnPtr").is_some()
+    {
+        return true;
+    }
+    let Some(def_id) = strip_ty_wrappers(node, llbc).and_then(adt_node_def_id) else {
+        return false;
+    };
+    llbc.type_by_id(def_id)
+        .is_some_and(|decl| type_decl_is_trivially_dropless(decl, llbc, depth + 1))
 }

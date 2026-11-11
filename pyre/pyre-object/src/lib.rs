@@ -54,6 +54,7 @@ pub mod nestedscope;
 pub mod noneobject;
 pub mod object_array;
 pub mod objectobject;
+pub mod objlock;
 pub mod operation;
 pub mod pyobject;
 pub mod quasiimmut;

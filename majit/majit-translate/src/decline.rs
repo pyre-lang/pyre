@@ -135,6 +135,15 @@ pub mod gate {
     /// A lowered graph passed a pointer to `OwnerRootGuard`, or to an
     /// aggregate that contains one, into a callee that stays residual.
     pub const OWNER_ROOT_GUARD_ESCAPE: &str = "mir::owner_root_guard";
+    /// A lowered graph passed `RBigIntGcRoot`, or an aggregate that
+    /// contains one, by value or through a pointer, into a callee that
+    /// stays residual, or received one as the call destination.
+    pub const RBIGINT_GC_ROOT_ESCAPE: &str = "mir::rbigint_gc_root";
+    /// A handle is in the graph, but the erased `RBigInt` type cannot be
+    /// resolved from the handle's fields or from the `RBigInt` declaration
+    /// path. Value lowering would drop `new` / `deref` while type lowering
+    /// kept the handle.
+    pub const RBIGINT_GC_ROOT_UNRESOLVED: &str = "mir::rbigint_gc_root_unresolved";
     /// `front::iter_adapter` `map(it, f).collect()` / `from_iter` rewrite.
     /// A structural miss leaves the residual `Range::map` FunctionPath,
     /// which then fails phaseA as an unregistered CallRegistry path.

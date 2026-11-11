@@ -2824,13 +2824,80 @@ fn live_rbigint_clone_result_is_rbigint_instance() {
     });
 }
 
-/// `_int_bitwise_and` keeps its handles: one lives in an
-/// `Option<RBigIntGcRoot>`. `live_rbigint`'s graph returns the value, so
-/// the kept body roots it again with the real `RBigIntGcRoot::new`, which
-/// keeps the body's `acquire_owner_root` decline.
+/// `RBigInt::pow` fills `[RBigIntGcRoot; 32]` with `array::from_fn`.
+/// That is `[f(0), …, f(31)]`: 32 calls of the closure body and an
+/// Array aggregate, not a residual `from_fn` and not `__array_repeat`.
 #[test]
-fn a_kept_handle_roots_the_producer_value_with_the_real_new() {
-    use crate::model::{CallTarget, LinkArg, OpKind};
+fn pow_from_fn_table_is_array_of_closure_calls() {
+    use crate::model::{CallTarget, OpKind};
+
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("rbigint::<Impl>::pow"))
+        .expect("RBigInt::pow in majit-rlib LLBC");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd)
+            .unwrap_or_else(|err| panic!("lower RBigInt::pow: {err}"));
+        let mut from_fn = 0usize;
+        let mut repeats = 0usize;
+        let mut closure_calls = 0usize;
+        let mut array_ctors = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("from_fn") =>
+                {
+                    from_fn += 1;
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.as_slice() == ["__array_repeat"] =>
+                {
+                    repeats += 1;
+                }
+                CallTarget::Method { name, .. }
+                    if matches!(name.as_str(), "call_mut" | "call_once") =>
+                {
+                    closure_calls += 1;
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments
+                        .last()
+                        .is_some_and(|leaf| matches!(leaf.as_str(), "call_mut" | "call_once")) =>
+                {
+                    closure_calls += 1;
+                }
+                CallTarget::SyntheticTransparentCtor { name, .. }
+                    if name == "Array" || name.starts_with("Array<") =>
+                {
+                    array_ctors += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(from_fn, 0, "pow still residualizes array::from_fn");
+        assert_eq!(repeats, 0, "pow from_fn must not become __array_repeat");
+        assert!(
+            closure_calls >= 32,
+            "pow from_fn must call the closure N times, got call_mut/call_once={closure_calls}"
+        );
+        assert!(
+            array_ctors >= 1,
+            "pow from_fn must build an Array aggregate, got array_ctors={array_ctors}"
+        );
+    });
+}
+
+/// `_int_bitwise_and` stores a handle in `Option<RBigIntGcRoot>`. The
+/// handle is the `RBigInt` it roots, so `live_rbigint`'s value is not
+/// wrapped again in `RBigIntGcRoot::new`.
+#[test]
+fn a_kept_handle_is_the_producer_value() {
+    use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
@@ -2840,39 +2907,60 @@ fn a_kept_handle_roots_the_producer_value_with_the_real_new() {
         .expect("_int_bitwise_and in majit-rlib LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower _int_bitwise_and");
-        let leaf_of = |op: &crate::model::SpaceOperation| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => segments.last().cloned(),
-            _ => None,
-        };
-        let rerooted = graph.blocks.iter().any(|block| {
-            let ops = &block.operations;
-            ops.iter().enumerate().any(|(i, op)| {
-                leaf_of(op).as_deref() == Some("live_rbigint")
-                    && ops[i + 1..].iter().any(|later| {
-                        let OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            args,
-                            ..
-                        } = &later.kind
-                        else {
-                            return false;
-                        };
-                        segments.iter().any(|s| s == "RBigIntGcRoot")
-                            && segments.last().is_some_and(|leaf| leaf == "new")
-                            && args.len() == 1
-                            && matches!(&args[0], LinkArg::Value(_))
-                    })
-            })
-        });
+        let mut disc_reads = 0usize;
+        let mut payload_reads = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call { target, .. } => {
+                    let names_handle = match target {
+                        CallTarget::FunctionPath { segments, .. } => {
+                            segments.iter().any(|s| s == "RBigIntGcRoot")
+                        }
+                        CallTarget::Method { receiver_root, .. } => receiver_root
+                            .as_deref()
+                            .is_some_and(|root| root.contains("RBigIntGcRoot")),
+                        _ => false,
+                    };
+                    assert!(
+                        !names_handle,
+                        "_int_bitwise_and still calls the handle: {target:?}"
+                    );
+                    let as_ref_or_deref = match target {
+                        CallTarget::FunctionPath { segments, .. } => {
+                            matches!(
+                                segments.last().map(String::as_str),
+                                Some("as_ref" | "as_deref" | "as_mut" | "as_deref_mut")
+                            )
+                        }
+                        CallTarget::Method { name, .. } => {
+                            matches!(
+                                name.as_str(),
+                                "as_ref" | "as_deref" | "as_mut" | "as_deref_mut"
+                            )
+                        }
+                        _ => false,
+                    };
+                    assert!(
+                        !as_ref_or_deref,
+                        "_int_bitwise_and still residualizes Option as_ref/as_deref: {target:?}"
+                    );
+                }
+                OpKind::FieldRead { field, .. } => {
+                    if field.name == "__discriminant" {
+                        disc_reads += 1;
+                    }
+                    if field.name == "__pos_0" {
+                        payload_reads += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
         assert!(
-            rerooted,
-            "live_rbigint's value is not rooted again by RBigIntGcRoot::new"
+            disc_reads >= 1 && payload_reads >= 1,
+            "_int_bitwise_and as_deref must be tagged-to-niche (disc + payload), \
+             got disc={disc_reads} payload={payload_reads}"
         );
-        // The `bool::then` closure keeps its handle and returns it; the kept
-        // caller stores it in the `Option<RBigIntGcRoot>` as a handle.
         let closure = llbc
             .iter_local_fns()
             .find(|fd| {
@@ -6495,7 +6583,7 @@ fn map_err_drop_detection_requires_resolved_trait_metadata() {
             "{trait_name:?}"
         );
         assert!(
-            !lowering.type_decl_has_explicit_drop(99),
+            !super::super::desugar::enum_site::type_decl_has_explicit_drop(&llbc, 99),
             "an unrelated owner must not be rejected"
         );
     }

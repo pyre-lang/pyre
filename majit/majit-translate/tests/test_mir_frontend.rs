@@ -4103,6 +4103,98 @@ fn call_names_owner_root_guard(call: &str) -> bool {
         || call.contains("shadow_stack::<Impl>::drop")
 }
 
+fn call_names_rbigint_gc_root(call: &str) -> bool {
+    call.contains("RBigIntGcRoot")
+        || call.contains("rbigint::gc::<Impl>::new")
+        || call.contains("rbigint::gc::<Impl>::set")
+        || call.contains("rbigint::gc::<Impl>::normalize")
+        || call.contains("rbigint::gc::<Impl>::drop")
+}
+
+fn rbigint_gc_root_graph_calls(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
+    use majit_translate::model::OpKind;
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => Some(call_target_text(target)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `live_rbigint` clones `&RBigInt` and passes the clone to
+/// `RBigIntGcRoot::new`. The handle is that clone.
+#[test]
+fn rbigint_gc_root_new_is_the_value() {
+    use majit_translate::front::mir::lower_fun_decl;
+
+    let llbc = load_llbc(RLIB_LLBC);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
+        .expect("live_rbigint in majit-rlib LLBC");
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(context, fd).expect("lower live_rbigint");
+        let calls = rbigint_gc_root_graph_calls(&graph);
+        assert!(
+            !calls.iter().any(|call| call_names_rbigint_gc_root(call)),
+            "live_rbigint still calls the handle: {calls:?}"
+        );
+    });
+}
+
+/// `_help_mult` derefs rooted handles to call `RBigInt` methods. The
+/// lowered graph keeps the `RBigInt` and does not call `Deref`.
+#[test]
+fn rbigint_gc_root_deref_is_the_value() {
+    use majit_translate::front::mir::lower_fun_decl;
+
+    let llbc = load_llbc(RLIB_LLBC);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_help_mult")
+        .expect("_help_mult in majit-rlib LLBC");
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(context, fd).expect("lower _help_mult");
+        let calls = rbigint_gc_root_graph_calls(&graph);
+        assert!(
+            !calls.iter().any(|call| call_names_rbigint_gc_root(call)
+                || ((call.contains("::deref") || call.contains("::deref_mut"))
+                    && call.contains("RBigIntGcRoot"))),
+            "_help_mult still calls Deref or the handle: {calls:?}"
+        );
+    });
+}
+
+/// `_help_mult` drops the rooted handles it creates. Drop of the handle
+/// is nothing.
+#[test]
+fn rbigint_gc_root_drop_is_nothing() {
+    use majit_translate::front::mir::lower_fun_decl;
+
+    let llbc = load_llbc(RLIB_LLBC);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_help_mult")
+        .expect("_help_mult in majit-rlib LLBC");
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(context, fd).expect("lower _help_mult");
+        let calls = rbigint_gc_root_graph_calls(&graph);
+        assert!(
+            !calls.iter().any(|call| {
+                call_names_rbigint_gc_root(call)
+                    || ((call.ends_with("::drop")
+                        || call.contains("DropGlue")
+                        || call.contains("drop_in_place"))
+                        && call.contains("RBigIntGcRoot"))
+            }),
+            "_help_mult still drops the handle: {calls:?}"
+        );
+    });
+}
+
 fn class_root_probe_span() -> serde_json::Value {
     serde_json::json!({
         "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}

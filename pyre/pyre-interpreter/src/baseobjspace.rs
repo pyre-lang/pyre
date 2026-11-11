@@ -15286,11 +15286,20 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // Take both class stripes around the map/storage migration so a
         // reader cannot observe a half-published pair when the two classes
         // hash to different stripes.
+        // Each class is re-read from its slot because the first wait can move the second.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls, w_oldcls.as_ptr()]);
-        let _stripes = crate::objspace::std::mapdict::lock_instance_stripes(
+        let keep_order = crate::objspace::std::mapdict::class_stripe_order(
             pyre_object::gc_roots::shadow_stack_get(base + 2),
             pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
+        let first_slot = if keep_order { base + 2 } else { base + 1 };
+        let second_slot = if keep_order { base + 1 } else { base + 2 };
+        let _first_stripe = crate::objspace::std::mapdict::lock_class_stripe(
+            pyre_object::gc_roots::shadow_stack_get(first_slot),
+        );
+        let _second_stripe = crate::objspace::std::mapdict::lock_class_stripe(
+            pyre_object::gc_roots::shadow_stack_get(second_slot),
         );
         if crate::objspace::std::mapdict::has_mapdict_layout(
             pyre_object::gc_roots::shadow_stack_get(base),

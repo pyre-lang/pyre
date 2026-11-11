@@ -18,8 +18,6 @@
 use crate::gc_hook::GCREF;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
-use std::cell::UnsafeCell;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and_weakref(
@@ -2290,57 +2288,16 @@ pub unsafe fn w_set_next_slot(obj: PyObjectRef, from: usize) -> Option<usize> {
 // W_SetObject; the stripes only restore the indivisible operation boundary
 // supplied by PyPy's GIL. Stripes are reset in a fork child because a vanished
 // thread may have held one at fork time.
-struct ForkSetLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
-unsafe impl Sync for ForkSetLock {}
+static SET_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
 
-impl ForkSetLock {
-    fn new() -> Self {
-        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
-    }
-
-    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
-    }
-}
-
-static SET_LOCKS: LazyLock<Vec<ForkSetLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkSetLock::new()).collect());
-
-/// The set stripe is its lock word. `repr(transparent)` so a residual call
-/// returns that integer and the guard's drop releases it, the same bracket
-/// `ListGuard` uses for `rthread.py` `Lock.acquire` / `Lock.release`.
-#[repr(transparent)]
-struct SetGuard {
-    lock: usize,
-    not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl Drop for SetGuard {
-    fn drop(&mut self) {
-        // SAFETY: only the acquire helpers below construct this owner, from
-        // one successful acquisition of a process-lifetime SET_LOCKS entry.
-        unsafe { w_set_lock_release(self.lock) };
-    }
-}
-
-#[inline]
-fn set_lock_index(obj: PyObjectRef) -> usize {
-    (obj as usize >> 4) & (SET_LOCKS.len() - 1)
-}
+type SetGuard = crate::objlock::ObjectLockGuard;
 
 /// Acquire a set's stripe without letting a contending mutator prevent a GC
 /// stop-the-world. Only the acquire is opaque; the guarded set operation stays
 /// visible to source translation, matching listobject/dictmultiobject.
 #[majit_macros::dont_look_inside]
 unsafe fn w_set_lock(obj: PyObjectRef) -> SetGuard {
-    SetGuard {
-        lock: w_set_lock_acquire(obj),
-        not_send: std::marker::PhantomData,
-    }
+    crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(obj))
 }
 
 /// [`w_set_lock`] for the residual-call ABI: the guard's lock word.
@@ -2351,7 +2308,7 @@ unsafe fn w_set_lock(obj: PyObjectRef) -> SetGuard {
 /// of the guard releases it through [`w_set_lock_release`].
 pub extern "C" fn w_set_lock_jit_abi(obj: i64) -> i64 {
     let obj = obj as usize as PyObjectRef;
-    std::mem::ManuallyDrop::new(unsafe { w_set_lock(obj) }).lock as i64
+    unsafe { w_set_lock(obj) }.into_word() as i64
 }
 
 // The traced call names `w_set_lock`. Publish the word-returning entry under
@@ -2384,22 +2341,7 @@ fn register_w_set_lock_jit_abi() {
 /// exactly once on the acquiring thread.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_lock_acquire(obj: PyObjectRef) -> usize {
-    acquire_set_lock_handle(SET_LOCKS[set_lock_index(obj)].get())
-}
-
-fn acquire_set_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> usize {
-    let guard = if let Some(guard) = lock.try_lock() {
-        guard
-    } else {
-        let blocked = majit_gc::gc_sync::before_external_block();
-        let guard = lock.lock();
-        drop(blocked);
-        guard
-    };
-    // `ReentrantMutex::force_unlock` supports a forgotten guard. The returned
-    // handle carries that obligation.
-    std::mem::forget(guard);
-    lock as *const parking_lot::ReentrantMutex<()> as usize
+    SET_LOCKS.acquire(obj as usize)
 }
 
 /// Discharge one acquisition of a handle from [`w_set_lock_acquire`].
@@ -2408,20 +2350,16 @@ fn acquire_set_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> us
 /// `lock` must be an unreleased handle from [`w_set_lock_acquire`] on this thread.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub unsafe fn w_set_lock_release(lock: usize) {
-    unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
+    unsafe { crate::objlock::object_lock_release(lock) };
 }
 
 /// `try_lock` only. A contended stripe returns `None` so the caller can
 /// leave the insert to [`w_set_lock`], which parks at a safepoint.
 #[majit_macros::dont_look_inside]
 fn try_w_set_lock(obj: PyObjectRef) -> Option<SetGuard> {
-    let lock = SET_LOCKS[set_lock_index(obj)].get();
-    let guard = lock.try_lock()?;
-    std::mem::forget(guard);
-    Some(SetGuard {
-        lock: lock as *const parking_lot::ReentrantMutex<()> as usize,
-        not_send: std::marker::PhantomData,
-    })
+    SET_LOCKS
+        .try_acquire(obj as usize)
+        .map(|lock| unsafe { crate::objlock::ObjectLockGuard::from_word(lock) })
 }
 
 /// Whether `value` is a plain int [`IntegerSetStrategy`] already stores.
@@ -2523,24 +2461,37 @@ pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
 }
 
 /// Lock two sets in stripe order. A shared stripe is acquired once.
+/// Keys are computed before the first wait because a wait can move either set.
 #[majit_macros::dont_look_inside]
 unsafe fn w_set_lock_pair(left: PyObjectRef, right: PyObjectRef) -> (SetGuard, Option<SetGuard>) {
-    let left_index = set_lock_index(left);
-    let right_index = set_lock_index(right);
-    if left_index == right_index {
+    if !crate::objlock::stripes_taken() {
         return (w_set_lock(left), None);
     }
-    if left_index < right_index {
-        (w_set_lock(left), Some(w_set_lock(right)))
-    } else {
-        (w_set_lock(right), Some(w_set_lock(left)))
+    let left_key = crate::gc_hook::gc_identity_hash(left as usize);
+    let right_key = crate::gc_hook::gc_identity_hash(right as usize);
+    let left_index = crate::objlock::stripe_index(left_key);
+    let right_index = crate::objlock::stripe_index(right_key);
+    if left_index == right_index {
+        return (
+            crate::objlock::ObjectLockGuard::from_word(SET_LOCKS.acquire_unconditionally(left_key)),
+            None,
+        );
     }
+    let (first_key, second_key) = if left_index < right_index {
+        (left_key, right_key)
+    } else {
+        (right_key, left_key)
+    };
+    (
+        crate::objlock::ObjectLockGuard::from_word(SET_LOCKS.acquire_unconditionally(first_key)),
+        Some(crate::objlock::ObjectLockGuard::from_word(
+            SET_LOCKS.acquire_unconditionally(second_key),
+        )),
+    )
 }
 
 pub fn set_locks_after_fork_child() {
-    for lock in SET_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    SET_LOCKS.after_fork_child();
 }
 
 /// Runtime-assigned GC type id for [`SetItemsStorage`]. Like the bigint
@@ -3422,12 +3373,15 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `dst` and `src` must point to valid `W_SetObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
-    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
-    // `w_other.get_storage_copy()` installed by `copy_real` /
-    // `EmptySetStrategy.update`.
     let _roots = crate::gc_roots::push_roots();
     let dst_slot = crate::gc_roots::pin_roots(&[dst, src]);
     let src_slot = dst_slot + 1;
+    let (_first_guard, _second_guard) = w_set_lock_pair(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(src_slot),
+    );
+    // `w_other.get_storage_copy()` installed by `copy_real` /
+    // `EmptySetStrategy.update`.
     let src = crate::gc_roots::shadow_stack_get(src_slot);
     let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let src_set = &*(src as *const W_SetObject);

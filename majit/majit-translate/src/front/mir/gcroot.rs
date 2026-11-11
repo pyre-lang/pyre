@@ -91,12 +91,8 @@ impl<'a> Lowering<'a> {
             )?;
             return Ok(true);
         }
-        if drop_place_is_list_guard(place, self.llbc) {
-            self.emit_one_word_guard_release(mir_bb, place, LIST_LOCK_RELEASE_PATH)?;
-            return Ok(true);
-        }
-        if drop_place_is_set_guard(place, self.llbc) {
-            self.emit_one_word_guard_release(mir_bb, place, SET_LOCK_RELEASE_PATH)?;
+        if drop_place_is_object_lock_guard(place, self.llbc) {
+            self.emit_one_word_guard_release(mir_bb, place, OBJECT_LOCK_RELEASE_PATH)?;
             return Ok(true);
         }
         let root_scope = match glue {
@@ -111,7 +107,9 @@ impl<'a> Lowering<'a> {
         }
         // The guard's slot does not exist in a jitcode. Dropping it, or the
         // `Option` that holds it, releases nothing.
-        if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc) {
+        if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc)
+            || rbigint_gc_root::tyref_is_erased_drop(&place.ty, self.llbc)
+        {
             return Ok(true);
         }
         if tyref_is_owned_vec(&place.ty, self.llbc) {
@@ -630,6 +628,226 @@ impl<'a> Lowering<'a> {
         )))
     }
 
+    /// [`rbigint_gc_root`]: `new` and `deref` alias the rooted `RBigInt`,
+    /// `set` writes that value back, `normalize` is `RBigInt::_normalize`,
+    /// `Drop` does not call, and `Option::as_ref` / `as_deref` convert the
+    /// tagged option to the null-niche of the instance.
+    pub(in crate::front::mir) fn lower_rbigint_gc_root_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        on_unwind: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(op) = rbigint_gc_root::classify(call, self.llbc) else {
+            return Ok(false);
+        };
+        match op {
+            rbigint_gc_root::Op::New | rbigint_gc_root::Op::Deref => {
+                let source = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot {op:?} without a plain-local operand"
+                    ))
+                })?;
+                let value = self.local_var[source]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased RBigIntGcRoot {op:?} reads unbound MIR local {source}"
+                        ))
+                    })?
+                    .one()?;
+                self.local_var[dest_local] = Some(LocalValue::One(value));
+            }
+            rbigint_gc_root::Op::OptionAsDeref => {
+                self.lower_rbigint_option_as_deref(mir_bb, call, dest_local, target)?;
+                return Ok(true);
+            }
+            rbigint_gc_root::Op::Set => {
+                let borrow = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot::set without a plain-local receiver"
+                    ))
+                })?;
+                let slot = self.mem_slot(Some(borrow)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot::set has no place for MIR local {borrow}"
+                    ))
+                })?;
+                let MemSlot::Place(place) = slot else {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot::set through an index element"
+                    )));
+                };
+                let value_local = operand_local(call.args.get(1)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot::set without a plain-local value"
+                    ))
+                })?;
+                let value = self.local_var[value_local]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased RBigIntGcRoot::set reads unbound MIR local {value_local}"
+                        ))
+                    })?
+                    .one()?;
+                self.write_mem_slot(mir_bb, MemSlot::Place(place), value)?;
+                let unit = self.emit_unit(self.emit_bb(mir_bb));
+                self.local_var[dest_local] = Some(LocalValue::One(unit));
+            }
+            rbigint_gc_root::Op::Normalize => {
+                let Some(norm) = rbigint_gc_root::rbigint_normalize_decl(self.llbc) else {
+                    crate::decline::record_named(
+                        crate::decline::gate::RBIGINT_GC_ROOT_ESCAPE,
+                        "normalize-without-_normalize",
+                        &self.graph.name,
+                    );
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased RBigIntGcRoot::normalize without RBigInt::_normalize"
+                    )));
+                };
+                let mut rewritten = call.clone();
+                if let CallFunc::Regular(reg) = &mut rewritten.func {
+                    reg.kind = CallKind::Fun(FunId::Regular { id: norm.def_id });
+                }
+                self.lower_call(mir_bb, rewritten, target, on_unwind)?;
+                return Ok(true);
+            }
+            rbigint_gc_root::Op::Drop => {
+                let unit = self.emit_unit(self.emit_bb(mir_bb));
+                self.local_var[dest_local] = Some(LocalValue::One(unit));
+            }
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Tagged `Option<RBigInt>` → null-niche `Option<&RBigInt>`: the
+    /// same disc / payload / null diamond a tagged Option consume then
+    /// niche produce already uses.
+    fn lower_rbigint_option_as_deref(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let source = operand_local(call.args.first()).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref without a plain-local operand"
+            ))
+        })?;
+        let value = self.local_var[source]
+            .as_ref()
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref reads unbound MIR local {source}"
+                ))
+            })?
+            .one()?;
+        let recv_ty = call.args.first().and_then(operand_tyref).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref without a typed operand"
+            ))
+        })?;
+        let option_ty = self.peel_to_option_or_result(recv_ty).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref receiver is not an Option"
+            ))
+        })?;
+        if self.tyref_is_niche_option_ptr(&option_ty) {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref expected a tagged Option"
+            )));
+        }
+        if !self.tyref_is_niche_option_ptr(&call.dest.ty) {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref dest is not a null-niche Option"
+            )));
+        }
+        let (option_owner, some_owner, payload_ty) = self
+            .resolve_option_consumer_owners(&option_ty)
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: erased Option<RBigIntGcRoot> as_ref without Option owners"
+                ))
+            })?;
+        let bb_id = self.emit_bb(mir_bb);
+        let disc = emit_enum_disc_read(&mut self.graph, bb_id, value.clone(), &option_owner);
+        let null_cast = self.option_niche_null_cast(&call.dest.ty);
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            false,
+            false,
+            std::slice::from_ref(&value),
+            &[],
+            |this, some_bb, mapped| {
+                emit_payload_read(
+                    &mut this.graph,
+                    some_bb,
+                    mapped[0].clone(),
+                    &some_owner,
+                    payload_ty.clone(),
+                    false,
+                )
+            },
+            |this, none_bb, _| emit_niche_null(&mut this.graph, none_bb, None, &null_cast),
+        )
+    }
+
+    /// The handle is in this call, but the erased `RBigInt` type cannot be
+    /// resolved. Classify would drop `new` / `deref` while the local kept
+    /// the handle type.
+    pub(in crate::front::mir) fn refuse_unresolved_rbigint_gc_root(
+        &self,
+        mir_bb: usize,
+        call: &CallPayload,
+    ) -> Result<(), LowerError> {
+        if !rbigint_gc_root::unresolved_escape(call, self.llbc) {
+            return Ok(());
+        }
+        crate::decline::record_named(
+            crate::decline::gate::RBIGINT_GC_ROOT_UNRESOLVED,
+            "erased-type-unresolved",
+            &self.graph.name,
+        );
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: `{}` uses RBigIntGcRoot without a resolvable RBigInt type",
+            self.graph.name
+        )))
+    }
+
+    /// A residual callee runs the real Rust layout. A handle, or an
+    /// aggregate that contains one, passed by value or through a pointer,
+    /// or returned the same way, would show it the erased value.
+    pub(in crate::front::mir) fn refuse_residual_rbigint_gc_root(
+        &self,
+        mir_bb: usize,
+        call: &CallPayload,
+    ) -> Result<(), LowerError> {
+        let Some(callee) = rbigint_gc_root::residual_escape(call, self.llbc, self.dont_look_inside)
+        else {
+            return Ok(());
+        };
+        crate::decline::record_named(
+            crate::decline::gate::RBIGINT_GC_ROOT_ESCAPE,
+            "pointer-to-residual",
+            &self.graph.name,
+        );
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: `{}` passes RBigIntGcRoot into residual `{callee}`",
+            self.graph.name
+        )))
+    }
+
     /// The `RBigIntGcRoot::new(value)` call that makes a producer's value the
     /// handle a kept body expects.
     ///
@@ -865,24 +1083,22 @@ pub(in crate::front::mir) fn drop_place_is_frame_anchor(
         || tyref_is_frame_anchor(&decl.ty, llbc)
 }
 
-/// The release residual a `ListGuard` drop lowers to (`rthread.py`
+/// The release residual an `ObjectLockGuard` drop lowers to (`rthread.py`
 /// `Lock.release`).
-pub(in crate::front::mir) const LIST_LOCK_RELEASE_PATH: [&str; 3] =
-    ["pyre_object", "listobject", "w_list_lock_release"];
+pub(in crate::front::mir) const OBJECT_LOCK_RELEASE_PATH: [&str; 3] =
+    ["pyre_object", "objlock", "object_lock_release"];
 
-/// The release residual a `SetGuard` drop lowers to. Same `Lock.release`
-/// boundary as [`LIST_LOCK_RELEASE_PATH`], on the set stripe.
-pub(in crate::front::mir) const SET_LOCK_RELEASE_PATH: [&str; 3] =
-    ["pyre_object", "setobject", "w_set_lock_release"];
-
-/// A drop of the list lock's one-word `ListGuard` (`listobject::ListGuard`).
+/// A drop of the shared one-word `ObjectLockGuard` (`objlock::ObjectLockGuard`).
 /// Its `Drop` releases the lock word; without this arm the drop fell through
 /// to a plain goto and the jitcode never released an acquisition.
-pub(in crate::front::mir) fn drop_place_is_list_guard(place: &Place, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn drop_place_is_object_lock_guard(place: &Place, llbc: &Llbc) -> bool {
     if !matches!(place.kind, PlaceKind::Local(_)) {
         return false;
     }
-    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+    let Some(node) = tyref_node(&place.ty, llbc)
+        .and_then(|n| type_node_peel_aliases(n, llbc))
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
         return false;
     };
     adt_id_flexible(node)
@@ -890,12 +1106,12 @@ pub(in crate::front::mir) fn drop_place_is_list_guard(place: &Place, llbc: &Llbc
         .is_some_and(|td| {
             let path = td.item_meta.name_path();
             let segments: Vec<&str> = path.split("::").collect();
-            segments.last() == Some(&"ListGuard") && segments.contains(&"listobject")
+            segments.last() == Some(&"ObjectLockGuard") && segments.contains(&"objlock")
         })
 }
 
-/// Match the bound `w_list_lock_release` residual a `ListGuard` drop emits.
-pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
+/// Match the bound `object_lock_release` residual an `ObjectLockGuard` drop emits.
+pub(crate) fn is_object_lock_release_call(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         ..
@@ -903,36 +1119,7 @@ pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
     else {
         return false;
     };
-    segments.last().map(String::as_str) == Some(LIST_LOCK_RELEASE_PATH[2])
-}
-
-/// A drop of the set lock's one-word `SetGuard` (`setobject::SetGuard`).
-pub(in crate::front::mir) fn drop_place_is_set_guard(place: &Place, llbc: &Llbc) -> bool {
-    if !matches!(place.kind, PlaceKind::Local(_)) {
-        return false;
-    }
-    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    adt_id_flexible(node)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            let path = td.item_meta.name_path();
-            let segments: Vec<&str> = path.split("::").collect();
-            segments.last() == Some(&"SetGuard") && segments.contains(&"setobject")
-        })
-}
-
-/// Match the bound `w_set_lock_release` residual a `SetGuard` drop emits.
-pub(crate) fn is_set_lock_release_call(kind: &OpKind) -> bool {
-    let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
-        ..
-    } = kind
-    else {
-        return false;
-    };
-    segments.last().map(String::as_str) == Some(SET_LOCK_RELEASE_PATH[2])
+    segments.last().map(String::as_str) == Some(OBJECT_LOCK_RELEASE_PATH[2])
 }
 
 /// Drops supported by both lowering and its liveness analysis.
@@ -987,13 +1174,12 @@ pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
 }
 
 /// Guard releases that an exceptional Result rewrite must replay on the
-/// raise edge: shadow-stack closes, the list lock release and the free of
-/// a raw array buffer that ends with the frame.
+/// raise edge: shadow-stack closes, the shared object-lock release and the
+/// free of a raw array buffer that ends with the frame.
 pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
     is_root_scope_drop_glue_call(kind)
         || is_frame_anchor_release_call(kind)
-        || is_list_lock_release_call(kind)
-        || is_set_lock_release_call(kind)
+        || is_object_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
         || is_rust_vec_free_call(kind)
 }
@@ -1247,8 +1433,7 @@ pub(in crate::front::mir) fn glue_call_drop_blocks(
         // the release or glue call. An unmarked word is absent there, and
         // the destructor is skipped.
         let lowers = drop_place_is_frame_anchor(place, body, llbc)
-            || drop_place_is_list_guard(place, llbc)
-            || drop_place_is_set_guard(place, llbc)
+            || drop_place_is_object_lock_guard(place, llbc)
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),
@@ -4054,6 +4239,9 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
         if fields.is_empty() {
             continue;
         }
+        // `RBigIntGcRoot` is included: an importing crate's declaration is
+        // Opaque, and `erased_value_ty` reads the copied `value` field.
+        // The ClassDef loop still skips the handle (`is_root_path`).
         let portable: Vec<PublishedStructField> = fields
             .iter()
             .map(|field| PublishedStructField {

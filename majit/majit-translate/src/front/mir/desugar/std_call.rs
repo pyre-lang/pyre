@@ -72,6 +72,122 @@ pub(in crate::front::mir) fn is_inlined_mem_exchange_path(name: &str) -> bool {
         && matches!(name.rsplit("::").next(), Some("replace" | "swap" | "take"))
 }
 
+/// Matched in full. `std::array::from_fn` is this `core::` item in LLBC.
+const ARRAY_FROM_FN_PATH: &str = "core::array::from_fn";
+
+/// `from_fn::<T, N, F>(f)` as `[f(0), …, f(N-1)]` when `N` is concrete and
+/// `F`'s `FnMut::call_mut` (or the closure body when `F` is `Fn` / `FnMut`)
+/// is a local unstructured body. `from_fn` requires `F: FnMut`; a
+/// `call_once` body is not reused. `from_fn` owns `f` and drops it on
+/// return; a plan exists only for a closure type that is trivially
+/// dropless (the predicate a `TermKind::Drop` of such a local uses to
+/// emit nothing), so that drop emits nothing.
+pub(in crate::front::mir) struct ArrayFromFnPlan {
+    n: u64,
+    call_fn_id: u64,
+    args_ty: TyRef,
+    idx_ty: TyRef,
+    elem_ty: TyRef,
+}
+
+/// `Some` when `core::array::from_fn` can be the array literal of `N`
+/// calls of `F`. Independent of lowering so `residual_escape` does not
+/// flag a call this desugar handles.
+pub(in crate::front::mir) fn array_from_fn_plan(
+    call: &CallPayload,
+    llbc: &Llbc,
+) -> Option<ArrayFromFnPlan> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    if regular_call_name_path(reg, llbc).as_deref() != Some(ARRAY_FROM_FN_PATH) {
+        return None;
+    }
+    if call.args.len() != 1 {
+        return None;
+    }
+    let td = closure_env_of_operand(&call.args[0], llbc)?;
+    if !super::enum_site::type_decl_is_trivially_dropless(td, llbc, 0) {
+        return None;
+    }
+    let call_fn_id = closure_call_fn_id(td, llbc)?;
+    let fd = llbc.fn_by_id(call_fn_id)?;
+    let dest_parts = dest_array_elem_and_len(&call.dest.ty, llbc);
+    let n = dest_parts
+        .as_ref()
+        .map(|(_, n)| *n)
+        .or_else(|| n_from_const_generics(&reg.generics, llbc))?;
+    let elem_ty = match dest_parts {
+        Some((elem, _)) => elem,
+        None => {
+            t_from_call_generics(&reg.generics).unwrap_or_else(|| clone_tyref(&fd.signature.output))
+        }
+    };
+    let args_ty = fd.signature.inputs.get(1).map(clone_tyref)?;
+    let idx_ty = tyref_tuple_element(&args_ty, 0, llbc)?;
+    Some(ArrayFromFnPlan {
+        n,
+        call_fn_id,
+        args_ty,
+        idx_ty,
+        elem_ty,
+    })
+}
+
+fn dest_array_elem_and_len(ty: &TyRef, llbc: &Llbc) -> Option<(TyRef, u64)> {
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let arr = node.get("Array")?.as_array()?;
+    let elem = serde_json::from_value(arr.first()?.clone()).ok()?;
+    let n = charon_array_len_to_string(arr.get(1)?, llbc).parse().ok()?;
+    Some((elem, n))
+}
+
+fn n_from_const_generics(generics: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
+    generics
+        .get("const_generics")?
+        .as_array()?
+        .iter()
+        .find_map(|value| charon_array_len_to_string(value, llbc).parse().ok())
+}
+
+fn t_from_call_generics(generics: &serde_json::Value) -> Option<TyRef> {
+    serde_json::from_value(generics.get("types")?.as_array()?.first()?.clone()).ok()
+}
+
+fn closure_env_of_operand<'a>(op: &Operand, llbc: &'a Llbc) -> Option<&'a TypeDecl> {
+    let ty = operand_tyref(op)?;
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))?;
+    let td = llbc.type_by_id(adt_node_def_id(node)?)?;
+    type_decl_is_closure_env(td).then_some(td)
+}
+
+fn closure_call_fn_id(td: &TypeDecl, llbc: &Llbc) -> Option<u64> {
+    let info = td.src.as_ref()?.get("Closure")?.get("info")?;
+    if let Some(fn_id) = fn_mut_impl_method_id(info, llbc)
+        && llbc
+            .fn_by_id(fn_id)
+            .is_some_and(FunDecl::has_unstructured_body)
+    {
+        return Some(fn_id);
+    }
+    let kind = info.get("kind").and_then(serde_json::Value::as_str)?;
+    if !matches!(kind, "Fn" | "FnMut") {
+        return None;
+    }
+    let body_id = info.pointer("/closure_body/id")?.as_u64()?;
+    llbc.fn_by_id(body_id)
+        .filter(|fd| fd.has_unstructured_body())
+        .map(|fd| fd.def_id)
+}
+
+fn fn_mut_impl_method_id(info: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
+    let impl_id = info
+        .get("fn_mut_impl")
+        .and_then(|impl_ref| impl_ref.pointer("/skip_binder/id"))
+        .and_then(serde_json::Value::as_u64)?;
+    crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, 0)
+}
+
 impl<'a> Lowering<'a> {
     /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
     /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
@@ -2728,15 +2844,24 @@ impl<'a> Lowering<'a> {
 
     /// A thin-pointer `Deref::deref` / `DerefMut::deref_mut` whose
     /// dereferenced `&T` is a registered struct, resolved to the pointee
-    /// struct root.  Valid only for a bodyless declaration whose handle's
-    /// single pointer word *is* the pointee address, so `*p` is a
+    /// struct root.  Valid only for a bodyless declaration whose handle is
+    /// one pointer word that *is* the pointee address, so `*p` is a
     /// zero-offset reinterpret: `Box<T>` (no header — `Unique<T>` points
-    /// straight at `T`) and single-field transparent wrappers
-    /// (`{UnsafeCell<T>}`).  For these the caller lowers the deref to the
-    /// `cast_pointer(T, p)` downcast marker (`cast_pointer_marker_op`),
-    /// which yields `SomeInstance(T)` (lltype.py) independent of the
-    /// receiver's (classdef-less) annotation — the same shape emitted for
-    /// `obj as *const W_Foo`.
+    /// straight at `T`) and `repr(transparent)` single-pointer wrappers
+    /// (`{UnsafeCell<T>}`).  The handle is recognised by the same
+    /// one-word predicates the rest of the front end uses
+    /// ([`opaque_pointer_handle`], [`transparent_handle_has_deref_class`],
+    /// [`one_word_pointer_pointee`]).  For these the caller lowers the
+    /// deref to the `cast_pointer(T, p)` downcast marker
+    /// (`cast_pointer_marker_op`), which yields `SomeInstance(T)`
+    /// (lltype.py) independent of the receiver's (classdef-less)
+    /// annotation — the same shape emitted for `obj as *const W_Foo`.
+    ///
+    /// A multi-field handle is not that word.  `PtrRepr.rtype_getattr`
+    /// (`rpython/rtyper/rptr.py`) uses `cast_pointer` only for
+    /// `TO._first_struct()` header inlining and `getsubstruct` /
+    /// `getfield` otherwise; this returns `None` so the call lowers on
+    /// the ordinary path and reaches the `Deref` body (field access).
     ///
     /// A declaration that carries an unstructured body in this LLBC is an
     /// ordinary method.  The body reads the pointee out of the handle, so
@@ -2752,10 +2877,11 @@ impl<'a> Lowering<'a> {
     /// resolve a registered struct root below.
     ///
     /// Returns `None` when the call is not a `deref` / `deref_mut` leaf,
-    /// the callee has a body, or the dereferenced type is not a named ADT
-    /// (slice / `str` derefs resolve no struct root — their `&[T]` /
-    /// `&str` value model is the receiver's, narrowed by the list / string
-    /// reprs, not a pointer downcast).
+    /// the callee has a body, the handle is not one pointer word, or the
+    /// dereferenced type is not a named ADT (slice / `str` derefs resolve
+    /// no struct root — their `&[T]` / `&str` value model is the
+    /// receiver's, narrowed by the list / string reprs, not a pointer
+    /// downcast).
     pub(in crate::front::mir) fn deref_cast_root(
         &self,
         reg: &RegularCall,
@@ -2778,7 +2904,75 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
+        let recv = fd.signature.inputs.first()?;
+        let recv_node = strip_ty_indirections(tyref_node(recv, self.llbc)?, self.llbc)?;
+        let self_node = if let Some(inner) = recv_node
+            .as_object()
+            .and_then(|obj| obj.get("Ref"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+        {
+            strip_ty_indirections(inner, self.llbc).unwrap_or(inner)
+        } else {
+            recv_node
+        };
+        let self_node = type_node_peel_aliases(self_node, self.llbc).unwrap_or(self_node);
+        if !self.deref_handle_is_one_pointer_word(self_node) {
+            return None;
+        }
         tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+    }
+
+    /// `Self` of a bodyless `Deref` after peeling `&self`: one pointer
+    /// word whose address is the pointee.  A published multi-field copy
+    /// (`apply_published_structs`) keeps its field list and layout size.
+    /// An Opaque foreign guard with no field list (`MutexGuard`) is one
+    /// word iff that layout size is the pointer width — the size half of
+    /// [`opaque_pointer_handle`], without requiring `repr(transparent)`.
+    fn deref_handle_is_one_pointer_word(&self, self_node: &serde_json::Value) -> bool {
+        if one_word_pointer_pointee(self_node, self.llbc).is_some() {
+            return true;
+        }
+        let Some(decl) = adt_node_def_id(self_node).and_then(|id| self.llbc.type_by_id(id)) else {
+            // Unresolved owner keeps the ordinary thin-pointer treatment.
+            return true;
+        };
+        if opaque_pointer_handle(decl, self.llbc)
+            || transparent_handle_has_deref_class(
+                decl,
+                decl.def_id,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        {
+            return true;
+        }
+        let one_word_layout = self.llbc.target_pointer_size().is_some_and(|width| {
+            decl.layout_for_target(self.llbc, "")
+                .and_then(|layout| layout.size)
+                == Some(u64::from(width))
+        });
+        match &decl.kind {
+            TypeDeclKind::Struct(fields) => {
+                let nonzst = fields
+                    .iter()
+                    .filter(|field| !field_is_zst(&field.ty, self.llbc))
+                    .count();
+                nonzst == 1 && one_word_layout
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {
+                match decl
+                    .layout_for_target(self.llbc, "")
+                    .and_then(|layout| layout.size)
+                {
+                    Some(_) => one_word_layout,
+                    None => true,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// `<String as Deref>::deref(&self) -> &str` / `<Vec<T> as
@@ -5186,6 +5380,127 @@ impl<'a> Lowering<'a> {
             args,
             dest: call.dest.clone(),
         })
+    }
+
+    /// `core::array::from_fn::<T, N, F>(f)` is `[f(0), …, f(N-1)]`. Each
+    /// element is the same Call of `F`'s `call_mut` (or the `Fn`/`FnMut`
+    /// closure body) a direct `f(i)` would emit, then the Array aggregate
+    /// a literal `[v0, …, vN-1]` builds. `from_fn` owns `f` and drops it
+    /// on return; a plan exists only for a closure type that is trivially
+    /// dropless (the predicate a [`TermKind::Drop`] of such a local uses
+    /// to emit nothing), so that drop emits nothing. `N` calls stay in
+    /// this block: a recursive `lower_call` would close it.
+    pub(in crate::front::mir) fn try_lower_array_from_fn(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(plan) = array_from_fn_plan(call, self.llbc) else {
+            return Ok(false);
+        };
+        let n = usize::try_from(plan.n).map_err(|_| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: array::from_fn length does not fit usize"
+            ))
+        })?;
+        let Some(arg) = call.args.first() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: array::from_fn without a closure argument"
+            )));
+        };
+        let f = self.resolve_operand(mir_bb, arg.clone())?;
+        let call_fd = self.llbc.fn_by_id(plan.call_fn_id).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: array::from_fn closure body disappeared"
+            ))
+        })?;
+        let call_target = self.assoc_fn_call_target(call_fd);
+        let elem_result_ty = tyref_to_value_type_with(
+            &plan.elem_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        let idx_unsigned = matches!(
+            tyref_to_value_type_with(
+                &plan.idx_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Unsigned | ValueType::UInt128
+        );
+        let bb_id = self.emit_bb(mir_bb);
+        let tuple_kind = serde_json::json!({ "Tuple": serde_json::Value::Null });
+        let array_kind = serde_json::json!({ "Array": serde_json::Value::Null });
+        let mut elems = Vec::with_capacity(n);
+        for i in 0..n {
+            let idx = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(idx.clone()),
+                kind: if idx_unsigned {
+                    OpKind::ConstUInt(i as u64)
+                } else {
+                    OpKind::ConstInt(i as i64)
+                },
+            });
+            let tuple_shape = self
+                .aggregate_shape(&tuple_kind, &plan.args_ty, 1)
+                .map_err(|msg| {
+                    LowerError::Unsupported(format!("bb{mir_bb}: array::from_fn args tuple: {msg}"))
+                })?;
+            let AggregateShape::Ctor(tuple_ctor) = tuple_shape else {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: array::from_fn args tuple is not an aggregate"
+                )));
+            };
+            let args_tuple = self.emit_tuple_ctor_with_typed_fields(
+                bb_id,
+                &tuple_ctor,
+                &[idx],
+                std::slice::from_ref(&plan.idx_ty),
+            );
+            let elem = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(elem.clone()),
+                kind: OpKind::Call {
+                    target: call_target.clone(),
+                    args: crate::model::call_args(vec![f.clone(), args_tuple]),
+                    result_ty: elem_result_ty.clone(),
+                },
+            });
+            elems.push(elem);
+        }
+        let array_shape = self
+            .aggregate_shape(&array_kind, &call.dest.ty, n)
+            .map_err(|msg| {
+                LowerError::Unsupported(format!("bb{mir_bb}: array::from_fn dest: {msg}"))
+            })?;
+        let array = match array_shape {
+            AggregateShape::Ctor(ctor) => {
+                let elem_tys = vec![clone_tyref(&plan.elem_ty); n];
+                self.emit_tuple_ctor_with_typed_fields(bb_id, &ctor, &elems, &elem_tys)
+            }
+            AggregateShape::Void => self.emit_unit(bb_id),
+            _ => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: array::from_fn dest is not an array aggregate"
+                )));
+            }
+        };
+        self.local_var[dest_local] = Some(LocalValue::One(array));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// True when [`Self::emit_default_of_ty`] can build `ty` without a

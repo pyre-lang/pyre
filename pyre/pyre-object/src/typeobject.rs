@@ -2512,57 +2512,38 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
 // `add_subclass` / `remove_subclass` / `get_subclasses` are indivisible under
 // PyPy's GIL: each one reallocates or reindexes the same out-of-line
 // `weak_subclasses` vector.  Pyre keeps the parent type as the sole semantic
-// owner and uses the same narrow address-striped reentrant synchronization
-// `w_list_lock` / `w_dict_lock` use around those transitions.  Reentrant
+// owner and uses the shared `objlock` stripe around those transitions.  Reentrant
 // because `get_subclasses` can be reached from inside a mutation on the same
 // thread through the `mutated()` recursion.
-struct ForkSubclassesLock(std::cell::UnsafeCell<parking_lot::ReentrantMutex<()>>);
-unsafe impl Sync for ForkSubclassesLock {}
+static SUBCLASSES_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
 
-impl ForkSubclassesLock {
-    fn new() -> Self {
-        Self(std::cell::UnsafeCell::new(
-            parking_lot::ReentrantMutex::new(()),
-        ))
-    }
-
-    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
-    }
-}
-
-static SUBCLASSES_LOCKS: std::sync::LazyLock<Vec<ForkSubclassesLock>> =
-    std::sync::LazyLock::new(|| (0..256).map(|_| ForkSubclassesLock::new()).collect());
-
-type SubclassesGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
+type SubclassesGuard = crate::objlock::ObjectLockGuard;
 
 /// Only the acquire is opaque to the tracer, the same split `w_list_lock` uses:
 /// the guard-holding bodies stay look-inside.
-#[majit_macros::dont_look_inside]
+/// The guard is the zero word while `gil_ready` is unpublished.
 unsafe fn w_type_subclasses_lock(w_parent: PyObjectRef) -> SubclassesGuard {
-    let lock = SUBCLASSES_LOCKS[(w_parent as usize >> 4) & (SUBCLASSES_LOCKS.len() - 1)].get();
-    if let Some(guard) = lock.try_lock() {
-        return guard;
-    }
-    let blocked = majit_gc::gc_sync::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        w_type_subclasses_lock_acquire(w_parent)
+    } else {
+        0
+    };
+    crate::objlock::ObjectLockGuard::from_word(lock)
+}
+
+/// # Safety
+/// `w_parent` must be a live type. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+unsafe fn w_type_subclasses_lock_acquire(w_parent: PyObjectRef) -> usize {
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class.
+    SUBCLASSES_LOCKS.acquire(crate::mapdict::instance_getclass(w_parent) as usize)
 }
 
 pub fn subclasses_locks_after_fork_child() {
-    for lock in SUBCLASSES_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    SUBCLASSES_LOCKS.after_fork_child();
 }
 
 /// `typeobject.py W_TypeObject.add_subclass`.
@@ -2662,7 +2643,15 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
     if !is_type(w_parent) {
         return;
     }
-    let _subclasses_guard = w_type_subclasses_lock(w_parent);
+    // Parent and subclass are pinned before the lock because a contended wait can move a heap type.
+    let _roots = crate::gc_roots::push_roots();
+    let parent_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_parent);
+    let subclass_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_subclass);
+    let _subclasses_guard = w_type_subclasses_lock(crate::gc_roots::shadow_stack_get(parent_slot));
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
+    let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);
     let parent = &mut *(w_parent as *mut W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return;
@@ -2697,7 +2686,12 @@ pub unsafe fn w_type_get_subclasses(
     if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
-    let _subclasses_guard = w_type_subclasses_lock(w_parent);
+    // Parent is pinned before the lock because a contended wait can move a heap type.
+    let _roots = crate::gc_roots::push_roots();
+    let parent_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_parent);
+    let _subclasses_guard = w_type_subclasses_lock(crate::gc_roots::shadow_stack_get(parent_slot));
+    let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
     let parent = &*(w_parent as *const W_TypeObject);
     if parent.weak_subclasses.is_null() {
         return Vec::new();
@@ -3213,6 +3207,8 @@ mod tests {
     /// guards and re-run to confirm the gate still bites before trusting it.
     #[test]
     fn subclass_registry_survives_concurrent_mutation() {
+        // Test threads do not hold the GIL; publish so acquire takes the stripe.
+        crate::gil_ready::publish_gil_ready_for_test();
         let w_parent = w_type_new("SharedParent", PY_NULL, std::ptr::null_mut());
         let parent_addr = w_parent as usize;
 

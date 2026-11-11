@@ -2709,6 +2709,15 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
+    if let Some(erased) = rbigint_gc_root::erase_tyref(ty, llbc) {
+        return tyref_to_value_type_with(
+            &erased,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+    }
     // The Value arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
@@ -4868,6 +4877,15 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
+    if let Some(erased) = rbigint_gc_root::erase_tyref(ty, llbc) {
+        return tyref_to_attr_value_type_with(
+            &erased,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+    }
     let Some(resolved) = tyref_node(ty, llbc) else {
         return ValueType::Ref(None);
     };
@@ -5481,7 +5499,9 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
     if tyref_option_payload_is_fn_ptr(option_ty, llbc) {
         return None;
     }
-    if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc) {
+    if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc)
+        || rbigint_gc_root::tyref_is_option_of_root(option_ty, llbc)
+    {
         return None;
     }
     if tyref_is_u8_window(option_ty, llbc) {
@@ -7662,6 +7682,12 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    if rbigint_gc_root::type_node_is_root(node, llbc) {
+        let id = type_node_peel_aliases(node, llbc).and_then(adt_node_def_id)?;
+        let value = rbigint_gc_root::erased_value_ty(id, llbc)?;
+        let value_node = tyref_node(&value, llbc)?;
+        return adt_node_class_root_with(value_node, llbc, tombstoned);
+    }
     let def_id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(def_id)?;
     // Pointer-shaped payloads stay on the wrapper (`PyError`).
@@ -8643,13 +8669,17 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
     let payload = crate::front::result_exc::tyref_option_payload(option_ty, llbc)?;
     if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc)
         || owner_root_guard::tyref_is_guard(&payload, llbc)
+        || rbigint_gc_root::tyref_is_option_of_root(option_ty, llbc)
+        || rbigint_gc_root::tyref_is_root(&payload, llbc)
     {
         return None;
     }
     let payload_node = tyref_node(&payload, llbc).and_then(|n| type_node_peel_aliases(n, llbc))?;
     let pointee = one_level_pointer_pointee(payload_node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-    if owner_root_guard::type_node_is_guard(pointee, llbc) {
+    if owner_root_guard::type_node_is_guard(pointee, llbc)
+        || rbigint_gc_root::type_node_is_root(pointee, llbc)
+    {
         return None;
     }
     let inputs = value_type_inputs(llbc);
@@ -8726,6 +8756,8 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     // (`ty_is_raw_address`) and never reaches this paint.
     if owner_root_guard::tyref_is_option_of_guard(ty, llbc)
         || owner_root_guard::tyref_is_guard(&payload, llbc)
+        || rbigint_gc_root::tyref_is_option_of_root(ty, llbc)
+        || rbigint_gc_root::tyref_is_root(&payload, llbc)
     {
         return None;
     }
@@ -8947,6 +8979,11 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     // `Option<*mut T>`.
     if owner_root_guard::type_node_is_guard(payload, llbc) {
         return true;
+    }
+    // `RBigIntGcRoot` is the by-value `RBigInt`, not a pointer word, so
+    // `Option<RBigIntGcRoot>` stays a tagged Option of that instance.
+    if rbigint_gc_root::type_node_is_root(payload, llbc) {
+        return false;
     }
     if type_node_is_mut_ref(payload, llbc) {
         return true;
@@ -13242,6 +13279,9 @@ fn charon_type_value_to_enum_arg(
         return key;
     }
     let leaf = name.rsplit("::").next().unwrap_or(&name);
+    if rbigint_gc_root::is_root_path(&name) {
+        return "RBigInt".to_string();
+    }
     if tombstoned.contains(leaf) && !intern_suffix_keeps_cast_leaf(llbc, leaf) {
         super::class_identity_spelling(&name, tombstoned)
     } else {

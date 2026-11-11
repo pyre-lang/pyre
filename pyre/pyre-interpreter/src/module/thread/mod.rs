@@ -74,7 +74,7 @@ static EXECUTION_CONTEXTS: LazyLock<ForkMutex<indexmap::IndexMap<i64, usize>>> =
     LazyLock::new(|| ForkMutex::new(indexmap::IndexMap::new()));
 static THREAD_ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// `listobject.rs ForkListLock`: a process-global `parking_lot` mutex whose
+/// `objlock.rs ForkLock`: a process-global `parking_lot` mutex whose
 /// native state is rebuilt after `fork` without taking the inherited lock.
 ///
 /// `RPyThreadAfterFork` (`thread_pthread.c`) walks `alllocks` and calls
@@ -105,7 +105,7 @@ impl<T> ForkMutex<T> {
 
     /// Write a fresh mutex around the live payload.  Must not lock: the
     /// inherited waiter table can hang on Linux.  Same write as
-    /// `cpyext::ForkMutex::reinit_after_fork` / `ForkListLock::reinit_after_fork`.
+    /// `cpyext::ForkMutex::reinit_after_fork` / `objlock::ForkLock::reinit_after_fork`.
     #[cfg(unix)]
     pub(crate) unsafe fn reinit_after_fork(&self) {
         let value = unsafe { (*self.inner.get()).data_ptr().read() };
@@ -780,11 +780,16 @@ pub(crate) fn after_fork_child() {
     pyre_object::listobject::list_locks_after_fork_child();
     pyre_object::setobject::set_locks_after_fork_child();
     pyre_object::interp_itertools::count_locks_after_fork_child();
+    pyre_object::nestedscope::cell_locks_after_fork_child();
+    pyre_object::interp_exceptions::exception_dict_locks_after_fork_child();
+    pyre_object::function::descr_dict_locks_after_fork_child();
+    crate::function::function_attr_locks_after_fork_child();
     pyre_object::typeobject::subclasses_locks_after_fork_child();
     pyre_object::unicodeobject::intern_locks_after_fork_child();
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
     crate::module::_collections::deque_locks_after_fork_child();
+    crate::module::_io::interp_bytesio::bytesio_locks_after_fork_child();
     #[cfg(all(
         feature = "cpyext",
         not(feature = "sandbox"),

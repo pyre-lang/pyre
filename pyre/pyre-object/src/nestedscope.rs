@@ -260,12 +260,67 @@ pub unsafe fn w_cell_family(obj: PyObjectRef) -> *const CellFamily {
     unsafe { (*(obj as *const Cell)).family }
 }
 
+// Cell.set / Cell.delete read `contents`, decide whether the write is a
+// bound-to-bound mutation, then write. PyPy runs that under its GIL; the stripe
+// covers a mutator that has dropped the GIL. Keyed on the cell's GC identity
+// hash, which survives a move.
+static CELL_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
+
+/// The guard is the zero word while `gil_ready` is unpublished.
+unsafe fn w_cell_lock(obj: PyObjectRef) -> crate::objlock::ObjectLockGuard {
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        unsafe { w_cell_lock_acquire(obj) }
+    } else {
+        0
+    };
+    unsafe { crate::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live cell. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+unsafe fn w_cell_lock_acquire(obj: PyObjectRef) -> usize {
+    CELL_LOCKS.acquire(obj as usize)
+}
+
+pub fn cell_locks_after_fork_child() {
+    CELL_LOCKS.after_fork_child();
+}
+
 /// Set the value stored in a cell (nestedscope.py `Cell.set`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
+    if crate::gil_ready::gil_ready_word() != 0 {
+        return unsafe { w_cell_set_locked(obj, value) };
+    }
+    unsafe { w_cell_set_unlocked(obj, value) }
+}
+
+/// A contended stripe wait may collect and move a nursery cell: pin the cell and `value` before the wait and reload both after it.
+unsafe fn w_cell_set_locked(obj: PyObjectRef, value: PyObjectRef) {
+    let _roots = crate::gc_roots::push_roots();
+    let cell_slot = crate::gc_roots::pin_roots(&[obj, value]);
+    let value_slot = cell_slot + 1;
+    let _guard = unsafe {
+        crate::objlock::ObjectLockGuard::from_word(w_cell_lock_acquire(
+            crate::gc_roots::shadow_stack_get(cell_slot),
+        ))
+    };
+    unsafe {
+        w_cell_set_unlocked(
+            crate::gc_roots::shadow_stack_get(cell_slot),
+            crate::gc_roots::shadow_stack_get(value_slot),
+        )
+    }
+}
+
+#[inline]
+unsafe fn w_cell_set_unlocked(obj: PyObjectRef, value: PyObjectRef) {
     // nestedscope.py `Cell.set`: only a bound-to-bound transition counts as a
     // mutation.  The first binding of a cellvar does not, which is what keeps
     // the ordinary write-once closure variable foldable.
@@ -277,10 +332,9 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
         }
     }
     unsafe { (*cell).contents = value }
-    // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
-    // possibly-nursery `value` into it needs the incminimark write barrier
-    // (incminimark.py write_barrier_from_array) so the next minor collection scans the cell and
-    // relocates the young value held only by `contents`.
+    // The cell may already be old; storing a possibly-nursery `value` into it needs the
+    // incminimark write barrier (incminimark.py write_barrier_from_array) so the next minor
+    // collection scans the cell and relocates the young value held only by `contents`.
     crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
@@ -292,6 +346,12 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_delete(obj: PyObjectRef) -> bool {
+    // The cell is pinned before the lock because a contended wait can move a nursery cell.
+    let _roots = crate::gc_roots::push_roots();
+    let cell_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let _guard = unsafe { w_cell_lock(crate::gc_roots::shadow_stack_get(cell_slot)) };
+    let obj = crate::gc_roots::shadow_stack_get(cell_slot);
     let cell = obj as *mut Cell;
     let family = unsafe { (*cell).family };
     if !family.is_null() {
@@ -398,6 +458,49 @@ mod tests {
         unsafe {
             assert_eq!(w_cell_get(cell), w_cell_elidable_get(cell));
             assert_eq!(w_cell_get(cell), 0xBEEF as PyObjectRef);
+        }
+    }
+
+    /// Two threads that both see an empty cell must still record the second
+    /// binding as a mutation. Pass raw pointers as `usize` so the family
+    /// (`Cell` is not `Sync`) can stay on this thread.
+    #[test]
+    fn cell_rebinding_race_records_the_mutation() {
+        // The stripe is skipped while `gil_ready` is 0; test threads do not hold the GIL.
+        crate::gil_ready::publish_gil_ready_for_test();
+        let value = 0xBEEF as PyObjectRef;
+        let value_addr = value as usize;
+        for i in 0..2000 {
+            let family = leak_family();
+            let cell = w_cell_new(PY_NULL, family);
+            let cell_addr = cell as usize;
+            let barrier = std::sync::Barrier::new(2);
+            let go = std::sync::atomic::AtomicBool::new(false);
+            let ready = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        ready.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        while !go.load(std::sync::atomic::Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        unsafe {
+                            w_cell_set(cell_addr as PyObjectRef, value_addr as PyObjectRef);
+                        }
+                    });
+                }
+                while ready.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+                    std::hint::spin_loop();
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+            });
+            unsafe {
+                assert!(
+                    (*family).ever_mutated.get(),
+                    "iteration {i} did not record the rebinding"
+                );
+            }
         }
     }
 

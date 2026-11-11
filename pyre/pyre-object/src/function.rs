@@ -371,6 +371,36 @@ pub unsafe fn w_staticmethod_current_w_function_qmut(
     )
 }
 
+// StaticMethod.getdict / ClassMethod.getdict run under PyPy's GIL
+// (`pypy/interpreter/function.py`). The stripe covers a mutator that has
+// dropped the GIL. Keyed on instance_getclass: both wrappers move.
+static DESCR_DICT_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
+
+/// The guard is the zero word while `gil_ready` is unpublished.
+unsafe fn w_descr_dict_lock(obj: PyObjectRef) -> crate::objlock::ObjectLockGuard {
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        unsafe { w_descr_dict_lock_acquire(obj) }
+    } else {
+        0
+    };
+    unsafe { crate::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live staticmethod or classmethod. The caller must release
+/// the returned handle exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+unsafe fn w_descr_dict_lock_acquire(obj: PyObjectRef) -> usize {
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class.
+    DESCR_DICT_LOCKS.acquire(unsafe { crate::mapdict::instance_getclass(obj) } as usize)
+}
+
+pub fn descr_dict_locks_after_fork_child() {
+    DESCR_DICT_LOCKS.after_fork_child();
+}
+
 /// function.py `StaticMethod.getdict` — allocate the instance
 /// dictionary on first access and retain its identity.
 #[inline]
@@ -386,7 +416,14 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
             let _roots = crate::gc_roots::push_roots();
             let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
+            let dict_slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(w_dict);
+            let _guard = w_descr_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            if !(*(obj as *mut StaticMethod)).w_dict.is_null() {
+                return (*(obj as *mut StaticMethod)).w_dict;
+            }
+            let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
             crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
             (*(obj as *mut StaticMethod)).w_dict = w_dict;
             return w_dict;
@@ -403,6 +440,15 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
+        // Contended stripe wait may collect: the receiver and dict are rooted across it and reloaded.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_dict);
+        let _guard = w_descr_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let w_dict = crate::gc_roots::shadow_stack_get(value_slot);
         (*(obj as *mut StaticMethod)).w_dict = w_dict;
         crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
@@ -598,7 +644,14 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
             let _roots = crate::gc_roots::push_roots();
             let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
+            let dict_slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(w_dict);
+            let _guard = w_descr_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            if !(*(obj as *mut ClassMethod)).w_dict.is_null() {
+                return (*(obj as *mut ClassMethod)).w_dict;
+            }
+            let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
             crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
             (*(obj as *mut ClassMethod)).w_dict = w_dict;
             return w_dict;
@@ -615,6 +668,14 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_dict);
+        let _guard = w_descr_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let w_dict = crate::gc_roots::shadow_stack_get(value_slot);
         (*(obj as *mut ClassMethod)).w_dict = w_dict;
         crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
@@ -682,5 +743,36 @@ mod tests {
             <ClassMethod as crate::lltype::GcType>::SIZE,
             W_CLASSMETHOD_OBJECT_SIZE
         );
+    }
+
+    /// Two first readers of `staticmethod.__dict__` must install one identity.
+    #[test]
+    fn staticmethod_dict_has_one_identity_under_contention() {
+        // The stripe is skipped while `gil_ready` is 0; test threads do not hold the GIL.
+        crate::gil_ready::publish_gil_ready_for_test();
+        for i in 0..500 {
+            let sm = w_staticmethod_new(PY_NULL);
+            let sm_addr = sm as usize;
+            let barrier = std::sync::Barrier::new(2);
+            let first = std::sync::atomic::AtomicUsize::new(0);
+            let second = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let dict = unsafe { w_staticmethod_getdict(sm_addr as PyObjectRef) };
+                    first.store(dict as usize, std::sync::atomic::Ordering::Relaxed);
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    let dict = unsafe { w_staticmethod_getdict(sm_addr as PyObjectRef) };
+                    second.store(dict as usize, std::sync::atomic::Ordering::Relaxed);
+                });
+            });
+            let a = first.load(std::sync::atomic::Ordering::Relaxed);
+            let b = second.load(std::sync::atomic::Ordering::Relaxed);
+            let field = unsafe { (*(sm as *const StaticMethod)).w_dict as usize };
+            assert_eq!(a, b, "iteration {i} returned two dict identities");
+            assert_eq!(a, field, "iteration {i} dict is not the field");
+        }
     }
 }

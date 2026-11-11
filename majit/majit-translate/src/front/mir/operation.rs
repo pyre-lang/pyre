@@ -5967,6 +5967,8 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn place_borrow_takes_address(&self, place: &Place) -> bool {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
+            || rbigint_gc_root::tyref_is_root(&place.ty, self.llbc)
+            || rbigint_gc_root::tyref_is_option_of_root(&place.ty, self.llbc)
         {
             return false;
         }

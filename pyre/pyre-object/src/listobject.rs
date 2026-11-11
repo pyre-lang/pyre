@@ -29,8 +29,6 @@ use crate::{
     unicode_array::UnicodeArray,
     unicodeobject::{w_str_from_storage, w_str_is_ascii, w_str_storage},
 };
-use std::cell::UnsafeCell;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// `rstr.py` `AbstractStringRepr.ll_strcmp` — `StringSort.lt` is `a < b`.
@@ -42,47 +40,9 @@ pub fn string_sort_chars_cmp(left: &[u8], right: &[u8]) -> isize {
 // PyPy's list strategy/storage transitions are indivisible under its GIL.
 // Pyre keeps the list itself as the sole semantic owner and uses only narrow
 // address-striped reentrant synchronization around those transitions.
-struct ForkListLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
-unsafe impl Sync for ForkListLock {}
+static LIST_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
 
-impl ForkListLock {
-    fn new() -> Self {
-        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
-    }
-
-    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
-    }
-}
-
-static LIST_LOCKS: LazyLock<Vec<ForkListLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkListLock::new()).collect());
-
-/// `rthread.py` `Lock`: the native synchronization object stays behind an
-/// opaque word, with distinct acquire/release boundaries. The Rust owner
-/// preserves `Lock.__exit__` on early return and unwind as well as success.
-/// It must not move to another thread: release consumes an acquisition made
-/// by the current thread, including one level of a recursive acquisition.
-///
-/// `repr(transparent)`: the guard is its lock word, so the translator types a
-/// `ListGuard` value as that integer and its drop releases that word.
-#[repr(transparent)]
-pub struct ListGuard {
-    lock: usize,
-    not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl Drop for ListGuard {
-    fn drop(&mut self) {
-        // SAFETY: only w_list_lock constructs this non-Send owner, from one
-        // successful acquisition of a process-lifetime LIST_LOCKS entry.
-        unsafe { w_list_lock_release(self.lock) };
-    }
-}
+pub type ListGuard = crate::objlock::ObjectLockGuard;
 
 /// PyPy runs every list operation under the GIL and has no per-list lock
 /// (`pypy/objspace/std/listobject.py`). `gil.py` `GILThreadLocals.gil_ready`
@@ -99,10 +59,7 @@ pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     } else {
         0
     };
-    ListGuard {
-        lock,
-        not_send: std::marker::PhantomData,
-    }
+    crate::objlock::ObjectLockGuard::from_word(lock)
 }
 
 /// [`w_list_lock`] for the residual-call ABI: the guard's lock word.
@@ -114,7 +71,7 @@ pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
 /// `obj` must be a live list, as for [`w_list_lock_acquire`].
 pub extern "C" fn w_list_lock_jit_abi(obj: i64) -> i64 {
     let obj = obj as usize as PyObjectRef;
-    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock as i64
+    unsafe { w_list_lock(obj) }.into_word() as i64
 }
 
 // The traced call names `w_list_lock`. Its return is `ListGuard`, which the
@@ -149,40 +106,11 @@ fn register_w_list_lock_jit_abi() {
 /// exactly once on the acquiring thread, including on exception exits.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_list_lock_acquire(obj: PyObjectRef) -> usize {
-    // listobject.py has no lock: PyPy serialises list ops with the GIL
-    // (`rgil.rs`: held for the whole stretch of pyre code, dropped only in
-    // `before_external_block`).  The stripe covers the complementary window —
-    // a mutator that has already dropped the GIL.  Taking it while still
-    // holding the GIL lets a later `Lock.acquire_timed` drop the GIL with the
-    // class-wide stripe held (one stripe for every `list`, because a nursery
-    // list can move).  `threading.Condition.wait` then deadlocks:
-    // it already holds the condition lock, and `deque.append` of
-    // `Condition._waiters` needs the same stripe
-    // (`test_pickle.PyUnpicklerTests.test_unpickle_module_race`).
-    if majit_gc::rgil::am_i_holding_the_gil() {
-        return 0;
-    }
-    // A nursery list can move while its guard is held.  Stripe on its stable
-    // class identity, not the movable instance address, so every operation on
-    // one list continues to acquire the same lock after collection.
+    // Key the stripe on the class's identity hash, which survives a move of
+    // the instance or of a heap class, so every operation on one list
+    // continues to acquire the same lock after collection.
     let w_class = crate::mapdict::instance_getclass(obj);
-    let lock = LIST_LOCKS[(w_class as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
-    acquire_list_lock_handle(lock)
-}
-
-fn acquire_list_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> usize {
-    let guard = if let Some(guard) = lock.try_lock() {
-        guard
-    } else {
-        let blocked = majit_gc::gc_sync::before_external_block();
-        let guard = lock.lock();
-        drop(blocked);
-        guard
-    };
-    // lock_api::ReentrantMutex::force_unlock explicitly supports a forgotten
-    // guard. Transfer exactly that obligation into the returned handle.
-    std::mem::forget(guard);
-    lock as *const parking_lot::ReentrantMutex<()> as usize
+    LIST_LOCKS.acquire(w_class as usize)
 }
 
 /// `rthread.py` `Lock.release`: discharge one acquisition, not every recursive
@@ -195,25 +123,11 @@ fn acquire_list_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> u
 /// The zero word is the guard [`w_list_lock`] holds while `gil_ready` is
 /// unpublished; it releases nothing.
 pub unsafe fn w_list_lock_release(lock: usize) {
-    if lock != 0 {
-        unsafe { w_list_lock_release_held(lock) };
-    }
-}
-
-/// [`w_list_lock_release`] of an acquired handle.
-///
-/// # Safety
-/// `lock` must be an unreleased, nonzero handle from w_list_lock_acquire on
-/// this thread.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub unsafe fn w_list_lock_release_held(lock: usize) {
-    unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
+    unsafe { crate::objlock::object_lock_release(lock) };
 }
 
 pub fn list_locks_after_fork_child() {
-    for lock in LIST_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    LIST_LOCKS.after_fork_child();
 }
 
 #[repr(u8)]
@@ -2998,16 +2912,31 @@ unsafe fn snapshot_range_storage(obj: PyObjectRef) -> Vec<i64> {
     range_list_values(&*(obj as *const W_ListObject))
 }
 
+/// Lock two lists in stripe order; a shared stripe is acquired once.
+/// Keys are computed before the first wait because a wait can move either list or its class.
 unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
-    let class_a = crate::mapdict::instance_getclass(a) as usize;
-    let class_b = crate::mapdict::instance_getclass(b) as usize;
-    if class_a <= class_b {
-        (w_list_lock(a), w_list_lock(b))
-    } else {
-        let guard_b = w_list_lock(b);
-        let guard_a = w_list_lock(a);
-        (guard_a, guard_b)
+    if !crate::objlock::stripes_taken() {
+        return (w_list_lock(a), w_list_lock(b));
     }
+    let a_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(a) as usize);
+    let b_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(b) as usize);
+    let a_index = crate::objlock::stripe_index(a_key);
+    let b_index = crate::objlock::stripe_index(b_key);
+    if a_index == b_index {
+        return (
+            crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(a_key)),
+            crate::objlock::ObjectLockGuard::from_word(0),
+        );
+    }
+    let (first_key, second_key) = if a_index < b_index {
+        (a_key, b_key)
+    } else {
+        (b_key, a_key)
+    };
+    (
+        crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(first_key)),
+        crate::objlock::ObjectLockGuard::from_word(LIST_LOCKS.acquire_unconditionally(second_key)),
+    )
 }
 
 unsafe fn concat_same_unwrapped(
@@ -7925,27 +7854,27 @@ mod tests {
 
     #[test]
     fn list_lock_handle_releases_one_recursive_level() {
-        static LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
-        let outer = super::ListGuard {
-            lock: super::acquire_list_lock_handle(&LOCK),
-            not_send: std::marker::PhantomData,
+        static FAMILY: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
+        let key = 0usize;
+        let outer = unsafe {
+            crate::objlock::ObjectLockGuard::from_word(FAMILY.acquire_unconditionally(key))
         };
-        let inner = super::ListGuard {
-            lock: super::acquire_list_lock_handle(&LOCK),
-            not_send: std::marker::PhantomData,
+        let inner = unsafe {
+            crate::objlock::ObjectLockGuard::from_word(FAMILY.acquire_unconditionally(key))
         };
-        assert_eq!(outer.lock, inner.lock);
+        assert_eq!(outer.word(), inner.word());
         drop(inner);
-        assert!(LOCK.is_owned_by_current_thread());
+        let lock = FAMILY.stripe(key);
+        assert!(lock.is_owned_by_current_thread());
         assert!(
-            !std::thread::spawn(|| LOCK.try_lock().is_some())
+            !std::thread::spawn(|| lock.try_lock().is_some())
                 .join()
                 .unwrap()
         );
         drop(outer);
-        assert!(!LOCK.is_owned_by_current_thread());
+        assert!(!lock.is_owned_by_current_thread());
         assert!(
-            std::thread::spawn(|| LOCK.try_lock().is_some())
+            std::thread::spawn(|| lock.try_lock().is_some())
                 .join()
                 .unwrap()
         );
@@ -7953,18 +7882,19 @@ mod tests {
 
     #[test]
     fn list_lock_handle_releases_on_unwind() {
-        static LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+        static FAMILY: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
+        let key = 0usize;
+        let lock = FAMILY.stripe(key);
         let result = std::panic::catch_unwind(|| {
-            let _guard = super::ListGuard {
-                lock: super::acquire_list_lock_handle(&LOCK),
-                not_send: std::marker::PhantomData,
+            let _guard = unsafe {
+                crate::objlock::ObjectLockGuard::from_word(FAMILY.acquire_unconditionally(key))
             };
             panic!("exercise the exceptional release edge");
         });
         assert!(result.is_err());
-        assert!(!LOCK.is_owned_by_current_thread());
+        assert!(!lock.is_owned_by_current_thread());
         assert!(
-            std::thread::spawn(|| LOCK.try_lock().is_some())
+            std::thread::spawn(|| lock.try_lock().is_some())
                 .join()
                 .unwrap()
         );

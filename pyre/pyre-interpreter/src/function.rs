@@ -2121,6 +2121,35 @@ pub unsafe fn function_set_kwdefaults_from_definition(obj: PyObjectRef, kwdefaul
     }
 }
 
+// Function.getdict / fget_func_annotations / fget_func_doc run under PyPy's GIL
+// (`pypy/interpreter/function.py`). The stripe covers a mutator that has
+// dropped the GIL. Keyed on the Function address: allocation is stable.
+static FUNCTION_ATTR_LOCKS: pyre_object::objlock::LockFamily =
+    pyre_object::objlock::LockFamily::new();
+
+/// The guard is the zero word while `gil_ready` is unpublished.
+unsafe fn function_attr_lock(obj: PyObjectRef) -> pyre_object::objlock::ObjectLockGuard {
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        unsafe { function_attr_lock_acquire(obj) }
+    } else {
+        0
+    };
+    unsafe { pyre_object::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live Function. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+unsafe fn function_attr_lock_acquire(obj: PyObjectRef) -> usize {
+    FUNCTION_ATTR_LOCKS.acquire(obj as usize)
+}
+
+pub fn function_attr_locks_after_fork_child() {
+    FUNCTION_ATTR_LOCKS.after_fork_child();
+}
+
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
 /// # Safety
@@ -2141,6 +2170,11 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
             let w_dict = crate::objspace::std::mapdict::make_instance_dict();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_dict);
+            let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let func = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut Function;
+            if !(*func).w_func_dict.is_null() {
+                return (*func).w_func_dict;
+            }
             function_write_barrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let func = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut Function;
             (*func).w_func_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
@@ -2161,6 +2195,12 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     crate::baseobjspace::require_dict_for_setdict(value)?;
     unsafe {
+        // Contended stripe wait may collect: the stored value is rooted across it and reloaded.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let _guard = function_attr_lock(obj);
+        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_func_dict = value;
     }
@@ -2212,6 +2252,11 @@ pub unsafe fn function_set_annotate(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let _guard = function_attr_lock(obj);
+        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_annotate = value;
@@ -2306,6 +2351,15 @@ pub fn function_get_doc(mut obj: PyObjectRef) -> PyObjectRef {
     }
     // Lazy fallback: `code.getdocstring(space)` (function.py).
     let resolved = pyre_object::with_roots!(obj => code_getdocstring(obj));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, resolved]);
+    let _guard = unsafe { function_attr_lock(pyre_object::gc_roots::shadow_stack_get(base)) };
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let cached = unsafe { (*(obj as *mut Function)).w_doc };
+    if !cached.is_null() {
+        return cached;
+    }
+    let resolved = pyre_object::gc_roots::shadow_stack_get(base + 1);
     unsafe {
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = resolved;
@@ -2359,6 +2413,11 @@ pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(
         if obj.is_null() {
             return Ok(());
         }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let _guard = function_attr_lock(obj);
+        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = value;
         Ok(())
@@ -2385,6 +2444,7 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
         if obj.is_null() {
             return Ok(());
         }
+        let _guard = function_attr_lock(obj);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = pyre_object::w_none();
         Ok(())
@@ -2440,15 +2500,32 @@ pub unsafe fn function_get_annotations(obj: PyObjectRef) -> Result<PyObjectRef, 
                     unsafe { crate::display::type_fully_qualified_name_of(dict) },
                 )));
             }
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(dict);
+            let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            let func = obj as *mut Function;
+            // The callback's validated result is stored and returned unconditionally, even if the callback itself rebound `__annotations__`.
             function_write_barrier(obj);
-            (*(obj as *mut Function)).w_ann = dict;
+            (*func).w_ann = dict;
             return Ok(dict);
         }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let fresh = pyre_object::w_dict_new();
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(fresh);
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let func = obj as *mut Function;
+        if !(*func).w_ann.is_null() {
+            return Ok((*func).w_ann);
+        }
         function_write_barrier(obj);
-        (*func).w_ann = fresh;
-        Ok(fresh)
+        (*func).w_ann = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+        Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
     }
 }
 
@@ -2470,6 +2547,11 @@ pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
         if obj.is_null() {
             return;
         }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_ann);
+        let _guard = function_attr_lock(obj);
+        let w_ann = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_ann = w_ann;
@@ -2509,6 +2591,11 @@ pub unsafe fn fset_func_annotations(
         } else {
             return Err(crate::PyError::type_error("__annotations__ must be a dict"));
         };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let stored_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stored);
+        let _guard = function_attr_lock(obj);
+        let stored = pyre_object::gc_roots::shadow_stack_get(stored_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_ann = stored;
@@ -2535,6 +2622,7 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
         if obj.is_null() {
             return Ok(());
         }
+        let _guard = function_attr_lock(obj);
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_ann = PY_NULL;
