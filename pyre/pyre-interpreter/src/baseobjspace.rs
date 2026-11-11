@@ -18062,7 +18062,10 @@ pub fn unpack_into_w_portal(
                 break;
             }
             w_generator_set_started(gen_obj);
-            match generator_invoke_execute_frame(gen_obj, &mut *frame_ptr, pyre_object::w_none()) {
+            // Same residual `_send_ex` uses: the generator's frame runs
+            // through its own portal activation.
+            match generator_invoke_execute_frame_residual(gen_obj, frame_ptr, pyre_object::w_none())
+            {
                 Err(e) => {
                     let (stop, e) = e.matches_stop_iteration_keep();
                     if stop {

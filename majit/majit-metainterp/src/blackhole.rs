@@ -13496,13 +13496,12 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity on the bits.
-/// Upstream carries `ll_assert((i & 1) == 1)`: the op only ever sees a
-/// tagged immediate there. `jtransform.rs` `coerce_operand_to_int`
-/// also emits this op for an untagged GCREF at an integer site, and
-/// `generator_invoke_execute_frame` reaches one under blackhole resume,
-/// so the assert is not carried until that recovery helper is retired.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
+/// (the tagging arithmetic lives at the erase site, never here); the
+/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
+/// `ll_assert` remains a translated runtime assertion.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
+    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 

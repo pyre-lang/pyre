@@ -11537,6 +11537,21 @@ fn drive_unpack_into_trace(
                 meta.aborted_tracing(stb.reason);
             }
         }
+        // `warmspot.py` `handle_jitexception`: a walk that ran the portal
+        // to its return leaves through `DoneWithThisFrameVoid` /
+        // `ExitFrameWithExceptionRef`, the same as a compiled finish.
+        match pyre_interpreter::stack_check::drain_jit_pending_exception() {
+            Err(err) => pyre_interpreter::call::park_unpack_into_err(err),
+            Ok(()) => {
+                pyre_interpreter::call::park_unpack_into_done();
+                pyre_interpreter::eval::set_current_exception(pyre_object::PY_NULL);
+            }
+        }
+        meta.clear_exception();
+        crate::call_jit::clear_residual_call_exception();
+        majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.set(0));
+        pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        pyre_interpreter::call::clear_call_error();
     } else {
         meta.abort_trace(false);
     }
