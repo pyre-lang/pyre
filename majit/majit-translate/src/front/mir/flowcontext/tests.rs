@@ -2720,9 +2720,8 @@ fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
             "kind": {"Fun": 1},
             "generics": window_empty_generics()
         }},
-        "args": [{"Move": window_place(serde_json::json!({"Local": 1}), &cell_ref)}],
-        "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty)
-    }, "target": 2, "on_unwind": 1}});
+        "args": [{"Move": window_place(serde_json::json!({"Local": 1}), &cell_ref)}]
+    }, "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty), "target": 2, "on_unwind": 1}});
     let f = serde_json::json!({
         "def_id": 0,
         "item_meta": window_meta(&["fixture", "f"], true),
