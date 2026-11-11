@@ -8066,21 +8066,25 @@ mod tests {
 
     #[test]
     fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         // `rmmap::ccall_c_dup` and `rposix::ccall_c_dup` share the leaf
         // (`rffi_expand` `ccall_c_dup`); `{crate}::{leaf}` is omitted.
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key("majit_rlib::rmmap::ccall_c_dup"),
-            "rmmap::ccall_c_dup must be registered"
-        );
-        assert!(
-            bindings.contains_key("majit_rlib::rposix::ccall_c_dup"),
-            "rposix::ccall_c_dup must be registered"
-        );
-        assert!(
-            !bindings.contains_key("majit_rlib::ccall_c_dup"),
-            "short alias shared by two full paths must not be emitted"
-        );
+        // `rmmap` is built on unix only, so the leaf is shared there only.
+        #[cfg(unix)]
+        {
+            assert!(
+                bindings.contains_key("majit_rlib::rmmap::ccall_c_dup"),
+                "rmmap::ccall_c_dup must be registered"
+            );
+            assert!(
+                bindings.contains_key("majit_rlib::rposix::ccall_c_dup"),
+                "rposix::ccall_c_dup must be registered"
+            );
+            assert!(
+                !bindings.contains_key("majit_rlib::ccall_c_dup"),
+                "short alias shared by two full paths must not be emitted"
+            );
+        }
         assert!(
             bindings.contains_key("pyre_interpreter::pyframe::register_frame_locals_slot"),
             "pyframe::register_frame_locals_slot must be registered"
