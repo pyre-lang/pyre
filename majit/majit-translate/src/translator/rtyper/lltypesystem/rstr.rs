@@ -17969,8 +17969,8 @@ mod tests {
         );
         let join_dbg = stringformat_direct_call_dbg(&ops.ops[3]);
         assert!(
-            join_dbg.contains("ll_join_strs"),
-            "expected 'll_join_strs' in {join_dbg}"
+            join_dbg.contains("ll_join_strs_look_inside_iff"),
+            "expected 'll_join_strs_look_inside_iff' in {join_dbg}"
         );
     }
 
@@ -18071,8 +18071,8 @@ mod tests {
         );
         let join_dbg = stringformat_direct_call_dbg(&ops.ops[3]);
         assert!(
-            join_dbg.contains("ll_join_strs"),
-            "expected 'll_join_strs' in {join_dbg}"
+            join_dbg.contains("ll_join_strs_look_inside_iff"),
+            "expected 'll_join_strs_look_inside_iff' in {join_dbg}"
         );
     }
 
@@ -18233,8 +18233,8 @@ mod tests {
         );
         let join_dbg = stringformat_direct_call_dbg(ops.ops.last().expect("join call"));
         assert!(
-            join_dbg.contains("ll_join_strs"),
-            "expected 'll_join_strs' in {join_dbg}"
+            join_dbg.contains("ll_join_strs_look_inside_iff"),
+            "expected 'll_join_strs_look_inside_iff' in {join_dbg}"
         );
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
@@ -18247,8 +18247,10 @@ mod tests {
     /// `unroll_safe` (`look_inside_iff`).
     #[test]
     fn build_ll_join_strs_synthesizes_malloc_varsize_and_copy_helper() {
-        let helper = build_ll_join_strs_helper_graph_for("ll_join_strs__orig", temp_ptr_lltype())
+        let helper = build_ll_join_strs_helper_graph_for("ll_join_strs", temp_ptr_lltype())
             .expect("build_ll_join_strs_helper_graph_for");
+        assert_eq!(helper.func.name, "ll_join_strs");
+        assert_eq!(helper.graph.borrow().name, "ll_join_strs");
         assert!(
             helper.func._jit_unroll_safe_,
             "look_inside_iff marks the original unroll_safe"
@@ -18294,7 +18296,7 @@ mod tests {
         let orig_fn = dummy_fn(1);
         let trampoline_fn = dummy_fn(2);
         let helper = build_ll_join_strs_look_inside_iff_helper_graph_for(
-            "ll_join_strs",
+            "ll_join_strs_look_inside_iff",
             orig_fn,
             trampoline_fn,
             dummy_fn(3),
@@ -18302,11 +18304,13 @@ mod tests {
             temp_ptr_lltype(),
         )
         .expect("build_ll_join_strs_look_inside_iff_helper_graph_for");
+        assert_eq!(helper.func.name, "ll_join_strs_look_inside_iff");
         assert_eq!(
             helper.func.annspecialcase, None,
             "look_inside_iff wrapper f does not get call_location"
         );
         let inner = helper.graph.borrow();
+        assert_eq!(inner.name, "ll_join_strs_look_inside_iff");
         let startblock = inner.startblock.borrow();
         assert!(startblock.operations.is_empty());
         assert_eq!(startblock.inputargs.len(), 2);
@@ -18404,7 +18408,7 @@ mod tests {
                 }
             }
         }
-        assert!(saw_orig, "wrapper must call ll_join_strs__orig");
+        assert!(saw_orig, "wrapper must call ll_join_strs");
         assert!(saw_trampoline, "wrapper must call ll_join_strs_trampoline");
     }
 

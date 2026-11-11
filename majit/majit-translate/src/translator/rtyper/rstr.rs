@@ -1204,12 +1204,15 @@ fn ll_join_helper(
 
 /// Mint `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) through
 /// `look_inside_iff` (`rlib/jit.py`) with `loop_unrolling_heuristic`
-/// (`cutoff=2`): original loop, `dont_look_inside` trampoline,
-/// `isconstant` / `isvirtual` predicates, and the wrapper named
-/// `ll_join_strs`. Returns the wrapper. The items pointer is `TEMP`
-/// (`do_stringformat`); a list of str passes its own items pointer to
-/// [`ll_join_strs_helper_for`] because `@jit.look_inside_iff` is on the
-/// function and each specialization keeps it.
+/// (`cutoff=2`). `look_inside_iff` keeps the body's `__name__`
+/// (`ll_join_strs`, `unroll_safe` + `specialize:call_location`), names
+/// the `dont_look_inside` trampoline `ll_join_strs_trampoline`, and
+/// names the wrapper `ll_join_strs_look_inside_iff`. Returns the wrapper:
+/// `rtype_method_join` `gendirectcall`s the decorated object. The items
+/// pointer is `TEMP` (`do_stringformat`); a list of str passes its own
+/// items pointer to [`ll_join_strs_helper_for`] because
+/// `@jit.look_inside_iff` is on the function and each specialization
+/// keeps it.
 pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
     ll_join_strs_helper_for(rtyper, temp_ptr_lltype())
 }
@@ -1218,26 +1221,30 @@ fn ll_join_strs_helper_for(
     rtyper: &RPythonTyper,
     items_ptr: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
+    // `look_inside_iff` (`rlib/jit.py`): body keeps `func.__name__`,
+    // trampoline is `func.__name__ + "_trampoline"`, wrapper `f` is
+    // `func.__name__ + "_look_inside_iff"`.
+    let body_name = "ll_join_strs";
+    let trampoline_name = "ll_join_strs_trampoline";
+    let wrapper_name = "ll_join_strs_look_inside_iff";
     let orig_args = vec![LowLevelType::Signed, items_ptr.clone()];
     let items_for_orig = items_ptr.clone();
     let orig = rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_strs__orig".to_string(),
+        body_name.to_string(),
         orig_args.clone(),
         STRPTR.clone(),
-        move |_r, _a, _res| {
-            build_ll_join_strs_helper_graph_for("ll_join_strs__orig", items_for_orig)
-        },
+        move |_r, _a, _res| build_ll_join_strs_helper_graph_for(body_name, items_for_orig),
     )?;
     let trampoline = {
         let orig_fn = functionptr_const(rtyper, &orig)?;
         let items_for_trampoline = items_ptr.clone();
         rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_strs_trampoline".to_string(),
+            trampoline_name.to_string(),
             orig_args.clone(),
             STRPTR.clone(),
             move |_r, _a, _res| {
                 build_ll_join_strs_trampoline_helper_graph_for(
-                    "ll_join_strs_trampoline",
+                    trampoline_name,
                     orig_fn,
                     items_for_trampoline,
                 )
@@ -1275,12 +1282,12 @@ fn ll_join_strs_helper_for(
     let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
     let items_for_wrapper = items_ptr;
     rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_strs".to_string(),
+        wrapper_name.to_string(),
         orig_args,
         STRPTR.clone(),
         move |_r, _a, _res| {
             build_ll_join_strs_look_inside_iff_helper_graph_for(
-                "ll_join_strs",
+                wrapper_name,
                 orig_fn,
                 trampoline_fn,
                 isconstant_fn,
@@ -1293,30 +1300,34 @@ fn ll_join_strs_helper_for(
 
 /// Mint `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`) through
 /// `look_inside_iff` (`rlib/jit.py`) with
-/// `isconstant(length) and isvirtual(chars)`: original loop,
-/// `dont_look_inside` trampoline, shared `isconstant` /
-/// `ll_join_chars_isvirtual` predicates, and the wrapper named
-/// `ll_join_chars`. Returns the wrapper. `result_ptr` is the
-/// specialised Void `RES` (`StringRepr.lowleveltype` or
-/// `UnicodeRepr.lowleveltype`).
+/// `isconstant(length) and isvirtual(chars)`. `look_inside_iff` keeps
+/// the body's `__name__` (`ll_join_chars`, `unroll_safe` +
+/// `specialize:call_location`), names the `dont_look_inside` trampoline
+/// `ll_join_chars_trampoline`, and names the wrapper
+/// `ll_join_chars_look_inside_iff`. Returns the wrapper;
+/// `rtype_method_join` `gendirectcall`s that decorated object.
+/// `result_ptr` is the specialised Void `RES`
+/// (`StringRepr.lowleveltype` or `UnicodeRepr.lowleveltype`).
 fn ll_join_chars_helper(
     rtyper: &RPythonTyper,
     items_ptr: LowLevelType,
     result_ptr: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
+    // `look_inside_iff` (`rlib/jit.py`): body keeps `func.__name__`,
+    // trampoline is `func.__name__ + "_trampoline"`, wrapper `f` is
+    // `func.__name__ + "_look_inside_iff"`.
+    let body_name = "ll_join_chars";
+    let trampoline_name = "ll_join_chars_trampoline";
+    let wrapper_name = "ll_join_chars_look_inside_iff";
     let orig_args = vec![LowLevelType::Signed, items_ptr.clone()];
     let items_for_orig = items_ptr.clone();
     let result_for_orig = result_ptr.clone();
     let orig = rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_chars__orig".to_string(),
+        body_name.to_string(),
         orig_args.clone(),
         result_ptr.clone(),
         move |_r, _a, _res| {
-            build_ll_join_chars_helper_graph_for(
-                "ll_join_chars__orig",
-                items_for_orig,
-                result_for_orig,
-            )
+            build_ll_join_chars_helper_graph_for(body_name, items_for_orig, result_for_orig)
         },
     )?;
     let trampoline = {
@@ -1324,12 +1335,12 @@ fn ll_join_chars_helper(
         let items_for_trampoline = items_ptr.clone();
         let result_for_trampoline = result_ptr.clone();
         rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_chars_trampoline".to_string(),
+            trampoline_name.to_string(),
             orig_args.clone(),
             result_ptr.clone(),
             move |_r, _a, _res| {
                 build_ll_join_chars_trampoline_helper_graph_for(
-                    "ll_join_chars_trampoline",
+                    trampoline_name,
                     orig_fn,
                     items_for_trampoline,
                     result_for_trampoline,
@@ -1369,12 +1380,12 @@ fn ll_join_chars_helper(
     let items_for_wrapper = items_ptr;
     let result_for_wrapper = result_ptr.clone();
     rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_chars".to_string(),
+        wrapper_name.to_string(),
         orig_args,
         result_ptr,
         move |_r, _a, _res| {
             build_ll_join_chars_look_inside_iff_helper_graph_for(
-                "ll_join_chars",
+                wrapper_name,
                 orig_fn,
                 trampoline_fn,
                 isconstant_fn,
@@ -5283,8 +5294,8 @@ mod tests {
             );
             if empty_sep {
                 assert!(
-                    names[2].contains("ll_join_strs"),
-                    "expected ll_join_strs in {}",
+                    names[2].contains("ll_join_strs_look_inside_iff"),
+                    "expected ll_join_strs_look_inside_iff in {}",
                     names[2]
                 );
                 assert_eq!(ops.ops[2].args.len(), 3);
@@ -5434,9 +5445,10 @@ mod tests {
     }
 
     /// `''.join(list_of_char)` (`AbstractStringRepr.rtype_method_join`)
-    /// direct-calls the minted `ll_join_chars` wrapper with
-    /// `(length, items)` and result `Ptr(STR)`. The original graph is
-    /// `LLHelpers.ll_join_chars`: `mallocstr`, then
+    /// direct-calls the `look_inside_iff` wrapper
+    /// `ll_join_chars_look_inside_iff` with `(length, items)` and result
+    /// `Ptr(STR)`. The body keeps `__name__` `ll_join_chars`
+    /// (`LLHelpers.ll_join_chars`): `mallocstr`, then
     /// `result.chars[i] = cast_primitive(Char, chars[i])`.
     fn assert_ll_join_chars_call(
         op: &SpaceOperation,
@@ -5467,7 +5479,7 @@ mod tests {
             Some(&LowLevelType::Signed)
         );
         let func = funcobj_from_funcptr_constant(&op.args[0]).expect("ll_join_chars funcptr");
-        assert_eq!(func._name, "ll_join_chars");
+        assert_eq!(func._name, "ll_join_chars_look_inside_iff");
         let Hlvalue::Variable(items_var) = items else {
             panic!("items is a Variable");
         };
@@ -5505,7 +5517,7 @@ mod tests {
         );
         assert_eq!(
             callee_name(&not_jitted.borrow().operations[0]),
-            "ll_join_chars__orig"
+            "ll_join_chars"
         );
         let isvirtual = bool_exit(&jitted, true);
         let const_false = bool_exit(&jitted, false);
@@ -5519,7 +5531,7 @@ mod tests {
         );
         assert_eq!(
             callee_name(&bool_exit(&isvirtual, true).borrow().operations[0]),
-            "ll_join_chars__orig"
+            "ll_join_chars"
         );
         assert_eq!(
             callee_name(&bool_exit(&isvirtual, false).borrow().operations[0]),
@@ -5546,7 +5558,7 @@ mod tests {
             .map(|func| func._name.clone())
             .collect();
         for name in [
-            "ll_join_chars__orig",
+            "ll_join_chars",
             "ll_join_chars_trampoline",
             "_ll_alloc_and_set_isconstant",
             "ll_join_chars_isvirtual",
@@ -5558,7 +5570,7 @@ mod tests {
         }
         let orig = direct_call_funcobjs(&wrapper)
             .into_iter()
-            .find(|func| func._name == "ll_join_chars__orig")
+            .find(|func| func._name == "ll_join_chars")
             .expect("orig");
         let trampoline = direct_call_funcobjs(&wrapper)
             .into_iter()
@@ -5663,7 +5675,7 @@ mod tests {
             .iter()
             .map(|func| func._name.clone())
             .collect();
-        assert_eq!(tramp_calls, vec!["ll_join_chars__orig".to_string()]);
+        assert_eq!(tramp_calls, vec!["ll_join_chars".to_string()]);
     }
 
     /// `''.join` of a char or unichar list (`rtype_method_join`).
