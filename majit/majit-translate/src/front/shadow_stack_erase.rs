@@ -44,7 +44,8 @@
 //! `on_unwind` cleanup chain either, and one chain is shared by calls made at
 //! different depths.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
@@ -3060,8 +3061,13 @@ pub(super) fn erase_or_keep(fd: &FunDecl, body: Unstructured, llbc: &Llbc) -> Un
 /// Census-path only: every local body's walk under the registered
 /// effects must equal the registered effect. A registered Observes
 /// whose own walk is clean (`why=-`) is the sticky-fixpoint bug.
+/// `callee_effect_of` must not answer `None` when the field tables
+/// hold a non-`None` product (depth-neutral overlay vs tables).
 fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
+    let collect_all = std::env::var_os("PYRE_SS_COLLECT_ALL").is_some();
     let effect = |identity: &str| callee_effect_of(llbc, identity);
+    let mut mismatches = 0usize;
+    let mut overlay_hides = 0usize;
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
@@ -3069,18 +3075,47 @@ fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
         let identity = super::scope_owner_identity(llbc, fd);
         let registered = effect(&identity);
         let walked = stack_walk(&body, llbc, &effect).effect();
-        if registered != walked {
+        let assembled = assembled_effect_from_tables(llbc, &identity);
+        if !assembled.is_none() && registered.is_none() {
+            overlay_hides += 1;
             let name = fd.item_meta.name_path();
-            panic!(
-                "stack-effect invariant: {name} identity={identity} registered {} rewalk {} why={}",
-                registered.as_str(),
-                walked.as_str(),
-                stack_walk(&body, llbc, &effect)
-                    .why
-                    .as_deref()
-                    .unwrap_or("-")
+            let msg = format!(
+                "stack-effect overlay: {name} identity={identity} tables {} callee_effect_of None",
+                assembled.describe()
             );
+            if collect_all {
+                eprintln!("[table-overlay-disagree] {msg}");
+            } else {
+                panic!("{msg}");
+            }
         }
+        if registered != walked {
+            mismatches += 1;
+            let name = fd.item_meta.name_path();
+            let why = stack_walk(&body, llbc, &effect)
+                .why
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+            let msg = format!(
+                "stack-effect invariant: {name} identity={identity} registered {} rewalk {} why={why}",
+                registered.describe(),
+                walked.describe(),
+            );
+            if collect_all {
+                eprintln!("[mismatch] {msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+    if collect_all {
+        eprintln!(
+            "[mismatch-summary] crate={} mismatches={} overlay_hides={}",
+            llbc.crate_name(),
+            mismatches,
+            overlay_hides
+        );
     }
 }
 
@@ -3111,8 +3146,8 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
                 callee.as_ref().map(|(p, _)| p.as_str()).unwrap_or("-"),
                 callee
                     .as_ref()
-                    .map(|(_, effect)| effect.as_str())
-                    .unwrap_or("-"),
+                    .map(|(_, effect)| effect.describe())
+                    .unwrap_or_else(|| "-".to_string()),
             );
         }
         out.entry(bucket).or_default().push(name);
@@ -3253,6 +3288,64 @@ impl CalleeEffect {
         !self.observes && !self.leaves_above && self.param_slots.is_empty() && !self.returns_index
     }
 
+    /// `GraphAnalyzer.bottom_result`: most optimistic answer.
+    /// `returns_index` is a must-property (`true ≼ false`), so bottom
+    /// still claims it. `RaiseAnalyzer.bottom_result` is `False`
+    /// (cannot raise) for the same reason: unseen / in-progress graphs
+    /// are optimistic until `Dependency.merge_with_result` / `leave_with`.
+    fn bottom() -> Self {
+        Self {
+            observes: false,
+            leaves_above: false,
+            param_slots: Vec::new(),
+            returns_index: true,
+        }
+    }
+
+    /// Pointwise join: `observes` / `leaves_above` OR, `param_slots`
+    /// union (sorted, dedup), `returns_index` AND.
+    /// `BoolGraphAnalyzer.join_two_results` is OR; the must-field uses
+    /// the dual. `WriteAnalyzer.join_two_results` is set union.
+    fn join_two_results(&self, other: &Self) -> Self {
+        let mut param_slots = self.param_slots.clone();
+        for &p in &other.param_slots {
+            if !param_slots.contains(&p) {
+                param_slots.push(p);
+            }
+        }
+        param_slots.sort_unstable();
+        Self {
+            observes: self.observes || other.observes,
+            leaves_above: self.leaves_above || other.leaves_above,
+            param_slots,
+            returns_index: self.returns_index && other.returns_index,
+        }
+    }
+
+    /// Product order: `self ≼ other` iff other is at least as severe
+    /// on every field (`false ≼ true` OR-fields, `⊆` on `param_slots`,
+    /// `true ≼ false` on `returns_index`).
+    fn leq(&self, other: &Self) -> bool {
+        (!self.observes || other.observes)
+            && (!self.leaves_above || other.leaves_above)
+            && self
+                .param_slots
+                .iter()
+                .all(|p| other.param_slots.contains(p))
+            && (!other.returns_index || self.returns_index)
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{}(observes={} leaves_above={} param_slots={:?} returns_index={})",
+            self.as_str(),
+            self.observes,
+            self.leaves_above,
+            self.param_slots,
+            self.returns_index
+        )
+    }
+
     fn as_str(&self) -> &'static str {
         if self.observes && self.leaves_above {
             "ObservesLeaves"
@@ -3292,24 +3385,24 @@ fn is_origportal_alias_fd(llbc: &Llbc, fd: &FunDecl) -> bool {
 /// graph, never by `ItemMeta::name_path`. Origportal aliases are
 /// answered as none by [`resolved_callee_effect`] / [`is_origportal_alias_fd`],
 /// not here: identities are not config paths.
+fn assembled_effect_from_tables(llbc: &Llbc, identity: &str) -> CalleeEffect {
+    CalleeEffect {
+        observes: llbc.is_stack_observes_fn(identity),
+        leaves_above: llbc.is_stack_leaves_above_fn(identity),
+        param_slots: llbc.stack_param_slots(identity).unwrap_or_default(),
+        returns_index: llbc.is_stack_returns_index_fn(identity),
+    }
+}
+
 fn callee_effect_of(llbc: &Llbc, identity: &str) -> CalleeEffect {
+    let assembled = assembled_effect_from_tables(llbc, identity);
     if llbc.is_stack_depth_neutral_fn(identity) {
         return CalleeEffect::none();
     }
-    let param_slots = llbc.stack_param_slots(identity).unwrap_or_default();
-    let leaves = llbc.is_stack_leaves_above_fn(identity);
-    let returns_index = llbc.is_stack_returns_index_fn(identity);
-    let observes = llbc.is_stack_observes_fn(identity);
-    let effect = CalleeEffect {
-        observes,
-        leaves_above: leaves,
-        param_slots,
-        returns_index,
-    };
-    if effect.is_none() && llbc.is_stack_sensitive_fn(identity) {
+    if assembled.is_none() && llbc.is_stack_sensitive_fn(identity) {
         return CalleeEffect::worst();
     }
-    effect
+    assembled
 }
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
@@ -3398,33 +3491,28 @@ impl StackWalk {
     fn effect(&self) -> CalleeEffect {
         // An exit the walk could not bound may sit below entry (the
         // caller's slots are gone) or above it (slots are left), so it
-        // sets both.
+        // sets both. The four fields are a product: Observes does not
+        // clear `param_slots` / `returns_index`.
         let observes = self.reads_below || self.unknown_exit;
         CalleeEffect {
             observes,
             leaves_above: self.leaves_above || self.unknown_exit,
-            param_slots: if observes {
-                Vec::new()
-            } else {
-                self.param_slots.clone()
-            },
-            returns_index: self.returns_index && !observes,
+            param_slots: self.param_slots.clone(),
+            returns_index: self.returns_index,
         }
     }
 }
 
-/// Depth-neutral: every reachable path restores the entry depth, the body
-/// never reads a caller-owned slot, Observes callees are refused only at
-/// entry depth (inside our Open they see our pins; Close rewinds),
-/// LeavesAbove is allowed, no parameter-indexed slot access, no returned
-/// own-index summary, and a `RootScope` opens on some reachable path.
+/// Depth-neutral: the walk's product is `None` and a `RootScope` opens
+/// on some reachable path (`effect().is_none() && saw_open`).
+#[cfg(test)]
 fn body_is_depth_neutral(
     body: &Unstructured,
     llbc: &Llbc,
     effect: &dyn Fn(&str) -> CalleeEffect,
 ) -> bool {
     let walk = stack_walk(body, llbc, effect);
-    walk.why.is_none() && walk.saw_open && walk.param_slots.is_empty() && !walk.returns_index
+    walk.effect().is_none() && walk.saw_open
 }
 
 fn clear_tracked(
@@ -3912,60 +4000,53 @@ fn stack_walk(
                             }
                         }
                         let callee = resolved_callee_effect(call, llbc, effect);
-                        if callee.observes {
-                            // Unproven stack-sensitive callee. At
-                            // Known(0) every live slot is the caller's,
-                            // so the body is not neutral. Inside our
-                            // own Open (`eval_slice_index` pin then
-                            // `getindex_w`) only the depth is unknown:
-                            // Close rewinds our guard, and
-                            // `is_stack_depth_neutral_fn` still holds
-                            // so BINARY_SLICE can erase its bracket.
-                            if !depth.above_entry() {
-                                reads_below = true;
-                                why = format!(
-                                    "unproven-stack-sensitive {}",
-                                    path.as_deref().unwrap_or("")
-                                );
-                            }
-                            // A reader that may also leave slots, or end
-                            // below its entry, leaves no bound at all.
-                            depth = if callee.leaves_above {
+                        // Four fields independently (`GraphAnalyzer` product
+                        // transfer). Observes does not gate param-slots or
+                        // `returns_index`. At Known(0) every live slot is
+                        // the caller's, so Observes is not neutral. Inside
+                        // our own Open (`eval_slice_index` pin then
+                        // `getindex_w`) Observes does not set `reads_below`:
+                        // Close rewinds our guard.
+                        if callee.observes && !depth.above_entry() {
+                            reads_below = true;
+                            why = format!(
+                                "unproven-stack-sensitive {}",
+                                path.as_deref().unwrap_or("")
+                            );
+                        }
+                        let depth_at_call = depth;
+                        if callee.leaves_above {
+                            // ObservesLeaves may be an unbounded exit
+                            // (below or above); LeavesAbove alone is a
+                            // publish of unknown length at this depth.
+                            depth = if callee.observes {
                                 Depth::Unknown
                             } else {
-                                depth
+                                depth.after_unknown_push()
                             };
-                        } else {
-                            // pin() returns shadow_stack_len() captured at
-                            // callee entry, an own index >= entry; the
-                            // caller dest is the depth at the call.
-                            let depth_at_call = depth;
-                            if callee.leaves_above {
-                                depth = depth.after_unknown_push();
-                            }
-                            for &p in &callee.param_slots {
-                                if !call
-                                    .args
-                                    .get(p as usize)
-                                    .and_then(operand_local)
-                                    .is_some_and(|l| {
-                                        accept_index(l, &indices, &params, &mut param_slots)
-                                    })
-                                {
-                                    reads_below = true;
-                                    why = format!("index-not-own bb{bb}");
-                                    break;
-                                }
-                            }
-                            if callee.returns_index
-                                && let Some(dest) = place_local(&call.dest)
-                                && depth_at_call.lower_bound().is_some()
+                        }
+                        for &p in &callee.param_slots {
+                            if !call
+                                .args
+                                .get(p as usize)
+                                .and_then(operand_local)
+                                .is_some_and(|l| {
+                                    accept_index(l, &indices, &params, &mut param_slots)
+                                })
                             {
-                                // pin() returns the entry Len; a struct
-                                // whose field is an own index is the same
-                                // bound at the call-site depth.
-                                indices.insert(dest, depth_at_call);
+                                reads_below = true;
+                                why = format!("index-not-own bb{bb}");
+                                break;
                             }
+                        }
+                        if callee.returns_index
+                            && let Some(dest) = place_local(&call.dest)
+                            && depth_at_call.lower_bound().is_some()
+                        {
+                            // pin() returns the entry Len; a struct
+                            // whose field is an own index is the same
+                            // bound at the call-site depth.
+                            indices.insert(dest, depth_at_call);
                         }
                     }
                 }
@@ -4041,10 +4122,6 @@ fn stack_walk(
     } else {
         None
     };
-    // A reader's parameter-indexed accesses add nothing to "reads below".
-    if reads_below {
-        param_slots.clear();
-    }
     param_slots.sort_unstable();
     param_slots.dedup();
     StackWalk {
@@ -4168,8 +4245,9 @@ pub fn discover_stack_returns_index_fns(llbc: &Llbc) -> Vec<String> {
     discover_stack_fn_effects(llbc).3
 }
 
-/// Sensitive, leaves-above, param-slots, returns-index and observes
-/// sets from one fixpoint, so harvest does not recompute the body walks.
+/// Sensitive, leaves-above, param-slots, returns-index, observes, and
+/// depth-neutral sets from one fixpoint, so harvest does not recompute
+/// the body walks.
 pub fn discover_stack_fn_effects(
     llbc: &Llbc,
 ) -> (
@@ -4178,19 +4256,38 @@ pub fn discover_stack_fn_effects(
     Vec<(String, Vec<u8>)>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 ) {
     discover_stack_effects(llbc)
 }
 
+fn local_callee_answer(
+    llbc: &Llbc,
+    identity: &str,
+    local: &HashSet<&str>,
+    class: &HashMap<String, CalleeEffect>,
+) -> CalleeEffect {
+    if local.contains(identity) {
+        class
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(CalleeEffect::bottom)
+    } else {
+        callee_effect_of(llbc, identity)
+    }
+}
+
 /// Least consistent assignment of per-body [`stack_walk`] over this artefact.
 ///
-/// Seed every local body against all-`None` (own-body effects only). Then
-/// Gauss-Seidel: recompute a body from scratch against the live classes
-/// (previous crates through [`callee_effect_of`]). Jacobi rounds oscillate
-/// on a caller that Observes only because a `returns_index` callee is not
-/// yet in the previous map; processing Observes first lets that caller
-/// drop once the callee's summary is live. A revisit cap freezes still-
-/// changing bodies as Observes.
+/// `GraphAnalyzer.analyze` / `analyze_direct_call`: every local body
+/// starts at [`CalleeEffect::bottom`] (`GraphAnalyzer.bottom_result`).
+/// A body's answer is `join_two_results(previous, walk)`
+/// (`Dependency.merge_with_result`). On a change, requeue that body's
+/// callers (`DependencyTracker`). FIFO worklist; no visit cap; no
+/// `CalleeEffect::worst()` freeze. Cross-artefact callees keep
+/// [`callee_effect_of`]. Termination follows from finite height
+/// (`param_slots` bounded by arity). Depth-neutral is the same
+/// assignment: `effect().is_none() && saw_open`.
 ///
 /// `class`, `identities[i]`, and `callers` are keyed by
 /// [`super::scope_owner_identity`], matching
@@ -4204,7 +4301,9 @@ fn discover_stack_effects(
     Vec<(String, Vec<u8>)>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 ) {
+    let started = Instant::now();
     let fds: Vec<&FunDecl> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
@@ -4213,21 +4312,17 @@ fn discover_stack_effects(
         .iter()
         .map(|fd| super::scope_owner_identity(llbc, fd))
         .collect();
-    let local: std::collections::HashSet<&str> = identities.iter().map(String::as_str).collect();
+    let local: HashSet<&str> = identities.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
+    // Concrete assignment, including resolved None. Missing is only the
+    // pre-init state; lookup must not revive `bottom` (`returns_index`)
+    // for a body already joined to None.
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
-    let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
+    for identity in &identities {
+        class.insert(identity.clone(), CalleeEffect::bottom());
+    }
+    let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect, bool)>> =
         vec![None; fds.len()];
-    let none_effect = |identity: &str| {
-        if local.contains(identity) {
-            CalleeEffect::none()
-        } else {
-            callee_effect_of(llbc, identity)
-        }
-    };
-    let mut queued = vec![false; fds.len()];
-    let mut observes_ids: Vec<usize> = Vec::new();
-    let mut other_ids: Vec<usize> = Vec::new();
     for (i, fd) in fds.iter().enumerate() {
         let Some(body) = fd.unstructured_shared() else {
             continue;
@@ -4243,12 +4338,63 @@ fn discover_stack_effects(
                 callers.entry(identity).or_default().push(i);
             }
         }
-        let new = if is_origportal_alias_fd(llbc, fd) {
+    }
+    let mut queued = vec![false; fds.len()];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for i in 0..fds.len() {
+        queued[i] = true;
+        queue.push_back(i);
+    }
+    let mut pops = 0usize;
+    let mut walks = 0usize;
+    let mut skips = 0usize;
+    let mut max_visits = 0u32;
+    let mut visits = vec![0u32; fds.len()];
+    while let Some(i) = queue.pop_front() {
+        queued[i] = false;
+        pops += 1;
+        visits[i] = visits[i].saturating_add(1);
+        if visits[i] > max_visits {
+            max_visits = visits[i];
+        }
+        let walk_effect = if let Some((queried, prev, _)) = &last_walk[i]
+            && queried.iter().all(|(identity, answer)| {
+                local_callee_answer(llbc, identity, &local, &class) == *answer
+            }) {
+            skips += 1;
+            prev.clone()
+        } else if is_origportal_alias_fd(llbc, fds[i]) {
             CalleeEffect::none()
         } else {
+            let Some(body) = fds[i].unstructured_shared() else {
+                let none = CalleeEffect::none();
+                let old = class
+                    .get(&identities[i])
+                    .cloned()
+                    .unwrap_or_else(CalleeEffect::bottom);
+                let joined = old.join_two_results(&none);
+                debug_assert!(
+                    old.leq(&joined),
+                    "stack-effect answer decreased: {} -> {}",
+                    old.describe(),
+                    joined.describe()
+                );
+                if joined != old {
+                    class.insert(identities[i].clone(), joined);
+                    for &caller in callers.get(&identities[i]).into_iter().flatten() {
+                        if queued[caller] {
+                            continue;
+                        }
+                        queued[caller] = true;
+                        queue.push_back(caller);
+                    }
+                }
+                continue;
+            };
+            walks += 1;
             let queried = std::cell::RefCell::new(Vec::new());
             let effect = |identity: &str| {
-                let answer = none_effect(identity);
+                let answer = local_callee_answer(llbc, identity, &local, &class);
                 if local.contains(identity) {
                     queried
                         .borrow_mut()
@@ -4256,104 +4402,32 @@ fn discover_stack_effects(
                 }
                 answer
             };
-            let new = stack_walk(&body, llbc, &effect).effect();
-            last_walk[i] = Some((queried.into_inner(), new.clone()));
-            new
-        };
-        if new.observes {
-            observes_ids.push(i);
-        } else {
-            other_ids.push(i);
-        }
-        if !new.is_none() {
-            class.insert(identities[i].clone(), new);
-        }
-    }
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    for i in observes_ids.into_iter().chain(other_ids) {
-        queued[i] = true;
-        queue.push_back(i);
-    }
-    let mut visits = vec![0u8; fds.len()];
-    const VISIT_CAP: u8 = 8;
-    while let Some(i) = queue.pop_front() {
-        queued[i] = false;
-        if visits[i] >= VISIT_CAP {
-            let old = class
-                .get(&identities[i])
-                .cloned()
-                .unwrap_or_else(CalleeEffect::none);
-            class.insert(identities[i].clone(), CalleeEffect::worst());
-            if old != CalleeEffect::worst() {
-                for &caller in callers.get(&identities[i]).into_iter().flatten() {
-                    if queued[caller] {
-                        continue;
-                    }
-                    queued[caller] = true;
-                    queue.push_back(caller);
-                }
-            }
-            continue;
-        }
-        visits[i] = visits[i].saturating_add(1);
-        let new = if let Some((queried, prev)) = &last_walk[i]
-            && queried.iter().all(|(identity, answer)| {
-                class
-                    .get(identity)
-                    .cloned()
-                    .unwrap_or_else(CalleeEffect::none)
-                    == *answer
-            }) {
-            prev.clone()
-        } else if is_origportal_alias_fd(llbc, fds[i]) {
-            CalleeEffect::none()
-        } else {
-            let Some(body) = fds[i].unstructured_shared() else {
-                continue;
-            };
-            let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |identity: &str| {
-                if local.contains(identity) {
-                    let answer = class
-                        .get(identity)
-                        .cloned()
-                        .unwrap_or_else(CalleeEffect::none);
-                    queried
-                        .borrow_mut()
-                        .push((identity.to_string(), answer.clone()));
-                    answer
-                } else {
-                    callee_effect_of(llbc, identity)
-                }
-            };
-            let new = stack_walk(&body, llbc, &effect).effect();
-            last_walk[i] = Some((queried.into_inner(), new.clone()));
-            new
+            let walk = stack_walk(&body, llbc, &effect);
+            let walk_effect = walk.effect();
+            last_walk[i] = Some((queried.into_inner(), walk_effect.clone(), walk.saw_open));
+            walk_effect
         };
         let old = class
             .get(&identities[i])
             .cloned()
-            .unwrap_or_else(CalleeEffect::none);
-        if new == old {
+            .unwrap_or_else(CalleeEffect::bottom);
+        let joined = old.join_two_results(&walk_effect);
+        debug_assert!(
+            old.leq(&joined),
+            "stack-effect answer decreased: {} -> {}",
+            old.describe(),
+            joined.describe()
+        );
+        if joined == old {
             continue;
         }
-        if new.is_none() {
-            class.remove(&identities[i]);
-        } else {
-            class.insert(identities[i].clone(), new.clone());
-        }
+        class.insert(identities[i].clone(), joined);
         for &caller in callers.get(&identities[i]).into_iter().flatten() {
             if queued[caller] {
                 continue;
             }
             queued[caller] = true;
-            if new.observes {
-                queue.push_back(caller);
-            } else {
-                // Callee dropped Observes or gained a summary: re-walk
-                // Observes callers first so they can drop.
-                queue.push_front(caller);
-            }
+            queue.push_back(caller);
         }
     }
     let mut sensitive: Vec<String> = Vec::new();
@@ -4361,8 +4435,20 @@ fn discover_stack_effects(
     let mut param_slots: Vec<(String, Vec<u8>)> = Vec::new();
     let mut returns_index: Vec<String> = Vec::new();
     let mut observes: Vec<String> = Vec::new();
-    for (identity, effect) in class {
+    let mut neutrals: Vec<String> = Vec::new();
+    for (i, identity) in identities.iter().enumerate() {
+        let effect = class
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(CalleeEffect::none);
+        let saw_open = last_walk[i]
+            .as_ref()
+            .map(|(_, _, open)| *open)
+            .unwrap_or(false);
         if effect.is_none() {
+            if saw_open {
+                neutrals.push(identity.clone());
+            }
             continue;
         }
         sensitive.push(identity.clone());
@@ -4376,7 +4462,7 @@ fn discover_stack_effects(
             param_slots.push((identity.clone(), effect.param_slots));
         }
         if effect.returns_index {
-            returns_index.push(identity);
+            returns_index.push(identity.clone());
         }
     }
     sensitive.sort();
@@ -4384,72 +4470,31 @@ fn discover_stack_effects(
     leaves.sort();
     param_slots.sort_by(|a, b| a.0.cmp(&b.0));
     returns_index.sort();
-    (sensitive, leaves, param_slots, returns_index, observes)
+    neutrals.sort();
+    if std::env::var_os("PYRE_SS_STATS").is_some() {
+        eprintln!(
+            "[discover-stats] crate={} pops={pops} walks={walks} skips={skips} max_visits={max_visits} neutrals={} ms={} bodies={}",
+            llbc.crate_name(),
+            neutrals.len(),
+            started.elapsed().as_millis(),
+            fds.len()
+        );
+    }
+    (
+        sensitive,
+        leaves,
+        param_slots,
+        returns_index,
+        observes,
+        neutrals,
+    )
 }
 
-/// Local bodies proven depth-neutral: every path restores the entry
-/// depth, no caller-owned slot is read, Observes callees are refused,
-/// and LeavesAbove callees are allowed (fixpoint, pessimistic start).
-/// Harvested in link order like [`discover_stack_sensitive_fns`].
-/// A body whose last failed check queried no newly proven identity is not re-checked.
-/// Keys are [`super::scope_owner_identity`], the same identity
-/// [`discover_stack_effects`] publishes (`GraphAnalyzer` keys by graph).
+/// Local bodies proven depth-neutral under the same assignment
+/// [`discover_stack_effects`] publishes: `effect().is_none() && saw_open`.
+/// Keys are [`super::scope_owner_identity`] (`GraphAnalyzer` keys by graph).
 pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
-    let fds: Vec<&FunDecl> = llbc
-        .iter_local_fns()
-        .filter(|fd| fd.body.is_some())
-        .collect();
-    // Proven identity -> how many identities were proven up to and including it.
-    let mut proven: HashMap<String, usize> = HashMap::new();
-    // Per body: the proven count at its last failed check and the callee identities that check
-    // queried. Only a newly proven queried identity can change the answer.
-    let mut last_check: Vec<Option<(usize, Vec<String>)>> = vec![None; fds.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (i, fd) in fds.iter().enumerate() {
-            let identity = super::scope_owner_identity(llbc, fd);
-            if proven.contains_key(&identity) {
-                continue;
-            }
-            if is_origportal_alias_fd(llbc, fd) {
-                let n = proven.len() + 1;
-                proven.insert(identity, n);
-                changed = true;
-                continue;
-            }
-            if let Some((at, queried)) = &last_check[i]
-                && queried
-                    .iter()
-                    .all(|identity| proven.get(identity).is_none_or(|&n| n <= *at))
-            {
-                continue;
-            }
-            let Some(body) = fd.unstructured_shared() else {
-                last_check[i] = Some((proven.len(), Vec::new()));
-                continue;
-            };
-            let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |identity: &str| {
-                queried.borrow_mut().push(identity.to_string());
-                if proven.contains_key(identity) {
-                    CalleeEffect::none()
-                } else {
-                    callee_effect_of(llbc, identity)
-                }
-            };
-            if body_is_depth_neutral(&body, llbc, &effect) {
-                let n = proven.len() + 1;
-                proven.insert(identity, n);
-                changed = true;
-            } else {
-                last_check[i] = Some((proven.len(), queried.into_inner()));
-            }
-        }
-    }
-    let mut out: Vec<String> = proven.into_keys().collect();
-    out.sort();
-    out
+    discover_stack_effects(llbc).5
 }
 
 /// Classify `llbc`'s own functions and mark its set complete, for a caller
@@ -4459,13 +4504,13 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     if llbc.stack_sensitive_fns_complete() {
         return;
     }
-    let (found, leaves, params, ret_idx, observes) = discover_stack_effects(llbc);
+    let (found, leaves, params, ret_idx, observes, neutrals) = discover_stack_effects(llbc);
     llbc.register_stack_sensitive_fns(found);
     llbc.register_stack_observes_fns(observes);
     llbc.register_stack_leaves_above_fns(leaves);
     llbc.register_stack_param_slots_fns(params);
     llbc.register_stack_returns_index_fns(ret_idx);
-    llbc.register_stack_depth_neutral_fns(discover_depth_neutral_fns(llbc));
+    llbc.register_stack_depth_neutral_fns(neutrals);
     llbc.mark_stack_sensitive_fns_complete();
 }
 
@@ -5801,6 +5846,208 @@ mod tests {
             "Return of unbound local 0 is not returns_index: {:?}",
             walk.effect()
         );
+    }
+
+    fn effect_params(slots: Vec<u8>) -> CalleeEffect {
+        CalleeEffect {
+            observes: false,
+            leaves_above: false,
+            param_slots: slots,
+            returns_index: false,
+        }
+    }
+
+    #[test]
+    fn callee_effect_join_leq_laws() {
+        let bottom = CalleeEffect::bottom();
+        let none = CalleeEffect::none();
+        let observes = CalleeEffect::observes();
+        let leaves = CalleeEffect::leaves_above();
+        let params = effect_params(vec![0, 2]);
+        let worst = CalleeEffect::worst();
+        for x in [&bottom, &none, &observes, &leaves, &params, &worst] {
+            assert!(x.leq(x), "leq reflexive {}", x.describe());
+            assert_eq!(
+                x.join_two_results(x),
+                *x,
+                "join idempotent {}",
+                x.describe()
+            );
+            assert!(bottom.leq(x), "bottom ≼ {}", x.describe());
+        }
+        assert!(none.leq(&observes));
+        assert!(none.leq(&leaves));
+        assert!(none.leq(&params));
+        assert!(observes.leq(&worst));
+        assert!(leaves.leq(&worst));
+        let joined = params.join_two_results(&observes);
+        assert_eq!(observes.join_two_results(&params), joined);
+        assert!(params.leq(&joined));
+        assert!(observes.leq(&joined));
+        assert!(joined.observes);
+        assert_eq!(joined.param_slots, vec![0, 2]);
+        assert!(!joined.returns_index);
+        assert!(!joined.leaves_above);
+        let a = effect_params(vec![0]);
+        let b = effect_params(vec![1]);
+        let u = a.join_two_results(&b);
+        assert_eq!(u.param_slots, vec![0, 1]);
+        assert!(a.leq(&u) && b.leq(&u));
+        let must = CalleeEffect::bottom().join_two_results(&none);
+        assert!(!must.returns_index, "true ≼ false, join is AND");
+    }
+
+    #[test]
+    fn join_param_slots_with_observes_keeps_both() {
+        let joined = effect_params(vec![0]).join_two_results(&CalleeEffect::observes());
+        assert!(joined.observes && joined.param_slots == vec![0]);
+        assert!(!joined.leaves_above && !joined.returns_index);
+    }
+
+    fn unstructured_fun_body(n_locals: u64, blocks: Vec<Value>) -> Value {
+        json!({
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": (0..n_locals).map(local_decl).collect::<Vec<_>>()
+                },
+                "body": blocks
+            }
+        })
+    }
+
+    #[test]
+    fn recursive_pair_converges_without_visit_cap() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["other", "rec_a"],
+                        unstructured_fun_body(
+                            2,
+                            vec![bb(call_fun(2, vec![], 1, 1)), bb(json!("Return"))],
+                        ),
+                    ),
+                    opaque_fun(
+                        2,
+                        &["other", "rec_b"],
+                        unstructured_fun_body(
+                            2,
+                            vec![bb(call_fun(1, vec![], 1, 1)), bb(json!("Return"))],
+                        ),
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let (sens, leaves, params, ret, obs, neutrals) = discover_stack_effects(&llbc);
+        assert!(sens.is_empty(), "sens={sens:?}");
+        assert!(leaves.is_empty(), "leaves={leaves:?}");
+        assert!(params.is_empty(), "params={params:?}");
+        assert!(ret.is_empty(), "ret={ret:?}");
+        assert!(obs.is_empty(), "obs={obs:?}");
+        assert!(neutrals.is_empty(), "neutrals={neutrals:?}");
+    }
+
+    #[test]
+    fn returns_index_cycle_stays_true() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_object", "gc_roots", "shadow_stack_len"],
+                        json!("Opaque"),
+                    ),
+                    opaque_fun(
+                        2,
+                        &["other", "ret_a"],
+                        unstructured_fun_body(
+                            3,
+                            vec![
+                                bb(call_fun(1, vec![], 0, 1)),
+                                bb(call_fun(3, vec![], 2, 2)),
+                                bb(json!("Return")),
+                            ],
+                        ),
+                    ),
+                    opaque_fun(
+                        3,
+                        &["other", "ret_b"],
+                        unstructured_fun_body(
+                            3,
+                            vec![
+                                bb(call_fun(1, vec![], 0, 1)),
+                                bb(call_fun(2, vec![], 2, 2)),
+                                bb(json!("Return")),
+                            ],
+                        ),
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let (sens, _leaves, _params, ret, obs, _) = discover_stack_effects(&llbc);
+        assert!(
+            ret.iter().any(|id| id.contains("ret_a")) && ret.iter().any(|id| id.contains("ret_b")),
+            "cycle must keep returns_index: ret={ret:?} sens={sens:?} obs={obs:?}"
+        );
+        assert!(obs.is_empty(), "obs={obs:?}");
+    }
+
+    #[test]
+    fn observes_param_slots_untracked_inside_open_is_observes() {
+        let llbc = stack_ops_llbc_with_callee();
+        let id = stack_fn_identity(&llbc, "unproven_callee");
+        llbc.register_stack_param_slots_fns([(id, vec![0])]);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
+        let untracked = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(5, vec![json!({"Read": place(0)})], 3, 3)),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        let walk = stack_walk(&untracked, &llbc, &effect);
+        assert!(
+            walk.effect().observes,
+            "Observes+ParamSlots callee with an untracked index inside Open is Observes: {:?}",
+            walk.effect()
+        );
+        let own = body_of(
+            5,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb(call_fun(5, vec![json!({"Read": place(3)})], 4, 4)),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            body_is_depth_neutral(&own, &llbc, &effect),
+            "own index to Observes+ParamSlots inside Open is depth-neutral"
+        );
+        match analyze(&own, &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
+        }
     }
 
     #[test]
