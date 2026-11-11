@@ -2106,11 +2106,17 @@ impl W_ModuleDictObject {
 ///     return w_obj
 /// ```
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// the body performs a `lltype::malloc_typed_stable` allocation
-/// (`W_ModuleDictObject`) that `fuse_boxing_alloc` leaves unfused, so
-/// the JIT residualises the whole call to a stable runtime fnaddr
-/// instead of tracing the allocation.  The `-> PyObjectRef` result is a
-/// plain GCREF with no discriminant to erase.
+/// `fuse_boxing_alloc` already rewrites the `malloc_typed_stable`
+/// (`W_ModuleDictObject`) cluster to `new_with_vtable` on the constant
+/// `&MODULE_DICT_TYPE` type word. The hint stays because looking inside
+/// still fails `setattr("imp")` (`UnionError`: `Instance(ModuleDictStrategy)`
+/// ∪ Tuple, the trait-object field) and residualizes
+/// `gc_roots::push_roots` / `RootScope::{publish,get}`,
+/// `gc_storage::gc_alloc_storage_box` (`specialize_argtype(0)`), and
+/// `celldict.py ModuleDictStrategy.__init__` (`Mutex::new` unresolvable).
+/// Removing it before those bodies record Skips `_flat_pycall` /
+/// `make_user_call_frame` / `module_value`. The `-> PyObjectRef` result
+/// is a plain GCREF with no discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_dict_new() -> PyObjectRef {
     let roots = crate::gc_roots::push_roots();
@@ -2120,12 +2126,12 @@ pub fn w_module_dict_new() -> PyObjectRef {
     );
     let strategy_slot = roots.publish(&[strategy as PyObjectRef]);
     let strategy = roots.get(strategy_slot) as *mut crate::celldict::ModuleDictStrategy;
-    // The strategy box is non-moving and lives as long as this holder.  The
-    // holder's `owner` word is explicitly traced by the module-dict custom
-    // trace, so extending the reference lifetime expresses that GC ownership
-    // without leaking a process-global strategy.
-    let imp: &'static dyn DictStrategy =
-        unsafe { std::mem::transmute::<&dyn DictStrategy, &'static dyn DictStrategy>(&*strategy) };
+    // The strategy box is non-moving and lives as long as this holder. The
+    // holder's `owner` field, traced through `DictStrategyRef`'s own type
+    // (`gctypelayout.py offsets_to_gc_pointers`), keeps the box alive, so
+    // the unbounded lifetime of a raw-pointer deref expresses that GC
+    // ownership without leaking a process-global strategy.
+    let imp: &'static dyn DictStrategy = unsafe { &*strategy };
     let strategy_ref = crate::gc_storage::gc_alloc_storage_box(
         DictStrategyRef {
             kind: StrategyKind::Module,
