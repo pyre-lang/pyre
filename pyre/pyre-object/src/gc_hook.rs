@@ -533,6 +533,79 @@ pub fn try_gc_collect(generation: i64) -> i64 {
     }
 }
 
+/// Host-side `gc.freeze()` callback.
+pub type GcFreezeHookFn = fn();
+
+majit_gc::global_hook!(static GC_FREEZE_HOOK: GcFreezeHookFn);
+
+/// Install the freeze callback. Overwrites any previously-installed hook.
+pub fn register_gc_freeze_hook(hook: GcFreezeHookFn) {
+    GC_FREEZE_HOOK.set(Some(hook));
+}
+
+/// Remove the freeze callback.
+pub fn clear_gc_freeze_hook() {
+    GC_FREEZE_HOOK.set(None);
+}
+
+/// Run `gc.freeze()` via the installed hook. No-op when no hook is installed.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_freeze() {
+    if let Some(f) = GC_FREEZE_HOOK.get() {
+        f();
+    }
+}
+
+/// Host-side `gc.unfreeze()` callback.
+pub type GcUnfreezeHookFn = fn();
+
+majit_gc::global_hook!(static GC_UNFREEZE_HOOK: GcUnfreezeHookFn);
+
+/// Install the unfreeze callback. Overwrites any previously-installed hook.
+pub fn register_gc_unfreeze_hook(hook: GcUnfreezeHookFn) {
+    GC_UNFREEZE_HOOK.set(Some(hook));
+}
+
+/// Remove the unfreeze callback.
+pub fn clear_gc_unfreeze_hook() {
+    GC_UNFREEZE_HOOK.set(None);
+}
+
+/// Run `gc.unfreeze()` via the installed hook. No-op when no hook is
+/// installed.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_unfreeze() {
+    if let Some(f) = GC_UNFREEZE_HOOK.get() {
+        f();
+    }
+}
+
+/// Host-side `gc.get_freeze_count()` callback.
+pub type GcFreezeCountHookFn = fn() -> i64;
+
+majit_gc::global_hook!(static GC_FREEZE_COUNT_HOOK: GcFreezeCountHookFn);
+
+/// Install the freeze-count callback. Overwrites any previously-installed
+/// hook.
+pub fn register_gc_freeze_count_hook(hook: GcFreezeCountHookFn) {
+    GC_FREEZE_COUNT_HOOK.set(Some(hook));
+}
+
+/// Remove the freeze-count callback.
+pub fn clear_gc_freeze_count_hook() {
+    GC_FREEZE_COUNT_HOOK.set(None);
+}
+
+/// Run `gc.get_freeze_count()` via the installed hook. Returns 0 when no
+/// hook is installed.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_freeze_count() -> i64 {
+    match GC_FREEZE_COUNT_HOOK.get() {
+        Some(f) => f(),
+        None => 0,
+    }
+}
+
 /// `incminimark.py collect_step` callback. The pair is the encoded
 /// `(old_state, new_state)` transition; keeping the hook in primitive terms
 /// avoids making pyre-object depend on majit-gc.

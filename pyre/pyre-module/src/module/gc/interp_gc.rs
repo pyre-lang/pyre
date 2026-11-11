@@ -2,8 +2,9 @@
 //! finalizer lock.
 //!
 //! The `get_count`, `set_threshold`/`get_threshold`, `set_debug`/`get_debug`,
-//! `is_tracked`, `is_finalized` and `freeze`/`unfreeze`/`get_freeze_count`
-//! bodies at the end answer to 3.14 alone; see the module doc in `mod.rs`.
+//! `is_tracked` and `is_finalized` bodies at the end answer to 3.14 alone;
+//! see the module doc in `mod.rs`. `freeze` / `unfreeze` /
+//! `get_freeze_count` are the 3.15t extra-root list.
 
 use majit_gc::GcStepTransition;
 use pyre_object::*;
@@ -413,28 +414,27 @@ pub(super) fn is_finalized(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_int
     )))
 }
 
-// `[3.14-spec]` `gc.freeze()` moves the surviving objects into a
-// permanent generation that later collections skip; it is a pre-fork
-// hint, not a semantic guarantee.  PyPy binds none of the three.  The
-// collector has no permanent generation, so freezing and unfreezing
-// are no-ops and the frozen count is the truthful zero.
-//
-// Rooting the live set instead would not be that operation under
-// another name: a frozen object in 3.14 is skipped by the cyclic
-// collector but still reclaimed by refcount, while a rooted one is
-// immortal until `unfreeze` and has its `__del__` deferred until then.
-// That is a third behaviour, matching neither side, and the whole live
-// set is what it would apply to.
+// 3.15t observable: `get_freeze_count() > 0` after freeze, `== 0` after
+// unfreeze, and frozen objects survive later collections. Engineered as
+// an extra root list like incminimark.py `prebuilt_root_objects`.
 pub(super) fn freeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_object::gc_hook::try_gc_freeze();
     Ok(w_none())
 }
 
+// 3.15t observable: `get_freeze_count() > 0` after freeze, `== 0` after
+// unfreeze, and frozen objects survive later collections. Engineered as
+// an extra root list like incminimark.py `prebuilt_root_objects`.
 pub(super) fn unfreeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_object::gc_hook::try_gc_unfreeze();
     Ok(w_none())
 }
 
+// 3.15t observable: `get_freeze_count() > 0` after freeze, `== 0` after
+// unfreeze, and frozen objects survive later collections. Engineered as
+// an extra root list like incminimark.py `prebuilt_root_objects`.
 pub(super) fn get_freeze_count(
     _args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    Ok(w_int_new(0))
+    Ok(w_int_new(pyre_object::gc_hook::try_gc_freeze_count()))
 }

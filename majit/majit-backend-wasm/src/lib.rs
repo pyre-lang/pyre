@@ -1462,6 +1462,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_total_memory_pressure(Some(wasm_total_memory_pressure));
     majit_gc::set_active_collect_generation(Some(wasm_collect_generation));
+    majit_gc::set_active_freeze(Some(wasm_freeze));
+    majit_gc::set_active_unfreeze(Some(wasm_unfreeze));
+    majit_gc::set_active_freeze_count(Some(wasm_freeze_count));
     majit_gc::set_active_collect_step(Some(wasm_collect_step));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_collect_nursery(Some(wasm_collect_nursery));
@@ -1742,6 +1745,18 @@ fn body_reload_fn_ptr() -> i64 {
 /// `collect_generation_via_active_runtime`.
 fn wasm_collect_generation(generation: i64) -> i64 {
     with_wasm_active_gc_mut(|gc| gc.collect_generation(generation)).unwrap_or(0)
+}
+
+fn wasm_freeze() {
+    with_wasm_active_gc_mut(|gc| gc.freeze());
+}
+
+fn wasm_unfreeze() {
+    with_wasm_active_gc_mut(|gc| gc.unfreeze());
+}
+
+fn wasm_freeze_count() -> i64 {
+    with_wasm_active_gc_mut(|gc| gc.freeze_count()).unwrap_or(0)
 }
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {

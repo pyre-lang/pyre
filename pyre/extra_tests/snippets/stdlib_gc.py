@@ -58,3 +58,12 @@ assert any(obj is marker for obj in gc.get_objects())
 
 with assert_raises(TypeError):
     gc.get_objects(None, None)
+
+# A frozen object in a cycle survives later collections until unfreeze; the
+# self-reference keeps refcount from freeing it under 3.15t as well.
+import weakref
+class Frozen: pass
+obj = Frozen(); obj.cycle = obj; ref = weakref.ref(obj)
+gc.freeze(); assert gc.get_freeze_count() > 0
+del obj; gc.collect(); assert ref() is not None
+gc.unfreeze(); assert gc.get_freeze_count() == 0

@@ -369,6 +369,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         alloc_young_nonmoving_typed_no_collect_via_active_runtime,
     ));
     majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
+    majit_gc::set_active_freeze(Some(freeze_via_active_runtime));
+    majit_gc::set_active_unfreeze(Some(unfreeze_via_active_runtime));
+    majit_gc::set_active_freeze_count(Some(freeze_count_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
     majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
@@ -1541,6 +1544,18 @@ fn alloc_young_nonmoving_typed_no_collect_via_active_runtime(type_id: u32, size:
 /// dangle after the embedded minor cycle).
 fn collect_generation_via_active_runtime(generation: i64) -> i64 {
     with_cranelift_gc(|gc| gc.collect_generation(generation)).unwrap_or(0)
+}
+
+fn freeze_via_active_runtime() {
+    with_cranelift_gc(|gc| gc.freeze());
+}
+
+fn unfreeze_via_active_runtime() {
+    with_cranelift_gc(|gc| gc.unfreeze());
+}
+
+fn freeze_count_via_active_runtime() -> i64 {
+    with_cranelift_gc(|gc| gc.freeze_count()).unwrap_or(0)
 }
 
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {

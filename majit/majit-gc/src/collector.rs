@@ -1190,6 +1190,12 @@ pub struct MiniMarkGC {
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
     prebuilt_root_objects: Vec<usize>,
+    /// Extra root list for `gc.freeze()` / `gc.unfreeze()` /
+    /// `gc.get_freeze_count()`. 3.15t observable: freeze snapshots every live
+    /// GC object, later collections treat them as roots (kept alive until
+    /// unfreeze), `get_freeze_count` is the list length. Engineered as an extra
+    /// `AddressStack` like incminimark.py `prebuilt_root_objects`.
+    frozen_objects: Vec<usize>,
     /// High-water capacity of [`Self::enumerate_labeled_root_walker_values`]'s
     /// snapshot, so the next one asks the allocator once instead of growing
     /// through it.  `collect_roots` materializes nothing upstream — it calls
@@ -1560,6 +1566,7 @@ impl MiniMarkGC {
                 id
             },
             prebuilt_root_objects: Vec::new(),
+            frozen_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
             old_objects_with_cards_set: Vec::new(),
@@ -6764,6 +6771,7 @@ impl MiniMarkGC {
     fn enumerate_all_root_values(&self) -> Vec<GcRef> {
         let mut result = self.enumerate_root_walker_values();
         result.extend(self.prebuilt_root_objects.iter().copied().map(GcRef));
+        result.extend(self.frozen_objects.iter().copied().map(GcRef));
         // incminimark.py `enum_live_with_finalizers`: registered
         // finalizer objects remain roots even before they become unreachable
         // and move to an app-visible death queue. AddressDeque.foreach(..., 2)
@@ -6820,6 +6828,7 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
+        self.seed_frozen_objects();
         // Each root source hands its values straight to `seed_major_root`, as
         // `collect_roots` hands `_collect_ref_stk` to `walk_roots`: upstream
         // materializes no list of roots, and one built here is a 16-byte write
@@ -6899,6 +6908,20 @@ impl MiniMarkGC {
                 (*hdr).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
             }
             self.incr_state.gray_stack.push(addr);
+        }
+    }
+
+    /// `frozen_objects` is scanned with `prebuilt_root_objects`
+    /// (`incminimark.py` `prebuilt_root_objects.foreach(_collect_obj)`).
+    /// Frozen entries are old heap objects after `do_collect_full`; the
+    /// extra-root seeder leaves `old_objects_pointing_to_young` to the write
+    /// barrier the same way `visit` does for `prebuilt_root_objects`.
+    fn seed_frozen_objects(&mut self) {
+        let mut i = 0;
+        while i < self.frozen_objects.len() {
+            let addr = self.frozen_objects[i];
+            self.seed_major_extra_root(GcRef(addr), "frozen_object");
+            i += 1;
         }
     }
 
@@ -7106,6 +7129,32 @@ impl MiniMarkGC {
         for gcref in result {
             visitor(gcref);
         }
+    }
+
+    /// Snapshot currently live objects as extra roots (`gc.freeze`).
+    ///
+    /// `do_collect_full` first so nursery survivors are old and non-moving
+    /// and every remaining old object is live, then the all-generations
+    /// `do_get_objects` walk (`rgc.py` `do_get_objects`) is the live set.
+    /// Union with the previous frozen set, then sort+dedup.
+    pub fn freeze(&mut self) {
+        self.do_collect_full();
+        let mut newly = Vec::new();
+        self.do_get_objects(-1, &mut |gcref| newly.push(gcref.0));
+        self.frozen_objects.extend(newly);
+        self.frozen_objects.sort_unstable();
+        self.frozen_objects.dedup();
+    }
+
+    /// Drop the freeze set (`gc.unfreeze`). Frozen objects become ordinary
+    /// old objects and later collections may reclaim them.
+    pub fn unfreeze(&mut self) {
+        self.frozen_objects.clear();
+    }
+
+    /// `gc.get_freeze_count`: size of the freeze set.
+    pub fn freeze_count(&self) -> i64 {
+        self.frozen_objects.len() as i64
     }
 
     /// `inspector.py get_rpy_roots`: enumerate the raw root values
@@ -7493,6 +7542,7 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
+        self.seed_frozen_objects();
         // `collect_nonstack_roots` repeats the static roots because the
         // mutator may have written them since `collect_roots`. A cycle that
         // `do_collect_full` seeded and is finishing in the same call has had
@@ -8147,7 +8197,7 @@ impl MiniMarkGC {
             "addr={obj_addr:#x} tid={} tid_and_flags={:#x} TRACK_YOUNG_PTRS={} \
              VISITED={} HAS_CARDS={} CARDS_SET={} NO_HEAP_PTRS={} PINNED={} \
              in_old_objects_pointing_to_young={} in_gray={} in_more_gray={} \
-             in_prebuilt_roots={} managed={} nursery={} oldgen={} young_raw={} gen={} \
+             in_prebuilt_roots={} in_frozen_roots={} managed={} nursery={} oldgen={} young_raw={} gen={} \
              gc_state={:?} oldgen_nonmoving={} minors={} majors={}",
             hdr.type_id(),
             hdr.tid_and_flags,
@@ -8161,6 +8211,7 @@ impl MiniMarkGC {
             self.incr_state.gray_stack.contains(&obj_addr),
             self.incr_state.more_gray_stack.contains(&obj_addr),
             self.prebuilt_root_objects.contains(&obj_addr),
+            self.frozen_objects.contains(&obj_addr),
             self.is_managed_heap_object(obj_addr),
             self.nursery.contains(obj_addr),
             self.oldgen.contains(obj_addr),
@@ -8184,6 +8235,7 @@ impl MiniMarkGC {
             || self.incr_state.gray_stack.contains(&addr)
             || self.incr_state.more_gray_stack.contains(&addr)
             || self.prebuilt_root_objects.contains(&addr)
+            || self.frozen_objects.contains(&addr)
     }
 
     /// `incminimark.py` `_debug_check_not_white` over the remembered set and
@@ -9212,6 +9264,9 @@ impl MiniMarkGC {
         // incminimark.py:2563-2564: prebuilt objects are outside the arena
         // sweep, so reset their mark bit explicitly for the next cycle.
         for &addr in &self.prebuilt_root_objects {
+            unsafe { (*header_of(addr)).clear_flag(GcFlags::GCFLAG_VISITED) };
+        }
+        for &addr in &self.frozen_objects {
             unsafe { (*header_of(addr)).clear_flag(GcFlags::GCFLAG_VISITED) };
         }
         // The non-moving major skipped the minor, whose last act is
@@ -11232,6 +11287,18 @@ impl GcAllocator for MiniMarkGC {
         let before = self.objects_freed();
         self.do_collect(generation);
         (self.objects_freed() - before) as i64
+    }
+
+    fn freeze(&mut self) {
+        MiniMarkGC::freeze(self)
+    }
+
+    fn unfreeze(&mut self) {
+        MiniMarkGC::unfreeze(self)
+    }
+
+    fn freeze_count(&mut self) -> i64 {
+        MiniMarkGC::freeze_count(self)
     }
 
     fn collect_step(&mut self) -> crate::GcStepTransition {
@@ -14519,6 +14586,30 @@ mod tests {
         gc.collect_full();
         assert!(gc.oldgen.contains(promoted_child.0));
         assert!(unsafe { !(*hdr).has_flag(GcFlags::GCFLAG_VISITED) });
+    }
+
+    /// `gc.freeze` snapshots live objects onto `frozen_objects`; they stay
+    /// valid across a full collection after every other root is dropped.
+    #[test]
+    fn freeze_keeps_objects_alive_until_unfreeze() {
+        let mut gc = test_gc(4096);
+        let mut info = TypeInfo::simple(16);
+        info.is_object = true;
+        let tid = gc.register_type(info);
+        let mut obj = gc.alloc_with_type(tid, 16);
+        unsafe { gc.roots.add(&mut obj) };
+        gc.freeze();
+        let addr = obj.0;
+        let n = gc.freeze_count();
+        assert!(n > 0);
+        assert_eq!(n, gc.frozen_objects.len() as i64);
+        assert!(gc.frozen_objects.contains(&addr));
+        gc.roots.clear();
+        gc.do_collect_full();
+        assert_eq!(unsafe { (*header_of(addr)).type_id() }, tid);
+        assert_eq!(gc.freeze_count(), n);
+        gc.unfreeze();
+        assert_eq!(gc.freeze_count(), 0);
     }
 
     // incminimark gates the write barrier solely on GCFLAG_TRACK_YOUNG_PTRS:
