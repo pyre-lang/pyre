@@ -117,7 +117,9 @@ fn resolve_types_inner(
         for op in &block.operations {
             if let Some(result_var) = op.result.as_ref() {
                 let inferred = infer_concrete_from_op(&op.kind, raw_alloc_flavor_structs);
-                if inferred != ConcreteType::Unknown {
+                if inferred != ConcreteType::Unknown
+                    && FunctionGraph::concretetype_of(result_var) != ConcreteType::Void
+                {
                     // The op carries authoritative result kind (post-
                     // jtransform `float_*` rewrite, explicit Call /
                     // FieldRead / etc. result_ty).  Override any
@@ -125,7 +127,9 @@ fn resolve_types_inner(
                     // UnaryOp result to Int, which would shadow a later
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
-                    // rewrite arm.
+                    // rewrite arm. A spelled `null_fn` dest is already
+                    // `NoneRepr` Void (`fn_null_constant`); Call
+                    // `result_ty` Int is the surface bank.
                     commit_concretetype(result_var, inferred);
                 }
                 seed_raw_ptr_cast_source(&op.kind, raw_alloc_flavor_structs);
@@ -496,6 +500,11 @@ fn concrete_from_annotation(
             return Ok(ConcreteType::Signed);
         }
     }
+    // `SomeNone.rtyper_makerepr` is `NoneRepr` (`rnone.py`);
+    // `NoneRepr.lowleveltype` is `Void`.
+    if matches!(s, SomeValue::None_(_)) {
+        return Ok(ConcreteType::Void);
+    }
     // `rptr.py` `SomePtr.rtyper_makerepr` → `PtrRepr(self.ll_ptrtype)`:
     // the concretetype of a SomePtr value IS `ll_ptrtype`.
     // `history.py` `getkind`: a Ptr whose `TO._gckind == 'raw'` is `"int"`,
@@ -730,10 +739,11 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
 }
 
 /// Copy `Ptr(FuncType)` stamps along Value links onto phi dests.
-/// `insert_link_conversions` converts into the dest repr; the dest of
-/// an `Option<fn>` / `fn` value is `FunctionsPBCRepr.lowleveltype`.
-/// A spelled `null_fn` annotates as `s_None`; without this copy the
-/// skip-path overlay is `GcRef`.
+/// `insert_link_conversions` converts into the dest repr; a function-PBC
+/// dest (`can_be_None` included) is `FunctionsPBCRepr.lowleveltype`.
+/// A spelled `null_fn` dest is `NoneRepr` Void (`fn_null_constant`);
+/// `copy_fn_ptr_concretetype` does not copy that. A phi that only
+/// receives the spelled null follows its annotation (`s_None` → Void).
 fn propagate_fn_ptr_stamps(graph: &FunctionGraph) {
     let mut changed = true;
     while changed {

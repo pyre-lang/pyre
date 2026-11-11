@@ -59,7 +59,7 @@
 //! `ConcreteType` on demand.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -246,17 +246,34 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
     if let Some(s) = legacy_var.annotation.borrow().as_ref() {
         *var.annotation.borrow_mut() = Some(s.clone());
     }
-    // `stamp_fn_ptr` lives on the legacy dest. `setconcretetype` keeps
-    // that `Ptr(FuncType)` when `bindingrepr` is `NoneRepr` Void
-    // (`s_None` of a spelled `fn`); without the copy the twin is
-    // unstamped and dual-gate reports `legacy=Signed, real=Void`.
+    // Live fn dests carry `Ptr(FuncType)` (`FunctionsPBCRepr.lowleveltype`);
+    // copy that stamp onto the twin. A spelled `null_fn` dest is
+    // `NoneRepr` Void (`fn_null_constant`) and is not a fn-ptr, so this
+    // copy is a no-op (`copy_fn_ptr_concretetype`).
     crate::model::FunctionGraph::copy_fn_ptr_concretetype(legacy_var, &var);
     var
 }
 
-/// `stamp_fn_ptr` on fn-typed Inputs, spelled `null_fn` dests, then
-/// copy onto phi dests (`propagate_fn_ptr_stamps`). Twins inherit the
-/// stamp through [`seed_variable`].
+/// Same spelling-shape check [`derive_subject_inputcells`] uses to
+/// seed `Option<fn>` as `s_None` and a bare `fn` as Impossible.
+/// Shared with `fn_ptr_annotation_incoming`.
+pub(crate) fn fn_ptr_input_seeds_s_none(root: &str) -> bool {
+    majit_ir::descr::option_payload_spelling(root)
+        .is_some_and(crate::annotator::bookkeeper::is_fn_type_spelling)
+}
+
+/// `stamp_fn_ptr` on fn-typed Inputs and untyped `null_fn` dests
+/// (`FunctionsPBCRepr.lowleveltype` / `ann_nullptr` `SomePtr`).
+///
+/// A fn-spelled `OpKind::Input` takes the same seed
+/// [`derive_subject_inputcells`] does: a bare `fn` is Impossible and
+/// keeps `Ptr(FuncType)` (`FunctionsPBCRepr.lowleveltype`);
+/// `Option<fn>` is `s_None` and stamps `NoneRepr` Void
+/// (`rnone.py` `NoneRepr.lowleveltype`; `rtyper.py` `getrepr` of
+/// `SomeNone`). A spelled `null_fn` dest is `NoneRepr` Void
+/// (`fn_null_constant`). Copy `Ptr(FuncType)` onto phi dests that
+/// receive a live fn (`propagate_fn_ptr_stamps`). Twins inherit
+/// the stamp through [`seed_variable`].
 fn stamp_fn_ptr_legacy_dests(legacy: &FunctionGraph) {
     use crate::model::ValueType;
     for block in &legacy.blocks {
@@ -272,11 +289,15 @@ fn stamp_fn_ptr_legacy_dests(legacy: &FunctionGraph) {
                 } if crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(root, None)
                     .is_some() =>
                 {
-                    crate::front::mir::stamp_fn_ptr_spelling(
-                        dest,
-                        root,
-                        crate::ErrorCarrierSpec::default(),
-                    );
+                    if fn_ptr_input_seeds_s_none(root) {
+                        dest.set_concretetype(Some(LowLevelType::Void));
+                    } else {
+                        crate::front::mir::stamp_fn_ptr_spelling(
+                            dest,
+                            root,
+                            crate::ErrorCarrierSpec::default(),
+                        );
+                    }
                 }
                 OpKind::Call {
                     target,
@@ -288,18 +309,25 @@ fn stamp_fn_ptr_legacy_dests(legacy: &FunctionGraph) {
                     Some(["core", "ptr", "null_fn"])
                 ) =>
                 {
-                    let spelling = args
+                    // A ByteStr spelling is `fn_null_constant` → `s_None`
+                    // (`NoneRepr` Void). Empty args are untyped
+                    // `ptr::null_fn()` (`ann_nullptr` `SomePtr`).
+                    if args
                         .first()
                         .and_then(|a| match a {
                             LinkArg::Const(c) => c.value.as_pystr(),
                             _ => None,
                         })
-                        .unwrap_or("fn");
-                    crate::front::mir::stamp_fn_ptr_spelling(
-                        dest,
-                        spelling,
-                        crate::ErrorCarrierSpec::default(),
-                    );
+                        .is_some()
+                    {
+                        dest.set_concretetype(Some(LowLevelType::Void));
+                    } else {
+                        crate::front::mir::stamp_fn_ptr_spelling(
+                            dest,
+                            "fn",
+                            crate::ErrorCarrierSpec::default(),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -6105,7 +6133,7 @@ pub(crate) fn derive_subject_inputcells(
                 )
                 .is_some()
             {
-                if crate::annotator::bookkeeper::spelling_is_option_fn(root) {
+                if fn_ptr_input_seeds_s_none(root) {
                     cells.push(crate::annotator::model::s_none());
                 } else {
                     cells.push(crate::annotator::model::SomeValue::Impossible);
@@ -7008,6 +7036,83 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     seen
 }
 
+/// Value ids of `{vtable}` `method_*` FieldRead results that must not
+/// become flowspace ops.
+///
+/// The annotator never sees a vtable-slot projection: a method call is
+/// `getattr(instance, name)` then `simple_call` (`unaryop.py`
+/// `SomeInstance.getattr`; `rclass.py` / `rpbc.py` mint the vtable read
+/// during rtyping). The family-keyed `IndirectCall` arm already drops
+/// `funcptr` and re-derives the method from the receiver, so a slot
+/// FieldRead whose only uses are those `funcptr` operands is dead at
+/// this level. Any other use (another op operand, a `Link.arg`, an
+/// `exitswitch`) keeps the current FieldRead translation.
+fn vtable_method_slot_reads_dropped_at_annotator(legacy: &FunctionGraph) -> HashSet<u64> {
+    let mut candidates: HashSet<u64> = HashSet::new();
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            if let (Some(result), OpKind::FieldRead { field, .. }) = (op.result.as_ref(), &op.kind)
+                && field.is_vtable_method_slot()
+            {
+                candidates.insert(result.id());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut other_use: HashSet<u64> = HashSet::new();
+    let mut mark = |var: &Variable| {
+        let id = var.id();
+        if candidates.contains(&id) {
+            other_use.insert(id);
+        }
+    };
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::IndirectCall {
+                    args,
+                    family_key: Some(_),
+                    ..
+                } => {
+                    for arg in args {
+                        mark(arg);
+                    }
+                }
+                kind => {
+                    for var in crate::inline::op_variable_refs(kind) {
+                        mark(&var);
+                    }
+                }
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => mark(var),
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    mark(arg);
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let Some(var) = arg.as_variable() {
+                    mark(var);
+                }
+            }
+            for extra in [&link.last_exception, &link.last_exc_value] {
+                if let Some(var) = extra.as_ref().and_then(LinkArg::as_variable) {
+                    mark(var);
+                }
+            }
+        }
+    }
+    candidates.retain(|id| !other_use.contains(id));
+    candidates
+}
+
 /// `RPythonTyper.specialize`'s per-graph entry: build the flowspace view of one
 /// legacy graph.
 ///
@@ -7104,9 +7209,13 @@ fn function_graph_to_flowspace_inner(
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
 
     // Skip-path Input / `null_fn` dests have no MIR `stamp_fn_ptr`.
-    // Stamp `Ptr(FuncType)` before twins are allocated so
-    // `setconcretetype` can keep it when the annotation is `s_None`.
+    // Stamp the seed's repr before twins are allocated
+    // (`FunctionsPBCRepr.lowleveltype` / `NoneRepr` Void).
     stamp_fn_ptr_legacy_dests(legacy);
+
+    // `{vtable}` `method_*` FieldReads that only feed a family-keyed
+    // `IndirectCall.funcptr` have no annotator-level spelling.
+    let dropped_vtable_method_reads = vtable_method_slot_reads_dropped_at_annotator(legacy);
 
     // `remove_dead_blocks` reachable set — blocks not reachable from
     // `startblock` are dropped from every pass below alongside the
@@ -7488,6 +7597,7 @@ fn function_graph_to_flowspace_inner(
             if let Some(result_var) = legacy_op.result.as_ref()
                 && !value_map.contains_key(result_var)
                 && !matches!(legacy_op.kind, OpKind::Abort { .. })
+                && !dropped_vtable_method_reads.contains(&result_var.id())
             {
                 // The op result is `result_var`'s sole definition site, so
                 // its freshly-seeded flowspace Variable is the authority for
@@ -7511,6 +7621,15 @@ fn function_graph_to_flowspace_inner(
                     .push(var.clone());
                 value_to_var.insert(result_var.clone(), var.clone());
                 value_map.insert(result_var.clone(), Hlvalue::Variable(var));
+            }
+            // The family-keyed IndirectCall arm drops `funcptr`; do not
+            // emit `getattr(FatMeta, "method_*")` for that dead slot.
+            if let (Some(result_var), OpKind::FieldRead { field, .. }) =
+                (legacy_op.result.as_ref(), &legacy_op.kind)
+                && field.is_vtable_method_slot()
+                && dropped_vtable_method_reads.contains(&result_var.id())
+            {
+                continue;
             }
             // RPython has one list model for Rust fixed arrays, slices, and
             // Vec values.  Rebuild the front-end's exact Array ctor +
@@ -8943,6 +9062,33 @@ mod tests {
             "Int + class_root Option<fn> must seed s_None, got {:?}",
             cells[0],
         );
+    }
+
+    #[test]
+    fn stamp_fn_ptr_legacy_dests_option_fn_input_is_void() {
+        for class_root in ["Option<fn>", "Option<fn() -> i64>"] {
+            let mut graph = LegacyGraph::new("takes_option_fn");
+            let entry = graph.startblock;
+            let f_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "func".to_string(),
+                        ty: ValueType::Int,
+                        class_root: Some(class_root.to_string()),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, f_var.clone());
+            stamp_fn_ptr_legacy_dests(&graph);
+            assert_eq!(
+                f_var.concretetype(),
+                Some(LowLevelType::Void),
+                "{class_root} Input seeded s_None is NoneRepr Void, got {:?}",
+                f_var.concretetype(),
+            );
+        }
     }
 
     #[test]
@@ -13601,11 +13747,11 @@ mod tests {
         let bk = registry.bookkeeper().clone();
         bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
         let _ = bk.intern_class_by_qualname("pyre_interpreter::error::PyError");
-        bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "PyError".to_string(),
-            overrides: String::new(),
-            variants: vec!["X".to_string()],
-        }]);
+        bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint::new(
+            "PyError",
+            "",
+            vec!["X".to_string()],
+        )]);
         assert!(bk.exception_class_base("PyError").is_some());
 
         let mut graph = LegacyGraph::new("_trace");
@@ -15184,6 +15330,167 @@ mod tests {
             translate_op(&meta_op, &value_map, &empty_call_registry()).expect("dyn-fat meta");
         let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
         assert_eq!(names, vec!["getattr", "getitem"]);
+    }
+
+    fn getattr_attr_bytes(op: &crate::flowspace::model::SpaceOperation) -> Option<&[u8]> {
+        if op.opname != "getattr" {
+            return None;
+        }
+        match op.args.get(1) {
+            Some(Hlvalue::Constant(c)) => match &c.value {
+                ConstValue::ByteStr(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A `{vtable}` `method_x` FieldRead that only feeds a family-keyed
+    /// `IndirectCall.funcptr` is dead at the annotator: `unaryop.py`
+    /// `SomeInstance.getattr` never sees the slot. The IndirectCall arm
+    /// already drops `funcptr` and emits `getattr(receiver, "x")`.
+    #[test]
+    fn function_graph_to_flowspace_drops_vtable_method_fieldread_used_only_as_family_keyed_funcptr()
+    {
+        let mut graph = LegacyGraph::new("vtable_method_fieldread_funcptr_only");
+        let vars = mint_vars(&mut graph, 5);
+        let receiver = vars[1].clone();
+        let vtable_word = vars[2].clone();
+        let method_ptr = vars[3].clone();
+        let call_result = vars[4].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(method_ptr.clone()),
+                    kind: OpKind::FieldRead {
+                        base: vtable_word,
+                        field: crate::model::FieldDescriptor::new(
+                            "method_x",
+                            Some("Handler::{vtable}".into()),
+                        ),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(call_result.clone()),
+                    kind: OpKind::IndirectCall {
+                        funcptr: method_ptr,
+                        args: vec![receiver],
+                        graphs: None,
+                        family_key: Some(("Handler".to_string(), "x".to_string())),
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(call_result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![call_result],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("family-keyed dyn dispatch must adapt");
+        let ops = flow_ops(&output);
+        assert!(
+            !ops.iter()
+                .any(|op| getattr_attr_bytes(op) == Some(b"method_x")),
+            "vtable slot FieldRead must not reach the annotator as getattr(method_x): {ops:?}"
+        );
+        let getattr = ops
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .expect("dyn dispatch getattr(receiver, \"x\")");
+        assert_eq!(getattr_attr_bytes(getattr), Some(&b"x"[..]));
+        let graph = output.graph.borrow();
+        let start = graph.startblock.borrow();
+        assert_eq!(
+            getattr.args[0], start.inputargs[0],
+            "getattr receiver must be the IndirectCall args[0] instance"
+        );
+        let names: Vec<&str> = ops.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "simple_call"]);
+    }
+
+    /// The same vtable-slot FieldRead stays translated when its result
+    /// also leaves the block as a `Link.arg`.
+    #[test]
+    fn function_graph_to_flowspace_keeps_vtable_method_fieldread_used_as_link_arg() {
+        let mut graph = LegacyGraph::new("vtable_method_fieldread_link_arg");
+        let vars = mint_vars(&mut graph, 5);
+        let receiver = vars[1].clone();
+        let vtable_word = vars[2].clone();
+        let method_ptr = vars[3].clone();
+        let call_result = vars[4].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(method_ptr.clone()),
+                    kind: OpKind::FieldRead {
+                        base: vtable_word,
+                        field: crate::model::FieldDescriptor::new(
+                            "method_x",
+                            Some("Handler::{vtable}".into()),
+                        ),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(call_result),
+                    kind: OpKind::IndirectCall {
+                        funcptr: method_ptr.clone(),
+                        args: vec![receiver],
+                        graphs: None,
+                        family_key: Some(("Handler".to_string(), "x".to_string())),
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(method_ptr.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![method_ptr],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("link-arg use keeps the FieldRead translation");
+        let ops = flow_ops(&output);
+        assert!(
+            ops.iter()
+                .any(|op| getattr_attr_bytes(op) == Some(b"method_x")),
+            "FieldRead used as a link arg must still lower to getattr(method_x): {ops:?}"
+        );
     }
 
     #[test]

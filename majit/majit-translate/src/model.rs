@@ -10268,7 +10268,13 @@ impl FunctionGraph {
     ) -> crate::flowspace::model::Variable {
         let res = self.alloc_value_var();
         let args = match spelling {
-            Some(s) if !s.is_empty() => vec![LinkArg::from(ConstValue::byte_str(s))],
+            Some(s) if !s.is_empty() => {
+                // `fn_null_constant` of a spelling is `s_None`;
+                // `NoneRepr.lowleveltype` is `Void` (`rnone.py`).
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                res.set_concretetype(Some(LowLevelType::Void));
+                vec![LinkArg::from(ConstValue::byte_str(s))]
+            }
             _ => crate::model::call_args(vec![]),
         };
         self.block_mut(block).operations.push(SpaceOperation {
@@ -10377,10 +10383,11 @@ impl FunctionGraph {
     }
 
     /// Copy a `Ptr(FuncType)` stamp (`stamp_fn_ptr` /
-    /// `FunctionsPBCRepr.lowleveltype`) onto a phi dest. `s_None` of a
-    /// spelled `fn` noneifies a function-PBC; without the stamp the
-    /// skip-path overlay is `GcRef` (`somevalue_to_valuetype` of
-    /// `SomeNone`).
+    /// `FunctionsPBCRepr.lowleveltype`) onto a phi dest. A spelled
+    /// `null_fn` dest is `NoneRepr` Void and is not copied. A phi
+    /// whose annotation is a function PBC (`can_be_None`) keeps this
+    /// pointer; a phi that only receives the spelled null follows
+    /// `s_None` (`Void`).
     pub(crate) fn copy_fn_ptr_concretetype(
         src: &crate::flowspace::model::Variable,
         dst: &crate::flowspace::model::Variable,

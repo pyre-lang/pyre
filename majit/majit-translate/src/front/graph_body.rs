@@ -13,8 +13,11 @@
 //! That requires the LLBC set to stay alive past the whole-program build,
 //! which is what a [`GraphBodyProvider`] owns.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+
+use crate::front::clause_spec::{CrateView, CrossCrateLookup};
 
 use majit_charon_reader::Llbc;
 
@@ -67,6 +70,42 @@ struct ProviderTables {
     /// Where every crate logs a declaration whose body did not lower; the
     /// pipeline reports it once the bodies it builds are built.
     skipped: mir::LoweringSkips,
+    /// Artefacts of this program, held as `Weak` so a crate's state can
+    /// point at the same registry without an `Rc` cycle. Identity of a
+    /// FunDecl across artefacts is its `name_path` (`bookkeeper.py`
+    /// `getdesc` / `FunctionDesc.cachedgraph` on the defining funcobj).
+    cross: Rc<CrossCrateSpec>,
+}
+
+/// Loaded crates of one `GraphBodyProvider`, for Opaque-import
+/// specialization (`specialize.py` `default_specialize` / `argtype`).
+struct CrossCrateSpec {
+    crates: RefCell<Vec<Weak<ProvidedCrate>>>,
+}
+
+impl CrossCrateSpec {
+    fn register(&self, krate: Weak<ProvidedCrate>) {
+        self.crates.borrow_mut().push(krate);
+    }
+}
+
+impl CrossCrateLookup for CrossCrateSpec {
+    fn with_crates(&self, f: &mut dyn FnMut(&[CrateView<'_>])) {
+        let strong: Vec<Rc<ProvidedCrate>> = self
+            .crates
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let views: Vec<CrateView<'_>> = strong
+            .iter()
+            .map(|krate| CrateView {
+                llbc: &krate.llbc,
+                spec: krate.state.spec_queue(),
+            })
+            .collect();
+        f(&views);
+    }
 }
 
 /// One lowered crate: its artefact and the lowering state its decls were
@@ -134,6 +173,9 @@ impl GraphBodyProvider {
             func_hints,
             declarations,
             skipped,
+            cross: Rc::new(CrossCrateSpec {
+                crates: RefCell::new(Vec::new()),
+            }),
         };
         Self {
             crates: Vec::new(),
@@ -174,7 +216,7 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
-        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let krate = self.wrap_crate(llbc, state);
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -212,7 +254,7 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
-        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let krate = self.wrap_crate(llbc, state);
         let functions = self.declare_crate(&krate, None, Some(&function_filter));
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -223,6 +265,18 @@ impl GraphBodyProvider {
         );
         self.crates.push(krate);
         program
+    }
+
+    fn wrap_crate(&self, llbc: Llbc, mut state: CrateLoweringState) -> Rc<ProvidedCrate> {
+        state.attach_cross_crate(self.tables.cross.clone());
+        let krate = Rc::new(ProvidedCrate { llbc, state });
+        self.tables.cross.register(Rc::downgrade(&krate));
+        krate
+    }
+
+    #[cfg(test)]
+    fn declared_funcobjs(&self) -> Vec<DeclaredFuncObj> {
+        self.tables.declarations.snapshot()
     }
 
     /// A funcobj per declaration of `krate` the membership gates admit,
@@ -257,7 +311,7 @@ impl GraphBodyProvider {
                     let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
                     let graph = LazyGraph::deferred(declared.clone(), move || {
                         let graph = krate.build_decl_graph(&tables, def_id, &stamp, &declared);
-                        krate.declare_queued_specs(&tables);
+                        tables.declare_all_queued();
                         graph
                     });
                     Some(header.into_semantic(graph))
@@ -337,22 +391,43 @@ impl GraphBodyProvider {
                 fd.item_meta.name_path()
             )));
         };
-        krate.declare_queued_specs(&self.tables);
+        self.tables.declare_all_queued();
         Ok(header.into_semantic(LazyGraph::built(graph)))
     }
 }
 
-impl ProvidedCrate {
-    /// Declare the clause specializations the bodies built so far queued,
-    /// in queue order.
-    fn declare_queued_specs(self: &Rc<Self>, tables: &Rc<ProviderTables>) {
-        while let Some(req) = self.lowering(tables, |lowering| lowering.pop_spec()) {
-            if let Some(spec) = self.declare_spec(tables, req) {
-                tables.declarations.push(spec);
+impl ProviderTables {
+    /// Declare every queued clause specialization across the loaded
+    /// crates. A caller body may enqueue on a dependency's queue
+    /// (`FunctionDesc.cachedgraph` of the defining funcobj); draining
+    /// only the crate that just built would leave that spec undeclared.
+    fn declare_all_queued(self: &Rc<Self>) {
+        loop {
+            let crates: Vec<Rc<ProvidedCrate>> = self
+                .cross
+                .crates
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            if crates
+                .iter()
+                .all(|krate| krate.state.spec_queue().borrow().is_empty())
+            {
+                break;
+            }
+            for krate in &crates {
+                while let Some(req) = krate.lowering(self, |lowering| lowering.pop_spec()) {
+                    if let Some(spec) = krate.declare_spec(self, req) {
+                        self.declarations.push(spec);
+                    }
+                }
             }
         }
     }
+}
 
+impl ProvidedCrate {
     /// The funcobj of the clause specialization `req`, its graph unbuilt.
     /// `None`, recorded, when its body does not substitute.
     fn declare_spec(
@@ -367,7 +442,7 @@ impl ProvidedCrate {
             let (krate, tables, body) = (self.clone(), tables.clone(), spec.body.clone());
             let graph = LazyGraph::deferred(declared.clone(), move || {
                 let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body))?;
-                krate.declare_queued_specs(&tables);
+                tables.declare_all_queued();
                 let mut graph = stamp_declared(&stamp, graph, &declared);
                 // A spec that folded the const has no sentinel and stays
                 // look-inside. One that still passes it is the template.
@@ -524,7 +599,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::model::FunctionGraph;
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
 
     const CORPUS: &str = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
 
@@ -788,5 +863,270 @@ mod tests {
                 "{name} graph hints"
             );
         }
+    }
+
+    /// Two call sites of an Opaque-imported generic, at i64 and String,
+    /// name two `__spec_` graphs declared on the defining crate
+    /// (`specialize.py` `default_specialize` / `FunctionDesc.cachedgraph`).
+    #[test]
+    fn opaque_import_specs_are_declared_on_the_defining_crate() {
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        );
+        provider.lower_named_for_test(defining_cast_llbc(), &["cast"]);
+        let caller = provider.lower_named_for_test(caller_cast_llbc(), &["use_i64", "use_string"]);
+        assert_eq!(caller.functions.len(), 2, "caller funcobjs");
+        for function in &caller.functions {
+            let _ = function.graph();
+        }
+        let declared = provider.declared_funcobjs();
+        let specs: Vec<_> = declared
+            .iter()
+            .filter(|decl| decl.path.segments.iter().any(|seg| seg.contains("__spec_")))
+            .collect();
+        assert_eq!(
+            specs.len(),
+            2,
+            "expected two __spec_ graphs, got {:?}",
+            declared
+                .iter()
+                .map(|decl| decl.path.segments.join("::"))
+                .collect::<Vec<_>>()
+        );
+        let mut kinds = Vec::new();
+        for spec in &specs {
+            let graph = spec
+                .graph
+                .get()
+                .unwrap_or_else(|| panic!("{} did not build", spec.path.segments.join("::")));
+            let kind = graph_return_kind(graph);
+            assert!(
+                kind == "Int" || kind == "Ref",
+                "{} return kind {kind} return_type {:?}",
+                spec.path.segments.join("::"),
+                graph.return_type,
+            );
+            kinds.push(kind);
+        }
+        kinds.sort();
+        assert_eq!(kinds, ["Int", "Ref"]);
+        let spec_names: Vec<String> = specs
+            .iter()
+            .map(|decl| decl.path.segments.join("::"))
+            .collect();
+        for function in &caller.functions {
+            let called = call_paths(function.graph());
+            assert!(
+                called.iter().any(|path| spec_names.iter().any(|spec| {
+                    path == spec || path.rsplit("::").next() == spec.rsplit("::").next()
+                })),
+                "{} did not name a defining-crate spec; calls {called:?} specs {spec_names:?}",
+                function.name
+            );
+        }
+    }
+
+    fn graph_return_kind(graph: &FunctionGraph) -> &'static str {
+        use crate::model::ValueType;
+        let mut saw_int = false;
+        let mut saw_ref = false;
+        for op in &graph.block(graph.startblock).operations {
+            if let OpKind::Input { ty, .. } = &op.kind {
+                match ty {
+                    ValueType::Int | ValueType::Unsigned | ValueType::Bool => saw_int = true,
+                    ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => saw_ref = true,
+                    ValueType::Void => {}
+                    _ => {}
+                }
+            }
+        }
+        if saw_int && !saw_ref {
+            "Int"
+        } else if saw_ref && !saw_int {
+            "Ref"
+        } else if graph.return_is_str {
+            "Ref"
+        } else if graph.return_type.as_deref() == Some("i64") {
+            "Int"
+        } else {
+            "mixed"
+        }
+    }
+
+    fn call_paths(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.join("::")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn defining_cast_llbc() -> Llbc {
+        Llbc::from_slice(cast_defining_json().as_bytes()).expect("defining cast llbc")
+    }
+
+    fn caller_cast_llbc() -> Llbc {
+        Llbc::from_slice(cast_caller_json().as_bytes()).expect("caller cast llbc")
+    }
+
+    fn cast_defining_json() -> String {
+        use serde_json::json;
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str], local: bool| {
+            json!({
+                "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": local
+            })
+        };
+        let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
+        let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| json!({"index": index, "name": name, "span": span, "ty": ty});
+        let file = json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "defn",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["defn", "cast"], true),
+                    "signature": {"is_unsafe": false, "inputs": [tvar], "output": tvar},
+                    "generics": {
+                        "regions": [],
+                        "types": [{"index": 0, "name": "T"}],
+                        "const_generics": [],
+                        "trait_clauses": []
+                    },
+                    "body": {"Unstructured": {
+                        "span": span,
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [local(0, None, &tvar), local(1, Some("v"), &tvar)]
+                        },
+                        "body": [{
+                            "statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &tvar),
+                                    {"Use": [{"Read": place(1, &tvar)}, "Yes"]}
+                                ]}
+                            }],
+                            "kind": "Regular",
+                            "terminator": {"span": span, "kind": "Return"}
+                        }]
+                    }}
+                }],
+                "global_decls": [],
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["alloc", "string", "String"], false),
+                    "kind": "Opaque",
+                    "src": "Normal"
+                }],
+                "trait_decls": [],
+                "trait_impls": [],
+                "files": []
+            }
+        });
+        file.to_string()
+    }
+
+    fn cast_caller_json() -> String {
+        use serde_json::json;
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str], local: bool| {
+            json!({
+                "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": local
+            })
+        };
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let string_ty = json!({"Adt": {"id": 1, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
+        let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
+        let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| json!({"index": index, "name": name, "span": span, "ty": ty});
+        let call_cast = |id: u64, name: &str, ty: &serde_json::Value| {
+            json!({
+                "def_id": id,
+                "item_meta": meta(&["caller", name], true),
+                "signature": {"is_unsafe": false, "inputs": [ty], "output": ty},
+                "body": {"Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [local(0, None, ty), local(1, Some("v"), ty)]
+                    },
+                    "body": [
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 0},
+                                    "generics": {"regions": [], "types": [ty], "const_generics": [], "trait_refs": []}
+                                }},
+                                "args": [{"Read": place(1, ty)}]
+                            },
+                            "dest": place(0, ty),
+                            "target": 2,
+                            "on_unwind": 1
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
+                    ]
+                }}
+            })
+        };
+        let file = json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "caller",
+                "fun_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(&["defn", "cast"], false),
+                        "signature": {"is_unsafe": false, "inputs": [tvar], "output": tvar},
+                        "generics": {
+                            "regions": [],
+                            "types": [{"index": 0, "name": "T"}],
+                            "const_generics": [],
+                            "trait_clauses": []
+                        },
+                        "body": "Opaque"
+                    },
+                    call_cast(1, "use_i64", &i64_ty),
+                    call_cast(2, "use_string", &string_ty)
+                ],
+                "global_decls": [],
+                "type_decls": [
+                    null,
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(&["alloc", "string", "String"], false),
+                        "kind": "Opaque",
+                        "src": "Normal"
+                    }
+                ],
+                "trait_decls": [],
+                "trait_impls": [],
+                "files": []
+            }
+        });
+        file.to_string()
     }
 }

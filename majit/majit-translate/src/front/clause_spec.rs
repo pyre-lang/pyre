@@ -13,9 +13,10 @@
 //! including a look-inside generic whose body names no `Clause`.
 //! The unspecialized body is left unchanged.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
-use majit_charon_reader::ullbc::{Signature, TyRef, duplicate_return};
+use majit_charon_reader::ullbc::{Signature, TyRef, TypeDecl, TypeDeclKind, duplicate_return};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -72,6 +73,298 @@ impl SpecQueue {
     pub(crate) fn pop(&mut self) -> Option<SpecRequest> {
         self.pending.pop_front()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// One loaded artefact the cross-crate spec walk can name.
+///
+/// `bookkeeper.py` `Bookkeeper.getdesc` keys a descriptor by the function
+/// object. Charon splits that object across artefacts: the defining crate
+/// carries the `Unstructured` body, a caller crate carries an `Opaque`
+/// import of the same `name_path`. The view is that object's defining
+/// crate: its LLBC tables, and the `SpecQueue` (`FunctionDesc.cachedgraph`)
+/// that crate owns.
+pub(crate) struct CrateView<'a> {
+    pub llbc: &'a Llbc,
+    pub spec: &'a RefCell<SpecQueue>,
+}
+
+/// The loaded artefacts of one program. `GraphBodyProvider` implements
+/// this; the `lower_all` path leaves it unset so an Opaque import stays
+/// unspecialized, as it did before.
+pub(crate) trait CrossCrateLookup {
+    fn with_crates(&self, f: &mut dyn FnMut(&[CrateView<'_>]));
+}
+
+/// The unique local `Unstructured` FunDecl whose `name_path` is `path`.
+/// `None` when no crate carries it, or more than one does: binding the
+/// wrong body is silent, a miss is not (`source_for_name_path`).
+pub(crate) fn unique_local_unstructured<'a>(
+    crates: &[CrateView<'a>],
+    path: &str,
+) -> Option<(usize, &'a FunDecl)> {
+    let mut found = None;
+    for (i, krate) in crates.iter().enumerate() {
+        for fd in krate.llbc.iter_fun_decls() {
+            if !fd.item_meta.is_local {
+                continue;
+            }
+            if fd.item_meta.name_path_str() != path {
+                continue;
+            }
+            if !decl_has_unstructured_body(fd) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((i, fd));
+        }
+    }
+    found
+}
+
+/// Rewrite call-site generic arguments so their Deduplicated / TraitImpl /
+/// ADT ids index `to`'s tables. `from` is the caller crate that spelled
+/// the arguments. A type or impl with no counterpart in `to` is resolved
+/// through the crate that defines that item; a substitution that still
+/// cannot be expressed in `to` is `Err`.
+pub(crate) fn remap_generics_to_llbc(
+    from: &Llbc,
+    to: &Llbc,
+    crates: &[CrateView<'_>],
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>), &'static str> {
+    let mut trait_refs = trait_refs.to_vec();
+    let mut types = types.to_vec();
+    let mut const_generics = const_generics.to_vec();
+    for tref in &mut trait_refs {
+        remap_value(tref, from, to, crates, Space::TraitRef, 0)?;
+    }
+    for ty in &mut types {
+        remap_value(ty, from, to, crates, Space::Ty, 0)?;
+    }
+    for cg in &mut const_generics {
+        remap_value(cg, from, to, crates, Space::Const, 0)?;
+    }
+    Ok((trait_refs, types, const_generics))
+}
+
+fn remap_value(
+    v: &mut Value,
+    from: &Llbc,
+    to: &Llbc,
+    crates: &[CrateView<'_>],
+    space: Space,
+    depth: usize,
+) -> Result<(), &'static str> {
+    if depth > 32 {
+        return Err("remap-depth");
+    }
+    if let Some(body) = indirect_body(v, from, space) {
+        *v = body;
+        return remap_value(v, from, to, crates, space, depth + 1);
+    }
+    match v {
+        Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                remap_value(item, from, to, crates, space.element(None, i), depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(_) => remap_object(v, from, to, crates, space, depth),
+        _ => Ok(()),
+    }
+}
+
+fn remap_object(
+    v: &mut Value,
+    from: &Llbc,
+    to: &Llbc,
+    crates: &[CrateView<'_>],
+    space: Space,
+    depth: usize,
+) -> Result<(), &'static str> {
+    if space == Space::Ty && v.get("Adt").is_some() {
+        match remap_adt(from, to, crates, v.get("Adt").unwrap())? {
+            AdtRemap::Keep => {}
+            AdtRemap::Id(id) => {
+                v["Adt"]["id"] = Value::from(id);
+            }
+            AdtRemap::Expand(ty) => {
+                *v = ty;
+                return remap_value(v, from, to, crates, Space::Ty, depth + 1);
+            }
+        }
+    }
+    if space == Space::TraitRef {
+        if let Some(id) = v.pointer("/kind/TraitImpl/id").and_then(Value::as_u64) {
+            let new_id = remap_trait_impl_id(from, to, id)?;
+            if let Some(slot) = v
+                .get_mut("kind")
+                .and_then(Value::as_object_mut)
+                .and_then(|kind| kind.get_mut("TraitImpl"))
+                .and_then(Value::as_object_mut)
+            {
+                slot.insert("id".into(), Value::from(new_id));
+            }
+        }
+        remap_trait_decl_ref_id(v, from, to)?;
+    }
+    let keys: Vec<String> = v
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    for key in keys {
+        let item_space = space.field(&key);
+        if let Some(item) = v.get_mut(&key) {
+            remap_value(item, from, to, crates, item_space, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+enum AdtRemap {
+    Keep,
+    Id(u64),
+    Expand(Value),
+}
+
+fn remap_adt(
+    from: &Llbc,
+    to: &Llbc,
+    crates: &[CrateView<'_>],
+    adt: &Value,
+) -> Result<AdtRemap, &'static str> {
+    let Some(obj) = adt.as_object() else {
+        return Ok(AdtRemap::Keep);
+    };
+    match obj.get("builtin").and_then(Value::as_str) {
+        None | Some("Box") => {}
+        Some(_) => return Ok(AdtRemap::Keep),
+    }
+    let Some(id) = obj.get("id").and_then(Value::as_u64) else {
+        return Ok(AdtRemap::Keep);
+    };
+    let Some(td) = from.type_by_id(id) else {
+        return Err("remap-adt-missing-src");
+    };
+    let path = td.item_meta.name_path();
+    if let Some(dest) = unique_type_decl(to, &path) {
+        return Ok(AdtRemap::Id(dest.def_id));
+    }
+    let mut expand = None;
+    for krate in crates {
+        if std::ptr::eq(krate.llbc, to) {
+            continue;
+        }
+        let Some(found) = unique_type_decl(krate.llbc, &path) else {
+            continue;
+        };
+        match &found.kind {
+            TypeDeclKind::Alias(body) => {
+                if expand.is_some() {
+                    return Err("remap-adt-ambiguous-alias");
+                }
+                expand = Some(body.get("aliased_ty").unwrap_or(body).clone());
+            }
+            _ => return Err("remap-adt-foreign-nominal"),
+        }
+    }
+    match expand {
+        Some(ty) => Ok(AdtRemap::Expand(ty)),
+        None => Err("remap-adt-no-dest"),
+    }
+}
+
+fn remap_trait_impl_id(from: &Llbc, to: &Llbc, id: u64) -> Result<u64, &'static str> {
+    let Some(identity) = render_trait_impl(from, id) else {
+        return Err("remap-impl-src");
+    };
+    unique_trait_impl(to, &identity).ok_or("remap-impl-no-dest")
+}
+
+fn remap_trait_decl_ref_id(v: &mut Value, from: &Llbc, to: &Llbc) -> Result<(), &'static str> {
+    let Some(decl) = v.get_mut("trait_decl_ref") else {
+        return Ok(());
+    };
+    let inner = if decl.get("skip_binder").is_some() {
+        decl.get_mut("skip_binder").unwrap()
+    } else {
+        decl
+    };
+    let Some(id) = inner.get("id").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let new_id = remap_trait_decl_id(from, to, id)?;
+    if let Some(obj) = inner.as_object_mut() {
+        obj.insert("id".into(), Value::from(new_id));
+    }
+    Ok(())
+}
+
+fn remap_trait_decl_id(from: &Llbc, to: &Llbc, id: u64) -> Result<u64, &'static str> {
+    let Some(td) = from.trait_by_id(id) else {
+        return Err("remap-trait-src");
+    };
+    let path = td.item_meta.name_path();
+    unique_trait_decl(to, &path)
+        .map(|td| td.def_id)
+        .ok_or("remap-trait-no-dest")
+}
+
+fn unique_type_decl<'a>(llbc: &'a Llbc, path: &str) -> Option<&'a TypeDecl> {
+    let mut found = None;
+    for td in llbc.iter_type_decls() {
+        if td.item_meta.name_path_str() != path {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(td);
+    }
+    found
+}
+
+fn unique_trait_decl<'a>(
+    llbc: &'a Llbc,
+    path: &str,
+) -> Option<&'a majit_charon_reader::ullbc::TraitDecl> {
+    let mut found = None;
+    for td in llbc.iter_trait_decls() {
+        if td.item_meta.name_path_str() != path {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(td);
+    }
+    found
+}
+
+fn unique_trait_impl(llbc: &Llbc, identity: &str) -> Option<u64> {
+    let mut found = None;
+    for (index, _) in llbc.trait_impls_raw().iter().enumerate() {
+        let id = index as u64;
+        let Some(rendered) = render_trait_impl(llbc, id) else {
+            continue;
+        };
+        if rendered != identity {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id);
+    }
+    found
 }
 
 /// The declaration carries an `Unstructured` body in this LLBC, so there
@@ -2555,6 +2848,117 @@ mod tests {
             Value::Object(map) => map.values().any(value_has_depth0_type_var),
             _ => false,
         }
+    }
+
+    /// Caller-crate `Adt { id: 1 }` for `alloc::string::String` becomes
+    /// the defining crate's id 0 of the same `name_path`.
+    #[test]
+    fn remap_generics_rewrites_adt_id_by_name_path() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str], id: u64| {
+            json!({
+                "def_id": id,
+                "item_meta": {
+                    "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                    "span": span,
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": false
+                },
+                "kind": "Opaque",
+                "src": "Normal"
+            })
+        };
+        let llbc = |crate_name: &str, string_id: u64| {
+            let mut type_decls = vec![Value::Null; string_id as usize];
+            type_decls.push(meta(&["alloc", "string", "String"], string_id));
+            let file = json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": crate_name,
+                    "fun_decls": [],
+                    "type_decls": type_decls,
+                    "files": []
+                }
+            });
+            Llbc::from_slice(file.to_string().as_bytes()).expect("llbc")
+        };
+        let from = llbc("caller", 1);
+        let to = llbc("defn", 0);
+        let spec = RefCell::new(SpecQueue::new());
+        let crates = [
+            CrateView {
+                llbc: &from,
+                spec: &spec,
+            },
+            CrateView {
+                llbc: &to,
+                spec: &spec,
+            },
+        ];
+        let string_ty = json!({"Adt": {"id": 1, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
+        let (refs, types, consts) =
+            remap_generics_to_llbc(&from, &to, &crates, &[], &[string_ty], &[]).expect("remap");
+        assert!(refs.is_empty() && consts.is_empty());
+        assert_eq!(types[0].pointer("/Adt/id").and_then(Value::as_u64), Some(0));
+    }
+
+    /// A caller-local nominal ADT has no counterpart in the defining crate.
+    #[test]
+    fn remap_generics_declines_caller_local_nominal_adt() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_decl = |path: &[&str], id: u64, local: bool| {
+            json!({
+                "def_id": id,
+                "item_meta": {
+                    "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                    "span": span,
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": local
+                },
+                "kind": "Opaque",
+                "src": "Normal"
+            })
+        };
+        let from_file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "caller",
+                "fun_decls": [],
+                "type_decls": [Value::Null, Value::Null, Value::Null, type_decl(&["caller", "Local"], 3, true)],
+                "files": []
+            }
+        });
+        let to_file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "defn",
+                "fun_decls": [],
+                "type_decls": [type_decl(&["alloc", "string", "String"], 0, false)],
+                "files": []
+            }
+        });
+        let from = Llbc::from_slice(from_file.to_string().as_bytes()).expect("from");
+        let to = Llbc::from_slice(to_file.to_string().as_bytes()).expect("to");
+        let spec = RefCell::new(SpecQueue::new());
+        let crates = [
+            CrateView {
+                llbc: &from,
+                spec: &spec,
+            },
+            CrateView {
+                llbc: &to,
+                spec: &spec,
+            },
+        ];
+        let local_ty = json!({"Adt": {"id": 3, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
+        let err = remap_generics_to_llbc(&from, &to, &crates, &[], &[local_ty], &[])
+            .expect_err("caller-local ADT");
+        assert_eq!(err, "remap-adt-foreign-nominal");
     }
 
     fn value_has_depth0_clause(v: &Value) -> bool {

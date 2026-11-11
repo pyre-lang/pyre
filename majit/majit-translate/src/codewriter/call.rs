@@ -2281,6 +2281,31 @@ impl GraphStore {
             key: self.key_for(path)?,
         })
     }
+
+    /// Callee graphs of `caller`'s body ops, the same set
+    /// `find_all_graphs` follows (`call.py graphs_from` /
+    /// [`CallControl::call_op_callees`]).
+    pub(crate) fn body_call_callees(
+        &self,
+        caller: &CallPath,
+        builtin_wrappers: &[CallPath],
+    ) -> Vec<CallPath> {
+        let Some(graph) = self.get(caller) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                out.extend(CallControl::graphs_from_call_op(
+                    op,
+                    builtin_wrappers,
+                    |target| self.registered_direct_callee(target),
+                    |_, _| Vec::new(),
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// A funcobj's graph as its [`GraphStore`] builds it on first demand.
@@ -2340,6 +2365,11 @@ impl FuncObjDeclarations {
 
     pub(crate) fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
         self.0.borrow().get(index).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Vec<DeclaredFuncObj> {
+        self.0.borrow().clone()
     }
 }
 
@@ -3307,6 +3337,47 @@ impl StoreCore {
             return false;
         }
         self.get(path).is_some()
+    }
+
+    /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
+    fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
+        let path = match target {
+            CallTarget::FunctionPath { .. } => {
+                if crate::model::fn_const_segments(target).is_some() {
+                    return None;
+                }
+                target.function_call_path()?
+            }
+            CallTarget::Method {
+                name,
+                receiver_root,
+                resolved_path,
+                ..
+            } => {
+                if let Some(path) = resolved_path {
+                    path.clone()
+                } else if let Some(receiver) = receiver_root.as_deref() {
+                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
+                    if !self.contains_key(&qualified) {
+                        return None;
+                    }
+                    qualified
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if self.contains_key(&path) {
+            return Some(path);
+        }
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+            let stripped = path.with_segments(stripped_segs.iter().cloned());
+            if self.contains_key(&stripped) {
+                return Some(stripped);
+            }
+        }
+        None
     }
 
     /// Every registered alias spelling (one entry per `CallPath`, not per
@@ -4362,6 +4433,11 @@ pub struct CallControl {
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
+    /// BFS starting set `find_all_graphs_bfs` queued before walking:
+    /// portal graphs, helper roots, builtin wrappers, oopspec helpers,
+    /// and `helper_seed_graphs`. The two-phase prepass drives these as
+    /// entry graphs with declared seeds (`annrpython.py` `build_types`).
+    bfs_entry_roots: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
@@ -5314,6 +5390,7 @@ impl CallControl {
             bfs_policy_state: crate::policy::JitPolicyState::new(),
             bfs_look_inside_function: Box::new(|_| true),
             helper_seed_graphs: Vec::new(),
+            bfs_entry_roots: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
@@ -8821,48 +8898,155 @@ impl CallControl {
         // set `call.py graphs_from(op, is_candidate)` would
         // yield: one path for a direct call, the whole family
         // for an indirect one.
-        match &op.kind {
-            // `call.py CallControl.graphs_from` indirect_call — the attached
-            // `c_graphs` family, `None` meaning "unknown
-            // family" and classifying the site as residual.
-            OpKind::IndirectCall { graphs, .. } => match graphs {
-                Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
-                Some(graphs) => graphs.clone(),
+        if let OpKind::Call { target, args, .. } = &op.kind
+            && !matches!(target, CallTarget::Indirect { .. })
+        {
+            // `call.py CallControl.guess_call_kind` direct_call.  These three
+            // classifications are attached to the single
+            // `funcobj` and so apply to the direct branch
+            // only; an indirect family is instead validated
+            // as a whole in `getcalldescr`.
+            //
+            // `annrpython.py consider_op` never `recursivecall`s a
+            // helper whose Call `translate_op` rewrites to a
+            // high-level op (`rlist.py rtype_newlist` lowers to
+            // `gendirectcall` at rtyping) or to `str.join`
+            // (`rstr.py rtype_method_join`) when the receiver is a
+            // list of str. Empty callees is the
+            // existing no-graph path: no block, no notify, no
+            // AccessDirect copy. `find_all_graphs` still follows
+            // the graph (`call.py guess_call_kind`).
+            if !bfs_phase
+                && crate::translator::rtyper::flowspace_adapter::call_rewritten_before_recursivecall(
+                    target, args,
+                )
+            {
+                return Vec::new();
+            }
+            let callee_path = match self.direct_callee_graph_path(target, Some(caller)) {
+                Some(callee) => callee,
                 None => {
+                    // The single widest silent refusal in the
+                    // pipeline: a call whose target resolves to
+                    // no registered path at all.  Upstream has
+                    // no analogue — `funcobj.graph` is an
+                    // object reference that either exists or is
+                    // `None` (`guess_call_kind`), never a name lookup
+                    // that can miss — so a miss here means the
+                    // callee was never lowered into
+                    // `function_graphs`, not that a gate judged
+                    // it.  Every gate downstream of this point
+                    // is therefore never consulted for this
+                    // callee, which is exactly the reading that
+                    // a bare `continue` cannot support.
                     if bfs_phase {
                         crate::decline::record(
                             BFS_GATE,
-                            "indirect-family-unknown",
-                            format_args!("in {caller}"),
+                            "callee-target-unresolvable",
+                            format_args!("{target:?} in {caller}"),
                         );
                     }
-                    Vec::new()
+                    return Vec::new();
                 }
+            };
+            // `getfunctionptr(graph)`: remember the nested
+            // closure identity on the op so emit's
+            // `graphs_from` uses the same path BFS followed.
+            if bfs_phase
+                && matches!(
+                    target,
+                    CallTarget::Method {
+                        resolved_path: None,
+                        fun_decl_id: None,
+                        ..
+                    }
+                )
+            {
+                self.stamp_method_resolved_path(caller, block_idx, op_idx, callee_path.clone());
+            }
+            // `guess_call_kind` classifications apply only to the
+            // `find_all_graphs` walk; the annotator follows every
+            // call into a graph (`annrpython.py recursivecall`).
+            if bfs_phase {
+                // `call.py CallControl.guess_call_kind`
+                // jitdriver_sd_from_portal_runner_ptr → recursive.
+                if self.is_portal_recursive_call(&callee_path) {
+                    // Not a refusal — the portal is already a
+                    // candidate and re-walking it would loop —
+                    // but recorded so the BFS's skip rows add up
+                    // to every call site it saw.
+                    crate::decline::record(
+                        BFS_GATE,
+                        "callee-is-portal-recursive",
+                        format_args!("{callee_path} in {caller}"),
+                    );
+                    return Vec::new();
+                }
+                // `call.py CallControl.guess_call_kind`
+                // `_gctransformer_hint_close_stack_` → residual.
+                // `get_jitcode` asserts such a graph never
+                // reaches it, so following one here would turn
+                // a residual classification into a panic.
+                if self
+                    .func_effects(&callee_path)
+                    .is_some_and(|f| f.close_stack)
+                {
+                    crate::decline::record(
+                        BFS_GATE,
+                        "callee-close-stack-residual",
+                        format_args!("{callee_path} in {caller}"),
+                    );
+                    return Vec::new();
+                }
+                // `call.py CallControl.guess_call_kind`
+                // `hasattr(targetgraph.func, 'oopspec')` → builtin.
+                if self
+                    .func_effects_with_crate_alias(&callee_path)
+                    .is_some_and(|f| f.recorded_oopspec().is_some())
+                {
+                    crate::decline::record(
+                        BFS_GATE,
+                        "callee-oopspec-builtin",
+                        format_args!("{callee_path} in {caller}"),
+                    );
+                    return Vec::new();
+                }
+            }
+            return vec![callee_path];
+        }
+        if bfs_phase && matches!(&op.kind, OpKind::IndirectCall { graphs: None, .. }) {
+            crate::decline::record(
+                BFS_GATE,
+                "indirect-family-unknown",
+                format_args!("in {caller}"),
+            );
+        }
+        Self::graphs_from_call_op(
+            op,
+            builtin_wrappers,
+            |_| None,
+            |trait_root, method_name| self.all_impls_for_indirect(trait_root, method_name),
+        )
+    }
+
+    /// Callee graphs of one call op (`call.py graphs_from`). Direct:
+    /// `funcobj.graph`. Indirect: attached `c_graphs` family, empty
+    /// family → builtin wrappers, unknown family → residual (empty).
+    /// `CallTarget::Indirect` without `graphs` uses `resolve_indirect`
+    /// (`all_impls_for_indirect` / `rpbc.py c_graphs =
+    /// row_of_graphs.values()`).
+    fn graphs_from_call_op(
+        op: &SpaceOperation,
+        builtin_wrappers: &[CallPath],
+        resolve_direct: impl Fn(&CallTarget) -> Option<CallPath>,
+        resolve_indirect: impl Fn(&str, &str) -> Vec<CallPath>,
+    ) -> Vec<CallPath> {
+        match &op.kind {
+            OpKind::IndirectCall { graphs, .. } => match graphs {
+                Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
+                Some(graphs) => graphs.clone(),
+                None => Vec::new(),
             },
-            // Same indirect_call site, spelled the way it
-            // exists *before* `rpbc::lower_indirect_calls`
-            // rewrites it into `VtableMethodPtr` +
-            // `IndirectCall`.  That lowering runs inside
-            // `transform_graph_to_jitcode`, i.e. strictly
-            // after `find_all_graphs`, so this is the shape
-            // the BFS actually sees.
-            //
-            // This is not a second family resolver: the arm
-            // below and `lower_indirect_calls` both call
-            // `all_impls_for_indirect`, and the lowering only
-            // folds an empty answer into `graphs = None`,
-            // which the arm above skips exactly as an empty
-            // `callees` does here.  The two arms therefore
-            // enumerate the same callees
-            // (`rpbc.py c_graphs = row_of_graphs.values()`).
-            //
-            // Running the lowering before graph discovery so
-            // only the post-rtyper shape reaches the BFS would
-            // match RPython's phase order, but it forces every
-            // registered graph to be lowered up front, which is
-            // the eager pass on-demand body lowering replaced
-            // when the prepass peak RSS came down from 7.71 GB
-            // to 4.25 GB.
             OpKind::Call {
                 target:
                     CallTarget::Indirect {
@@ -8873,126 +9057,9 @@ impl CallControl {
                 ..
             } => match graphs {
                 Some(graphs) => graphs.clone(),
-                None => self.all_impls_for_indirect(trait_root, method_name),
+                None => resolve_indirect(trait_root, method_name),
             },
-            // `call.py CallControl.guess_call_kind` direct_call.  These three
-            // classifications are attached to the single
-            // `funcobj` and so apply to the direct branch
-            // only; an indirect family is instead validated
-            // as a whole in `getcalldescr`.
-            OpKind::Call { target, args, .. } => {
-                // `annrpython.py consider_op` never `recursivecall`s a
-                // helper whose Call `translate_op` rewrites to a
-                // high-level op (`rlist.py rtype_newlist` lowers to
-                // `gendirectcall` at rtyping) or to `str.join`
-                // (`rstr.py rtype_method_join`) when the receiver is a
-                // list of str. Empty callees is the
-                // existing no-graph path: no block, no notify, no
-                // AccessDirect copy. `find_all_graphs` still follows
-                // the graph (`call.py guess_call_kind`).
-                if !bfs_phase
-                    && crate::translator::rtyper::flowspace_adapter::call_rewritten_before_recursivecall(
-                        target,
-                        args,
-                    )
-                {
-                    return Vec::new();
-                }
-                let callee_path = match self.direct_callee_graph_path(target, Some(caller)) {
-                    Some(callee) => callee,
-                    None => {
-                        // The single widest silent refusal in the
-                        // pipeline: a call whose target resolves to
-                        // no registered path at all.  Upstream has
-                        // no analogue — `funcobj.graph` is an
-                        // object reference that either exists or is
-                        // `None` (`guess_call_kind`), never a name lookup
-                        // that can miss — so a miss here means the
-                        // callee was never lowered into
-                        // `function_graphs`, not that a gate judged
-                        // it.  Every gate downstream of this point
-                        // is therefore never consulted for this
-                        // callee, which is exactly the reading that
-                        // a bare `continue` cannot support.
-                        if bfs_phase {
-                            crate::decline::record(
-                                BFS_GATE,
-                                "callee-target-unresolvable",
-                                format_args!("{target:?} in {caller}"),
-                            );
-                        }
-                        return Vec::new();
-                    }
-                };
-                // `getfunctionptr(graph)`: remember the nested
-                // closure identity on the op so emit's
-                // `graphs_from` uses the same path BFS followed.
-                if bfs_phase
-                    && matches!(
-                        target,
-                        CallTarget::Method {
-                            resolved_path: None,
-                            fun_decl_id: None,
-                            ..
-                        }
-                    )
-                {
-                    self.stamp_method_resolved_path(caller, block_idx, op_idx, callee_path.clone());
-                }
-                // `guess_call_kind` classifications apply only to the
-                // `find_all_graphs` walk; the annotator follows every
-                // call into a graph (`annrpython.py recursivecall`).
-                if bfs_phase {
-                    // `call.py CallControl.guess_call_kind`
-                    // jitdriver_sd_from_portal_runner_ptr → recursive.
-                    if self.is_portal_recursive_call(&callee_path) {
-                        // Not a refusal — the portal is already a
-                        // candidate and re-walking it would loop —
-                        // but recorded so the BFS's skip rows add up
-                        // to every call site it saw.
-                        crate::decline::record(
-                            BFS_GATE,
-                            "callee-is-portal-recursive",
-                            format_args!("{callee_path} in {caller}"),
-                        );
-                        return Vec::new();
-                    }
-                    // `call.py CallControl.guess_call_kind`
-                    // `_gctransformer_hint_close_stack_` → residual.
-                    // `get_jitcode` asserts such a graph never
-                    // reaches it, so following one here would turn
-                    // a residual classification into a panic.
-                    if self
-                        .func_effects(&callee_path)
-                        .is_some_and(|f| f.close_stack)
-                    {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "callee-close-stack-residual",
-                            format_args!("{callee_path} in {caller}"),
-                        );
-                        return Vec::new();
-                    }
-                    // `call.py CallControl.guess_call_kind`
-                    // `hasattr(targetgraph.func, 'oopspec')` → builtin.
-                    if self
-                        .func_effects_with_crate_alias(&callee_path)
-                        .is_some_and(|f| f.recorded_oopspec().is_some())
-                    {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "callee-oopspec-builtin",
-                            format_args!("{callee_path} in {caller}"),
-                        );
-                        return Vec::new();
-                    }
-                }
-                vec![callee_path]
-            }
-            // Not a call operation.  This arm is the population
-            // filter, not a decline: recording it would count
-            // every arithmetic op in every graph and drown the
-            // rows that are about call sites.
+            OpKind::Call { target, .. } => resolve_direct(target).into_iter().collect(),
             _ => Vec::new(),
         }
     }
@@ -9694,6 +9761,7 @@ impl CallControl {
                 todo.push(path);
             }
         }
+        self.bfs_entry_roots = todo.clone();
         // Phase 1: annotator-analog AccessDirect fixpoint (`cachedgraph`
         // clones + call-op retarget). Roots include the split portal, whose
         // red startblock formals already carry the flag inherited from the
@@ -11487,6 +11555,13 @@ impl CallControl {
     /// corpus.
     pub(crate) fn candidate_graphs(&self) -> &HashSet<CallPath> {
         &self.candidate_graphs
+    }
+
+    /// Portal / helper / wrapper / oopspec graphs `find_all_graphs_bfs`
+    /// queued before walking. The two-phase prepass seeds these as
+    /// entries (`annrpython.py` `build_types`).
+    pub(crate) fn bfs_entry_roots(&self) -> &[CallPath] {
+        &self.bfs_entry_roots
     }
 
     /// Returns true when a concrete helper address was registered for this

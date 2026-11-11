@@ -2406,11 +2406,8 @@ fn cast_instance_intrinsic(
     }
     // A `Vec` of one-word items is `SomeRustVec` (`project_rust_vec`),
     // not `SomeList`. The unique-graph of `gc_alloc_young_storage_box`
-    // (`specialize:argtype(0)`) seeds that dest as RustVec; a list /
-    // GCREF operand that fell through to the pin_root List pass-through
-    // below returned List and `mergeinputargs` then saw List ∪ RustVec.
-    // Recast to the dest annotation the way the List / Tuple / Dict
-    // arms already recast a pointer-shaped operand.
+    // (`specialize:argtype(0)`) seeds that dest as RustVec. Recast a
+    // list / GCREF operand to that dest (`ann_cast_pointer`).
     if matches!(&projected, SomeValue::RustVec(_)) {
         return match operand {
             SomeValue::RustVec(_) => Ok(operand.clone()),
@@ -2551,14 +2548,16 @@ fn cast_instance_intrinsic(
                     std::collections::BTreeMap::new(),
                 )));
             }
-            // `GcArray` is a GCREF (`rlist.py`). `pin_root(p as PyObjectRef)`
-            // is `rgc.pin` of that word (`rgc.py`).
-            return Ok(operand.clone());
+            // List-modelled GcArray recast onto dest Instance is
+            // `ann_cast_opaque_ptr` / `ann_cast_pointer`: dest annotation
+            // (`SomePtr(typeOf(cast_p))`). `rgc.pin` takes a GCREF.
+            true
         }
         SomeValue::String(_) => {
-            // `STR` is `Ptr(GcStruct)` (`rstr.py`). `pin_root(p as PyObjectRef)`
-            // is `rgc.pin` of that GCREF (`rgc.py`).
-            return Ok(operand.clone());
+            // STR is `Ptr(GcStruct)` (`rstr.py`). Recast onto dest
+            // Instance is `ann_cast_opaque_ptr` / `ann_cast_pointer`: dest
+            // annotation. `rgc.pin` takes a GCREF.
+            true
         }
         other => {
             // A root the bookkeeper models as a list or string (a
@@ -5840,10 +5839,13 @@ mod tests {
             &[Some(s_str), Some(s_root)],
             &no_kwds(),
         )
-        .expect("pin_root of STR is rgc.pin");
+        .expect("ann_cast_opaque_ptr of STR onto PyObject is dest Instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("STR recast onto PyObject is dest Instance, got {out:?}");
+        };
         assert!(
-            matches!(out, SomeValue::String(_)),
-            "STR GCREF must stay SomeString, got {out:?}"
+            inst.can_be_none,
+            "GCREF word recast is can_be_None=True, same as Ptr/Address"
         );
     }
 
@@ -5866,10 +5868,138 @@ mod tests {
             &[Some(s_list), Some(s_root)],
             &no_kwds(),
         )
-        .expect("pin_root of GcArray is rgc.pin");
+        .expect("ann_cast_opaque_ptr of GcArray onto PyObject is dest Instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("GcArray recast onto PyObject is dest Instance, got {out:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "GCREF word recast is can_be_None=True, same as Ptr/Address"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_list_operand_object_root_dest_is_instance() {
+        // `ann_cast_opaque_ptr` / `ann_cast_pointer` return dest
+        // `SomePtr(typeOf(cast_p))`. A List-modelled GcArray recast onto
+        // `*mut PyObject` is dest Instance; `rgc.pin` takes a GCREF.
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_none(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("pyobject::PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("List operand recast onto PyObject");
+        let SomeValue::Instance(inst) = out else {
+            panic!("List dest PyObject is SomeInstance, got {out:?}");
+        };
+        assert!(inst.can_be_none, "GCREF word recast is can_be_None=True");
+        assert!(
+            inst.classdef.is_some(),
+            "dest Instance must intern the PyObject classdef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_string_operand_object_root_dest_is_instance() {
+        // STR recast onto `*mut PyObject` is dest Instance
+        // (`ann_cast_opaque_ptr` / `ann_cast_pointer`). `rgc.pin` takes
+        // a GCREF.
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::default());
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("pyobject::PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_str), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("String operand recast onto PyObject");
+        let SomeValue::Instance(inst) = out else {
+            panic!("String dest PyObject is SomeInstance, got {out:?}");
+        };
+        assert!(inst.can_be_none, "GCREF word recast is can_be_None=True");
+        assert!(
+            inst.classdef.is_some(),
+            "dest Instance must intern the PyObject classdef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_instance_to_itemsblock_root_is_list() {
+        // Reverse of List→PyObject: dest ItemsBlock is the two-field
+        // `{capacity, [PyObjectRef; 0]}` GcArray `project_struct_field_type`
+        // models as SomeList (`FixedSizeListRepr`).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::ItemsBlock".to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "ItemsBlock".to_string(),
+            reg.fields["object_array::ItemsBlock"].clone(),
+        );
+        reg.note_declared_gc_name("object_array::ItemsBlock");
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("object_array::ItemsBlock"))
+            .expect("ItemsBlock root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Instance recast onto ItemsBlock");
         assert!(
             matches!(out, SomeValue::List(_)),
-            "GcArray GCREF must stay SomeList, got {out:?}"
+            "ItemsBlock dest must project as SomeList, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_instance_to_utf8str_root_is_string() {
+        // Reverse of String→PyObject: dest Utf8Str is rstr `STR`
+        // (`is_rstr_str_layout_declaration`) and `project_struct_field_type`
+        // answers `s_str0`.
+        let bk = bk();
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("unicodeobject::Utf8Str"))
+            .expect("Utf8Str root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Instance recast onto Utf8Str");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "Utf8Str dest must project as SomeString, got {out:?}"
         );
     }
 

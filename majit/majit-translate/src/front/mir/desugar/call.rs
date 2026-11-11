@@ -9407,6 +9407,13 @@ impl<'a> Lowering<'a> {
         self.spec_body = true;
     }
 
+    pub(in crate::front::mir) fn set_cross_crate(
+        &mut self,
+        cross: &'a dyn crate::front::clause_spec::CrossCrateLookup,
+    ) {
+        self.cross_crate = Some(cross);
+    }
+
     /// Specialized path for a direct call whose type args are concrete,
     /// or whose `generics.trait_refs` name impls. The bare path is
     /// unchanged when the callee is not generic or the call still
@@ -9556,28 +9563,22 @@ impl<'a> Lowering<'a> {
         if fun_decl_is_convert_into_impl(self.llbc, fd) {
             return None;
         }
-        // No unstructured body: keep the ordinary `CallKind::Trait` route.
-        // A spec path for this method would name a graph nobody registers.
-        // A zero-arg opaque impl method is the exception: it has no body
-        // to copy, and `collect_foreign_opaque_method_externals` registers
-        // the impl path when `foreign_opaque_method_result_valuetype`
-        // accepts the result (`Default::default` on an opaque `Self`).
+        // No unstructured body here. `enqueue_spec` names
+        // `FunctionDesc.cachedgraph`: the identity body of the reflexive
+        // `impl<T> From<T> for T` (`description.py` `getuniquegraph`), or
+        // the defining crate's copy of an Opaque import when that crate
+        // is loaded. Any other selected `From` impl names its registered
+        // path, not the generic trait residual `["From", "from"]`. A
+        // zero-arg opaque impl method names the path
+        // `collect_foreign_opaque_method_externals` registers
+        // (`Default::default` on an opaque `Self`).
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
-            // Reflexive `impl<T> From<T> for T` is opaque in core; a
-            // Trait call still selects that impl. Direct Fun calls
-            // alias (`is_reflexive_from`); a residual path must name
-            // `FunctionDesc.cachedgraph` of the identity body
-            // (`description.py` `getuniquegraph` / `specialize`).
-            if fun_decl_is_reflexive_from(self.llbc, fd)
-                && let Some(segments) = self.enqueue_spec(fd, &generics)
-            {
+            if let Some(segments) = self.enqueue_spec(fd, &generics) {
                 return Some((segments, None));
             }
-            let path = fd.item_meta.name_path();
-            let leaf = path.rsplit("::").next().unwrap_or("fn");
-            // Any other selected `From` impl: the registered identity
-            // path, not the generic trait residual `["From", "from"]`.
             if fun_decl_is_convert_from_impl(self.llbc, fd) {
+                let path = fd.item_meta.name_path();
+                let leaf = path.rsplit("::").next().unwrap_or("fn");
                 return Some((spec_segments(self.llbc, fd, leaf), None));
             }
             return self.opaque_nullary_impl_target(fd);
@@ -9594,8 +9595,8 @@ impl<'a> Lowering<'a> {
 
     /// Impl path of a zero-arg method whose declaration has no body.
     ///
-    /// `enqueue_spec` refuses an opaque body. The call still has to name
-    /// the path `collect_foreign_opaque_method_externals` registers, or a
+    /// The call still has to name the path
+    /// `collect_foreign_opaque_method_externals` registers, or a
     /// specialized caller keeps the unregistered trait path. A method
     /// with a receiver is left on that trait path: retargeting it would
     /// resolve graphs the prepass does not annotate.
@@ -9633,17 +9634,6 @@ impl<'a> Lowering<'a> {
         if fun_decl_is_convert_into_impl(self.llbc, fd) {
             return None;
         }
-        // Only a body this LLBC extracted can be copied. An opaque
-        // declaration (a foreign crate's or std's) keeps its bare path,
-        // except the reflexive `impl<T> From<T> for T`: its body is
-        // identity (`fn from(t: T) -> T { t }`) and
-        // `FunctionDesc.getuniquegraph` still builds that graph
-        // (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
-        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
-            && !fun_decl_is_reflexive_from(self.llbc, fd)
-        {
-            return None;
-        }
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
         if self.callee_is_host_builtin(fd) {
             return None;
@@ -9659,6 +9649,17 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
+        // Only a body this LLBC extracted can be copied here. An Opaque
+        // import is the same function object in the defining crate
+        // (`bookkeeper.py` `getdesc`); enqueue on that crate's queue.
+        // The reflexive `impl<T> From<T> for T` is the exception: its
+        // body is identity and `declare_spec` builds that graph
+        // (`FunctionDesc.getuniquegraph`).
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+            && !fun_decl_is_reflexive_from(self.llbc, fd)
+        {
+            return self.enqueue_cross_crate_spec(fd, generics, &path);
+        }
         // `FunctionDesc.cachedgraph`: each concrete instantiation is
         // its own graph, including a look-inside generic whose body
         // names no `Clause`. The inner residual then sees the type
@@ -9667,13 +9668,7 @@ impl<'a> Lowering<'a> {
             crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
-        let leaf = fd
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("fn")
-            .to_string();
+        let leaf = path.rsplit("::").next().unwrap_or("fn").to_string();
         let leaf = crate::front::clause_spec::spec_leaf(&leaf, fd.def_id, generics, self.llbc);
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
@@ -9684,6 +9679,86 @@ impl<'a> Lowering<'a> {
                 const_generics,
             });
         Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
+    /// `FunctionDesc.cachedgraph(key)` for an Opaque-imported generic:
+    /// the body lives on the defining crate, so the spec is declared
+    /// there under the leaf hashed from that crate's remapped generics.
+    fn enqueue_cross_crate_spec(
+        &self,
+        _fd: &FunDecl,
+        generics: &serde_json::Value,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let cross = self.cross_crate?;
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+        let (types, const_generics) =
+            crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let mut result = None;
+        let mut decline: Option<&'static str> = None;
+        cross.with_crates(&mut |crates| {
+            let Some((def_idx, def_fd)) =
+                crate::front::clause_spec::unique_local_unstructured(crates, path)
+            else {
+                decline = Some("no-defining-fun");
+                return;
+            };
+            let def_llbc = crates[def_idx].llbc;
+            let remapped = crate::front::clause_spec::remap_generics_to_llbc(
+                self.llbc,
+                def_llbc,
+                crates,
+                &trait_refs,
+                &types,
+                &const_generics,
+            );
+            let (trait_refs, types, const_generics) = match remapped {
+                Ok(args) => args,
+                Err(reason) => {
+                    decline = Some(reason);
+                    return;
+                }
+            };
+            let mut generics = serde_json::Map::new();
+            generics.insert("types".into(), serde_json::Value::Array(types.clone()));
+            generics.insert(
+                "const_generics".into(),
+                serde_json::Value::Array(const_generics.clone()),
+            );
+            generics.insert(
+                "trait_refs".into(),
+                serde_json::Value::Array(trait_refs.clone()),
+            );
+            let remapped_generics = serde_json::Value::Object(generics);
+            let leaf = path.rsplit("::").next().unwrap_or("fn").to_string();
+            let leaf = crate::front::clause_spec::spec_leaf(
+                &leaf,
+                def_fd.def_id,
+                &remapped_generics,
+                def_llbc,
+            );
+            let segments = spec_segments(def_llbc, def_fd, &leaf);
+            crates[def_idx]
+                .spec
+                .borrow_mut()
+                .enqueue(crate::front::clause_spec::SpecRequest {
+                    fn_id: def_fd.def_id,
+                    leaf,
+                    trait_refs,
+                    types,
+                    const_generics,
+                });
+            result = Some(segments);
+        });
+        if result.is_none() {
+            crate::decline::record_named(
+                crate::decline::gate::CROSS_CRATE_SPEC,
+                decline.unwrap_or("no-defining-fun"),
+                path,
+            );
+        }
+        result
     }
 
     /// `HOST_ENV` resolves the bare call segments, or the crate-qualified

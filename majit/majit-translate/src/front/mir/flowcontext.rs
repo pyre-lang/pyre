@@ -438,6 +438,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// This body is a `cachedgraph` copy, so clause refs have been
     /// replaced and a `TraitImpl` call names the impl method.
     pub(in crate::front::mir) spec_body: bool,
+    /// Loaded artefacts of this program. An Opaque-imported generic
+    /// enqueues its spec on the crate that holds the body.
+    pub(in crate::front::mir) cross_crate:
+        Option<&'a dyn crate::front::clause_spec::CrossCrateLookup>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -2172,6 +2176,7 @@ impl<'a> Lowering<'a> {
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
+            cross_crate: None,
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
