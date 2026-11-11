@@ -7883,6 +7883,25 @@ impl<'a> ResumeDataDirectReader<'a> {
         self._prepare_next_section(info, bh, vinfo);
     }
 
+    /// resume.py `_prepare_next_section(self, info)`.
+    ///
+    /// ```python
+    /// def _prepare_next_section(self, info):
+    ///     from rpython.jit.codewriter.jitcode import enumerate_vars
+    ///     enumerate_vars(info,
+    ///             self.metainterp_sd.liveness_info,
+    ///             self._callback_i,
+    ///             self._callback_r,
+    ///             self._callback_f,
+    ///             self.unique_id)
+    /// ```
+    ///
+    /// `self.all_liveness` shadows `self.metainterp_sd.liveness_info` —
+    /// the shared packed buffer that `enumerate_vars` indexes with
+    /// `info`. The three callbacks still call `next_int`/`next_ref`/
+    /// `next_float` on this reader (resume.py), matching
+    /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
+    /// write_a_float` (resume.py).
     fn _prepare_next_section(
         &mut self,
         info: usize,
