@@ -587,24 +587,27 @@ mod tests {
 
     #[test]
     fn vcvars_tool_env_puts_cl_dir_first_when_cc_reports_no_path() {
-        let snapshot = [(
-            OsString::from("PATH"),
-            OsString::from(r"C:\Git\usr\bin;C:\vc\bin"),
-        )];
-        let tool_env = vcvars_tool_env(&[], Path::new(r"C:\vc\bin\cl.exe"));
+        // Built with the host separator: this module is tested on every host,
+        // and only on Windows does `\` split a path component.
+        let vc_bin = Path::new("vc").join("bin");
+        let cl = vc_bin.join("cl.exe");
+        let mut inherited = OsString::from("git-usr-bin;");
+        inherited.push(&vc_bin);
+        let snapshot = [(OsString::from("PATH"), inherited.clone())];
+        let tool_env = vcvars_tool_env(&[], &cl);
         let merged = merged_compiler_environ(Some(&snapshot), &tool_env);
         let path = merged
             .iter()
             .find(|(k, _)| env_name_eq(k, "PATH"))
-            .map(|(_, v)| v.as_os_str());
-        assert_eq!(
-            path,
-            Some(std::ffi::OsStr::new(r"C:\vc\bin;C:\Git\usr\bin;C:\vc\bin"))
-        );
+            .map(|(_, v)| v.clone());
+        let mut expected = vc_bin.as_os_str().to_os_string();
+        expected.push(";");
+        expected.push(&inherited);
+        assert_eq!(path, Some(expected));
 
         // A PATH from the script itself is kept as is.
         let script = [(OsString::from("Path"), OsString::from(r"C:\vs\bin"))];
-        let tool_env = vcvars_tool_env(&script, Path::new(r"C:\vc\bin\cl.exe"));
+        let tool_env = vcvars_tool_env(&script, &cl);
         assert_eq!(tool_env.len(), 1);
         assert_eq!(tool_env[0].1, OsString::from(r"C:\vs\bin"));
 
