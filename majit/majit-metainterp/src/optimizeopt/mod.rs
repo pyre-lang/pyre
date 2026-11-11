@@ -1413,10 +1413,11 @@ pub struct OptContext {
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
     /// `rewrite.py` `self.loop_invariant_results = {}` — keyed by
     /// constant function pointer. PyPy uses a dict; pyre replaces it
-    /// with a Vec of `(func_ptr, source_opref)` pairs and linear-scan
+    /// with a Vec of `(func_ptr, PreambleOp)` pairs (`LoopInvariantOp.produce_op`'s
+    /// result Box and replay op) and linear-scan
     /// dedup. CALL_LOOPINVARIANT is rare and the live set per trace is
     /// tiny, so O(n) lookup is acceptable.
-    pub imported_loop_invariant_results: Vec<(i64, OpRef)>,
+    pub imported_loop_invariant_results: Vec<(i64, crate::optimizeopt::info::PreambleOp)>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
     /// store_final_boxes_in_guard to resolve NONE positions
     /// inherited from Phase 1 virtualization.

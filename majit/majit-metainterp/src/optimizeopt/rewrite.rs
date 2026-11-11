@@ -1926,37 +1926,19 @@ impl OptRewrite {
                         .borrow()
                         .iter()
                         .any(|(k, _)| *k == func_val);
-                    if let Some(&(_, source)) = ctx
+                    if let Some((_, pop)) = ctx
                         .imported_loop_invariant_results
                         .iter()
                         .find(|(k, _)| *k == func_val)
                         && !already_cached
                     {
-                        // RPython shortpreamble.py:158-159. Dual-slot case:
-                        // `produce_loop_invariant` installs
-                        // `make_equal_to(source, result_opref)`, so the source
-                        // box's `_forwarded` slot now holds
-                        // `Forwarded::Op(result_op)`.
-                        // Build the synthetic SameAsI replay at
-                        // `result_opref` (= get_box_replacement(source))
-                        // so `take_preamble_forwarded_opinfo` reads the
-                        // info seeded at result_opref's slot per the
-                        // dual-slot rule (`mod.rs`'s `replay_pos` closure).
-                        let replay_pos = ctx.get_replacement_opref(source);
-                        let source_op = ctx.materialize_operand_at(source);
-                        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
-                        replay.pos().set(replay_pos);
-                        self.loop_invariant_results.borrow_mut().insert(
-                            func_val,
-                            LoopInvariantEntry::Preamble(PreambleOp {
-                                op: source_op,
-                                invented_name: false,
-                                preamble_op: OpRc::new(replay),
-                                // Non-invented loop-invariant producer: the
-                                // SameAs arm is never taken, so no source.
-                                same_as_source: None,
-                            }),
-                        );
+                        // `LoopInvariantOp.produce_op` stored
+                        // `PreambleOp(self.res, preamble_op, invented_name)`:
+                        // the preamble's own result Box, which the label
+                        // carries, and the replay call for the short preamble.
+                        self.loop_invariant_results
+                            .borrow_mut()
+                            .insert(func_val, LoopInvariantEntry::Preamble(pop.clone()));
                     }
                     // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
                     // → force_op_from_preamble → replace in dict

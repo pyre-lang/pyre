@@ -1859,14 +1859,25 @@ impl ProducedShortOp {
         result_map: &FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos().get();
-        let result_type = self.preamble_op.result_type();
         // shortpreamble.py `LoopInvariantOp.produce_op` reads
         // `self.res.getarg(0).getint()`.
         let func_ptr = self.res.bound_op()?.arg(0).const_int()?;
-        // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
-        // and the replay call separately in PreambleOp.
-        let result_opref = *result_map.get(&source)?;
-        let _ = result_type;
+        // shortpreamble.py LoopInvariantOp.produce_op stores `self.res` as the
+        // body-visible Box and the replay call separately in PreambleOp.
+        // Only a LoopInvariant op the label actually carries is imported.
+        result_map.get(&source)?;
+        let replay = ctx
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|builder| builder.produced_short_op(&self.res))
+            .map(|produced| produced.preamble_op)
+            .unwrap_or_else(|| self.preamble_op.clone());
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: self.res.clone(),
+            preamble_op: replay,
+            invented_name: self.invented_name,
+            same_as_source: self.same_as_source.clone(),
+        };
         // `rewrite.py` `self.opt.loop_invariant_results[key] = old_op` —
         // dict-as-map semantics; pyre's Vec-backed parity overwrites the
         // entry when `func_ptr` already exists (PyPy dict behavior),
@@ -1876,9 +1887,9 @@ impl ProducedShortOp {
             .iter_mut()
             .find(|(k, _)| *k == func_ptr)
         {
-            entry.1 = source;
+            entry.1 = pop;
         } else {
-            ctx.imported_loop_invariant_results.push((func_ptr, source));
+            ctx.imported_loop_invariant_results.push((func_ptr, pop));
         }
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
