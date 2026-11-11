@@ -8536,7 +8536,7 @@ mod tests {
             ctx2.imported_loop_invariant_results
                 .iter()
                 .find(|(k, _)| *k == func_ptr)
-                .map(|(_, v)| *v),
+                .map(|(_, v)| v.op.to_opref()),
             Some(OpRef::int_op(11))
         );
         // history.py ConstInt.value inline — the imported func
@@ -8558,7 +8558,6 @@ mod tests {
         let func = OpRef::const_int(func_ptr);
         let source = OpRef::int_op(11);
         let source_box = rooted_resop_operand(Type::Int, 11);
-        let phase2_result = OpRef::int_op(3);
         let call = {
             let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
             op.pos().set(source);
@@ -8572,7 +8571,11 @@ mod tests {
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
                 res: Operand::from_bound_op(&call),
-                op: call,
+                op: {
+                    let replay = OpRc::new((*call).clone());
+                    replay.pos().set(OpRef::int_op(12));
+                    replay
+                },
                 source_op: None,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
@@ -8594,22 +8597,22 @@ mod tests {
 
         import_short_preamble_state(
             &[OpRef::int_op(0)],
-            &[phase2_result],
+            &[OpRef::int_op(3)],
             &exported,
             &mut optimizer,
             &mut ctx,
         );
 
-        // imported_loop_invariant_results stores the
-        // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
-        let _ = phase2_result;
-        assert_eq!(
-            ctx.imported_loop_invariant_results
-                .iter()
-                .find(|(k, _)| *k == func_ptr)
-                .map(|(_, v)| *v),
-            Some(source)
-        );
+        let pop = &ctx
+            .imported_loop_invariant_results
+            .iter()
+            .find(|(k, _)| *k == func_ptr)
+            .expect("imported loop-invariant result")
+            .1;
+        assert!(pop.op.same_box(&Operand::from_bound_op(&call)));
+        assert_eq!(pop.preamble_op.pos().get(), OpRef::int_op(12));
+        assert_eq!(pop.preamble_op.opcode, OpCode::CallLoopinvariantI);
+        assert!(!pop.invented_name);
     }
 
     /// Invariant: `force_op_from_preamble_op` follows RPython
