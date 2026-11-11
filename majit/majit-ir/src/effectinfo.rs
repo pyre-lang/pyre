@@ -1124,14 +1124,22 @@ pub enum RuntimeHelperKind {
     /// save/restore the heap optimizer dead-store-eliminates, letting a
     /// non-escaping exception stay virtual.
     CurrentExceptionOrNone,
-    /// `set_current_exception(exc)` — the PUSH_EXC_INFO store and the
-    /// POP_EXCEPT restore residual (`(exc: Ref) → Void`, TLS write via
-    /// `cpu.set_current_exception_fn`, which clears the slot for `None`).  The
-    /// full-body walker recognises this tag to lower it to `SETFIELD_GC(ec, exc,
-    /// sys_exc_value)`; paired with the [`CurrentExceptionOrNone`] save on the
-    /// same descr-identity field, a balanced never-read save/restore is
-    /// dead-store-eliminated so the virtual exception de-escapes and DCEs.
+    /// `set_current_exception(exc)` — the PUSH_EXC_INFO store residual
+    /// (`(exc: Ref) → Void`, TLS write via `cpu.set_current_exception_fn`).
+    /// `pyopcode.py PUSH_EXC_INFO` publishes the caught exception with
+    /// `ec.set_sys_exc_info`.  The full-body walker recognises this tag to
+    /// lower it to `SETFIELD_GC(ec, exc, sys_exc_value)`; paired with the
+    /// [`CurrentExceptionOrNone`] save on the same descr-identity field, a
+    /// balanced never-read save/restore is dead-store-eliminated so the
+    /// virtual exception de-escapes and DCEs.
     SetCurrentException,
+    /// `restore_exc_info(w_prev)` — the POP_EXCEPT restore residual
+    /// (`(w_prev: Ref) → Void`, TLS write via `cpu.restore_exc_info_fn`).
+    /// `pyframe.py _restore_exc_info` → `set_sys_exc_info3`; `None` clears
+    /// the slot.  The full-body walker recognises this tag to lower it to
+    /// the same `SETFIELD_GC(ec, w_prev, sys_exc_value)` as
+    /// [`SetCurrentException`], with `None` stored as NULL.
+    RestoreExcInfo,
     /// `for_iter_next(iter)` — the FOR_ITER advance residual the codewriter
     /// emits for the continue arm (`jit_next` via `cpu.for_iter_next_fn`).
     /// It advances the real shared heap iterator concretely during the

@@ -762,8 +762,12 @@ pub struct Cpu {
     /// Used by a bare `RAISE_VARARGS(0)` with no static `last_exception` pair.
     pub reraise_varargs_zero_fn: extern "C" fn() -> pyre_object::PyObjectRef,
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
-    /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
+    /// (`ec.set_sys_exc_info`, the caught exception becomes current).
     pub set_current_exception_fn: extern "C" fn(pyre_object::PyObjectRef),
+    /// Restore the saved prev into per-thread `CURRENT_EXCEPTION` —
+    /// used by `POP_EXCEPT` (`pyframe.py _restore_exc_info` →
+    /// `set_sys_exc_info3`; `None` clears the slot).
+    pub restore_exc_info_fn: extern "C" fn(pyre_object::PyObjectRef),
     /// Clear the exception-propagation carrier after `PUSH_EXC_INFO` has
     /// transferred ownership to `CURRENT_EXCEPTION`.
     pub clear_in_flight_exception_fn: extern "C" fn(),
@@ -1036,6 +1040,7 @@ impl Cpu {
             ),
             reraise_varargs_zero_fn: cpu_word!(0, crate::call_jit::bh_reraise_varargs_zero),
             set_current_exception_fn: cpu_word!(1, crate::call_jit::bh_set_current_exception),
+            restore_exc_info_fn: cpu_word!(1, crate::call_jit::bh_restore_exc_info),
             clear_in_flight_exception_fn: cpu_word!(
                 0,
                 crate::call_jit::bh_clear_in_flight_exception

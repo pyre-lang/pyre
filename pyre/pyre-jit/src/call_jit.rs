@@ -9528,11 +9528,17 @@ pub extern "C" fn bh_reraise_varargs_zero() -> PyObjectRef {
 }
 
 /// Store `exc` into the per-thread `CURRENT_EXCEPTION` slot. Matches
-/// the write at `pyopcode.py POP_EXCEPT` (restore of saved
-/// sys_exc_info, where `None` clears it) and at `pyopcode.py
-/// PUSH_EXC_INFO` (new raised exception becomes current).
+/// the write at `pyopcode.py PUSH_EXC_INFO` (`ec.set_sys_exc_info`):
+/// the caught exception becomes current.
 pub extern "C" fn bh_set_current_exception(exc: PyObjectRef) {
-    pyre_interpreter::eval::restore_exc_info(exc);
+    pyre_interpreter::eval::set_current_exception(exc);
+}
+
+/// Restore the saved prev into the per-thread `CURRENT_EXCEPTION` slot.
+/// Matches `pyframe.py _restore_exc_info` → `set_sys_exc_info3`; `None`
+/// clears the slot.
+pub extern "C" fn bh_restore_exc_info(w_prev: PyObjectRef) {
+    pyre_interpreter::eval::restore_exc_info(w_prev);
 }
 
 /// Complete the `PUSH_EXC_INFO` ownership transfer after the caught exception

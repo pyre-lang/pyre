@@ -19061,11 +19061,16 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 ///     and stamp the live value concrete (the residual executor would have
 ///     returned it) so a downstream read of the dst sees the right value.
 ///   * `SetCurrentException` — `set_current_exception(exc)` (`[Ref]→void`,
-///     dst_bank `'v'`): the PUSH_EXC_INFO store and the POP_EXCEPT restore.
-///     Emit `SETFIELD_GC(ec, exc, sys_exc_value)` and apply the concrete
-///     write the authoritative walk's residual executor would have done.  A
-///     restore with no matching save tests its operand against `None`
-///     (`set_sys_exc_info3`) and stores NULL for it.
+///     dst_bank `'v'`): the PUSH_EXC_INFO store (`pyopcode.py PUSH_EXC_INFO`
+///     `ec.set_sys_exc_info`).  Emit `SETFIELD_GC(ec, exc, sys_exc_value)`
+///     and apply the concrete write the authoritative walk's residual
+///     executor would have done.  When the operand is NULL or not an
+///     exception, recover the tracked active exception.
+///   * `RestoreExcInfo` — `restore_exc_info(w_prev)` (`[Ref]→void`,
+///     dst_bank `'v'`): the POP_EXCEPT restore (`pyframe.py
+///     _restore_exc_info` → `set_sys_exc_info3`).  The saved prev goes
+///     back verbatim; `None` clears.  Emit the same SETFIELD.  No
+///     tracked-exception recovery.
 ///   * `ClearInFlightException` — `set_in_flight_exception(PY_NULL)`
 ///     (`[]→void`, dst_bank `'v'`): apply the clear to the authoritative
 ///     recording walk, but emit no IR.  PyPy keeps the propagating exception
@@ -19226,9 +19231,13 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // `SetCurrentException`: PUSH_EXC_INFO's store passes the caught exc,
-    // POP_EXCEPT's restore passes the slot it popped; both are
-    // `set_sys_exc_info3` writes of their operand.
+    if !matches!(
+        runtime_helper,
+        majit_ir::RuntimeHelperKind::SetCurrentException
+            | majit_ir::RuntimeHelperKind::RestoreExcInfo
+    ) {
+        return Ok(None);
+    }
     if r_args.len() != 1 || dst_bank != 'v' {
         return Ok(None);
     }
@@ -19240,40 +19249,48 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
         _ => return Ok(None),
     };
-    let (mut store_op, mut store_concrete) =
-        walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?;
-    // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
-    // tracked active exception (`ctx.last_exc_value()`, the walker's mirror of
-    // RPython `metainterp.last_exc_box`).  The graph-side codewriter binds the
-    // popped `exc_value`'s producer to a `last_exc_value` re-read for exactly
-    // this reason (`codewriter.rs` PushExcInfo arm), but that producer is
-    // graph-only — the walker reads the operand-stack slot directly on the
-    // assumption that runtime register threading already holds the caught
-    // exception there.  At a bridge resume into a handler the slot's per-PC
-    // resume reconstruction can alias a non-exception constant (e.g. the vable
-    // `f_code` scalar when the catch-landing exception slot shares its color),
-    // so the published current exception would become a code object.  The
-    // reconstruction can also leave the slot NULL (a bare handler entry whose
-    // caught-exception slot was filled with a null sentinel), which would
-    // publish `set_current_exception(NULL)` and lose the active exception for a
-    // following bare `raise` / `sys.exc_info()`.  When the store operand
-    // resolves to NULL or a non-exception that is not `w_None`, recover the
-    // authoritative exception from the tracked channel, matching the graph-side
-    // producer.  `w_None` is the empty prev `POP_EXCEPT` restores
-    // (`pyframe.py _restore_exc_info`).
-    let operand_is_none = !exc_concrete.is_null() && unsafe { pyre_object::is_none(exc_concrete) };
-    if !operand_is_none
-        && (store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) })
-    {
-        if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
-            (ctx.last_exc_value(), ctx.last_exc_value_concrete())
-        {
-            if !tracked_obj.is_null() && unsafe { pyre_object::is_exception(tracked_obj) } {
-                store_op = tracked_op;
-                store_concrete = tracked_obj;
+    let (store_op, store_concrete) =
+        if runtime_helper == majit_ir::RuntimeHelperKind::RestoreExcInfo {
+            // `pyframe.py _restore_exc_info` → `set_sys_exc_info3`: the saved
+            // prev goes back verbatim; `None` clears.
+            walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
+        } else {
+            // `pyopcode.py PUSH_EXC_INFO` publishes the caught exception
+            // (`ec.set_sys_exc_info`).
+            let mut store_op = r_args[0];
+            let mut store_concrete = exc_concrete;
+            // A PUSH_EXC_INFO store publishes the exception being handled,
+            // which IS the tracked active exception (`ctx.last_exc_value()`,
+            // the walker's mirror of RPython `metainterp.last_exc_box`).  The
+            // graph-side codewriter binds the popped `exc_value`'s producer to
+            // a `last_exc_value` re-read for exactly this reason
+            // (`codewriter.rs` PushExcInfo arm), but that producer is
+            // graph-only — the walker reads the operand-stack slot directly on
+            // the assumption that runtime register threading already holds the
+            // caught exception there.  At a bridge resume into a handler the
+            // slot's per-PC resume reconstruction can alias a non-exception
+            // constant (e.g. the vable `f_code` scalar when the catch-landing
+            // exception slot shares its color), so the published current
+            // exception would become a code object.  The reconstruction can
+            // also leave the slot NULL (a bare handler entry whose
+            // caught-exception slot was filled with a null sentinel), which
+            // would publish `set_current_exception(NULL)` and lose the active
+            // exception for a following bare `raise` / `sys.exc_info()`.  When
+            // the store operand resolves to NULL or a non-exception, recover
+            // the authoritative exception from the tracked channel, matching
+            // the graph-side producer.
+            if store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) } {
+                if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
+                    (ctx.last_exc_value(), ctx.last_exc_value_concrete())
+                {
+                    if !tracked_obj.is_null() && unsafe { pyre_object::is_exception(tracked_obj) } {
+                        store_op = tracked_op;
+                        store_concrete = tracked_obj;
+                    }
+                }
             }
-        }
-    }
+            (store_op, store_concrete)
+        };
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[ec, store_op],
