@@ -5393,12 +5393,17 @@ impl PyFrame {
     /// PyPy-compatible pickle state helper.
     #[inline]
     pub fn _reduce_state(&self) -> PyObjectRef {
+        // `space.newint` collects (`pyframe.py` `_reduce_state`). Capture the
+        // scalars before the first malloc so a forwarded frame is not required
+        // for the second field.
+        let last_instr = self.last_instr as i64;
+        let valuestackdepth = self.valuestackdepth as i64;
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(pyre_object::w_none());
         fields.push(pyre_object::w_none());
         fields.push(pyre_object::w_none());
-        fields.push(pyre_object::w_int_new(self.last_instr as i64));
-        fields.push(pyre_object::w_int_new(self.valuestackdepth as i64));
+        fields.push(pyre_object::w_int_new(last_instr));
+        fields.push(pyre_object::w_int_new(valuestackdepth));
         pyre_object::w_tuple_new(fields.take())
     }
 
@@ -5890,43 +5895,50 @@ impl PyFrame {
     /// Returns false when an allocation failed; the MemoryError stays pending for the caller.
     #[majit_macros::dont_look_inside]
     pub(crate) fn clear_references(&mut self) -> bool {
-        if let Some(debug) = self.getdebug() {
-            let had_locals = !debug.w_locals.is_null();
-            // Allocate before remembering debugdata: a minor can happen here.
-            let w_locals = if had_locals {
+        // `space.newdict` / `Cell(...)` collect. Pin the frame
+        // (`shadowstack.py` `push_roots` / `pop_roots`) and store through
+        // the reloaded address (`PyFrame.descr_clear`).
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        let had_locals = unsafe { &*frame_anchor.live() }
+            .getdebug()
+            .map(|debug| !debug.w_locals.is_null());
+        if let Some(had_locals) = had_locals {
+            let roots = pyre_object::gc_roots::push_roots();
+            let locals_slot = roots.base();
+            if had_locals {
                 let w_locals = unsafe { pyre_object::w_dict_new() };
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && w_locals.is_null() {
                     return false;
                 }
-                Some(w_locals)
-            } else {
-                None
-            };
-            let Ok(d) = self.getorcreate_debug_data(-1) else {
+                let _ = roots.pin_root(w_locals);
+            }
+            let Ok(d) = unsafe { &mut *frame_anchor.live() }.getorcreate_debug_data(-1) else {
                 return false;
             };
             d.w_f_trace = pyre_object::PY_NULL;
             // CPython `frame_tp_clear` drops `f_extra_locals`; proxy-only
             // writes must not survive an explicit frame clear.
             d.w_extra_locals = pyre_object::PY_NULL;
-            if let Some(w_locals) = w_locals {
-                d.w_locals = w_locals;
+            if had_locals {
+                d.w_locals = roots.get(locals_slot);
             }
         }
 
         // Clear locals, cell/free vars, and the stack.  A cell slot is
         // rebound to a fresh empty cell (not mutated in place, since it may
         // still be shared by an inner/outer function).
-        let len = locals_w!(self).len();
+        let len = locals_w!(unsafe { &*frame_anchor.live() }).len();
         for i in 0..len {
-            let w_oldvalue = locals_w!(self)[i];
+            let w_oldvalue = locals_w!(unsafe { &*frame_anchor.live() })[i];
             let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
             {
                 // `PyFrame.descr_clear` `Cell(None, w_oldvalue.family)` — the
                 // replacement stands for the same binding, so it keeps the
                 // family the cleared cell shared with its siblings.
-                let cell = pyre_object::w_cell_new(pyre_object::PY_NULL, unsafe {
-                    pyre_object::w_cell_family(w_oldvalue)
+                let mut w_oldvalue = w_oldvalue;
+                let family = unsafe { pyre_object::w_cell_family(w_oldvalue) };
+                let cell = pyre_object::with_roots!(w_oldvalue => {
+                    pyre_object::w_cell_new(pyre_object::PY_NULL, family)
                 });
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && cell.is_null() {
                     return false;
@@ -5935,9 +5947,9 @@ impl PyFrame {
             } else {
                 pyre_object::PY_NULL
             };
-            self.set_locals_w(i, w_newvalue);
+            unsafe { &mut *frame_anchor.live() }.set_locals_w(i, w_newvalue);
         }
-        self.valuestackdepth = 0;
+        unsafe { &mut *frame_anchor.live() }.valuestackdepth = 0;
         true
     }
 
