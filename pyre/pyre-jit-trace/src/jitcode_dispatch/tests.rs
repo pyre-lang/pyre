@@ -32802,7 +32802,7 @@ fn capture_root_parent_resume_stack_keeps_post_pop_call_slots() {
         *vsd = nlocals + POST_POP_OPERAND_DEPTH;
     }
     let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
-    snapshot_sym.concrete_vable_ptr = parent_frame_ptr;
+    snapshot_sym.set_concrete_vable_ptr_unrooted(parent_frame_ptr);
     snapshot_sym.nlocals = nlocals;
     snapshot_sym.valuestackdepth = nlocals + POST_POP_OPERAND_DEPTH;
 
