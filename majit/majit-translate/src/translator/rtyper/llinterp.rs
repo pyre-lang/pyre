@@ -2872,7 +2872,12 @@ fn exact_int_of_const(case: &ConstValue) -> Option<ExactInt> {
 }
 
 /// `intmask` (signed) / `unsigned_int.__new__` (unsigned) down to `LONG_BIT`.
-fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
+///
+/// `word` is `layout::target_signed_size` (`rffi.sizeof(lltype.Signed)`).
+/// Word 8 keeps the low 64 bits; any other word sign-extends (signed) or
+/// zero-extends (unsigned) the low 32 bits, matching `rarithmetic.intmask`
+/// when `LONG_BIT` is 32.
+pub(crate) fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
     if word == 8 {
         if signed {
             low128 as i64

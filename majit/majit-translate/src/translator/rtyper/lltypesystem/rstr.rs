@@ -175,46 +175,76 @@ pub(crate) fn llstr(s: &[u8]) -> Result<_ptr, String> {
     Ok(p)
 }
 
-/// `_hash_string(s)` (objectmodel.py): the modified-FNV hash
-/// behind `compute_hash()` — `x = ord(s[0]) << 7`, then
-/// `x = intmask((1000003*x) ^ ord(s[i]))` per char, `x ^= length`,
-/// empty string → `-1`.  `intmask` is machine-word wraparound, hence
-/// `wrapping_mul` on the `Signed` width.  Byte chars hash by their
-/// Latin-1 ord, matching the `Char` element embedding in [`llstr`].
-pub(crate) fn hash_string_bytes(s: &[u8]) -> i64 {
-    let Some(&first) = s.first() else {
-        return -1;
-    };
-    let mut x = (first as i64) << 7;
-    for &c in s {
-        x = 1000003i64.wrapping_mul(x) ^ c as i64;
-    }
-    x ^ s.len() as i64
+/// `rarithmetic.intmask` down to `signed_bytes`
+/// (`layout::target_signed_size`, `LONG_BIT // 8`). Delegates to
+/// [`crate::translator::rtyper::llinterp::mask_to_i64`]: word 8 is the
+/// i64 bit pattern, word 4 sign-extends the low 32 bits.
+fn intmask(n: i64, signed_bytes: usize) -> i64 {
+    crate::translator::rtyper::llinterp::mask_to_i64(n as u64 as u128, signed_bytes, true)
 }
 
-/// `_ll_strhash(s)` value computation (rstr.py): malloc
-/// zero-fills the `hash` slot, so `0` is reserved as the
-/// not-computed-yet marker — a real hash of `0` is replaced with
-/// `29872897` (the same fixup the runtime helper graph
-/// `build_ll_strhash_internal_helper_graph` applies).
-pub(crate) fn ll_strhash_value(s: &[u8]) -> i64 {
-    let x = hash_string_bytes(s);
+/// `_hash_string` (`objectmodel.py`). `ord_at(i)` is `ord` of one
+/// `Char` byte or one `UniChar` code point — STR and UNICODE share
+/// this loop. `signed_bytes` is `rffi.sizeof(lltype.Signed)`.
+///
+/// Empty input returns `-1` with no `intmask`. Otherwise
+/// `x = ord(s[0]) << 7`, then for each index
+/// `x = intmask((1000003 * x) ^ ord(s[i]))`, then `x ^= length`,
+/// `return intmask(x)`.
+pub(crate) fn hash_string(
+    length: usize,
+    mut ord_at: impl FnMut(usize) -> u32,
+    signed_bytes: usize,
+) -> i64 {
+    if length == 0 {
+        return -1;
+    }
+    let mut x = (ord_at(0) as i64) << 7;
+    let mut i = 0;
+    while i < length {
+        x = intmask(
+            1000003i64.wrapping_mul(x) ^ (ord_at(i) as i64),
+            signed_bytes,
+        );
+        i += 1;
+    }
+    x ^= length as i64;
+    intmask(x, signed_bytes)
+}
+
+/// `_hash_string` over STR `chars` at [`crate::layout::target_signed_size`].
+/// Byte `ord` is the Latin-1 value stored by [`llstr`].
+pub(crate) fn hash_string_bytes(s: &[u8]) -> i64 {
+    hash_string(
+        s.len(),
+        |i| u32::from(s[i]),
+        crate::layout::target_signed_size(),
+    )
+}
+
+/// `_ll_strhash` (`rstr.py` `LLHelpers._ll_strhash`): malloc
+/// zero-fills the `hash` slot, so `0` is the not-computed-yet marker.
+/// A real hash of `0` is replaced with `29872897` (the same fixup
+/// `build_ll_strhash_internal_helper_graph` applies). [`hash_string`]
+/// has already applied `intmask`.
+fn substitute_uncomputed_hash(x: i64) -> i64 {
     if x == 0 { 29872897 } else { x }
+}
+
+/// `_ll_strhash(s)` value for STR bytes (`rstr.py`).
+pub(crate) fn ll_strhash_value(s: &[u8]) -> i64 {
+    substitute_uncomputed_hash(hash_string_bytes(s))
 }
 
 /// `LLHelpers._ll_strhash` (`lltypesystem/rstr.py`) over UNICODE
-/// `chars`: `objectmodel._hash_string` on the code points, then the
-/// `x == 0` replacement with `29872897`. Empty is `-1`.
+/// `chars`: `_hash_string` on the code points, then the `x == 0`
+/// replacement with `29872897`. Empty is `-1`.
 pub(crate) fn ll_unicodehash_value(chars: &[char]) -> i64 {
-    let Some(&first) = chars.first() else {
-        return -1;
-    };
-    let mut x = (u32::from(first) as i64) << 7;
-    for &c in chars {
-        x = 1000003i64.wrapping_mul(x) ^ u32::from(c) as i64;
-    }
-    x ^= chars.len() as i64;
-    if x == 0 { 29872897 } else { x }
+    substitute_uncomputed_hash(hash_string(
+        chars.len(),
+        |i| u32::from(chars[i]),
+        crate::layout::target_signed_size(),
+    ))
 }
 
 thread_local! {
@@ -9564,10 +9594,13 @@ fn build_ll_startsendswith_char_helper_graph(
 /// ```
 ///
 /// `s` is a chars Array (`Ptr(Array(Char|UniChar))`), not a STR/UNICODE
-/// pointer — the caller (`ll_hash_string`, objectmodel.py)
-/// supplies `ll_s.chars` via `getsubstruct`. `intmask` is a no-op
-/// at lltype level (lltype `Signed` arithmetic already wraps), so the
-/// synthesizer drops the call.
+/// pointer — the caller (`ll_hash_string`, `objectmodel.py`)
+/// supplies `ll_s.chars` via `getsubstruct`. `rtype_intmask`
+/// (`rbuiltin.py`) is `inputargs(lltype.Signed)` and returns that
+/// value, so this graph emits no separate `intmask` op. `int_mul` /
+/// `int_xor` on `Signed` wrap at `layout::target_signed_size`.
+/// [`hash_string`] applies that same `intmask` (`mask_to_i64`) when
+/// the constant hash is folded ahead of the graph.
 ///
 /// 5-block CFG plus the returnblock:
 /// - **start**: `length = getarraysize(chars)`, `is_empty =
@@ -14359,17 +14392,90 @@ mod tests {
         }
     }
 
-    /// `_hash_string` (objectmodel.py) reproduces CPython
-    /// 2.7's non-randomized 64-bit string hash; spot-check known
-    /// values plus the empty-string `-1` and the `_ll_strhash`
-    /// zero-fixup passthrough (a `-1` hash is not zero, so the
-    /// 29872897 substitute must not fire).
+    /// `_hash_string` (`objectmodel.py`) on the empty string is `-1`.
+    /// `_ll_strhash` must not replace that with `29872897`. An 8-byte
+    /// `Signed` keeps the historical i64 wrap for `abc` and `Foo`.
     #[test]
     fn hash_string_bytes_matches_cpython2_values() {
         assert_eq!(hash_string_bytes(b""), -1);
-        assert_eq!(hash_string_bytes(b"abc"), 1453079729188098211);
-        assert_eq!(hash_string_bytes(b"Foo"), -5036909580522842981);
         assert_eq!(ll_strhash_value(b""), -1);
+        if crate::layout::target_signed_size() == 8 {
+            assert_eq!(hash_string_bytes(b"abc"), 1453079729188098211);
+            assert_eq!(hash_string_bytes(b"Foo"), -5036909580522842981);
+        }
+    }
+
+    /// `_hash_string` `intmask`s at the Signed width (`objectmodel.py`,
+    /// `rarithmetic.intmask`). Width 4 is the `i32` wrap of the same
+    /// loop. Width 8 is the historical i64 value of `abc`. STR bytes
+    /// and UNICODE code points share [`hash_string`].
+    #[test]
+    fn hash_string_intmask_follows_signed_width() {
+        fn hash_i32(ords: &[u32]) -> i64 {
+            let length = ords.len();
+            if length == 0 {
+                return -1;
+            }
+            let mut x = (ords[0] as i32) << 7;
+            let mut i = 0;
+            while i < length {
+                x = 1000003i32.wrapping_mul(x) ^ (ords[i] as i32);
+                i += 1;
+            }
+            x ^= length as i32;
+            i64::from(x)
+        }
+
+        fn hash_i64(ords: &[u32]) -> i64 {
+            let length = ords.len();
+            if length == 0 {
+                return -1;
+            }
+            let mut x = (ords[0] as i64) << 7;
+            let mut i = 0;
+            while i < length {
+                x = 1000003i64.wrapping_mul(x) ^ (ords[i] as i64);
+                i += 1;
+            }
+            x ^ (length as i64)
+        }
+
+        let abc = [u32::from(b'a'), u32::from(b'b'), u32::from(b'c')];
+        let at4 = hash_string(abc.len(), |i| abc[i], 4);
+        let at8 = hash_string(abc.len(), |i| abc[i], 8);
+        assert_eq!(at4, hash_i32(&abc));
+        assert_ne!(at4, at8);
+        assert_eq!(at8, hash_i64(&abc));
+        assert_eq!(at8, 1453079729188098211);
+        assert_eq!(hash_string(0, |_| 0, 4), -1);
+        assert_eq!(hash_string(0, |_| 0, 8), -1);
+
+        let width = crate::layout::target_signed_size();
+        assert_eq!(
+            hash_string_bytes(b"abc"),
+            hash_string(abc.len(), |i| abc[i], width)
+        );
+        if width == 8 {
+            assert_eq!(hash_string_bytes(b"abc"), 1453079729188098211);
+            assert_eq!(hash_string_bytes(b"Foo"), -5036909580522842981);
+        } else {
+            assert_eq!(hash_string_bytes(b"abc"), hash_i32(&abc));
+        }
+
+        let alpha = [u32::from('α')];
+        assert_eq!(hash_string(alpha.len(), |i| alpha[i], 4), hash_i32(&alpha));
+        assert_eq!(hash_string(alpha.len(), |i| alpha[i], 8), hash_i64(&alpha));
+        assert_ne!(
+            hash_string(alpha.len(), |i| alpha[i], 4),
+            hash_string(alpha.len(), |i| alpha[i], 8)
+        );
+        let raw = hash_string(alpha.len(), |i| alpha[i], width);
+        let expect = if raw == 0 { 29872897 } else { raw };
+        assert_eq!(ll_unicodehash_value(&['α']), expect);
+        assert_eq!(
+            ll_unicodehash_value(&['a', 'b', 'c']),
+            ll_strhash_value(b"abc")
+        );
     }
 
     /// `CONST_UNICODE_CACHE` (`UnicodeRepr.CACHE`): repeated

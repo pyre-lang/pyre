@@ -794,9 +794,10 @@ impl Repr for UnicodeRepr {
                 "cast_unichar_to_int",
                 StringIsxxxPredicate::InRange(97, 122),
             ),
-            // AbstractUnicodeRepr overrides these to raise TyperError
-            // instead of inheriting AbstractStringRepr's byte-string
-            // casefold helpers (rstr.py:452-457).
+            // `AbstractUnicodeRepr.rtype_method_upper` /
+            // `rtype_method_lower` (`rstr.py`) raise TyperError instead of
+            // inheriting `AbstractStringRepr.rtype_method_upper` /
+            // `rtype_method_lower`.
             "upper" => Err(TyperError::message("Cannot do toupper on unicode string")),
             "lower" => Err(TyperError::message("Cannot do tolower on unicode string")),
             "replace" => rtype_abstract_string_method_replace(
