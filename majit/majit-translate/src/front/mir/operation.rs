@@ -812,10 +812,14 @@ impl<'a> Lowering<'a> {
                         }
                     };
                     let arr = if let Some(root) = cast_root {
-                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(arr), root)
-                            .as_variable()
-                            .expect("a materialized typed-items base stays a Variable")
-                            .clone()
+                        if root == STRING_GCREF_GCARRAY_TYPE_ID {
+                            self.narrow_gcref_items_to_str_list(bb_id, arr)
+                        } else {
+                            self.narrow_value_to_instance_root(bb_id, LinkArg::Value(arr), root)
+                                .as_variable()
+                                .expect("a materialized typed-items base stays a Variable")
+                                .clone()
+                        }
                     } else {
                         arr
                     };
@@ -862,16 +866,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let block = self.emit_string_array_items_read(bb_id, list.clone(), owner);
-                    let arr = self
-                        .narrow_value_to_instance_root(
-                            bb_id,
-                            LinkArg::Value(block),
-                            STRING_GCREF_GCARRAY_TYPE_ID,
-                        )
-                        .as_variable()
-                        .expect("a string-items view stays a Variable")
-                        .clone();
+                    let arr = self.emit_string_array_items_view(bb_id, list.clone(), owner);
                     let length = self.emit_string_array_len_read(bb_id, list, owner);
                     let one = self
                         .graph
@@ -7203,6 +7198,17 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind,
                     });
+                    if string_array_view {
+                        return Ok(self
+                            .narrow_value_to_instance_root(
+                                bb_id,
+                                crate::model::LinkArg::Value(res),
+                                "str",
+                            )
+                            .as_variable()
+                            .expect("a string-list getitem recast stays a Variable")
+                            .clone());
+                    }
                     return Ok(res);
                 }
                 // Positional aggregate `.N` read: the base local was

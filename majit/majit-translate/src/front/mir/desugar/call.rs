@@ -2485,11 +2485,17 @@ impl<'a> Lowering<'a> {
                     // `result_narrow_root` cannot recover the pointee name,
                     // but the canonical object-array identity is already the
                     // positive proof that the element is `PyObjectRef` (the
-                    // int/float workspaces have non-Ref banks). A string
-                    // index's element is already `Str`; casting it to a
-                    // class drops that.
-                    let item_narrow_root = if string_index_owner.is_some() {
-                        None
+                    // int/float workspaces have non-Ref banks). String-list
+                    // getitem is `rlist.py` `AbstractBaseListRepr.recast`
+                    // after a GCREF-backed `getarrayitem`: the `"str"`
+                    // string root is identity on an already-String operand
+                    // and dest-Str of Instance. A class root would drop
+                    // `Str`.
+                    let item_narrow_root = if string_index_owner.is_some()
+                        || first_arg_is_string_array_view
+                        || array_type_id.as_deref() == Some(STRING_GCREF_GCARRAY_TYPE_ID)
+                    {
+                        Some("str".to_string())
                     } else {
                         result_narrow_root.clone().or_else(|| {
                             (array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID))
@@ -2521,27 +2527,18 @@ impl<'a> Lowering<'a> {
                     } else {
                         item_ty
                     };
-                    let (array_base, item_ty, array_type_id) =
-                        if let Some(owner) = string_index_owner {
-                            let block =
-                                self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
-                            let view = self
-                                .narrow_value_to_instance_root(
-                                    bb_id,
-                                    LinkArg::Value(block),
-                                    STRING_GCREF_GCARRAY_TYPE_ID,
-                                )
-                                .as_variable()
-                                .expect("a string-items view stays a Variable")
-                                .clone();
-                            (
-                                view,
-                                ValueType::Str,
-                                Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
-                            )
-                        } else {
-                            (array_base, item_ty, array_type_id)
-                        };
+                    let (array_base, item_ty, array_type_id) = if let Some(owner) =
+                        string_index_owner
+                    {
+                        let view = self.emit_string_array_items_view(bb_id, args[0].clone(), owner);
+                        (
+                            view,
+                            ValueType::Str,
+                            Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        )
+                    } else {
+                        (array_base, item_ty, array_type_id)
+                    };
                     if !write_only {
                         let read = match rust_vec_header {
                             Some(kind) => OpKind::Call {
@@ -2650,16 +2647,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let block = self.emit_string_array_items_read(bb_id, list, owner);
-                    let array = self
-                        .narrow_value_to_instance_root(
-                            bb_id,
-                            LinkArg::Value(block),
-                            STRING_GCREF_GCARRAY_TYPE_ID,
-                        )
-                        .as_variable()
-                        .expect("a string-items view stays a Variable")
-                        .clone();
+                    let array = self.emit_string_array_items_view(bb_id, list, owner);
                     let one = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -4049,11 +4037,8 @@ impl<'a> Lowering<'a> {
                 // `from_raw_parts(base, logical_len)` cannot discard its
                 // second word.
                 if args.len() == 2 && self.is_string_array_view_from_raw_parts(&reg) {
-                    let view = self.narrow_value_to_instance_root(
-                        bb_id,
-                        args[0].clone().into(),
-                        STRING_GCREF_GCARRAY_TYPE_ID,
-                    );
+                    let view =
+                        LinkArg::Value(self.narrow_gcref_items_to_str_list(bb_id, args[0].clone()));
                     self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")
@@ -5339,14 +5324,13 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && let Some(owner) = self.string_array_slice_view_owner(&reg)
                 {
-                    let block = self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
+                    let view = LinkArg::Value(self.emit_string_array_items_view(
+                        bb_id,
+                        args[0].clone(),
+                        owner,
+                    ));
                     let logical_len =
                         self.emit_string_array_len_read(bb_id, args[0].clone(), owner);
-                    let view = self.narrow_value_to_instance_root(
-                        bb_id,
-                        LinkArg::Value(block),
-                        STRING_GCREF_GCARRAY_TYPE_ID,
-                    );
                     self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")

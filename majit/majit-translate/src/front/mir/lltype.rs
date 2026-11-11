@@ -8869,6 +8869,26 @@ fn fn_ptr_ty_node_to_lltype(
     fn_ptr_tyref_to_lltype(&ty, llbc, error_carrier)
 }
 
+/// A one-level pointer onto the rstr `STR` layout. `rstr.STRPTR`, not
+/// `GCREF` / `OBJECTPTR`. Identity is the pointee declaration path
+/// (`node_is_string_value` / `is_rstr_str_layout_declaration`): intern
+/// spelling (`tyref_to_ast_string` / `charon_adt_to_ast_string`) uses
+/// the TypeDecl leaf, so `*const other::Utf8Str` would look like
+/// `*const Utf8Str` and `is_raw_ptr_to_str_family_spelling` would match.
+/// `class_identity_spelling` strips the crate the same way. Wrap's
+/// `*const BytesBlock` / `*const Utf8Str` stay STRPTR because those
+/// TypeDecls *are* the layout.
+fn fn_ptr_raw_ptr_lowers_as_strptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
+        return false;
+    };
+    let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
+    node_is_string_value(pointee, llbc)
+}
+
 fn fn_ptr_tyref_to_lltype(
     ty: &TyRef,
     llbc: &Llbc,
@@ -8888,6 +8908,15 @@ fn fn_ptr_tyref_to_lltype(
     }
     if is_unit_type(ty, llbc) {
         return LowLevelType::Void;
+    }
+    // rstr.py `STRPTR = Ptr(STR)` before `llmemory.GCREF` and
+    // `rclass.OBJECTPTR`. The STR layout is a named GcStruct (`Utf8Str`
+    // / `BytesBlock`) that implements GcType, so the GCREF and classed
+    // arms would otherwise steal wrap's `*const BytesBlock`. Same order
+    // as `field_row_lltype`. Intern already keeps this spelling off the
+    // classed path (`raw_ptr_pointee_is_non_adt_spelling`).
+    if fn_ptr_raw_ptr_lowers_as_strptr(ty, llbc) {
+        return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
     }
     if tyref_is_gcref_spelling(ty, llbc) {
         return GCREF.clone();
@@ -8912,10 +8941,10 @@ fn fn_ptr_tyref_to_lltype(
         && let Some(pointee) = one_level_pointer_pointee(node, llbc)
     {
         let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
-        if let Some(root) = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves())
-            && !crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
-        {
-            return OBJECTPTR.clone();
+        if let Some(root) = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves()) {
+            if !crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+                return OBJECTPTR.clone();
+            }
         }
         // `*mut bool` is a primitive slot address (`SomeInteger` /
         // Signed at the call site). `valuetype_to_lltype` of `Ref` would
@@ -14354,11 +14383,17 @@ fn field_row_lltype(
         if pointee.starts_with("??") {
             return None;
         }
-        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
-            return Some((*GCREF).clone());
-        }
+        // rstr.py `STRPTR = Ptr(STR)` before declared-GC `GCREF` and
+        // classed `OBJECTPTR`. The STR layout (`Utf8Str` / `BytesBlock`)
+        // implements GcType and has a class identity, so those later
+        // arms would otherwise steal the field. `project_struct_field_type`
+        // of the same spelling is SomeString; wrap (`newbytes`) takes
+        // that STR, not a W_Root.
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
+        }
+        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
+            return Some((*GCREF).clone());
         }
         if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
             return Some((*GCREF).clone());

@@ -36051,16 +36051,33 @@ fn ascii_setitem_writes_items_block() {
         .iter()
         .find(|op| op.result.as_ref() == Some(base))
         .unwrap_or_else(|| panic!("ArrayWrite base must be defined; ops={ops:?}"));
-    let items = if crate::model::cast_instance_root(&producer.kind) == Some("[str]") {
-        match &producer.kind {
-            OpKind::Call { args, .. } => args
-                .first()
-                .and_then(LinkArg::as_variable)
-                .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
-            other => panic!("[str] narrow is a call, got {other:?}"),
-        }
-    } else {
-        base
+    assert_eq!(
+        crate::model::cast_instance_root(&producer.kind),
+        Some("[str]"),
+        "write base is the [str] view; ops={ops:?}"
+    );
+    let gcref = match &producer.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+        other => panic!("[str] narrow is a call, got {other:?}"),
+    };
+    let gcref_op = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(gcref))
+        .unwrap_or_else(|| panic!("[str] operand must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&gcref_op.kind),
+        Some("GCREF"),
+        "ItemsBlock ListDef is erased before the [str] view; ops={ops:?}"
+    );
+    let items = match &gcref_op.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("GCREF cast needs a value arg; ops={ops:?}")),
+        other => panic!("GCREF erase is a call, got {other:?}"),
     };
     let items_op = ops
         .iter()
@@ -36076,6 +36093,93 @@ fn ascii_setitem_writes_items_block() {
             );
         }
         other => panic!("write base must be FieldRead block, got {other:?}"),
+    }
+}
+
+/// Positive: `ll_list_bytes_getitem_fast` is `l.bytes_items[index]`.
+/// The shared `ItemsBlock` intern is `SomeList` of `PyObject`; a direct
+/// `[str]` narrow would pass that ListDef through (`cast_instance_intrinsic`
+/// list arm) and wrap would see `String ∪ Instance(PyObject)`. Erase to
+/// GCREF first, project `[str]`, then recast the element to `"str"`
+/// (`rlist.py` `AbstractBaseListRepr.recast`).
+#[test]
+fn bytes_getitem_erases_items_block_list_before_str_view() {
+    let graph = lower_object_fn("pyre_object::listobject::ll_list_bytes_getitem_fast");
+    let ops = graph_ops(&graph);
+    let read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::ArrayRead {
+            base,
+            item_ty: ValueType::Str,
+            array_type_id: Some(array_type_id),
+            array: _,
+            ..
+        } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID => {
+            Some((base, op.result.as_ref()))
+        }
+        _ => None,
+    });
+    let Some((base, result)) = read else {
+        panic!("bytes getitem must emit getarrayitem on [str]; ops={ops:?}");
+    };
+    let producer = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(base))
+        .unwrap_or_else(|| panic!("ArrayRead base must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&producer.kind),
+        Some("[str]"),
+        "read base is the [str] view; ops={ops:?}"
+    );
+    let gcref = match &producer.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+        other => panic!("[str] narrow is a call, got {other:?}"),
+    };
+    let gcref_op = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(gcref))
+        .unwrap_or_else(|| panic!("[str] operand must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&gcref_op.kind),
+        Some("GCREF"),
+        "ItemsBlock ListDef is erased before the [str] view; ops={ops:?}"
+    );
+    assert!(
+        result.is_some_and(|loaded| ops.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind) == Some("str")
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { args, .. }
+                        if args.first().and_then(LinkArg::as_variable) == Some(loaded)
+                )
+        })),
+        "getitem recasts the GCREF word onto str; ops={ops:?}"
+    );
+}
+
+/// Negative: an object-item array keeps `[PyObject]` and does not dest-Str
+/// the element. The GCREF erase + `"str"` recast is the string-list
+/// `externalvsinternal` boundary, not a generic array recast.
+#[test]
+fn object_array_index_does_not_recast_element_to_str() {
+    for name in [
+        "pyre_object::kwargsdict::kwargs_at",
+        "pyre_object::tupleobject::w_tuple_new_from_slice",
+    ] {
+        let graph = lower_object_fn(name);
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")),
+            "{name} must narrow through [PyObject]; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| crate::model::cast_instance_root(&op.kind) != Some("str")),
+            "{name} must not dest-Str an object-array element; ops={ops:?}"
+        );
     }
 }
 

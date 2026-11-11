@@ -1469,6 +1469,59 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
 }
 
 #[test]
+fn fn_ptr_str_family_pointer_is_strptr_not_objectptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let utf8 = type_decl_struct(0, &["unicodeobject", "Utf8Str"], vec![]);
+    let inst = type_decl_struct(1, &["owner", "Inst"], vec![]);
+    let other = type_decl_struct(2, &["other", "Utf8Str"], vec![]);
+    let llbc = llbc_with_types("fixture", vec![utf8, inst, other], vec![]);
+    let raw = |id: u64| {
+        serde_json::json!({
+            "RawPtr": [{"Adt": {"id": id, "generics": empty_generics()}}, "Const"]
+        })
+    };
+    let fnptr = |id: u64| {
+        TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [raw(id)],
+                    "output": {"Tuple": []},
+                    "is_unsafe": false
+                }
+            }
+        }))
+    };
+    let spec = crate::ErrorCarrierSpec::default();
+    let str_ft = super::func_type_from_fn_ptr_ty(&fnptr(0), &llbc, spec).expect("Utf8Str fn-ptr");
+    assert_eq!(
+        str_ft.args,
+        vec![STRPTR.clone()],
+        "FUNC.ARGS of *const unicodeobject::Utf8Str is STRPTR; ast={}",
+        super::tyref_to_ast_string(&TyRef::Other(raw(0)), &llbc)
+    );
+    let inst_ft = super::func_type_from_fn_ptr_ty(&fnptr(1), &llbc, spec).expect("Inst fn-ptr");
+    assert_eq!(inst_ft.args, vec![OBJECTPTR.clone()]);
+    let other_ty = TyRef::Other(raw(2));
+    let other_ft =
+        super::func_type_from_fn_ptr_ty(&fnptr(2), &llbc, spec).expect("other::Utf8Str fn-ptr");
+    assert!(
+        !super::tyref_raw_ptr_pointee_is_string_value(&other_ty, &llbc),
+        "other::Utf8Str is not the STR layout; intern ast={}",
+        super::tyref_to_ast_string(&other_ty, &llbc)
+    );
+    assert_eq!(
+        other_ft.args,
+        vec![OBJECTPTR.clone()],
+        "other::Utf8Str is not the STR layout; intern ast={}",
+        super::tyref_to_ast_string(&other_ty, &llbc)
+    );
+    let str_ty = super::fn_ptr_tyref_to_lltype(&TyRef::Other(raw(0)), &llbc, spec);
+    assert_eq!(str_ty, *STRPTR);
+}
+
+#[test]
 fn hkey_alias_of_c_void_ptr_is_voidp() {
     let c_void_adt = serde_json::json!({
         "Adt": {"id": 0, "generics": empty_generics()}
@@ -13245,6 +13298,28 @@ fn field_row_declared_gc_pointer_is_gcref() {
 }
 
 #[test]
+fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("unicodeobject::Utf8Str");
+    note_class_identity(&mut reg, "unicodeobject::Utf8Str");
+    let got = super::field_row_lltype(
+        &reg,
+        "*mut unicodeobject::Utf8Str",
+        &mut field_row_visited(),
+    )
+    .expect("str-family pointer field");
+    assert_eq!(got, *STRPTR);
+    let got = super::field_row_lltype(
+        &reg,
+        "*const bytesobject::BytesBlock",
+        &mut field_row_visited(),
+    )
+    .expect("BytesBlock pointer field");
+    assert_eq!(got, *STRPTR);
+}
+
+#[test]
 fn field_row_raw_word_pointer_is_ptr_struct() {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
     let mut reg = crate::front::StructFieldRegistry::default();
@@ -13291,6 +13366,37 @@ fn struct_item_gcarray_classed_pointer_field_interns_objectptr() {
         st.getattr_field_type("value"),
         Some(OBJECTPTR.clone()),
         "classed pointer field is the instance pointer"
+    );
+}
+
+#[test]
+fn struct_item_gcarray_str_family_pointer_field_interns_strptr() {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let mut reg = slot_block_registry("*mut unicodeobject::Utf8Str");
+    reg.note_declared_gc_name("unicodeobject::Utf8Str");
+    note_class_identity(&mut reg, "unicodeobject::Utf8Str");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("str-family pointer ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let PtrTarget::Array(arr) = &ptr.ll_ptrtype.TO else {
+        panic!("must intern Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+    };
+    let LowLevelType::Struct(st) = &arr.OF else {
+        panic!("ITEM must be STRUCT, got {:?}", arr.OF)
+    };
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(STRPTR.clone()),
+        "str-family pointer field is STRPTR, not GCREF or OBJECTPTR"
     );
 }
 
