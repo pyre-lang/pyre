@@ -19200,41 +19200,9 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             // prev goes back verbatim; `None` clears.
             walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
         } else {
-            // `pyopcode.py PUSH_EXC_INFO` publishes the caught exception
+            // `pyopcode.py PUSH_EXC_INFO` publishes the exception it popped
             // (`ec.set_sys_exc_info`).
-            let mut store_op = r_args[0];
-            let mut store_concrete = exc_concrete;
-            // A PUSH_EXC_INFO store publishes the exception being handled,
-            // which IS the tracked active exception (`ctx.last_exc_value()`,
-            // the walker's mirror of RPython `metainterp.last_exc_box`).  The
-            // graph-side codewriter binds the popped `exc_value`'s producer to
-            // a `last_exc_value` re-read for exactly this reason
-            // (`codewriter.rs` PushExcInfo arm), but that producer is
-            // graph-only — the walker reads the operand-stack slot directly on
-            // the assumption that runtime register threading already holds the
-            // caught exception there.  At a bridge resume into a handler the
-            // slot's per-PC resume reconstruction can alias a non-exception
-            // constant (e.g. the vable `f_code` scalar when the catch-landing
-            // exception slot shares its color), so the published current
-            // exception would become a code object.  The reconstruction can
-            // also leave the slot NULL (a bare handler entry whose
-            // caught-exception slot was filled with a null sentinel), which
-            // would publish `set_current_exception(NULL)` and lose the active
-            // exception for a following bare `raise` / `sys.exc_info()`.  When
-            // the store operand resolves to NULL or a non-exception, recover
-            // the authoritative exception from the tracked channel, matching
-            // the graph-side producer.
-            if store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) } {
-                if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
-                    (ctx.last_exc_value(), ctx.last_exc_value_concrete())
-                {
-                    if !tracked_obj.is_null() && unsafe { pyre_object::is_exception(tracked_obj) } {
-                        store_op = tracked_op;
-                        store_concrete = tracked_obj;
-                    }
-                }
-            }
-            (store_op, store_concrete)
+            (r_args[0], exc_concrete)
         };
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
