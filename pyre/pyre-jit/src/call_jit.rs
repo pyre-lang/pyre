@@ -1828,7 +1828,7 @@ fn run_python_portal_abort_blackhole(
     jit_state: &mut pyre_jit_trace::state::PyreJitState,
     env: &pyre_jit_trace::state::PyreEnv,
 ) -> Option<majit_metainterp::jitexc::PortalResume> {
-    let per_frame = {
+    let mut per_frame = {
         let pending = driver.pending_abort_blackhole_mut()?;
         if let Some(banks) = pending.abort_banks.as_deref() {
             pyre_jit_trace::state::per_frame_vables_from_abort_banks(&pending.framestack, banks)
@@ -1852,6 +1852,11 @@ fn run_python_portal_abort_blackhole(
             per_frame
         }
     };
+    let mut frame_ptrs: Vec<i64> = per_frame.iter().map(|&(ptr, _)| ptr).collect();
+    let _frame_ptr_roots = pyre_jit_trace::trace::ResumeRefSliceRoots::arm(&mut frame_ptrs);
+    for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
+        slot.0 = ptr;
+    }
     let jitdrivers_sd = python_portal_bh_jitdrivers_sd(driver);
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
@@ -1866,7 +1871,9 @@ fn run_python_portal_abort_blackhole(
     // `pyframe.py execute_frame` `insert_stack_check_here` charges each
     // interpreter activation. Levels below the root were minted by the walker;
     // `eval.rs` `run_blackhole_interp_to_cancel_tracing` charges them for the
-    // drive. Guards left when the drive returns early drop by RAII.
+    // drive. Guards left when the drive returns early drop by RAII. The key
+    // is the live frame GCREF after the publish above, stored through
+    // `enter_recursive_frame`'s Ref path.
     let level_recursion = std::cell::RefCell::new(
         per_frame
             .iter()

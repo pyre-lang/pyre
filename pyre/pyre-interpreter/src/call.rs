@@ -174,7 +174,8 @@ thread_local! {
     /// the window before process boot seeds `LAST_EXEC_CTX`, and every
     /// activation records which of the two it used so the two can never be
     /// read against each other.
-    static DETACHED_RECURSION: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static DETACHED_RECURSION: Cell<(usize, *mut PyFrame)> =
+        const { Cell::new((0, std::ptr::null_mut())) };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
@@ -205,7 +206,7 @@ type RecursionHome = *mut crate::PyExecutionContext;
 /// execution context; this Rust TLS is only the pre-context fallback and has
 /// no source-translatable object graph.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_get() -> (usize, usize) {
+fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.get())
 }
 
@@ -214,40 +215,38 @@ fn detached_recursion_state_get() -> (usize, usize) {
 /// execution-context write in [`recursion_state_set`] remains visible to the
 /// translator.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_set(depth: usize, accounted: usize) {
+fn detached_recursion_state_set(depth: usize, accounted: *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.set((depth, accounted)));
 }
 
 /// Read `(py_recursion_depth, accounted_activation)` from `home`.
 ///
 /// PyPy reads these slots straight off the live execution context
-/// (`executioncontext.py ExecutionContext`). A `(*home).field` projection is
-/// the shape `rewrite_op_getfield` already lowers to `getfield_raw_i` (the
-/// same raw integer field load as `profilefunc`). `(&raw const
-/// (*home).field).read()` is not that load: the codewriter leaves it as
-/// `const_ptr::<Impl>::read`, a symbolic residual the portal walk cannot
-/// execute.
+/// (`executioncontext.py ExecutionContext`). `py_recursion_depth` is the
+/// integer field `rewrite_op_getfield` lowers to `getfield_raw_i`;
+/// `accounted_activation` is the GCREF field stored like `topframeref`.
 #[inline]
-fn recursion_state_get(home: RecursionHome) -> (usize, usize) {
+fn recursion_state_get(home: RecursionHome) -> (usize, *mut PyFrame) {
     if home.is_null() {
         detached_recursion_state_get()
     } else {
-        unsafe { ((*home).py_recursion_depth, (*home).accounted_activation) }
+        unsafe { ((*home).py_recursion_depth, (*home).accounted_activation()) }
     }
 }
 
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
 ///
-/// Twin of [`recursion_state_get`]: a field store, so `rewrite_op_setfield`
-/// emits `setfield_raw_i` instead of residualising `mut_ptr::<Impl>::write`.
+/// Twin of [`recursion_state_get`]: the depth is an integer field store;
+/// the claim is a GCREF `SetfieldGc` (`shadowstack.py` `push_roots` /
+/// `pop_roots`; `framework.py` `gct_direct_call`).
 #[inline]
-fn recursion_state_set(home: RecursionHome, depth: usize, accounted: usize) {
+fn recursion_state_set(home: RecursionHome, depth: usize, accounted: *mut PyFrame) {
     if home.is_null() {
         detached_recursion_state_set(depth, accounted);
     } else {
         unsafe {
             (*home).py_recursion_depth = depth;
-            (*home).accounted_activation = accounted;
+            (*home).set_accounted_activation(accounted);
         }
     }
 }
@@ -301,21 +300,13 @@ pub fn bump_frame_entry_count() {
 #[inline]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let home = recursion_home();
-    let key = frame as usize;
+    let key = frame as *mut PyFrame;
     let (saved_depth, accounted) = recursion_state_get(home);
-    if accounted == key {
-        return RecursionDepthGuard {
-            home,
-            prev: key,
-            saved_depth,
-        };
+    if std::ptr::eq(accounted, key) {
+        return RecursionDepthGuard::arm(home, key, saved_depth);
     }
     recursion_state_set(home, saved_depth + 1, key);
-    RecursionDepthGuard {
-        home,
-        prev: accounted,
-        saved_depth,
-    }
+    RecursionDepthGuard::arm(home, accounted, saved_depth)
 }
 
 /// Spend one unit of the recursion budget on a dispatch level that pushes no
@@ -331,11 +322,7 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
     let home = recursion_home();
     let (saved_depth, accounted) = recursion_state_get(home);
     recursion_state_set(home, saved_depth + 1, accounted);
-    RecursionDepthGuard {
-        home,
-        prev: accounted,
-        saved_depth,
-    }
+    RecursionDepthGuard::arm(home, accounted, saved_depth)
 }
 
 /// RAII guard that gives back the activation unit `enter_recursive_frame`
@@ -352,17 +339,33 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
 /// slot naming a callee that has already finished, and the next frame minted
 /// at that address would read itself as already accounted and never pay.
 /// This is the boundary where `pyre-jit`'s `TopFrameRefGuard` already
-/// balances the frame chain for the same exits.
+/// balances the frame chain for the same exits. `prev` lives on the
+/// shadow stack (`shadowstack.py` `push_roots` / `pop_roots`) so a
+/// collection during the activation forwards it, matching that guard's
+/// saved `topframeref`.
 pub struct RecursionDepthGuard {
     home: RecursionHome,
-    prev: usize,
+    prev_root: usize,
     saved_depth: usize,
+}
+
+impl RecursionDepthGuard {
+    #[inline]
+    fn arm(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
+        Self {
+            home,
+            prev_root: majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize)),
+            saved_depth,
+        }
+    }
 }
 
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
-        recursion_state_set(self.home, self.saved_depth, self.prev);
+        let prev = majit_gc::shadow_stack::get(self.prev_root);
+        majit_gc::shadow_stack::pop_to(self.prev_root);
+        recursion_state_set(self.home, self.saved_depth, prev.0 as *mut PyFrame);
     }
 }
 

@@ -323,9 +323,9 @@ impl FrameView {
 }
 
 /// Restores compiled execution's frame-chain and activation bookkeeping,
-/// including on guard exits and panic unwinds. The saved frame pointer lives
-/// on the shadow stack so a moving collection can forward it in place,
-/// matching `CurrentFrameGuard`.
+/// including on guard exits and panic unwinds. The saved `topframeref` and
+/// `accounted_activation` live on the shadow stack so a moving collection
+/// can forward them in place, matching `CurrentFrameGuard`.
 ///
 /// Every door that runs a frame-bearing compiled trace has to take it, not just
 /// the one a given trace happened to be entered through: the reason it exists
@@ -344,26 +344,32 @@ impl FrameView {
 struct TopFrameRefGuard {
     ec: *mut PyExecutionContext,
     saved_root: Option<usize>,
-    saved_recursion: Option<(usize, usize)>,
+    saved_accounted_root: Option<usize>,
+    saved_depth: Option<usize>,
 }
 
 impl TopFrameRefGuard {
     fn new(ec: *mut PyExecutionContext) -> Self {
-        let (saved_root, saved_recursion) = if ec.is_null() {
-            (None, None)
+        let (saved_root, saved_accounted_root, saved_depth) = if ec.is_null() {
+            (None, None, None)
         } else {
             let saved = unsafe { (*ec).topframeref() };
+            let accounted = unsafe { (*ec).accounted_activation() };
             (
                 Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
                     saved as usize,
                 ))),
-                Some(unsafe { ((*ec).py_recursion_depth, (*ec).accounted_activation) }),
+                Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+                    accounted as usize,
+                ))),
+                Some(unsafe { (*ec).py_recursion_depth }),
             )
         };
         Self {
             ec,
             saved_root,
-            saved_recursion,
+            saved_accounted_root,
+            saved_depth,
         }
     }
 }
@@ -374,12 +380,16 @@ impl Drop for TopFrameRefGuard {
             return;
         };
         let saved = majit_gc::shadow_stack::get(saved_root);
+        let accounted = self
+            .saved_accounted_root
+            .map(majit_gc::shadow_stack::get)
+            .unwrap_or(majit_ir::GcRef::NULL);
         majit_gc::shadow_stack::pop_to(saved_root);
         unsafe {
             (*self.ec).set_topframeref(saved.0 as *mut PyFrame);
-            if let Some((depth, accounted)) = self.saved_recursion {
+            if let Some(depth) = self.saved_depth {
                 (*self.ec).py_recursion_depth = depth;
-                (*self.ec).accounted_activation = accounted;
+                (*self.ec).set_accounted_activation(accounted.0 as *mut PyFrame);
             }
         }
     }
@@ -8084,7 +8094,15 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     let staticdata = std::sync::Arc::clone(&meta.staticdata);
     let mut builder =
         majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
-    let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let mut per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let mut frame_ptrs: Vec<i64> = per_frame.iter().map(|&(ptr, _)| ptr).collect();
+    let _frame_ptr_roots = pyre_jit_trace::trace::ResumeRefSliceRoots::arm(&mut frame_ptrs);
+    for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
+        slot.0 = ptr;
+    }
+    // Charge from the live frame GCREF after the publish, stored through
+    // `enter_recursive_frame`'s Ref path (`executioncontext.py` has no
+    // accounted slot; pyre stores the claim like `topframeref`).
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     let set_topframeref = |frame_ptr: i64| {

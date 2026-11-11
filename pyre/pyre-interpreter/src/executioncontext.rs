@@ -848,20 +848,18 @@ pub struct ExecutionContext {
     /// the unit with the same GETFIELD_GC/SETFIELD_GC pair it already emits
     /// there instead of residualizing a call to reach a thread-local.
     pub py_recursion_depth: usize,
-    /// The innermost frame whose activation has already spent its
-    /// [`py_recursion_depth`](Self::py_recursion_depth) unit, as a bare
-    /// address.  A frame is executed through nested entry points -- the JIT
-    /// wrapper may run it as compiled code, hand it to the JIT eval loop, or
-    /// decline and re-enter the plain evaluator for the very same frame -- and
-    /// only the outermost of those pays.  Any frame reached from here is a
-    /// different, simultaneously-live frame, so its address cannot collide
-    /// with the one recorded.
+    /// Pyre recursion-budget claim, stored like `topframeref` so the collector forwards it.
     ///
-    /// Never dereferenced and never a GC root: [`executioncontext_custom_trace`]
-    /// walks the context's reference slots one named field at a time, and
-    /// this one is an identity token that may name a frame already freed, so
-    /// forwarding it would be wrong rather than merely unnecessary.
-    pub accounted_activation: usize,
+    /// The innermost frame whose activation has already spent its
+    /// [`py_recursion_depth`](Self::py_recursion_depth) unit.  A frame is
+    /// executed through nested entry points -- the JIT wrapper may run it as
+    /// compiled code, hand it to the JIT eval loop, or decline and re-enter
+    /// the plain evaluator for the very same frame -- and only the outermost
+    /// of those pays.  Any frame reached from here is a different,
+    /// simultaneously-live frame, so identity cannot collide with the one
+    /// recorded.  PyPy has no accounted-activation slot (`executioncontext.py`
+    /// `enter`/`leave` only write `topframeref`).
+    accounted_activation: *mut PyFrame,
     /// Left by `generator_invoke_execute_frame`'s finally once
     /// the frame body returned and `running` is cleared; read by the jd2 abort
     /// fallback to tell 'the resume never returned' from 'the body already ran'.
@@ -967,6 +965,7 @@ pub unsafe fn executioncontext_custom_trace(
         let ec = obj_addr as *mut ExecutionContext;
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).space));
         f(std::ptr::addr_of_mut!((*ec).topframeref) as *mut majit_ir::GcRef);
+        f(std::ptr::addr_of_mut!((*ec).accounted_activation) as *mut majit_ir::GcRef);
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_tracefunc));
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).compiler));
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_profilefuncarg));
@@ -1159,6 +1158,19 @@ impl ExecutionContext {
             self as *const Self as pyre_object::gc_hook::GCREF,
         );
         self.topframeref = anchor.live();
+    }
+
+    #[inline]
+    pub fn accounted_activation(&self) -> *mut PyFrame {
+        self.accounted_activation
+    }
+
+    #[inline]
+    pub fn set_accounted_activation(&mut self, frame: *mut PyFrame) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.accounted_activation = frame;
     }
 
     #[inline]
@@ -1401,7 +1413,7 @@ impl ExecutionContext {
             repr_active: RefCell::new(Vec::new()),
             lazy_imports_resolving: RefCell::new(Vec::new()),
             py_recursion_depth: 0,
-            accounted_activation: 0,
+            accounted_activation: std::ptr::null_mut(),
             root_stack_slot: Cell::new(0),
         }
     }
@@ -1417,11 +1429,10 @@ impl ExecutionContext {
         // The activation accounting is per-context and the worker runs none of
         // the spawning thread's frames.  Carrying the depth over would spend
         // part of `sys.getrecursionlimit()` before the thread's first frame;
-        // carrying the address over would let a frame minted here read itself
-        // as already accounted, the way an address reused by this thread's
-        // allocator would, and never pay its unit.
+        // carrying the claim over would let a frame minted here read itself
+        // as already accounted and never pay its unit.
         ec.py_recursion_depth = 0;
-        ec.accounted_activation = 0;
+        ec.accounted_activation = std::ptr::null_mut();
         // The cached cell belongs to the spawning thread's TLS.
         ec.root_stack_slot.set(0);
         ec.w_tracefunc = pyre_object::PY_NULL;

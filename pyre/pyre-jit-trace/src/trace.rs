@@ -70,12 +70,12 @@ impl Drop for ObjectVecRoot {
 /// The slice has to stay put: `push_resume_ref_roots` records its address,
 /// and a realloc would leave the collector writing into the freed buffer.
 /// Drop pops the registration on return and unwind.
-struct ResumeRefSliceRoots {
+pub struct ResumeRefSliceRoots {
     depth: usize,
 }
 
 impl ResumeRefSliceRoots {
-    fn arm(slots: &mut [i64]) -> Self {
+    pub fn arm(slots: &mut [i64]) -> Self {
         let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
         if !slots.is_empty() {
             // SAFETY: `slots` is a Rust `Vec` buffer, not a nursery object,
