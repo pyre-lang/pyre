@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=5.5
 # Changing an unboxed int or float slot to the other type creates a boxed map;
 # the promoted-map guard must deopt before the old raw-storage read or write is
 # reused for the new representation (mapdict.py, 600-619, 905-916).
@@ -43,5 +43,5 @@ def run_float(n):
     return total, obj.x
 
 
-print(run_int(3000000))
-print(run_float(3000000))
+print(run_int(12000000))
+print(run_float(12000000))
