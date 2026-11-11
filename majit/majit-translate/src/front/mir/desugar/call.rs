@@ -5425,26 +5425,8 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // A borrow of a `repr(transparent)` scalar `Cell<T>`
-                    // is the word, so `get` is that word; an opaque
-                    // receiver keeps the call.
-                    if tyref_is_primitive_scalar(&call.dest.ty, self.llbc)
-                        && first_arg_ty.as_ref().is_some_and(|ty| {
-                            tyref_is_borrowed_transparent_scalar(
-                                ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            )
-                        })
-                    {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
+                    // No containing field place: the call stays
+                    // (`jtransform.py rewrite_op_getfield` has no field to read).
                 }
                 // `Cell::set(&self, v)` is the containing field's own
                 // `setfield` (`jtransform.py rewrite_op_setfield`).
