@@ -28,6 +28,26 @@ for generation in (None, 1.25, "0"):
 with assert_raises(TypeError):
     gc.collect(0, 1)
 
+# A cycle of a few hundred objects, dropped, then collected twice. The return
+# is the old-generation objects this collection released (`minimarkpage.py`
+# `walk_page`, `incminimark.py` `free_unvisited_rawmalloc_objects_step`); a
+# minor does not enumerate dead nursery objects, so the cycle is collected
+# once while still live and then dropped.
+class Node:
+    def __init__(self):
+        self.next = None
+
+
+cycle = [Node() for _ in range(400)]
+for i, node in enumerate(cycle):
+    node.next = cycle[(i + 1) % len(cycle)]
+gc.collect()
+del cycle, node
+first = gc.collect()
+second = gc.collect()
+assert isinstance(first, int)
+assert isinstance(second, int)
+assert first + second > 0
 
 assert isinstance(gc.get_objects(), list)
 assert isinstance(gc.get_objects(None), list)

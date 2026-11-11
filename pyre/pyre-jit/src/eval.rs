@@ -169,8 +169,8 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
 /// segfault on the next memory access. The trampoline is wired up, but
 /// safe enablement is not yet implemented: it requires a shadowstack
 /// pass that registers every live PyObjectRef as a GC root.
-fn pyre_object_gc_collect_trampoline(generation: i64) {
-    majit_gc::collect_generation(generation);
+fn pyre_object_gc_collect_trampoline(generation: i64) -> i64 {
+    majit_gc::collect_generation(generation)
 }
 
 fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {

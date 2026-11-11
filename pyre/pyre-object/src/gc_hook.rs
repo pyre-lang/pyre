@@ -505,8 +505,9 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
 /// Signature of the host-side collection callback. Used by
 /// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
 /// `gc.collect(n)` reaches the live GC through this hook, carrying the
-/// generation it was asked for.
-pub type GcCollectHookFn = fn(i64);
+/// generation it was asked for. The return is the number of objects that
+/// collection freed.
+pub type GcCollectHookFn = fn(i64) -> i64;
 
 majit_gc::global_hook!(static GC_COLLECT_HOOK: GcCollectHookFn);
 
@@ -521,12 +522,14 @@ pub fn clear_gc_collect_hook() {
 }
 
 /// Run `incminimark.py collect(gen)` via the installed hook: a minor at
-/// generation 0, a started major at 1, a full major at 2 and above. No-op when
-/// no hook is installed.
+/// generation 0, a started major at 1, a full major at 2 and above. Returns
+/// the number of old-generation objects that collection freed, or 0 when no
+/// hook is installed.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_collect(generation: i64) {
-    if let Some(f) = GC_COLLECT_HOOK.get() {
-        f(generation);
+pub fn try_gc_collect(generation: i64) -> i64 {
+    match GC_COLLECT_HOOK.get() {
+        Some(f) => f(generation),
+        None => 0,
     }
 }
 

@@ -1740,8 +1740,8 @@ fn body_reload_fn_ptr() -> i64 {
 /// executes: no `__del__`, no generator `finally`, not even under an explicit
 /// `gc.collect()`. Mirrors dynasm's `dynasm_collect_generation` and cranelift's
 /// `collect_generation_via_active_runtime`.
-fn wasm_collect_generation(generation: i64) {
-    with_wasm_active_gc_mut(|gc| gc.collect_generation(generation));
+fn wasm_collect_generation(generation: i64) -> i64 {
+    with_wasm_active_gc_mut(|gc| gc.collect_generation(generation)).unwrap_or(0)
 }
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {

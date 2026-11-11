@@ -1070,9 +1070,12 @@ pub trait GcAllocator: Send {
     /// singleton does not reach.
     ///
     /// A collector with no state machine has no generation to select, so the
-    /// default answers every one of them with the whole collection.
-    fn collect_generation(&mut self, _generation: i64) {
+    /// default answers every one of them with the whole collection. Impls that
+    /// do not count what they free return 0; MiniMark returns the objects this
+    /// call released.
+    fn collect_generation(&mut self, _generation: i64) -> i64 {
         self.collect_full();
+        0
     }
 
     /// `incminimark.py collect_step`: perform one minor collection
@@ -2015,7 +2018,7 @@ impl GcAllocator for GcHandle {
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
     }
-    fn collect_generation(&mut self, generation: i64) {
+    fn collect_generation(&mut self, generation: i64) -> i64 {
         gc_sync::gc_op(|gc| gc.collect_generation(generation))
     }
     fn collect_step(&mut self) -> GcStepTransition {
@@ -3693,9 +3696,9 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_roots(
 /// active backend's GC. App-level `gc.collect(n)` reaches the live GC through
 /// this trampoline, carrying the generation it was given: the backends do not
 /// share one GC, so the dispatch cannot happen on `gc_sync`'s singleton.
-/// Returns silently when no backend has installed a hook (callers treat it as
-/// a no-op).
-pub type CollectGenerationFn = fn(i64);
+/// Returns 0 when no backend has installed a hook (callers treat it as a
+/// no-op).
+pub type CollectGenerationFn = fn(i64) -> i64;
 
 global_hook!(static ACTIVE_COLLECT_GENERATION: CollectGenerationFn);
 
@@ -3705,10 +3708,12 @@ pub fn set_active_collect_generation(hook: Option<CollectGenerationFn>) {
 }
 
 /// Run `incminimark.py collect(gen)` on the active backend's GC.
-/// No-op when no backend has installed a hook.
-pub fn collect_generation(generation: i64) {
-    if let Some(f) = ACTIVE_COLLECT_GENERATION.get() {
-        f(generation);
+/// Returns the number of old-generation objects that call freed, or 0 when
+/// no backend has installed a hook.
+pub fn collect_generation(generation: i64) -> i64 {
+    match ACTIVE_COLLECT_GENERATION.get() {
+        Some(f) => f(generation),
+        None => 0,
     }
 }
 

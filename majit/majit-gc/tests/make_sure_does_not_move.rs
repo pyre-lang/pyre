@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static GENERATIONS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 static STOP_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-fn record_collection(generation: i64) {
+fn record_collection(generation: i64) -> i64 {
     GENERATIONS.lock().unwrap().push(generation);
     // A moving collector rewrites roots, not the caller's unregistered copy.
     shadow_stack::walk_roots(|p| p.0 += 16);
+    0
 }
 
 fn can_still_move(p: GcRef) -> bool {
@@ -100,7 +101,7 @@ fn rgc_make_sure_does_not_move_preserves_the_collection_and_root_contract() {
         ..Default::default()
     });
     set_active_collect_generation(Some(|generation| {
-        gc_sync::gc_op(|gc| gc.collect_generation(generation));
+        gc_sync::gc_op(|gc| gc.collect_generation(generation))
     }));
     let mut p = gc_sync::gc_op(|gc| gc.alloc_with_type(tid, 16));
     unsafe { *(p.0 as *mut usize) = 0xabcdef };

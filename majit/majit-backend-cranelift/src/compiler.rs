@@ -1539,8 +1539,8 @@ fn alloc_young_nonmoving_typed_no_collect_via_active_runtime(type_id: u32, size:
 /// safety constraints apply (caller must be at a safepoint where every
 /// live PyObjectRef is rooted — Rust-stack PyObjectRef in nursery would
 /// dangle after the embedded minor cycle).
-fn collect_generation_via_active_runtime(generation: i64) {
-    with_cranelift_gc(|gc| gc.collect_generation(generation));
+fn collect_generation_via_active_runtime(generation: i64) -> i64 {
+    with_cranelift_gc(|gc| gc.collect_generation(generation)).unwrap_or(0)
 }
 
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {

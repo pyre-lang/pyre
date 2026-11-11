@@ -100,6 +100,9 @@ pub struct ArenaCollection {
     pub total_memory_alloced: usize,
     pub peak_memory_alloced: usize,
     live_objects: usize,
+    /// Objects `walk_page` has released. Monotonic; a collection's count is
+    /// the delta across that call (`minimarkpage.py` `walk_page`).
+    objects_freed: usize,
     size_class_with_old_pages: isize,
 }
 
@@ -160,6 +163,7 @@ impl ArenaCollection {
             total_memory_alloced: 0,
             peak_memory_alloced: 0,
             live_objects: 0,
+            objects_freed: 0,
             size_class_with_old_pages: -1,
         }
     }
@@ -532,6 +536,7 @@ impl ArenaCollection {
             }
             self.total_memory_used -= freed * block_size;
             self.live_objects -= freed;
+            self.objects_freed += freed;
             surviving
         }
     }
@@ -539,6 +544,10 @@ impl ArenaCollection {
     #[cfg(test)]
     pub(crate) fn object_count(&self) -> usize {
         self.live_objects
+    }
+
+    pub(crate) fn objects_freed(&self) -> usize {
+        self.objects_freed
     }
 
     pub(crate) fn debug_validate_freeblocks(&self, site: &str) {

@@ -9768,6 +9768,14 @@ impl MiniMarkGC {
         self.rrc_invoke_cpyext_drain();
     }
 
+    /// Old-generation objects this collector has released: arena
+    /// `walk_page` `freed` plus unvisited rawmalloc objects
+    /// `free_unvisited_rawmalloc_objects_step` actually deallocated.
+    /// Nursery deaths are not enumerated by a minor collection.
+    pub(crate) fn objects_freed(&self) -> usize {
+        self.oldgen.objects_freed()
+    }
+
     /// incminimark.py `collect(gen=2)`: "Do a minor (gen=0), start a major
     /// (gen=1), or do a full major (gen>=2) collection."
     ///
@@ -11220,8 +11228,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_collect_full();
     }
 
-    fn collect_generation(&mut self, generation: i64) {
+    fn collect_generation(&mut self, generation: i64) -> i64 {
+        let before = self.objects_freed();
         self.do_collect(generation);
+        (self.objects_freed() - before) as i64
     }
 
     fn collect_step(&mut self) -> crate::GcStepTransition {

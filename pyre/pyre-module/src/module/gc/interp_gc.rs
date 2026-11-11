@@ -192,14 +192,16 @@ pub(super) fn collect(
     }
     pyre_interpreter::baseobjspace::clear_method_cache();
     pyre_interpreter::objspace::std::mapdict::clear_map_attr_cache();
-    pyre_object::gc_hook::try_gc_collect(generation);
+    let freed = pyre_object::gc_hook::try_gc_collect(generation);
     _run_finalizers()?;
     run_cpyext_deallocs_now();
-    // The return value is the caller-observable axis and is an int.
-    // A collector that never counts unreachable objects has no count
-    // to report, so the constant `interp_gc.py:48` carries is what it
-    // answers.  `extra_tests/snippets/stdlib_gc.py` pins the type.
-    Ok(w_int_new(0))
+    // The return is the number of old-generation objects this collection
+    // released: `minimarkpage.py` `walk_page`'s `freed`, plus each unvisited
+    // rawmalloc object `incminimark.py` `free_unvisited_rawmalloc_objects_step`
+    // actually deallocates. A minor does not enumerate the nursery objects
+    // it discards, so those deaths are not in the count. `interp_gc.py`
+    // `collect` is the app-level entry; the observable is an int.
+    Ok(w_int_new(freed))
 }
 
 /// `interp_gc.py collect_step`, running `StepCollector.do`.
