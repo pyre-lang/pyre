@@ -207,6 +207,20 @@ CHARON_CORE_INCLUDE = [
     # then reads as a named Struct field (`RangeInclusive` above).
     "--include",
     "majit_metainterp::pyjitpl::frame::MIFrame",
+    # The blanket conversions `impl TryFrom<U> for T where U: Into<T>`
+    # (`Ok(U::into(value))`), `impl Into<U> for T where U: From<T>`
+    # (`U::from(self)`) and the reflexive `impl From<T> for T`. A generic
+    # body specialized on a type whose `TryFrom` is the blanket one
+    # (`Arg<T>::try_get` on the `From<u32>` oparg types) calls these
+    # through its clause; with the bodies present the specialized copy
+    # calls the resolved impl method (`classdesc.py ClassDesc.lookup`)
+    # down to the type's own `From` body.
+    "--include",
+    "core::convert::_::try_from",
+    "--include",
+    "core::convert::_::into",
+    "--include",
+    "core::convert::_::from",
 ]
 CHARON_ARGS = [
     "--hide-marker-traits",
