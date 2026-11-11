@@ -4802,6 +4802,7 @@ struct FnPtrIndices {
     current_exception_or_none_fn: HelperHandle,
     reraise_varargs_zero_fn: HelperHandle,
     set_current_exception_fn: HelperHandle,
+    restore_exc_info_fn: HelperHandle,
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
     load_special_fn: HelperHandle,
@@ -4883,7 +4884,7 @@ struct FnPtrIndices {
 /// `call.py:282-330` + `effectinfo.py EffectInfo`):  allow-line-citation
 ///
 /// * `get_current_exception_fn` / `current_exception_or_none_fn` /
-///   `set_current_exception_fn`: TLS read/write of
+///   `set_current_exception_fn` / `restore_exc_info_fn`: TLS read/write of
 ///   `CURRENT_EXCEPTION`; never raises.  RPython's
 ///   `EF_CANNOT_RAISE` (`call.py getcalldescr`'s `else` branch) →
 ///   `PlainCannotRaise`.
@@ -5034,6 +5035,12 @@ fn register_helper_fn_pointers(
     let set_current_exception_fn = bind(
         assembler,
         cpu.set_current_exception_fn as *const (),
+        CallFlavor::PlainCannotRaiseNoHeap,
+    );
+    // TLS write of the saved prev; `None` clears. Same flavor as the store.
+    let restore_exc_info_fn = bind(
+        assembler,
+        cpu.restore_exc_info_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
     // `bh_newtuple_from_array` is allocation-only (`newtuple(list_w)`
@@ -5689,6 +5696,7 @@ fn register_helper_fn_pointers(
         current_exception_or_none_fn,
         reraise_varargs_zero_fn,
         set_current_exception_fn,
+        restore_exc_info_fn,
         load_attr_fn,
         load_method_self_fn,
         load_special_fn,
@@ -7621,6 +7629,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: set_current_exception_fn_idx,
                     flavor: _set_current_exception_fn_flavor,
+                },
+            restore_exc_info_fn:
+                HelperHandle {
+                    idx: restore_exc_info_fn_idx,
+                    flavor: _restore_exc_info_fn_flavor,
                 },
             load_attr_fn:
                 HelperHandle {
@@ -12094,9 +12107,9 @@ impl CodeWriter {
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             let _ = residual_call!(
-                                set_current_exception_fn_idx,
+                                restore_exc_info_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::RuntimeHelperKind::SetCurrentException,
+                                majit_ir::RuntimeHelperKind::RestoreExcInfo,
                                 vec![],
                                 vec![prev_value],
                                 vec![],
@@ -18837,6 +18850,7 @@ mod tests {
         // handler whose catch-site FrameState may be missing, so
         // PUSH_EXC_INFO binds a fresh Variable that is not already
         // the symbolic stack top.
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
         let sources = [
             "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
             "def f():\n    for i in range(3):\n        try:\n            {}[i]\n        except KeyError:\n            pass\n",
@@ -18913,13 +18927,15 @@ mod tests {
     fn pop_except_restores_the_slot_it_reads_before_the_clear() {
         // `pyopcode.py POP_EXCEPT`: `popvalue_maybe_none` reads
         // `locals_cells_stack_w[depth - 1]` before clearing it, then
-        // `_restore_exc_info`s that value.  The SetCurrentException residual's
+        // `_restore_exc_info`s that value.  The RestoreExcInfo residual's
         // Ref argument is that `getarrayitem_vable_r` result, not a
         // handler-entry shadow Variable (same as `RERAISE`).
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
         let sources = [
             "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
             "def f():\n    for i in range(3):\n        try:\n            {}[i]\n        except KeyError:\n            pass\n",
         ];
+        let restore_ptr = crate::call_jit::bh_restore_exc_info as *const () as i64;
         for source in sources {
             let code = first_nested_function_code(source);
             let w_code = pyre_interpreter::box_code_constant(&code);
@@ -18929,29 +18945,28 @@ mod tests {
             assert!(!pyjit.has_abort, "try/except handler must lower");
             let ops: Vec<_> =
                 pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+            let num_regs_i = pyjit.jitcode.num_regs_i();
             let mut found_pop_restore = false;
-            for residual in ops.iter().filter(|op| {
-                op.key == "residual_call_r_v/iRd" && pyjit.jitcode.code.get(op.pc + 2) == Some(&1)
-            }) {
+            for residual in ops.iter().filter(|op| op.key == "residual_call_r_v/iRd") {
+                let fn_reg = pyjit.jitcode.code[residual.pc + 1] as usize;
+                let Some(fn_ptr) =
+                    resolve_int_operand(fn_reg, num_regs_i, &pyjit.jitcode.constants_i, &[])
+                else {
+                    continue;
+                };
+                if fn_ptr != restore_ptr {
+                    continue;
+                }
                 let Some(getitem) = ops
                     .iter()
                     .rev()
                     .find(|op| op.pc < residual.pc && op.opname.starts_with("getarrayitem_vable"))
                 else {
-                    continue;
+                    panic!(
+                        "POP_EXCEPT restore must read the slot before the residual; \
+                         source={source:?}"
+                    );
                 };
-                // PUSH_EXC_INFO's SetCurrentException is the same residual
-                // shape, but `current_exception_or_none` sits between its
-                // caught-exc getarrayitem and the store.  POP_EXCEPT has no
-                // residual between the slot read and the restore.
-                let residual_between = ops.iter().any(|op| {
-                    op.pc > getitem.pc
-                        && op.pc < residual.pc
-                        && op.opname.starts_with("residual_call")
-                });
-                if residual_between {
-                    continue;
-                }
                 assert_eq!(
                     getitem.key, "getarrayitem_vable_r/ridd>r",
                     "POP_EXCEPT prev read is getarrayitem_vable_r; source={source:?}"
@@ -18960,7 +18975,7 @@ mod tests {
                 let ref_arg = pyjit.jitcode.code[residual.pc + 3];
                 assert_eq!(
                     dest, ref_arg,
-                    "SetCurrentException Ref arg is the getarrayitem_vable_r result; \
+                    "RestoreExcInfo Ref arg is the getarrayitem_vable_r result; \
                      source={source:?}"
                 );
                 let clear = ops.iter().find(|op| {
@@ -18971,19 +18986,19 @@ mod tests {
                 let Some(clear) = clear else {
                     panic!(
                         "slot-clear setarrayitem_vable_r must follow the prev read \
-                         and precede SetCurrentException; source={source:?}"
+                         and precede RestoreExcInfo; source={source:?}"
                     );
                 };
                 assert!(
                     getitem.pc < clear.pc && clear.pc < residual.pc,
-                    "getarrayitem_vable -> setarrayitem_vable -> SetCurrentException; \
+                    "getarrayitem_vable -> setarrayitem_vable -> RestoreExcInfo; \
                      source={source:?}"
                 );
                 found_pop_restore = true;
             }
             assert!(
                 found_pop_restore,
-                "POP_EXCEPT SetCurrentException must read the slot before clearing it; \
+                "POP_EXCEPT RestoreExcInfo must read the slot before clearing it; \
                  source={source:?}"
             );
         }

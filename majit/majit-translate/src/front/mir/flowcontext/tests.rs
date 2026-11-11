@@ -2590,15 +2590,11 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
         "f must not keep Cell::get as a Call; graph={}",
         f_graph.dump()
     );
-    let g_graph = crate::test_support::lower_function(&llbc, "g").expect("lower g");
+    let g_err = crate::test_support::lower_function(&llbc, "g")
+        .expect_err("g(&Cell<bool>) has no field place and its word is not an address");
     assert!(
-        g_graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .all(|op| !call_target_ends_with(op, "get")),
-        "g(&Cell<bool>) is the bool word; graph={}",
-        g_graph.dump()
+        g_err.to_string().contains("the word is not an address"),
+        "g(&Cell<bool>) is refused, not aliased; got {g_err}"
     );
     let h_graph = crate::test_support::lower_function(&llbc, "h").expect("lower h");
     let h_ops: Vec<_> = h_graph
@@ -2682,9 +2678,9 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
     );
 }
 
-/// `Cell::get` of an opaque `core::cell::Cell<bool>` parameter has no
-/// MemSlot and no transparent layout, so the result stays the call
-/// (`jtransform.py rewrite_op_getfield` has no field to rewrite).
+/// `Cell::get` of a `core::cell::Cell<bool>` parameter has no containing
+/// field place, so the result stays the call (`jtransform.py
+/// rewrite_op_getfield` has no field to rewrite).
 #[test]
 fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
     use crate::model::{CallTarget, LinkArg, OpKind};
@@ -2756,50 +2752,41 @@ fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
         } => name == leaf_name,
         _ => false,
     };
-    match crate::test_support::lower_function(&llbc, "f") {
-        Ok(graph) => {
-            let ops: Vec<_> = graph
-                .blocks
+    let graph = crate::test_support::lower_function(&llbc, "f").expect("lower f");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| call_target_ends_with(op, "get")),
+        "opaque Cell::get stays a Call; graph={}",
+        graph.dump()
+    );
+    let input = ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.clone(),
+            _ => None,
+        })
+        .expect("f has a Cell argument");
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
                 .iter()
-                .flat_map(|block| &block.operations)
-                .collect();
-            assert!(
-                ops.iter().any(|op| call_target_ends_with(op, "get")),
-                "opaque Cell::get stays a Call; graph={}",
-                graph.dump()
-            );
-            let input = ops
-                .iter()
-                .find_map(|op| match &op.kind {
-                    OpKind::Input { .. } => op.result.clone(),
-                    _ => None,
-                })
-                .expect("f has a Cell argument");
-            let returned = graph
-                .blocks
-                .iter()
-                .find_map(|block| {
-                    block.exits.iter().find_map(|link| {
-                        (link.target == graph.returnblock).then(|| link.args.first())
-                    })
-                })
-                .flatten()
-                .and_then(LinkArg::as_variable);
-            assert_ne!(
-                returned,
-                Some(&input),
-                "opaque Cell::get must not alias the argument; graph={}",
-                graph.dump()
-            );
-        }
-        Err(err) => {
-            let err = err.to_string();
-            assert!(
-                !err.contains("alias"),
-                "opaque Cell::get must not alias; got {err}"
-            );
-        }
-    }
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_ne!(
+        returned,
+        Some(&input),
+        "opaque Cell::get must not alias the argument; graph={}",
+        graph.dump()
+    );
 }
 
 /// `live_rbigint` clones `&RBigInt` and passes the by-value result to

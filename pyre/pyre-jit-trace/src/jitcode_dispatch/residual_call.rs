@@ -5975,6 +5975,7 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
         helper,
         majit_ir::RuntimeHelperKind::StoreSubscr
             | majit_ir::RuntimeHelperKind::SetCurrentException
+            | majit_ir::RuntimeHelperKind::RestoreExcInfo
             | majit_ir::RuntimeHelperKind::StoreDeref
             | majit_ir::RuntimeHelperKind::SetAddMethod
             | majit_ir::RuntimeHelperKind::BareSuperFromFrame
@@ -6883,9 +6884,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // The few VALUE-returning writes the Void test cannot see are caught by
     // helper tag: `CallFn` (an opaque Python call returning its None ref may
     // mutate arbitrary state), `StoreSubscr` (a dict/object `o[k]=v` returning
-    // the stored value), `SetCurrentException` (the TLS exc-slot write), and
-    // `StoreDeref` (an in-place closure-cell write returning the slot value —
-    // `nonlocal n; n += 1`).  Over-refusing only these (never a benign read)
+    // the stored value), `SetCurrentException` / `RestoreExcInfo` (the TLS
+    // exc-slot writes), and `StoreDeref` (an in-place closure-cell write
+    // returning the slot value — `nonlocal n; n += 1`).  Over-refusing only
+    // these (never a benign read)
     // keeps the journaled-append body (`for_mutate`) delivering, since its
     // `getattr`/append residuals return `Ref` and carry no write tag.
     //
@@ -12386,7 +12388,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `sys_exc_value` slot, and consume the interpreter-only propagation-root
     // clear without recording a runtime CallN. Recognised by the
     // codewriter-stamped `runtime_helper` tag (not a funcptr address — the
-    // residual calls the cross-crate `cpu.{get,set}_current_exception_fn`
+    // residual calls the cross-crate
+    // `cpu.{get,set}_current_exception_fn` / `cpu.restore_exc_info_fn`
     // wrappers).  A balanced PUSH save + POP restore on the same descr-
     // identity field is dead-store-eliminated by the heap optimizer, so a
     // non-escaping exception (built + raised + caught in one trace) stays
@@ -12398,6 +12401,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             majit_ir::RuntimeHelperKind::GetCurrentException
                 | majit_ir::RuntimeHelperKind::CurrentExceptionOrNone
                 | majit_ir::RuntimeHelperKind::SetCurrentException
+                | majit_ir::RuntimeHelperKind::RestoreExcInfo
                 | majit_ir::RuntimeHelperKind::ClearInFlightException
         )
         && try_walker_lower_exc_info_residual(
