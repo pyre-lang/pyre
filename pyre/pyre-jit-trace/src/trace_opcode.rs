@@ -3020,8 +3020,8 @@ impl MIFrame {
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
-        let concrete_frame_ptr = if !sym.concrete_vable_ptr.is_null() {
-            sym.concrete_vable_ptr as usize
+        let concrete_frame_ptr = if !sym.concrete_vable_ptr().is_null() {
+            sym.concrete_vable_ptr() as usize
         } else {
             self.concrete_frame_addr
         };

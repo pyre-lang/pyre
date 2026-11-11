@@ -1855,7 +1855,7 @@ fn seed_and_synchronize_bridge_vable(
     let resume_vable = resume_decoded_vable_addr(boxes);
     if resume_vable != 0 {
         sym.publish_live_vable_frame(resume_vable);
-        sym.concrete_vable_ptr = resume_vable as *mut u8;
+        sym.bind_concrete_vable_ptr(resume_vable as *mut u8);
         ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
     }
     // `rebuild_state_after_failure` installs the boxes then
@@ -3167,7 +3167,15 @@ pub struct PyreSym {
     pub(crate) concrete_execution_context: *const pyre_interpreter::PyExecutionContext,
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
-    pub(crate) concrete_vable_ptr: *mut u8,
+    /// The raw word as bound; readers use [`Self::concrete_vable_ptr`].
+    concrete_vable_raw: *mut u8,
+    /// Forwards [`Self::concrete_vable_raw`] across a minor.
+    ///
+    /// The tracing snapshot (`snapshot_for_tracing`) is a GC-owned nursery
+    /// frame, and the walk runs residual calls concretely, so a minor moves
+    /// it while this field still names the old copy.  Once the nursery is
+    /// reused, a read through the raw word lands on a new occupant.
+    concrete_vable_root: LiveVableFrameRoot,
     /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
     /// snapshot, or 0 when tracing runs without one (tests).
     /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
@@ -3371,7 +3379,7 @@ impl WalkSym for PyreSym {
 
     #[inline]
     fn tracing_vable_frame_addr(&self) -> usize {
-        self.concrete_vable_ptr as usize
+        self.concrete_vable_ptr() as usize
     }
 
     #[inline]
@@ -7306,6 +7314,54 @@ fn copy_constants<T, F>(
 }
 
 impl PyreSym {
+    /// Address of the tracing virtualizable after any minor that ran since
+    /// [`Self::bind_concrete_vable_ptr`].
+    pub(crate) fn concrete_vable_ptr(&self) -> *mut u8 {
+        if let Some(root) = self.concrete_vable_root.inner.as_ref() {
+            let now = root.get().0;
+            if now != 0 {
+                return now as *mut u8;
+            }
+        }
+        self.concrete_vable_raw
+    }
+
+    /// Bind the tracing virtualizable to a frame the caller holds live now.
+    ///
+    /// A GC-owned frame is held in a root, so [`Self::concrete_vable_ptr`]
+    /// follows it across later minors.
+    pub(crate) fn bind_concrete_vable_ptr(&mut self, value: *mut u8) {
+        self.concrete_vable_raw = value;
+        let addr = value as usize;
+        if addr == 0 || !majit_gc::gc_owns_object(addr) {
+            self.concrete_vable_root.inner = None;
+            return;
+        }
+        // Extra-area walks hold `lock_mutator_registry`; planting here
+        // would call `mutator_is_registered` and deadlock.  Refresh a root
+        // that is already planted, as `publish_live_vable_frame` does.
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            if let Some(root) = self.concrete_vable_root.inner.as_ref() {
+                root.set(majit_ir::GcRef(addr));
+            }
+            return;
+        }
+        if let Some(root) = self.concrete_vable_root.inner.as_ref() {
+            root.set(majit_ir::GcRef(addr));
+        } else {
+            self.concrete_vable_root.inner = Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(addr),
+            ));
+        }
+    }
+
+    /// Store an address without rooting it.  For a seed that may already
+    /// name a reused nursery slot, and for frames the GC does not own.
+    pub(crate) fn set_concrete_vable_ptr_unrooted(&mut self, value: *mut u8) {
+        self.concrete_vable_raw = value;
+        self.concrete_vable_root.inner = None;
+    }
+
     /// Address of the live virtualizable after any minor that ran since
     /// [`Self::publish_live_vable_frame`].
     pub(crate) fn current_live_vable_frame(&self) -> usize {
@@ -7328,7 +7384,7 @@ impl PyreSym {
         if live != 0 {
             live
         } else {
-            self.concrete_vable_ptr as usize
+            self.concrete_vable_ptr() as usize
         }
     }
 
@@ -7401,7 +7457,8 @@ impl PyreSym {
             concrete_namespace: std::ptr::null_mut(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
-            concrete_vable_ptr: std::ptr::null_mut(),
+            concrete_vable_raw: std::ptr::null_mut(),
+            concrete_vable_root: LiveVableFrameRoot::default(),
             live_vable_frame_addr: 0,
             live_vable_frame_root: LiveVableFrameRoot::default(),
             last_exc_value: Default::default(),
@@ -7811,7 +7868,7 @@ impl PyreSym {
                     majit_ir::Value::Ref(majit_ir::GcRef(self.concrete_execution_context as usize)),
                 );
             }
-            self.concrete_vable_ptr = concrete_frame as *mut u8;
+            self.bind_concrete_vable_ptr(concrete_frame as *mut u8);
             // pyjitpl.py MIFrame.setup parity for the per-kind banks
             // (including pyjitpl.py copy_constants).
             self.setup_kind_register_banks(ctx);
@@ -11498,7 +11555,7 @@ impl JitState for PyreJitState {
         // consume layout `[vable, statics, array...]`). Do not follow or pin
         // the copy: after a minor the nursery slot may already hold a new
         // occupant.
-        sym.concrete_vable_ptr = self.frame as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(self.frame as *mut u8);
         sym.concrete_execution_context =
             self.execution_context as *const pyre_interpreter::PyExecutionContext;
     }
@@ -11796,7 +11853,7 @@ impl JitState for PyreJitState {
             let frame = value_to_usize(&live);
             if frame != 0 {
                 sym.set_live_vable_frame_addr(frame);
-                sym.concrete_vable_ptr = frame as *mut u8;
+                sym.bind_concrete_vable_ptr(frame as *mut u8);
             }
         }
 
@@ -11846,7 +11903,7 @@ impl JitState for PyreJitState {
             let resume_vable = resume_decoded_vable_addr(boxes);
             if resume_vable != 0 {
                 sym.publish_live_vable_frame(resume_vable);
-                sym.concrete_vable_ptr = resume_vable as *mut u8;
+                sym.bind_concrete_vable_ptr(resume_vable as *mut u8);
                 ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
             }
             for (idx, &(op, val)) in boxes.virtualizable_boxes.iter().enumerate() {
@@ -15868,7 +15925,7 @@ mod tests {
         sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
-        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(frame_ptr as *mut u8);
 
         let local0 = w_int_new(41) as i64;
         let stale_cell = w_int_new(42) as i64;
@@ -16036,7 +16093,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.nlocals = 0;
         sym.valuestackdepth = 1;
-        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(frame_ptr as *mut u8);
         let fail_values = [frame_ptr as i64, 0, 9, code_ref as i64, 4, 0];
         let fail_types = [
             Type::Ref,
@@ -16124,7 +16181,7 @@ mod tests {
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
         // Unbound / recycled concrete: bind must take live_vable(0).
-        sym.concrete_vable_ptr = std::ptr::null_mut();
+        sym.set_concrete_vable_ptr_unrooted(std::ptr::null_mut());
         let fail_values = [frame_ptr as i64, 0, 9, code_ref as i64, 1, 0, item as i64];
         let fail_types = [
             Type::Ref,
@@ -16789,7 +16846,7 @@ mod tests {
         sym.registers_r.replace(vec![OpRef::input_arg_ref(6)]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
-        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(frame_ptr as *mut u8);
         // Bind a populated jitcode (real PyCode = frame.pycode) so
         // any sym.jitcode/payload read is well-formed; the single live Ref
         // color 0 maps to local0 in registers_r.
@@ -17886,7 +17943,7 @@ pub(crate) fn pending_concrete_frame(ctx: &TraceCtx, pending: &PendingInlineFram
         Some(majit_ir::Value::Ref(gc)) if !gc.is_null() && gc != majit_ir::GcRef::NO_CONCRETE => {
             gc.as_usize()
         }
-        _ => pending.sym.concrete_vable_ptr as usize,
+        _ => pending.sym.concrete_vable_ptr() as usize,
     }
 }
 
@@ -18395,11 +18452,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // A resumed callee keeps its own nursery `PyFrame`, which
     // `assemble_bridge_inline_pending` may have moved; the recorder cell is
     // forwarded by the collector, the raw copy is not.
-    pending.sym.concrete_vable_ptr = if resumed.is_some() {
-        pending_concrete_frame(ctx, &pending) as *mut u8
+    if resumed.is_some() {
+        let frame = pending_concrete_frame(ctx, &pending) as *mut u8;
+        pending.sym.bind_concrete_vable_ptr(frame);
     } else {
-        concrete_frame_ptr as *mut u8
-    };
+        pending
+            .sym
+            .set_concrete_vable_ptr_unrooted(concrete_frame_ptr as *mut u8);
+    }
     // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot
     // (`collect_outer_active_boxes`) reads ec at portal_ec_reg via
     // `sym.execution_context`.  `assemble_bridge_inline_pending` only seeds it
