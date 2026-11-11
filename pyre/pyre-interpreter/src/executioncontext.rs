@@ -1167,10 +1167,13 @@ impl ExecutionContext {
 
     #[inline]
     pub fn set_accounted_activation(&mut self, frame: *mut PyFrame) {
+        // Same shape as [`Self::set_topframeref`]: the frame crosses the
+        // write barrier in an anchor and is stored from it.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         pyre_object::gc_hook::try_gc_write_barrier(
             self as *const Self as pyre_object::gc_hook::GCREF,
         );
-        self.accounted_activation = frame;
+        self.accounted_activation = anchor.live();
     }
 
     #[inline]
