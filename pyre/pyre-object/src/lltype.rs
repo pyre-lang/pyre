@@ -141,6 +141,21 @@ pub struct PyreClassDescriptor {
     /// identifier difference (`mod r#struct`), which the consumer side
     /// normalizes away.
     pub pytype_path: &'static str,
+    /// Fully-qualified Rust path of the [`TypeIdCell`] static
+    /// [`Self::gc_type_id`] points at (`"pyre_object::_pypy_generic_alias\
+    /// ::W_GENERIC_ALIAS_USER_GC_TYPE_ID_CELL"`), spelled the way the
+    /// flowgraph names the global read.  `#[pyre_class]` derives the cell's
+    /// identifier from the struct name, so the path exists only after
+    /// macro expansion; carrying it here is what lets
+    /// `pyre_class_typeidcell_addrs` bind the address without a
+    /// hand-written table row per type.
+    ///
+    /// The row is the cell's identity so a translated field load / `get`
+    /// is a memory access through a constant pointer (`flowcontext.py`
+    /// `FlowContext.find_global`, `bookkeeper.py` `immutablevalue`).  The
+    /// payload is written once at JIT init (`TypeIdCell::set`); folding
+    /// `get()` as an integer would bake [`TypeIdCell::UNASSIGNED`].
+    pub gc_type_id_path: &'static str,
     /// Fully-qualified Rust path of the TYPE this describes
     /// (`"pyre_interpreter::pycode::W_LineIter"`), as distinct from
     /// [`Self::pytype_path`], which names the `PyType` static.
@@ -177,16 +192,17 @@ unsafe impl Sync for PyreClassDescriptor {}
 /// class descriptors — the Rust stand-in for RPython's translation-time
 /// walk over every `GcStruct` in the low-level type graph
 /// (`rpython/memory/gctransform/framework.py`), which pyre cannot do
-/// because Rust has no such pass.  Two consumers read it: the JIT
+/// because Rust has no such pass.  Three consumers read it: the JIT
 /// driver's `build_gc` completeness *oracle*, which asserts right before
 /// `freeze_types()` that every descriptor with managed children was
-/// actually wired into the GC, and `pyre_class_pytype_addrs`, which binds
-/// each `PyType` static's address for the translation boundary.  The
-/// oracle degrades gracefully under under-population (it can only
-/// under-check, never false-alarm); the address binder does not, because
-/// a name bound at build time and missing at runtime keeps the
-/// build-process address.  Both populations below therefore have to hold
-/// the same set.
+/// actually wired into the GC, `pyre_class_pytype_addrs`, which binds
+/// each `PyType` static's address for the translation boundary, and
+/// `pyre_class_typeidcell_addrs`, which binds each [`TypeIdCell`] static
+/// the same way.  The oracle degrades gracefully under under-population
+/// (it can only under-check, never false-alarm); the address binders do
+/// not, because a name bound at build time and missing at runtime keeps
+/// the build-process address.  Both populations below therefore have to
+/// hold the same set.
 ///
 /// `distributed_slice` rejects `wasm32` ("distributed_slice is not
 /// implemented for this platform"), which carries the same set in
