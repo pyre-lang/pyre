@@ -23669,6 +23669,262 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     reset_single_frame_blackhole();
 }
 
+/// Void-bank `boxed_out` descent (`try_walker_orthodox_newutf8`) does not
+/// run the no-driver check inside `run_prepared_orthodox_descent`. Dest
+/// is still the caller's previous value until the caller writes it
+/// (`finishframe` / `make_result_of_lastop`); `_interpret` checks after
+/// that write.
+#[test]
+fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
+    use crate::state::PyreSym;
+
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let source = "boxed_out_void_bank_parent = None";
+    let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
+    let raw = Box::into_raw(Box::new(py_code));
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("boxed_out_void_bank_parent");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![void_ret],
+        startpoints: Some([0_usize].into_iter().collect()),
+        c_num_regs_i: 1,
+        c_num_regs_r: 4,
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let parent_index = unsafe { (*installed).index as usize };
+    let parent_next = 8;
+
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let sentinel = regs_r[0];
+    let length = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let boxed = pyre_object::w_str_new("ab");
+    let storage_ptr = unsafe { pyre_object::unicodeobject::w_str_storage(boxed) };
+    let storage = tc.const_ref(storage_ptr as i64);
+    tc.set_opref_concrete(
+        storage,
+        majit_ir::Value::Ref(majit_ir::GcRef(storage_ptr as usize)),
+    );
+    let mut concrete_i = [ConcreteValue::Int(0)];
+    let regs_i = [length];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the parent must enter under budget so the child ordinary steps cut"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.jitcode = installed;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.transparent_helper_subwalk = true;
+    mode.transparent_helper_jitcode_index = Some(parent_index);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null; 4],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &|_| None,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    super::residual_call::note_residual_pc_advanced(&wc, parent_next);
+    let descent =
+        super::specialize::try_walker_orthodox_newutf8(&mut wc, 0, storage, length, boxed);
+    assert_eq!(
+        wc.registers_r.get(0),
+        Some(sentinel),
+        "void-bank boxed_out must not write the caller dest"
+    );
+    assert!(
+        !abort_blackhole_latched(),
+        "the no-driver check must not run inside run_prepared_orthodox_descent: \
+         descent={descent:?} latched={:?}",
+        latched_multi_frame_view()
+    );
+    let produced = match descent {
+        Ok(Some(result)) => result,
+        other => panic!(
+            "boxed_out newutf8 descent must complete so the caller can dest-write: {other:?}"
+        ),
+    };
+    let after_write =
+        super::write_no_driver_finishframe_dest(&mut wc, 0, parent_next, 0, 'r', produced);
+    assert_eq!(
+        wc.registers_r.get(0),
+        Some(produced),
+        "the caller dest must hold the new result when the check runs"
+    );
+    assert!(
+        matches!(after_write, Err(DispatchError::TraceTooLong { .. })),
+        "the no-driver check must fire after the caller dest write: {after_write:?}"
+    );
+    let innermost_pc = latched_multi_frame_view()
+        .as_ref()
+        .and_then(|(_, frames)| frames.last().map(|(_, pc)| *pc));
+    if let Some(pc) = innermost_pc {
+        assert_eq!(
+            pc, parent_next,
+            "finishframe must deliver the dest before the check; latch at CALL \
+             ({innermost_pc:?}) means the entry check ran before dest-write"
+        );
+    }
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    std::hint::black_box(&mut snapshot_sym);
+}
+
+/// `orthodox_helper_boxed` takes `boxed_out` with no CALL dest
+/// (`dst_bank` `'v'`). After the helper `finishframe`s it runs the
+/// no-driver check (`_interpret` / `blackhole_if_trace_too_long`).
+#[test]
+fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
+    use crate::state::PyreSym;
+
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let source = "orthodox_helper_boxed_parent = None";
+    let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
+    let raw = Box::into_raw(Box::new(py_code));
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("orthodox_helper_boxed_parent");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![void_ret],
+        startpoints: Some([0_usize].into_iter().collect()),
+        c_num_regs_i: 1,
+        c_num_regs_r: 4,
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let parent_index = unsafe { (*installed).index as usize };
+    let parent_next = 8;
+
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let regs_i = [dummy_int_add_box(&mut tc)];
+    let ops_at_entry = tc.num_recorded_ops();
+    let mut concrete_i = [ConcreteValue::Int(0)];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the parent must enter under budget so the child ordinary steps cut"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.jitcode = installed;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.transparent_helper_subwalk = true;
+    mode.transparent_helper_jitcode_index = Some(parent_index);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null; 4],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &|_| None,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    super::residual_call::note_residual_pc_advanced(&wc, parent_next);
+    let descent = super::specialize::try_walker_orthodox_kwargs_dict_new(&mut wc, 0);
+    assert!(
+        matches!(descent, Err(DispatchError::TraceTooLong { .. })),
+        "orthodox_helper_boxed must run the no-driver check after finishframe: \
+         descent={descent:?} latched={:?}",
+        latched_multi_frame_view()
+    );
+    let innermost_pc = latched_multi_frame_view()
+        .as_ref()
+        .and_then(|(_, frames)| frames.last().map(|(_, pc)| *pc));
+    if let Some(pc) = innermost_pc {
+        assert_eq!(
+            pc, parent_next,
+            "finishframe must complete before the check; latch at CALL \
+             ({innermost_pc:?}) means the entry check ran before finishframe"
+        );
+    }
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    std::hint::black_box(&mut snapshot_sym);
+}
+
 /// Residualized `inline_call_*` (`do_residual_or_indirect_call` does not
 /// `perform_call`) stays inside the same `run_one_step`. The helper
 /// ChangeFrame check must not fire at that instruction.
