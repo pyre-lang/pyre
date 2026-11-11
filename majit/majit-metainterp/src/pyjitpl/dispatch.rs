@@ -4990,18 +4990,6 @@ where
         };
         let (lhs, lhs_value) = self.read_ref_reg(ctx, lhs_idx);
         let (rhs, rhs_value) = self.read_ref_reg(ctx, rhs_idx);
-        if opcode == OpCode::InstancePtrEq && std::env::var_os("PYRE_JD3_DEBUG").is_some() {
-            let name = self.frames.current_mut().jitcode.name.clone();
-            if matches!(
-                name.as_str(),
-                "is_list_iter" | "py_type_check" | "is_range_iter_one_arg"
-            ) {
-                eprintln!(
-                    "[jd3dump-eq] {name} lhs={lhs_value:x} rhs={rhs_value:x} eq={}",
-                    lhs_value == rhs_value
-                );
-            }
-        }
         if lhs == rhs
             && let Some(fast) = fastpath_same_boxes(opcode)
         {
