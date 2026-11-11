@@ -8154,9 +8154,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             // register; `write_residual_call_result_to_dst` no-ops `'v'`.
             DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
                 let _ = finish_inline_callee_return(ctx, None);
-                // `boxed_out` is a result-box request: the caller writes dest
-                // (`finishframe` / `make_result_of_lastop`) and `_interpret`
-                // checks `blackhole_if_trace_too_long` after that write.
+                // Callers that pass `boxed_out` check after the result is
+                // delivered (`finishframe` / `make_result_of_lastop`, then
+                // `_interpret` / `blackhole_if_trace_too_long`). That
+                // includes `orthodox_helper_boxed` (kwargs dict new /
+                // setitem have no CALL dest) and the dest writes after
+                // newutf8 / specialised-tuple descents.
                 if boxed_out.is_none() {
                     helper_blackhole_after_no_driver_finishframe(
                         ctx,
@@ -8198,9 +8201,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
 /// Descend a helper and return its result box without writing a caller
 /// dst register.  `allow_void` accepts `void_return` (`SubReturn` with
 /// no box) and yields `Ok(Some(None))`.  Walks through
-/// [`try_walker_orthodox_descent_ex`] (`dst_bank` `'v'`); a `SubRaise`
-/// declines without an extra cut — `run_prepared_orthodox_descent`
-/// already returns that outcome.
+/// [`try_walker_orthodox_descent_ex`] (`dst_bank` `'v'`).  Callers that
+/// take `boxed_out` check after the result is delivered; this helper is
+/// one of them (`finishframe`, then `_interpret` /
+/// `blackhole_if_trace_too_long`).  A `SubRaise` declines without an
+/// extra cut — `run_prepared_orthodox_descent` already returns that
+/// outcome.
 fn orthodox_helper_boxed<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8222,6 +8228,11 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
         Some(&mut boxed),
     )? {
         Some(DispatchOutcome::Continue) => {
+            helper_blackhole_after_no_driver_finishframe(
+                ctx,
+                no_driver_finishframe_latch(ctx, op_pc),
+                op_pc,
+            )?;
             if allow_void {
                 Ok(Some(boxed))
             } else {
