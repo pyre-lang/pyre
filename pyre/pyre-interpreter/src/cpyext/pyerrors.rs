@@ -841,8 +841,12 @@ fn set_import_error(
                 "cpyext keyword call has no current frame",
             ));
         }
+        // `cpyext/object.py`: the executing frame is a GCREF local across
+        // `space.call_args`. `framework.py` `gct_direct_call` /
+        // `shadowstack.py` `pop_roots` rewrite this copy.
+        let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::call::call_with_kwargs(
-            unsafe { &mut *frame },
+            unsafe { &mut *frame_anchor.live() },
             pyre_object::gc_roots::shadow_stack_get(class_slot),
             &[message],
             &named,

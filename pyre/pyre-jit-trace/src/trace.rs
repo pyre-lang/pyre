@@ -70,12 +70,12 @@ impl Drop for ObjectVecRoot {
 /// The slice has to stay put: `push_resume_ref_roots` records its address,
 /// and a realloc would leave the collector writing into the freed buffer.
 /// Drop pops the registration on return and unwind.
-struct ResumeRefSliceRoots {
+pub struct ResumeRefSliceRoots {
     depth: usize,
 }
 
 impl ResumeRefSliceRoots {
-    fn arm(slots: &mut [i64]) -> Self {
+    pub fn arm(slots: &mut [i64]) -> Self {
         let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
         if !slots.is_empty() {
             // SAFETY: `slots` is a Rust `Vec` buffer, not a nursery object,
@@ -942,6 +942,9 @@ fn try_commit_midbody_abort_inner(
         }
     };
     frame.fix_array_ptrs();
+    // `FrameBox::owner_root` already keeps the frame; this pin is the
+    // `shadowstack.py` `push_roots` livevar `Function.call_args` holds.
+    // `pyframe_object_custom_trace` visits `locals_cells_stack_w`.
     let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
 
     let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =

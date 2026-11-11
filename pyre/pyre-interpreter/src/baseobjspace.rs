@@ -17116,6 +17116,12 @@ pub fn call_args_and_c_profile(
     mut callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
+    // `baseobjspace.py call_args_and_c_profile` keeps `frame` across the
+    // pin of `w_func` / `args` and then `c_call_trace` / `call_args`.
+    // `framework.py` `gct_direct_call` / `shadowstack.py` `pop_roots`
+    // rewrite that GCREF. One `FrameAnchor` for this profiled call; the
+    // user-function speedhack never enters here (`funccall_valuestack`).
+    let frame_anchor = crate::eval::FrameAnchor::new(frame);
     let nargs = args.len();
     let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = roots.pin_roots(&[callable]);
@@ -17125,11 +17131,15 @@ pub fn call_args_and_c_profile(
     let mut arguments = crate::argument::Arguments::positional_only(&rooted_args);
     pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
     callable = roots.get(callable_slot);
-    call_args_and_c_profile_args(frame, callable, &mut arguments, &rooted_args)
+    call_args_and_c_profile_args(&frame_anchor, callable, &mut arguments, &rooted_args)
 }
 
 /// `baseobjspace.py call_args_and_c_profile` with a
 /// pre-built `Arguments` instance.
+///
+/// `frame_anchor` is the one `FrameAnchor` [`call_args_and_c_profile`]
+/// parked; `live()` re-reads the executing frame after `c_call_trace` /
+/// `call_args` / `c_return_trace` (`gct_direct_call` / `pop_roots`).
 ///
 /// Step 2 of the Arguments port (continuation of `argument.rs`):
 /// callers that have positional and kwargs separated (currently
@@ -17144,7 +17154,7 @@ pub fn call_args_and_c_profile(
 /// dict) that `call_function` still expects until the call surface
 /// itself learns about Arguments.
 pub fn call_args_and_c_profile_args(
-    frame: &mut crate::pyframe::PyFrame,
+    frame_anchor: &crate::eval::FrameAnchor,
     callable: PyObjectRef,
     arguments: &mut crate::argument::Arguments,
     flat_args: &[PyObjectRef],
@@ -17181,13 +17191,8 @@ pub fn call_args_and_c_profile_args(
 
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null()
-        && let Err(err) = unsafe {
-            (*ec).c_call_trace(
-                frame as *mut crate::pyframe::PyFrame,
-                callable(),
-                Some(arguments),
-            )
-        }
+        && let Err(err) =
+            unsafe { (*ec).c_call_trace(frame_anchor.live(), callable(), Some(arguments)) }
     {
         crate::call::set_call_error(err);
         return pyre_object::PY_NULL;
@@ -17217,9 +17222,7 @@ pub fn call_args_and_c_profile_args(
                 let mut err = err;
                 let parked_base = err.pin(&roots);
                 let exc_children = pin_unmanaged_exception_children(err.exc_object);
-                let traced = unsafe {
-                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
-                };
+                let traced = unsafe { (*ec).c_exception_trace(frame_anchor.live(), callable()) };
                 err.reload(&roots, parked_base);
                 if let Some((child_base, offsets)) = exc_children {
                     write_unmanaged_exception_children(err.exc_object, child_base, offsets);
@@ -17227,9 +17230,7 @@ pub fn call_args_and_c_profile_args(
                 crate::call::set_call_error(err);
                 traced
             } else {
-                unsafe {
-                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
-                }
+                unsafe { (*ec).c_exception_trace(frame_anchor.live(), callable()) }
             };
             if let Err(trace_err) = traced {
                 crate::call::set_call_error(trace_err);
@@ -17243,13 +17244,8 @@ pub fn call_args_and_c_profile_args(
     let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_res);
     if !ec.is_null()
-        && let Err(err) = unsafe {
-            (*ec).c_return_trace(
-                frame as *mut crate::pyframe::PyFrame,
-                callable(),
-                Some(arguments),
-            )
-        }
+        && let Err(err) =
+            unsafe { (*ec).c_return_trace(frame_anchor.live(), callable(), Some(arguments)) }
     {
         crate::call::set_call_error(err);
         return pyre_object::PY_NULL;
@@ -23727,28 +23723,15 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
     // `frame = self.frame`, read off the pinned generator: a pin above can
     // wait behind a collection that moves the frame, and the generator's
     // edge is what that collection updates.
-    // Pin a GC-owned frame. An unmanaged `FrameBox::from_raw` allocation
-    // (`owner_root: None`) is not a `GcRef`; publishing it lets a
-    // collection rewrite the pointer, so its slot holds null instead.
-    // `try_gc_owns_object` is the gate. `FrameAnchor` publishes the
-    // same pointer as `GcRef`, so it is not a substitute.
-    let frame_owned = {
-        let frame =
-            unsafe { w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) };
-        !frame.is_null()
-            && pyre_object::gc_hook::try_gc_owns_object(frame as pyre_object::gc_hook::GCREF)
-    };
+    // Pin the frame whether or not `try_gc_owns_object` — `generator.py`
+    // `_send_ex` keeps `frame` as a GCREF local. `gc_current_object_address`
+    // / `drag_out_root` are pyre collector functions (majit-gc), not
+    // upstream symbols; they leave a non-heap address unchanged. The third
+    // slot stays the frame (or null), so the bracket is still three roots.
     let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(if frame_owned {
-        unsafe {
-            w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) as PyObjectRef
-        }
-    } else {
-        pyre_object::PY_NULL
+    let _ = pyre_object::gc_roots::pin_root(unsafe {
+        w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) as PyObjectRef
     });
-    let frame_ptr =
-        unsafe { w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) }
-            as *mut crate::pyframe::PyFrame;
     unsafe {
         if w_generator_is_exhausted(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
             return genentry_raise_finished(
@@ -23756,7 +23739,7 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
                 pyre_object::gc_roots::shadow_stack_get(arg_slot),
             );
         }
-        if frame_ptr.is_null() {
+        if pyre_object::gc_roots::shadow_stack_get(frame_slot).is_null() {
             w_generator_set_exhausted(pyre_object::gc_roots::shadow_stack_get(gen_slot));
             return genentry_raise_finished(
                 pyre_object::gc_roots::shadow_stack_get(gen_slot),
@@ -23806,24 +23789,18 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
         // the outer frame has entered the execution context.  Pass the
         // argument on send/`__next__` whether or not the generator has
         // started so `resume_execute_frame` shares that push.
-        let frame_live = if frame_owned {
-            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame
-        } else {
-            frame_ptr
-        };
+        // `may_ignore_finalizer` / `execute_frame` collect; re-read the
+        // pinned frame (`_send_ex` `frame = self.frame`).
+        let frame_live =
+            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
         match generator_invoke_execute_frame_residual(
             pyre_object::gc_roots::shadow_stack_get(gen_slot),
             frame_live,
             pyre_object::gc_roots::shadow_stack_get(arg_slot),
         ) {
             Ok(value) => {
-                let frame_now = if frame_owned {
-                    pyre_object::gc_roots::shadow_stack_get(frame_slot)
-                        as *mut crate::pyframe::PyFrame
-                } else {
-                    w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot))
-                        as *mut crate::pyframe::PyFrame
-                };
+                let frame_now = pyre_object::gc_roots::shadow_stack_get(frame_slot)
+                    as *mut crate::pyframe::PyFrame;
                 // generator.py `_send_ex` — if the frame marked itself
                 // finished, it was RETURNed from; otherwise it YIELDed.
                 if (*frame_now).frame_finished_execution() {
@@ -23834,13 +23811,8 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
                     let _value_roots = pyre_object::gc_roots::push_roots();
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(value);
-                    let frame_now = if frame_owned {
-                        pyre_object::gc_roots::shadow_stack_get(frame_slot)
-                            as *mut crate::pyframe::PyFrame
-                    } else {
-                        w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot))
-                            as *mut crate::pyframe::PyFrame
-                    };
+                    let frame_now = pyre_object::gc_roots::shadow_stack_get(frame_slot)
+                        as *mut crate::pyframe::PyFrame;
                     generator_frame_is_finished(
                         pyre_object::gc_roots::shadow_stack_get(gen_slot),
                         &mut *frame_now,

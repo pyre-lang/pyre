@@ -21228,7 +21228,11 @@ pub fn exec_or_eval(
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
         let current_globals = frame.get_w_globals();
-        frame.w_builtin = crate::baseobjspace::pick_builtin_obj_checked(current_globals, exec_ctx)?;
+        // `pick_builtin_obj_checked` can collect. Evaluate the RHS first so
+        // the `FrameBox` DerefMut re-reads `owner_root` (`shadowstack.py`
+        // `pop_roots`) after that call (`framework.py` `gct_direct_call`).
+        let w_builtin = crate::baseobjspace::pick_builtin_obj_checked(current_globals, exec_ctx)?;
+        frame.w_builtin = w_builtin;
     }
     frame.fix_array_ptrs();
     // eval.py:32 frame.setdictscope(w_locals, ...) — only when locals

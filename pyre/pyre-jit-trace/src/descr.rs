@@ -9811,7 +9811,10 @@ pub fn ec_py_recursion_depth_descr() -> DescrRef {
 
 /// Field descr for `ExecutionContext::accounted_activation`, read and restored
 /// by the same seam so a frame that reaches a portal door after the charge
-/// does not pay a second unit.
+/// does not pay a second unit.  A `Type::Ref` pointer field
+/// (`descr.py` `FieldDescr.is_pointer_field`) so `rewrite.py`
+/// `handle_write_barrier_setfield` emits `COND_CALL_GC_WB` and the
+/// collector forwards the claim the way it forwards `topframeref`.
 pub fn ec_accounted_activation_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET)
 }
@@ -9824,11 +9827,10 @@ pub fn ec_accounted_activation_descr() -> DescrRef {
 /// `COND_CALL_GC_WB` because the parent SizeDescr is `is_gc_managed = true`
 /// (`executioncontext.py ExecutionContext` is a translated GC instance).
 ///
-/// The two activation-accounting slots are Int-typed instead.  The custom
-/// trace visits the context's object slots by name and never reaches them,
-/// which is what makes an integer sound here: `accounted_activation` is a
-/// bare identity token that may name an already-freed frame, so forwarding
-/// it as a root would be wrong rather than merely unnecessary.
+/// `py_recursion_depth` is Int-typed.  `accounted_activation` is a
+/// Ref-typed GC pointer field like `topframeref` so the collector
+/// forwards it (`descr.py` `FieldDescr.is_pointer_field`; `rewrite.py`
+/// `handle_write_barrier_setfield`).
 ///
 /// The collector tid is [`pyre_interpreter::EXECUTION_CONTEXT_GC_TYPE_ID`].
 /// `GUARD_GC_TYPE` reads the header word `malloc_typed_stable` prepends. An
@@ -9936,7 +9938,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
             "py_recursion_depth",
             pyre_interpreter::EC_PY_RECURSION_DEPTH_OFFSET,
         ),
-        int_field(
+        field(
             u32::MAX,
             "accounted_activation",
             pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
@@ -11913,6 +11915,24 @@ mod tests {
         let can_change = function_can_change_code_descr();
         let imag = complex_imag_descr();
         assert_ne!(can_change.index(), imag.index());
+    }
+
+    #[test]
+    fn ec_accounted_activation_is_a_gc_pointer_field() {
+        let field = ec_accounted_activation_descr();
+        let fd = field
+            .as_field_descr()
+            .expect("accounted_activation FieldDescr");
+        assert_eq!(fd.field_type(), Type::Ref);
+        assert!(fd.is_pointer_field());
+        assert_eq!(
+            fd.offset(),
+            pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &field,
+            &field_descr_from_group_named(&*EC_DESCR_GROUP, "accounted_activation")
+        ));
     }
 
     #[test]
@@ -15784,6 +15804,11 @@ mod tests {
                 ec_topframeref_descr(),
             ),
             (
+                "accounted_activation",
+                pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
+                ec_accounted_activation_descr(),
+            ),
+            (
                 "w_tracefunc",
                 pyre_interpreter::EC_W_TRACEFUNC_OFFSET,
                 ec_w_tracefunc_descr(),
@@ -17899,6 +17924,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 let canonical = match name.as_str() {
                     "sys_exc_value" => Some(ec_sys_exc_value_descr()),
                     "topframeref" => Some(ec_topframeref_descr()),
+                    "accounted_activation" => Some(ec_accounted_activation_descr()),
                     "w_tracefunc" => Some(ec_w_tracefunc_descr()),
                     "profilefunc" => Some(ec_profilefunc_descr()),
                     "current_gen_or_coroutine" => Some(ec_current_gen_or_coroutine_descr()),

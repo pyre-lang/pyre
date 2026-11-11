@@ -6711,7 +6711,7 @@ fn recursion_limit_word_descr() -> DescrRef {
 /// PyPy's limit as approximative and lower-level, and its `@jit.dont_look_inside`
 /// is load-bearing for that policy.
 ///
-/// Returns the depth to restore and the claim to put back -- the two words the
+/// Returns the depth to restore and the claim to put back -- the two boxes the
 /// release takes, threaded to it as dataflow rather than respelled there.
 fn record_activation_charge<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -6735,18 +6735,13 @@ fn record_activation_charge<Sym: WalkSym>(
     );
 
     let displaced_activation = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcI,
+        OpCode::GetfieldGcR,
         &[ec],
         crate::descr::ec_accounted_activation_descr(),
     );
-    // The claim is an identity token, never dereferenced, so it is banked as
-    // an integer rather than as the reference the frame arrives in.
-    let claim = ctx
-        .trace_ctx
-        .record_op(OpCode::CastPtrToInt, &[callee_frame]);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[ec, claim],
+        &[ec, callee_frame],
         crate::descr::ec_accounted_activation_descr(),
     );
 

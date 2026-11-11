@@ -1339,8 +1339,12 @@ fn call_slot_arguments(
                 "a cpyext slot forwarded a call with no current frame",
             ));
         }
+        // `cpyext/object.py` / `slotdefs.py make_tp_call`: the executing
+        // frame is a GCREF local across `space.call_args`.
+        // `framework.py` `gct_direct_call` / `shadowstack.py` `pop_roots`.
+        let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::call::call_function_ex(
-            unsafe { &mut *frame },
+            unsafe { &mut *frame_anchor.live() },
             reload(0),
             reload(1),
             pyre_object::gc_roots::shadow_stack_get(starargs_slot),

@@ -3565,8 +3565,12 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
 }
 
 /// `FrameBox::new` stores the operand of `OwnerRootGuard::new(r)` in
-/// `owner_root`. `frame_ptr`'s `Some` arm returns that word, and
-/// `deref_mut` passes it on as the frame.
+/// `owner_root`. That operand is the frame allocation result; the live
+/// address lives only in that slot (`shadowstack.py` `push_roots` /
+/// `pop_roots`). The managed path writes a null `ptr`; `new_boxed` is
+/// the only writer of a birth address into `ptr`. `frame_ptr`'s `Some`
+/// arm returns the owner_root word, and `deref_mut` passes it on as the
+/// frame.
 ///
 /// The owner_root FieldRead is a classdef-less `Ref` (`llmemory.GCREF`).
 /// `cast_gcref_to_instance` (`rgc.py`) / `annotationoftype` then names
@@ -3818,27 +3822,90 @@ fn frame_box_owner_root_word_roundtrips() {
             "deref_mut casts the frame pointer through the integer bank"
         );
 
+        fn op_is_null_or_zero(op: &SpaceOperation) -> bool {
+            match &op.kind {
+                OpKind::ConstInt(0) | OpKind::ConstUInt(0) | OpKind::ConstRefNull => true,
+                kind if majit_translate::model::is_core_ptr_null_call(kind) => true,
+                OpKind::Call { target, .. } => {
+                    let text = call_target_text(target);
+                    text == "core::ptr::null_mut" || text == "core::ptr::null"
+                }
+                _ => false,
+            }
+        }
+
+        fn const_is_null_or_zero(c: &majit_translate::flowspace::model::Constant) -> bool {
+            c.value.as_int() == Some(0) || c.value.as_uint() == Some(0) || c.value.is_null_address()
+        }
+
+        fn peel_recasts<'a>(graph: &'a FunctionGraph, start: u64) -> &'a SpaceOperation {
+            let mut id = start;
+            let mut seen = Vec::new();
+            loop {
+                assert!(!seen.contains(&id), "cycle at v{id}");
+                seen.push(id);
+                let op = defining_op(graph, id);
+                if op_is_null_or_zero(op) {
+                    return op;
+                }
+                let peel = match &op.kind {
+                    OpKind::UnaryOp { .. } => true,
+                    kind if majit_translate::model::cast_instance_root(kind).is_some() => true,
+                    kind if majit_translate::model::cast_pointer_root(kind).is_some() => true,
+                    _ => false,
+                };
+                if peel {
+                    if let Some(&operand) = operand_ids(op).first() {
+                        id = operand;
+                        continue;
+                    }
+                }
+                return op;
+            }
+        }
+
+        fn call_is_frame_alloc(target: &majit_translate::model::CallTarget) -> bool {
+            let text = call_target_text(target);
+            text.ends_with("try_gc_alloc_young_nonmoving_raw")
+                || text.ends_with("try_gc_alloc_stable_raw")
+        }
+
+        fn call_is_new_boxed(target: &majit_translate::model::CallTarget) -> bool {
+            call_target_text(target).ends_with("new_boxed")
+        }
+
+        fn call_is_boxed_birth(target: &majit_translate::model::CallTarget) -> bool {
+            let text = call_target_text(target);
+            text.ends_with("into_raw") || text.contains("addr_of_mut")
+        }
+
         let new_graph = lower_pyframe(llbc, context, "pub fn new(mut frame: PyFrame)");
         let mut owner_value = None;
-        let mut ptr_value = None;
+        let mut ptr_writes: Vec<&LinkArg> = Vec::new();
         for block in &new_graph.blocks {
             for op in &block.operations {
                 if let OpKind::FieldWrite { field, value, .. } = &op.kind {
-                    let LinkArg::Value(var) = value else {
-                        panic!("{} is a constant, not new(r)", field.name);
-                    };
                     if field.name == "owner_root" {
-                        assert!(owner_value.is_none(), "two owner_root writes");
-                        owner_value = Some(var.id());
+                        match value {
+                            LinkArg::Value(var) => {
+                                assert!(owner_value.is_none(), "two owner_root writes");
+                                owner_value = Some(var.id());
+                            }
+                            LinkArg::Const(c) => {
+                                assert!(
+                                    const_is_null_or_zero(c),
+                                    "owner_root constant is not the None arm, got {c:?}"
+                                );
+                            }
+                        }
                     } else if field.name == "ptr" {
-                        assert!(ptr_value.is_none(), "two ptr writes");
-                        ptr_value = Some(var.id());
+                        ptr_writes.push(value);
                     }
                 }
             }
         }
         let owner_value = owner_value.expect("FrameBox::new writes owner_root");
-        let ptr_value = ptr_value.expect("FrameBox::new writes ptr");
+        assert!(!ptr_writes.is_empty(), "FrameBox::new writes ptr");
         let stored = defining_op(&new_graph, owner_value);
         assert_eq!(
             majit_translate::model::cast_instance_root(&stored.kind),
@@ -3850,10 +3917,89 @@ fn frame_box_owner_root_word_roundtrips() {
             .first()
             .copied()
             .expect("GCREF cast operand");
-        let ptr_ancestors = ancestors(&new_graph, ptr_value);
+        let alloc_results: Vec<u64> = new_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } if call_is_frame_alloc(target) => {
+                    op.result.as_ref().map(|var| var.id())
+                }
+                _ => None,
+            })
+            .collect();
         assert!(
-            ptr_ancestors.contains(&new_operand),
-            "owner_root's new(r) operand is not the frame pointer stored in ptr"
+            !alloc_results.is_empty(),
+            "FrameBox::new must call the frame allocator"
+        );
+        let operand_ancestors = ancestors(&new_graph, new_operand);
+        assert!(
+            alloc_results
+                .iter()
+                .any(|id| operand_ancestors.contains(id)),
+            "owner_root's new(r) operand does not descend from the frame allocation result"
+        );
+        let boxed_birth_results: Vec<u64> = new_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } if call_is_boxed_birth(target) => {
+                    op.result.as_ref().map(|var| var.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let calls_new_boxed = new_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::Call { target, .. } if call_is_new_boxed(target)));
+        let mut saw_null_ptr = false;
+        let mut saw_boxed_ptr = false;
+        for value in &ptr_writes {
+            match value {
+                LinkArg::Const(c) => {
+                    assert!(
+                        const_is_null_or_zero(c),
+                        "ptr constant is not null/zero, got {c:?}"
+                    );
+                    saw_null_ptr = true;
+                }
+                LinkArg::Value(var) => {
+                    let peeled = peel_recasts(&new_graph, var.id());
+                    if op_is_null_or_zero(peeled) {
+                        let ptr_ancestors = ancestors(&new_graph, var.id());
+                        assert!(
+                            alloc_results.iter().all(|id| !ptr_ancestors.contains(id)),
+                            "managed ptr write stores the frame allocation"
+                        );
+                        assert!(
+                            !ptr_ancestors.contains(&new_operand),
+                            "managed ptr write stores owner_root's new(r) operand"
+                        );
+                        saw_null_ptr = true;
+                    } else {
+                        let ptr_ancestors = ancestors(&new_graph, var.id());
+                        assert!(
+                            boxed_birth_results
+                                .iter()
+                                .any(|id| ptr_ancestors.contains(id)),
+                            "new_boxed ptr write defining op is {:?}, not the boxed frame pointer",
+                            peeled.kind
+                        );
+                        saw_boxed_ptr = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_null_ptr,
+            "managed owner_root path must store a null ptr"
+        );
+        assert!(
+            saw_boxed_ptr || calls_new_boxed,
+            "new_boxed fallback must write ptr with the frame pointer or remain a call"
         );
     });
 }

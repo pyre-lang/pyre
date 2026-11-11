@@ -35,46 +35,6 @@ pub(crate) fn frame_into_generator_for_function(
     )
 }
 
-struct FrameLocalsRoot {
-    frame: *mut PyFrame,
-    registered: bool,
-}
-
-impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
-    fn new(frame: &PyFrame) -> Self {
-        let frame = frame as *const PyFrame as *mut PyFrame;
-        let registered = unsafe { register_frame_locals_slot(frame) };
-        Self { frame, registered }
-    }
-
-    fn new_mut(frame: &mut PyFrame) -> Self {
-        Self::new(frame)
-    }
-}
-
-impl Drop for FrameLocalsRoot {
-    fn drop(&mut self) {
-        if self.registered {
-            unregister_frame_locals_slot(self.frame);
-        }
-    }
-}
-
-#[majit_macros::dont_look_inside]
-unsafe fn register_frame_locals_slot(frame: *mut PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
-        as *mut pyre_object::gc_hook::GCREF;
-    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
-}
-
-#[majit_macros::dont_look_inside]
-fn unregister_frame_locals_slot(frame: *mut PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
-        as *mut pyre_object::gc_hook::GCREF;
-    pyre_object::gc_hook::try_gc_remove_root(slot);
-}
-
 thread_local! {
     /// Most recent error swallowed by `call_function_impl` /
     /// `call_user_function_with_args`. These functions return a bare
@@ -214,7 +174,8 @@ thread_local! {
     /// the window before process boot seeds `LAST_EXEC_CTX`, and every
     /// activation records which of the two it used so the two can never be
     /// read against each other.
-    static DETACHED_RECURSION: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static DETACHED_RECURSION: Cell<(usize, *mut PyFrame)> =
+        const { Cell::new((0, std::ptr::null_mut())) };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
@@ -245,7 +206,7 @@ type RecursionHome = *mut crate::PyExecutionContext;
 /// execution context; this Rust TLS is only the pre-context fallback and has
 /// no source-translatable object graph.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_get() -> (usize, usize) {
+fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.get())
 }
 
@@ -254,40 +215,38 @@ fn detached_recursion_state_get() -> (usize, usize) {
 /// execution-context write in [`recursion_state_set`] remains visible to the
 /// translator.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_set(depth: usize, accounted: usize) {
+fn detached_recursion_state_set(depth: usize, accounted: *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.set((depth, accounted)));
 }
 
 /// Read `(py_recursion_depth, accounted_activation)` from `home`.
 ///
 /// PyPy reads these slots straight off the live execution context
-/// (`executioncontext.py ExecutionContext`). A `(*home).field` projection is
-/// the shape `rewrite_op_getfield` already lowers to `getfield_raw_i` (the
-/// same raw integer field load as `profilefunc`). `(&raw const
-/// (*home).field).read()` is not that load: the codewriter leaves it as
-/// `const_ptr::<Impl>::read`, a symbolic residual the portal walk cannot
-/// execute.
+/// (`executioncontext.py ExecutionContext`). `py_recursion_depth` is the
+/// integer field `rewrite_op_getfield` lowers to `getfield_raw_i`;
+/// `accounted_activation` is the GCREF field stored like `topframeref`.
 #[inline]
-fn recursion_state_get(home: RecursionHome) -> (usize, usize) {
+fn recursion_state_get(home: RecursionHome) -> (usize, *mut PyFrame) {
     if home.is_null() {
         detached_recursion_state_get()
     } else {
-        unsafe { ((*home).py_recursion_depth, (*home).accounted_activation) }
+        unsafe { ((*home).py_recursion_depth, (*home).accounted_activation()) }
     }
 }
 
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
 ///
-/// Twin of [`recursion_state_get`]: a field store, so `rewrite_op_setfield`
-/// emits `setfield_raw_i` instead of residualising `mut_ptr::<Impl>::write`.
+/// Twin of [`recursion_state_get`]: the depth is an integer field store;
+/// the claim is a GCREF `SetfieldGc` (`shadowstack.py` `push_roots` /
+/// `pop_roots`; `framework.py` `gct_direct_call`).
 #[inline]
-fn recursion_state_set(home: RecursionHome, depth: usize, accounted: usize) {
+fn recursion_state_set(home: RecursionHome, depth: usize, accounted: *mut PyFrame) {
     if home.is_null() {
         detached_recursion_state_set(depth, accounted);
     } else {
         unsafe {
             (*home).py_recursion_depth = depth;
-            (*home).accounted_activation = accounted;
+            (*home).set_accounted_activation(accounted);
         }
     }
 }
@@ -341,21 +300,13 @@ pub fn bump_frame_entry_count() {
 #[inline]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let home = recursion_home();
-    let key = frame as usize;
+    let key = frame as *mut PyFrame;
     let (saved_depth, accounted) = recursion_state_get(home);
-    if accounted == key {
-        return RecursionDepthGuard {
-            home,
-            prev: key,
-            saved_depth,
-        };
+    if std::ptr::eq(accounted, key) {
+        return RecursionDepthGuard::arm(home, key, saved_depth);
     }
     recursion_state_set(home, saved_depth + 1, key);
-    RecursionDepthGuard {
-        home,
-        prev: accounted,
-        saved_depth,
-    }
+    RecursionDepthGuard::arm(home, accounted, saved_depth)
 }
 
 /// Spend one unit of the recursion budget on a dispatch level that pushes no
@@ -371,11 +322,7 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
     let home = recursion_home();
     let (saved_depth, accounted) = recursion_state_get(home);
     recursion_state_set(home, saved_depth + 1, accounted);
-    RecursionDepthGuard {
-        home,
-        prev: accounted,
-        saved_depth,
-    }
+    RecursionDepthGuard::arm(home, accounted, saved_depth)
 }
 
 /// RAII guard that gives back the activation unit `enter_recursive_frame`
@@ -392,17 +339,33 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
 /// slot naming a callee that has already finished, and the next frame minted
 /// at that address would read itself as already accounted and never pay.
 /// This is the boundary where `pyre-jit`'s `TopFrameRefGuard` already
-/// balances the frame chain for the same exits.
+/// balances the frame chain for the same exits. `prev` lives on the
+/// shadow stack (`shadowstack.py` `push_roots` / `pop_roots`) so a
+/// collection during the activation forwards it, matching that guard's
+/// saved `topframeref`.
 pub struct RecursionDepthGuard {
     home: RecursionHome,
-    prev: usize,
+    prev_root: usize,
     saved_depth: usize,
+}
+
+impl RecursionDepthGuard {
+    #[inline]
+    fn arm(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
+        Self {
+            home,
+            prev_root: majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize)),
+            saved_depth,
+        }
+    }
 }
 
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
-        recursion_state_set(self.home, self.saved_depth, self.prev);
+        let prev = majit_gc::shadow_stack::get(self.prev_root);
+        majit_gc::shadow_stack::pop_to(self.prev_root);
+        recursion_state_set(self.home, self.saved_depth, prev.0 as *mut PyFrame);
     }
 }
 
@@ -1330,9 +1293,9 @@ fn call_user_function_with_eval(
     // The caller is the executing frame: `FrameAnchor` and the
     // execution-context chain already root it, and
     // `pyframe_object_custom_trace` visits `locals_cells_stack_w`.
-    // The callee is a `FrameBox` on the Rust stack until `eval_fn` links
-    // it, so its locals slot stays registered for that window.
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    // The callee is a `FrameBox` (`owner_root`) until `eval_fn` links it;
+    // pin the frame object (`shadowstack.py` `push_roots`).
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     eval_fn(&mut func_frame, None)
 }
 
@@ -1371,7 +1334,8 @@ fn call_user_function_with_eval(
 ///
 /// The caller-side `FrameLocalsRoot` is skipped for the same reason it is in
 /// [`call_user_function_plain_with_ctx`] — no caller `PyFrame` is available.
-/// The callee root is still installed so its locals stay reachable.
+/// The callee frame object is still pinned so `pyframe_object_custom_trace`
+/// can visit `locals_cells_stack_w`.
 pub fn call_user_function_with_ctx(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -1383,7 +1347,7 @@ pub fn call_user_function_with_ctx(
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
     func_frame.fix_array_ptrs();
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     let result = eval_current_frame_raw(&mut func_frame);
     if result.is_null() {
         Err(take_call_error().unwrap_or_else(|| crate::PyError::value_error("call failed")))
@@ -1465,7 +1429,7 @@ pub fn call_user_function_resolved(
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )?)?;
     func_frame.fix_array_ptrs();
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     eval_fn(&mut func_frame, None)
 }
 
@@ -1762,6 +1726,10 @@ fn call_function_carrier_with_mode(
             // two `is_builtin_code` looks through.
             let profile_frame = c_profile_frame(profile_frame);
             if !profile_frame.is_null() {
+                // `call_args_and_c_profile` owns the `FrameAnchor`
+                // (`funccall_valuestack` / `call_valuestack`). This arm
+                // does not take one, so the user-function speedhack never
+                // pays a push/pop.
                 let w_res = crate::baseobjspace::call_args_and_c_profile(
                     unsafe { &mut *profile_frame },
                     callable,
@@ -2250,11 +2218,6 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-    // The caller frame stays anchored across binding and the callee. A user
-    // function does not receive it: `Function.call_args` is the entry, and
-    // `call_user_function_resolved` keeps that shape. The non-user arm reads
-    // it back with `FrameAnchor::live` for `call_callable_with_mode`.
-    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     // `crate::is_function` is also true for a builtin function and a method
     // descriptor. Those stay on `resolve_kwargs` (the builtin arm above
     // already returned). `get_pycode` is the same user-code gate
@@ -2264,6 +2227,10 @@ fn call_kw_in_ctx_impl(
             && !crate::is_builtin_code(crate::getcode(target_func) as pyre_object::PyObjectRef)
     };
     if plain_user {
+        // `Function.call_args` → `pycode.py PyCode.funcrun`. The caller
+        // frame is not read after `createframe` (`funccall_valuestack`
+        // drops values first on the non-flat path; here the opcode already
+        // popped). Do not take a `FrameAnchor` on this arm.
         return call_user_function_from_call_kw(
             execution_context,
             target_func,
@@ -2278,6 +2245,9 @@ fn call_kw_in_ctx_impl(
     // profiled frame afterwards. Publish the words first. The frame is not a
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
     // keeping the raw pointer live across the call.
+    // `CALL_FUNCTION_KW` keeps `frame` across `argument_factory` /
+    // `call_args` (`pyopcode.py`). Park it before the first collecting bind.
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let n_args = call_args.len();
     let roots = pyre_object::gc_roots::push_roots();
     let func_slot = roots.publish(&[target_func, kwarg_names]);
@@ -2860,8 +2830,9 @@ pub fn call_user_function_plain(
 /// so MIFrame Box tracking sees the same result as a concrete-frame call
 /// for callees with positional defaults, kw-only defaults, varargs, or
 /// the GENERATOR/COROUTINE flags.  The caller-side `FrameLocalsRoot` is
-/// skipped because no caller `PyFrame` is available; the callee root is
-/// still installed so its locals stay reachable during eval.
+/// skipped because no caller `PyFrame` is available; the callee frame
+/// object is still pinned so `pyframe_object_custom_trace` can visit
+/// `locals_cells_stack_w` during eval.
 pub fn call_user_function_plain_with_ctx(
     execution_context: *const crate::PyExecutionContext,
     mut callable: PyObjectRef,
@@ -2898,7 +2869,7 @@ pub fn call_user_function_plain_with_ctx(
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )?)?;
     func_frame.fix_array_ptrs();
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     func_frame.run()
 }
 
@@ -4692,8 +4663,9 @@ fn call_with_kwargs_in_ctx_impl(
             }
             // Same callee `FrameLocalsRoot` the positional portal sites
             // install.  `Function.call_args` keeps the new frame as a GC
-            // local; this ABI boundary is outside that transform.
-            let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+            // local (`shadowstack.py` `push_roots`); this ABI boundary is
+            // outside that transform.
+            let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
             return get_eval_fn()(&mut func_frame, None);
         } // end user function branch
     } // end is_function
@@ -5844,9 +5816,9 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     // `Function.call_args` shape and has been routing to `get_eval_fn` all
     // along.
     //
-    // The callee root is installed and the caller root is not, for the reason
+    // The callee frame is pinned and the caller is not, for the reason
     // `call_user_function_with_ctx` records: no caller `PyFrame` exists here.
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
     let result = frame.run_with_jit();
     match result {
         Ok(v) => v,
@@ -5909,7 +5881,7 @@ fn call_user_function_resolved_frameless(
     // Argument matching has already happened, but the activation is the same
     // `PyCode.funcrun` -> `PyFrame.run` one, so this takes the portal on the
     // terms the ordinary spelling above records.
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
     match frame.run_with_jit() {
         Ok(v) => v,
         Err(e) => {

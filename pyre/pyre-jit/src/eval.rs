@@ -323,9 +323,9 @@ impl FrameView {
 }
 
 /// Restores compiled execution's frame-chain and activation bookkeeping,
-/// including on guard exits and panic unwinds. The saved frame pointer lives
-/// on the shadow stack so a moving collection can forward it in place,
-/// matching `CurrentFrameGuard`.
+/// including on guard exits and panic unwinds. The saved `topframeref` and
+/// `accounted_activation` live on the shadow stack so a moving collection
+/// can forward them in place, matching `CurrentFrameGuard`.
 ///
 /// Every door that runs a frame-bearing compiled trace has to take it, not just
 /// the one a given trace happened to be entered through: the reason it exists
@@ -344,26 +344,32 @@ impl FrameView {
 struct TopFrameRefGuard {
     ec: *mut PyExecutionContext,
     saved_root: Option<usize>,
-    saved_recursion: Option<(usize, usize)>,
+    saved_accounted_root: Option<usize>,
+    saved_depth: Option<usize>,
 }
 
 impl TopFrameRefGuard {
     fn new(ec: *mut PyExecutionContext) -> Self {
-        let (saved_root, saved_recursion) = if ec.is_null() {
-            (None, None)
+        let (saved_root, saved_accounted_root, saved_depth) = if ec.is_null() {
+            (None, None, None)
         } else {
             let saved = unsafe { (*ec).topframeref() };
+            let accounted = unsafe { (*ec).accounted_activation() };
             (
                 Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
                     saved as usize,
                 ))),
-                Some(unsafe { ((*ec).py_recursion_depth, (*ec).accounted_activation) }),
+                Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+                    accounted as usize,
+                ))),
+                Some(unsafe { (*ec).py_recursion_depth }),
             )
         };
         Self {
             ec,
             saved_root,
-            saved_recursion,
+            saved_accounted_root,
+            saved_depth,
         }
     }
 }
@@ -374,12 +380,16 @@ impl Drop for TopFrameRefGuard {
             return;
         };
         let saved = majit_gc::shadow_stack::get(saved_root);
+        let accounted = self
+            .saved_accounted_root
+            .map(majit_gc::shadow_stack::get)
+            .unwrap_or(majit_ir::GcRef::NULL);
         majit_gc::shadow_stack::pop_to(saved_root);
         unsafe {
             (*self.ec).set_topframeref(saved.0 as *mut PyFrame);
-            if let Some((depth, accounted)) = self.saved_recursion {
+            if let Some(depth) = self.saved_depth {
                 (*self.ec).py_recursion_depth = depth;
-                (*self.ec).accounted_activation = accounted;
+                (*self.ec).set_accounted_activation(accounted.0 as *mut PyFrame);
             }
         }
     }
@@ -8122,7 +8132,15 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     let staticdata = std::sync::Arc::clone(&meta.staticdata);
     let mut builder =
         majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
-    let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let mut per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let mut frame_ptrs: Vec<i64> = per_frame.iter().map(|&(ptr, _)| ptr).collect();
+    let _frame_ptr_roots = pyre_jit_trace::trace::ResumeRefSliceRoots::arm(&mut frame_ptrs);
+    for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
+        slot.0 = ptr;
+    }
+    // Charge from the live frame GCREF after the publish, stored through
+    // `enter_recursive_frame`'s Ref path (`executioncontext.py` has no
+    // accounted slot; pyre stores the claim like `topframeref`).
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     let set_topframeref = |frame_ptr: i64| {
@@ -10434,6 +10452,13 @@ fn eval_with_jit_inner(
     // through the frame — compiled, JIT eval loop, or declined to the plain
     // evaluator — passes exactly once.
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    // `PYRE_JIT_PROCESS_SETUP.call_once` collects on the first frame
+    // (`init_gc_root_walkers` / `install_jit_call_bridge`). The EvalFn
+    // `&mut PyFrame` is a register snapshot of a `FrameBox` DerefMut;
+    // `FrameRoot` is the shadow-stack livevar (`shadowstack.py`
+    // `push_roots` / `pop_roots`) re-read after that collect
+    // (`framework.py` `gct_direct_call`).
+    let mut frame_root = FrameRoot::new(frame);
     // Process-global JIT/eval setup. The walkers, reverse hooks, call
     // bridge, callback table and cranelift deopt latch are each
     // idempotent; running them on every frame paid the call and the
@@ -10475,7 +10500,7 @@ fn eval_with_jit_inner(
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| env_var("PYRE_JIT").as_deref() == Some("0")) {
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
-        return frame.execute_frame_plain(resume);
+        return frame_root.frame().execute_frame_plain(resume);
     }
     // This door tests only `frame_tracing_active`, which is true when the
     // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
@@ -10487,11 +10512,10 @@ fn eval_with_jit_inner(
     // `is_being_profiled` is a green on
     // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
     // and is not tested here.
-    if pyre_interpreter::pyframe::frame_tracing_active(frame) {
+    if pyre_interpreter::pyframe::frame_tracing_active(frame_root.frame()) {
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
-        return frame.execute_frame_plain(resume);
+        return frame_root.frame().execute_frame_plain(resume);
     }
-    let mut frame_root = FrameRoot::new(frame);
     let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let jit_shape = cached_unsupported_jit_shape(w_code, code);
@@ -11993,6 +12017,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
+        // `execute_opcode_step` is a collecting call (`framework.py`
+        // `gct_direct_call`); `shadowstack.py` `pop_roots` rewrites the red
+        // frame before the next use of `f`.
+        f = reload_loop_frame!(f, root_slot);
         match step_result {
             // `blackhole_if_trace_too_long` belongs to the tracer's own
             // stepping loop (`pyjitpl.py _interpret`, which drives
