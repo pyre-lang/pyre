@@ -2716,9 +2716,8 @@ fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
             "kind": {"Fun": 1},
             "generics": window_empty_generics()
         }},
-        "args": [{"Move": window_place(serde_json::json!({"Local": 1}), &cell_ref)}],
-        "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty)
-    }, "target": 2, "on_unwind": 1}});
+        "args": [{"Move": window_place(serde_json::json!({"Local": 1}), &cell_ref)}]
+    }, "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty), "target": 2, "on_unwind": 1}});
     let f = serde_json::json!({
         "def_id": 0,
         "item_meta": window_meta(&["fixture", "f"], true),
@@ -2753,50 +2752,41 @@ fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
         } => name == leaf_name,
         _ => false,
     };
-    match crate::test_support::lower_function(&llbc, "f") {
-        Ok(graph) => {
-            let ops: Vec<_> = graph
-                .blocks
+    let graph = crate::test_support::lower_function(&llbc, "f").expect("lower f");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| call_target_ends_with(op, "get")),
+        "opaque Cell::get stays a Call; graph={}",
+        graph.dump()
+    );
+    let input = ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.clone(),
+            _ => None,
+        })
+        .expect("f has a Cell argument");
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
                 .iter()
-                .flat_map(|block| &block.operations)
-                .collect();
-            assert!(
-                ops.iter().any(|op| call_target_ends_with(op, "get")),
-                "opaque Cell::get stays a Call; graph={}",
-                graph.dump()
-            );
-            let input = ops
-                .iter()
-                .find_map(|op| match &op.kind {
-                    OpKind::Input { .. } => op.result.clone(),
-                    _ => None,
-                })
-                .expect("f has a Cell argument");
-            let returned = graph
-                .blocks
-                .iter()
-                .find_map(|block| {
-                    block.exits.iter().find_map(|link| {
-                        (link.target == graph.returnblock).then(|| link.args.first())
-                    })
-                })
-                .flatten()
-                .and_then(LinkArg::as_variable);
-            assert_ne!(
-                returned,
-                Some(&input),
-                "opaque Cell::get must not alias the argument; graph={}",
-                graph.dump()
-            );
-        }
-        Err(err) => {
-            let err = err.to_string();
-            assert!(
-                !err.contains("alias"),
-                "opaque Cell::get must not alias; got {err}"
-            );
-        }
-    }
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_ne!(
+        returned,
+        Some(&input),
+        "opaque Cell::get must not alias the argument; graph={}",
+        graph.dump()
+    );
 }
 
 /// `live_rbigint` clones `&RBigInt` and passes the by-value result to
