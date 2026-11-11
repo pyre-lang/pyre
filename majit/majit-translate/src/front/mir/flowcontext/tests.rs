@@ -10714,6 +10714,93 @@ fn cross_crate_same_module_leaf_keeps_distinct_rows() {
 }
 
 #[test]
+fn cast_dest_layout_owner_keeps_the_crate_of_a_withdrawn_stripped_path() {
+    fn code_with_field(def_id: u64, path: &[&str], field: &str, ty: &str) -> serde_json::Value {
+        let mut decl = code_struct(def_id, path);
+        decl["kind"]["Struct"][0]["name"] = serde_json::json!(field);
+        decl["kind"]["Struct"][0]["ty"] =
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": ty}}});
+        decl
+    }
+    let a = llbc_with_types(
+        "a",
+        vec![code_with_field(0, &["a", "same", "Code"], "n", "U64")],
+        vec![],
+    );
+    let b = llbc_with_types(
+        "b",
+        vec![code_with_field(0, &["b", "same", "Code"], "m", "U32")],
+        vec![],
+    );
+    let mut facts = super::DuplicateLeafFacts::default();
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &a,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &b,
+        &std::collections::HashSet::new(),
+    ));
+    let cross = facts.tombstoned_leaves();
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum_a = super::AccumulatorFacts::build(&a, &body);
+    let gc_struct_ids_a = super::harvest_declared_gc_facts(&a).gc_struct_ids();
+    let lowering_a = super::Lowering::new(
+        &a,
+        "a".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &cross,
+        &gc_struct_ids_a,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum_a,
+        &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
+        false,
+        false,
+    )
+    .unwrap();
+    let dest = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+    assert_eq!(
+        lowering_a.cast_dest_layout_owner(&dest),
+        Some("a::same::Code".to_string())
+    );
+
+    let lowering_stripped = super::Lowering::new(
+        &a,
+        "a".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        super::no_tombstoned_leaves(),
+        &gc_struct_ids_a,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum_a,
+        &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        lowering_stripped.cast_dest_layout_owner(&dest),
+        Some("same::Code".to_string())
+    );
+}
+
+#[test]
 fn harden_withdraws_shape_divergent_variant_leaf_alias() {
     let mut reg = crate::front::semantic::StructFieldRegistry::default();
     let shape_a = rows(&[("__pos_0", "i64")]);

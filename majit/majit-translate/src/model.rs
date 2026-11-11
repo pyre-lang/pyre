@@ -4369,6 +4369,7 @@ fn intersect_idoms(mut finger1: u32, mut finger2: u32, idom: &[u32], rpo_of: &[u
 struct ProducerIndex<'g> {
     graph: &'g FunctionGraph,
     defined: rustc_hash::FxHashSet<crate::flowspace::model::Variable>,
+    definition: rustc_hash::FxHashMap<crate::flowspace::model::Variable, (usize, usize)>,
     input_slot: rustc_hash::FxHashMap<crate::flowspace::model::Variable, (BlockId, usize)>,
     incoming: rustc_hash::FxHashMap<BlockId, Vec<(usize, usize)>>,
     memo: rustc_hash::FxHashMap<
@@ -4380,13 +4381,15 @@ struct ProducerIndex<'g> {
 impl<'g> ProducerIndex<'g> {
     fn build(graph: &'g FunctionGraph) -> Self {
         let mut defined = rustc_hash::FxHashSet::default();
+        let mut definition = rustc_hash::FxHashMap::default();
         let mut input_slot = rustc_hash::FxHashMap::default();
         let mut incoming: rustc_hash::FxHashMap<BlockId, Vec<(usize, usize)>> =
             rustc_hash::FxHashMap::default();
         for (block_idx, block) in graph.blocks.iter().enumerate() {
-            for op in &block.operations {
+            for (op_idx, op) in block.operations.iter().enumerate() {
                 if let Some(result) = op.result.as_ref() {
                     defined.insert(result.clone());
+                    definition.insert(result.clone(), (block_idx, op_idx));
                 }
             }
             for (slot, input) in block.inputargs.iter().enumerate() {
@@ -4402,6 +4405,7 @@ impl<'g> ProducerIndex<'g> {
         Self {
             graph,
             defined,
+            definition,
             input_slot,
             incoming,
             memo: rustc_hash::FxHashMap::default(),
@@ -4457,6 +4461,57 @@ impl<'g> ProducerIndex<'g> {
         }
         root
     }
+
+    /// Pointee owner of a pointer `var`: the declared owner of every definition
+    /// reaching it through block inputargs. RPython gives a Variable one
+    /// `concretetype`, the same on both sides of a phi (`flowspace/model.py`
+    /// `Variable`, `framestate.py` `union`). A cast reports its layout owner
+    /// ([`cast_instance_layout_owner`]); another call reports its
+    /// `Ref(Some(owner))` result. A constant incoming (a null pointer) carries no
+    /// owner and is skipped. Disagreeing owners, an unowned definition, or no
+    /// owner at all decline.
+    fn pointee_owner(&self, var: &crate::flowspace::model::Variable, depth: u32) -> Option<String> {
+        if depth == 0 {
+            return None;
+        }
+        if let Some(&(block_idx, op_idx)) = self.definition.get(var) {
+            let op = &self.graph.blocks[block_idx].operations[op_idx];
+            if let Some(owner) = cast_instance_layout_owner(&op.kind) {
+                return Some(owner.to_string());
+            }
+            if let OpKind::Call {
+                result_ty: ValueType::Ref(Some(owner)),
+                ..
+            } = &op.kind
+            {
+                if !owner.is_empty() {
+                    return Some(owner.clone());
+                }
+            }
+            return None;
+        }
+        let (target, slot) = self.input_slot.get(var).copied()?;
+        let mut collected: Option<String> = None;
+        if let Some(links) = self.incoming.get(&target) {
+            for &(block_idx, exit_idx) in links {
+                let arg = self.graph.blocks[block_idx].exits[exit_idx]
+                    .args
+                    .get(slot)?;
+                match arg {
+                    LinkArg::Const(_) => {}
+                    LinkArg::Value(incoming) => {
+                        let owner = self.pointee_owner(incoming, depth - 1)?;
+                        match &collected {
+                            None => collected = Some(owner),
+                            Some(seen) if seen == &owner => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+        }
+        collected
+    }
 }
 
 /// Lower `core::ptr::write(raw as *mut T, T { fields... })` to field stores.
@@ -4472,11 +4527,11 @@ impl<'g> ProducerIndex<'g> {
 /// the stores are operations in each caller graph.
 ///
 /// The MIR front has already made the concrete type explicit on both sides:
-/// the destination is a `__cast_instance_intrinsic(T)` result and the value is a
-/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  The cast
-/// constant stays the class leaf; its result type carries the declaration
-/// path when that path is longer than the leaf, the spelling
-/// [`synthetic_transparent_ctor_owner`] reduces to.  Calls in the
+/// the destination owner is the pointer's declared owner, read through phis,
+/// and the value is a `SyntheticTransparentCtor(T)` followed by ordered
+/// `FieldWrite`s.  The cast constant stays the class leaf; its result type
+/// carries the declaration path when that path is longer than the leaf, the
+/// spelling [`synthetic_transparent_ctor_owner`] reduces to.  Calls in the
 /// source often split the aggregate from the stable allocation with
 /// residual GC hooks; resolve only phis whose every incoming path reaches the
 /// same constructor, then re-emit the registered complete field layout in
@@ -4638,17 +4693,14 @@ pub(crate) fn lower_struct_ptr_writes_with(
             }
             let destination = &args[0];
             let aggregate = producers.root(&args[1], 16);
-            // Class key and layout owner are different strings on one cast:
-            // the constant is the leaf, the result's `Ref` name is the
-            // declaration path. [`cast_instance_layout_owner`] reads the path.
-            let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
-                match candidate.result.as_ref() {
-                    Some(result) if result == destination => {
-                        cast_instance_layout_owner(&candidate.kind)
-                    }
-                    _ => None,
-                }
-            });
+            // The destination owner is the pointer's declared owner, read
+            // through phis. A cast reports its layout owner
+            // ([`cast_instance_layout_owner`]); another call reports its
+            // `Ref(Some(owner))` result. A constant incoming (a null
+            // pointer) is skipped.
+            let destination_owner: Option<String> = destination
+                .as_variable()
+                .and_then(|var| producers.pointee_owner(var, 16));
             let aggregate_ctor = aggregate.as_ref().and_then(|aggregate| {
                 graph
                     .blocks
@@ -4679,7 +4731,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                 let Some(owner) = destination_owner else {
                     continue;
                 };
-                let Some(layout) = registered_struct_layout(owner, struct_field_attrs) else {
+                let Some(layout) = registered_struct_layout(&owner, struct_field_attrs) else {
                     continue;
                 };
                 let Some(source) = args[1].as_variable().cloned() else {
@@ -4688,7 +4740,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                 let Some(destination) = destination.as_variable().cloned() else {
                     continue;
                 };
-                let owner_id = majit_ir::descr::struct_id_for_name(owner);
+                let owner_id = majit_ir::descr::struct_id_for_name(&owner);
                 // The copy is the aggregate's stored words, including a
                 // virtualizable array field.  A live virtualizable access
                 // would drop that read and refuse the following store
@@ -4700,11 +4752,11 @@ pub(crate) fn lower_struct_ptr_writes_with(
                     .iter()
                     .map(|(name, ty)| {
                         (
-                            FieldDescriptor::new(name.clone(), Some(owner.to_string()))
+                            FieldDescriptor::new(name.clone(), Some(owner.clone()))
                                 .with_owner_id(owner_id)
                                 .with_base_is_deref(false),
                             crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-                                owner,
+                                &owner,
                                 name,
                                 ty.clone(),
                             ),
@@ -4715,7 +4767,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                     block: bi,
                     op: oi,
                     destination,
-                    owner: owner.to_string(),
+                    owner,
                     init: FieldInit::Copy { source, fields },
                     result: op.result.clone(),
                 });
@@ -4728,7 +4780,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
             // ambiguous. The constructor carries that leaf beside its module
             // path. The name → `StructId` table is published only after the
             // whole program is lowered, so the leaf is compared directly.
-            let same_owner = destination_owner.is_some_and(|destination| {
+            let same_owner = destination_owner.as_deref().is_some_and(|destination| {
                 destination == aggregate_owner
                     || aggregate_leaf.as_deref() == Some(destination)
                     || majit_ir::descr::struct_id_for_name(destination)
@@ -13582,6 +13634,147 @@ mod tests {
         read_then_write(4, 5, "pycode", ValueType::Ref(Some("PyCode".into())));
         assert!(matches!(lowered[6].kind, OpKind::ConstNone));
         assert_eq!(lowered[6].result.as_ref(), Some(&call_result));
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_reads_the_destination_owner_through_a_phi() {
+        // The destination is a phi of a `__cast_instance_intrinsic(PyFrame)`
+        // result and a constant null. The write lives in the join block, so
+        // the owner is read through the inputarg.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let source = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(source.clone());
+        let cond = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(cond.clone());
+        let raw = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let destination = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("PyFrame", raw),
+                true,
+            )
+            .unwrap();
+        let (write_block, write_args) = graph.create_block_with_arg_vars(2);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::new_mixed(
+                    vec![LinkArg::Value(destination), LinkArg::Value(source.clone())],
+                    write_block,
+                    Some(ExitCase::Bool(true)),
+                ),
+                Link::new_mixed(
+                    vec![LinkArg::from(ConstValue::None), LinkArg::Value(source)],
+                    write_block,
+                    Some(ExitCase::Bool(false)),
+                ),
+            ],
+        );
+        graph.push_op_var(
+            write_block,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![write_args[0].clone(), write_args[1].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(write_block, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "PyFrame".to_string(),
+            vec![
+                ("ob_header.w_class".to_string(), ValueType::Ref(None)),
+                ("pycode".to_string(), ValueType::Ref(Some("PyCode".into()))),
+            ],
+        )]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 1);
+        assert!(
+            !graph.block(write_block).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+            "core::ptr::write must be replaced"
+        );
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_declines_disagreeing_phi_destination_owners() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let source = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(source.clone());
+        let cond = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(cond.clone());
+        let raw = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let dest_frame = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("PyFrame", raw.clone()),
+                true,
+            )
+            .unwrap();
+        let dest_code = graph
+            .push_op_var(entry, crate::model::cast_instance_call("PyCode", raw), true)
+            .unwrap();
+        let (write_block, write_args) = graph.create_block_with_arg_vars(2);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::new_mixed(
+                    vec![LinkArg::Value(dest_frame), LinkArg::Value(source.clone())],
+                    write_block,
+                    Some(ExitCase::Bool(true)),
+                ),
+                Link::new_mixed(
+                    vec![LinkArg::Value(dest_code), LinkArg::Value(source)],
+                    write_block,
+                    Some(ExitCase::Bool(false)),
+                ),
+            ],
+        );
+        graph.push_op_var(
+            write_block,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![write_args[0].clone(), write_args[1].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(write_block, None);
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyFrame".to_string(),
+                vec![("pycode".to_string(), ValueType::Ref(None))],
+            ),
+            (
+                "PyCode".to_string(),
+                vec![("co_name".to_string(), ValueType::Ref(None))],
+            ),
+        ]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
     }
 
     #[test]

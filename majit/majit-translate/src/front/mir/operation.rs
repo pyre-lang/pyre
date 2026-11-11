@@ -4735,8 +4735,12 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Crate-relative layout owner of `dest_ty` (`crate_relative_struct_owner`).
-    /// The intern leaf stays on the CAST ByteStr; this spelling is `result_ty`.
+    /// Layout owner of `dest_ty`. A crate-relative path
+    /// (`crate_relative_struct_owner`) is the usual spelling; a withdrawn
+    /// crate-relative spelling (`function::Method` declared in two crates)
+    /// yields the full-path class identity, the key the layout is registered
+    /// under. The intern leaf stays on the CAST ByteStr; this spelling is
+    /// `result_ty`.
     pub(in crate::front::mir) fn cast_dest_layout_owner(&self, dest_ty: &TyRef) -> Option<String> {
         let node = strip_ty_indirections(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
         let pointee = one_level_pointer_pointee(node, self.llbc)
@@ -4744,8 +4748,18 @@ impl<'a> Lowering<'a> {
             .unwrap_or(node);
         let id = adt_node_def_id(pointee)?;
         let decl = self.llbc.type_by_id(id)?;
+        let name_path = decl.item_meta.name_path();
+        // A crate-relative spelling withdrawn as ambiguous (`function::Method`
+        // declared in two crates) keeps the crate in the class identity
+        // (`tombstoned_owner_spelling`), and the layout is registered under
+        // that identity, so the crate-relative path names no layout.
+        let identity =
+            crate::front::mir::class_identity_spelling(&name_path, self.tombstoned_leaves);
+        if identity == name_path {
+            return Some(identity);
+        }
         let owner = crate::model::crate_relative_struct_owner(
-            &decl.item_meta.name_path(),
+            &name_path,
             self.graph.name.split("::").next(),
         );
         (!owner.is_empty()).then_some(owner)
@@ -5700,12 +5714,13 @@ impl<'a> Lowering<'a> {
         Ok(self.emit_decoded_const(bb_id, decoded))
     }
 
-    /// Path a `FnDef` constant names. A reflexive `impl<T> From<T> for T`
-    /// is `FunctionDesc.cachedgraph` of that instantiation
-    /// (`description.py` `getuniquegraph` / `specialize`,
-    /// `bookkeeper.py` `getdesc`): enqueue the spec so the identity body
-    /// `fn from(t: T) -> T { t }` is a registered callee. Direct calls of
-    /// the same impl alias (`is_reflexive_from`); a fn-item value cannot.
+    /// Path a `FnDef` constant names: `FunctionDesc.cachedgraph` of the
+    /// instantiation a call to the same item names (`description.py`
+    /// `getuniquegraph` / `specialize`, `bookkeeper.py` `getdesc`).
+    /// `enqueue_spec` registers that `__spec_` graph, so the value and a
+    /// direct call resolve to one callee. A reflexive `impl<T> From<T> for T`
+    /// gets its identity body this way; direct calls of the same impl alias
+    /// (`is_reflexive_from`), a fn-item value cannot.
     pub(in crate::front::mir) fn fn_item_const_segments(
         &self,
         value: &serde_json::Value,
@@ -5715,12 +5730,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        if fun_decl_is_reflexive_from(self.llbc, fd)
-            && let Some(segments) = self.enqueue_spec(fd, &reg.generics)
-        {
-            return Some(segments);
-        }
-        None
+        self.enqueue_spec(fd, &reg.generics)
     }
 
     /// Emit `decoded` onto `bb_id`. A Unicode scalar is
