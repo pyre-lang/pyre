@@ -1834,6 +1834,20 @@ fn defining_op<'a>(
     })
 }
 
+/// `Transformer.rewrite_op_int_is_true`: the operand is
+/// `Constant(objectmodel.malloc_zero_filled, Signed)`, carried as
+/// `OpKind::ConstSymbolic` (`materialize_constant`).
+fn int_is_true_of_malloc_zero_filled(
+    graph: &FunctionGraph,
+    operand: &crate::flowspace::model::Variable,
+) -> bool {
+    matches!(
+        defining_op(graph, operand).map(|def| &def.kind),
+        Some(OpKind::ConstSymbolic { tag, .. })
+            if *tag == crate::translator::backendopt::constfold::MALLOC_ZERO_FILLED_TAG_ID
+    )
+}
+
 /// `Const*` / null-builtin producer of `variable` with no Identity chase.
 /// Live-var scans (`autodetect_jit_markers_redvars`, `jit_merge_point`)
 /// use this: `isinstance(v, Variable)` does not follow `same_as`.
@@ -5479,6 +5493,28 @@ impl<'a> Transformer<'a> {
             // replace_we_are_jitted` folding the genc side to `false`.
             OpKind::ConstSymbolic { tag, .. }
                 if *tag == crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID =>
+            {
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ConstBool(true),
+                }])
+            }
+            // `Transformer.rewrite_op_int_is_true` (`jtransform.py`):
+            // `value is objectmodel.malloc_zero_filled` becomes
+            // `Constant(True, lltype.Bool)`. The operand is the Signed
+            // `CDefinedIntSymbolic` (`rstr.py` `new_malloc`), carried as
+            // `OpKind::ConstSymbolic` (`materialize_constant`). The
+            // replacement keeps the same result variable, so
+            // `fold_constant_exitswitch` keeps the true link,
+            // `clear_unreachable_blocks` drops the `hash` store, and
+            // `prune_dead_phis` drops the unread `ConstSymbolic`
+            // (`is_pure_op`).
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "int_is_true"
+                && int_is_true_of_malloc_zero_filled(graph, operand) =>
             {
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -34793,6 +34829,98 @@ mod tests {
             .find(|op| op.result.as_ref() == Some(&result_var))
             .expect("we_are_jitted op must survive as a const-define");
         assert!(matches!(folded.kind, OpKind::ConstBool(true)));
+    }
+
+    /// `rewrite_op_int_is_true` folds `value is objectmodel.malloc_zero_filled`
+    /// to true. The false arm's `hash = 0` store is then unreachable
+    /// (`fold_constant_exitswitch` + `clear_unreachable_blocks`).
+    /// The unread `ConstSymbolic` is dropped by `prune_dead_phis`.
+    #[test]
+    fn malloc_zero_filled_symbolic_folds_hash_store_away() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::translator::backendopt::constfold::MALLOC_ZERO_FILLED_TAG_ID;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("mallocstr_hash_guard");
+        let entry = graph.startblock;
+        let sym = graph
+            .push_op_var(
+                entry,
+                OpKind::ConstSymbolic {
+                    tag: MALLOC_ZERO_FILLED_TAG_ID,
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        sym.set_concretetype(Some(LowLevelType::Signed));
+        let truth = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "int_is_true".into(),
+                    operand: sym,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        truth.set_concretetype(Some(LowLevelType::Bool));
+        let keep = graph.create_block();
+        let store = graph.create_block();
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(store).inputargs.push(base.clone());
+        graph.push_op_var(
+            store,
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor::new("hash", Some("rpy_string".to_string())),
+                value: LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                    crate::flowspace::model::ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(keep, None);
+        graph.set_return(store, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(truth)),
+            vec![
+                Link::new_mixed(vec![], keep, Some(ExitCase::Bool(true))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(base)],
+                    store,
+                    Some(ExitCase::Bool(false)),
+                ),
+            ],
+        );
+
+        let result = transform_graph(&graph, &config);
+        for block in &result.graph.blocks {
+            for op in &block.operations {
+                assert!(
+                    !matches!(op.kind, OpKind::ConstSymbolic { .. }),
+                    "malloc_zero_filled ConstSymbolic is dead after rewrite_op_int_is_true"
+                );
+                assert!(
+                    !matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "hash"
+                    ),
+                    "the not-zero-filled hash store is dropped"
+                );
+            }
+            assert!(
+                block.exits.len() <= 1,
+                "folded mallocstr keeps no residual branch"
+            );
+        }
+        assert!(result.graph.block(entry).exitswitch.is_none());
+        assert_eq!(result.graph.block(entry).exits.len(), 1);
     }
 
     /// Reject when arg/result IR kinds disagree — that means the

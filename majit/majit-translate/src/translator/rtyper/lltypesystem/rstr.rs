@@ -51,7 +51,7 @@ use crate::flowspace::model::{
     GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
+use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GCREF, GcKind, LowLevelType,
@@ -2098,7 +2098,125 @@ pub(crate) fn build_ll_strlen_helper_graph(
     ))
 }
 
-/// Synthesise `mallocstr` / `mallocunicode` (`lltypesystem/rstr.py`):
+/// After `malloc_varsize` has defined `result` in `malloc_block`, emit
+/// `new_malloc`'s hash clear (`rstr.py` `mallocstr`).
+///
+/// A lifted low-level helper is part of the translated program, so
+/// `we_are_translated()` folds to the translated arm (as
+/// [`build_ll_arrayfill_helper_graph`] states for the same predicate):
+/// the guard is `not malloc_zero_filled`.
+///
+/// `malloc_zero_filled` is
+/// `CDefinedIntSymbolic('MALLOC_ZERO_FILLED', default=0)`
+/// (`objectmodel.py`). `constfold` leaves a Symbolic alone, so the
+/// guard is `v = int_is_true(Constant(malloc_zero_filled, Signed))`
+/// with `exitswitch v` (`rstr.py` `new_malloc`). `FlowContext.not_`
+/// swaps the link exitcases. The true link is the zero-filled arm and
+/// joins without a store. The false link is the only block that
+/// `setfield`s `hash` to 0. Both links join at `join`, forwarding
+/// `forward` (which includes `result`). True link first, matching
+/// `build_ll_append_helper_graph`.
+/// `Transformer.rewrite_op_int_is_true` replaces that `int_is_true`
+/// with `Constant(True, lltype.Bool)` when
+/// `value is objectmodel.malloc_zero_filled`; `fold_constant_exitswitch`
+/// keeps the true link. llinterp evaluates the Signed symbolic at its
+/// default 0, so `int_is_true` is false and the false link stores
+/// `hash = 0`.
+///
+/// [`build_ll_arrayfill_helper_graph`]: super::rbuilder::build_ll_arrayfill_helper_graph
+fn close_with_mallocstr_hash_clear(
+    malloc_block: &BlockRef,
+    result: &Variable,
+    join: BlockRef,
+    forward: Vec<Hlvalue>,
+) {
+    let mut sources: Vec<Variable> = Vec::new();
+    let mut copies: Vec<Variable> = Vec::new();
+    for arg in &forward {
+        let Hlvalue::Variable(var) = arg else {
+            continue;
+        };
+        if sources.iter().any(|seen| seen == var) {
+            continue;
+        }
+        sources.push(var.clone());
+        copies.push(var.copy());
+    }
+    assert!(
+        sources.iter().any(|var| var == result),
+        "close_with_mallocstr_hash_clear: result is not forwarded to the join"
+    );
+    let store = Block::shared(copies.iter().cloned().map(Hlvalue::Variable).collect());
+    let result_index = sources
+        .iter()
+        .position(|var| var == result)
+        .expect("result");
+    let store_result = copies[result_index].clone();
+    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
+    store.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(store_result),
+            void_field_const("hash"),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(set_hash),
+    ));
+    let join_from_store: Vec<Hlvalue> = forward
+        .iter()
+        .map(|arg| match arg {
+            Hlvalue::Variable(var) => {
+                let index = sources
+                    .iter()
+                    .position(|seen| seen == var)
+                    .expect("carried variable");
+                Hlvalue::Variable(copies[index].clone())
+            }
+            other => other.clone(),
+        })
+        .collect();
+    store.closeblock(vec![
+        Link::new(join_from_store, Some(join.clone()), None).into_ref(),
+    ]);
+    let false_args: Vec<Hlvalue> = sources.into_iter().map(Hlvalue::Variable).collect();
+    // `v = int_is_true(Constant(malloc_zero_filled, Signed))`; exitswitch `v`.
+    let zero_filled = variable_with_lltype("zero_filled", LowLevelType::Bool);
+    malloc_block
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_is_true",
+            vec![constant_with_lltype(
+                ConstValue::SpecTag(MALLOC_ZERO_FILLED_TAG_ID),
+                LowLevelType::Signed,
+            )],
+            Hlvalue::Variable(zero_filled.clone()),
+        ));
+    malloc_block.borrow_mut().exitswitch = Some(Hlvalue::Variable(zero_filled));
+    malloc_block.closeblock(vec![
+        Link::new(
+            forward,
+            Some(join),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            false_args,
+            Some(store),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+}
+
+/// Synthesise `mallocstr` / `mallocunicode` (`lltypesystem/rstr.py`
+/// `new_malloc`):
 ///
 /// ```python
 /// def mallocstr(length):
@@ -2109,13 +2227,16 @@ pub(crate) fn build_ll_strlen_helper_graph(
 ///     return r
 /// ```
 ///
-/// Single block: `malloc_varsize(STR/UNICODE, gc, length)` then
-/// `setfield(r, 'hash', 0)`. `ll_assert` is a translation-time no-op, and
-/// the zero-fill guard collapses to always initialising the hash field
-/// (matching the inline `mallocstr` shape emitted by the int-to-string
-/// helpers). `name` selects the helper identity (`"mallocstr"` /
-/// `"mallocunicode"`) and `ptr_lltype` selects `Ptr(STR)` vs
-/// `Ptr(UNICODE)`.
+/// A lifted low-level helper is part of the translated program, so
+/// `we_are_translated()` folds to the translated arm (as
+/// [`build_ll_arrayfill_helper_graph`] states for the same predicate):
+/// the guard is `not malloc_zero_filled`. `ll_assert` is a
+/// translation-time no-op. [`close_with_mallocstr_hash_clear`] stores
+/// `hash = 0` only on the not-zero-filled arm. `name` selects the
+/// helper identity (`"mallocstr"` / `"mallocunicode"`) and `ptr_lltype`
+/// selects `Ptr(STR)` vs `Ptr(UNICODE)`.
+///
+/// [`build_ll_arrayfill_helper_graph`]: super::rbuilder::build_ll_arrayfill_helper_graph
 pub(crate) fn build_ll_mallocstr_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -2123,9 +2244,6 @@ pub(crate) fn build_ll_mallocstr_helper_graph(
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
 
     let struct_lltype = struct_lltype_from_strptr(&ptr_lltype)?;
-    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let hash_field_const =
-        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
 
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let startblock = Block::shared(vec![Hlvalue::Variable(length_arg.clone())]);
@@ -2146,24 +2264,12 @@ pub(crate) fn build_ll_mallocstr_helper_graph(
         ],
         Hlvalue::Variable(result.clone()),
     ));
-    let set_hash = variable_with_lltype("set", LowLevelType::Void);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
-        vec![
-            Hlvalue::Variable(result.clone()),
-            hash_field_const(),
-            signed_const(0),
-        ],
-        Hlvalue::Variable(set_hash),
-    ));
-    startblock.closeblock(vec![
-        Link::new(
-            vec![Hlvalue::Variable(result)],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
+    close_with_mallocstr_hash_clear(
+        &startblock,
+        &result,
+        graph.returnblock.clone(),
+        vec![Hlvalue::Variable(result.clone())],
+    );
 
     let func = GraphFunc::new(
         name.to_string(),
@@ -2697,9 +2803,9 @@ fn emit_gen_cast(
 ///
 /// `RES` is specialised into `result_ptr` (`Ptr(STR)` or `Ptr(UNICODE)`).
 /// `mallocstr` / `mallocunicode` (`new_malloc`) are inlined as
-/// `malloc_varsize` plus `setfield(hash, 0)`. `cast_primitive` is
-/// `gen_cast` (`rbuiltin.py`). `num_chars = length` is the `length`
-/// argument.
+/// `malloc_varsize` plus [`close_with_mallocstr_hash_clear`].
+/// `cast_primitive` is `gen_cast` (`rbuiltin.py`). `num_chars = length`
+/// is the `length` argument.
 pub(crate) fn build_ll_join_chars_helper_graph_for(
     name: &str,
     items_ptr_lltype: LowLevelType,
@@ -2745,6 +2851,15 @@ pub(crate) fn build_ll_join_chars_helper_graph_for(
         Hlvalue::Variable(i_for_cond.clone()),
     ]);
 
+    let chars_after_hash = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let length_after_hash = variable_with_lltype("length", LowLevelType::Signed);
+    let result_after_hash = variable_with_lltype("result", result_ptr.clone());
+    let block_after_hash = Block::shared(vec![
+        Hlvalue::Variable(chars_after_hash.clone()),
+        Hlvalue::Variable(length_after_hash.clone()),
+        Hlvalue::Variable(result_after_hash.clone()),
+    ]);
+
     let chars_for_body = variable_with_lltype("chars", items_ptr_lltype);
     let length_for_body = variable_with_lltype("length", LowLevelType::Signed);
     let result_for_body = variable_with_lltype("result", result_ptr.clone());
@@ -2768,28 +2883,34 @@ pub(crate) fn build_ll_join_chars_helper_graph_for(
         ],
         Hlvalue::Variable(result.clone()),
     ));
-    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
+    close_with_mallocstr_hash_clear(
+        &startblock,
+        &result,
+        block_after_hash.clone(),
         vec![
+            Hlvalue::Variable(chars_arg),
+            Hlvalue::Variable(length_arg),
             Hlvalue::Variable(result.clone()),
-            void_field_const("hash"),
-            signed_const(0),
         ],
-        Hlvalue::Variable(set_hash),
-    ));
+    );
     let res_chars = variable_with_lltype("res_chars", chars_array_ptr_lltype);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(result.clone()), void_field_const("chars")],
-        Hlvalue::Variable(res_chars.clone()),
-    ));
-    startblock.closeblock(vec![
+    block_after_hash
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getsubstruct",
+            vec![
+                Hlvalue::Variable(result_after_hash.clone()),
+                void_field_const("chars"),
+            ],
+            Hlvalue::Variable(res_chars.clone()),
+        ));
+    block_after_hash.closeblock(vec![
         Link::new(
             vec![
-                Hlvalue::Variable(chars_arg),
-                Hlvalue::Variable(length_arg),
-                Hlvalue::Variable(result),
+                Hlvalue::Variable(chars_after_hash),
+                Hlvalue::Variable(length_after_hash),
+                Hlvalue::Variable(result_after_hash),
                 Hlvalue::Variable(res_chars),
                 signed_const(0),
             ],
@@ -3210,10 +3331,11 @@ fn empty_string_const(str_ptr: &LowLevelType) -> Result<Hlvalue, TyperError> {
 /// ```
 ///
 /// `mallocstr` / `mallocunicode` (`new_malloc`) are inlined as
-/// `malloc_varsize` plus `setfield(hash, 0)`. `copy_string_contents` /
-/// `copy_unicode_contents` (`_new_copy_contents_fun`) are the
-/// `copystrcontent` / `copyunicodecontent` oopspecs. `ovfcheck` is
-/// trailing `int_add_ovf` of its block; OverflowError raises MemoryError.
+/// `malloc_varsize` plus [`close_with_mallocstr_hash_clear`].
+/// `copy_string_contents` / `copy_unicode_contents`
+/// (`_new_copy_contents_fun`) are the `copystrcontent` /
+/// `copyunicodecontent` oopspecs. `ovfcheck` is trailing `int_add_ovf`
+/// of its block; OverflowError raises MemoryError.
 ///
 /// `items_ptr_lltype` specializes the items pointer. `TEMP`
 /// (`GcArray(Ptr(STR))`) and `TEMP_UNICODE` index straight to `str_ptr`.
@@ -3232,8 +3354,6 @@ pub(crate) fn build_ll_join_strs_helper_graph_for(
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
-    let hash_field_const =
-        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
 
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let items_arg = variable_with_lltype("items", items_ptr_lltype.clone());
@@ -3482,33 +3602,18 @@ pub(crate) fn build_ll_join_strs_helper_graph_for(
             ],
             Hlvalue::Variable(result.clone()),
         ));
-    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
-    block_malloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "setfield",
-            vec![
-                Hlvalue::Variable(result.clone()),
-                hash_field_const(),
-                signed_const(0),
-            ],
-            Hlvalue::Variable(set_hash),
-        ));
-    block_malloc.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(items_for_malloc),
-                Hlvalue::Variable(length_for_malloc),
-                Hlvalue::Variable(result),
-                signed_const(0),
-                signed_const(0),
-            ],
-            Some(block_copy_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
+    close_with_mallocstr_hash_clear(
+        &block_malloc,
+        &result,
+        block_copy_cond.clone(),
+        vec![
+            Hlvalue::Variable(items_for_malloc),
+            Hlvalue::Variable(length_for_malloc),
+            Hlvalue::Variable(result.clone()),
+            signed_const(0),
+            signed_const(0),
+        ],
+    );
 
     let keep_copying = variable_with_lltype("keep_copying", LowLevelType::Bool);
     block_copy_cond
@@ -4007,9 +4112,10 @@ fn emit_array_item_as_strptr(
 /// (`mallocstr` / `mallocunicode`, `copy_string_contents` /
 /// `copy_unicode_contents`). `str_ptr` is `typeOf(s)`. `mallocstr` /
 /// `mallocunicode` are inlined as `malloc_varsize` plus
-/// `setfield(hash, 0)`. `copy_string_contents` / `copy_unicode_contents`
-/// (`_new_copy_contents_fun`) are the `copystrcontent` /
-/// `copyunicodecontent` oopspecs. Each overflow raises `MemoryError`.
+/// [`close_with_mallocstr_hash_clear`]. `copy_string_contents` /
+/// `copy_unicode_contents` (`_new_copy_contents_fun`) are the
+/// `copystrcontent` / `copyunicodecontent` oopspecs. Each overflow
+/// raises `MemoryError`.
 pub(crate) fn build_ll_join_helper_graph(
     name: &str,
     items_ptr_lltype: LowLevelType,
@@ -4024,8 +4130,6 @@ pub(crate) fn build_ll_join_helper_graph(
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
-    let hash_field_const =
-        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
 
     let s_arg = variable_with_lltype("s", str_ptr.clone());
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
@@ -4399,33 +4503,18 @@ pub(crate) fn build_ll_join_helper_graph(
             ],
             Hlvalue::Variable(result.clone()),
         ));
-    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
-    block_malloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "setfield",
-            vec![
-                Hlvalue::Variable(result.clone()),
-                hash_field_const(),
-                signed_const(0),
-            ],
-            Hlvalue::Variable(set_hash),
-        ));
-    block_malloc.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(s_malloc),
-                Hlvalue::Variable(slen_malloc),
-                Hlvalue::Variable(items_malloc),
-                Hlvalue::Variable(len_malloc),
-                Hlvalue::Variable(result),
-            ],
-            Some(block_copy_item0.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
+    close_with_mallocstr_hash_clear(
+        &block_malloc,
+        &result,
+        block_copy_item0.clone(),
+        vec![
+            Hlvalue::Variable(s_malloc),
+            Hlvalue::Variable(slen_malloc),
+            Hlvalue::Variable(items_malloc),
+            Hlvalue::Variable(len_malloc),
+            Hlvalue::Variable(result.clone()),
+        ],
+    );
 
     let item0 = emit_array_item_as_strptr(
         &block_copy_item0,
@@ -4826,8 +4915,6 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let chars_field_const =
         || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
-    let hash_field_const =
-        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
     let char_for = |code: i64, block: &crate::flowspace::model::BlockRef| -> Hlvalue {
         let ch = variable_with_lltype("ch", LowLevelType::Char);
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -4929,6 +5016,15 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         ("sign", LowLevelType::Signed),
         ("len", LowLevelType::Signed),
     ]);
+    // Join after `new_malloc`'s hash guard. The `if sign` branch stays
+    // on this block: `b_alloc`'s exitswitch is `malloc_zero_filled`.
+    let b_after_hash = mk_block(vec![
+        ("addPrefix", LowLevelType::Bool),
+        ("temp", temp_ptr_lltype.clone()),
+        ("sign", LowLevelType::Signed),
+        ("len", LowLevelType::Signed),
+        ("result", STRPTR.clone()),
+    ]);
     let b_write_sign = mk_block(vec![
         ("addPrefix", LowLevelType::Bool),
         ("temp", temp_ptr_lltype.clone()),
@@ -4988,6 +5084,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         &b_after_digits,
         &b_addprefix_len,
         &b_alloc,
+        &b_after_hash,
         &b_write_sign,
         &b_check_prefix,
         &b_write_prefix,
@@ -5346,7 +5443,7 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
     ]);
 
-    // b_alloc: result = mallocstr(len); result.hash = 0; branch on sign.
+    // b_alloc: result = mallocstr(len), guarded by `malloc_zero_filled`.
     let result = variable_with_lltype("result", STRPTR.clone());
     b_alloc.borrow_mut().operations.push(SpaceOperation::new(
         "malloc_varsize",
@@ -5357,37 +5454,50 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         ],
         Hlvalue::Variable(result.clone()),
     ));
-    let set_hash = variable_with_lltype("set", LowLevelType::Void);
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
+    close_with_mallocstr_hash_clear(
+        &b_alloc,
+        &result,
+        b_after_hash.clone(),
         vec![
+            Hlvalue::Variable(var_of(&b_alloc, 0)),
+            Hlvalue::Variable(var_of(&b_alloc, 1)),
+            Hlvalue::Variable(var_of(&b_alloc, 2)),
+            Hlvalue::Variable(var_of(&b_alloc, 3)),
             Hlvalue::Variable(result.clone()),
-            hash_field_const(),
-            signed_const(0),
         ],
-        Hlvalue::Variable(set_hash),
-    ));
+    );
+
+    // b_after_hash: result.chars; branch on sign (`ll_int2hex`).
     let result_chars = variable_with_lltype("result_chars", result_chars_ptr_lltype.clone());
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(result.clone()), chars_field_const()],
-        Hlvalue::Variable(result_chars.clone()),
-    ));
+    b_after_hash
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getsubstruct",
+            vec![
+                Hlvalue::Variable(var_of(&b_after_hash, 4)),
+                chars_field_const(),
+            ],
+            Hlvalue::Variable(result_chars.clone()),
+        ));
     let sign_b = variable_with_lltype("sign_b", LowLevelType::Bool);
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "int_is_true",
-        vec![Hlvalue::Variable(var_of(&b_alloc, 2))],
-        Hlvalue::Variable(sign_b.clone()),
-    ));
-    b_alloc.borrow_mut().exitswitch = Some(Hlvalue::Variable(sign_b));
-    b_alloc.closeblock(vec![
+    b_after_hash
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_is_true",
+            vec![Hlvalue::Variable(var_of(&b_after_hash, 2))],
+            Hlvalue::Variable(sign_b.clone()),
+        ));
+    b_after_hash.borrow_mut().exitswitch = Some(Hlvalue::Variable(sign_b));
+    b_after_hash.closeblock(vec![
         Link::new(
             vec![
-                Hlvalue::Variable(var_of(&b_alloc, 0)),
-                Hlvalue::Variable(var_of(&b_alloc, 1)),
-                Hlvalue::Variable(result.clone()),
+                Hlvalue::Variable(var_of(&b_after_hash, 0)),
+                Hlvalue::Variable(var_of(&b_after_hash, 1)),
+                Hlvalue::Variable(var_of(&b_after_hash, 4)),
                 Hlvalue::Variable(result_chars.clone()),
-                Hlvalue::Variable(var_of(&b_alloc, 3)),
+                Hlvalue::Variable(var_of(&b_after_hash, 3)),
             ],
             Some(b_write_sign.clone()),
             Some(bool_true()),
@@ -5395,11 +5505,11 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         .into_ref(),
         Link::new(
             vec![
-                Hlvalue::Variable(var_of(&b_alloc, 0)),
-                Hlvalue::Variable(var_of(&b_alloc, 1)),
-                Hlvalue::Variable(result),
+                Hlvalue::Variable(var_of(&b_after_hash, 0)),
+                Hlvalue::Variable(var_of(&b_after_hash, 1)),
+                Hlvalue::Variable(var_of(&b_after_hash, 4)),
                 Hlvalue::Variable(result_chars),
-                Hlvalue::Variable(var_of(&b_alloc, 3)),
+                Hlvalue::Variable(var_of(&b_after_hash, 3)),
                 signed_const(0),
             ],
             Some(b_check_prefix.clone()),
@@ -5672,8 +5782,6 @@ pub(crate) fn build_ll_int2dec_helper_graph(
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let unsigned_const =
         |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
-    let hash_field_const =
-        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
     let chars_field_const =
         || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
@@ -5735,6 +5843,15 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         ("len", LowLevelType::Signed),
         ("zero_add", LowLevelType::Signed),
     ]);
+    // Join after `new_malloc`'s hash guard. The `if sign` branch stays
+    // on this block: `b_alloc`'s exitswitch is `malloc_zero_filled`.
+    let b_after_hash = mk_block(vec![
+        ("result", STRPTR.clone()),
+        ("val", LowLevelType::Unsigned),
+        ("len", LowLevelType::Signed),
+        ("total_len", LowLevelType::Signed),
+        ("sign", LowLevelType::Signed),
+    ]);
     let chars_slot = || ("result_chars", result_chars_ptr_lltype.clone());
     let b_write_minus = mk_block(vec![
         ("result", STRPTR.clone()),
@@ -5791,6 +5908,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         &b_count_body,
         &b_total,
         &b_alloc,
+        &b_after_hash,
         &b_write_minus,
         &b_check_zero,
         &b_write_zero,
@@ -6033,37 +6151,50 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         ],
         Hlvalue::Variable(result.clone()),
     ));
-    let set_hash = variable_with_lltype("set", LowLevelType::Void);
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
+    close_with_mallocstr_hash_clear(
+        &b_alloc,
+        &result,
+        b_after_hash.clone(),
         vec![
             Hlvalue::Variable(result.clone()),
-            hash_field_const(),
-            signed_const(0),
+            Hlvalue::Variable(var_of(&b_alloc, 0)),
+            Hlvalue::Variable(var_of(&b_alloc, 2)),
+            Hlvalue::Variable(total_len),
+            Hlvalue::Variable(var_of(&b_alloc, 1)),
         ],
-        Hlvalue::Variable(set_hash),
-    ));
+    );
+
+    // b_after_hash: result.chars; branch on sign (`ll_int2dec`).
     let result_chars = variable_with_lltype("result_chars", result_chars_ptr_lltype.clone());
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(result.clone()), chars_field_const()],
-        Hlvalue::Variable(result_chars.clone()),
-    ));
+    b_after_hash
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getsubstruct",
+            vec![
+                Hlvalue::Variable(var_of(&b_after_hash, 0)),
+                chars_field_const(),
+            ],
+            Hlvalue::Variable(result_chars.clone()),
+        ));
     let sign_b = variable_with_lltype("sign_b", LowLevelType::Bool);
-    b_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "int_is_true",
-        vec![Hlvalue::Variable(var_of(&b_alloc, 1))],
-        Hlvalue::Variable(sign_b.clone()),
-    ));
-    b_alloc.borrow_mut().exitswitch = Some(Hlvalue::Variable(sign_b));
-    b_alloc.closeblock(vec![
+    b_after_hash
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_is_true",
+            vec![Hlvalue::Variable(var_of(&b_after_hash, 4))],
+            Hlvalue::Variable(sign_b.clone()),
+        ));
+    b_after_hash.borrow_mut().exitswitch = Some(Hlvalue::Variable(sign_b));
+    b_after_hash.closeblock(vec![
         Link::new(
             vec![
-                Hlvalue::Variable(result.clone()),
+                Hlvalue::Variable(var_of(&b_after_hash, 0)),
                 Hlvalue::Variable(result_chars.clone()),
-                Hlvalue::Variable(var_of(&b_alloc, 0)),
-                Hlvalue::Variable(var_of(&b_alloc, 2)),
-                Hlvalue::Variable(total_len.clone()),
+                Hlvalue::Variable(var_of(&b_after_hash, 1)),
+                Hlvalue::Variable(var_of(&b_after_hash, 2)),
+                Hlvalue::Variable(var_of(&b_after_hash, 3)),
             ],
             Some(b_write_minus.clone()),
             Some(bool_true()),
@@ -6071,11 +6202,11 @@ pub(crate) fn build_ll_int2dec_helper_graph(
         .into_ref(),
         Link::new(
             vec![
-                Hlvalue::Variable(result),
+                Hlvalue::Variable(var_of(&b_after_hash, 0)),
                 Hlvalue::Variable(result_chars),
-                Hlvalue::Variable(var_of(&b_alloc, 0)),
-                Hlvalue::Variable(var_of(&b_alloc, 2)),
-                Hlvalue::Variable(total_len),
+                Hlvalue::Variable(var_of(&b_after_hash, 1)),
+                Hlvalue::Variable(var_of(&b_after_hash, 2)),
+                Hlvalue::Variable(var_of(&b_after_hash, 3)),
             ],
             Some(b_check_zero.clone()),
             Some(bool_false()),
@@ -15065,14 +15196,15 @@ mod tests {
         assert!(format!("{err:?}").contains("Ptr(STR/UNICODE)"));
     }
 
-    /// rstr.py — `mallocstr(length)` lowers to
-    /// `malloc_varsize(STR, gc, length)` + `setfield(r, 'hash', 0)`,
-    /// returning `Ptr(STR)`.
-    #[test]
-    fn build_ll_mallocstr_emits_malloc_varsize_then_hash_zero() {
-        let helper = build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+    /// `mallocstr` / `mallocunicode` (`new_malloc`): `malloc_varsize`,
+    /// then `int_is_true(Constant(malloc_zero_filled, Signed))`. The
+    /// exitswitch is that result. The `hash = 0` `setfield` sits only
+    /// on the false (not-zero-filled) arm.
+    fn assert_malloc_helper_guards_hash(name: &str, ptr: &LowLevelType) {
+        let helper = build_ll_mallocstr_helper_graph(name, ptr.clone())
             .expect("build_ll_mallocstr_helper_graph");
-        assert_eq!(helper.func.name, "mallocstr");
+        crate::flowspace::model::checkgraph(&helper.graph.borrow());
+        assert_eq!(helper.func.name, name);
         let inner = helper.graph.borrow();
         let startblock = inner.startblock.borrow();
         let opnames: Vec<&str> = startblock
@@ -15080,9 +15212,52 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(opnames, vec!["malloc_varsize", "setfield"]);
+        assert_eq!(opnames, vec!["malloc_varsize", "int_is_true"]);
+        let truth = &startblock.operations[1];
+        let Hlvalue::Constant(operand) = &truth.args[0] else {
+            panic!("int_is_true operand is Constant(malloc_zero_filled, Signed)");
+        };
+        assert!(
+            matches!(operand.value, ConstValue::SpecTag(tag) if tag == MALLOC_ZERO_FILLED_TAG_ID)
+        );
+        assert!(matches!(operand.concretetype, Some(LowLevelType::Signed)));
+        let Hlvalue::Variable(produced) = &truth.result else {
+            panic!("int_is_true result is a Variable");
+        };
+        let Some(Hlvalue::Variable(switch)) = &startblock.exitswitch else {
+            panic!("exitswitch is the int_is_true result");
+        };
+        assert_eq!(switch, produced);
+        assert_eq!(startblock.exits.len(), 2);
+        let true_link = startblock.exits[0].borrow();
+        assert!(
+            matches!(&true_link.exitcase, Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(true))
+        );
+        let true_target = true_link
+            .target
+            .clone()
+            .expect("true link joins the return");
+        assert!(std::rc::Rc::ptr_eq(&true_target, &inner.returnblock));
+        assert!(
+            true_target.borrow().operations.is_empty(),
+            "the zero-filled arm does not store hash"
+        );
+        drop(true_link);
+        let false_link = startblock.exits[1].borrow();
+        assert!(
+            matches!(&false_link.exitcase, Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false))
+        );
+        let store = false_link
+            .target
+            .clone()
+            .expect("false link is the not-zero-filled arm");
+        drop(false_link);
+        drop(startblock);
+        let store_block = store.borrow();
+        assert_eq!(store_block.operations.len(), 1);
+        assert_eq!(store_block.operations[0].opname, "setfield");
         // setfield's field-name constant is `"hash"`, value constant 0.
-        let setfield_args = &startblock.operations[1].args;
+        let setfield_args = &store_block.operations[0].args;
         assert_eq!(setfield_args.len(), 3);
         let Hlvalue::Constant(field) = &setfield_args[1] else {
             panic!("setfield field-name must be a Constant");
@@ -15092,33 +15267,36 @@ mod tests {
             panic!("setfield value must be a Constant");
         };
         assert!(matches!(zero.value, ConstValue::Int(0)));
-        // The returned value carries `Ptr(STR)`.
+        let store_target = store_block.exits[0]
+            .borrow()
+            .target
+            .clone()
+            .expect("store joins the return");
+        assert!(std::rc::Rc::ptr_eq(&store_target, &inner.returnblock));
+        drop(store_block);
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
-        assert_eq!(ret.concretetype.borrow().clone(), Some(STRPTR.clone()));
-        assert_eq!(startblock.inputargs.len(), 1);
+        assert_eq!(ret.concretetype.borrow().clone(), Some(ptr.clone()));
     }
 
-    /// `mallocunicode` is the `Ptr(UNICODE)` mirror — same op sequence,
+    /// rstr.py — `mallocstr(length)` lowers to
+    /// `malloc_varsize(STR, gc, length)` then the `malloc_zero_filled`
+    /// guard, returning `Ptr(STR)`.
+    #[test]
+    fn build_ll_mallocstr_emits_malloc_varsize_then_hash_zero() {
+        assert_malloc_helper_guards_hash("mallocstr", &STRPTR);
+        let helper = build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+            .expect("build_ll_mallocstr_helper_graph");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 1);
+    }
+
+    /// `mallocunicode` is the `Ptr(UNICODE)` mirror — same guard,
     /// distinct struct/pointer lltype and helper identity.
     #[test]
     fn build_ll_mallocunicode_mirrors_mallocstr_against_unicode() {
-        let helper = build_ll_mallocstr_helper_graph("mallocunicode", UNICODEPTR.clone())
-            .expect("build_ll_mallocstr_helper_graph for UNICODE");
-        assert_eq!(helper.func.name, "mallocunicode");
-        let inner = helper.graph.borrow();
-        let startblock = inner.startblock.borrow();
-        let opnames: Vec<&str> = startblock
-            .operations
-            .iter()
-            .map(|op| op.opname.as_str())
-            .collect();
-        assert_eq!(opnames, vec!["malloc_varsize", "setfield"]);
-        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
-            panic!("returnblock inputarg must be a Variable");
-        };
-        assert_eq!(ret.concretetype.borrow().clone(), Some(UNICODEPTR.clone()));
+        assert_malloc_helper_guards_hash("mallocunicode", &UNICODEPTR);
     }
 
     /// `mallocstr` is only meaningful against `Ptr(STR/UNICODE)`.
