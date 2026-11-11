@@ -328,13 +328,15 @@ fn is_frame_anchor_helper(fd: &FunDecl, llbc: &Llbc) -> bool {
                 || module.starts_with(&format!("{m}::FrameAnchor::"))
         }) && matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place");
     }
-    if matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place")
-        && (is_frame_anchor_ty(&fd.signature.output, llbc)
-            || fd
-                .signature
-                .inputs
-                .first()
-                .is_some_and(|ty| is_frame_anchor_ty(ty, llbc)))
+    if matches!(
+        leaf,
+        "new" | "from_raw" | "live" | "drop" | "drop_in_place" | "anchor"
+    ) && (is_frame_anchor_ty(&fd.signature.output, llbc)
+        || fd
+            .signature
+            .inputs
+            .first()
+            .is_some_and(|ty| is_frame_anchor_ty(ty, llbc)))
     {
         return true;
     }
@@ -2088,9 +2090,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // call as `getattr(recv, method)` (`CallTarget::Method`); a broken
     // callee graph blocks that getattr. Refuse: the Pin lives in the
     // caller's RootScope and is only erasable if the helper is inlined.
+    // A Guard bound there is an opener whose result is the bracket itself
+    // (`FrameAnchor::new`, a trait `anchor`): the erase would strip the
+    // write of local 0 the same way. The caller keeps that guard and the
+    // Open is modeled at its call site
+    // (`shadowstack.py ShadowStackFrameworkGCTransformer.push_roots`).
     if matches!(
         plan.specials.get(&0),
-        Some(Special::Index(_) | Special::IndexPair(_))
+        Some(Special::Index(_) | Special::IndexPair(_) | Special::Guard(_))
     ) {
         return Err("returns-slot-index");
     }
@@ -4818,6 +4825,67 @@ mod tests {
                     )],
                     json!("Return"),
                 ),
+                bb(json!("UnwindResume")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("returns-slot-index") => {}
+            Ok(Some(_)) => panic!("expected returns-slot-index, got accepted"),
+            Ok(None) => panic!("expected returns-slot-index, got no bracket"),
+            Err(reason) => panic!("expected returns-slot-index, got {reason}"),
+        }
+    }
+
+    /// Identity of `SharedOpcodeHandler::anchor` (`eval::<Impl>::anchor`):
+    /// output is FrameAnchor, leaf `anchor`, no FrameAnchor path segment.
+    /// Skip like `new` so the Open is modeled at the call site.
+    #[test]
+    fn is_frame_anchor_helper_skips_anchor_returning_frame_anchor() {
+        let anchor = frame_anchor_adt();
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [frame_anchor_type_decl()],
+                "fun_decls": [
+                    null,
+                    opaque_fun_sig(
+                        1,
+                        &["eval", "<Impl>", "anchor"],
+                        vec![ty()],
+                        anchor.clone(),
+                        json!("Opaque")
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(1).expect("anchor");
+        assert!(
+            is_frame_anchor_helper(fd, &llbc),
+            "anchor returning FrameAnchor is an opener identity"
+        );
+        let body = body_of(2, vec![bb(json!("Return"))]);
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("anchor identity must skip erase"),
+            Err(reason) => panic!("anchor identity must skip erase, got {reason}"),
+        }
+    }
+
+    /// Returning-open FrameAnchor: dest of the push is local 0, cleanup
+    /// UnwindResume is retained. Must refuse (erase would uninit local 0).
+    #[test]
+    fn analyze_refuses_returning_an_open_frame_anchor() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Read": place(i)});
+        let body = body_of(
+            2,
+            vec![
+                bb(call_fun(5, vec![copy(1)], 0, 1)),
+                bb(json!("Return")),
                 bb(json!("UnwindResume")),
             ],
         );
