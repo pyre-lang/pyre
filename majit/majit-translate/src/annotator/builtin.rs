@@ -2391,9 +2391,22 @@ fn cast_instance_intrinsic(
     // `SomeList` carries no `can_be_None` — upstream's does not either — so
     // the nullability computed above has nowhere to land on this arm; a null
     // operand is still admitted rather than hard-errored.
-    if matches!(&projected, SomeValue::List(_)) {
+    if let SomeValue::List(list) = &projected {
+        let dest_item = list.listdef.s_value();
         return match operand {
-            SomeValue::List(_) => Ok(operand.clone()),
+            SomeValue::List(op_list) => {
+                // Same-family identity: the operand ListDef can hold the dest
+                // item. Different-family is `IdentityDesc.leave_tunnel` of the
+                // dest spelling (`rerased.py` `leave_tunnel`): the operand is
+                // erased storage of another pair and is not unioned in. The
+                // first visit seeds Impossible `s_input` with `projected`.
+                let op_item = op_list.listdef.s_value();
+                if union(&op_item, &dest_item).is_ok() {
+                    Ok(operand.clone())
+                } else {
+                    bk.leave_erasing_pair_list_tunnel(&root, &projected)
+                }
+            }
             SomeValue::Instance(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
@@ -7560,6 +7573,188 @@ mod tests {
         assert!(
             a.listdef.same_as(&bk.getlistdef(None)),
             "the cast ListDef is Bookkeeper.getlistdef of the current position"
+        );
+    }
+
+    fn some_list_of_object(bk: &Rc<Bookkeeper>) -> SomeValue {
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_item =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let listdef =
+            crate::annotator::listdef::ListDef::new(Some(bk.clone()), s_item, false, false);
+        SomeValue::List(crate::annotator::model::SomeList::new(listdef))
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_object_list_to_str_list_is_rerased_leave_tunnel() {
+        // List[Instance(PyObject)] unerase onto `[str]` is `leave_tunnel` of
+        // the `[str]` pair, not identity of the operand ListDef.
+        let bk = bk();
+        let operand = some_list_of_object(&bk);
+        let SomeValue::List(op_list) = &operand else {
+            panic!("operand must be SomeList");
+        };
+        let op_listdef = op_list.listdef.clone();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[str]"))
+            .expect("[str] dest constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(operand), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("PyObject-list unerase onto [str]");
+        let SomeValue::List(out_list) = out else {
+            panic!("[str] dest must be SomeList, got {out:?}");
+        };
+        assert!(
+            matches!(out_list.listdef.s_value(), SomeValue::String(_)),
+            "leave_tunnel of [str] must yield a String item, got {:?}",
+            out_list.listdef.s_value()
+        );
+        assert!(
+            !out_list.listdef.same_as(&op_listdef),
+            "the [str] ListDef must not be the operand's PyObject ListDef"
+        );
+        out_list.listdef.mutate().expect("setitem mutate");
+        out_list
+            .listdef
+            .generalize(&crate::annotator::model::s_str0())
+            .expect("setitem of a str into the [str] list");
+        assert!(
+            matches!(op_listdef.s_value(), SomeValue::Instance(_)),
+            "setitem of a str must not touch the operand ListItem, got {:?}",
+            op_listdef.s_value()
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_two_str_list_casts_share_pair_listdef() {
+        // Two `[str]` unerase sites of PyObject-list operands share the
+        // pair's ListDef (`_get_desc` keyed by dest spelling).
+        use crate::annotator::bookkeeper::PositionKey;
+        let bk = bk();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[str]"))
+            .expect("[str] dest constant");
+        bk.set_position_key(Some(PositionKey::new(11, 0, 0)));
+        let first = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(some_list_of_object(&bk)), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("first [str] cast");
+        bk.set_position_key(Some(PositionKey::new(12, 0, 1)));
+        let second = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(some_list_of_object(&bk)), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("second [str] cast");
+        let (SomeValue::List(a), SomeValue::List(b)) = (first, second) else {
+            panic!("[str] dest must be SomeList");
+        };
+        assert!(
+            a.listdef.same_as(&b.listdef),
+            "two [str] casts of PyObject storage share one ListDef"
+        );
+        assert!(
+            Rc::ptr_eq(&a.listdef.listitem_rc(), &b.listdef.listitem_rc()),
+            "two [str] casts of PyObject storage share one ListItem"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_same_family_list_is_identity() {
+        // Same-family: operand ListDef item unions with dest `[PyObject]`
+        // item, so the operand is returned unchanged.
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "PyObject".to_string(),
+            "pyobject".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let pyobj = "pyobject::PyObject";
+        let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
+        let pyobj_identity = crate::front::semantic::ClassIdentity {
+            id: pyobj_id,
+            spelling: pyobj.to_string(),
+        };
+        reg.fields.insert(
+            pyobj.to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields
+            .insert("PyObject".to_string(), reg.fields[pyobj].clone());
+        reg.class_identity
+            .insert(pyobj.to_string(), Some(pyobj_identity.clone()));
+        reg.class_identity
+            .insert("PyObject".to_string(), Some(pyobj_identity));
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let s_item =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let op_listdef =
+            crate::annotator::listdef::ListDef::new(Some(bk.clone()), s_item, false, false);
+        let operand = SomeValue::List(crate::annotator::model::SomeList::new(op_listdef.clone()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("[PyObject] dest constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(operand), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("same-family [PyObject] cast");
+        let SomeValue::List(out_list) = out else {
+            panic!("[PyObject] dest must be SomeList, got {out:?}");
+        };
+        assert!(
+            out_list.listdef.same_as(&op_listdef),
+            "same-family [PyObject] must return the operand ListDef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_identity_desc_enter_tunnel_after_leave_records_reflow() {
+        // `enter_tunnel` of a wider `s_obj` after `leave_tunnel` keeps the
+        // leave's position scheduled and generalizes `s_input`.
+        use crate::annotator::bookkeeper::{IdentityDesc, PositionKey};
+        let bk = bk();
+        let pk = PositionKey::new(3, 4, 5);
+        bk.set_position_key(Some(pk.clone()));
+        let mut desc = IdentityDesc::new();
+        let narrow = SomeValue::Integer(SomeInteger::new(true, false));
+        desc.enter_tunnel(&bk, &narrow).expect("seed enter_tunnel");
+        let left = desc.leave_tunnel(&bk);
+        assert!(
+            matches!(left, SomeValue::Integer(ref i) if i.nonneg),
+            "leave_tunnel returns the seeded s_input"
+        );
+        assert!(
+            desc.reflowpositions.contains_key(&Some(pk.clone())),
+            "leave_tunnel records the current position"
+        );
+        let wide = SomeValue::Integer(SomeInteger::new(false, false));
+        desc.enter_tunnel(&bk, &wide)
+            .expect("widening enter_tunnel");
+        assert!(
+            matches!(&desc.s_input, SomeValue::Integer(i) if !i.nonneg),
+            "s_input must generalize to signed, got {:?}",
+            desc.s_input
+        );
+        assert!(
+            desc.reflowpositions.contains_key(&Some(pk)),
+            "the leave position stays scheduled for reflow"
         );
     }
 

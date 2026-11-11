@@ -243,6 +243,74 @@ impl PositionKey {
     }
 }
 
+/// `rerased.py` `IdentityDesc`. One desc per erasing-pair identity;
+/// `rerased.py` `_get_desc` stores them on `bk._erasing_pairs_descs`.
+/// The identity here is the dest list spelling the front emits
+/// (`[str]`, `[PyObject]`, `[i64]`, ...).
+pub(crate) struct IdentityDesc {
+    /// `IdentityDesc.s_input`. Starts as `s_ImpossibleValue`.
+    pub(crate) s_input: SomeValue,
+    /// `IdentityDesc.reflowpositions`. Positions that `leave_tunnel`'d
+    /// this pair; a later `enter_tunnel` that widens `s_input` reflows them.
+    pub(crate) reflowpositions: IndexMap<Option<PositionKey>, ()>,
+}
+
+impl IdentityDesc {
+    pub(crate) fn new() -> Self {
+        IdentityDesc {
+            s_input: s_impossible_value(),
+            reflowpositions: IndexMap::new(),
+        }
+    }
+
+    /// Union `s_obj` into `s_input`. When the annotation widens, return
+    /// the positions that already `leave_tunnel`'d so the caller can
+    /// `reflowfromposition` after dropping `erasing_pairs_descs`.
+    fn collect_enter_tunnel_reflows(
+        &mut self,
+        s_obj: &SomeValue,
+    ) -> Result<Vec<PositionKey>, AnnotatorError> {
+        let new = union(&self.s_input, s_obj).map_err(|e| AnnotatorError::new(e.msg))?;
+        if new != self.s_input {
+            self.s_input = new;
+            Ok(self.reflowpositions.keys().cloned().flatten().collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn reflow_positions(bk: &Bookkeeper, positions: Vec<PositionKey>) {
+        if positions.is_empty() {
+            return;
+        }
+        let Some(ann) = bk.try_annotator() else {
+            return;
+        };
+        for pk in positions {
+            ann.reflowfromposition(&pk);
+        }
+    }
+
+    /// `IdentityDesc.enter_tunnel`. Union `s_obj` into `s_input`; if it
+    /// changed, `annotator.reflowfromposition` every recorded leave.
+    pub(crate) fn enter_tunnel(
+        &mut self,
+        bk: &Bookkeeper,
+        s_obj: &SomeValue,
+    ) -> Result<(), AnnotatorError> {
+        let positions = self.collect_enter_tunnel_reflows(s_obj)?;
+        Self::reflow_positions(bk, positions);
+        Ok(())
+    }
+
+    /// `IdentityDesc.leave_tunnel`. Record the current `position_key` and
+    /// return `s_input`.
+    pub(crate) fn leave_tunnel(&mut self, bk: &Bookkeeper) -> SomeValue {
+        self.reflowpositions.insert(bk.current_position_key(), ());
+        self.s_input.clone()
+    }
+}
+
 /// RPython `class Bookkeeper` (bookkeeper.py).
 pub struct Bookkeeper {
     /// RPython `self.annotator = annotator` (bookkeeper.py). A weak
@@ -342,6 +410,11 @@ pub struct Bookkeeper {
     /// [`super::model::s_impossible_value`] as the
     /// seed for the first hit.
     pub _jit_annotation_cache: RefCell<HashMap<HostObject, HashMap<String, SomeValue>>>,
+    /// `rerased.py` `_get_desc` / `bk._erasing_pairs_descs`. Keyed by
+    /// `ErasingPairIdentity`, which here is the dest list spelling
+    /// (`[str]`, `[PyObject]`, `[i64]`, ...). `IndexMap` matches the
+    /// insertion-ordered Python dict `_get_desc` attaches.
+    pub(crate) erasing_pairs_descs: RefCell<IndexMap<String, IdentityDesc>>,
     /// RPython `self.immutable_cache = {}` (bookkeeper.py).
     /// Upstream's cache memoises the returned `SomeList` / `SomeDict` so
     /// downstream `generalize_key` / `generalize` mutations on the
@@ -1855,6 +1928,7 @@ impl Bookkeeper {
             })),
             emulated_pbc_calls: RefCell::new(IndexMap::new()),
             _jit_annotation_cache: RefCell::new(HashMap::new()),
+            erasing_pairs_descs: RefCell::new(IndexMap::new()),
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
             all_specializations: RefCell::new(IndexMap::new()),
@@ -2829,6 +2903,56 @@ impl Bookkeeper {
     /// `self.position_key = None`).
     pub(crate) fn current_position_key(&self) -> Option<PositionKey> {
         self.position_key.borrow().clone()
+    }
+
+    /// `rerased.py` `_get_desc`. Inserts an `IdentityDesc` for `identity`
+    /// on first use (`bk._erasing_pairs_descs`).
+    fn get_erasing_pair_desc<R>(
+        &self,
+        identity: &str,
+        f: impl FnOnce(&mut IdentityDesc) -> R,
+    ) -> R {
+        let mut descs = self.erasing_pairs_descs.borrow_mut();
+        let desc = descs
+            .entry(identity.to_string())
+            .or_insert_with(IdentityDesc::new);
+        f(desc)
+    }
+
+    /// `IdentityDesc.enter_tunnel`. Drops `erasing_pairs_descs` before
+    /// `reflowfromposition` so a re-entry cannot `BorrowMutError`.
+    pub(crate) fn erasing_pair_enter_tunnel(
+        &self,
+        identity: &str,
+        s_obj: &SomeValue,
+    ) -> Result<(), AnnotatorError> {
+        let positions =
+            self.get_erasing_pair_desc(identity, |desc| desc.collect_enter_tunnel_reflows(s_obj))?;
+        IdentityDesc::reflow_positions(self, positions);
+        Ok(())
+    }
+
+    /// `IdentityDesc.leave_tunnel`.
+    pub(crate) fn erasing_pair_leave_tunnel(&self, identity: &str) -> SomeValue {
+        self.get_erasing_pair_desc(identity, |desc| desc.leave_tunnel(self))
+    }
+
+    /// Different-family list unerase: the operand is erased storage of
+    /// another pair and is not unioned in. If `s_input` is still
+    /// Impossible, `enter_tunnel(projected)` seeds the dest SomeList,
+    /// then `leave_tunnel` returns that shared ListDef.
+    pub(crate) fn leave_erasing_pair_list_tunnel(
+        &self,
+        identity: &str,
+        projected: &SomeValue,
+    ) -> Result<SomeValue, AnnotatorError> {
+        let seed = self.get_erasing_pair_desc(identity, |desc| {
+            matches!(desc.s_input, SomeValue::Impossible)
+        });
+        if seed {
+            self.erasing_pair_enter_tunnel(identity, projected)?;
+        }
+        Ok(self.erasing_pair_leave_tunnel(identity))
     }
 
     /// RPython `Bookkeeper.enter(self, position_key)` (bookkeeper.py).
