@@ -4527,9 +4527,9 @@ pub fn with_except_start_values(
 /// `W_Super.getattribute` call graph instead of teaching the tracer a second
 /// implementation of either one.
 pub fn load_super_attr_value_w(
-    global_super: PyObjectRef,
-    self_obj: PyObjectRef,
-    cls: PyObjectRef,
+    mut global_super: PyObjectRef,
+    mut self_obj: PyObjectRef,
+    mut cls: PyObjectRef,
     frame: *mut PyFrame,
     mut w_name: PyObjectRef,
     is_two_arg: bool,
@@ -4543,8 +4543,11 @@ pub fn load_super_attr_value_w(
     }
     let exact_builtin_zero_arg =
         !is_two_arg && crate::builtins::is_builtin_super_type(global_super);
+    // `framework.py` `gct_direct_call`: the three opcode operands are GCREF
+    // livevars across `call_function_impl`. Pin and re-read after each
+    // collecting call (`shadowstack.py` `pop_roots`).
     let proxy = if is_two_arg {
-        pyre_object::with_roots!(w_name =>
+        pyre_object::with_roots!(global_super, cls, self_obj, w_name =>
             crate::call::call_function_impl_result(global_super, &[cls, self_obj])
         )?
     } else if exact_builtin_zero_arg {
@@ -4552,7 +4555,7 @@ pub fn load_super_attr_value_w(
             crate::builtins::builtin_super_from_frame_layout(frame, self_is_cell, class_slot)
         )?
     } else {
-        pyre_object::with_roots!(w_name =>
+        pyre_object::with_roots!(global_super, w_name =>
             crate::call::call_function_impl_result(global_super, &[])
         )?
     };
@@ -5868,7 +5871,7 @@ impl OpcodeStepExecutor for PyFrame {
         let _ = roots.pin_root(self.pop());
         let anchor = FrameAnchor::new(self);
         let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(self.getdictscope()?);
+        let _ = roots.pin_root(unsafe { &mut *anchor.live() }.getdictscope()?);
         crate::importing::import_all_from_w(roots.get(module_slot), roots.get(locals_slot))?;
         unsafe { &mut *anchor.live() }.setdictscope(roots.get(locals_slot), false)?;
         Ok(())

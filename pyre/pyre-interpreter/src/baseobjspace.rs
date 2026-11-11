@@ -23715,9 +23715,10 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
     // wait behind a collection that moves the frame, and the generator's
     // edge is what that collection updates.
     // Pin the frame whether or not `try_gc_owns_object` — `generator.py`
-    // `_send_ex` keeps `frame` as a GCREF local, and `gc_current_object_address`
-    // / `drag_out_root` leave a non-heap address unchanged. The third slot
-    // stays the frame (or null), so the bracket is still three roots.
+    // `_send_ex` keeps `frame` as a GCREF local. `gc_current_object_address`
+    // / `drag_out_root` are pyre collector functions (majit-gc), not
+    // upstream symbols; they leave a non-heap address unchanged. The third
+    // slot stays the frame (or null), so the bracket is still three roots.
     let frame_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(unsafe {
         w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) as PyObjectRef

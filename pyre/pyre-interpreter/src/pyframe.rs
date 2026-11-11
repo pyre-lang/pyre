@@ -4650,8 +4650,12 @@ impl PyFrame {
     /// `frame.f_locals is frame.f_locals` holds.
     #[inline]
     pub fn getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        self.fast2locals()?;
-        Ok(self.get_w_locals())
+        // `fast2locals` can collect (`space.newdict` / `setitem_str`).
+        // `framework.py` `gct_direct_call` rewrites the `self` livevar;
+        // read `get_w_locals` through `live()` (`shadowstack.py` `pop_roots`).
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        unsafe { &mut *frame_anchor.live() }.fast2locals()?;
+        Ok(unsafe { &*frame_anchor.live() }.get_w_locals())
     }
 
     /// pyframe.py `fget_getdictscope` — the `f_locals` getset.
