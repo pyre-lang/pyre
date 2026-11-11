@@ -2193,6 +2193,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         Vec::new(),
     ));
     debug_assert_eq!(py_object_array_tid, PY_OBJECT_ARRAY_GC_TYPE_ID);
+    // majit-rlib stamps this host's slot into the list-of-str header.
+    pyre_object::object_array::set_gc_object_items_array_gc_type_id(py_object_array_tid);
     // `pypy/objspace/std/specialisedtupleobject.py` `Cls_ii / Cls_ff
     // / Cls_oo` — three subclasses of `W_AbstractTupleObject` with
     // inline `value0` / `value1` fields. Each gets a distinct
@@ -4989,6 +4991,22 @@ fn build_gc() -> Box<MiniMarkGC> {
             &pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_TYPE as *const _ as usize;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, sapp_pytype, sapp_tid);
         pytype_to_tid.insert(sapp_pytype, sapp_tid);
+        // Minted RPython exception classes stay in this group. Row `i`
+        // is `minted_exception_first_gc_type_id() + i`.
+        let minted = pyre_jit_trace::minted_exception_classes::MINTED_EXCEPTION_CLASSES;
+        let minted_tids =
+            pyre_jit_trace::minted_exception_classes::register_minted_exception_classes(
+                &mut gc,
+                minted,
+                host_exc_tid,
+            );
+        for (index, (row, tid)) in minted.iter().zip(minted_tids).enumerate() {
+            debug_assert_eq!(
+                tid,
+                pyre_interpreter::pyopcode::minted_exception_first_gc_type_id() + index as u32
+            );
+            pytype_to_tid.insert(row.pytype as *const _ as usize, tid);
+        }
     }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
@@ -19703,6 +19721,45 @@ mod tests {
             rebuilt.subclass_range(classptr)
         });
         assert_matches_gc();
+    }
+
+    /// A list of str and a list of instances are one `GcArray` of gc
+    /// pointers (`externalvsinternal(..., gcref=True)`, `rmodel.py`).
+    /// `get_type_id` / `get_array_descr` share the object-items
+    /// registration: tid [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`],
+    /// token [`pyre_object::ITEMS_BLOCK_TOKEN`], descr key
+    /// `OBJECT_REF_GCARRAY_TYPE_ID`. The varsize row traces item slots
+    /// as GC pointers.
+    #[test]
+    fn gc_object_items_array_traces_pointer_items() {
+        let gc = build_gc();
+        assert_eq!(
+            pyre_object::object_array::gc_object_items_array_gc_type_id(),
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID
+        );
+        let _descr = pyre_jit_trace::state::pyobject_gcarray_descr();
+        let tid = pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID;
+        assert!(
+            (tid as usize) < gc.types.len(),
+            "object-items tid {tid} is outside the registry ({})",
+            gc.types.len()
+        );
+        let info = gc.types.get(tid);
+        let token = &pyre_object::ITEMS_BLOCK_TOKEN;
+        assert_eq!(info.size, token.base_size);
+        assert_eq!(info.item_size, token.item_size);
+        assert_eq!(info.length_offset, token.len_offset);
+        assert!(info.items_have_gc_ptrs);
+        assert_eq!(info.var_gc_ptr_offsets, vec![0]);
+        assert!(info.has_gc_ptrs);
+        assert!(!info.has_subclass_range);
+        let key = majit_ir::descr::path_hash(
+            majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID,
+        );
+        assert_eq!(
+            majit_ir::descr::gc_cache().lock().resolve_array_tid(key),
+            Some(tid)
+        );
     }
 
     #[test]

@@ -1510,6 +1510,30 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
+/// `<[T]>::join(list, sep)` (`alloc::slice::<Impl>::join` and
+/// `core::slice::<Impl>::join`). Trailing segments, not an exact `core`
+/// prefix: `ArgErr::getmsg` spells the call as `alloc::slice`.
+fn is_slice_join_segments(segments: &[String]) -> bool {
+    let n = segments.len();
+    n >= 3 && segments[n - 3] == "slice" && segments[n - 2] == "<Impl>" && segments[n - 1] == "join"
+}
+
+/// The receiver's concretetype is the unresized list-of-str word
+/// (`FixedSizeListRepr` of `string_repr` after `externalvsinternal`).
+/// A resized list, a `[i64]`, or an unstamped receiver is not this call.
+fn slice_join_list_of_str_call(target: &crate::model::CallTarget, args: &[LinkArg]) -> bool {
+    let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    if !is_slice_join_segments(segments) || args.len() != 2 {
+        return false;
+    }
+    let Some(LinkArg::Value(var)) = args.first() else {
+        return false;
+    };
+    var.concretetype().as_ref() == Some(&crate::translator::rtyper::rlist::list_of_str_lltype())
+}
+
 /// `Vec::with_capacity(n)` / `Vec::new()` (Rust MIR `vec::Vec::{with_capacity,
 /// new}`) — the resizable-list constructor. Routed in [`translate_op`] to the
 /// `newlist` operation with no element args, the shape `rtype_newlist`
@@ -1832,6 +1856,11 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             ..
         } if is_slice_reverse_segments(segments) => false,
+        // `<[str]>::join` lowers to `getattr(sep, "join")` + `simple_call`.
+        // `AbstractStringRepr.rtype_method_join` (`rstr.py`) calls
+        // `hop.exception_cannot_occur()`. An unstamped receiver is not
+        // rewritten and stays a raising Call.
+        OpKind::Call { target, args, .. } if slice_join_list_of_str_call(target, args) => false,
         // `vec::Vec::{with_capacity,new}` lowers (in `translate_op`) to the
         // `newlist` operation, whose `canraise` is `[]` (operation.py
         // `class NewList`); classify the originating Call non-raising so a `?`
@@ -2465,6 +2494,18 @@ pub(crate) fn function_path_is_high_level_op(
         }
         _ => false,
     }
+}
+
+/// [`translate_op`] rewrites this call before `annrpython.py consider_op`
+/// would `recursivecall` the callee. High-level FunctionPaths, plus a
+/// `<[T]>::join` whose receiver is a list of str (`rstr.py`
+/// `rtype_method_join`). The join gate needs the receiver lltype, which
+/// [`function_path_is_high_level_op`] does not see.
+pub(crate) fn call_rewritten_before_recursivecall(
+    target: &crate::model::CallTarget,
+    args: &[LinkArg],
+) -> bool {
+    function_path_is_high_level_op(target, args.len()) || slice_join_list_of_str_call(target, args)
 }
 
 fn gc_root_reload_analyser(segments: &[String]) -> Option<&'static str> {
@@ -3935,6 +3976,27 @@ pub fn translate_op(
                             op,
                             call_registry,
                         );
+                    }
+                    // `posonly_kwds.join(", ")` is `<[S]>::join(&list, sep)`.
+                    // `AbstractStringRepr.rtype_method_join` (`rstr.py`) is
+                    // `sep.join(list)`, so the list-of-str receiver becomes
+                    // `getattr(sep, "join")` + `simple_call(bound, list)`.
+                    // Any other receiver keeps the residual FunctionPath.
+                    if slice_join_list_of_str_call(target, args) {
+                        let list = arg_hls[0].clone();
+                        let sep = arg_hls[1].clone();
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    sep,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("join"))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, list], result),
+                        ]);
                     }
                     // The interpreter's source spelling of the llop
                     // `rclass.py InstanceRepr.hook_setfield` genops during
@@ -12450,6 +12512,130 @@ mod tests {
         assert_eq!(&seeded, ctor_host);
     }
 
+    /// `<[str]>::join(list, sep)` whose receiver concretetype is the
+    /// unresized list-of-str word becomes `getattr(sep, "join")` +
+    /// `simple_call(bound, list)`. Any other receiver stays a residual
+    /// FunctionPath.
+    #[test]
+    fn translate_op_slice_join_of_list_of_str_lowers_to_str_method_join() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
+        use crate::translator::rtyper::rlist::list_of_str_lltype;
+
+        let list_ll = list_of_str_lltype();
+        let signed_items = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+
+        fn join_call(
+            graph: &mut LegacyGraph,
+            segments: &[&str],
+            receiver_ll: Option<LowLevelType>,
+            nargs: usize,
+        ) -> (SpaceOperation, HashMap<Variable, Hlvalue>, Vec<Hlvalue>) {
+            let mut value_map = HashMap::new();
+            let vars = mint_vars(graph, nargs + 1);
+            let result_hl = Hlvalue::Variable(Variable::new());
+            value_map.insert(vars[0].clone(), result_hl);
+            if let Some(ll) = receiver_ll {
+                vars[1].set_concretetype(Some(ll));
+            }
+            let mut arg_hls = Vec::new();
+            for var in &vars[1..1 + nargs] {
+                let hl = Hlvalue::Variable(Variable::new());
+                value_map.insert(var.clone(), hl.clone());
+                arg_hls.push(hl);
+            }
+            let spaceop = SpaceOperation {
+                result: Some(vars[0].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::function_path(segments.iter().copied()),
+                    args: crate::model::call_args(vars[1..1 + nargs].to_vec()),
+                    result_ty: ValueType::Str,
+                },
+            };
+            (spaceop, value_map, arg_hls)
+        }
+
+        let mut graph = LegacyGraph::new("slice_join");
+        for segments in [
+            &["alloc", "slice", "<Impl>", "join"][..],
+            &["core", "slice", "<Impl>", "join"][..],
+        ] {
+            let (spaceop, value_map, arg_hls) =
+                join_call(&mut graph, segments, Some(list_ll.clone()), 2);
+            let OpKind::Call { target, args, .. } = &spaceop.kind else {
+                panic!("expected Call");
+            };
+            assert!(
+                !function_path_is_high_level_op(target, args.len()),
+                "slice join is not a high-level op"
+            );
+            assert!(call_rewritten_before_recursivecall(target, args));
+            assert!(!op_canraise(&spaceop.kind));
+            let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
+                .unwrap_or_else(|err| panic!("{segments:?} must lower: {err}"));
+            assert_eq!(translated.len(), 2);
+            assert_eq!(translated[0].opname, "getattr");
+            assert_eq!(translated[0].args[0], arg_hls[1]);
+            let Hlvalue::Constant(method) = &translated[0].args[1] else {
+                panic!("method name is a Constant");
+            };
+            assert_eq!(method.value.as_text(), Some("join"));
+            assert_eq!(translated[1].opname, "simple_call");
+            assert_eq!(translated[1].args[0], translated[0].result);
+            assert_eq!(translated[1].args[1], arg_hls[0]);
+            assert_eq!(
+                translated[1].result,
+                *value_map.get(&spaceop.result.clone().unwrap()).unwrap()
+            );
+        }
+
+        let negatives: Vec<(&str, &[&str], Option<LowLevelType>, usize)> = vec![
+            ("unstamped", &["alloc", "slice", "<Impl>", "join"], None, 2),
+            (
+                "signed",
+                &["alloc", "slice", "<Impl>", "join"],
+                Some(LowLevelType::Signed),
+                2,
+            ),
+            (
+                "signed-items",
+                &["core", "slice", "<Impl>", "join"],
+                Some(signed_items),
+                2,
+            ),
+            (
+                "index",
+                &["core", "slice", "<Impl>", "index"],
+                Some(list_ll.clone()),
+                2,
+            ),
+            (
+                "one-arg",
+                &["alloc", "slice", "<Impl>", "join"],
+                Some(list_ll),
+                1,
+            ),
+        ];
+        for (label, segments, receiver_ll, nargs) in negatives {
+            let (spaceop, value_map, _) = join_call(&mut graph, segments, receiver_ll, nargs);
+            let OpKind::Call { target, args, .. } = &spaceop.kind else {
+                panic!("{label}: expected Call");
+            };
+            assert!(
+                !call_rewritten_before_recursivecall(target, args),
+                "{label}"
+            );
+            assert!(op_canraise(&spaceop.kind), "{label}");
+            let err = translate_op(&spaceop, &value_map, &empty_call_registry()).expect_err(label);
+            assert!(
+                err.to_string().contains("not registered in CallRegistry"),
+                "{label}: {err}"
+            );
+        }
+        let _keep_graph = graph;
+    }
+
     /// A call of each `ll_vec_*` helper lowers to the high-level `Vec`
     /// operation it implements.
     #[test]
@@ -16393,14 +16579,14 @@ mod tests {
     }
 
     fn synth_e_hint() -> crate::front::llbc_hints::ExceptionClassHint {
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "synth::E".to_string(),
-            overrides: "C(B)".to_string(),
-            variants: ["A", "B", "C", "D"]
+        crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "C(B)",
+            ["A", "B", "C", "D"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-        }
+        )
     }
 
     fn unwind_panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -16427,10 +16613,10 @@ mod tests {
         bk.mint_exception_class_hierarchies(&[synth_e_hint()]);
         let registry = CallRegistry::new(Rc::clone(&bk));
         for (name, tag, class_name) in [
-            ("A", 0i64, "EA"),
-            ("B", 1, "EB"),
-            ("C", 2, "EC"),
-            ("D", 3, "ED"),
+            ("A", 0i64, "synth::E::A"),
+            ("B", 1, "synth::E::B"),
+            ("C", 2, "synth::E::C"),
+            ("D", 3, "synth::E::D"),
         ] {
             let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
             let mut graph = LegacyGraph::new("marked_ctor");
@@ -16502,7 +16688,7 @@ mod tests {
             let borrowed = classdef.borrow();
             borrowed.classdesc.borrow().pyobj.clone()
         };
-        let operand = HostObject::new_class("EA", Vec::new());
+        let operand = HostObject::new_class("synth::E::A", Vec::new());
         let op = SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::ConstRef(operand.clone()),
@@ -16524,7 +16710,7 @@ mod tests {
         }));
         let message = unwind_panic_text(missing.expect_err("missing registry panics"));
         assert!(
-            message.contains("class ConstRef `EA` requires a CallRegistry"),
+            message.contains("class ConstRef `synth::E::A` requires a CallRegistry"),
             "{message}"
         );
 

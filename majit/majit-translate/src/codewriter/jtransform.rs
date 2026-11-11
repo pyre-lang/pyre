@@ -201,6 +201,26 @@ pub struct GraphTransformConfig {
     /// same shape as `ll_int2dec` for a non-string operand).
     #[serde(default = "default_rust_string_str_helper")]
     pub rust_string_str_helper: String,
+    /// `HighLevelOp.convertvar` from a rust-heap `Vec<String>`
+    /// (`{cap, ptr, len}`) into an unresized list of str
+    /// (`Ptr(GcArray(GCREF))`; `externalvsinternal` wraps `Ptr(STR)`).
+    ///
+    /// The path is split on `::` before `CallTarget::function_path`: each
+    /// segment is one path component. Bound through `HELPER_FNADDRS`
+    /// (`register_macro_helper_trace_fnaddr`), canonical
+    /// `lltypesystem::rlist::jit_ll_list_str_from_rust_vec`.
+    #[serde(default = "default_rust_vec_list_str_helper")]
+    pub rust_vec_list_str_helper: String,
+    /// `HighLevelOp.convertvar` from a by-value raw-flavor struct into the
+    /// one-word `*mut T` a marked exception class stores.
+    ///
+    /// The path is split on `::` before `CallTarget::function_path`. Bound
+    /// through `HELPER_FNADDRS`, canonical
+    /// `lltypesystem::rraw::jit_ll_box_raw_moved`. An empty name leaves the
+    /// write on the plain `setfield` arm. A field declared as that pointer
+    /// has no raw-owned row, so this conversion does not run.
+    #[serde(default = "default_raw_owned_box_helper")]
+    pub raw_owned_box_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -258,6 +278,26 @@ fn default_rust_string_str_helper() -> String {
     "jit_ll_str_from_rust_string".to_string()
 }
 
+/// The [`GraphTransformConfig::rust_vec_list_str_helper`] default.
+///
+/// `HighLevelOp.convertvar` into `FixedSizeListRepr`. The macro registry
+/// publishes `lltypesystem::rlist::jit_ll_list_str_from_rust_vec`.
+fn default_rust_vec_list_str_helper() -> String {
+    "lltypesystem::rlist::jit_ll_list_str_from_rust_vec".to_string()
+}
+
+/// The [`GraphTransformConfig::raw_owned_box_helper`] default.
+///
+/// `lltype.malloc(STRUCT, flavor='raw')` of the moved bytes. The macro
+/// registry publishes `lltypesystem::rraw::jit_ll_box_raw_moved`.
+fn default_raw_owned_box_helper() -> String {
+    "lltypesystem::rraw::jit_ll_box_raw_moved".to_string()
+}
+
+fn helper_path_target(path: &str) -> CallTarget {
+    CallTarget::function_path(path.split("::").filter(|segment| !segment.is_empty()))
+}
+
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -274,6 +314,8 @@ impl Default for GraphTransformConfig {
             float_str_helper: default_float_str_helper(),
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
+            rust_vec_list_str_helper: default_rust_vec_list_str_helper(),
+            raw_owned_box_helper: default_raw_owned_box_helper(),
         }
     }
 }
@@ -5381,13 +5423,15 @@ impl<'a> Transformer<'a> {
             }
             // `setfield` converts the operand to the field repr
             // (`rtyper.py` `HighLevelOp.convertvar` →
-            // `pairtype(r_from, r_to).convert_from_to`). A `ValueType::Str`
+            // `pairtype(r_from, r_to).convert_from_to`) before
+            // `Transformer.rewrite_op_setfield`. A `ValueType::Str`
             // field (`Ptr(STR)`) written from a rust-heap `String`
-            // (`{cap, ptr, len}`) copies into `STR`. An operand that is
-            // already `Ptr(STR)` — a `Wtf8Buf` value — is that
-            // conversion's identity (`coerce_operand_to_rstr_str`), so
-            // this arm does not match and the write stays as it is.
-            // Not gated on `lower_virtualizable`.
+            // (`{cap, ptr, len}`) copies into `STR`, then that store
+            // takes `rewrite_op_setfield` when `lower_virtualizable` is
+            // on. An operand that is already `Ptr(STR)` — a `Wtf8Buf`
+            // value — is that conversion's identity
+            // (`coerce_operand_to_rstr_str`), so this arm does not match
+            // and the write falls through to the plain arm.
             OpKind::FieldWrite {
                 base,
                 field,
@@ -5400,7 +5444,53 @@ impl<'a> Transformer<'a> {
                         if crate::front::mir::interpolant_is_rust_heap_string(graph, operand)
                 ) =>
             {
-                self.rewrite_rust_heap_string_setfield(graph, op, base, field, value)
+                self.rewrite_rust_heap_string_setfield(graph, op, base, field, value, graph_name)
+            }
+            // `setfield` converts the operand to the field repr
+            // (`HighLevelOp.convertvar`) before
+            // `Transformer.rewrite_op_setfield`. An unresized list-of-str
+            // field written from a rust-heap `Vec<String>` allocates the
+            // `GcArray(GCREF)` (`externalvsinternal` wraps `Ptr(STR)`),
+            // then that store takes `rewrite_op_setfield` when
+            // `lower_virtualizable` is on. An empty helper name leaves
+            // the write on the plain arm.
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if !self.config.rust_vec_list_str_helper.is_empty()
+                && matches!(
+                    ty,
+                    ValueType::Ref(Some(root))
+                        if root == crate::front::mir::RPY_LIST_OF_STR
+                )
+                && matches!(
+                    value,
+                    LinkArg::Value(operand)
+                        if crate::front::mir::interpolant_is_rust_heap_vec_string(graph, operand)
+                ) =>
+            {
+                self.rewrite_rust_heap_vec_string_setfield(
+                    graph, op, base, field, value, graph_name,
+                )
+            }
+            // A marked exception class stores a by-value raw-flavor struct
+            // as `*mut T`. The operand is still the moved value; the row's
+            // raw-owned payload is what distinguishes it from a field
+            // declared as that pointer (`PyCode._signature`). Recognition
+            // stays on that row: the store type is `ValueType::Unsigned`
+            // (`descr.py get_type_flag` of a raw `Ptr`), and that type is
+            // not what selects this arm. An empty helper name, a missing
+            // row, or an operand that is already the pointer leaves the
+            // write on the plain arm.
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if self.raw_owned_move(field, value, graph).is_some() => {
+                self.rewrite_raw_owned_setfield(graph, op, base, field, value, ty, graph_name)
             }
             OpKind::FieldWrite {
                 field, value, ty, ..
@@ -7862,6 +7952,13 @@ impl<'a> Transformer<'a> {
 
     /// `setfield` of a `ValueType::Str` field from a rust-heap `String`.
     /// The operand is still `{cap, ptr, len}`; the field is `Ptr(STR)`.
+    ///
+    /// `HighLevelOp.convertvar` emits the copy, then
+    /// `Transformer.rewrite_op_setfield` sees the converted value.
+    /// `optimize_block` does not feed `Replace` ops back into
+    /// `rewrite_operation`, so the store is passed through here when
+    /// `lower_virtualizable` is on. The gate matches the plain
+    /// `FieldWrite` arm.
     fn rewrite_rust_heap_string_setfield(
         &mut self,
         graph: &mut FunctionGraph,
@@ -7869,6 +7966,7 @@ impl<'a> Transformer<'a> {
         base: &crate::flowspace::model::Variable,
         field: &FieldDescriptor,
         value: &LinkArg,
+        graph_name: &str,
     ) -> RewriteResult {
         let LinkArg::Value(operand) = value else {
             return RewriteResult::Keep;
@@ -7877,7 +7975,7 @@ impl<'a> Transformer<'a> {
         if ops.is_empty() {
             return RewriteResult::Keep;
         }
-        ops.push(SpaceOperation {
+        let write = SpaceOperation {
             result: op.result.clone(),
             kind: OpKind::FieldWrite {
                 base: base.clone(),
@@ -7885,7 +7983,31 @@ impl<'a> Transformer<'a> {
                 value: LinkArg::Value(coerced),
                 ty: ValueType::Str,
             },
-        });
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten = {
+                let OpKind::FieldWrite {
+                    field, value, ty, ..
+                } = &write.kind
+                else {
+                    unreachable!("coerced rust-heap string store is a FieldWrite");
+                };
+                self.rewrite_op_setfield(&write, field, value, ty, graph_name, graph)
+            };
+            // `rewrite_op_setfield` returns `Keep` or `Replace`.
+            // `emit_string_contains` / `rewrite_emitted` reject the other
+            // variants the same way: a setfield is not an alias or a constant.
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        ops.extend(follow_up);
         RewriteResult::Replace(ops)
     }
 
@@ -7935,6 +8057,331 @@ impl<'a> Transformer<'a> {
                 },
             ],
         )
+    }
+
+    /// `setfield` of an unresized list-of-str field from a rust-heap
+    /// `Vec<String>`. The operand is still `{cap, ptr, len}`; the field
+    /// is `Ptr(GcArray(GCREF))` (`FixedSizeListRepr` after
+    /// `externalvsinternal`).
+    ///
+    /// `HighLevelOp.convertvar` emits the copy, then
+    /// `Transformer.rewrite_op_setfield` sees the converted value.
+    /// `optimize_block` does not feed `Replace` ops back into
+    /// `rewrite_operation`, so the store is passed through here when
+    /// `lower_virtualizable` is on.
+    fn rewrite_rust_heap_vec_string_setfield(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let LinkArg::Value(operand) = value else {
+            return RewriteResult::Keep;
+        };
+        let (coerced, mut ops) = self.coerce_operand_to_list_of_str(graph, operand);
+        if ops.is_empty() {
+            return RewriteResult::Keep;
+        }
+        let stored = LinkArg::Value(coerced);
+        let list_ty = ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()));
+        let write = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field.clone(),
+                value: stored.clone(),
+                ty: list_ty.clone(),
+            },
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten =
+                self.rewrite_op_setfield(&write, field, &stored, &list_ty, graph_name, graph);
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        ops.extend(follow_up);
+        RewriteResult::Replace(ops)
+    }
+
+    /// Copy a rust-heap `Vec<String>` (`{cap, ptr, len}`) into an
+    /// unresized list of str (`HighLevelOp.convertvar` into
+    /// `FixedSizeListRepr`). Identity when the operand is already that
+    /// list pointer.
+    fn coerce_operand_to_list_of_str(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        if !crate::front::mir::interpolant_is_rust_heap_vec_string(graph, operand) {
+            return (operand.clone(), Vec::new());
+        }
+        let target = helper_path_target(&self.config.rust_vec_list_str_helper);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        let coerced = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        coerced.set_concretetype(Some(crate::translator::rtyper::rlist::list_of_str_lltype()));
+        (
+            coerced.clone(),
+            vec![
+                funcptr_op,
+                SpaceOperation {
+                    result: Some(coerced),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Ref],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![operand.clone()],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::live(),
+                },
+            ],
+        )
+    }
+
+    /// Raw-owned payload when this `setfield` still holds the moved
+    /// by-value struct. `None` leaves the write on the plain arm.
+    fn raw_owned_move(
+        &self,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        graph: &FunctionGraph,
+    ) -> Option<crate::front::semantic::RawOwnedField> {
+        if self.config.raw_owned_box_helper.is_empty() {
+            return None;
+        }
+        let cc = self.callcontrol.as_deref()?;
+        let owner = field.owner_root.as_deref()?;
+        let row = cc
+            .struct_field_entries(owner)?
+            .iter()
+            .find(|row| row.name == field.name)?;
+        let raw = row.raw_owned.clone()?;
+        let LinkArg::Value(operand) = value else {
+            return None;
+        };
+        if self.operand_is_already_raw_pointer(graph, operand) {
+            return None;
+        }
+        Some(raw)
+    }
+
+    /// The operand word is already the `*mut T` this field stores.
+    ///
+    /// A missing concretetype is still the by-value struct (the front
+    /// operand is the moved local). `Ptr` / `InteriorPtr`, the box
+    /// helper's result, and a `FieldRead` of a raw-owned row are the
+    /// pointer.
+    fn operand_is_already_raw_pointer(
+        &self,
+        graph: &FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+    ) -> bool {
+        if matches!(
+            operand.concretetype(),
+            Some(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
+                    | crate::translator::rtyper::lltypesystem::lltype::LowLevelType::InteriorPtr(_)
+            )
+        ) {
+            return true;
+        }
+        let Some(op) = defining_op(graph, operand) else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::CallResidual { funcptr, .. } => {
+                let crate::model::CallFuncPtr::Value(func_var) = funcptr else {
+                    return false;
+                };
+                let Some(def) = defining_op(graph, func_var) else {
+                    return false;
+                };
+                let OpKind::ConstFnAddr { path, .. } = &def.kind else {
+                    return false;
+                };
+                let leaf = self
+                    .config
+                    .raw_owned_box_helper
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("");
+                !leaf.is_empty() && path.contains(leaf)
+            }
+            OpKind::FieldRead {
+                field: read_field, ..
+            } => {
+                let Some(cc) = self.callcontrol.as_deref() else {
+                    return false;
+                };
+                let Some(owner) = read_field.owner_root.as_deref() else {
+                    return false;
+                };
+                cc.struct_field_entries(owner).is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| row.name == read_field.name && row.raw_owned.is_some())
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Box the moved raw-flavor struct, then `rewrite_op_setfield` of
+    /// that pointer. `optimize_block` does not feed `Replace` back into
+    /// `rewrite_operation`.
+    ///
+    /// `history.py getkind`: a `Ptr` whose `TO._gckind` is `'raw'`
+    /// (`rclass.py getgcflavor`) is `'int'`. `descr.py get_type_flag`
+    /// banks that word `FLAG_UNSIGNED`. The helper result is that
+    /// pointer, so its cell is `Signed` and the following store is
+    /// `ValueType::Unsigned`. The cell stays `Unknown` until after
+    /// `rewrite_op_setfield`: `get_value_type(Signed)` is `Int`, and
+    /// that would replace the unsigned flag with `FLAG_SIGNED`.
+    ///
+    /// The moved operand is the by-value struct. Only
+    /// `ConcreteType::GcRef` (`try_getkind` of a non-raw `Ptr`) is a GC
+    /// pointer; a missing concretetype is `Unknown`, and
+    /// `get_value_kind_var`'s Unknown→`'r'` fallback is not one. A real
+    /// `Ptr` never reaches here (`operand_is_already_raw_pointer`).
+    fn rewrite_raw_owned_setfield(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        _ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let Some(raw) = self.raw_owned_move(field, value, graph) else {
+            return RewriteResult::Keep;
+        };
+        let LinkArg::Value(operand) = value else {
+            return RewriteResult::Keep;
+        };
+        let size = i64::try_from(raw.size).expect("raw-owned attr size fits in Signed");
+        let align = i64::try_from(raw.align).expect("raw-owned attr align fits in Signed");
+        let size_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let align_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let target = helper_path_target(&self.config.raw_owned_box_helper);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        // `Unknown` so `rewrite_op_setfield` keeps `ValueType::Unsigned`.
+        // `fresh_synthetic_variable_typed(Signed)` would stamp first.
+        let boxed = graph.alloc_value_var();
+        let stored = LinkArg::Value(boxed.clone());
+        let stored_ty = ValueType::Unsigned;
+        let operand_is_gc_ref = operand.concretetype().as_ref().is_some_and(|lltype| {
+            crate::model::try_getkind(lltype, true, true, true).ok()
+                == Some(crate::model::ConcreteType::GcRef)
+        });
+        let (arg_types, args_i, args_r) = if operand_is_gc_ref {
+            (
+                vec![
+                    majit_ir::value::Type::Ref,
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                ],
+                vec![size_var.clone(), align_var.clone()],
+                vec![operand.clone()],
+            )
+        } else {
+            (
+                vec![
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                ],
+                vec![operand.clone(), size_var.clone(), align_var.clone()],
+                vec![],
+            )
+        };
+        let mut ops = vec![
+            SpaceOperation {
+                result: Some(size_var),
+                kind: OpKind::ConstInt(size),
+            },
+            SpaceOperation {
+                result: Some(align_var),
+                kind: OpKind::ConstInt(align),
+            },
+            funcptr_op,
+            SpaceOperation {
+                result: Some(boxed.clone()),
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &arg_types,
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                    ),
+                    args_i,
+                    args_r,
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::live(),
+            },
+        ];
+        let write = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field.clone(),
+                value: stored.clone(),
+                ty: stored_ty.clone(),
+            },
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten =
+                self.rewrite_op_setfield(&write, field, &stored, &stored_ty, graph_name, graph);
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        self.stamp_value_kind(
+            graph,
+            Some(boxed),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.extend(follow_up);
+        RewriteResult::Replace(ops)
     }
 
     /// Skip-spine expansion of `pairtype(AbstractStringRepr,
@@ -11196,6 +11643,40 @@ impl<'a> Transformer<'a> {
                 false,
                 Vec::new(),
             );
+        }
+        // `rclass.py` `InstanceRepr.new_instance` mallocs the instance and
+        // stores the vtable. `jtransform.py` `Transformer.rewrite_op_malloc`
+        // emits that malloc as `new_with_vtable`. A class instance has no
+        // discriminant store. The class is a hint host
+        // (`minted_exception_size_owner`), including a variant that declares
+        // no fields. A spelling that belongs to the hierarchy but is not one
+        // of those hosts has no class to allocate, so it must not fall
+        // through to the tag arm or to a residual call.
+        if args.is_empty()
+            && matches!(target, CallTarget::SyntheticTransparentCtor { .. })
+            && let ValueType::Ref(Some(owner)) = result_ty
+            && let Some(cc) = self.callcontrol.as_deref()
+        {
+            if crate::codewriter::assembler::minted_exception_size_owner(cc, owner, 0).is_some() {
+                let result = op
+                    .result
+                    .clone()
+                    .expect("minted exception class ctor must produce a value");
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    Some(result),
+                    owner.clone(),
+                    true,
+                    Vec::new(),
+                );
+            }
+            if crate::front::llbc_hints::exception_class_name_belongs(
+                &cc.exception_class_hints,
+                owner,
+            ) {
+                panic!("marked exception class `{owner}` has no minted class");
+            }
         }
         // RPython's rtyper materialises every heap-carried enum variant as
         // `malloc(GcStruct)` plus a tag store and payload stores. Charon gives
@@ -33238,6 +33719,347 @@ mod tests {
         ));
     }
 
+    /// `InstanceRepr.new_instance` of a marked class: `new_with_vtable` of
+    /// the variant, then `setfield` on the class that declares each field.
+    /// `B(A)` stores `n` on `A` and `flag` on `B`. `D` declares nothing and
+    /// still allocates. Neither ctor stores `__discriminant` or stays a
+    /// residual call. An unmarked user enum keeps the tag path
+    /// (`niladic_instantiated_enum_variant_lowers_to_new_and_tag_store`).
+    #[test]
+    fn marked_exception_class_ctor_lowers_to_new_with_vtable() {
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into(), "D".into()],
+        );
+        let header_owner = crate::codewriter::assembler::host_header_owner();
+        let header_id = majit_ir::descr::StructId::from_canonical(header_owner);
+        let mut ids = std::collections::HashMap::new();
+        ids.insert(header_owner.to_string(), Some(header_id));
+        let _header_ids = crate::test_support::register_struct_ids_serialized(ids);
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            header_owner.to_string(),
+            crate::codewriter::assembler::host_header_rows(),
+        );
+        struct_fields.fields.insert(
+            "synth::E::A".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            "synth::E::B".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            header_id,
+            crate::codewriter::assembler::host_header_layout(),
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.exception_class_hints = vec![hint];
+
+        let word = crate::layout::target_word_size();
+        let header = cc.struct_layout_for(header_owner).expect("host header");
+        let header_size = header.size;
+        let header_align = header.align;
+        assert_eq!(header_size, 2 * word);
+        let n_align = 8usize;
+        let n_offset = (header_size + n_align - 1) & !(n_align - 1);
+        let a_align = header_align.max(n_align);
+        let a_size = (n_offset + 8 + a_align - 1) & !(a_align - 1);
+        let flag_offset = a_size;
+        let b_size = (flag_offset + 1 + a_align - 1) & !(a_align - 1);
+        let b_spec =
+            crate::codewriter::assembler::bh_size_spec_from_callcontrol(&cc, "synth::E::B")
+                .expect("B size");
+        let d_spec =
+            crate::codewriter::assembler::bh_size_spec_from_callcontrol(&cc, "synth::E::D")
+                .expect("D size");
+        assert_eq!(b_spec.size, b_size);
+        assert_eq!(d_spec.size, header_size);
+        assert_eq!(d_spec.all_fielddescrs.len(), 1);
+        assert_eq!(d_spec.all_fielddescrs[0].field_key(), "w_class");
+        assert_eq!(d_spec.all_fielddescrs[0].offset, word);
+        assert_eq!(d_spec.all_fielddescrs[0].index, 0);
+        assert_eq!(d_spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(
+            d_spec.all_fielddescrs[0].name,
+            format!("{}.w_class", header_owner)
+        );
+        assert!(d_spec.all_fielddescrs[0].is_class_word.is_none());
+        assert_eq!(b_spec.owner, "synth::E::B");
+        assert_eq!(b_spec.vtable, 0);
+        let n_spec = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "n")
+            .expect("n");
+        let flag_spec = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "flag")
+            .expect("flag");
+        assert_eq!(n_spec.name, "synth::E::A.n");
+        assert_eq!(n_spec.field_key(), "n");
+        assert_eq!(n_spec.offset, n_offset);
+        assert_eq!(n_spec.offset, header_size);
+        assert_eq!(n_spec.index, 1);
+        assert_eq!(n_spec.index_in_parent, 1);
+        assert_eq!(flag_spec.name, "synth::E::B.flag");
+        assert_eq!(flag_spec.field_key(), "flag");
+        assert_eq!(flag_spec.offset, flag_offset);
+        assert_eq!(flag_spec.index, 2);
+        assert_eq!(flag_spec.index_in_parent, 2);
+        let class_word = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "w_class")
+            .expect("w_class");
+        assert_eq!(class_word.offset, word);
+        assert_eq!(class_word.index, 0);
+        if word >= 8 {
+            assert_eq!(flag_offset, header_size + 8);
+            assert_eq!(a_size, header_size + 8);
+            assert_eq!(b_size, header_size + 16);
+        }
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let build_b = marked_exception_ctor_graph("build_b", "B", "synth::E::B", true);
+        let build_d = marked_exception_ctor_graph("build_d", "D", "synth::E::D", false);
+        let lowered_b = transformer.transform(&build_b).graph;
+        let lowered_d = transformer.transform(&build_d).graph;
+        assert_minted_ctor(&lowered_b, "synth::E::B", true);
+        assert_minted_ctor(&lowered_d, "synth::E::D", false);
+
+        let asm_b = assemble_marked_ctor(&lowered_b, transformer.callcontrol.as_deref());
+        let asm_d = assemble_marked_ctor(&lowered_d, transformer.callcontrol.as_deref());
+        assert_minted_assembly(&asm_b, "synth::E::B", true, n_offset, flag_offset);
+        assert_minted_assembly(&asm_d, "synth::E::D", false, n_offset, flag_offset);
+    }
+
+    fn marked_exception_ctor_graph(
+        name: &str,
+        variant: &str,
+        owner: &str,
+        with_fields: bool,
+    ) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        let bb = graph.startblock;
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["synth".into(), "E".into()],
+            variant,
+            if variant == "D" { 3 } else { 1 },
+        );
+        graph.push_op_with_result_var(
+            bb,
+            OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
+            },
+            result.clone(),
+        );
+        if with_fields {
+            for (field, field_owner, value) in [("n", "synth::E::A", 7), ("flag", "synth::E::B", 1)]
+            {
+                graph.push_op_var(
+                    bb,
+                    OpKind::FieldWrite {
+                        base: result.clone(),
+                        field: FieldDescriptor::new(field, Some(field_owner.into())),
+                        value: LinkArg::Const(crate::flowspace::model::Constant::new(
+                            crate::flowspace::model::ConstValue::Int(value),
+                        )),
+                        ty: ValueType::Int,
+                    },
+                    false,
+                );
+            }
+        }
+        graph.set_return(bb, Some(result));
+        graph
+    }
+
+    fn assert_minted_ctor(graph: &FunctionGraph, owner: &str, with_fields: bool) {
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner: allocated, vtable: 0 }
+                    if allocated == owner
+            )),
+            "{owner} must allocate with new_with_vtable: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Call { .. } | OpKind::CallResidual { .. } | OpKind::New { .. }
+            )),
+            "{owner} must not stay a call: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "__discriminant"
+            )),
+            "{owner} must not store a discriminant: {ops:?}"
+        );
+        let writes: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => {
+                    Some((field.name.as_str(), field.owner_root.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        if with_fields {
+            assert_eq!(
+                writes,
+                vec![("n", Some("synth::E::A")), ("flag", Some("synth::E::B"))]
+            );
+        } else {
+            assert!(writes.is_empty(), "{owner} field writes: {writes:?}");
+        }
+    }
+
+    fn assemble_marked_ctor(
+        graph: &FunctionGraph,
+        cc: Option<&crate::call::CallControl>,
+    ) -> crate::codewriter::assembler::Assembler {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+
+        let mut graph = graph.clone();
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            if let OpKind::NewWithVtable { .. } = &op.kind
+                && let Some(result) = &op.result
+            {
+                FunctionGraph::set_concretetype_of_inline(result, ConcreteType::GcRef);
+            }
+        }
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, cc);
+        asm
+    }
+
+    fn assert_minted_assembly(
+        asm: &crate::codewriter::assembler::Assembler,
+        owner: &str,
+        with_fields: bool,
+        n_offset: usize,
+        flag_offset: usize,
+    ) {
+        use crate::jitcode::BhDescr;
+        use majit_jitcode::codewriter::assembler::is_type_static_const_sentinel;
+
+        let keys: Vec<_> = asm.insns.keys().cloned().collect();
+        assert!(
+            keys.iter().any(|key| key.starts_with("new_with_vtable/")),
+            "{owner} jitcode missing new_with_vtable: {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|key| !key.contains("residual_call")),
+            "{owner} jitcode has a residual call: {keys:?}"
+        );
+        if with_fields {
+            assert!(
+                keys.iter().any(|key| key.starts_with("setfield_gc_")),
+                "{owner} jitcode missing setfield_gc: {keys:?}"
+            );
+        } else {
+            assert!(
+                keys.iter().all(|key| !key.starts_with("setfield_gc_")),
+                "{owner} jitcode stored a field: {keys:?}"
+            );
+        }
+        let descrs = asm.snapshot_descrs();
+        let size = descrs.iter().find_map(|descr| match descr {
+            BhDescr::Size {
+                vtable,
+                owner: descr_owner,
+                ..
+            } if descr_owner == owner => Some(*vtable),
+            _ => None,
+        });
+        let vtable = size.unwrap_or_else(|| panic!("{owner} size descr missing: {descrs:?}"));
+        assert!(is_type_static_const_sentinel(vtable));
+        if with_fields {
+            let fields: Vec<_> = descrs
+                .iter()
+                .filter_map(|descr| match descr {
+                    BhDescr::Field {
+                        name,
+                        owner,
+                        offset,
+                        ..
+                    } => Some((name.as_str(), owner.as_str(), *offset)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                fields.contains(&("n", "synth::E::A", n_offset)),
+                "n descr: {fields:?}"
+            );
+            assert!(
+                fields.contains(&("flag", "synth::E::B", flag_offset)),
+                "flag descr: {fields:?}"
+            );
+        }
+    }
+
+    /// A hierarchy spelling that is not a minted host must not take the
+    /// tag arm or residualise.
+    #[test]
+    #[should_panic(expected = "marked exception class `fixture::synth::E::B` has no minted class")]
+    fn marked_exception_ctor_without_minted_host_panics() {
+        let mut cc = crate::call::CallControl::new();
+        cc.exception_class_hints = vec![crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into()],
+        )];
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("missing_host");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "fixture::synth::E::B".to_string();
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["fixture".into(), "synth".into(), "E".into()],
+            "B",
+            1,
+        );
+        let result_ty = ValueType::Ref(Some(owner));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let _ = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "missing_host",
+            &mut graph,
+        );
+    }
+
     /// `jtransform.py rewrite_op_malloc`: a niladic enum-variant ctor whose
     /// result is `Ptr` with `TO._gckind == 'raw'` residualizes
     /// `raw_malloc_fixedsize` and keeps the tag store. Assembler
@@ -39113,6 +39935,273 @@ mod tests {
         }));
     }
 
+    /// `HighLevelOp.convertvar` copies a rust-heap `String` into `Ptr(STR)`
+    /// before `Transformer.rewrite_op_setfield`. `setup_repr_llfields` adds
+    /// only `vable_token: GCREF`, so no virtualizable field is
+    /// `ValueType::Str`. The coerced store and a plain `Ptr(STR)` store
+    /// must take the same `rewrite_op_setfield` result: the ordinary kind
+    /// retarget (`getkind(Ptr(STR))` is GcRef), or a typeptr drop.
+    #[test]
+    fn coerced_rust_heap_string_setfield_reaches_rewrite_op_setfield() {
+        let ordinary = crate::model::FieldDescriptor::new("missing", Some("BadStr::S".into()));
+        let typeptr = crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into()));
+        for field in [ordinary, typeptr] {
+            let typeptr_field = crate::codewriter::heaptracker::is_typeptr_field(&field);
+            for lower_virtualizable in [true, false] {
+                let config = GraphTransformConfig {
+                    lower_virtualizable,
+                    ..GraphTransformConfig::default()
+                };
+                let plain = transform_str_field_store(&config, false, field.clone());
+                let coerced = transform_str_field_store(&config, true, field.clone());
+                let plain_tags = setfield_op_tags(&plain.graph);
+                let coerced_tags = setfield_op_tags(&coerced.graph);
+                assert_eq!(
+                    plain_tags,
+                    tags_after_rust_string_coerce(&coerced_tags),
+                    "lower_virtualizable={lower_virtualizable} typeptr={typeptr_field}\n\
+                     plain={plain_tags:?}\ncoerced={coerced_tags:?}\n{}",
+                    coerced.graph.dump()
+                );
+                assert_eq!(
+                    dropped_setfield_notes(&plain),
+                    dropped_setfield_notes(&coerced),
+                    "typeptr/void drops are rewrite_op_setfield notes"
+                );
+                assert_eq!(plain.vable_rewrites, 0);
+                assert_eq!(coerced.vable_rewrites, 0);
+                let expected = if lower_virtualizable && typeptr_field {
+                    None
+                } else if lower_virtualizable {
+                    Some(ValueType::Ref(None))
+                } else {
+                    Some(ValueType::Str)
+                };
+                assert_eq!(
+                    store_ty(&plain_tags),
+                    expected,
+                    "plain rewrite_op_setfield result, lower_virtualizable={lower_virtualizable}"
+                );
+                assert!(
+                    rust_string_copy_present(&coerced.graph),
+                    "rust-heap operand is copied before the store: {}",
+                    coerced.graph.dump()
+                );
+                assert!(
+                    !rust_string_copy_present(&plain.graph),
+                    "Ptr(STR) is convertvar identity: {}",
+                    plain.graph.dump()
+                );
+                if expected.is_some() {
+                    assert_coerced_store_uses_copy_result(&coerced.graph);
+                    assert_plain_store_uses_str_input(&plain.graph);
+                } else {
+                    assert!(
+                        plain
+                            .notes
+                            .iter()
+                            .any(|note| note.detail.contains("setfield(ob_type) → dropped")),
+                        "typeptr drop note missing: {:?}",
+                        plain.notes
+                    );
+                }
+            }
+        }
+    }
+
+    fn transform_str_field_store(
+        config: &GraphTransformConfig,
+        rust_heap: bool,
+        field: crate::model::FieldDescriptor,
+    ) -> GraphTransformResult {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        let mut graph = FunctionGraph::new(if rust_heap {
+            "rust_heap_setfield"
+        } else {
+            "plain_str_setfield"
+        });
+        let bb = graph.startblock;
+        let base = graph
+            .push_op_var(
+                bb,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: field.owner_root.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op_var(
+                bb,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: if rust_heap {
+                        ValueType::Ref(Some("String".into()))
+                    } else {
+                        ValueType::Str
+                    },
+                    class_root: rust_heap.then(|| "String".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        if rust_heap {
+            FunctionGraph::set_concretetype_of_inline(&value, ConcreteType::GcRef);
+        } else {
+            value.set_concretetype(Some(STRPTR.clone()));
+        }
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ty: ValueType::Str,
+            },
+            false,
+        );
+        graph.set_return(bb, None);
+        Transformer::new(config).transform(&graph)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SetfieldOpTag {
+        Input,
+        CopyAddr,
+        CopyCall,
+        Live,
+        Store(ValueType),
+        Other(String),
+    }
+
+    fn setfield_op_tags(graph: &FunctionGraph) -> Vec<SetfieldOpTag> {
+        let copy_addr = rust_string_copy_addr();
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| match &op.kind {
+                OpKind::Input { .. } => SetfieldOpTag::Input,
+                OpKind::ConstFnAddr { value, .. } if *value == copy_addr => SetfieldOpTag::CopyAddr,
+                OpKind::CallResidual { .. } => SetfieldOpTag::CopyCall,
+                OpKind::Live { .. } => SetfieldOpTag::Live,
+                OpKind::FieldWrite { ty, .. } | OpKind::VableFieldWrite { ty, .. } => {
+                    SetfieldOpTag::Store(ty.clone())
+                }
+                other => SetfieldOpTag::Other(format!("{other:?}")),
+            })
+            .collect()
+    }
+
+    fn tags_after_rust_string_coerce(tags: &[SetfieldOpTag]) -> Vec<SetfieldOpTag> {
+        let mut out = Vec::with_capacity(tags.len());
+        let mut index = 0;
+        while index < tags.len() {
+            if matches!(
+                tags.get(index..index + 3),
+                Some([
+                    SetfieldOpTag::CopyAddr,
+                    SetfieldOpTag::CopyCall,
+                    SetfieldOpTag::Live
+                ])
+            ) {
+                index += 3;
+                continue;
+            }
+            out.push(tags[index].clone());
+            index += 1;
+        }
+        out
+    }
+
+    fn store_ty(tags: &[SetfieldOpTag]) -> Option<ValueType> {
+        let mut stores = tags.iter().filter_map(|tag| match tag {
+            SetfieldOpTag::Store(ty) => Some(ty.clone()),
+            _ => None,
+        });
+        let ty = stores.next();
+        assert!(stores.next().is_none(), "one store: {tags:?}");
+        ty
+    }
+
+    fn rust_string_copy_addr() -> i64 {
+        crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "jit_ll_str_from_rust_string",
+        ]))
+    }
+
+    fn rust_string_copy_present(graph: &FunctionGraph) -> bool {
+        let expected = rust_string_copy_addr();
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(
+                |op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
+            )
+        })
+    }
+
+    fn dropped_setfield_notes(result: &GraphTransformResult) -> Vec<String> {
+        result
+            .notes
+            .iter()
+            .filter(|note| note.detail.contains("→ dropped"))
+            .map(|note| note.detail.clone())
+            .collect()
+    }
+
+    fn assert_coerced_store_uses_copy_result(graph: &FunctionGraph) {
+        let mut copy_result = None;
+        let mut stored = None;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::CallResidual { .. } => copy_result = op.result.clone(),
+                    OpKind::FieldWrite {
+                        value: LinkArg::Value(value),
+                        ..
+                    } => stored = Some(value.clone()),
+                    OpKind::VableFieldWrite { .. } => {
+                        panic!("no ValueType::Str virtualizable field: {}", graph.dump())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            stored.as_ref(),
+            copy_result.as_ref(),
+            "the store must use the Ptr(STR) copy, not the rust-heap header: {}",
+            graph.dump()
+        );
+    }
+
+    fn assert_plain_store_uses_str_input(graph: &FunctionGraph) {
+        let input = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::Input {
+                    ty: ValueType::Str, ..
+                } => op.result.clone(),
+                _ => None,
+            })
+        });
+        let stored = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    value: LinkArg::Value(value),
+                    ..
+                } => Some(value.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            stored,
+            input,
+            "plain Ptr(STR) store keeps its operand: {}",
+            graph.dump()
+        );
+    }
+
     /// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops
     /// typeptr unconditionally ("instead, it's done by 'new'").
     #[test]
@@ -41040,10 +42129,12 @@ mod tests {
     }
 
     /// `do_fixed_newlist` (jtransform.py): `Ptr(GcArray(GCREF))` emits
-    /// `new_array_clear` with the `GcArray(OBJECTPTR)` identity, so the
-    /// collector can trace the items.
+    /// `new_array_clear`. `externalvsinternal(..., gcref=True)` makes that
+    /// the same ARRAY as every other gc-pointer `GcArray`, so the identity
+    /// is `LIST_OBJ_ITEMS_ARRAY`. Items are GC pointers (`ValueType::Ref`),
+    /// so the opcode is the clearing one.
     #[test]
-    fn handle_list_call_newlist_fixed_gcref_assigns_object_ref_array_id() {
+    fn handle_list_call_newlist_fixed_gcref_assigns_object_items_array_id() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, GCREF, LowLevelType, Ptr, PtrTarget,
         };
@@ -41089,8 +42180,8 @@ mod tests {
                 );
                 assert_eq!(
                     array_type_id.as_deref(),
-                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
-                    "fixed GCREF array must name the GcArray(OBJECTPTR) identity"
+                    Some(LIST_OBJ_ITEMS_ARRAY),
+                    "fixed GCREF array shares the object-items ARRAY"
                 );
             }
             other => panic!("expected NewArrayClear, got {other:?}"),

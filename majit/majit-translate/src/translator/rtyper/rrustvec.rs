@@ -606,11 +606,12 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
 /// Argument 0 is the constant item lowleveltype. A `FixedSizeListRepr`
 /// self `gendirectcall`s `ll_vec_copy_from_fixed_list_{segment}` when its
 /// item lowleveltype equals the result header's, or when the list stores
-/// `GCREF` (`externalvsinternal`, `gcref=True`) and the header item is
-/// the external one-word GC pointer (`SomeRustVec::for_kind(Ref)` is a
-/// classdef-less `InstanceRepr`, whose lowleveltype is `OBJECTPTR`).
-/// Those two pointers are the same word; the helper returns the header's
-/// own lowleveltype. Any other self stays a `direct_call` of `to_vec`.
+/// `GCREF` (`lltypesystem/rlist.py` `_setup_repr` passes
+/// `externalvsinternal(..., gcref=True)`) and the header item is a
+/// one-word GC pointer. A classed instance and a classdef-less instance
+/// both store `GCREF` in the list. Those two pointers are the same word;
+/// the helper returns the header's own lowleveltype. Any other self stays
+/// a `direct_call` of `to_vec`.
 /// Replacing that call with `ll_vec_newemptylist_*` would drop the copied
 /// items.
 pub fn rtype_ll_vec_copy_from_slice(hop: &HighLevelOp) -> RTypeResult {
@@ -1502,5 +1503,30 @@ mod tests {
         };
         assert_eq!(result.concretetype().as_ref(), Some(r_vec.lowleveltype()));
         assert_only_direct_call_to(&llops, "ll_vec_copy_from_fixed_list_GCREF");
+    }
+
+    /// A classed GC instance list stores `GCREF`.
+    ///
+    /// `lltypesystem/rlist.py` `FixedSizeListRepr._setup_repr` and
+    /// `ListRepr._setup_repr` call `externalvsinternal(..., gcref=True)`.
+    /// `rmodel.py` `externalvsinternal` matches a gc `Ptr` before the
+    /// `getinstancerepr(None)` arm, so the internal item is `GCRefRepr`.
+    /// A list of instances and a list of str are one `GcArray(GCREF)`.
+    /// Classdef-less instances take the same arm
+    /// ([`rtype_gcref_fixed_list_into_external_ref_vec`]).
+    #[test]
+    fn rtype_classed_gc_instance_list_stores_gcref() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rlist::ListRepr;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let classdef = ClassDef::new_standalone("pkg.Foo", None);
+        let item_repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
+            .expect("classed instance repr") as Arc<dyn Repr>;
+        let fixed = FixedSizeListRepr::new(&rtyper, item_repr.clone()).expect("fixed list");
+        let resized = ListRepr::new(&rtyper, item_repr).expect("resized list");
+        assert_eq!(fixed.item_lowleveltype(), *GCREF);
+        assert_eq!(resized.item_lowleveltype(), *GCREF);
     }
 }

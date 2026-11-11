@@ -155,9 +155,28 @@ fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
         let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
         runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
         runtime_map.extend(pyre_interpreter::jit_static_ref_addrs());
+        insert_minted_exception_class_rows(&mut runtime_map);
         runtime_map
     });
     MAP.get(name).copied()
+}
+
+/// Add each minted class's `(intern key, &PyType)` row.
+///
+/// A name already published by the maps above panics. The pre-existing
+/// `extend` calls still overwrite one another; only a minted row refuses
+/// to replace a name. Two minted rows with one name panic the same way.
+fn insert_minted_exception_class_rows(map: &mut HashMap<&'static str, i64>) {
+    for row in crate::minted_exception_classes::MINTED_EXCEPTION_CLASSES {
+        if map.contains_key(row.name) {
+            panic!(
+                "minted exception class `{}` collides with an existing runtime static name",
+                row.name
+            );
+        }
+        let addr = row.pytype as *const pyre_object::PyType as i64;
+        map.insert(row.name, addr);
+    }
 }
 
 /// The runtime address published for `path` in `jit_trace_fnaddrs`, or
@@ -582,6 +601,7 @@ static TYPE_STATIC_RUNTIME_MAP: LazyLock<HashMap<&'static str, i64>> = LazyLock:
     runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
     runtime_map.extend(pyre_interpreter::pyre_class_pytype_addrs());
     runtime_map.extend(pyre_interpreter::pyre_class_pytype_by_struct_addrs());
+    insert_minted_exception_class_rows(&mut runtime_map);
     runtime_map
 });
 
@@ -593,7 +613,13 @@ static TYPE_STATIC_RUNTIME_MAP: LazyLock<HashMap<&'static str, i64>> = LazyLock:
 pub fn rebind_type_static_size_vtable(descr: &mut majit_jitcode::jitcode::BhDescr) {
     use majit_jitcode::codewriter::assembler::is_type_static_const_sentinel;
     use majit_jitcode::jitcode::BhDescr;
-    let BhDescr::Size { vtable, owner, .. } = descr else {
+    let BhDescr::Size {
+        vtable,
+        owner,
+        type_id,
+        ..
+    } = descr
+    else {
         return;
     };
     if !is_type_static_const_sentinel(*vtable) {
@@ -604,6 +630,14 @@ pub fn rebind_type_static_size_vtable(descr: &mut majit_jitcode::jitcode::BhDesc
         .unwrap_or_else(|| {
             panic!("type-static size descr '{owner}' has no published runtime address")
         });
+    // `init_size_descr` / `get_type_id`: the typeptr and the collector tid
+    // belong to the same TYPE. A later mint whose tid is still the
+    // truncated cache key adopts this id through `object_shape_for_struct`.
+    if let Some(tid) = crate::minted_exception_classes::minted_exception_collector_tid(owner, 0) {
+        majit_ir::descr::gc_cache()
+            .lock()
+            .register_gcstruct_vtable(*type_id, addr as usize, tid);
+    }
     *vtable = addr as u64;
     owner.clear();
 }

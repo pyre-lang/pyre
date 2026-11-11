@@ -679,11 +679,11 @@ mod tests {
     }
 
     fn e_hints() -> Vec<crate::front::llbc_hints::ExceptionClassHint> {
-        vec![crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "synth::E".into(),
-            overrides: "C(B)".into(),
-            variants: vec!["A".into(), "B".into(), "C".into()],
-        }]
+        vec![crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "C(B)",
+            vec!["A".into(), "B".into(), "C".into()],
+        )]
     }
 
     fn lower_with_e_hints(graph: &mut FunctionGraph) {
@@ -792,7 +792,7 @@ mod tests {
                         "__pos_0",
                         Some("result::Result<u64,E>::Err".into()),
                     ),
-                    ty: ValueType::Ref(Some("E".into())),
+                    ty: ValueType::Ref(Some("synth::E".into())),
                     pure: true,
                 },
                 true,
@@ -801,7 +801,7 @@ mod tests {
         crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, value.clone());
         assert_eq!(
             crate::front::result_exc::raised_value_class_name(&graph, &value).as_deref(),
-            Some("E")
+            Some("synth::E")
         );
         lower_with_e_hints(&mut graph);
         assert_eq!(fresh_evalue(&graph), value);
@@ -862,11 +862,11 @@ mod tests {
             &mut stamped_graph,
             handler,
             inputs[0].clone(),
-            "E",
+            "synth::E",
         );
         assert_eq!(
             crate::front::result_exc::raised_value_class_name(&stamped_graph, &stamped).as_deref(),
-            Some("E")
+            Some("synth::E")
         );
         crate::front::exc_from_raise::set_raise_from_instance(
             &mut stamped_graph,

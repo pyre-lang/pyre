@@ -13,7 +13,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 use serde_json::{Value, json};
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::result_exc::{
     ExceptionSum, ExceptionSumPayload, exception_sum_of_result, tyref_is_result_of_carrier,
     tyref_lowers_as_result_exc,
@@ -42,6 +42,7 @@ const NON_SUM_ID: u64 = 9;
 const LEAK_SINK_ID: u64 = 10;
 const LEAK_ID: u64 = 11;
 const RETHROW_ID: u64 = 12;
+const FROM_FN_ID: u64 = 13;
 
 fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
     crate::ErrorCarrierSpec {
@@ -254,7 +255,13 @@ fn opaque(id: u64, name: &str, inputs: Vec<Value>, output: Value) -> Value {
     })
 }
 
-fn parse_llbc(types: Vec<Value>, funs: Vec<Value>, globals: Vec<Value>) -> Llbc {
+fn parse_llbc(
+    types: Vec<Value>,
+    funs: Vec<Value>,
+    globals: Vec<Value>,
+    traits: Vec<Value>,
+    impls: Vec<Value>,
+) -> Llbc {
     let file = json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -263,11 +270,31 @@ fn parse_llbc(types: Vec<Value>, funs: Vec<Value>, globals: Vec<Value>) -> Llbc 
             "type_decls": types,
             "fun_decls": funs,
             "global_decls": globals,
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": traits,
+            "trait_impls": impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("exception sum fixture parses")
+}
+
+/// `{"Value": [id, Adt]}` so `resolve_tyexpr_to_adt_def_id_free` sees the decl.
+fn hashed_adt(id: u64) -> Value {
+    json!({"Value": [id, adt_ref(id)]})
+}
+
+fn from_fn_meta() -> Value {
+    json!({
+        "name": [
+            {"Ident": ["fixture", 0]},
+            {"Ident": ["synth", 0]},
+            {"Impl": {"Trait": 0}},
+            {"Ident": ["from", 0]}
+        ],
+        "span": span(),
+        "source_text": null,
+        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+        "is_local": false
+    })
 }
 
 fn result_of(ok: &Value, err: &Value) -> Value {
@@ -774,15 +801,41 @@ fn fixture() -> Llbc {
             caller,
             own,
             non_sum,
-            opaque(LEAK_SINK_ID, "exception_sum_leak_sink", vec![s], u.clone()),
+            opaque(
+                LEAK_SINK_ID,
+                "exception_sum_leak_sink",
+                vec![s.clone()],
+                u.clone(),
+            ),
             leak,
             rethrow,
+            json!({
+                "def_id": FROM_FN_ID,
+                "item_meta": from_fn_meta(),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [e.clone()],
+                    "output": s.clone()
+                },
+                "body": "Opaque"
+            }),
         ],
         vec![marker(
             0,
             &["fixture", "synth", "_exception_class_E"],
             "C(B)",
         )],
+        vec![json!({
+            "def_id": 0,
+            "item_meta": meta(&["core", "convert", "From"], false)
+        })],
+        vec![json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [hashed_adt(S_ID), hashed_adt(E_ID)]}
+            },
+            "methods": [{"skip_binder": {"id": FROM_FN_ID}}]
+        })],
     )
 }
 
@@ -1065,7 +1118,19 @@ fn assert_tail_reraise(graph: &FunctionGraph, leaf: &str) {
 
 fn class_name(exitcase: &Option<ExitCase>) -> Option<String> {
     match exitcase {
+        Some(ExitCase::Const(ConstValue::HostObject(host))) if host.is_class() => {
+            Some(host.qualname().to_string())
+        }
         Some(ExitCase::ExceptionClass(class)) => Some(class.classdef().borrow().name.clone()),
+        _ => None,
+    }
+}
+
+fn exitcase_host(exitcase: &Option<ExitCase>) -> Option<crate::flowspace::model::HostObject> {
+    match exitcase {
+        Some(ExitCase::Const(ConstValue::HostObject(host))) if host.is_class() => {
+            Some(host.clone())
+        }
         _ => None,
     }
 }
@@ -1159,18 +1224,38 @@ fn exception_sum_predicate() {
         ExceptionSumPayload::Marked {
             enum_path,
             base_class,
+            base_host,
             classes,
         } => {
             assert_eq!(enum_path, "synth::E");
-            assert_eq!(base_class, "E");
+            assert_eq!(base_class, "synth::E");
+            let names: Vec<(String, String)> = classes
+                .iter()
+                .map(|(variant, qualname, _)| (variant.clone(), qualname.clone()))
+                .collect();
             assert_eq!(
-                classes,
-                &vec![
-                    ("A".to_string(), "EA".to_string()),
-                    ("B".to_string(), "EB".to_string()),
-                    ("C".to_string(), "EC".to_string()),
+                names,
+                vec![
+                    ("A".to_string(), "synth::E::A".to_string()),
+                    ("B".to_string(), "synth::E::B".to_string()),
+                    ("C".to_string(), "synth::E::C".to_string()),
                 ]
             );
+            let hint = crate::front::mir::llbc_exception_class_hints(&llbc)
+                .iter()
+                .find(|hint| hint.enum_path == "synth::E")
+                .expect("harvested E");
+            assert_eq!(base_host, &hint.classes.base);
+            for (variant, _, host) in classes {
+                let expected = hint
+                    .classes
+                    .variants
+                    .iter()
+                    .find(|(name, _)| name == variant)
+                    .map(|(_, host)| host)
+                    .expect("variant host");
+                assert_eq!(host, expected);
+            }
         }
         ExceptionSumPayload::Carrier => panic!("Own payload is the marked enum"),
     }
@@ -1266,24 +1351,34 @@ fn exception_sum_selector_raises() {
         describe_raises(&graph),
         graph.dump()
     );
-    assert_eq!(
-        fields.len(),
-        1,
-        "{}\n{}",
-        describe_raises(&graph),
-        graph.dump()
-    );
     assert!(
-        err_arg_leaf_is_e(&fields[0]),
-        "k residual owner {}\n{}",
-        fields[0],
+        fields.is_empty(),
+        "a different error is From::from, not the Err field ({fields:?})\n{}",
         graph.dump()
     );
-    assert_eq!(others, 1, "{}\n{}", describe_raises(&graph), graph.dump());
+    assert_eq!(others, 2, "{}\n{}", describe_raises(&graph), graph.dump());
     let leafs = call_leafs(&graph);
     assert!(
         leafs.iter().any(|leaf| leaf == "exception_sum_k"),
         "k call missing {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert_eq!(
+        leafs.iter().filter(|leaf| leaf.as_str() == "from").count(),
+        1,
+        "From::from once {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert!(
+        !leafs.iter().any(|leaf| leaf == "from_residual"),
+        "from_residual remains {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert!(
+        !leafs
+            .iter()
+            .any(|leaf| leaf == "to_exc_object" || leaf == "pyerror_to_exc_object"),
+        "conversion runs after the front {leafs:?}\n{}",
         graph.dump()
     );
     assert_eq!(
@@ -1292,7 +1387,6 @@ fn exception_sum_selector_raises() {
         "{leafs:?}\n{}",
         graph.dump()
     );
-    assert_no_forbidden_leafs(&graph);
     assert_no_sum_ctor(&graph);
     assert!(graph.return_type.is_none(), "{:?}", graph.return_type);
     assert!(
@@ -1351,8 +1445,11 @@ fn exception_sum_caller_links() {
     let specific = &block.exits[1];
     let binding = &block.exits[2];
     let reraise = &block.exits[3];
-    assert_eq!(class_name(&specific.exitcase).as_deref(), Some("EC"));
-    assert_eq!(class_name(&binding.exitcase).as_deref(), Some("E"));
+    assert_eq!(
+        class_name(&specific.exitcase).as_deref(),
+        Some("synth::E::C")
+    );
+    assert_eq!(class_name(&binding.exitcase).as_deref(), Some("synth::E"));
     assert!(specific.llexitcase.is_none() && binding.llexitcase.is_none());
     assert!(specific.last_exception.is_some() && specific.last_exc_value.is_some());
     assert!(binding.last_exception.is_some() && binding.last_exc_value.is_some());
@@ -1372,8 +1469,8 @@ fn exception_sum_caller_links() {
 
     let (ec_at, ec_owner, ec_base) = find_n(&graph, specific.target);
     let (e_at, e_owner, e_base) = find_n(&graph, binding.target);
-    assert_eq!(ec_owner, "EB", "{}", graph.dump());
-    assert_eq!(e_owner, "EA", "{}", graph.dump());
+    assert_eq!(ec_owner, "synth::E::B", "{}", graph.dump());
+    assert_eq!(e_owner, "synth::E::A", "{}", graph.dump());
     assert!(
         exc_value_feeds(&graph, specific, ec_at, &ec_base),
         "EC arm does not bind the caught instance\n{}",
@@ -1396,6 +1493,83 @@ fn exception_sum_caller_links() {
     );
     assert_no_sum_ctor(&graph);
     assert!(graph.return_type.is_none(), "{:?}", graph.return_type);
+}
+
+/// The handler link's exitcase is the harvested class object. Minting
+/// that object yields the classdef whose `basedef` chain reaches the
+/// base, and the base's bases include the host `Exception`.
+#[test]
+fn exception_sum_handler_exitcase_is_the_minted_class_object() {
+    use crate::flowspace::model::HOST_ENV;
+    use std::rc::Rc;
+
+    let llbc = fixture();
+    let graph = lower_named(&llbc, "exception_sum_match");
+    let hints = crate::front::mir::llbc_exception_class_hints(&llbc);
+    let hint = hints
+        .iter()
+        .find(|hint| hint.enum_path == "synth::E")
+        .expect("harvested E");
+    let c_host = hint
+        .classes
+        .variants
+        .iter()
+        .find(|(name, _)| name == "C")
+        .map(|(_, host)| host.clone())
+        .expect("C");
+    let callers = blocks_calling(&graph, "exception_sum_src");
+    assert_eq!(callers.len(), 1);
+    let block = &graph.blocks[callers[0]];
+    let specific = exitcase_host(&block.exits[1].exitcase).expect("C exitcase");
+    let binding = exitcase_host(&block.exits[2].exitcase).expect("base exitcase");
+    assert_eq!(specific, c_host);
+    assert_eq!(binding, hint.classes.base);
+    let base_exception = HOST_ENV
+        .lookup_exception_class("BaseException")
+        .expect("BaseException");
+    assert!(specific.is_subclass_of(&base_exception));
+    assert!(binding.is_subclass_of(&base_exception));
+
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.mint_exception_class_hierarchies(hints);
+    let minted_c = bk
+        .getuniqueclassdef(&specific)
+        .expect("getuniqueclassdef(C)");
+    let recorded_c = bk
+        .exception_class_variant("synth::E", "C")
+        .expect("C classdef");
+    assert!(Rc::ptr_eq(&minted_c, &recorded_c));
+    let minted_base = bk.exception_class_base("synth::E").expect("base classdef");
+    let recorded_base = bk
+        .getuniqueclassdef(&binding)
+        .expect("getuniqueclassdef(base)");
+    assert!(Rc::ptr_eq(&minted_base, &recorded_base));
+    let mut current = minted_c;
+    let mut reached_base = false;
+    for _ in 0..8 {
+        if Rc::ptr_eq(&current, &minted_base) {
+            reached_base = true;
+            break;
+        }
+        let next = current.borrow().basedef.clone();
+        let Some(next) = next else {
+            break;
+        };
+        current = next;
+    }
+    assert!(reached_base, "C.basedef chain reaches the base");
+    let exception = HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    let base_host = minted_base.borrow().classdesc.borrow().pyobj.clone();
+    assert_eq!(base_host, hint.classes.base);
+    assert!(
+        base_host
+            .class_bases()
+            .is_some_and(|bases| bases.iter().any(|base| base == &exception)),
+        "base host bases {:?}",
+        base_host.class_bases()
+    );
 }
 
 #[test]
@@ -1444,12 +1618,12 @@ fn exception_sum_own_raise_skips_exc_conversion() {
 }
 
 #[test]
-fn exception_sum_err_payload_field_read_skips_exc_conversion() {
+fn exception_sum_unclassed_from_and_carrier_convert() {
     let llbc = fixture();
     let mut graph = lower_named(&llbc, "exception_sum_f");
     let before = fresh_raises(&graph);
     let mut ctor = None;
-    let mut field = None;
+    let mut from_result = None;
     let mut carrier = None;
     for var in &before {
         match classify(&graph, var.clone()) {
@@ -1459,18 +1633,19 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
                 ctor = Some(var.clone());
             }
             Raised::Field { owner } => {
-                assert!(
-                    err_arg_leaf_is_e(&owner),
-                    "k residual owner {owner}\n{}",
-                    graph.dump()
-                );
-                field = Some(var.clone());
+                panic!("Err field raised as itself ({owner})\n{}", graph.dump())
             }
-            Raised::Other => carrier = Some(var.clone()),
+            Raised::Other => {
+                if from_call_arg_is_err_field(&graph, var) {
+                    from_result = Some(var.clone());
+                } else {
+                    carrier = Some(var.clone());
+                }
+            }
         }
     }
     let ctor = ctor.expect("own ctor raise");
-    let field = field.expect("Err payload field read");
+    let from_result = from_result.expect("From::from raise");
     let carrier = carrier.expect("carrier raise");
     apply_runtime_edges(&mut graph, &llbc);
     let after = fresh_raises(&graph);
@@ -1480,8 +1655,8 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
         graph.dump()
     );
     assert!(
-        after.iter().any(|var| var == &field),
-        "field-read raise converted\n{}",
+        !after.iter().any(|var| var == &from_result),
+        "unclassed From result stayed a fresh raise\n{}",
         graph.dump()
     );
     assert!(
@@ -1496,13 +1671,36 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
         describe_raises(&graph),
         graph.dump()
     );
-    assert!(
-        after
+    assert_eq!(
+        call_leafs(&graph)
             .iter()
-            .any(|var| raise_call_leaf(&graph, var) == Some("to_exc_object")),
-        "carrier materialisation missing\n{}",
+            .filter(|leaf| leaf.as_str() == "to_exc_object")
+            .count(),
+        2,
+        "From result and carrier both materialise\n{}",
         graph.dump()
     );
+}
+
+fn from_call_arg_is_err_field(graph: &FunctionGraph, var: &Variable) -> bool {
+    let Some(OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    }) = producing(graph, var)
+    else {
+        return false;
+    };
+    if segments.last().map(String::as_str) != Some("from") {
+        return false;
+    }
+    let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+        return false;
+    };
+    match classify(graph, arg.clone()) {
+        Raised::Field { owner } => err_arg_leaf_is_e(&owner),
+        _ => false,
+    }
 }
 
 #[test]
@@ -1520,7 +1718,7 @@ fn exception_sum_handler_reraise_skips_exc_conversion() {
     );
     assert_eq!(
         crate::front::result_exc::raised_value_class_name(&graph, &before[0]).as_deref(),
-        Some("E"),
+        Some("synth::E"),
         "{}\n{}",
         describe_raises(&graph),
         graph.dump()
@@ -1542,27 +1740,11 @@ fn exception_sum_handler_reraise_skips_exc_conversion() {
     );
     assert_eq!(
         crate::front::result_exc::raised_value_class_name(&graph, &after[0]).as_deref(),
-        Some("E"),
+        Some("synth::E"),
         "{}",
         graph.dump()
     );
     assert_no_forbidden_leafs(&graph);
-}
-
-fn raise_call_leaf(graph: &FunctionGraph, var: &Variable) -> Option<&'static str> {
-    let kind = producing(graph, &follow_same_as(graph, var.clone()))?;
-    let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
-        ..
-    } = kind
-    else {
-        return None;
-    };
-    match segments.last().map(String::as_str) {
-        Some("to_exc_object") => Some("to_exc_object"),
-        Some("pyerror_to_exc_object") => Some("pyerror_to_exc_object"),
-        _ => None,
-    }
 }
 
 #[test]
@@ -1623,4 +1805,115 @@ fn exception_sum_value_use_unsupported() {
         err,
         "unsupported MIR: exception sum fixture::synth::S used as a value"
     );
+}
+
+fn fn_ptr_result(
+    llbc: &Llbc,
+    output: Value,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    let ty = TyRef::Other(json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": output,
+                "is_unsafe": false
+            }
+        }
+    }));
+    super::lltype::func_type_from_fn_ptr_ty(&ty, llbc, carrier_spec())
+        .expect("fn pointer")
+        .result
+}
+
+fn i64_ty() -> Value {
+    json!({"Scalar": {"Integer": {"Signed": "I64"}}})
+}
+
+fn f64_ty() -> Value {
+    json!({"Scalar": {"Float": "F64"}})
+}
+
+fn unit_ty() -> Value {
+    json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+#[test]
+fn fn_ptr_result_of_exception_sum_is_the_ok_payload() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let llbc = fixture();
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&i64_ty(), &adt_ref(S_ID))),
+        LowLevelType::Signed,
+        "Result<i64, S> returns the Ok payload (`getfunctionptr`)"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&f64_ty(), &adt_ref(CARRIER_ID))),
+        LowLevelType::Float,
+        "Result<f64, PyError> stays the carrier payload"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&unit_ty(), &adt_ref(CARRIER_ID))),
+        LowLevelType::Void,
+        "Result<(), PyError> stays Void"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&i64_ty(), &adt_ref(T_ID))),
+        OBJECTPTR.clone(),
+        "Result<i64, T> is not a sum and stays the ADT"
+    );
+}
+
+#[test]
+fn from_into_the_sum_uses_declaration_identity() {
+    let llbc = fixture();
+    let conv = super::lltype::from_impl_conversion_declared(
+        &llbc,
+        "synth::S",
+        "fixture::synth::S",
+        "synth::E",
+    )
+    .expect("From<E> for S");
+    assert_eq!(conv.segments.last().map(String::as_str), Some("from"));
+    assert!(
+        conv.segments
+            .iter()
+            .any(|seg| super::is_trait_impl_identity_segment(seg)),
+        "{:?}",
+        conv.segments
+    );
+    assert!(conv.pass_payload);
+    let qualified = super::lltype::from_impl_conversion_declared(
+        &llbc,
+        "synth::S",
+        "fixture::synth::S",
+        "fixture::synth::E",
+    )
+    .expect("crate-qualified E is the same declaration");
+    assert_eq!(qualified.segments, conv.segments);
+    for missing in ["other::E", "module::E", "E"] {
+        let err = super::lltype::from_impl_conversion_declared(
+            &llbc,
+            "synth::S",
+            "fixture::synth::S",
+            missing,
+        )
+        .expect_err(missing);
+        assert!(
+            err.contains(missing) && err.contains("no From impl"),
+            "{missing}: {err}"
+        );
+    }
 }

@@ -1043,10 +1043,26 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: write of a GcArray length header (immutable after allocation)"
                         )));
                     }
+                    // Same seam for a by-value `Vec<String>`: one list word,
+                    // not a leaf copy of `{cap, ptr, len}` over the class word.
+                    let store_list_of_str =
+                        self.exception_disc_info_for_ty(&field_base_ty).is_some()
+                            && tyref_is_by_value_vec_string(dest_ty, self.llbc);
+                    // A by-value raw-flavor struct is one `*mut T` word.
+                    // The moved bytes are boxed later; copying the struct
+                    // over the class word would publish the interior.
+                    let store_raw_owned = self.exception_disc_info_for_ty(&field_base_ty).is_some()
+                        && tyref_is_by_value_raw_flavor_struct(
+                            dest_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        );
                     // A multi-word inline field is the aggregate, not a
                     // pointer. Storing the temporary's address into the
                     // first word overwrites the discriminant.
                     if !store_rstr_attr
+                        && !store_list_of_str
+                        && !store_raw_owned
                         && self.struct_field_offset_from_payload(&field_base_ty, field_payload)
                             == Some(0)
                         && let Some(plan) = self.move_plan(dest_ty)
@@ -1065,6 +1081,8 @@ impl<'a> Lowering<'a> {
                     // (`history.getkind`): leaf-copy would GETFIELD
                     // `__pos_0` with that Int as the base.
                     if !store_rstr_attr
+                        && !store_list_of_str
+                        && !store_raw_owned
                         && let Some(nested) = tyref_by_value_struct_decl(
                             dest_ty,
                             self.llbc,
@@ -1180,6 +1198,22 @@ impl<'a> Lowering<'a> {
                                 );
                             let ty = if store_rstr_attr {
                                 ValueType::Str
+                            } else if store_list_of_str {
+                                ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+                            } else if store_raw_owned {
+                                // The row is one raw `*mut T`. `history.py
+                                // getkind` of that `Ptr` (`rclass.py
+                                // getgcflavor`) is `'int'`. `descr.py
+                                // get_type_flag` is `FLAG_UNSIGNED`.
+                                exception_class_raw_owned_attr(
+                                    dest_ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                                .expect("raw-owned exception attr has a pointer row");
+                                ValueType::Unsigned
                             } else {
                                 overlaid
                             };
@@ -5816,6 +5850,12 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
     ) -> Result<Option<Variable>, LowerError> {
+        // A raw-owned exception attr is the pointer word the instance
+        // holds (`PyCode._signature`), not an interior address of the
+        // by-value struct.
+        if self.place_is_raw_owned_exception_field(place) {
+            return Ok(None);
+        }
         let Some(offset) = self.inline_substruct_field_offset(place) else {
             return Ok(None);
         };
@@ -5900,6 +5940,24 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Field of a marked exception class whose type is a by-value
+    /// raw-flavor struct. `&field` is the stored `*mut T`, the same
+    /// word a declared pointer field yields from `&*ptr`.
+    pub(in crate::front::mir) fn place_is_raw_owned_exception_field(&self, place: &Place) -> bool {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+            return false;
+        };
+        if elem.as_object().and_then(|map| map.get("Field")).is_none() {
+            return false;
+        }
+        self.exception_disc_info_for_ty(&inner.ty).is_some()
+            && tyref_is_by_value_raw_flavor_struct(
+                &place.ty,
+                self.llbc,
+                &self.raw_alloc_flavor_structs,
+            )
+    }
+
     /// `&T` of a transparent scalar is the word, so the field read stays a
     /// value. Any other projection borrow is the place address.
     ///
@@ -5910,6 +5968,9 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
         {
+            return false;
+        }
+        if self.place_is_raw_owned_exception_field(place) {
             return false;
         }
         Self::place_ref_is_address_of(place)
@@ -6703,6 +6764,25 @@ impl<'a> Lowering<'a> {
                     let read_rstr_attr = self.exception_disc_info_for_ty(&inner.ty).is_some()
                         && (tyref_is_by_value_alloc_string(&field_ty, self.llbc)
                             || tyref_is_by_value_alloc_string(&place_ty, self.llbc));
+                    // A by-value `Vec<String>` attr is the list pointer.
+                    // `inline_vec` would make `missing.len()` read the rust
+                    // header's length word (`inline_vec_field_part`).
+                    let read_list_of_str = self.exception_disc_info_for_ty(&inner.ty).is_some()
+                        && (tyref_is_by_value_vec_string(&field_ty, self.llbc)
+                            || tyref_is_by_value_vec_string(&place_ty, self.llbc));
+                    // A by-value raw-flavor struct attr is the `*mut T`
+                    // word. `inline_vec` would treat that pointer as a
+                    // rust header.
+                    let read_raw_owned = self.exception_disc_info_for_ty(&inner.ty).is_some()
+                        && (tyref_is_by_value_raw_flavor_struct(
+                            &field_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ) || tyref_is_by_value_raw_flavor_struct(
+                            &place_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ));
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -6766,6 +6846,27 @@ impl<'a> Lowering<'a> {
                         );
                     if read_rstr_attr {
                         ty = ValueType::Str;
+                    } else if read_list_of_str {
+                        ty = ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()));
+                    } else if read_raw_owned {
+                        let raw_ty = if tyref_is_by_value_raw_flavor_struct(
+                            &place_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ) {
+                            &place_ty
+                        } else {
+                            &field_ty
+                        };
+                        let raw = exception_class_raw_owned_attr(
+                            raw_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                        .expect("raw-owned exception attr has a pointer row");
+                        ty = ValueType::Ref(Some(raw.class_root));
                     }
                     // `rewrite_op_getfield`: kind is `getkind(RESULT)`, the
                     // dest register. Unknown banks as `'r'`, so an Int field
@@ -6800,8 +6901,10 @@ impl<'a> Lowering<'a> {
                         .with_base_is_deref(base_is_deref)
                         .with_host_index(host_index)
                         .with_inline_vec(
-                            field_ty_is_inline_vec(&field_ty, self.llbc)
-                                || field_ty_is_inline_vec(&place_ty, self.llbc),
+                            !read_list_of_str
+                                && !read_raw_owned
+                                && (field_ty_is_inline_vec(&field_ty, self.llbc)
+                                    || field_ty_is_inline_vec(&place_ty, self.llbc)),
                         );
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
@@ -6818,6 +6921,9 @@ impl<'a> Lowering<'a> {
                     if read_rstr_attr {
                         stamp_as_rstr_str(&res);
                         self.exception_rstr_attr_vars.push(res.clone());
+                    }
+                    if read_list_of_str {
+                        stamp_as_rpy_list_of_str(&res);
                     }
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                     stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
@@ -8140,6 +8246,15 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(spelling_void)
                     || ((result_owner == "Tuple" || result_owner == "Array")
                         && name.starts_with("__pos_"));
+                // `InstanceRepr.setfield` / `ClassDef.get_owner`: a marked
+                // variant stores an inherited field on the declaring
+                // ancestor. A struct, a tuple, and an unmarked enum keep
+                // the constructor's result class (`owner_root: None`).
+                let owner_root = if adt_is_struct {
+                    None
+                } else {
+                    self.exception_class_aggregate_field_owner(dest_ty, &ctor_name, &name)
+                };
                 AggregateField {
                     name,
                     void,
@@ -8156,6 +8271,25 @@ impl<'a> Lowering<'a> {
                         tyref_is_by_value_alloc_string(ty, self.llbc)
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
                     }),
+                    list_of_str: declared_ty.is_some_and(|ty| {
+                        tyref_is_by_value_vec_string(ty, self.llbc)
+                            && self.exception_disc_info_for_ty(dest_ty).is_some()
+                    }),
+                    raw_owned_root: if self.exception_disc_info_for_ty(dest_ty).is_some() {
+                        declared_ty.and_then(|ty| {
+                            exception_class_raw_owned_attr(
+                                ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                            .map(|raw| raw.class_root)
+                        })
+                    } else {
+                        None
+                    },
+                    owner_root,
                 }
             })
             .collect();
@@ -8789,10 +8923,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Literal class that declares `field` on a marked enum variant.
+    /// Farthest declaring ancestor, same walk as registration.
     ///
-    /// The furthest ancestor that publishes the same spelling owns the
-    /// attr. A hint with no such ancestor still names this variant's
+    /// [`crate::front::llbc_hints::exception_class_field_owner`] continues
+    /// through a parent that does not declare the field.
+    /// `ClassDef.get_owner` (`classdesc.py`) returns the class in
+    /// `getmro()` that holds the attr; after `_generalize_attr` that
+    /// class is the topmost declarer. No declarer names this variant's
     /// own class. `None` when the enum is not marked.
     fn exception_class_attr_owner(
         &self,
@@ -8813,37 +8950,52 @@ impl<'a> Lowering<'a> {
             &hint.overrides,
             &hint.variants,
         );
-        let mut owner = variant;
-        loop {
-            let parent = links
-                .iter()
-                .find(|(name, _)| name == owner)
-                .and_then(|(_, parent)| parent.as_deref());
-            let Some(parent) = parent else {
-                break;
-            };
-            let declares = variants.iter().any(|candidate| {
-                candidate.name == parent
-                    && candidate
-                        .fields
-                        .iter()
-                        .enumerate()
-                        .any(|(index, field_decl)| {
-                            let spelling = field_decl.name.clone().unwrap_or_else(|| {
-                                majit_charon_reader::ullbc::positional_field_name(index)
-                            });
-                            spelling == field
-                        })
+        let owner =
+            crate::front::llbc_hints::exception_class_field_owner(&links, variant, |name| {
+                variants.iter().any(|candidate| {
+                    candidate.name == name
+                        && candidate
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .any(|(index, field_decl)| {
+                                let spelling = field_decl.name.clone().unwrap_or_else(|| {
+                                    majit_charon_reader::ullbc::positional_field_name(index)
+                                });
+                                spelling == field
+                            })
+                })
             });
-            if !declares {
-                break;
-            }
-            owner = parent;
-        }
-        Some(crate::front::llbc_hints::exception_class_qualname(
+        Some(crate::front::llbc_hints::exception_class_key(
             &hint.enum_path,
             Some(owner),
         ))
+    }
+
+    /// Declaring class of field `field` on enum variant `variant`, when
+    /// `dest_ty` is that marked enum.
+    ///
+    /// Peels `dest_ty` the same way [`Self::exception_disc_info_for_ty`]
+    /// does, then reuses [`Self::exception_class_attr_owner`]. The result
+    /// is the class key, including when the declarer is `variant` itself.
+    /// `None` when `dest_ty` is not this enum or the enum is unmarked.
+    fn exception_class_aggregate_field_owner(
+        &self,
+        dest_ty: &TyRef,
+        variant: &str,
+        field: &str,
+    ) -> Option<String> {
+        let node =
+            tyref_node(dest_ty, self.llbc).and_then(|node| strip_ty_wrappers(node, self.llbc))?;
+        let id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        if !variants.iter().any(|candidate| candidate.name == variant) {
+            return None;
+        }
+        self.exception_class_attr_owner(&td.item_meta.name_path(), variants, variant, field)
     }
 
     /// Scalar field of an opaque dependency struct.

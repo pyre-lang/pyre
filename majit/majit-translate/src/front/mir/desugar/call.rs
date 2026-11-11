@@ -98,6 +98,13 @@ impl<'a> Lowering<'a> {
         if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        // `Option<fn>::is_some` / `is_none` (`rnone.py` `rtype_is_None`).
+        // `is_some` is `flowcontext.py` `cmp_is_not`: `not_` / `guessbool`
+        // forks on `is_(opt, null_fn)` and each link carries the constant
+        // `not` of that exit. `is_none` stays `cmp_is` (the `is_` value).
+        if self.lower_fn_niche_option_predicate(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         // Whole-list `Vec<PyObjectRef>` views (`&vec`, `&mut vec`, `&vec[..]`,
         // `&mut vec[..]`) are one `SomeList` word. Take that arm before
         // `is_pair_call`: an object-pointer `&mut [T]` dest would otherwise

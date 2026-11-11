@@ -5718,6 +5718,104 @@ mod tests {
         );
     }
 
+    /// `rewrite.py handle_new` → `clear_gc_fields` zeroes every
+    /// `descr.gc_fielddescrs` entry when `malloc_zero_filled` is false,
+    /// header class word included. `gen_initialize_w_class` runs only
+    /// when `w_class_obj()` is nonzero, so a minted class (no app-level
+    /// class object) keeps the delayed NULL store. A scalar that is not
+    /// a GC field is not stored.
+    #[test]
+    fn test_clear_gc_fields_zeros_minted_class_word_and_payload_gc_fields() {
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let word = std::mem::size_of::<usize>();
+        let str_off = word * 2;
+        let list_off = word * 3;
+        let scalar_off = word * 4;
+        let descr = size_descr_with_w_class(
+            word * 5,
+            9,
+            0xBEEF,
+            Some(0),
+            vec![
+                w_class_field_descr_at(word),
+                ref_field_descr_at(str_off),
+                ref_field_descr_at(list_off),
+            ],
+        );
+        let size = descr.as_size_descr().expect("size descr");
+        assert_eq!(size.w_class_obj(), Some(0));
+        assert_eq!(
+            size.class_word_field().map(|field| field.offset()),
+            Some(word),
+            "class_word_field must see the header GC word"
+        );
+        let ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
+
+        assert!(
+            gcrefs.is_empty(),
+            "a zero class object is not a GC constant: {gcrefs:?}"
+        );
+        assert!(
+            result.iter().any(|op| {
+                op.opcode == OpCode::GcStore
+                    && op.arg(1).to_opref().inline_const_bits() == Some(0)
+                    && op.arg(2).to_opref().inline_const_bits() == Some(0xBEEF)
+            }),
+            "NewWithVtable still stamps the typeptr: {result:?}"
+        );
+        let mut null_offsets: Vec<i64> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::GcStore)
+            .filter(|op| op.arg(2).to_opref().inline_const_bits() == Some(0))
+            .map(|op| {
+                assert_eq!(
+                    op.arg(3).to_opref().inline_const_bits(),
+                    Some(word as i64),
+                    "delayed zero is one pointer word: {op:?}"
+                );
+                op.arg(1)
+                    .to_opref()
+                    .inline_const_bits()
+                    .expect("inline ConstInt")
+            })
+            .collect();
+        null_offsets.sort();
+        assert_eq!(
+            null_offsets,
+            vec![word as i64, str_off as i64, list_off as i64],
+            "clear_gc_fields must zero the class word and every payload GC field: {result:?}"
+        );
+        let class_stores: Vec<_> = result
+            .iter()
+            .filter(|op| {
+                op.opcode == OpCode::GcStore
+                    && op.arg(1).to_opref().inline_const_bits() == Some(word as i64)
+            })
+            .collect();
+        assert_eq!(
+            class_stores.len(),
+            1,
+            "gen_initialize_w_class must not replace the delayed NULL when w_class_obj() is 0: {result:?}"
+        );
+        assert_eq!(
+            class_stores[0].arg(2).to_opref().inline_const_bits(),
+            Some(0)
+        );
+        assert!(
+            result.iter().all(|op| {
+                op.opcode != OpCode::GcStore
+                    || op.arg(1).to_opref().inline_const_bits() != Some(scalar_off as i64)
+            }),
+            "a non-GC field is not cleared: {result:?}"
+        );
+    }
+
     // ── Test 11: SETARRAYITEM_GC with Ref — no card marking → regular WB ──
 
     #[test]

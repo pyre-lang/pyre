@@ -1528,8 +1528,6 @@ mod tests {
         ll_raw_malloc_varsize_zero,
     };
 
-    static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn fixedsize_roundtrip_zero_clears_and_free() {
         let ptr = ll_raw_malloc_fixedsize(8);
@@ -1636,7 +1634,10 @@ mod tests {
         assert_ne!(empty, 0);
         ll_raw_free(empty);
 
-        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::RAISE_MEMORY_ERROR_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clear = crate::ClearRaiseHook;
         fn hook() {}
         majit_gc::set_active_raise_memory_error(Some(hook));
         assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
@@ -1645,7 +1646,6 @@ mod tests {
         assert_eq!(ll_raw_malloc_varsize(-1, 0, 8), 0);
         assert_eq!(ll_raw_malloc_varsize_no_length(i64::MAX, 0, 2), 0);
         assert_eq!(ll_raw_malloc_varsize_with_length(i64::MAX, 8, 8, 0), 0);
-        majit_gc::set_active_raise_memory_error(None);
     }
 
     /// Overflowing `ll_raw_malloc_varsize*` raises MemoryError through
@@ -1657,11 +1657,13 @@ mod tests {
         fn hook() {
             HITS.fetch_add(1, Ordering::SeqCst);
         }
-        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::RAISE_MEMORY_ERROR_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clear = crate::ClearRaiseHook;
         HITS.store(0, Ordering::SeqCst);
         majit_gc::set_active_raise_memory_error(Some(hook));
         let result = ll_raw_malloc_varsize(i64::MAX, 0, 2);
-        majit_gc::set_active_raise_memory_error(None);
         assert_eq!(result, 0);
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
@@ -1732,11 +1734,13 @@ mod tests {
         fn hook() {
             HITS.fetch_add(1, Ordering::SeqCst);
         }
-        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::RAISE_MEMORY_ERROR_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clear = crate::ClearRaiseHook;
         HITS.store(0, Ordering::SeqCst);
         majit_gc::set_active_raise_memory_error(Some(hook));
         let result = super::raw_malloc_or_memory_error(usize::MAX);
-        majit_gc::set_active_raise_memory_error(None);
         assert_eq!(result, Err(super::MemoryError));
         assert_eq!(HITS.load(Ordering::SeqCst), 0);
     }

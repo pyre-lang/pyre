@@ -72,18 +72,17 @@ pub struct FixedSizeListRepr {
     /// external element repr `recast` ([`list_recast`]) converts a getitem
     /// result back to. For primitive items this is a clone of the same
     /// cached `Arc` as `item_repr`, so the recast short-circuits to
-    /// identity; for a gc `InstanceRepr` it is the concrete repr while
-    /// `item_repr` is the generic `OBJECTPTR` root.
+    /// identity. `externalvsinternal(..., gcref=True)` (`rmodel.py`) wraps
+    /// every gc `Ptr` item — `Ptr(STR)` and an instance pointer alike —
+    /// as `GCRefRepr`, so `item_repr` is `GCREF` and `external_item_repr`
+    /// stays the concrete repr.
     external_item_repr: Arc<dyn Repr>,
 }
 
 impl FixedSizeListRepr {
     pub fn new(rtyper: &Rc<RPythonTyper>, item_repr: Arc<dyn Repr>) -> Result<Self, TyperError> {
-        // `externalvsinternal(rtyper, item_repr, gcref=True)` —
-        // gc `InstanceRepr` items become the generic `Ptr(OBJECT)`
-        // gcref so the array element type is never a gc container
-        // (which `Array::gc` rejects); non-instance reprs pass
-        // through unchanged.
+        // `BaseListRepr._setup_repr` / `FixedSizeListRepr._setup_repr`
+        // (`lltypesystem/rlist.py`) always pass `gcref=True`.
         let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
         let item_lltype = internal.lowleveltype().clone();
@@ -104,6 +103,21 @@ impl FixedSizeListRepr {
     }
 }
 
+/// Lowleveltype of an unresized list of str.
+///
+/// `FixedSizeListRepr._setup_repr` calls
+/// `externalvsinternal(..., gcref=True)` (`rmodel.py`). `StringRepr` is
+/// `Ptr(STR)`, a GC pointer, so the internal item is `GCRefRepr`
+/// (`GCREF`) and the list is `Ptr(GcArray(GCREF))`. Each slot still holds
+/// the `STR` pointer the convertvar helper allocated; the wrap is that
+/// cast, not a second copy.
+pub(crate) fn list_of_str_lltype() -> LowLevelType {
+    let arr = Array::gc(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone());
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(arr),
+    }))
+}
+
 /// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py`):
 ///
 /// ```python
@@ -116,9 +130,9 @@ impl FixedSizeListRepr {
 /// primitive items a live subject builds, `item_repr` and
 /// `external_item_repr` are clones of the same cached `Arc`, so `convertvar`
 /// short-circuits to identity (its `ptr::eq` guard) and emits no op. A
-/// gc-instance element list (`external != internal`) downcasts the generic
-/// `OBJECTPTR` internal repr to the concrete external `InstanceRepr` via the
-/// `cast_pointer` `pair(InstanceRepr, InstanceRepr)` arm.
+/// gc-instance element list (`external != internal`) converts the internal
+/// `GCREF` item back to the concrete external repr
+/// (`pairtype(GCRefRepr, Repr).convert_from_to`, `rgcref.py`).
 fn list_recast(
     hop: &HighLevelOp,
     item_repr: &Arc<dyn Repr>,
@@ -1222,6 +1236,40 @@ pub(crate) fn build_ll_fixed_length_helper_graph(
     ))
 }
 
+/// `ll_fixed_items(l)` (`lltypesystem/rlist.py`): the fixed list IS the
+/// item array, so the helper returns `l`.
+pub(crate) fn build_ll_fixed_items_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("l", ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", ptr_lltype);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(arg)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class ListRepr(AbstractListRepr, BaseListRepr)`
 /// (`lltypesystem/rlist.py`):
 ///
@@ -1257,17 +1305,15 @@ pub struct ListRepr {
     item_repr: Arc<dyn Repr>,
     /// `self.external_item_repr` (`lltypesystem/rlist.py:110`) — the
     /// external element repr `recast` ([`list_recast`]) converts a getitem
-    /// result back to (a clone of `item_repr` for primitives, the concrete
-    /// `InstanceRepr` for a gc-instance element list).
+    /// result back to. `externalvsinternal(..., gcref=True)` wraps every
+    /// gc `Ptr` item as `GCRefRepr`, so a classed instance and a
+    /// classdef-less instance both store `GCREF` internally.
     external_item_repr: Arc<dyn Repr>,
 }
 
 impl ListRepr {
     pub fn new(rtyper: &Rc<RPythonTyper>, item_repr: Arc<dyn Repr>) -> Result<Self, TyperError> {
-        // `externalvsinternal(rtyper, item_repr, gcref=True)` — same
-        // gcref normalisation as `FixedSizeListRepr`: gc `InstanceRepr`
-        // items become the generic `Ptr(OBJECT)` gcref so the array
-        // element type is never a gc container.
+        // `ListRepr._setup_repr` (`lltypesystem/rlist.py`) passes `gcref=True`.
         let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
         Ok(Self::from_item_reprs(external_item_repr, internal))
@@ -1764,6 +1810,46 @@ pub(crate) fn build_ll_length_helper_graph(
         .into_ref(),
     ]);
 
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
+}
+
+/// `ll_items(l)` (`lltypesystem/rlist.py` ADTIList): `return l.items`.
+pub(crate) fn build_ll_items_helper_graph(
+    name: &str,
+    list_ptr_lltype: LowLevelType,
+    items_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("l", list_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", items_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let v_items = variable_with_lltype("items", items_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(arg), void_field_const("items")],
+        Hlvalue::Variable(v_items.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_items)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
     let func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
@@ -2608,6 +2694,47 @@ pub(crate) fn items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
     }))
+}
+
+/// `ll_length` / `ll_items` of a `BaseListRepr`, the pair
+/// `_list_length_items` (`lltypesystem/rstr.py`) passes to `ll_join`.
+/// `external_item_repr` / `item_repr` are the fields `rtype_method_join`
+/// (`rstr.py`) compares to `string_repr` / `char_repr`.
+pub(crate) struct ListLengthItems {
+    /// `FixedSizeListRepr` uses `ll_fixed_length` / `ll_fixed_items`.
+    /// `ListRepr` uses `ll_length` / `ll_items`.
+    pub(crate) fixed: bool,
+    pub(crate) list_ll: LowLevelType,
+    /// Fixed: the array itself (`ll_fixed_items` returns `l`).
+    /// Resized: `Ptr(GcArray(ITEM))`, the `items` field.
+    pub(crate) items_ll: LowLevelType,
+    pub(crate) external_item_repr: Arc<dyn Repr>,
+    pub(crate) item_repr: Arc<dyn Repr>,
+}
+
+pub(crate) fn list_length_items_view(r: &dyn Repr) -> Option<ListLengthItems> {
+    let any = r as &dyn std::any::Any;
+    if let Some(fixed) = any.downcast_ref::<FixedSizeListRepr>() {
+        let list_ll = fixed.lowleveltype().clone();
+        return Some(ListLengthItems {
+            fixed: true,
+            items_ll: list_ll.clone(),
+            list_ll,
+            external_item_repr: fixed.external_item_repr.clone(),
+            item_repr: fixed.item_repr.clone(),
+        });
+    }
+    if let Some(resized) = any.downcast_ref::<ListRepr>() {
+        let items_ll = items_array_ptr_lltype(resized.item_repr.lowleveltype());
+        return Some(ListLengthItems {
+            fixed: false,
+            list_ll: resized.lowleveltype().clone(),
+            items_ll,
+            external_item_repr: resized.external_item_repr.clone(),
+            item_repr: resized.item_repr.clone(),
+        });
+    }
+    None
 }
 
 /// The `ptr` field of a [`ListLayout::RustVec`] header: a raw nolength

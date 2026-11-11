@@ -3938,8 +3938,10 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
 
 /// `GcLLDescr_framework.init_array_descr`: after the host has declared the
 /// collector tids for `GcArray(Signed)` / `GcArray(Float)`, publish the
-/// runtime ArrayDescrs under `LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY`
-/// so the first tracing `new_array` sees a real tid.
+/// runtime ArrayDescrs under `LIST_INT_ITEMS_ARRAY` /
+/// `LIST_FLOAT_ITEMS_ARRAY`. A `GcArray` of gc pointers, including
+/// `GcArray(GCREF)`, is [`pyobject_gcarray_descr`]
+/// (`LIST_OBJ_ITEMS_ARRAY`).
 pub fn publish_typed_items_gcarray_descrs() {
     let _ = int_gcarray_descr();
     let _ = float_gcarray_descr();

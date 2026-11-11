@@ -836,6 +836,13 @@ pub(in crate::front::mir) fn stamp_as_rstr_str(var: &Variable) {
     var.set_concretetype(Some(STRPTR.clone()));
 }
 
+/// Mark `var` as an unresized list of str (`FixedSizeListRepr`,
+/// `Ptr(GcArray(GCREF))` — `externalvsinternal` wraps `Ptr(STR)`).
+pub(in crate::front::mir) fn stamp_as_rpy_list_of_str(var: &Variable) {
+    FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::GcRef);
+    var.set_concretetype(Some(crate::translator::rtyper::rlist::list_of_str_lltype()));
+}
+
 /// Shim / window data word is `CCHARP` (`rffi.py` `CCHARP`). The result
 /// bank stays `ValueType::Int` (`SomePtr` is not a `ValueType`).
 pub(in crate::front::mir) fn stamp_as_ccharp(var: &Variable) {
@@ -955,6 +962,55 @@ pub(in crate::front::mir) fn value_type_is_rust_heap_string(ty: &crate::model::V
     matches!(ty, crate::model::ValueType::Ref(Some(root)) if is_rust_heap_string_root(root))
 }
 
+/// Whether `root` is a by-value rust-heap `Vec<String>` spelling.
+///
+/// The last `Vec<` must be an ident (`Vec`, or a path ending in `::Vec`),
+/// and no `<` may precede it, so `Option<Vec<String>>` and
+/// `Vec<Vec<String>>` are not this header. The first type argument's leaf
+/// is `String`. A borrow or raw pointer in that argument is not by-value.
+/// `rpy_list_of_str` does not match: that word is already the list.
+fn class_root_is_rust_heap_vec_string(root: &str) -> bool {
+    let Some(vec_at) = root.rfind("Vec<") else {
+        return false;
+    };
+    if vec_at > 0 && root.as_bytes()[vec_at - 1] != b':' {
+        return false;
+    }
+    if root[..vec_at].contains('<') {
+        return false;
+    }
+    let after = &root[vec_at + "Vec<".len()..];
+    let mut depth = 0i32;
+    let mut end = None;
+    for (index, ch) in after.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth == 0 => {
+                end = Some(index);
+                break;
+            }
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                end = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return false;
+    };
+    let arg = after[..end].trim();
+    if arg.contains('&') || arg.contains('*') {
+        return false;
+    }
+    arg.rsplit("::").next().unwrap_or(arg).trim() == "String"
+}
+
+fn value_type_is_rust_heap_vec_string(ty: &crate::model::ValueType) -> bool {
+    matches!(ty, crate::model::ValueType::Ref(Some(root)) if class_root_is_rust_heap_vec_string(root))
+}
+
 pub(in crate::front::mir) fn producer_is_rust_heap_string(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -1008,6 +1064,68 @@ pub(crate) fn interpolant_is_rust_heap_string(
         .filter(|link| link.target == owner)
         .any(|link| match link.args.get(pos) {
             Some(LinkArg::Value(v)) => producer_is_rust_heap_string(graph, v),
+            _ => false,
+        })
+}
+
+fn producer_is_rust_heap_vec_string(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::model::OpKind;
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::Input { ty, class_root, .. } => {
+            value_type_is_rust_heap_vec_string(ty)
+                || class_root
+                    .as_deref()
+                    .is_some_and(class_root_is_rust_heap_vec_string)
+        }
+        OpKind::UnaryOp { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::Call { result_ty, .. } => value_type_is_rust_heap_vec_string(result_ty),
+        OpKind::FieldRead { ty, .. } => value_type_is_rust_heap_vec_string(ty),
+        _ => false,
+    }
+}
+
+/// Whether `var` is a rust-heap `Vec<String>` (`{cap, ptr, len}`), including
+/// a linear SSA chain and a phi whose incoming values are that header.
+///
+/// A value already converted to [`crate::front::mir::RPY_LIST_OF_STR`] is
+/// the list pointer, not this header.
+pub(crate) fn interpolant_is_rust_heap_vec_string(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::model::LinkArg;
+    if producer_is_rust_heap_vec_string(graph, var) {
+        return true;
+    }
+    let Some((owner, pos)) = graph.blocks.iter().find_map(|block| {
+        block
+            .inputargs
+            .iter()
+            .position(|arg| arg.id() == var.id())
+            .map(|pos| (block.id, pos))
+    }) else {
+        return false;
+    };
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .filter(|link| link.target == owner)
+        .any(|link| match link.args.get(pos) {
+            Some(LinkArg::Value(value)) => producer_is_rust_heap_vec_string(graph, value),
             _ => false,
         })
 }

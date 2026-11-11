@@ -15981,6 +15981,40 @@ mod tests {
             );
         }
     }
+
+    /// `[str]` is `GcArray(GCREF)` after `externalvsinternal(..., gcref=True)`
+    /// (`rmodel.py`). `get_array_descr` keys that ARRAY once, so
+    /// `runtime_gcarray_descr("[str]")` is `pyobject_gcarray_descr`
+    /// (`OBJECT_REF_GCARRAY_TYPE_ID`, tid [`PY_OBJECT_ARRAY_GC_TYPE_ID`],
+    /// [`ITEMS_BLOCK_TOKEN`]). Items are GC pointers.
+    #[test]
+    fn str_list_gcarray_descr_shares_the_object_items_array() {
+        let descr = crate::state::runtime_gcarray_descr("[str]")
+            .expect("[str] must resolve through the object-items ARRAY");
+        let array = descr
+            .as_array_descr()
+            .expect("str-list gcarray descr must be an ArrayDescr");
+        let token = &pyre_object::ITEMS_BLOCK_TOKEN;
+        let atid = majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
+        assert_eq!(array.base_size(), token.base_size);
+        assert_eq!(array.item_size(), token.item_size);
+        assert_eq!(array.item_type(), Type::Ref);
+        assert!(array.is_array_of_pointers());
+        assert!(!array.is_array_of_structs());
+        assert_eq!(array.type_id(), PY_OBJECT_ARRAY_GC_TYPE_ID);
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_array_tid(majit_ir::descr::path_hash(atid)),
+            Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
+        );
+        let via_object =
+            crate::state::runtime_gcarray_descr(atid).expect("object-items ARRAY identity");
+        assert_eq!(
+            via_object.as_array_descr().unwrap().type_id(),
+            PY_OBJECT_ARRAY_GC_TYPE_ID
+        );
+    }
 }
 
 /// CallDescr for `pyre_object::longobject::jit_w_long_fits_int(obj) -> i64`.
@@ -16806,6 +16840,53 @@ fn published_declared_group(
     })
 }
 
+/// Collector tid `register_minted_exception_classes` stored for this
+/// TYPE, or `fallback` when the spec is not a minted class.
+///
+/// `GcLLDescr_framework.init_size_descr` writes
+/// `TypeLayoutBuilder.get_type_id` into `descr.tid`. The fallback is the
+/// truncated cache key the structural spec already carried.
+fn minted_size_collector_tid(owner: &str, vtable: u64, fallback: u32) -> u32 {
+    crate::minted_exception_classes::minted_exception_collector_tid(owner, vtable)
+        .unwrap_or(fallback)
+}
+
+/// Stamp that id onto the cached SizeDescr and fix it there.
+///
+/// Parent layouts publish before `register_synthetic_struct_tids`
+/// (`materialize_gccache_owned_descrs_with`: `publish_pyre_class_vtables`,
+/// then `decode_kind0_descrs` which publishes packed parents before
+/// parentless slots, then the census). The tid has to be on the descr
+/// before that census. A different nonzero collector tid already on the
+/// slot is a host group that won the STRUCT key (`descr.py` one
+/// SizeDescr per STRUCT); leave it. A zero or unresolved tid is the
+/// structural placeholder and takes the minted id.
+fn bind_minted_size_descr(cache_key: u64, owner: &str, vtable: u64) {
+    let Some(tid) = crate::minted_exception_classes::minted_exception_collector_tid(owner, vtable)
+    else {
+        return;
+    };
+    if cache_key == 0 {
+        return;
+    }
+    let key = majit_ir::descr::LLType::Struct(cache_key);
+    let gc = majit_ir::descr::gc_cache().lock();
+    let Some(size_ref) = gc._cache_size.get(&key).cloned() else {
+        return;
+    };
+    let Ok(sd) = majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref)
+    else {
+        return;
+    };
+    let current = majit_ir::descr::SizeDescr::type_id(sd.as_ref());
+    if current == 0 || majit_ir::descr::struct_tid_is_unresolved(cache_key, current) {
+        sd.set_type_id(tid);
+        sd.fix_collector_tid();
+    } else if current == tid {
+        sd.fix_collector_tid();
+    }
+}
+
 fn simple_descr_group_from_bh_size(
     spec: &majit_jitcode::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
@@ -16813,6 +16894,7 @@ fn simple_descr_group_from_bh_size(
         force_declared_group(spec.type_id);
         if let Some(group) = published_declared_group(spec) {
             intern_packed_fields_into_gccache(spec);
+            bind_minted_size_descr(spec.type_id, &spec.owner, spec.vtable);
             return group;
         }
     }
@@ -16852,17 +16934,22 @@ fn simple_descr_group_from_bh_size(
     // cover every field (`published_declared_group`).
     // `descr.py get_size_descr` + `:218-239 get_field_descr`
     // keyed publish: GcCache is the sole owner/cache for this STRUCT.
-    majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+    // `init_size_descr` passes `get_type_id` as the tid, and the cache
+    // key stays the STRUCT identity.
+    let tid = minted_size_collector_tid(&spec.owner, spec.vtable, spec.type_id as u32);
+    let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         u32::MAX,
         spec.size,
-        spec.type_id as u32,
+        tid,
         spec.type_id,
         spec.vtable as usize,
         spec.is_gc_managed,
         spec.headerless,
         &field_specs,
         &[],
-    )
+    );
+    bind_minted_size_descr(spec.type_id, &spec.owner, spec.vtable);
+    group
 }
 
 /// `descr.py` `GcCache.setup_descrs` numbers the rows `get_size_descr` /
@@ -17108,8 +17195,13 @@ pub(crate) fn publish_kind0_parent_layout(spec: majit_jitcode::jitcode::BhSizeSp
     force_declared_group(spec.type_id);
     if published_declared_group(&spec).is_some() {
         intern_packed_fields_into_gccache(&spec);
+        bind_minted_size_descr(spec.type_id, &spec.owner, spec.vtable);
         return;
     }
+    let cache_key = spec.type_id;
+    let vtable = spec.vtable;
+    let owner = spec.owner.clone();
+    let tid = minted_size_collector_tid(&owner, vtable, cache_key as u32);
     let field_specs: Vec<_> = spec
         .all_fielddescrs
         .into_iter()
@@ -17118,14 +17210,15 @@ pub(crate) fn publish_kind0_parent_layout(spec: majit_jitcode::jitcode::BhSizeSp
     let _group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         u32::MAX,
         spec.size,
-        spec.type_id as u32,
-        spec.type_id,
-        spec.vtable as usize,
+        tid,
+        cache_key,
+        vtable as usize,
         spec.is_gc_managed,
         spec.headerless,
         &field_specs,
         &[],
     );
+    bind_minted_size_descr(cache_key, &owner, vtable);
 }
 
 /// `descr.py` `get_field_descr` for a STRUCT that is not cached yet.
@@ -17134,6 +17227,10 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
     if layout.type_id == 0 {
         return;
     }
+    let owner = layout.owner;
+    let vtable = layout.vtable;
+    let cache_key = layout.type_id;
+    let tid = minted_size_collector_tid(owner, vtable, cache_key as u32);
     let fields = layout
         .fields
         .into_iter()
@@ -17156,14 +17253,15 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
     let _group = majit_ir::descr::publish_borrowed_struct_layout(
         u32::MAX,
         layout.size,
-        layout.type_id as u32,
-        layout.type_id,
-        layout.vtable as usize,
+        tid,
+        cache_key,
+        vtable as usize,
         layout.is_gc_managed,
         layout.headerless,
         &[],
         fields,
     );
+    bind_minted_size_descr(cache_key, owner, vtable);
 }
 
 /// `claimed_index` is the descr's own `index_in_parent` claim, passed beside

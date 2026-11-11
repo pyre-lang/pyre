@@ -282,6 +282,58 @@ fn exception_instance_spec(
     Some((name, message))
 }
 
+/// Intern key of a minted exception class, recognised by host identity.
+///
+/// The class object is one of the hosts on
+/// `CallControl.exception_class_hints`. Comparison is [`HostObject`]
+/// equality (`Arc::ptr_eq`). A same-named host built elsewhere is not
+/// this class, so the lookup is not a name table.
+fn minted_exception_static_name(
+    obj: &crate::flowspace::model::HostObject,
+    callcontrol: Option<&CallControl>,
+) -> Option<String> {
+    let hints = &callcontrol?.exception_class_hints;
+    let matched = hints.iter().any(|hint| {
+        hint.classes.base == *obj || hint.classes.variants.iter().any(|(_, host)| host == obj)
+    });
+    matched.then(|| obj.qualname().to_string())
+}
+
+/// Intern key for a `new_with_vtable` of a minted class.
+///
+/// A nonzero `vtable` that is a hint host's `identity_id` wins, and the
+/// key is that host's qualname. Otherwise `owner` equal to a hint host's
+/// qualname is the key, including when `vtable` is 0. The walk is the
+/// hint list; there is no name table.
+pub(crate) fn minted_exception_size_owner(
+    cc: &CallControl,
+    owner: &str,
+    vtable: i64,
+) -> Option<String> {
+    let hints = &cc.exception_class_hints;
+    if vtable != 0 {
+        for hint in hints {
+            for host in std::iter::once(&hint.classes.base)
+                .chain(hint.classes.variants.iter().map(|(_, host)| host))
+            {
+                if host.identity_id() as i64 == vtable {
+                    return Some(host.qualname().to_string());
+                }
+            }
+        }
+    }
+    for hint in hints {
+        for host in std::iter::once(&hint.classes.base)
+            .chain(hint.classes.variants.iter().map(|(_, host)| host))
+        {
+            if host.qualname() == owner {
+                return Some(owner.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Pytype address for a builtin exception class. `None` when `obj` is not
 /// one, so other host objects keep their existing pool bits. A class with
 /// no row panics: the constant must not fall back to `identity_id`.
@@ -2368,31 +2420,38 @@ impl AssemblerEncode for Assembler {
             // runtime stamps into the new object's header
             // (`bh_new_with_vtable` writes the type word when it is nonzero,
             // and the class word when the backend was given an offset).
-            // A zero vtable would silently leave `ob_type` null, so it
-            // fails loud here.
+            // vtable 0 is the size-descr-only form: the published group
+            // fills `descr.get_vtable()` later. A minted class emits a
+            // type-static sentinel instead of this process's address.
             OpKind::NewWithVtable { owner, vtable } => {
-                let spec = bh_size_spec_from_callcontrol(
-                    callcontrol.expect("new_with_vtable assembly requires a CallControl"),
-                    owner,
-                )
-                .unwrap_or_else(|| {
+                let cc = callcontrol.expect("new_with_vtable assembly requires a CallControl");
+                let spec = bh_size_spec_from_callcontrol(cc, owner).unwrap_or_else(|| {
                     panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
                 });
-                // A registered type static cannot travel as this process's
-                // address: the descr pool is loaded in another process.
-                // The sentinel is the one `constants_r` already uses, and
-                // `owner` carries the name the runtime map resolves. An
-                // address that was never interned keeps the raw word.
-                // vtable 0 is `rewrite_op_malloc`'s size-descr-only form:
-                // `descr.get_vtable()` is filled from the published group.
-                let (vtable_word, type_static_name) = if *vtable == 0 {
-                    (0, String::new())
-                } else {
-                    match self.type_static_size_words(*vtable) {
-                        Some((word, name)) => (word, name),
-                        None => (*vtable as u64, String::new()),
-                    }
-                };
+                // A minted class has no translator-process `PyType`.
+                // Identity against the hint hosts wins, then the size
+                // descr's `owner` when it is one of those hosts' qualnames
+                // (including vtable 0). The name-only intern does not
+                // store a fake address. A registered type static cannot
+                // travel as this process's address either: the descr pool
+                // is loaded in another process. The sentinel is the one
+                // `constants_r` already uses, and `owner` carries the name
+                // the runtime map resolves. An address that was never
+                // interned keeps the raw word. vtable 0 on a class that
+                // is not minted is `rewrite_op_malloc`'s size-descr-only
+                // form: `descr.get_vtable()` is filled from the published
+                // group.
+                let (vtable_word, type_static_name) =
+                    if let Some(key) = minted_exception_size_owner(cc, owner, *vtable) {
+                        self.intern_type_static_name(&key)
+                    } else if *vtable == 0 {
+                        (0, String::new())
+                    } else {
+                        match self.type_static_size_words(*vtable) {
+                            Some((word, name)) => (word, name),
+                            None => (*vtable as u64, String::new()),
+                        }
+                    };
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
@@ -4334,8 +4393,17 @@ impl AssemblerEncode for Assembler {
             ConstValue::Int(value) => self.emit_const_i(*value, state),
             ConstValue::UInt(value) => self.emit_const_i(*value as i64, state),
             // Builtin host class (`StopIteration`, `OverflowError`, the
-            // carrier): pytype row, `StaticAddr` reloc.
+            // carrier): pytype row, `StaticAddr` reloc. A minted class
+            // is recognised by identity before that lookup and uses the
+            // same reloc channel. The static for its intern key is the
+            // `PyType` in `minted_exception_classes.rs`; the runtime map
+            // rebinds the name.
+            // `ClassRepr.getvtable` / `Assembler.emit_const` keys the
+            // slot on the symbol.
             ConstValue::HostObject(obj) => {
+                if let Some(name) = minted_exception_static_name(obj, callcontrol) {
+                    return self.emit_const_i_reloc(0, ConstIRelocKind::StaticAddr { name }, state);
+                }
                 let bits = exception_class_addr(obj, callcontrol, "goto_if_exception_mismatch")
                     .unwrap_or_else(|| {
                         panic!("goto_if_exception_mismatch: llexitcase {obj:?} is not an exception class")
@@ -5565,6 +5633,389 @@ pub fn definition_path_type_id(definition_path: &str, is_gc_managed: bool) -> u6
     majit_ir::descr::path_hash_for_gc_kind(definition_path, is_gc_managed)
 }
 
+fn align_up_pow2(offset: usize, align: usize) -> usize {
+    let align = align.max(1);
+    (offset + align - 1) & !(align - 1)
+}
+
+/// Parent chain of a minted class, rootmost ancestor first.
+///
+/// `InstanceRepr._setup_repr` embeds the parent struct as `super`. The
+/// base class is the root and contributes no variant fields: its chain
+/// is empty and the instance is the host object header
+/// ([`host_object_header_layout`]). A variant walks
+/// `parse_exception_class_overrides` to the base, then reverses so the
+/// farthest ancestor is laid out first. A cycle uses the same panic as
+/// `exception_class_field_owner`.
+fn minted_exception_variant_chain(
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+    key: &str,
+) -> Option<Vec<String>> {
+    use crate::front::llbc_hints::{
+        exception_class_key, exception_class_leaf, parse_exception_class_overrides,
+    };
+    let base = exception_class_key(&hint.enum_path, None);
+    if hint.classes.base.qualname() == key || key == base {
+        return Some(Vec::new());
+    }
+    let variant = hint
+        .classes
+        .variants
+        .iter()
+        .find(|(_, host)| host.qualname() == key)?
+        .0
+        .as_str();
+    let enum_name = exception_class_leaf(&hint.enum_path);
+    let links = parse_exception_class_overrides(enum_name, &hint.overrides, &hint.variants);
+    let mut upward = Vec::new();
+    let mut current = variant.to_string();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        if seen.iter().any(|name| name == &current) {
+            panic!("exception class field owner: cycle in override links {seen:?} -> {current}");
+        }
+        seen.push(current.clone());
+        upward.push(exception_class_key(&hint.enum_path, Some(&current)));
+        let Some(parent) = links
+            .iter()
+            .find(|(name, _)| name == &current)
+            .and_then(|(_, parent)| parent.clone())
+        else {
+            break;
+        };
+        current = parent;
+    }
+    upward.reverse();
+    Some(upward)
+}
+
+fn minted_exception_chain_for_key(cc: &CallControl, key: &str) -> Vec<String> {
+    for hint in &cc.exception_class_hints {
+        if let Some(chain) = minted_exception_variant_chain(hint, key) {
+            return chain;
+        }
+    }
+    panic!("marked exception class `{key}` has no minted class");
+}
+
+/// Size, alignment, and owner of the host object header.
+///
+/// `InstanceRepr._setup_repr` roots every instance at `OBJECT`. The
+/// header is the field-registry owner whose first field is the typeptr
+/// (`heaptracker::is_typeptr_field`). Its size and alignment are that
+/// owner's `StructLayout`, the same record `CallControl::struct_layout_for`
+/// already stores for a host class. Every spelling that resolves must
+/// agree. A missing layout is skipped; none resolved, a zero size, or
+/// two shapes is a closed failure.
+///
+/// The owner is the first resolved spelling in name order. The field
+/// map does not iterate stably, and the spec rows come from that
+/// owner's own list ([`host_object_header_gc_field_specs`]).
+/// `NewWithVtable` still stamps the typeptr through `fielddescr_vtable`.
+fn host_object_header_layout(cc: &CallControl) -> (usize, usize, String) {
+    // Collect owners before `struct_layout_for`: the field map borrow
+    // cannot overlap that lookup.
+    let mut owners: Vec<String> = cc
+        .struct_fields()
+        .fields
+        .iter()
+        .filter_map(|(owner, rows)| {
+            let first = rows.first()?;
+            let field = crate::model::FieldDescriptor::new(first.name.clone(), Some(owner.clone()));
+            crate::codewriter::heaptracker::is_typeptr_field(&field).then(|| owner.clone())
+        })
+        .collect();
+    owners.sort();
+    let mut found: Option<(usize, usize, String)> = None;
+    for owner in owners {
+        let Some(layout) = cc.struct_layout_for(&owner) else {
+            continue;
+        };
+        if layout.size == 0 || layout.align == 0 {
+            panic!(
+                "minted exception instance: object header `{owner}` has size {} align {}",
+                layout.size, layout.align
+            );
+        }
+        let shape = (layout.size, layout.align);
+        match &found {
+            None => found = Some((shape.0, shape.1, owner)),
+            Some((prev_size, prev_align, _)) if (*prev_size, *prev_align) == shape => {}
+            Some((prev_size, prev_align, _)) => panic!(
+                "minted exception instance: object header layouts disagree: ({prev_size}, {prev_align}) vs {shape:?} (`{owner}`)"
+            ),
+        }
+    }
+    found.unwrap_or_else(|| {
+        panic!(
+            "minted exception instance: no StructLayout for the object header whose first field is the typeptr (heaptracker::is_typeptr_field)"
+        )
+    })
+}
+
+/// GC-pointer words of the host object header, typeptr omitted.
+///
+/// `heaptracker.py all_fielddescrs` walks the header STRUCT, skips
+/// `typeptr`, and keeps every other field. A host class reaches that
+/// list by inlining the header (`bh_all_field_specs_for_struct` on the
+/// outer struct, which recurses and prefixes the header field). A
+/// minted class has no such field: the same walk starts at the owner
+/// [`host_object_header_layout`] resolved. Only `ArrayFlag::Pointer`
+/// rows are specs. `rewrite.py clear_gc_fields` zeroes each of them
+/// when `malloc_zero_filled` is false.
+///
+/// The blackhole does not consult this list. `llmodel.py
+/// bh_new_with_vtable` calls `gc_malloc`, and framework `_bh_malloc`
+/// is `do_malloc_fixedsize_clear`. The typed path is
+/// `alloc_oldgen_typed`, which `raw_memclear`s the payload before
+/// `write_new_with_vtable_header` stores a class word only when
+/// `resolve_w_class_obj` is nonzero. The nursery bump does not clear.
+///
+/// Indices are the dense prefix of the instance list. `sort_key` stays
+/// the field offset, which the walk already took from the layout.
+fn host_object_header_gc_field_specs(
+    cc: &CallControl,
+    owner: &str,
+) -> Vec<crate::jitcode::BhFieldSpec> {
+    let mut specs: Vec<_> = bh_all_field_specs_for_struct(cc, owner)
+        .into_iter()
+        .filter(|spec| spec.field_flag == majit_ir::descr::ArrayFlag::Pointer)
+        .collect();
+    for (index, spec) in specs.iter_mut().enumerate() {
+        spec.index = index as u32;
+        spec.index_in_parent = index;
+    }
+    specs
+}
+
+/// One own or `mutate_<name>` row while `minted_exception_instance_layout`
+/// places a class. `name` is borrowed for a harvested field and owned for
+/// the mutation slot `InstanceRepr._setup_repr` appends.
+struct MintedLayoutField<'a> {
+    name: std::borrow::Cow<'a, str>,
+    size: usize,
+    flag: majit_ir::descr::ArrayFlag,
+    ty: majit_ir::value::Type,
+    raw_owned: Option<&'a crate::front::semantic::RawOwnedField>,
+    is_immutable: bool,
+    is_quasi: bool,
+    is_atomic: bool,
+}
+
+/// Field rows of one minted class, embedded the way `InstanceRepr`
+/// embeds `super`.
+///
+/// The root is the host object header ([`host_object_header_layout`]),
+/// not a one-word `typeptr`. That header's GC-pointer words, typeptr
+/// omitted, are the first `BhFieldSpec`s
+/// ([`host_object_header_gc_field_specs`]). Each class then places only
+/// the fields it declares, after the previous class's aligned size.
+/// Alignment carries forward: a subclass whose own field is a byte
+/// still rounds with an ancestor `i64`'s alignment, because the outer
+/// struct's alignment includes the nested `super`. Payload offsets do
+/// not move when the header specs are prepended.
+///
+/// Own rows, after the `__discriminant` / header-word / `Void` / size-0
+/// filter, follow `InstanceRepr._setup_repr`: name order, then a stable
+/// decreasing-size order (`attr_reverse_size`, the comparator
+/// `sort_llfields` uses). Each quasi-immutable own field then appends
+/// `mutate_<name>` as `OBJECTPTR` after those sorted fields, in that
+/// same name order. The slot is pointer-sized, `ArrayFlag::Pointer`,
+/// `Type::Ref`, traced, and not itself quasi-immutable.
+///
+/// The fourth value is the payload GC-pointer offsets, in layout order:
+/// `ArrayFlag::Pointer` fields that are not raw-owned, including each
+/// `mutate_<name>` slot. The header's class word is a field spec but is
+/// absent here. `TypeRegistry::register` merges the parent's offsets,
+/// and the object root already lists that edge. A raw-owned `*mut T`
+/// is an integer word the destructor frees.
+fn minted_exception_instance_layout(
+    cc: &CallControl,
+    chain: &[String],
+) -> (
+    usize,
+    Vec<crate::jitcode::BhFieldSpec>,
+    Vec<crate::front::llbc_hints::MintedRawOwnedDrop>,
+    Vec<usize>,
+) {
+    let (mut super_size, mut super_align, header_owner) = host_object_header_layout(cc);
+    let mut specs = host_object_header_gc_field_specs(cc, &header_owner);
+    let mut drops = Vec::new();
+    let mut gc_ptr_offsets = Vec::new();
+    if chain.is_empty() {
+        return (
+            align_up_pow2(super_size, super_align),
+            specs,
+            drops,
+            gc_ptr_offsets,
+        );
+    }
+    for class_key in chain {
+        let mut offset = super_size;
+        let mut class_align = super_align;
+        let rows = cc
+            .struct_field_entries(class_key)
+            .map(|rows| rows.to_vec())
+            .unwrap_or_default();
+        let mut own: Vec<MintedLayoutField<'_>> = Vec::new();
+        for row in &rows {
+            if row.name == "__discriminant"
+                || crate::codewriter::heaptracker::is_header_word(class_key, &row.name)
+            {
+                continue;
+            }
+            let (flag, ty, size) = type_flag_from_str(&row.ty, &cc.raw_alloc_flavor_structs);
+            if ty == majit_ir::value::Type::Void || size == 0 {
+                continue;
+            }
+            let rank = cc.field_immutability(Some(class_key), &row.name);
+            let is_quasi = rank.is_some_and(|rank| rank.is_quasi_immutable());
+            own.push(MintedLayoutField {
+                name: std::borrow::Cow::Borrowed(row.name.as_str()),
+                size,
+                flag,
+                ty,
+                raw_owned: row.raw_owned.as_ref(),
+                is_immutable: rank.is_some(),
+                is_quasi,
+                is_atomic: row.is_atomic,
+            });
+        }
+        own.sort_by(|left, right| {
+            crate::translator::rtyper::rclass::cmp_llfields_name_then_reverse_size(
+                left.name.as_ref(),
+                Some(left.size),
+                right.name.as_ref(),
+                Some(right.size),
+            )
+        });
+        // `InstanceRepr._setup_repr` walks the name-sorted attrs again,
+        // not the size-sorted `myllfields`, when it appends `mutate_<name>`.
+        let mut quasi_names: Vec<&str> = own
+            .iter()
+            .filter(|field| field.is_quasi)
+            .map(|field| field.name.as_ref())
+            .collect();
+        quasi_names.sort();
+        let mutate_names: Vec<String> = quasi_names
+            .into_iter()
+            .map(|name| format!("mutate_{name}"))
+            .collect();
+        let word = crate::layout::target_word_size();
+        for name in mutate_names {
+            own.push(MintedLayoutField {
+                name: std::borrow::Cow::Owned(name),
+                size: word,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                ty: majit_ir::value::Type::Ref,
+                raw_owned: None,
+                is_immutable: false,
+                is_quasi: false,
+                is_atomic: false,
+            });
+        }
+        for field in &own {
+            let align = scalar_align(field.size).max(1);
+            class_align = class_align.max(align);
+            offset = align_up_pow2(offset, align);
+            if let Some(raw) = field.raw_owned {
+                drops.push(crate::front::llbc_hints::MintedRawOwnedDrop {
+                    offset,
+                    type_path: raw.type_path.clone(),
+                });
+            }
+            if field.flag == majit_ir::descr::ArrayFlag::Pointer && field.raw_owned.is_none() {
+                gc_ptr_offsets.push(offset);
+            }
+            // `get_type_flag`'s unknown-type arm banks `*mut T` as a GC
+            // pointer. A raw pointee is `FLAG_UNSIGNED` (`descr.py
+            // get_type_flag`). Keep the word's size so later offsets do
+            // not move; `gc_fielddescrs` then omits a slot the collector
+            // does not trace. The payload offset list above already
+            // excluded it.
+            let (flag, ty) = if field.raw_owned.is_some() {
+                (
+                    majit_ir::descr::ArrayFlag::Unsigned,
+                    majit_ir::value::Type::Int,
+                )
+            } else {
+                (field.flag, field.ty)
+            };
+            let index = specs.len();
+            specs.push(bh_field_spec_from_parts(
+                index as u32,
+                class_key,
+                field.name.as_ref(),
+                offset,
+                field.size,
+                ty,
+                flag,
+                field.is_immutable,
+                field.is_quasi,
+                index,
+                field.is_quasi && field.is_atomic,
+                field.is_quasi && field.is_atomic,
+            ));
+            offset += field.size;
+        }
+        offset = align_up_pow2(offset, class_align);
+        super_size = offset;
+        super_align = class_align;
+    }
+    (super_size, specs, drops, gc_ptr_offsets)
+}
+
+/// Fill `size`, `gc_ptr_offsets`, and `raw_owned` from one instance layout.
+///
+/// The field row stays on the declaring class. A subclass instance is
+/// allocated with the subclass tid, so its destructor repeats every
+/// ancestor's raw-owned attr at the offset `super` embedding gives that
+/// field. A class whose chain has no such attr keeps an empty list.
+/// `size` is the same byte count `minted_exception_instance_size_spec`
+/// publishes, and `gc_ptr_offsets` are that layout's payload GC edges.
+pub(crate) fn attach_minted_exception_raw_owned_drops(
+    cc: &CallControl,
+    rows: &mut [crate::front::llbc_hints::MintedExceptionClassEmit],
+) {
+    for row in rows {
+        let chain = minted_exception_chain_for_key(cc, &row.name);
+        let (size, _specs, drops, gc_ptr_offsets) = minted_exception_instance_layout(cc, &chain);
+        row.size = size;
+        row.gc_ptr_offsets = gc_ptr_offsets;
+        row.raw_owned = drops;
+    }
+}
+
+/// Size of a minted exception class, including a variant with no fields
+/// of its own.
+///
+/// `minted_exception_size_owner` is the host walk. A match always yields
+/// a spec: the chain is that host's ancestors, and a missing chain is
+/// the same missing-class panic as the constructor arm. `vtable` stays
+/// 0. `owner` is the class key so `GcLLDescr_framework.init_size_descr`
+/// can stamp `TypeLayoutBuilder.get_type_id` for that TYPE.
+/// `OpKind::NewWithVtable` still overwrites the opcode `BhDescr.owner`
+/// with that same key and replaces `vtable` with the type-static sentinel.
+fn minted_exception_instance_size_spec(
+    cc: &CallControl,
+    owner: &str,
+) -> Option<crate::jitcode::BhSizeSpec> {
+    let key = minted_exception_size_owner(cc, owner, 0)?;
+    let chain = minted_exception_chain_for_key(cc, &key);
+    let (size, all_fielddescrs, _drops, _gc_ptr_offsets) =
+        minted_exception_instance_layout(cc, &chain);
+    let (is_gc_managed, headerless) = cc.struct_storage_for(owner).unwrap_or((true, false));
+    Some(crate::jitcode::BhSizeSpec {
+        size,
+        is_gc_managed,
+        headerless,
+        type_id: bh_size_type_id(owner, owner, is_gc_managed),
+        vtable: 0,
+        owner: key,
+        all_fielddescrs,
+    })
+}
+
 pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
@@ -5574,6 +6025,14 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     }
     let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
     let owner = canonical_owner.as_str();
+    // `rclass.py` `InstanceRepr._setup_repr` embeds the parent struct as
+    // `super`, rooted at the host object header (`host_object_header_layout`).
+    // A minted class always has that size, including a variant that
+    // declares no fields. This wins over a registered empty `StructLayout`
+    // and over a missing row list: neither is the instance struct.
+    if let Some(spec) = minted_exception_instance_size_spec(cc, owner) {
+        return Some(spec);
+    }
     // RPython keys SizeDescrs on the concrete low-level STRUCT object. A Rust
     // generic TypeDecl is only a template: `Option<usize>::Some` and
     // `Option<BinOpKind>::Some` can have different payload banks and therefore
@@ -7240,6 +7699,44 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
 }
 
 pub use majit_ir::CallInfoCollection;
+
+/// Owner spelling tests use for the host object header.
+///
+/// The string is the leaf `heaptracker::is_typeptr_field` matches. The
+/// layout is two pointer words built by `StructLayout::from_type_strings`,
+/// not a literal `2 * word` inside the production layout.
+#[cfg(test)]
+pub(crate) fn host_header_owner() -> &'static str {
+    "PyObject"
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_field_pairs() -> Vec<(String, String)> {
+    vec![
+        ("ob_type".to_string(), "*mut HeaderClass".to_string()),
+        ("w_class".to_string(), "*mut HeaderClass".to_string()),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_rows() -> Vec<crate::front::semantic::FieldRow> {
+    host_header_field_pairs()
+        .into_iter()
+        .map(|(name, ty)| crate::front::semantic::FieldRow::named(name, ty))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn host_header_layout() -> crate::call::StructLayout {
+    crate::call::StructLayout::from_type_strings(
+        &host_header_field_pairs(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -10325,6 +10822,99 @@ mod tests {
     }
 
     #[test]
+    fn minted_exception_llexitcase_emits_static_addr_by_identity() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::HOST_ENV;
+        use crate::front::llbc_hints::ExceptionClassHint;
+        use crate::jitcode::ConstIRelocKind;
+
+        let hint = ExceptionClassHint::new("synth::E", "", vec!["C".to_string()]);
+        let minted = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(name, _)| name == "C")
+            .map(|(_, host)| host.clone())
+            .expect("C");
+        assert_eq!(minted.qualname(), "synth::E::C");
+        let stop = HOST_ENV
+            .lookup_exception_class("StopIteration")
+            .expect("StopIteration");
+        let mut cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        cc.exception_class_hints = vec![hint];
+        let mut flat = SSARepr {
+            name: "minted_mismatch".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(minted.clone()),
+                    target: Label(0),
+                },
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(stop.clone()),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.constants_i, vec![0, 0x30]);
+        assert!(!body.constants_i.contains(&(minted.identity_id() as i64)));
+        assert!(!body.constants_i.contains(&(stop.identity_id() as i64)));
+        assert_eq!(body.reloc_consts_i.len(), 2);
+        assert_eq!(
+            body.constants_i[body.reloc_consts_i[0].constants_i_index],
+            0
+        );
+        assert_eq!(
+            body.reloc_consts_i[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "synth::E::C".to_string(),
+            }
+        );
+        assert_eq!(
+            body.constants_i[body.reloc_consts_i[1].constants_i_index],
+            0x30
+        );
+        assert!(matches!(
+            &body.reloc_consts_i[1].kind,
+            ConstIRelocKind::StaticAddr { name } if name.contains("EXC_STOP_ITERATION_TYPE")
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "no interp_exceptions pytype row for exception class synth::E::C")]
+    fn same_named_host_is_not_the_minted_llexitcase() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::{HOST_ENV, HostObject};
+        use crate::front::llbc_hints::ExceptionClassHint;
+
+        let hint = ExceptionClassHint::new("synth::E", "", vec!["C".to_string()]);
+        let exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let other = HostObject::new_class("synth::E::C", vec![exception]);
+        let mut cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        cc.exception_class_hints = vec![hint];
+        let mut flat = SSARepr {
+            name: "other_host".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(other),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+    }
+
+    #[test]
     fn assertion_error_message_instance_emits_sentinel_not_identity() {
         use crate::flatten::{FlatOp, RegOrConst, SSARepr};
         use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
@@ -11895,6 +12485,733 @@ mod tests {
             "unexpected setarrayitem_gc_v/iiid key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+    }
+
+    fn layout_cc_for_owners(
+        owners: &[&str],
+    ) -> (
+        crate::call::CallControl,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        use crate::call::{CallControl, StructLayout};
+        use std::collections::HashMap;
+
+        let mut cc = CallControl::new();
+        let mut ids = HashMap::new();
+        for owner in owners {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            ids.insert((*owner).to_string(), Some(owner_id));
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 0,
+                    align: 1,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                    fields: Vec::new(),
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+                },
+            );
+        }
+        // The size-0 loop must not own the header: a later
+        // `set_struct_layout` would have to overwrite a zero size, and a
+        // test that replaces the field registry has to put these rows
+        // back or `host_object_header_layout` fails closed.
+        let header_id = majit_ir::descr::StructId::from_canonical(host_header_owner());
+        ids.insert(host_header_owner().to_string(), Some(header_id));
+        cc.set_struct_layout(header_id, host_header_layout());
+        let guard = crate::test_support::register_struct_ids_serialized(ids);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        cc.set_struct_fields(fields);
+        (cc, guard)
+    }
+
+    fn assemble_new_with_vtable(
+        cc: &crate::call::CallControl,
+        owner: &str,
+        vtable: i64,
+        intern: &[(&str, i64)],
+    ) -> crate::jitcode::BhDescr {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind};
+
+        let mut graph = FunctionGraph::new("new_with_vtable");
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::NewWithVtable {
+                    owner: owner.to_string(),
+                    vtable,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&result, crate::model::ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(intern);
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(cc));
+        let want = majit_ir::descr::struct_id_for_name(owner)
+            .unwrap_or_else(|| panic!("struct id for {owner}"))
+            .as_u64();
+        asm.snapshot_descrs()
+            .into_iter()
+            .find(|descr| {
+                matches!(descr, crate::jitcode::BhDescr::Size { type_id, .. } if *type_id == want)
+            })
+            .unwrap_or_else(|| panic!("new_with_vtable size descr for {owner}"))
+    }
+
+    /// A minted class emits the type-static sentinel with `owner` = the
+    /// intern key. A class that is not minted keeps the address-intern
+    /// sentinel, the raw word, or vtable 0.
+    #[test]
+    fn new_with_vtable_minted_class_emits_type_static_sentinel() {
+        use crate::jitcode::BhDescr;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into()],
+        );
+        let host_b = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(name, _)| name == "B")
+            .map(|(_, host)| host.clone())
+            .expect("variant B");
+        let identity = host_b.identity_id() as i64;
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::E", "synth::E::A", "synth::E::B", "Plain"]);
+        cc.exception_class_hints = vec![hint];
+
+        let minted_by_identity =
+            assemble_new_with_vtable(&cc, "synth::E::B", identity, &[("decoy::Type", identity)]);
+        match minted_by_identity {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, identity as u64);
+                assert_eq!(owner, "synth::E::B");
+                assert_eq!(vtable, type_static_const_sentinel(1usize << 32) as u64);
+            }
+            other => panic!("minted identity: {other:?}"),
+        }
+
+        let minted_by_owner = assemble_new_with_vtable(&cc, "synth::E::B", 0x1111, &[]);
+        match minted_by_owner {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, 0x1111);
+                assert_eq!(owner, "synth::E::B");
+            }
+            other => panic!("minted owner: {other:?}"),
+        }
+
+        let minted_zero = assemble_new_with_vtable(&cc, "synth::E::A", 0, &[]);
+        match minted_zero {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, 0);
+                assert_eq!(owner, "synth::E::A");
+            }
+            other => panic!("minted zero vtable: {other:?}"),
+        }
+
+        cc.exception_class_hints.clear();
+        let addr = 0xABC0;
+        let interned =
+            assemble_new_with_vtable(&cc, "Plain", addr, &[("floatobject::FLOAT_TYPE", addr)]);
+        match interned {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, type_static_const_sentinel(0) as u64);
+                assert_eq!(owner, "floatobject::FLOAT_TYPE");
+            }
+            other => panic!("interned address: {other:?}"),
+        }
+
+        let raw = assemble_new_with_vtable(&cc, "Plain", 0x2222, &[]);
+        match raw {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, 0x2222);
+                assert!(owner.is_empty());
+            }
+            other => panic!("raw address: {other:?}"),
+        }
+
+        let zero = assemble_new_with_vtable(&cc, "Plain", 0, &[]);
+        match zero {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, 0);
+                assert!(owner.is_empty());
+            }
+            other => panic!("zero vtable: {other:?}"),
+        }
+    }
+
+    /// A size-0 layout does not describe a minted class. The size is the
+    /// host object header plus ancestor fields (`InstanceRepr._setup_repr`),
+    /// and `new_with_vtable` still carries the type-static sentinel.
+    #[test]
+    fn new_with_vtable_minted_class_embeds_ancestor_fields() {
+        use crate::jitcode::BhDescr;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into(), "D".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::E", "synth::E::A", "synth::E::B", "synth::E::D"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::E::A".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "synth::E::B".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint];
+
+        let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let header_size = header.size;
+        let header_align = header.align;
+        assert_eq!(header_size, 2 * word);
+        let n_align = 8usize;
+        let n_offset = align_up_pow2(header_size, n_align);
+        let class_align = header_align.max(n_align);
+        let a_size = align_up_pow2(n_offset + 8, class_align);
+        let flag_offset = a_size;
+        let b_size = align_up_pow2(flag_offset + 1, class_align);
+        let root_size = align_up_pow2(header_size, header_align);
+
+        let b_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::B").expect("B");
+        let d_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::D").expect("D");
+        let base_spec = bh_size_spec_from_callcontrol(&cc, "synth::E").expect("base");
+        assert_eq!(b_spec.size, b_size);
+        assert_eq!(d_spec.size, root_size);
+        assert_eq!(base_spec.size, root_size);
+        let header_name = format!("{}.w_class", host_header_owner());
+        for spec in [&d_spec, &base_spec] {
+            assert_eq!(spec.all_fielddescrs.len(), 1);
+            assert_eq!(spec.all_fielddescrs[0].field_key(), "w_class");
+            assert_eq!(spec.all_fielddescrs[0].name, header_name);
+            assert_eq!(spec.all_fielddescrs[0].offset, word);
+            assert_eq!(spec.all_fielddescrs[0].index, 0);
+            assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+            assert!(spec.all_fielddescrs[0].is_class_word.is_none());
+            assert!(spec.all_fielddescrs[0].effective_class_word());
+        }
+        assert_eq!(b_spec.owner, "synth::E::B");
+        assert_eq!(b_spec.vtable, 0);
+        assert_eq!(b_spec.all_fielddescrs.len(), 3);
+        assert_eq!(b_spec.all_fielddescrs[0].field_key(), "w_class");
+        assert_eq!(b_spec.all_fielddescrs[0].name, header_name);
+        assert_eq!(b_spec.all_fielddescrs[0].offset, word);
+        assert_eq!(b_spec.all_fielddescrs[0].index, 0);
+        assert_eq!(b_spec.all_fielddescrs[1].field_key(), "n");
+        assert_eq!(b_spec.all_fielddescrs[1].name, "synth::E::A.n");
+        assert_eq!(b_spec.all_fielddescrs[1].offset, n_offset);
+        assert_eq!(b_spec.all_fielddescrs[1].index, 1);
+        assert_eq!(b_spec.all_fielddescrs[1].index_in_parent, 1);
+        assert_eq!(n_offset, header_size);
+        assert_eq!(b_spec.all_fielddescrs[2].field_key(), "flag");
+        assert_eq!(b_spec.all_fielddescrs[2].name, "synth::E::B.flag");
+        assert_eq!(b_spec.all_fielddescrs[2].offset, flag_offset);
+        assert_eq!(b_spec.all_fielddescrs[2].index, 2);
+        if word >= 8 {
+            assert_eq!(flag_offset, header_size + 8);
+            assert_eq!(a_size, header_size + 8);
+            assert_eq!(b_size, header_size + 16);
+        }
+        assert_eq!(
+            cc.struct_layout_for("synth::E::B")
+                .map(|layout| layout.size),
+            Some(0),
+            "the registered layout stays empty; the minted spec replaces it"
+        );
+
+        let assembled_b = assemble_new_with_vtable(&cc, "synth::E::B", 0, &[]);
+        match assembled_b {
+            BhDescr::Size {
+                vtable,
+                owner,
+                size,
+                all_fielddescrs,
+                ..
+            } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_eq!(owner, "synth::E::B");
+                assert_eq!(size, b_size);
+                assert_eq!(all_fielddescrs.len(), 3);
+                assert_eq!(all_fielddescrs[0].name, header_name);
+                assert_eq!(all_fielddescrs[0].offset, word);
+                assert_eq!(all_fielddescrs[1].name, "synth::E::A.n");
+                assert_eq!(all_fielddescrs[1].offset, n_offset);
+                assert_eq!(all_fielddescrs[2].name, "synth::E::B.flag");
+                assert_eq!(all_fielddescrs[2].offset, flag_offset);
+            }
+            other => panic!("assembled B: {other:?}"),
+        }
+        let assembled_d = assemble_new_with_vtable(&cc, "synth::E::D", 0, &[]);
+        match assembled_d {
+            BhDescr::Size {
+                vtable,
+                owner,
+                size,
+                all_fielddescrs,
+                ..
+            } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_eq!(owner, "synth::E::D");
+                assert_eq!(size, root_size);
+                assert_eq!(all_fielddescrs.len(), 1);
+                assert_eq!(all_fielddescrs[0].name, header_name);
+                assert_eq!(all_fielddescrs[0].offset, word);
+            }
+            other => panic!("assembled D: {other:?}"),
+        }
+    }
+
+    /// A minted class with `String`, `i64`, `Vec<String>`, and a raw-owned
+    /// struct starts its first payload field at the host header. `String`
+    /// is harvested as `"str"` and `Vec<String>` as
+    /// [`crate::front::mir::RPY_LIST_OF_STR`]. Own fields follow
+    /// `InstanceRepr._setup_repr`: `count` is the wide field, then the
+    /// word-sized names stay in name order (`missing`, `msg`,
+    /// `signature`). The `SizeDescr` size is the rendered row size.
+    /// `gc_fielddescrs` is the header class word plus the list word and
+    /// the str word, in that layout order. The rendered `gc_ptr_offsets`
+    /// omit the header edge: `TypeRegistry::register` merges the object
+    /// root. The `i64` and the raw-owned word are in neither list. A
+    /// subclass keeps the inherited offsets.
+    #[test]
+    fn minted_class_layout_starts_at_host_header_and_traces_gc_pointers() {
+        use crate::front::llbc_hints::{
+            minted_exception_class_rows, render_minted_exception_classes_rs,
+        };
+        use crate::front::semantic::{FieldRow, RawOwnedField};
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Mix",
+            "Child(Parent)",
+            vec!["Parent".into(), "Child".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::Mix", "synth::Mix::Parent", "synth::Mix::Child"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Mix::Parent".to_string(),
+            vec![
+                FieldRow::named("msg", "str"),
+                FieldRow::named("count", "i64"),
+                FieldRow::named("missing", crate::front::mir::RPY_LIST_OF_STR),
+                FieldRow::named("signature", "*mut fixture::Signature").with_raw_owned(
+                    RawOwnedField {
+                        type_path: "fixture::Signature".into(),
+                        size: 8,
+                        align: 8,
+                    },
+                ),
+            ],
+        );
+        fields.fields.insert(
+            "synth::Mix::Child".to_string(),
+            vec![FieldRow::named("extra", "i64")],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint.clone()];
+
+        let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        assert_eq!(header.fields.len(), 2);
+        assert_eq!(header.fields[0].name, "ob_type");
+        assert_eq!(header.fields[0].offset, 0);
+        assert_eq!(header.fields[1].name, "w_class");
+        assert_eq!(header.fields[1].offset, word);
+        assert_eq!(header.size, 2 * word);
+        let header_size = header.size;
+
+        let parent_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix::Parent").expect("parent");
+        let child_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix::Child").expect("child");
+        let base_spec = bh_size_spec_from_callcontrol(&cc, "synth::Mix").expect("base");
+        assert_eq!(base_spec.size, header_size);
+
+        let field = |spec: &crate::jitcode::BhSizeSpec, key: &str| {
+            spec.all_fielddescrs
+                .iter()
+                .find(|row| row.field_key() == key)
+                .unwrap_or_else(|| panic!("{key} missing from {spec:?}"))
+                .clone()
+        };
+        let header_name = format!("{}.w_class", host_header_owner());
+        let class_word = field(&parent_spec, "w_class");
+        let msg = field(&parent_spec, "msg");
+        let count = field(&parent_spec, "count");
+        let missing = field(&parent_spec, "missing");
+        let signature = field(&parent_spec, "signature");
+        assert_eq!(class_word.offset, word);
+        assert_eq!(class_word.name, header_name);
+        assert_eq!(class_word.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+        assert!(class_word.is_class_word.is_none());
+        assert!(class_word.effective_class_word());
+        assert_eq!(class_word.index, 0);
+        assert_eq!(class_word.index_in_parent, 0);
+        let parent_keys: Vec<_> = parent_spec
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(
+            parent_keys,
+            vec!["w_class", "count", "missing", "msg", "signature"]
+        );
+        assert_eq!(count.offset, header_size);
+        assert_eq!(count.index, 1);
+        assert_eq!(count.index_in_parent, 1);
+        assert_eq!(missing.offset, count.offset + count.field_size);
+        assert_eq!(msg.offset, missing.offset + missing.field_size);
+        assert_eq!(signature.offset, msg.offset + msg.field_size);
+        assert_eq!(signature.field_flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(signature.field_type, majit_ir::value::Type::Int);
+        assert_eq!(signature.field_size, word);
+        for (index, row) in parent_spec.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        for spec in [&parent_spec, &child_spec, &base_spec] {
+            assert!(
+                spec.all_fielddescrs.iter().all(|row| {
+                    let key = row.field_key();
+                    key != "ob_type" && key != "typeptr"
+                }),
+                "the typeptr is not a field spec: {:?}",
+                spec.all_fielddescrs
+            );
+            let class_rows: Vec<_> = spec
+                .all_fielddescrs
+                .iter()
+                .filter(|row| row.field_key() == "w_class")
+                .collect();
+            assert_eq!(class_rows.len(), 1);
+            assert_eq!(class_rows[0].offset, word);
+            assert_eq!(class_rows[0].name, header_name);
+        }
+        assert_eq!(base_spec.all_fielddescrs.len(), 1);
+        for key in ["msg", "count", "missing", "signature"] {
+            assert_eq!(
+                field(&parent_spec, key).offset,
+                field(&child_spec, key).offset,
+                "{key}"
+            );
+        }
+        let extra = field(&child_spec, "extra");
+        assert!(extra.offset >= parent_spec.size);
+
+        let mut rows = minted_exception_class_rows(std::slice::from_ref(&hint));
+        attach_minted_exception_raw_owned_drops(&cc, &mut rows);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+        };
+        let parent_row = row("synth::Mix::Parent");
+        let child_row = row("synth::Mix::Child");
+        let base_row = row("synth::Mix");
+        assert_eq!(parent_spec.size, parent_row.size);
+        assert_eq!(child_spec.size, child_row.size);
+        assert_eq!(base_row.size, header_size);
+        assert_eq!(parent_row.gc_ptr_offsets, vec![missing.offset, msg.offset]);
+        assert_eq!(child_row.gc_ptr_offsets, parent_row.gc_ptr_offsets);
+        assert!(base_row.gc_ptr_offsets.is_empty());
+        // `descr.py get_size_descr`: `gc_fielddescrs` is the pointer
+        // subset of `all_fielddescrs`. The class word is that subset's
+        // header row. `w_class_obj()` is absent because the minted
+        // vtable carries no app-level class (`resolve_w_class_obj(0)`).
+        let gc_field_offsets = |spec: &crate::jitcode::BhSizeSpec| -> Vec<usize> {
+            use majit_ir::descr::SizeDescr;
+            let fields: Vec<_> = spec
+                .all_fielddescrs
+                .iter()
+                .map(|row| majit_ir::descr::SimpleFieldDescrSpec {
+                    index: row.index,
+                    field_key: row.field_key().to_string(),
+                    name: row.name.clone(),
+                    offset: row.offset,
+                    field_size: row.field_size,
+                    field_type: row.field_type,
+                    is_immutable: row.is_immutable,
+                    is_quasi_immutable: row.is_quasi_immutable,
+                    flag: row.field_flag,
+                    virtualizable: false,
+                    is_class_word: row.is_class_word,
+                    index_in_parent: row.index_in_parent,
+                    load_is_acquire: row.load_is_acquire,
+                    store_is_release: row.store_is_release,
+                })
+                .collect();
+            let group = majit_ir::descr::make_simple_descr_group(
+                0,
+                spec.size,
+                spec.type_id as u32,
+                0,
+                &fields,
+            );
+            let size_descr = group.size_descr.as_ref();
+            let class_word = size_descr.class_word_field().expect("class word");
+            assert_eq!(class_word.offset(), word);
+            assert_eq!(class_word.sort_key(), word);
+            assert!(class_word.is_w_class());
+            assert_eq!(size_descr.w_class_obj(), None);
+            size_descr
+                .gc_fielddescrs()
+                .iter()
+                .map(|field| field.offset())
+                .collect()
+        };
+        let parent_gc = gc_field_offsets(&parent_spec);
+        let child_gc = gc_field_offsets(&child_spec);
+        assert_eq!(parent_gc, vec![word, missing.offset, msg.offset]);
+        assert_eq!(child_gc, parent_gc);
+        assert_eq!(gc_field_offsets(&base_spec), vec![word]);
+        for offsets in [&parent_gc, &child_gc] {
+            assert!(!offsets.contains(&count.offset));
+            assert!(!offsets.contains(&signature.offset));
+            assert!(!offsets.contains(&extra.offset));
+            assert!(!offsets.contains(&0));
+        }
+        for offsets in [&parent_row.gc_ptr_offsets, &child_row.gc_ptr_offsets] {
+            assert!(offsets.iter().all(|offset| *offset >= header_size));
+            assert!(!offsets.contains(&0));
+            assert!(!offsets.contains(&word));
+            assert!(!offsets.contains(&count.offset));
+            assert!(!offsets.contains(&signature.offset));
+            assert!(!offsets.contains(&extra.offset));
+        }
+        assert_eq!(parent_row.raw_owned.len(), 1);
+        assert_eq!(parent_row.raw_owned[0].offset, signature.offset);
+        assert_eq!(child_row.raw_owned[0].offset, signature.offset);
+
+        let src = render_minted_exception_classes_rs(&rows);
+        assert!(src.contains(&format!(
+            "size: {}, gc_ptr_offsets: &[{}, {}]",
+            parent_row.size, missing.offset, msg.offset
+        )));
+        assert!(src.contains(&format!(
+            "size: {}, gc_ptr_offsets: &[{}, {}]",
+            child_row.size, missing.offset, msg.offset
+        )));
+        assert!(src.contains(&format!("size: {header_size}, gc_ptr_offsets: &[]")));
+    }
+
+    /// Declared `b: u8`, `a: i64`, `c: i64`. `InstanceRepr._setup_repr`
+    /// sorts by name, then stably by decreasing size (`attr_reverse_size`),
+    /// so the own fields are `a`, `c`, `b`.
+    #[test]
+    fn minted_class_own_fields_sort_like_setup_repr() {
+        use crate::front::semantic::FieldRow;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Order",
+            "",
+            vec!["Leaf".into()],
+        );
+        let (mut cc, _guard) = layout_cc_for_owners(&["synth::Order", "synth::Order::Leaf"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Order::Leaf".to_string(),
+            vec![
+                FieldRow::named("b", "u8"),
+                FieldRow::named("a", "i64"),
+                FieldRow::named("c", "i64"),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint];
+
+        let spec = bh_size_spec_from_callcontrol(&cc, "synth::Order::Leaf").expect("leaf");
+        let keys: Vec<_> = spec
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(keys, vec!["w_class", "a", "c", "b"]);
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let a = &spec.all_fielddescrs[1];
+        let c = &spec.all_fielddescrs[2];
+        let b = &spec.all_fielddescrs[3];
+        assert_eq!(a.field_size, 8);
+        assert_eq!(c.field_size, 8);
+        assert_eq!(b.field_size, 1);
+        assert_eq!(
+            a.offset,
+            align_up_pow2(header.size, scalar_align(a.field_size))
+        );
+        assert_eq!(c.offset, a.offset + a.field_size);
+        assert_eq!(b.offset, c.offset + c.field_size);
+        for (index, row) in spec.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        assert!(
+            spec.all_fielddescrs
+                .iter()
+                .all(|row| !row.field_key().starts_with("mutate_"))
+        );
+    }
+
+    /// Quasi `b: i64` and `a: u8`. Own fields follow decreasing size (`b`,
+    /// `a`). `InstanceRepr._setup_repr` then appends `mutate_<name>` in
+    /// name order (`mutate_a`, `mutate_b`): `OBJECTPTR`, so `Type::Ref`,
+    /// traced, and found by `bh_field_lookup`. The subclass field sits
+    /// after those slots because `super` embeds them.
+    #[test]
+    fn minted_class_quasi_immutable_field_appends_mutate_slot() {
+        use crate::front::semantic::FieldRow;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Q",
+            "Sub(Leaf)",
+            vec!["Leaf".into(), "Sub".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::Q", "synth::Q::Leaf", "synth::Q::Sub"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "synth::Q::Leaf".to_string(),
+            vec![FieldRow::named("b", "i64"), FieldRow::named("a", "u8")],
+        );
+        fields.fields.insert(
+            "synth::Q::Sub".to_string(),
+            vec![FieldRow::named("z", "u8")],
+        );
+        cc.set_struct_fields(fields);
+        cc.immutable_fields_by_struct.insert(
+            "synth::Q::Leaf".to_string(),
+            vec![
+                ("b".to_string(), ImmutableRank::QuasiImmutable),
+                ("a".to_string(), ImmutableRank::QuasiImmutable),
+            ],
+        );
+        cc.exception_class_hints = vec![hint];
+
+        let leaf = bh_size_spec_from_callcontrol(&cc, "synth::Q::Leaf").expect("leaf");
+        let sub = bh_size_spec_from_callcontrol(&cc, "synth::Q::Sub").expect("sub");
+        let leaf_keys: Vec<_> = leaf
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(leaf_keys, vec!["w_class", "b", "a", "mutate_a", "mutate_b"]);
+        let sub_keys: Vec<_> = sub
+            .all_fielddescrs
+            .iter()
+            .map(|row| row.field_key())
+            .collect();
+        assert_eq!(
+            sub_keys,
+            vec!["w_class", "b", "a", "mutate_a", "mutate_b", "z"]
+        );
+        let word = crate::layout::target_word_size();
+        let header = cc
+            .struct_layout_for(host_header_owner())
+            .expect("host header");
+        let b = &leaf.all_fielddescrs[1];
+        let a = &leaf.all_fielddescrs[2];
+        let mutate_a = &leaf.all_fielddescrs[3];
+        let mutate_b = &leaf.all_fielddescrs[4];
+        assert!(b.is_quasi_immutable && b.is_immutable);
+        assert!(a.is_quasi_immutable && a.is_immutable);
+        assert_eq!(b.field_size, 8);
+        assert_eq!(a.field_size, 1);
+        assert_eq!(
+            b.offset,
+            align_up_pow2(header.size, scalar_align(b.field_size))
+        );
+        assert_eq!(a.offset, b.offset + b.field_size);
+        for mutate in [mutate_a, mutate_b] {
+            assert_eq!(mutate.field_type, majit_ir::value::Type::Ref);
+            assert_eq!(mutate.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+            assert_eq!(mutate.field_size, word);
+            assert!(!mutate.is_quasi_immutable);
+            assert!(!mutate.is_immutable);
+            assert!(!mutate.load_is_acquire);
+            assert!(!mutate.store_is_release);
+        }
+        assert_eq!(
+            mutate_a.offset,
+            align_up_pow2(a.offset + a.field_size, scalar_align(word))
+        );
+        assert_eq!(mutate_b.offset, mutate_a.offset + word);
+        assert_eq!(mutate_a.name, "synth::Q::Leaf.mutate_a");
+        assert_eq!(mutate_b.name, "synth::Q::Leaf.mutate_b");
+        for (index, row) in leaf.all_fielddescrs.iter().enumerate() {
+            assert_eq!(row.index, index as u32);
+            assert_eq!(row.index_in_parent, index);
+        }
+        let z = sub
+            .all_fielddescrs
+            .iter()
+            .find(|row| row.field_key() == "z")
+            .expect("z");
+        assert_eq!(z.offset, leaf.size);
+        assert!(z.offset >= mutate_b.offset + word);
+
+        let chain = minted_exception_chain_for_key(&cc, "synth::Q::Leaf");
+        let (_size, _specs, _drops, gc_ptr_offsets) = minted_exception_instance_layout(&cc, &chain);
+        assert_eq!(gc_ptr_offsets, vec![mutate_a.offset, mutate_b.offset]);
+        let sub_chain = minted_exception_chain_for_key(&cc, "synth::Q::Sub");
+        let (_size, _specs, _drops, sub_gc) = minted_exception_instance_layout(&cc, &sub_chain);
+        assert_eq!(sub_gc, gc_ptr_offsets);
+
+        for owner in ["synth::Q::Leaf", "synth::Q::Sub"] {
+            for (name, offset) in [("mutate_a", mutate_a.offset), ("mutate_b", mutate_b.offset)] {
+                let field = FieldDescriptor::new(name, Some(owner.to_string()));
+                match bh_field_lookup(&cc, &field) {
+                    BhFieldLookup::Parent(spec) => {
+                        assert_eq!(spec.field_key(), name);
+                        assert_eq!(spec.offset, offset);
+                        assert_eq!(spec.field_type, majit_ir::value::Type::Ref);
+                        assert_eq!(spec.field_flag, majit_ir::descr::ArrayFlag::Pointer);
+                    }
+                    BhFieldLookup::Layout(_) => panic!("{owner}.{name} resolved via layout row"),
+                    BhFieldLookup::Missing => panic!("{owner}.{name} is missing"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -15035,11 +16352,11 @@ mod tests {
     }
 
     fn hierarchy_e() -> crate::front::llbc_hints::ExceptionClassHint {
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "E".to_string(),
-            overrides: "C(B)".to_string(),
-            variants: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-        }
+        crate::front::llbc_hints::ExceptionClassHint::new(
+            "E",
+            "C(B)",
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        )
     }
 
     fn class_names_exception_and_not_builtin(classdef: &Rc<RefCell<ClassDef>>, name: &str) {
@@ -15068,7 +16385,7 @@ mod tests {
         );
     }
 
-    /// `E { A, B, C }` with `"C(B)"`: `EC ⊂ EB ⊂ E`, `EA ⊂ E`, `EA` not ⊂ `EB`.
+    /// `E { A, B, C }` with `"C(B)"`: `E::C ⊂ E::B ⊂ E`, `E::A ⊂ E`, `E::A` not ⊂ `E::B`.
     /// The carrier class is not a subclass of `E`. After
     /// `assign_inheritance_ids` and `getclassrepr`, each class has a
     /// distinct vtable whose subclass range matches `minid`/`maxid`.
@@ -15079,7 +16396,8 @@ mod tests {
         bk.set_exception_carrier("error::PyErrorObject");
         let carrier = bk.exception_carrier_class().expect("carrier host");
         let carrier_def = bk.getuniqueclassdef(&carrier).expect("carrier classdef");
-        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+        let hint = hierarchy_e();
+        bk.mint_exception_class_hierarchies(&[hint.clone()]);
 
         let base = bk.exception_class_base("E").expect("base E");
         let ea = bk.exception_class_variant("E", "A").expect("EA");
@@ -15095,9 +16413,9 @@ mod tests {
         ));
 
         class_names_exception_and_not_builtin(&base, "E");
-        class_names_exception_and_not_builtin(&ea, "EA");
-        class_names_exception_and_not_builtin(&eb, "EB");
-        class_names_exception_and_not_builtin(&ec, "EC");
+        class_names_exception_and_not_builtin(&ea, "E::A");
+        class_names_exception_and_not_builtin(&eb, "E::B");
+        class_names_exception_and_not_builtin(&ec, "E::C");
         assert!(ec.borrow().issubclass(&eb));
         assert!(eb.borrow().issubclass(&base));
         assert!(ec.borrow().issubclass(&base));
@@ -15107,7 +16425,7 @@ mod tests {
         assert!(!carrier_def.borrow().issubclass(&base));
         assert!(!base.borrow().issubclass(&carrier_def));
 
-        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+        bk.mint_exception_class_hierarchies(&[hint]);
         assert!(Rc::ptr_eq(
             &bk.exception_class_base("E").expect("second mint"),
             &base
@@ -15130,7 +16448,7 @@ mod tests {
         let ea_min = ea.borrow().minid.expect("EA minid");
         assert!(
             !(eb_min < ea_min && ea_min < eb_max),
-            "EA must not sit inside EB ({eb_min}..{eb_max} vs {ea_min})"
+            "E::A must not sit inside E::B ({eb_min}..{eb_max} vs {ea_min})"
         );
 
         let lls = [
@@ -15153,7 +16471,7 @@ mod tests {
         }
     }
 
-    /// Exitcase `EB` catches an `EC` instance and misses `EA`.
+    /// Exitcase `E::B` catches an `E::C` instance and misses `E::A`.
     #[test]
     fn minted_exception_exitcase_eb_catches_ec_misses_ea() {
         let (ann, rtyper) = fresh_exception_typer();
@@ -15190,23 +16508,27 @@ mod tests {
         let ec_inst = raised_instance(&rtyper, &ec);
         assert!(
             handler_catches(&ec_inst, eb_ptr),
-            "exitcase EB catches a raised EC"
+            "exitcase E::B catches a raised E::C"
         );
         assert!(
             !handler_catches(&ea_inst, eb_ptr),
-            "exitcase EB misses a raised EA"
+            "exitcase E::B misses a raised E::A"
         );
     }
 
-    /// Literal class key `ArgErr` stays a different host from the struct
-    /// `argument::ArgErr`.
+    /// The minted base is the value class: one host under the declaration
+    /// key, bases `[Exception]`, and a later intern does not replace them.
     #[test]
-    fn minted_exception_class_keeps_literal_key_beside_struct_origin() {
+    fn minted_exception_class_is_the_value_class() {
         let (ann, _rtyper) = fresh_exception_typer();
         let mut reg = crate::front::StructFieldRegistry::default();
         reg.fields.insert(
             "argument::ArgErr".to_string(),
             Vec::<(String, String)>::new(),
+        );
+        reg.fields.insert(
+            "argument::ArgErr::Missing".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
         );
         let id = majit_ir::descr::StructId::from_canonical("argument::ArgErr");
         let identity = crate::front::semantic::ClassIdentity {
@@ -15221,23 +16543,16 @@ mod tests {
         let _guard = crate::test_support::register_struct_origins_serialized(
             std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
         );
-        // `CallRegistry::ensure_session` pre-mints every `struct_fields`
-        // key; interning the qualified declaration first lets the leaf
-        // alias `ArgErr` reach that host through the registry identity
-        // (`Bookkeeper.getdesc`).
-        let _ = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
-        let struct_host = ann.bookkeeper.intern_class_by_qualname("ArgErr");
-        assert_eq!(struct_host.qualname(), "argument::ArgErr");
         ann.bookkeeper.mint_exception_class_hierarchies(&[
-            crate::front::llbc_hints::ExceptionClassHint {
-                enum_path: "argument::ArgErr".to_string(),
-                overrides: "TooManyMethod(TooMany)".to_string(),
-                variants: vec![
+            crate::front::llbc_hints::ExceptionClassHint::new(
+                "argument::ArgErr",
+                "TooManyMethod(TooMany)",
+                vec![
                     "Missing".to_string(),
                     "TooMany".to_string(),
                     "TooManyMethod".to_string(),
                 ],
-            },
+            ),
         ]);
         let base = ann
             .bookkeeper
@@ -15246,21 +16561,54 @@ mod tests {
         let by_leaf = ann
             .bookkeeper
             .exception_class_base("ArgErr")
-            .expect("base by leaf");
+            .expect("base by origin leaf");
         assert!(Rc::ptr_eq(&base, &by_leaf));
         let exc_host = base.borrow().classdesc.borrow().pyobj.clone();
-        assert_eq!(exc_host.qualname(), "ArgErr");
-        assert_ne!(exc_host, struct_host);
+        assert_eq!(exc_host.qualname(), "argument::ArgErr");
+        let exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        assert_eq!(
+            exc_host.class_bases(),
+            Some(std::slice::from_ref(&exception))
+        );
+        let by_path = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
+        let by_alias = ann.bookkeeper.intern_class_by_qualname("ArgErr");
+        assert_eq!(by_path, exc_host);
+        assert_eq!(by_alias, exc_host);
+        assert_eq!(
+            by_path.class_bases(),
+            Some(std::slice::from_ref(&exception))
+        );
         let roots = ann.bookkeeper.struct_root_classes();
-        assert_ne!(
-            roots.get("ArgErr").expect("literal key"),
-            roots.get("argument::ArgErr").expect("struct key")
+        assert!(
+            roots.get("ArgErr").is_none(),
+            "the leaf alias is not a second host"
+        );
+        assert_eq!(
+            roots.get("argument::ArgErr").expect("declaration key"),
+            &exc_host
         );
         drop(roots);
         assert!(
             base.borrow().attrs.is_empty(),
-            "literal ArgErr copied struct attrs: {:?}",
+            "the base copied variant attrs: {:?}",
             base.borrow().attrs.keys().collect::<Vec<_>>()
         );
+        let missing = ann
+            .bookkeeper
+            .exception_class_variant("argument::ArgErr", "Missing")
+            .expect("Missing");
+        assert_eq!(missing.borrow().name, "argument::ArgErr::Missing");
+        let missing_host = missing.borrow().classdesc.borrow().pyobj.clone();
+        assert_eq!(
+            missing_host.class_bases(),
+            Some(std::slice::from_ref(&exc_host))
+        );
+        let again = ann
+            .bookkeeper
+            .intern_class_by_qualname("argument::ArgErr::Missing");
+        assert_eq!(again, missing_host);
+        assert_eq!(again.class_bases(), Some(std::slice::from_ref(&exc_host)));
     }
 }

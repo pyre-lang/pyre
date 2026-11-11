@@ -260,6 +260,15 @@ pub struct Assembler {
     /// `assembler.py` `Assembler` keeps `constants_r` on the assembler;
     /// these rows name the sentinel that pool writes into that vector.
     type_static_by_addr: Vec<(i64, String)>,
+    /// Names interned with no build-process address.
+    ///
+    /// A minted exception class has no `PyType` in the translator
+    /// process. Pushing a fake address into [`Self::type_static_by_addr`]
+    /// would let first-name-wins steal a real static's name when that
+    /// address later collides. Ordinals for these names start at `1 << 32`,
+    /// above any address-row ordinal. The runtime resolves `owner`, not
+    /// the ordinal.
+    type_static_names: Vec<String>,
     /// `(address, name)` rows for host-static refs (`HostStaticAddrs.refs`).
     /// Parallel to [`Self::type_static_by_addr`]: these rows name the
     /// `reloc_consts_r` descriptor the pool writes for a prebuilt GCREF.
@@ -298,6 +307,7 @@ impl Assembler {
             inline_jitcodes: indexmap::IndexMap::new(),
             inline_prebuild_seen: indexmap::IndexSet::new(),
             type_static_by_addr: Vec::new(),
+            type_static_names: Vec::new(),
             static_ref_by_addr: Vec::new(),
             live_ref_consts: None,
         }
@@ -319,6 +329,31 @@ impl Assembler {
                 self.type_static_by_addr.push((*addr, (*name).to_string()));
             }
         }
+    }
+
+    /// Intern `name` with no address.
+    ///
+    /// Does not push into [`Self::type_static_by_addr`]. A repeated name
+    /// keeps the first ordinal. The sentinel's low half is
+    /// `(1 << 32) + index`, disjoint from address-row ordinals.
+    pub fn intern_type_static_name(&mut self, name: &str) -> (u64, String) {
+        let index = match self
+            .type_static_names
+            .iter()
+            .position(|existing| existing == name)
+        {
+            Some(index) => index,
+            None => {
+                self.type_static_names.push(name.to_string());
+                self.type_static_names.len() - 1
+            }
+        };
+        // Bit 32 does not fit in a 32-bit `usize`. The sentinel is an
+        // `i64`, so the name-row ordinal is computed in `u64`.
+        let ordinal = (1u64 << 32) + index as u64;
+        debug_assert!(ordinal < (1u64 << 48), "too many type-static constants");
+        let sentinel = (TYPE_STATIC_CONST_SENTINEL_BASE as u64) | ordinal;
+        (sentinel, name.to_string())
     }
 
     /// The name [`Self::intern_type_static_addrs`] recorded for `addr`.

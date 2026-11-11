@@ -58,10 +58,11 @@ pub(crate) fn ll_chars_strcmp(left: &[u8], right: &[u8]) -> isize {
 pub use majit_rlib::lltypesystem::rlist::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock,
     alloc_typed_items_block_immortal, alloc_typed_items_block_nursery, gc_float_array_gc_type_id,
-    gc_int_array_gc_type_id, itemsblock_gc_enabled, set_gc_float_array_gc_type_id,
-    set_gc_int_array_gc_type_id, try_alloc_typed_items_block_nursery, try_typed_items_block_layout,
-    typed_items_block_capacity, typed_items_block_clear, typed_items_block_items_base,
-    typed_items_block_layout,
+    gc_int_array_gc_type_id, gc_object_items_array_gc_type_id, itemsblock_gc_enabled,
+    set_gc_float_array_gc_type_id, set_gc_int_array_gc_type_id,
+    set_gc_object_items_array_gc_type_id, try_alloc_typed_items_block_nursery,
+    try_typed_items_block_layout, typed_items_block_capacity, typed_items_block_clear,
+    typed_items_block_items_base, typed_items_block_layout,
 };
 
 /// GC type id for the variable-length backing block of
@@ -191,6 +192,17 @@ pub const ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
 // `majit_ir::helper_fnaddr::object_gcarray_slice` reads this layout.
 const _: () = assert!(
     ITEMS_BLOCK_LEN_OFFSET == 0 && ITEMS_BLOCK_ITEMS_OFFSET == std::mem::size_of::<usize>()
+);
+
+// The list-of-str payload is this block: length word, then pointer items
+// (`ll_fixed_length` / `getarraysize` at `len_offset`, `getarrayitem` at
+// `base_size + index * item_size`). `ItemsBlock` and the majit-rlib
+// object-items constants are that one shape.
+const _: () = assert!(
+    ITEMS_BLOCK_LEN_OFFSET == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_LEN_OFFSET
+        && ITEMS_BLOCK_ITEMS_OFFSET == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_OFFSET
+        && std::mem::size_of::<PyObjectRef>()
+            == majit_rlib::lltypesystem::rlist::OBJECT_ITEMS_ITEM_SIZE
 );
 
 /// Return the items base pointer (i.e. `&items[0]`) of an

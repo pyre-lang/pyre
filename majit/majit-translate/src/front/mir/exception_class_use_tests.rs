@@ -239,6 +239,43 @@ fn const_match_body(
     )
 }
 
+/// Full match, same shape as [`match_body`].
+///
+/// Disc 0 and 1 return constants. Disc 2 copies `field_place`. The
+/// panic-abort default is outside the lowered closure, so every variant
+/// has an arm and that default stays unreachable.
+fn read_variant_field_body(
+    scrutinee: Value,
+    scrutinee_ty: &Value,
+    field_place: Value,
+    field_ty: &Value,
+) -> Value {
+    let disc_ty = isize_disc_ty();
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, field_ty);
+    unstructured(
+        1,
+        vec![
+            named_local(0, None, field_ty),
+            named_local(1, Some("e"), scrutinee_ty),
+            named_local(2, None, &disc_ty),
+        ],
+        vec![
+            regular(
+                vec![assign(disc.clone(), json!({"Discriminant": scrutinee}))],
+                switch_int(disc, &[(1, 1), (2, 2), (0, 3)], 4),
+            ),
+            ret_block(vec![assign(ret.clone(), const_usize_use("1"))]),
+            ret_block(vec![assign(
+                ret.clone(),
+                json!({"Use": [{"Read": field_place}, "No"]}),
+            )]),
+            ret_block(vec![assign(ret, const_usize_use("0"))]),
+            regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+        ],
+    )
+}
+
 fn match_body(scrutinee: Value, scrutinee_ty: &Value, c_arm_place: Value) -> Value {
     let disc_ty = isize_disc_ty();
     let u = usize_ty();
@@ -494,7 +531,7 @@ fn fixture_llbc() -> majit_charon_reader::Llbc {
             match_values,
         ],
         vec![
-            marker(0, &["fixture", "synth", "_exception_class_E"], "C(B)"),
+            marker(0, &["fixture", "synth", "_exception_class_E"], "C(B) B(A)"),
             marker(1, &["fixture", "synth", "_exception_class_P"], ""),
             marker(2, &["fixture", "synth", "_exception_class_Q"], "C(B)"),
         ],
@@ -515,9 +552,7 @@ fn program_metadata(
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) {
-    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-        std::slice::from_ref(llbc),
-    );
+    let hints = super::super::llbc_exception_class_hints(llbc);
     let raw =
         crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
     let gc = super::super::harvest_declared_gc_facts(llbc).gc_struct_ids();
@@ -526,7 +561,7 @@ fn program_metadata(
         &gc,
         super::super::lltype::no_immutable_fields(),
         &raw,
-        &hints,
+        hints,
     );
     (known, fields, by_discr, origins, attrs)
 }
@@ -703,7 +738,11 @@ fn assert_isinstance_cascade(graph: &FunctionGraph, label: &str) {
     }
     assert_eq!(
         isinstance_chain(graph),
-        vec!["EC".to_string(), "EB".to_string(), "EA".to_string()],
+        vec![
+            "synth::E::C".to_string(),
+            "synth::E::B".to_string(),
+            "synth::E::A".to_string(),
+        ],
         "{label} children-first isinstance cascade; graph={}",
         graph.dump()
     );
@@ -877,6 +916,29 @@ fn opaque_string_decl(id: u64) -> Value {
     })
 }
 
+fn opaque_vec_decl(id: u64) -> Value {
+    json!({
+        "def_id": id,
+        "item_meta": super::window_meta(&["alloc", "vec", "Vec"], false),
+        "kind": "Opaque"
+    })
+}
+
+fn vec_adt_of(vec_id: u64, item_id: u64) -> Value {
+    json!({
+        "Adt": {
+            "id": vec_id,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [adt(item_id)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
 fn str_ref_ty() -> Value {
     json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]})
 }
@@ -944,8 +1006,11 @@ fn assert_coerce_then_setfield(graph: &FunctionGraph, source: &Variable) {
                 OpKind::FieldWrite {
                     field, value, ty, ..
                 } => {
+                    // `rewrite_op_setfield` retypes from the coerced value.
+                    // `Ptr(STR)` is GcRef, so the store's `ty` is `Ref`,
+                    // the same retarget a plain `Ptr(STR)` store gets.
                     field.name == "missing"
-                        && *ty == ValueType::Str
+                        && *ty == ValueType::Ref(None)
                         && matches!(value, LinkArg::Value(stored) if window[1].result.as_ref() == Some(stored))
                 }
                 _ => false,
@@ -1081,10 +1146,13 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     let llbc = fixture_llbc();
     let e = adt(0);
     let u = adt(2);
-    assert_eq!(paint(e.clone(), &llbc), ValueType::Ref(Some("E".into())));
+    assert_eq!(
+        paint(e.clone(), &llbc),
+        ValueType::Ref(Some("synth::E".into()))
+    );
     assert_eq!(
         paint(shared_ref(&e), &llbc),
-        ValueType::Ref(Some("E".into()))
+        ValueType::Ref(Some("synth::E".into()))
     );
     assert_eq!(paint(u, &llbc), ValueType::Ref(Some("synth::U".into())));
 
@@ -1099,20 +1167,21 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(origins.get("P").map(String::as_str), Some("synth"));
     assert_eq!(origins.get("Q").map(String::as_str), Some("synth"));
 
-    assert_rows(&fields, "EA", &[("n", "usize", false)]);
-    assert_rows(
-        &fields,
-        "EB",
-        &[("n", "usize", false), ("flag", "bool", false)],
-    );
-    assert_absent(&fields, "EC");
-    assert_absent(&fields, "ED");
+    assert_rows(&fields, "synth::E::A", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::E::B", &[("flag", "bool", false)]);
+    assert_absent(&fields, "synth::E::C");
+    assert_absent(&fields, "synth::E::D");
+    assert_absent(&fields, "EA");
+    assert_absent(&fields, "EB");
     assert_absent(&fields, "E");
     assert_absent(&fields, "synth::E");
     assert_absent(&fields, "fixture::synth::E");
-    assert_rows(&fields, "PT", &[("__pos_0", "usize", true)]);
-    assert_rows(&fields, "QB", &[("n", "usize", false)]);
-    assert_rows(&fields, "QC", &[("extra", "bool", false)]);
+    assert_rows(&fields, "synth::P::T", &[("__pos_0", "usize", true)]);
+    assert_rows(&fields, "synth::Q::B", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::Q::C", &[("extra", "bool", false)]);
+    assert_absent(&fields, "PT");
+    assert_absent(&fields, "QB");
+    assert_absent(&fields, "QC");
     assert_absent(&fields, "Q");
 
     for key in ["fixture::synth::U", "U", "synth::U"] {
@@ -1142,24 +1211,21 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert!(!by_discr.contains_key("Q"));
 
     assert_eq!(
-        attrs.get("EA"),
+        attrs.get("synth::E::A"),
         Some(&vec![("n".to_string(), ValueType::Unsigned)])
     );
     assert_eq!(
-        attrs.get("EB"),
-        Some(&vec![
-            ("n".to_string(), ValueType::Unsigned),
-            ("flag".to_string(), ValueType::Bool),
-        ])
+        attrs.get("synth::E::B"),
+        Some(&vec![("flag".to_string(), ValueType::Bool)])
     );
-    assert!(attrs.get("EC").is_none());
-    assert!(attrs.get("ED").is_none());
+    assert!(attrs.get("synth::E::C").is_none());
+    assert!(attrs.get("synth::E::D").is_none());
     assert_eq!(
-        attrs.get("PT"),
+        attrs.get("synth::P::T"),
         Some(&vec![("__pos_0".to_string(), ValueType::Unsigned)])
     );
     assert_eq!(
-        attrs.get("QC"),
+        attrs.get("synth::Q::C"),
         Some(&vec![("extra".to_string(), ValueType::Bool)])
     );
     let unmarked_a = attrs.get("synth::U::A").expect("unmarked variant attrs");
@@ -1196,7 +1262,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(
         field_writes(&build_b),
         vec![
-            ("n".to_string(), Some("synth::E::B".to_string())),
+            ("n".to_string(), Some("synth::E::A".to_string())),
             ("flag".to_string(), Some("synth::E::B".to_string())),
         ]
     );
@@ -1205,8 +1271,8 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(
         field_writes(&build_c),
         vec![
-            ("n".to_string(), Some("synth::E::C".to_string())),
-            ("flag".to_string(), Some("synth::E::C".to_string())),
+            ("n".to_string(), Some("synth::E::A".to_string())),
+            ("flag".to_string(), Some("synth::E::B".to_string())),
         ]
     );
     let build_d = lower(&llbc, "build_d");
@@ -1229,7 +1295,10 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
         let graph = lower(&llbc, name);
         assert_eq!(
             inputs(&graph),
-            vec![(ValueType::Ref(Some("E".into())), Some("E".into()))],
+            vec![(
+                ValueType::Ref(Some("synth::E".into())),
+                Some("synth::E".into()),
+            )],
             "{name} graph={}",
             graph.dump()
         );
@@ -1238,15 +1307,15 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     let match_e = lower(&llbc, "match_e");
     assert_isinstance_cascade(&match_e, "match_e");
     assert!(
-        true_edge_reaches_field(&match_e, "n", "EB"),
-        "C arm getattr n on EB; graph={}",
+        true_edge_reaches_field(&match_e, "n", "synth::E::A"),
+        "C arm getattr n on synth::E::A; graph={}",
         match_e.dump()
     );
     let classify = lower(&llbc, "classify");
     assert_isinstance_cascade(&classify, "classify");
     assert!(
-        true_edge_reaches_field(&classify, "n", "EB"),
-        "classify C arm getattr n on EB; graph={}",
+        true_edge_reaches_field(&classify, "n", "synth::E::A"),
+        "classify C arm getattr n on synth::E::A; graph={}",
         classify.dump()
     );
 
@@ -1269,6 +1338,8 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     );
 
     let call = lower(&llbc, "call_classify");
+    // `impl_method_owner` keys the method by the ADT name-path leaf.
+    // The exception class of the value is the Input's `synth::E`.
     let method = super::window_graph_ops(&call).into_iter().any(|op| {
         matches!(
             &op.kind,
@@ -1280,7 +1351,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     });
     assert!(
         method,
-        "classify stays getattr on class E; graph={}",
+        "classify stays getattr on struct leaf E; graph={}",
         call.dump()
     );
 }
@@ -1293,22 +1364,28 @@ fn exception_class_parent_arm_tests_the_child_first() {
     let names: Vec<&str> = arms.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
         names,
-        ["EC", "EB"],
+        ["synth::E::C", "synth::E::B"],
         "C ⊂ B is tested before B; graph={}",
         graph.dump()
     );
-    let ec = arms.iter().find(|(name, _)| name == "EC").expect("EC");
-    let eb = arms.iter().find(|(name, _)| name == "EB").expect("EB");
+    let ec = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::C")
+        .expect("synth::E::C");
+    let eb = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::B")
+        .expect("synth::E::B");
     assert_eq!(
         unsigned_reached(&graph, ec.1),
         Some(2),
-        "EC takes the otherwise arm; graph={}",
+        "synth::E::C takes the otherwise arm; graph={}",
         graph.dump()
     );
     assert_eq!(
         unsigned_reached(&graph, eb.1),
         Some(1),
-        "EB takes the B arm; graph={}",
+        "synth::E::B takes the B arm; graph={}",
         graph.dump()
     );
     let final_false = final_false.expect("otherwise edge");
@@ -1328,22 +1405,28 @@ fn exception_class_listed_child_keeps_its_arm() {
     let names: Vec<&str> = arms.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
         names,
-        ["EC", "EB", "EA"],
+        ["synth::E::C", "synth::E::B", "synth::E::A"],
         "children-first cascade elides the covered last arm; graph={}",
         graph.dump()
     );
-    let ec = arms.iter().find(|(name, _)| name == "EC").expect("EC");
-    let eb = arms.iter().find(|(name, _)| name == "EB").expect("EB");
+    let ec = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::C")
+        .expect("synth::E::C");
+    let eb = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::B")
+        .expect("synth::E::B");
     assert_eq!(
         unsigned_reached(&graph, ec.1),
         Some(2),
-        "EC takes the C arm; graph={}",
+        "synth::E::C takes the C arm; graph={}",
         graph.dump()
     );
     assert_eq!(
         unsigned_reached(&graph, eb.1),
         Some(1),
-        "EB takes the B arm; graph={}",
+        "synth::E::B takes the B arm; graph={}",
         graph.dump()
     );
     let final_false = final_false.expect("D is the false edge");
@@ -1369,7 +1452,7 @@ fn exception_class_non_one_word_field_panics() {
         vec![string_decl.clone()],
         vec![],
     );
-    assert_by_value_string_attr_is_rstr(&bad_str, "BadStrS");
+    assert_by_value_string_attr_is_rstr(&bad_str, "BadStr::S");
 
     let vec_adt = json!({
         "Adt": {
@@ -1393,28 +1476,102 @@ fn exception_class_non_one_word_field_panics() {
         "item_meta": super::window_meta(&["alloc", "string", "String"], false),
         "kind": "Opaque"
     });
-    let bad_vec = bad_enum_llbc("BadVec", vec_adt, vec![vec_decl, string_decl], vec![]);
-    expect_one_word_panic(&bad_vec, "BadVecS", "Vec<String>");
+    let bad_vec = bad_enum_llbc(
+        "BadVec",
+        vec_adt,
+        vec![vec_decl.clone(), string_decl],
+        vec![],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&bad_vec);
+    assert_rows(
+        &fields,
+        "BadVec::S",
+        &[("missing", crate::front::mir::RPY_LIST_OF_STR, false)],
+    );
+    assert_eq!(
+        attrs.get("BadVec::S"),
+        Some(&vec![(
+            "missing".to_string(),
+            ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+        )])
+    );
+    let (flag, kind, size) = crate::codewriter::call::get_type_flag(
+        crate::front::mir::RPY_LIST_OF_STR,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(flag, majit_ir::descr::ArrayFlag::Pointer);
+    assert_eq!(kind, majit_ir::value::Type::Ref);
+    assert_eq!(size, crate::layout::target_word_size());
 
-    let signature = super::interior_struct(
-        1,
+    let signature_for_vec = super::interior_struct(
+        2,
         &["fixture", "Signature"],
         &[("word", super::interior_usize())],
         8,
         &[0],
         false,
     );
-    let raw_marker = marker(1, &["fixture", "_alloc_flavor_Signature"], "raw");
-    let bad_sig = bad_enum_llbc("BadSig", adt(1), vec![signature.clone()], vec![raw_marker]);
-    expect_one_word_panic(&bad_sig, "BadSigS", "Signature");
-
-    let ok_sig = bad_enum_llbc("OkSig", adt(1), vec![signature], vec![]);
-    let (_, fields, _, _, _) = program_metadata(&ok_sig);
-    let rows = row_names(&fields, "OkSigS").expect("OkSigS");
-    assert!(
-        rows.iter().any(|(name, _, _)| name == "missing"),
-        "one-word struct field is placed, got {rows:?}"
+    let vec_of_sig = vec_adt_of(1, 2);
+    let bad_vec_sig = bad_enum_llbc(
+        "BadVecSig",
+        vec_of_sig,
+        vec![vec_decl, signature_for_vec],
+        vec![],
     );
+    expect_one_word_panic(&bad_vec_sig, "BadVecSig::S", "Vec<Signature>");
+
+    let bad_sig = bad_enum_llbc(
+        "BadSig",
+        adt(1),
+        signature_types(),
+        vec![signature_raw_marker()],
+    );
+    let ok_raw = bad_enum_llbc(
+        "OkRawPtr",
+        super::interior_raw_mut(adt(1)),
+        signature_types(),
+        vec![signature_raw_marker()],
+    );
+    let (_, bad_fields, _, _, bad_attrs) = program_metadata(&bad_sig);
+    let (_, raw_fields, _, _, raw_attrs) = program_metadata(&ok_raw);
+    let bad_row = missing_field_row(&bad_fields, "BadSig::S");
+    let raw_row = missing_field_row(&raw_fields, "OkRawPtr::S");
+    assert_eq!(bad_row.ty, "*mut Signature");
+    assert_eq!(bad_row.ty, raw_row.ty);
+    assert_eq!(bad_attrs.get("BadSig::S"), raw_attrs.get("OkRawPtr::S"));
+    assert_eq!(
+        bad_attrs.get("BadSig::S"),
+        Some(&vec![(
+            "missing".to_string(),
+            ValueType::Ref(Some("Signature".to_string()))
+        )])
+    );
+    let raw_set = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(&bad_sig),
+    );
+    let bad_flag = crate::codewriter::call::get_type_flag(&bad_row.ty, &raw_set);
+    let raw_flag = crate::codewriter::call::get_type_flag(&raw_row.ty, &raw_set);
+    assert_eq!(bad_flag, raw_flag);
+    assert_eq!(bad_flag.2, crate::layout::target_word_size());
+    let owned = bad_row
+        .raw_owned
+        .as_ref()
+        .expect("by-value raw-flavor struct is raw-owned");
+    assert_eq!(owned.type_path, "fixture::Signature");
+    assert!(owned.type_path.ends_with("Signature"));
+    assert_eq!(owned.size, 8);
+    assert_eq!(owned.align, 8);
+    assert!(raw_row.raw_owned.is_none());
+
+    let ok_sig = bad_enum_llbc("OkSig", adt(1), signature_types(), vec![]);
+    let (_, fields, _, _, _) = program_metadata(&ok_sig);
+    let ok_row = missing_field_row(&fields, "OkSig::S");
+    assert!(
+        !ok_row.ty.starts_with("*mut"),
+        "one-word struct field stays inline, got {}",
+        ok_row.ty
+    );
+    assert!(ok_row.raw_owned.is_none());
 
     let ok_ptr = bad_enum_llbc(
         "OkPtr",
@@ -1427,12 +1584,12 @@ fn exception_class_non_one_word_field_panics() {
         vec![],
     );
     let (_, fields, _, _, attrs) = program_metadata(&ok_ptr);
-    let rows = row_names(&fields, "OkPtrS").expect("OkPtrS");
+    let rows = row_names(&fields, "OkPtr::S").expect("OkPtr::S");
     assert!(
         rows.iter().any(|(name, _, _)| name == "missing"),
         "{rows:?}"
     );
-    assert_missing_field_not_str(&fields, &attrs, &["OkPtrS"]);
+    assert_missing_field_not_str(&fields, &attrs, &["OkPtr::S"]);
 }
 
 #[test]
@@ -1736,4 +1893,1702 @@ fn exception_class_unmarked_string_field_stays_rust_heap() {
         "a plain String field is not an rstr attr; graph={}",
         transformed.dump()
     );
+}
+
+#[test]
+fn two_marked_enums_with_the_same_leaf_are_distinct_classes() {
+    let n = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = super::window_llbc_with_globals(
+        vec![
+            enum_decl(
+                0,
+                &["fixture", "a", "E"],
+                vec![variant("A", vec![named_field("n", &n)], 0)],
+            ),
+            enum_decl(
+                1,
+                &["fixture", "b", "E"],
+                vec![variant("A", vec![named_field("n", &n)], 0)],
+            ),
+        ],
+        Vec::new(),
+        vec![
+            marker(0, &["fixture", "a", "_exception_class_E"], ""),
+            marker(1, &["fixture", "b", "_exception_class_E"], ""),
+        ],
+    );
+    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(&llbc),
+    );
+    let paths: Vec<_> = hints.iter().map(|hint| hint.enum_path.as_str()).collect();
+    assert_eq!(paths, ["a::E", "b::E"]);
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "a::E::A", &[("n", "i64", false)]);
+    assert_rows(&fields, "b::E::A", &[("n", "i64", false)]);
+    assert_absent(&fields, "a::E");
+    assert_absent(&fields, "b::E");
+    assert_absent(&fields, "E");
+    assert_absent(&fields, "EA");
+    assert_eq!(
+        attrs.get("a::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Int)])
+    );
+    assert_eq!(
+        attrs.get("b::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Int)])
+    );
+
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(std::rc::Rc::new(fields));
+    bk.mint_exception_class_hierarchies(&hints);
+    let a_base = bk.exception_class_base("a::E").expect("a::E");
+    let b_base = bk.exception_class_base("b::E").expect("b::E");
+    assert!(!std::rc::Rc::ptr_eq(&a_base, &b_base));
+    assert_eq!(a_base.borrow().name, "a::E");
+    assert_eq!(b_base.borrow().name, "b::E");
+    let a_var = bk.exception_class_variant("a::E", "A").expect("a::E::A");
+    let b_var = bk.exception_class_variant("b::E", "A").expect("b::E::A");
+    assert!(!std::rc::Rc::ptr_eq(&a_var, &b_var));
+    assert_eq!(a_var.borrow().name, "a::E::A");
+    assert_eq!(b_var.borrow().name, "b::E::A");
+    let a_host = a_base.borrow().classdesc.borrow().pyobj.clone();
+    let b_host = b_base.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(a_host, b_host);
+    assert_eq!(bk.intern_class_by_qualname("a::E"), a_host);
+    assert_eq!(bk.intern_class_by_qualname("b::E"), b_host);
+    let exception = crate::flowspace::model::HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    assert_eq!(a_host.class_bases(), Some(std::slice::from_ref(&exception)));
+    let again = bk.intern_class_by_qualname("a::E");
+    assert_eq!(again, a_host);
+    assert_eq!(again.class_bases(), Some(std::slice::from_ref(&exception)));
+    let a_var_host = a_var.borrow().classdesc.borrow().pyobj.clone();
+    let b_var_host = b_var.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(a_var_host, b_var_host);
+    assert_eq!(
+        a_var_host.class_bases(),
+        Some(std::slice::from_ref(&a_host))
+    );
+    assert_eq!(
+        b_var_host.class_bases(),
+        Some(std::slice::from_ref(&b_host))
+    );
+    assert_eq!(bk.intern_class_by_qualname("a::E::A"), a_var_host);
+    assert_eq!(bk.intern_class_by_qualname("b::E::A"), b_var_host);
+}
+
+#[test]
+fn marked_variant_keys_do_not_collide_across_declarations() {
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.mint_exception_class_hierarchies(&[
+        crate::front::llbc_hints::ExceptionClassHint::new("pkg::E", "", vec!["AB".into()]),
+        crate::front::llbc_hints::ExceptionClassHint::new("pkg::EA", "", vec!["B".into()]),
+    ]);
+    let ab = bk
+        .exception_class_variant("pkg::E", "AB")
+        .expect("pkg::E::AB");
+    let b = bk
+        .exception_class_variant("pkg::EA", "B")
+        .expect("pkg::EA::B");
+    assert!(!std::rc::Rc::ptr_eq(&ab, &b));
+    assert_eq!(ab.borrow().name, "pkg::E::AB");
+    assert_eq!(b.borrow().name, "pkg::EA::B");
+    let ab_host = ab.borrow().classdesc.borrow().pyobj.clone();
+    let b_host = b.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(ab_host, b_host);
+    assert_eq!(bk.intern_class_by_qualname("pkg::E::AB"), ab_host);
+    assert_eq!(bk.intern_class_by_qualname("pkg::EA::B"), b_host);
+}
+
+#[test]
+#[should_panic(expected = "already interned with bases")]
+fn minting_refuses_a_plain_class_under_the_declaration_key() {
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let _ = bk.intern_class_by_qualname("pkg::E");
+    bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint::new(
+        "pkg::E",
+        "",
+        vec!["A".into()],
+    )]);
+}
+
+#[test]
+#[should_panic(expected = "already interned as a different class object")]
+fn interning_a_different_arc_under_a_minted_key_panics() {
+    let hint = crate::front::llbc_hints::ExceptionClassHint::new("pkg::E", "", vec!["A".into()]);
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let exception = crate::flowspace::model::HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    let _ = bk.intern_class_by_qualname_with_bases("pkg::E", vec![exception]);
+    bk.mint_exception_class_hierarchies(&[hint]);
+}
+
+#[test]
+fn isinstance_constref_is_the_harvested_class_object() {
+    let llbc = fixture_llbc();
+    let graph = lower(&llbc, "match_e");
+    let hints = super::super::llbc_exception_class_hints(&llbc);
+    let hint = hints
+        .iter()
+        .find(|hint| hint.enum_path == "synth::E")
+        .expect("harvested E");
+    let mut id = graph.startblock;
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let block = graph.block(id);
+        let Some(host) = block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::ConstRef(host) if host.is_class() => Some(host.clone()),
+            _ => None,
+        }) else {
+            break;
+        };
+        let expected = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(_, candidate)| candidate == &host)
+            .map(|(_, candidate)| candidate.clone());
+        let Some(expected) = expected else {
+            panic!(
+                "isinstance host {} is not a variant of the harvested hierarchy",
+                host.qualname()
+            );
+        };
+        assert_eq!(host, expected);
+        seen.push(host.qualname().to_string());
+        let Some(next) = block
+            .exits
+            .iter()
+            .find_map(|link| (link.exitcase == Some(ExitCase::Bool(false))).then_some(link.target))
+        else {
+            break;
+        };
+        id = next;
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "synth::E::C".to_string(),
+            "synth::E::B".to_string(),
+            "synth::E::A".to_string(),
+        ]
+    );
+}
+
+fn lowering_state(llbc: &majit_charon_reader::Llbc) -> super::super::CrateLoweringState {
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    super::super::CrateLoweringState::new(
+        llbc,
+        &std::collections::HashSet::new(),
+        std::collections::HashMap::new(),
+        Default::default(),
+        &gc,
+        &raw,
+        None,
+        None,
+    )
+}
+
+/// Artefact B carries a copied `E` and a function that takes `E`. Seeded
+/// with A's marker plus B's own harvest, B paints the declaration key and
+/// registers no tagged rows and no variant-field rows.
+#[test]
+fn copied_marked_enum_uses_the_program_wide_hint() {
+    let defining = super::window_llbc_with_globals(
+        vec![payload_enum(0, "E")],
+        Vec::new(),
+        vec![marker(0, &["fixture", "synth", "_exception_class_E"], "")],
+    );
+    let e_ty = adt(0);
+    let mut copied_enum = payload_enum(0, "E");
+    copied_enum["item_meta"] = super::window_meta(&["fixture", "synth", "E"], false);
+    let take_e = super::window_opaque_fun(
+        1,
+        &["fixture", "synth", "take_e"],
+        vec![e_ty.clone()],
+        e_ty.clone(),
+    );
+    let copied = super::window_llbc_with_globals(vec![copied_enum], vec![take_e], Vec::new());
+
+    let mut hints = Vec::new();
+    crate::front::llbc_hints::extend_program_exception_class_hints(
+        &mut hints,
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            &defining,
+        )),
+    );
+    crate::front::llbc_hints::extend_program_exception_class_hints(
+        &mut hints,
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            &copied,
+        )),
+    );
+    super::super::seed_program_exception_class_hints(&copied, hints);
+
+    let parsed: TyRef = serde_json::from_value(e_ty).expect("E ty");
+    assert_eq!(
+        super::super::lltype::tyref_exception_class_key(&parsed, &copied).as_deref(),
+        Some("synth::E")
+    );
+
+    let state_a = lowering_state(&defining);
+    let mut state_b = lowering_state(&copied);
+    for key in ["E", "synth::E", "fixture::synth::E"] {
+        if let Some(rows) = state_b.struct_fields().fields.get(key) {
+            assert!(
+                rows.iter().all(|row| row.name != "__discriminant"),
+                "{key} registered __discriminant"
+            );
+        }
+    }
+    for key in [
+        "synth::E::A",
+        "fixture::synth::E::A",
+        "E::A",
+        "synth::E::B",
+        "fixture::synth::E::B",
+        "E::B",
+    ] {
+        assert!(
+            state_b.struct_fields().fields.get(key).is_none(),
+            "{key} registered rows on the copy"
+        );
+    }
+
+    state_b.absorb_struct_fields(state_a.struct_fields());
+    let program_a = state_a.finish(Vec::new());
+    let program_b = state_b.finish(Vec::new());
+    assert_eq!(program_a.exception_class_hints.len(), 1);
+    assert_eq!(program_a.exception_class_hints[0].enum_path, "synth::E");
+    assert_rows(
+        &program_a.struct_fields,
+        "synth::E::A",
+        &[("n", "usize", false)],
+    );
+    assert!(program_b.exception_class_hints.is_empty());
+    assert_rows(
+        &program_b.struct_fields,
+        "synth::E::A",
+        &[("n", "usize", false)],
+    );
+    for key in ["E", "synth::E", "fixture::synth::E"] {
+        assert!(
+            !program_b.enum_variant_by_discriminant.contains_key(key),
+            "{key} registered enum_variant_by_discriminant"
+        );
+        if let Some(rows) = program_b.struct_fields.fields.get(key) {
+            assert!(
+                rows.iter().all(|row| row.name != "__discriminant"),
+                "{key} registered __discriminant"
+            );
+        }
+    }
+}
+
+/// `C(B) B(A)`, `n` on A and C, none on B. The row lives on A, and a
+/// read of C's `n` names that same owner.
+#[test]
+fn exception_class_field_read_skips_a_non_declaring_parent() {
+    let e = adt(0);
+    let u_size = usize_ty();
+    let flag = bool_ty();
+    let enum_ty = enum_decl(
+        0,
+        &["fixture", "synth", "E"],
+        vec![
+            variant("A", vec![named_field("n", &u_size)], 0),
+            variant("B", vec![named_field("flag", &flag)], 1),
+            variant("C", vec![named_field("n", &u_size)], 2),
+        ],
+    );
+    let match_c = fun(
+        0,
+        &["fixture", "synth", "match_c"],
+        vec![e.clone()],
+        u_size.clone(),
+        read_variant_field_body(
+            local_place(1, &e),
+            &e,
+            downcast_field(local_place(1, &e), &e, 2, 0, &u_size),
+            &u_size,
+        ),
+    );
+    let llbc = super::window_llbc_with_globals(
+        vec![enum_ty],
+        vec![match_c],
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "C(B) B(A)",
+        )],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "synth::E::A", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::E::B", &[("flag", "bool", false)]);
+    assert_absent(&fields, "synth::E::C");
+    assert_absent(&fields, "synth::E");
+    let mut n_owners: Vec<&str> = fields
+        .fields
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|row| row.name == "n"))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    n_owners.sort();
+    assert_eq!(n_owners, vec!["synth::E::A"]);
+    assert_eq!(
+        attrs.get("synth::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Unsigned)])
+    );
+    assert_eq!(
+        attrs.get("synth::E::B"),
+        Some(&vec![("flag".to_string(), ValueType::Bool)])
+    );
+    assert!(attrs.get("synth::E::C").is_none());
+    let graph = lower(&llbc, "match_c");
+    assert!(
+        true_edge_reaches_field(&graph, "n", "synth::E::A"),
+        "C arm getattr n on synth::E::A; graph={}",
+        graph.dump()
+    );
+}
+
+/// Owner `x: i64`, subclass `x: isize`. `ClassDef._generalize_attr`
+/// merges both signed integers onto the owner; the subclass has no row.
+#[test]
+fn exception_class_inherited_i64_isize_merges_on_owner() {
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let isize_ty = isize_disc_ty();
+    let llbc = super::window_llbc_with_globals(
+        vec![enum_decl(
+            0,
+            &["fixture", "synth", "E"],
+            vec![
+                variant("A", vec![named_field("x", &i64_ty)], 0),
+                variant("B", vec![named_field("x", &isize_ty)], 1),
+            ],
+        )],
+        Vec::new(),
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "B(A)",
+        )],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "synth::E::A", &[("x", "i64", false)]);
+    assert_absent(&fields, "synth::E::B");
+    assert_absent(&fields, "synth::E");
+    let row = &fields.fields["synth::E::A"][0];
+    let raw = std::collections::HashSet::new();
+    assert_eq!(
+        crate::codewriter::call::get_type_flag(&row.ty, &raw),
+        crate::codewriter::call::get_type_flag("isize", &raw),
+        "i64 and isize are one signed integer"
+    );
+    assert!(row.raw_owned.is_none());
+    assert_eq!(
+        attrs.get("synth::E::A"),
+        Some(&vec![("x".to_string(), ValueType::Int)])
+    );
+    assert!(attrs.get("synth::E::B").is_none());
+    let mut owners: Vec<&str> = fields
+        .fields
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|candidate| candidate.name == "x"))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, vec!["synth::E::A"]);
+}
+
+#[test]
+#[should_panic(expected = "exception class synth::E::A.x: field type i64 ∪ String")]
+fn exception_class_inherited_field_type_mismatch_panics() {
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let string_ty = adt(1);
+    let llbc = super::window_llbc_with_globals(
+        vec![
+            enum_decl(
+                0,
+                &["fixture", "synth", "E"],
+                vec![
+                    variant("A", vec![named_field("x", &i64_ty)], 0),
+                    variant("B", vec![named_field("x", &string_ty)], 1),
+                ],
+            ),
+            opaque_string_decl(1),
+        ],
+        Vec::new(),
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "B(A)",
+        )],
+    );
+    let _ = program_metadata(&llbc);
+}
+
+fn list_of_str_helper_addr() -> i64 {
+    crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+        "lltypesystem",
+        "rlist",
+        "jit_ll_list_str_from_rust_vec",
+    ]))
+}
+
+fn names_list_of_str_helper(graph: &FunctionGraph) -> bool {
+    let expected = list_of_str_helper_addr();
+    super::window_graph_ops(graph)
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == expected))
+}
+
+fn assert_list_coerce_then_setfield(graph: &FunctionGraph, source: &Variable) {
+    let expected = list_of_str_helper_addr();
+    let mut found = false;
+    for block in &graph.blocks {
+        let ops = &block.operations;
+        for window in ops.windows(4) {
+            let addr = matches!(
+                &window[0].kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected
+            );
+            let OpKind::CallResidual { args_r, .. } = &window[1].kind else {
+                continue;
+            };
+            let live = matches!(window[2].kind, OpKind::Live { .. });
+            let write = match &window[3].kind {
+                OpKind::FieldWrite {
+                    field, value, ty, ..
+                } => {
+                    field.name == "missing"
+                        && *ty == ValueType::Ref(None)
+                        && matches!(value, LinkArg::Value(stored) if window[1].result.as_ref() == Some(stored))
+                }
+                _ => false,
+            };
+            if addr && args_r == &vec![source.clone()] && live && write {
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "rust-heap Vec<String> is converted to the list before setfield; graph={}",
+        graph.dump()
+    );
+}
+
+fn assert_rpy_list_of_str_is_fixed_list()
+-> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::annotator::model::SomeValue;
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let projected = bk.project_struct_field_type(crate::front::mir::RPY_LIST_OF_STR);
+    let SomeValue::List(list) = &projected else {
+        panic!("rpy_list_of_str projects to {projected:?}");
+    };
+    {
+        let item = list.listdef.listitem_rc();
+        let item = item.borrow();
+        assert!(!item.resized, "the list is unresized");
+        assert!(!item.mutated, "the list is not mutated");
+        assert_eq!(item.s_value, crate::annotator::model::s_str0());
+    }
+    let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+    let rtyper = std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(&ann));
+    rtyper.initialize_exceptiondata().expect("exceptiondata");
+    let repr = crate::translator::rtyper::rmodel::rtyper_makerepr(&projected, &rtyper)
+        .expect("SomeList rtyper_makerepr");
+    assert_eq!(repr.class_name(), "FixedSizeListRepr");
+    // `externalvsinternal(..., gcref=True)` wraps `Ptr(STR)` as `GCREF`,
+    // so the list pointer is `Ptr(GcArray(GCREF))`, not `Ptr(GcArray(Ptr(STR)))`.
+    let ll = crate::translator::rtyper::rlist::list_of_str_lltype();
+    assert_eq!(repr.lowleveltype(), &ll);
+    let helper = crate::translator::rtyper::rlist::build_ll_fixed_length_helper_graph(
+        "ll_fixed_length",
+        ll.clone(),
+    )
+    .expect("ll_fixed_length");
+    let graph = helper.graph.borrow();
+    let block = graph.startblock.borrow();
+    assert!(
+        block
+            .operations
+            .iter()
+            .any(|op| op.opname == "getarraysize"),
+        "ll_fixed_length is getarraysize"
+    );
+    ll
+}
+
+fn enum_vec_string_field_llbc(
+    leaf: &str,
+    marked: bool,
+    funs: Vec<Value>,
+) -> majit_charon_reader::Llbc {
+    let vec_ty = vec_adt_of(1, 2);
+    let types = vec![
+        enum_decl(
+            0,
+            &["fixture", leaf],
+            vec![variant("S", vec![named_field("missing", &vec_ty)], 0)],
+        ),
+        opaque_vec_decl(1),
+        opaque_string_decl(2),
+    ];
+    let globals = if marked {
+        vec![marker(
+            0,
+            &["fixture", &format!("_exception_class_{leaf}")],
+            "",
+        )]
+    } else {
+        Vec::new()
+    };
+    super::window_llbc_with_globals(types, funs, globals)
+}
+
+fn vec_string_len_reader(enum_leaf: &str, fun_id: u64, len_fun_id: u64) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let vec_ty = vec_adt_of(1, 2);
+    let out = usize_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &vec_ty);
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    fun(
+        fun_id,
+        &["fixture", enum_leaf, "len_missing"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(vec![], call_regular(len_fun_id, field, ret, 3, 2)),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+fn vec_len_fun(id: u64) -> Value {
+    super::window_opaque_fun(
+        id,
+        &["alloc", "vec", "<Impl>", "len"],
+        vec![vec_adt_of(1, 2)],
+        usize_ty(),
+    )
+}
+
+#[test]
+fn exception_class_vec_string_attr_coerces_rust_heap_on_write() {
+    let vec_ty = vec_adt_of(1, 2);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![build]);
+    let _list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert_eq!(
+        writes[0].0,
+        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "front stores the attr as the list word; graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand is still the rust-heap local; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !names_list_of_str_helper(&graph),
+        "the copy is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let found = inputs(&graph);
+    assert!(
+        found.iter().any(|(ty, root)| {
+            matches!(ty, ValueType::Ref(Some(name)) if name == "Vec<String>")
+                || root.as_deref() == Some("Vec<String>")
+        }),
+        "the local stays a rust-heap header so the copy has a source; inputs={found:?}"
+    );
+    let transformed = transform_graph(&graph);
+    assert_list_coerce_then_setfield(&transformed, &source);
+}
+
+#[test]
+fn exception_class_vec_string_len_is_fixed_list_length() {
+    let list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let len_fun = vec_len_fun(0);
+    let reader = vec_string_len_reader("BadVec", 1, 0);
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![len_fun, reader]);
+    let graph = lower(&llbc, "len_missing");
+    let reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "missing" && field.vec_part.is_none()
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{}", graph.dump());
+    let OpKind::FieldRead { field, ty, .. } = &reads[0].kind else {
+        unreachable!("filtered to FieldRead");
+    };
+    assert!(
+        !field.inline_vec,
+        "the list word is not an inline Vec header"
+    );
+    assert_eq!(
+        *ty,
+        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+    );
+    let produced = reads[0].result.as_ref().expect("field read result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&list_ll),
+        "the getattr word is the FixedSizeListRepr pointer; graph={}",
+        graph.dump()
+    );
+    let len_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("__len"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(len_calls.len(), 1, "{}", graph.dump());
+    let OpKind::Call { args, .. } = &len_calls[0].kind else {
+        unreachable!("filtered to Call");
+    };
+    assert!(
+        matches!(args.first(), Some(LinkArg::Value(value)) if Some(value) == reads[0].result.as_ref()),
+        "len's receiver is the list word; graph={}",
+        graph.dump()
+    );
+    let len_parts = super::window_graph_ops(&graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "missing" && field.vec_part == Some(crate::model::VecFieldPart::Len)
+        )
+    });
+    assert!(
+        !len_parts,
+        "missing.len() is not the rust header length word; graph={}",
+        graph.dump()
+    );
+}
+
+fn slice_join_fun(id: u64) -> Value {
+    super::window_opaque_fun(
+        id,
+        &["alloc", "slice", "<Impl>", "join"],
+        vec![vec_adt_of(1, 2), str_ref_ty()],
+        str_ref_ty(),
+    )
+}
+
+fn vec_string_join_reader(enum_leaf: &str, fun_id: u64, join_fun_id: u64) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let vec_ty = vec_adt_of(1, 2);
+    let out = str_ref_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &vec_ty);
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    let sep = json!({"Const": [{"Str": ", "}, str_ref_ty()]});
+    fun(
+        fun_id,
+        &["fixture", enum_leaf, "getmsg"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(
+                    vec![],
+                    json!({"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": join_fun_id},
+                            "generics": super::window_empty_generics()
+                        }},
+                        "args": [{"Read": field}, sep]
+                    }, "dest": ret, "target": 3, "on_unwind": 2}}),
+                ),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+/// `posonly_kwds.join(", ")` on a marked exception's `Vec<String>` attr
+/// is `<[S]>::join`. The list word stays `list_of_str`, and the adapter
+/// rewrites that call to `str.join` (`rtype_method_join`).
+#[test]
+fn exception_class_vec_string_join_lowers_to_str_join() {
+    use crate::flowspace::model::Hlvalue;
+    let list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let join_fun = slice_join_fun(0);
+    let reader = vec_string_join_reader("BadVec", 1, 0);
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![join_fun, reader]);
+    let graph = lower(&llbc, "getmsg");
+    let join_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let n = segments.len();
+                n >= 3
+                    && segments[n - 3] == "slice"
+                    && segments[n - 2] == "<Impl>"
+                    && segments[n - 1] == "join"
+            }
+            _ => false,
+        })
+        .collect();
+    assert_eq!(join_calls.len(), 1, "{}", graph.dump());
+    let OpKind::Call { args, .. } = &join_calls[0].kind else {
+        unreachable!("filtered to Call");
+    };
+    let Some(LinkArg::Value(receiver)) = args.first() else {
+        panic!("join receiver is the list word; graph={}", graph.dump());
+    };
+    assert_eq!(
+        receiver.concretetype().as_ref(),
+        Some(&list_ll),
+        "join receiver concretetype {}; graph={}",
+        receiver
+            .concretetype()
+            .map(|ty| format!("{ty:?}"))
+            .unwrap_or_else(|| "none".to_string()),
+        graph.dump()
+    );
+
+    let registry = crate::translator::rtyper::call_registry::CallRegistry::new(std::rc::Rc::new(
+        crate::annotator::bookkeeper::Bookkeeper::new(),
+    ));
+    let mut value_map = std::collections::HashMap::new();
+    let result = join_calls[0].result.clone().expect("join result");
+    let result_hl = Hlvalue::Variable(Variable::new());
+    value_map.insert(result, result_hl.clone());
+    let mut arg_hls = Vec::new();
+    for arg in args {
+        match arg {
+            LinkArg::Value(var) => {
+                let hl = Hlvalue::Variable(Variable::new());
+                value_map.insert(var.clone(), hl.clone());
+                arg_hls.push(hl);
+            }
+            LinkArg::Const(constant) => arg_hls.push(Hlvalue::Constant(constant.clone())),
+        }
+    }
+    let translated = crate::translator::rtyper::flowspace_adapter::translate_op(
+        join_calls[0],
+        &value_map,
+        &registry,
+    )
+    .unwrap_or_else(|err| panic!("{err}; graph={}", graph.dump()));
+    assert_eq!(translated.len(), 2, "{}", graph.dump());
+    assert_eq!(translated[0].opname, "getattr");
+    assert_eq!(translated[0].args[0], arg_hls[1]);
+    let Hlvalue::Constant(method) = &translated[0].args[1] else {
+        panic!("method name is a Constant");
+    };
+    assert_eq!(method.value.as_text(), Some("join"));
+    assert_eq!(translated[1].opname, "simple_call");
+    assert_eq!(translated[1].args[0], translated[0].result);
+    assert_eq!(translated[1].args[1], arg_hls[0]);
+    assert_eq!(translated[1].result, result_hl);
+}
+
+#[test]
+fn exception_class_unmarked_vec_string_field_stays_three_words() {
+    let vec_ty = vec_adt_of(1, 2);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let len_fun = vec_len_fun(1);
+    let reader = vec_string_len_reader("Plain", 2, 1);
+    let unmarked = enum_vec_string_field_llbc("Plain", false, vec![build, len_fun, reader]);
+    let (_, fields, _, _, attrs) = program_metadata(&unmarked);
+    let mut saw_row = false;
+    for key in ["Plain::S", "fixture::Plain::S", "synth::Plain::S"] {
+        let Some(rows) = row_names(&fields, key) else {
+            continue;
+        };
+        for (name, ty, _) in &rows {
+            if name == "missing" {
+                saw_row = true;
+                assert_eq!(ty.as_str(), "Vec<String>", "{key} row {rows:?}");
+            }
+        }
+        let Some(attr_rows) = attrs.get(key) else {
+            continue;
+        };
+        for (name, ty) in attr_rows {
+            if name == "missing" {
+                assert_ne!(
+                    *ty,
+                    ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+                    "{key} attr {attr_rows:?}"
+                );
+            }
+        }
+    }
+    assert!(saw_row, "unmarked Vec<String> row absent");
+    let (flag, kind, size) =
+        crate::codewriter::call::get_type_flag("Vec<String>", &std::collections::HashSet::new());
+    assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
+    assert_eq!(kind, majit_ir::value::Type::Ref);
+    assert_eq!(size, 3 * crate::layout::target_word_size());
+
+    let graph = lower(&unmarked, "build_s");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "an unmarked enum keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_list_of_str_helper(&transformed),
+        "no coerce without the exception-class flag; graph={}",
+        transformed.dump()
+    );
+
+    let len_graph = lower(&unmarked, "len_missing");
+    // `.len()` of an unmarked inline `Vec` is the header length word.
+    // The whole-header read is not kept when nothing else consumes it.
+    let inline_header = super::window_graph_ops(&len_graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "missing"
+                    && field.inline_vec
+                    && *ty != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+        )
+    });
+    assert!(
+        inline_header,
+        "unmarked read keeps the inline Vec; graph={}",
+        len_graph.dump()
+    );
+    let len_part = super::window_graph_ops(&len_graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "missing" && field.vec_part == Some(crate::model::VecFieldPart::Len)
+        )
+    });
+    assert!(
+        len_part,
+        "unmarked len is the header length word; graph={}",
+        len_graph.dump()
+    );
+    let calls_len = super::window_graph_ops(&len_graph)
+        .iter()
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("__len"),
+            _ => false,
+        });
+    assert!(
+        !calls_len,
+        "unmarked len is not Call __len; graph={}",
+        len_graph.dump()
+    );
+
+    let holder_ty = adt(0);
+    let holder = super::interior_struct(
+        0,
+        &["fixture", "Holder"],
+        &[("missing", vec_ty.clone())],
+        24,
+        &[0],
+        false,
+    );
+    let build_holder = build_struct_aggregate(
+        0,
+        "build_holder",
+        0,
+        &holder_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let plain = super::window_llbc_with_globals(
+        vec![holder, opaque_vec_decl(1), opaque_string_decl(2)],
+        vec![build_holder],
+        Vec::new(),
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&plain);
+    for key in ["Holder", "fixture::Holder"] {
+        if let Some(rows) = row_names(&fields, key) {
+            for (name, ty, _) in &rows {
+                if name == "missing" {
+                    assert_eq!(ty.as_str(), "Vec<String>", "{key} row {rows:?}");
+                }
+            }
+        }
+        if let Some(rows) = attrs.get(key) {
+            for (name, ty) in rows {
+                if name == "missing" {
+                    assert_ne!(
+                        *ty,
+                        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+                        "{key} attr {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+    let graph = lower(&plain, "build_holder");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "a plain struct keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_list_of_str_helper(&transformed),
+        "a plain Vec<String> field is not a list-of-str attr; graph={}",
+        transformed.dump()
+    );
+}
+
+fn signature_string_decl() -> Value {
+    json!({
+        "def_id": 2,
+        "item_meta": super::window_meta(&["alloc", "string", "String"], false),
+        "kind": "Opaque"
+    })
+}
+
+/// One-word layout. The field is `alloc::string::String`, a GC container,
+/// so the struct's `_gckind` stays Gc and `*mut Signature` is the
+/// flavor-raw class root (`ValueType::Ref` on the attr and the read).
+/// The raw-owned store writes that pointer as `ValueType::Unsigned`
+/// (`descr.py get_type_flag`).
+fn signature_struct() -> Value {
+    super::interior_struct(
+        1,
+        &["fixture", "Signature"],
+        &[("word", adt(2))],
+        8,
+        &[0],
+        false,
+    )
+}
+
+fn signature_types() -> Vec<Value> {
+    vec![signature_struct(), signature_string_decl()]
+}
+
+fn signature_raw_marker() -> Value {
+    marker(1, &["fixture", "_alloc_flavor_Signature"], "raw")
+}
+
+fn missing_field_row<'a>(
+    fields: &'a crate::front::semantic::StructFieldRegistry,
+    key: &str,
+) -> &'a crate::front::semantic::FieldRow {
+    fields
+        .fields
+        .get(key)
+        .and_then(|rows| rows.iter().find(|row| row.name == "missing"))
+        .unwrap_or_else(|| panic!("{key} has no missing row"))
+}
+
+fn names_raw_box(graph: &FunctionGraph) -> bool {
+    super::window_graph_ops(graph).iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::ConstFnAddr { path, .. } if path.contains("jit_ll_box_raw_moved")
+        )
+    })
+}
+
+fn transform_with_fields(
+    graph: &FunctionGraph,
+    fields: crate::front::semantic::StructFieldRegistry,
+    helper: Option<&str>,
+) -> FunctionGraph {
+    let mut cc = crate::call::CallControl::new();
+    cc.set_struct_fields(fields);
+    let mut config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    if let Some(helper) = helper {
+        config.raw_owned_box_helper = helper.to_string();
+    }
+    crate::codewriter::jtransform::Transformer::new(&config)
+        .with_callcontrol(&mut cc)
+        .transform(graph)
+        .graph
+}
+
+fn const_int_of(ops: &[crate::model::SpaceOperation], var: &Variable) -> Option<(usize, i64)> {
+    ops.iter()
+        .enumerate()
+        .find_map(|(index, op)| match &op.kind {
+            OpKind::ConstInt(value) if op.result.as_ref() == Some(var) => Some((index, *value)),
+            _ => None,
+        })
+}
+
+fn assert_raw_box_then_setfield(graph: &FunctionGraph, source: &Variable, size: i64, align: i64) {
+    let mut found = false;
+    for block in &graph.blocks {
+        let ops = &block.operations;
+        for (index, op) in ops.iter().enumerate() {
+            let OpKind::CallResidual {
+                args_r,
+                args_i,
+                funcptr,
+                descriptor,
+                result_kind,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args_r.is_empty() || args_i.len() != 3 || &args_i[0] != source {
+                continue;
+            }
+            let crate::model::CallFuncPtr::Value(func_var) = funcptr else {
+                continue;
+            };
+            let Some(def_index) = ops[..index]
+                .iter()
+                .rposition(|earlier| earlier.result.as_ref() == Some(func_var))
+            else {
+                continue;
+            };
+            let OpKind::ConstFnAddr { path, .. } = &ops[def_index].kind else {
+                continue;
+            };
+            if !path.contains("jit_ll_box_raw_moved") {
+                continue;
+            }
+            let Some((size_index, size_value)) = const_int_of(&ops[..index], &args_i[1]) else {
+                continue;
+            };
+            let Some((align_index, align_value)) = const_int_of(&ops[..index], &args_i[2]) else {
+                continue;
+            };
+            assert_eq!(size_value, size, "{}", graph.dump());
+            assert_eq!(align_value, align, "{}", graph.dump());
+            assert!(
+                size_index < align_index && align_index < def_index,
+                "size, align, then the helper; graph={}",
+                graph.dump()
+            );
+            assert_eq!(*result_kind, 'i', "{}", graph.dump());
+            assert_eq!(descriptor.result_type, 'i', "{}", graph.dump());
+            assert_eq!(
+                descriptor.result_ir_type(),
+                majit_ir::value::Type::Int,
+                "{}",
+                graph.dump()
+            );
+            assert_eq!(descriptor.arg_classes, "iii", "{}", graph.dump());
+            assert!(
+                index + 2 < ops.len(),
+                "helper, live, then the store; graph={}",
+                graph.dump()
+            );
+            assert!(
+                matches!(ops[index + 1].kind, OpKind::Live { .. }),
+                "graph={}",
+                graph.dump()
+            );
+            let OpKind::FieldWrite {
+                field, value, ty, ..
+            } = &ops[index + 2].kind
+            else {
+                panic!("the store follows live; graph={}", graph.dump());
+            };
+            let boxed = op.result.as_ref().expect("boxed pointer");
+            assert_eq!(
+                FunctionGraph::concretetype_of(boxed),
+                crate::model::ConcreteType::Signed,
+                "raw pointer is int kind; graph={}",
+                graph.dump()
+            );
+            assert_eq!(field.name, "missing");
+            assert!(
+                matches!(value, LinkArg::Value(stored) if stored == boxed),
+                "the store operand is the boxed pointer; graph={}",
+                graph.dump()
+            );
+            assert_eq!(
+                *ty,
+                ValueType::Unsigned,
+                "stored ty {ty:?}; graph={}",
+                graph.dump()
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "raw-owned store boxes the moved value; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !field_writes(graph).iter().any(|(name, _)| name == "word"),
+        "the projection does not copy the struct leaf; graph={}",
+        graph.dump()
+    );
+}
+
+fn read_missing_fun(enum_leaf: &str, by_value: bool) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let sig_ty = adt(1);
+    let field_ty = if by_value {
+        sig_ty.clone()
+    } else {
+        super::interior_raw_mut(sig_ty.clone())
+    };
+    let borrow_ty = shared_ref(&sig_ty);
+    let out = usize_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &field_ty);
+    let place = if by_value {
+        field
+    } else {
+        super::window_place(json!({"Projection": [field, "Deref"]}), &sig_ty)
+    };
+    let borrowed = json!({"Ref": {"place": place, "kind": "Shared", "ptr_metadata": null}});
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    let tmp = local_place(3, &borrow_ty);
+    fun(
+        1,
+        &["fixture", enum_leaf, "read_missing"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+                named_local(3, None, &borrow_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(
+                    vec![assign(tmp.clone(), borrowed)],
+                    call_regular(0, tmp, ret, 3, 2),
+                ),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+struct SigFieldRead {
+    ty: ValueType,
+    inline_vec: bool,
+    taken_by_address: bool,
+    concretetype: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+    result: Variable,
+}
+
+fn sig_field_read(graph: &FunctionGraph) -> SigFieldRead {
+    let reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "missing"
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{}", graph.dump());
+    let OpKind::FieldRead { field, ty, .. } = &reads[0].kind else {
+        unreachable!("filtered to FieldRead");
+    };
+    let result = reads[0].result.clone().expect("field read result");
+    SigFieldRead {
+        ty: ty.clone(),
+        inline_vec: field.inline_vec,
+        taken_by_address: field.taken_by_address,
+        concretetype: result.concretetype(),
+        result,
+    }
+}
+
+fn use_sig_receiver(graph: &FunctionGraph) -> Variable {
+    super::window_graph_ops(graph)
+        .into_iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, args, .. } => {
+                let leaf = match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.last().map(String::as_str)
+                    }
+                    CallTarget::Method { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                if leaf != Some("use_sig") {
+                    return None;
+                }
+                match args.first() {
+                    Some(LinkArg::Value(value)) => Some(value.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("use_sig call; graph={}", graph.dump()))
+}
+
+#[test]
+fn exception_class_raw_owned_attr_boxes_on_write() {
+    let sig_ty = adt(1);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[sig_ty.clone()],
+        vec![copy_of(local_place(1, &sig_ty))],
+    );
+    let llbc = bad_enum_with_funs(
+        "BadSig",
+        sig_ty,
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![build],
+    );
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert_eq!(
+        writes[0].0,
+        ValueType::Unsigned,
+        "front stores the raw pointer as an unsigned word; graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand is still the moved value; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !field_writes(&graph).iter().any(|(name, _)| name == "word"),
+        "front does not copy the struct leaf; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !names_raw_box(&graph),
+        "the box is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let owner = field_writes(&graph)
+        .into_iter()
+        .find(|(name, _)| name == "missing")
+        .and_then(|(_, owner)| owner);
+    assert_eq!(owner.as_deref(), Some("BadSig::S"));
+
+    let (_, fields, _, _, _) = program_metadata(&llbc);
+    assert!(missing_field_row(&fields, "BadSig::S").raw_owned.is_some());
+    let transformed = transform_with_fields(&graph, fields.clone(), None);
+    assert_raw_box_then_setfield(&transformed, &source, 8, 8);
+
+    let plain = transform_with_fields(&graph, fields, Some(""));
+    let plain_writes = missing_field_writes(&plain);
+    assert_eq!(plain_writes.len(), 1, "{}", plain.dump());
+    assert!(
+        matches!(&plain_writes[0].1, LinkArg::Value(value) if value == &source),
+        "an empty helper name leaves the moved value; graph={}",
+        plain.dump()
+    );
+    assert!(
+        !names_raw_box(&plain),
+        "an empty helper name does not box; graph={}",
+        plain.dump()
+    );
+}
+
+#[test]
+fn exception_class_declared_raw_pointer_store_is_not_reboxed() {
+    let ptr_ty = super::interior_raw_mut(adt(1));
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[ptr_ty.clone()],
+        vec![copy_of(local_place(1, &ptr_ty))],
+    );
+    let llbc = bad_enum_with_funs(
+        "OkRawPtr",
+        ptr_ty,
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![build],
+    );
+    let (_, fields, _, _, _) = program_metadata(&llbc);
+    assert!(
+        missing_field_row(&fields, "OkRawPtr::S")
+            .raw_owned
+            .is_none()
+    );
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let transformed = transform_with_fields(&graph, fields, None);
+    assert!(
+        !names_raw_box(&transformed),
+        "a declared pointer is already the word; graph={}",
+        transformed.dump()
+    );
+    let writes = missing_field_writes(&transformed);
+    assert_eq!(writes.len(), 1, "{}", transformed.dump());
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand stays the pointer; graph={}",
+        transformed.dump()
+    );
+}
+
+#[test]
+fn exception_class_raw_owned_attr_read_matches_raw_pointer() {
+    let use_sig = super::window_opaque_fun(
+        0,
+        &["fixture", "use_sig"],
+        vec![shared_ref(&adt(1))],
+        usize_ty(),
+    );
+    let by_value = bad_enum_with_funs(
+        "BadSig",
+        adt(1),
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![use_sig.clone(), read_missing_fun("BadSig", true)],
+    );
+    let declared = bad_enum_with_funs(
+        "OkRawPtr",
+        super::interior_raw_mut(adt(1)),
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![use_sig, read_missing_fun("OkRawPtr", false)],
+    );
+    let by_graph = lower(&by_value, "read_missing");
+    let ptr_graph = lower(&declared, "read_missing");
+    let by_read = sig_field_read(&by_graph);
+    let ptr_read = sig_field_read(&ptr_graph);
+    let root = ValueType::Ref(Some("Signature".to_string()));
+    assert_eq!(by_read.ty, root, "{}", by_graph.dump());
+    assert_eq!(by_read.ty, ptr_read.ty, "{}", ptr_graph.dump());
+    assert!(!by_read.inline_vec, "{}", by_graph.dump());
+    assert!(!ptr_read.inline_vec, "{}", ptr_graph.dump());
+    assert!(!by_read.taken_by_address, "{}", by_graph.dump());
+    assert!(!ptr_read.taken_by_address, "{}", ptr_graph.dump());
+    assert_eq!(
+        by_read.concretetype,
+        ptr_read.concretetype,
+        "by={} ptr={}",
+        by_graph.dump(),
+        ptr_graph.dump()
+    );
+    assert_eq!(
+        use_sig_receiver(&by_graph),
+        by_read.result,
+        "{}",
+        by_graph.dump()
+    );
+    assert_eq!(
+        use_sig_receiver(&ptr_graph),
+        ptr_read.result,
+        "{}",
+        ptr_graph.dump()
+    );
+}
+
+#[test]
+fn exception_class_raw_owned_destructor_includes_inherited_attr() {
+    let mut registry = crate::front::semantic::StructFieldRegistry::default();
+    registry.fields.insert(
+        "Arg::TooMany".to_string(),
+        [
+            crate::front::semantic::FieldRow::named("signature", "*mut Signature").with_raw_owned(
+                crate::front::semantic::RawOwnedField {
+                    type_path: "fixture::Signature".to_string(),
+                    size: 8,
+                    align: 8,
+                },
+            ),
+        ],
+    );
+    registry.fields.insert(
+        "Arg::TooManyMethod".to_string(),
+        [crate::front::semantic::FieldRow::named("extra", "usize")],
+    );
+    let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+        "Arg",
+        "TooManyMethod(TooMany)",
+        vec!["TooMany".into(), "TooManyMethod".into()],
+    );
+    let mut rows =
+        crate::front::llbc_hints::minted_exception_class_rows(std::slice::from_ref(&hint));
+    let header_id = majit_ir::descr::StructId::from_canonical(
+        crate::codewriter::assembler::host_header_owner(),
+    );
+    let mut ids = std::collections::HashMap::new();
+    ids.insert(
+        crate::codewriter::assembler::host_header_owner().to_string(),
+        Some(header_id),
+    );
+    let _registry = crate::test_support::register_struct_ids_serialized(ids);
+    registry.fields.insert(
+        crate::codewriter::assembler::host_header_owner().to_string(),
+        crate::codewriter::assembler::host_header_rows(),
+    );
+    let mut cc = crate::call::CallControl::new();
+    cc.set_struct_layout(
+        header_id,
+        crate::codewriter::assembler::host_header_layout(),
+    );
+    cc.set_struct_fields(registry);
+    cc.exception_class_hints = vec![hint];
+    crate::codewriter::assembler::attach_minted_exception_raw_owned_drops(&cc, &mut rows);
+
+    let word = crate::layout::target_word_size();
+    let header = cc
+        .struct_layout_for(crate::codewriter::assembler::host_header_owner())
+        .expect("host header");
+    assert_eq!(header.size, 2 * word);
+    let row = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+    };
+    let base = row("Arg");
+    let parent = row("Arg::TooMany");
+    let child = row("Arg::TooManyMethod");
+    assert!(base.raw_owned.is_empty(), "{:?}", base.raw_owned);
+    assert_eq!(parent.raw_owned.len(), 1);
+    assert_eq!(child.raw_owned.len(), 1);
+    assert_eq!(parent.raw_owned[0].offset, header.size);
+    assert_eq!(child.raw_owned[0].offset, header.size);
+    assert_eq!(base.size, header.size);
+    assert_eq!(parent.size, header.size + word);
+    assert!(base.gc_ptr_offsets.is_empty());
+    assert!(parent.gc_ptr_offsets.is_empty());
+    assert!(child.gc_ptr_offsets.is_empty());
+    assert_eq!(parent.raw_owned[0].type_path, "fixture::Signature");
+    assert_eq!(child.raw_owned[0].type_path, "fixture::Signature");
+
+    let src = crate::front::llbc_hints::render_minted_exception_classes_rs(&rows);
+    assert_eq!(
+        src.matches("drop_raw_owned_attr::<fixture::Signature>")
+            .count(),
+        2,
+        "{src}"
+    );
+    assert!(src.contains(&format!(
+        "drop_raw_owned_attr::<fixture::Signature>(obj_addr, {})",
+        header.size
+    )));
+    assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooMany_destructor"));
+    assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooManyMethod_destructor"));
+    assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
+    assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooManyMethod_destructor)"));
+    assert!(src.contains(&format!(
+        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None }}",
+        base.size
+    )));
+    assert!(
+        !src.contains("fn MINTED_EXC_Arg_destructor"),
+        "the base owns no raw attr; src={src}"
+    );
+}
+
+/// A layout sidecar is the same crate's type decls with no function or
+/// global bodies. The defining artefact's `_alloc_flavor_` marker is the
+/// program-wide set `DuplicateLeafFacts::discover` and `prelink_crate`
+/// register exception classes with (`rclass.py` `getgcflavor`).
+#[test]
+fn layout_sidecar_raw_flavor_attr_uses_the_program_set() {
+    let wide = super::interior_struct(
+        1,
+        &["fixture", "WideSig"],
+        &[
+            ("a", usize_ty()),
+            ("b", usize_ty()),
+            ("c", usize_ty()),
+            ("d", usize_ty()),
+        ],
+        32,
+        &[0, 8, 16, 24],
+        false,
+    );
+    let enum_ty = enum_decl(
+        0,
+        &["fixture", "WideErr"],
+        vec![variant("Too", vec![named_field("signature", &adt(1))], 0)],
+    );
+    let types = vec![enum_ty, wide];
+    let host = super::window_llbc_with_globals(
+        types.clone(),
+        Vec::new(),
+        vec![
+            marker(0, &["fixture", "_exception_class_WideErr"], ""),
+            marker(1, &["fixture", "_alloc_flavor_WideSig"], "raw"),
+        ],
+    );
+    let sidecar = || super::window_llbc_with_globals(types.clone(), Vec::new(), Vec::new());
+    let program_raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&host));
+    assert!(
+        program_raw.contains("WideSig"),
+        "defining artefact harvest: {program_raw:?}"
+    );
+    assert!(
+        32 > crate::layout::target_word_size() as u64,
+        "the fixture struct has to miss the one-word size fallback"
+    );
+
+    let (_, host_fields, _, _, _) = program_metadata(&host);
+    let host_row = host_fields
+        .fields
+        .get("WideErr::Too")
+        .and_then(|rows| rows.iter().find(|row| row.name == "signature"))
+        .unwrap_or_else(|| {
+            panic!(
+                "defining artefact registers WideErr::Too.signature, keys {:?}",
+                host_fields.fields.keys().collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(host_row.ty, "*mut WideSig");
+    let host_owned = host_row
+        .raw_owned
+        .as_ref()
+        .expect("defining artefact stores the moved struct");
+    assert_eq!(host_owned.type_path, "fixture::WideSig");
+    assert_eq!(host_owned.size, 32);
+    assert_eq!(host_owned.align, 8);
+
+    let bare = sidecar();
+    assert_eq!(bare.iter_fun_decls().count(), 0);
+    assert_eq!(bare.iter_global_decls().count(), 0);
+    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(&host),
+    );
+    super::super::seed_program_exception_class_hints(&bare, hints.clone());
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ =
+            super::super::DuplicateLeafFacts::discover(&bare, &std::collections::HashSet::new());
+    }));
+    let Err(payload) = caught else {
+        panic!("a layout copy with an empty raw set must fail the one-word check");
+    };
+    let message = panic_text(payload);
+    let expected =
+        "exception class WideErr::Too.signature: field type WideSig is not a one-word attr";
+    assert!(
+        message.contains(expected),
+        "panic `{message}` must contain `{expected}`"
+    );
+
+    let copied = sidecar();
+    super::super::seed_program_exception_class_hints(&copied, hints);
+    let facts = super::super::DuplicateLeafFacts::discover(&copied, &program_raw);
+    let row = facts
+        .struct_fields
+        .fields
+        .get("WideErr::Too")
+        .and_then(|rows| rows.iter().find(|row| row.name == "signature"))
+        .unwrap_or_else(|| {
+            panic!(
+                "layout copy registers WideErr::Too.signature from the program set, keys {:?}",
+                facts.struct_fields.fields.keys().collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(row.ty, "*mut WideSig");
+    let owned = row
+        .raw_owned
+        .as_ref()
+        .expect("layout copy stores the moved struct");
+    assert_eq!(owned.type_path, "fixture::WideSig");
+    assert_eq!(owned.size, 32);
+    assert_eq!(owned.align, 8);
+    let _ = super::super::prelink_crate(&copied, &std::collections::HashSet::new(), &program_raw);
 }

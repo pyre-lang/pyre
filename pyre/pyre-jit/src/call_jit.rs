@@ -1033,6 +1033,15 @@ fn try_record_caught_blackhole_traceback(
     if frame_ptr.is_null() || exc_value == 0 {
         return true;
     }
+    // `pyopcode.py` `handle_operation_error` records a traceback for an
+    // `OperationError`. The forwards path and the attach below read
+    // `W_BaseException` slots, so a raised value that is not an exception
+    // instance returns before either read. `false` is only an allocation
+    // failure (`PyTraceback.__init__`); this skip must not replace the
+    // value in flight.
+    if unsafe { !pyre_object::is_exception(exc_value as PyObjectRef) } {
+        return true;
+    }
     // Both operands are raw i64 copies of GC refs. The blackhole roots the
     // interpreter's `virtualizable_ptr` / `exception_last_value` slots, not
     // these argument copies; a wasm local is invisible to `walk_roots`, and
@@ -1276,6 +1285,11 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     if exc_value == 0 || w_code_value == 0 {
         return;
     }
+    // Same instance check as `record_caught_blackhole_traceback`: the
+    // attach reads `W_BaseException` slots.
+    if unsafe { !pyre_object::is_exception(exc_value as PyObjectRef) } {
+        return;
+    }
     let Some(last_instruction) = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
         jitcode_index,
         opcode_position,
@@ -1352,6 +1366,11 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     py_pc: i64,
 ) {
     if exc_value == 0 || w_code_value == 0 || py_pc < 0 {
+        return;
+    }
+    // Same instance check as `record_caught_blackhole_traceback`: the
+    // attach reads `W_BaseException` slots.
+    if unsafe { !pyre_object::is_exception(exc_value as PyObjectRef) } {
         return;
     }
     let last_instruction = py_pc.saturating_sub(1);

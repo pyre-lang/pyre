@@ -51,13 +51,13 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
     build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
-    build_ll_join_chars_isvirtual_helper_graph, build_ll_join_strs_helper_graph,
-    build_ll_join_strs_look_inside_iff_helper_graph, build_ll_join_strs_trampoline_helper_graph,
-    build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
-    build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
-    build_ll_str_is_true_helper_graph, build_ll_str_string_helper_graph,
-    build_ll_str2unicode_helper_graph, build_ll_strcmp_helper_graph,
-    build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
+    build_ll_join_chars_isvirtual_helper_graph, build_ll_join_helper_graph,
+    build_ll_join_strs_helper_graph_for, build_ll_join_strs_look_inside_iff_helper_graph_for,
+    build_ll_join_strs_trampoline_helper_graph_for, build_ll_replace_chr_chr_helper_graph,
+    build_ll_rfind_char_helper_graph, build_ll_startswith_char_helper_graph,
+    build_ll_startswith_helper_graph, build_ll_str_is_true_helper_graph,
+    build_ll_str_string_helper_graph, build_ll_str2unicode_helper_graph,
+    build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
     build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
     build_ll_stringslice_helper_graph, build_ll_stritem_checked_helper_graph,
@@ -65,7 +65,11 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
     build_ll_unichr2str_helper_graph, const_str_cache_llstr, null_str_ptr, temp_ptr_lltype,
 };
-use crate::translator::rtyper::rlist::build_ll_alloc_and_set_isconstant_helper_graph;
+use crate::translator::rtyper::rlist::{
+    ListLengthItems, build_ll_alloc_and_set_isconstant_helper_graph,
+    build_ll_fixed_items_helper_graph, build_ll_fixed_length_helper_graph,
+    build_ll_items_helper_graph, build_ll_length_helper_graph, list_length_items_view,
+};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, hop_arg_const_string};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
@@ -477,6 +481,8 @@ impl Repr for StringRepr {
                 STRPTR.clone(),
                 LowLevelType::Char,
             ),
+            // `AbstractStringRepr.rtype_method_join` (`rstr.py`).
+            "join" => rtype_method_join(hop),
             _ => Err(TyperError::message(format!(
                 "missing StringRepr.rtype_method_{method_name}"
             ))),
@@ -954,27 +960,224 @@ fn lowlevel_str2unicode_function(rtyper: &RPythonTyper) -> Result<LowLevelFuncti
     )
 }
 
+/// `AbstractStringRepr.rtype_method_join` (`rstr.py`).
+///
+/// `exception_cannot_occur`, then a constant `s_result`, then a
+/// `BaseListRepr` argument. `lltypesystem/rstr.py` `_list_length_items`
+/// is `ll_length` / `ll_items` (resized) or `ll_fixed_length` /
+/// `ll_fixed_items` (fixed). An empty constant separator calls
+/// `ll_join_strs`; any other separator calls `LLHelpers.ll_join`.
+/// `ll_join_chars` is not minted here.
+fn rtype_method_join(hop: &HighLevelOp) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let s_result = hop.s_result.borrow().clone();
+    if s_result.as_ref().is_some_and(|s| s.is_constant()) {
+        let value = s_result
+            .as_ref()
+            .and_then(SomeValue::const_)
+            .cloned()
+            .ok_or_else(|| TyperError::message("string.join: constant s_result has no const"))?;
+        let srepr = string_repr();
+        let c = HighLevelOp::inputconst(srepr.as_ref(), &value)?;
+        return Ok(Some(Hlvalue::Constant(c)));
+    }
+    let r_lst = hop
+        .args_r
+        .borrow()
+        .get(1)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| TyperError::message("string.join: args_r[1] missing"))?;
+    let Some(view) = list_length_items_view(r_lst.as_ref()) else {
+        return Err(TyperError::message(format!(
+            "string.join of non-list: {}",
+            r_lst.repr_string()
+        )));
+    };
+    let empty_sep = hop.args_s.borrow().first().is_some_and(|s| {
+        s.is_constant()
+            && s.const_()
+                .and_then(ConstValue::as_text)
+                .is_some_and(|text| text.is_empty())
+    });
+    let srepr: Arc<dyn Repr> = string_repr();
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(srepr.as_ref()),
+        ConvertedTo::Repr(r_lst.as_ref()),
+    ])?;
+    let v_str = vlist[0].clone();
+    let v_lst = vlist[1].clone();
+    let (v_length, v_items) = list_length_items(hop, v_lst, &view)?;
+    if empty_sep {
+        if repr_data_eq(view.external_item_repr.as_ref(), srepr.as_ref()) {
+            let helper = ll_join_strs_helper_for(hop.rtyper.as_ref(), view.items_ll.clone())?;
+            return hop.gendirectcall(&helper, vec![v_length, v_items]);
+        }
+        if repr_data_eq(view.item_repr.as_ref(), char_repr().as_ref())
+            || repr_data_eq(view.item_repr.as_ref(), unichar_repr().as_ref())
+        {
+            return Err(TyperError::message(format!(
+                "'\'.join() of char list requires ll_join_chars: {}",
+                r_lst.repr_string()
+            )));
+        }
+        return Err(TyperError::message(format!(
+            "'\'.join() of non-string list: {}",
+            r_lst.repr_string()
+        )));
+    }
+    if repr_data_eq(view.external_item_repr.as_ref(), srepr.as_ref()) {
+        let helper = ll_join_helper(hop.rtyper.as_ref(), view.items_ll.clone())?;
+        hop.gendirectcall(&helper, vec![v_str, v_length, v_items])
+    } else {
+        Err(TyperError::message(format!(
+            "sep.join() of non-string list: {}",
+            r_lst.repr_string()
+        )))
+    }
+}
+
+/// Data-pointer identity of two reprs. `std::ptr::eq` on `&dyn Repr`
+/// also compares the vtable, so the cast matches `convertvar`.
+fn repr_data_eq(a: &dyn Repr, b: &dyn Repr) -> bool {
+    std::ptr::eq(
+        a as *const dyn Repr as *const (),
+        b as *const dyn Repr as *const (),
+    )
+}
+
+fn direct_list_helper<F>(
+    hop: &HighLevelOp,
+    name: &str,
+    arg_ll: LowLevelType,
+    result_ll: LowLevelType,
+    v_lst: Hlvalue,
+    builder: F,
+) -> Result<Hlvalue, TyperError>
+where
+    F: FnOnce(&RPythonTyper, &[LowLevelType], &LowLevelType) -> Result<PyGraph, TyperError>,
+{
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        name.to_string(),
+        vec![arg_ll],
+        result_ll,
+        builder,
+    )?;
+    hop.gendirectcall(&helper, vec![v_lst])?
+        .ok_or_else(|| TyperError::message(format!("{name} returned no value")))
+}
+
+/// `_list_length_items` (`lltypesystem/rstr.py`).
+fn list_length_items(
+    hop: &HighLevelOp,
+    v_lst: Hlvalue,
+    view: &ListLengthItems,
+) -> Result<(Hlvalue, Hlvalue), TyperError> {
+    if view.fixed {
+        let length_ptr = view.list_ll.clone();
+        let items_ptr = view.list_ll.clone();
+        let v_length = direct_list_helper(
+            hop,
+            "ll_fixed_length",
+            view.list_ll.clone(),
+            LowLevelType::Signed,
+            v_lst.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_fixed_length_helper_graph("ll_fixed_length", length_ptr)
+            },
+        )?;
+        let v_items = direct_list_helper(
+            hop,
+            "ll_fixed_items",
+            view.list_ll.clone(),
+            view.items_ll.clone(),
+            v_lst,
+            move |_rtyper, _args, _result| {
+                build_ll_fixed_items_helper_graph("ll_fixed_items", items_ptr)
+            },
+        )?;
+        Ok((v_length, v_items))
+    } else {
+        let length_ptr = view.list_ll.clone();
+        let items_list = view.list_ll.clone();
+        let items_field = view.items_ll.clone();
+        let v_length = direct_list_helper(
+            hop,
+            "ll_length",
+            view.list_ll.clone(),
+            LowLevelType::Signed,
+            v_lst.clone(),
+            move |_rtyper, _args, _result| build_ll_length_helper_graph("ll_length", length_ptr),
+        )?;
+        let v_items = direct_list_helper(
+            hop,
+            "ll_items",
+            view.list_ll.clone(),
+            view.items_ll.clone(),
+            v_lst,
+            move |_rtyper, _args, _result| {
+                build_ll_items_helper_graph("ll_items", items_list, items_field)
+            },
+        )?;
+        Ok((v_length, v_items))
+    }
+}
+
+/// `LLHelpers.ll_join` (`lltypesystem/rstr.py`). A bare static method:
+/// no `@jit.look_inside_iff` and no `@signature`. `items_ptr` is the
+/// list's `ll_items` result (`Ptr(GcArray(GCREF))` for a list of str).
+fn ll_join_helper(
+    rtyper: &RPythonTyper,
+    items_ptr: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let items_for_builder = items_ptr.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        "ll_join".to_string(),
+        vec![STRPTR.clone(), LowLevelType::Signed, items_ptr],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_join_helper_graph("ll_join", items_for_builder),
+    )
+}
+
 /// Mint `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) through
 /// `look_inside_iff` (`rlib/jit.py`) with `loop_unrolling_heuristic`
 /// (`cutoff=2`): original loop, `dont_look_inside` trampoline,
 /// `isconstant` / `isvirtual` predicates, and the wrapper named
-/// `ll_join_strs`. Returns the wrapper.
+/// `ll_join_strs`. Returns the wrapper. The items pointer is `TEMP`
+/// (`do_stringformat`); a list of str passes its own items pointer to
+/// [`ll_join_strs_helper_for`] because `@jit.look_inside_iff` is on the
+/// function and each specialization keeps it.
 pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
-    let orig_args = vec![LowLevelType::Signed, temp_ptr_lltype()];
+    ll_join_strs_helper_for(rtyper, temp_ptr_lltype())
+}
+
+fn ll_join_strs_helper_for(
+    rtyper: &RPythonTyper,
+    items_ptr: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let orig_args = vec![LowLevelType::Signed, items_ptr.clone()];
+    let items_for_orig = items_ptr.clone();
     let orig = rtyper.lowlevel_helper_function_with_builder(
         "ll_join_strs__orig".to_string(),
         orig_args.clone(),
         STRPTR.clone(),
-        move |_r, _a, _res| build_ll_join_strs_helper_graph("ll_join_strs__orig"),
+        move |_r, _a, _res| {
+            build_ll_join_strs_helper_graph_for("ll_join_strs__orig", items_for_orig)
+        },
     )?;
     let trampoline = {
         let orig_fn = functionptr_const(rtyper, &orig)?;
+        let items_for_trampoline = items_ptr.clone();
         rtyper.lowlevel_helper_function_with_builder(
             "ll_join_strs_trampoline".to_string(),
             orig_args.clone(),
             STRPTR.clone(),
             move |_r, _a, _res| {
-                build_ll_join_strs_trampoline_helper_graph("ll_join_strs_trampoline", orig_fn)
+                build_ll_join_strs_trampoline_helper_graph_for(
+                    "ll_join_strs_trampoline",
+                    orig_fn,
+                    items_for_trampoline,
+                )
             },
         )?
     };
@@ -989,13 +1192,17 @@ pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunct
         },
     )?;
     let isvirtual = {
-        let items = temp_ptr_lltype();
+        let items_for_virtual = items_ptr.clone();
         rtyper.lowlevel_helper_function_with_builder(
             "ll_join_strs_isvirtual".to_string(),
-            vec![items.clone()],
+            vec![items_ptr.clone()],
             LowLevelType::Bool,
             move |rtyper, _a, _res| {
-                build_ll_join_chars_isvirtual_helper_graph(rtyper, "ll_join_strs_isvirtual", items)
+                build_ll_join_chars_isvirtual_helper_graph(
+                    rtyper,
+                    "ll_join_strs_isvirtual",
+                    items_for_virtual,
+                )
             },
         )?
     };
@@ -1003,17 +1210,19 @@ pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunct
     let trampoline_fn = functionptr_const(rtyper, &trampoline)?;
     let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
     let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
+    let items_for_wrapper = items_ptr;
     rtyper.lowlevel_helper_function_with_builder(
         "ll_join_strs".to_string(),
         orig_args,
         STRPTR.clone(),
         move |_r, _a, _res| {
-            build_ll_join_strs_look_inside_iff_helper_graph(
+            build_ll_join_strs_look_inside_iff_helper_graph_for(
                 "ll_join_strs",
                 orig_fn,
                 trampoline_fn,
                 isconstant_fn,
                 isvirtual_fn,
+                items_for_wrapper,
             )
         },
     )
@@ -4714,6 +4923,245 @@ mod tests {
             dbg.contains("ll_startswith"),
             "expected 'll_startswith' in {dbg}"
         );
+    }
+
+    fn const_some_string(text: &str) -> crate::annotator::model::SomeValue {
+        use crate::annotator::model::SomeString;
+        let mut value = SomeString::new(false, false);
+        value.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(text)));
+        SomeValue::String(value)
+    }
+
+    fn list_of(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        item: Arc<dyn Repr>,
+        fixed: bool,
+    ) -> Arc<dyn Repr> {
+        use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
+        if fixed {
+            Arc::new(FixedSizeListRepr::new(rtyper, item).expect("FixedSizeListRepr"))
+        } else {
+            Arc::new(ListRepr::new(rtyper, item).expect("ListRepr"))
+        }
+    }
+
+    fn run_method_join(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        sep_text: &str,
+        sep_constant: bool,
+        list_repr: Arc<dyn Repr>,
+        s_result: Option<SomeValue>,
+    ) -> (
+        Result<Option<Hlvalue>, TyperError>,
+        std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
+    ) {
+        use crate::annotator::model::SomeString;
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let v_str = Variable::new();
+        v_str.set_concretetype(Some(STRPTR.clone()));
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_repr.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_str), Hlvalue::Variable(v_lst)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let sep = if sep_constant {
+            const_some_string(sep_text)
+        } else {
+            SomeValue::String(SomeString::new(false, false))
+        };
+        hop.args_s
+            .borrow_mut()
+            .extend([sep, SomeValue::String(SomeString::new(false, false))]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(string_repr() as Arc<dyn Repr>), Some(list_repr)]);
+        if let Some(s_result) = s_result {
+            *hop.s_result.borrow_mut() = Some(s_result);
+        }
+        let result = string_repr().rtype_method("join", &hop);
+        (result, llops)
+    }
+
+    fn direct_call_name(op: &SpaceOperation) -> String {
+        let Hlvalue::Constant(func) = &op.args[0] else {
+            panic!("direct_call function is a Constant");
+        };
+        format!("{:?}", func.value)
+    }
+
+    /// `AbstractStringRepr.rtype_method_join` (`rstr.py`): a list of str
+    /// calls `ll_fixed_length`/`ll_fixed_items` or `ll_length`/`ll_items`,
+    /// then `ll_join`. An empty constant separator calls `ll_join_strs`.
+    #[test]
+    fn string_repr_rtype_method_join_list_of_str_calls_ll_join() {
+        use crate::translator::rtyper::rlist::list_of_str_lltype;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let item: Arc<dyn Repr> = string_repr();
+        let cases = [
+            (
+                true,
+                ", ",
+                false,
+                "ll_fixed_length",
+                "ll_fixed_items",
+                false,
+            ),
+            (false, ", ", false, "ll_length", "ll_items", false),
+            (true, "", true, "ll_fixed_length", "ll_fixed_items", true),
+        ];
+        for (fixed, sep, sep_constant, length_name, items_name, empty_sep) in cases {
+            let list = list_of(&rtyper, item.clone(), fixed);
+            let (result, llops) = run_method_join(&rtyper, sep, sep_constant, list, None);
+            result.unwrap_or_else(|err| panic!("join {sep:?} fixed={fixed}: {err}"));
+            let ops = llops.borrow();
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "rtype_method_join calls exception_cannot_occur"
+            );
+            assert_eq!(
+                ops.ops.len(),
+                3,
+                "length, items, join; {sep:?} fixed={fixed}"
+            );
+            let names: Vec<String> = ops.ops.iter().map(direct_call_name).collect();
+            assert!(
+                names[0].contains(length_name),
+                "expected {length_name} in {}",
+                names[0]
+            );
+            if length_name == "ll_length" {
+                assert!(
+                    !names[0].contains("ll_fixed_length"),
+                    "resized list uses ll_length, got {}",
+                    names[0]
+                );
+            }
+            assert!(
+                names[1].contains(items_name),
+                "expected {items_name} in {}",
+                names[1]
+            );
+            if items_name == "ll_items" {
+                assert!(
+                    !names[1].contains("ll_fixed_items"),
+                    "resized list uses ll_items, got {}",
+                    names[1]
+                );
+            }
+            let Hlvalue::Variable(items_var) = &ops.ops[1].result else {
+                panic!("ll_items result is a Variable");
+            };
+            assert_eq!(
+                items_var.concretetype().as_ref(),
+                Some(&list_of_str_lltype())
+            );
+            if empty_sep {
+                assert!(
+                    names[2].contains("ll_join_strs"),
+                    "expected ll_join_strs in {}",
+                    names[2]
+                );
+                assert_eq!(ops.ops[2].args.len(), 3);
+            } else {
+                assert!(
+                    names[2].contains("ll_join") && !names[2].contains("ll_join_strs"),
+                    "expected ll_join in {}",
+                    names[2]
+                );
+                assert_eq!(ops.ops[2].args.len(), 4);
+            }
+        }
+    }
+
+    /// Constant `s_result` returns before the list check. A non-list,
+    /// a char/unichar list, and a non-string list each name the branch
+    /// `rtype_method_join` refuses.
+    #[test]
+    fn string_repr_rtype_method_join_constant_result_and_rejected_item_kinds() {
+        use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
+        use crate::translator::rtyper::rint::signed_repr;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let strings: Arc<dyn Repr> = string_repr();
+        let fixed_str = list_of(&rtyper, strings, true);
+
+        let (result, llops) = run_method_join(
+            &rtyper,
+            ", ",
+            false,
+            fixed_str.clone(),
+            Some(const_some_string("joined")),
+        );
+        let value = result
+            .expect("constant s_result")
+            .expect("constant s_result value");
+        let Hlvalue::Constant(constant) = value else {
+            panic!("constant s_result is an LLPtr constant, got {value:?}");
+        };
+        let ConstValue::LLPtr(ptr) = &constant.value else {
+            panic!("expected LLPtr, got {:?}", constant.value);
+        };
+        let (bytes, _) = prebuilt_str_bytes_and_hash(ptr).expect("joined ptr");
+        assert_eq!(bytes, b"joined");
+        let ops = llops.borrow();
+        assert!(ops.ops.is_empty(), "constant s_result emits no direct_call");
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        drop(ops);
+
+        let (err, llops) =
+            run_method_join(&rtyper, ", ", false, signed_repr() as Arc<dyn Repr>, None);
+        let err = err.expect_err("non-list");
+        assert!(err.to_string().contains("string.join of non-list"), "{err}");
+        let ops = llops.borrow();
+        assert!(ops.ops.is_empty());
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        drop(ops);
+
+        for item in [
+            char_repr() as Arc<dyn Repr>,
+            unichar_repr() as Arc<dyn Repr>,
+        ] {
+            let list = list_of(&rtyper, item, true);
+            let (err, llops) = run_method_join(&rtyper, "", true, list, None);
+            let err = err.expect_err("char list");
+            let text = err.to_string();
+            assert!(text.contains("ll_join_chars"), "{text}");
+            assert!(text.contains("''.join()"), "{text}");
+            assert_eq!(llops.borrow().ops.len(), 2, "{text}");
+        }
+
+        let signed_list = list_of(&rtyper, signed_repr() as Arc<dyn Repr>, true);
+        let (err, llops) = run_method_join(&rtyper, "", true, signed_list.clone(), None);
+        let text = err.expect_err("empty non-string").to_string();
+        assert!(text.contains("''.join() of non-string list"), "{text}");
+        assert_eq!(llops.borrow().ops.len(), 2, "{text}");
+
+        let (err, llops) = run_method_join(&rtyper, ", ", false, signed_list, None);
+        let text = err.expect_err("sep non-string").to_string();
+        assert!(text.contains("sep.join() of non-string list"), "{text}");
+        assert_eq!(llops.borrow().ops.len(), 2, "{text}");
     }
 
     /// Mirror for `UnicodeRepr.rtype_method_startswith` — distinct

@@ -250,13 +250,21 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
 /// tombstones to paint (this artefact's and `cross_tombstoned_leaves`),
 /// its named-const folds merged into the invocation table, and its
 /// eval-hook graph list. Returns the tombstones.
+///
+/// `program_raw_alloc_flavor_structs` is the program-wide
+/// `_alloc_flavor_ = raw` set (`rclass.py` `getgcflavor`). Discovery
+/// registers marked exception classes and reads that set.
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn prelink_crate(
     llbc: &Llbc,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
+    program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
     let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
-    duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+    duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(
+        llbc,
+        program_raw_alloc_flavor_structs,
+    ));
     let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
     paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
     merge_named_const_folds(llbc.crate_name(), harvest_named_const_folds(llbc));
@@ -453,18 +461,10 @@ pub(crate) fn absorb_semantic_program(
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
             for hint in prog.exception_class_hints {
-                if acc
-                    .exception_class_hints
-                    .iter()
-                    .any(|existing| existing.enum_path == hint.enum_path)
-                {
-                    let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
-                    panic!(
-                        "_exception_class_ {enum_name}: duplicate hierarchy `{}`",
-                        hint.enum_path
-                    );
-                }
-                acc.exception_class_hints.push(hint);
+                crate::front::llbc_hints::push_program_exception_class_hint(
+                    &mut acc.exception_class_hints,
+                    hint,
+                );
             }
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
@@ -489,9 +489,23 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     // body is painted. A leaf unique inside each artefact (the two
     // `FrameBlock`s) is still withdrawn once the artefacts are merged, and
     // the per-file lowering has to paint that qualified root up front.
+    // The raw-flavor set is the same program-wide harvest the lowering
+    // uses (`rclass.py` `getgcflavor`): a type-decl layout copy carries
+    // the class and none of the marker globals.
+    let mut program_raw_alloc_flavor_structs = std::collections::HashSet::new();
+    for llbc in llbcs {
+        program_raw_alloc_flavor_structs.extend(
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                *llbc,
+            )),
+        );
+    }
     let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
     for llbc in llbcs {
-        duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+        duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(
+            llbc,
+            &program_raw_alloc_flavor_structs,
+        ));
     }
     let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
     paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
@@ -1767,10 +1781,14 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
-    /// `_exception_class_<Enum>` rows from this artefact. Bodies do not
-    /// read them. `finish` copies the vec; earlier crates stay out so
-    /// `absorb_semantic_program` is the only merge (a second copy of the
-    /// same intern key panics there).
+    /// This artefact's own `_exception_class_<Enum>` markers, cloned from
+    /// the seeded program-wide set. Bodies do not read them. `finish`
+    /// copies the vec; earlier crates stay out so
+    /// `absorb_semantic_program` is the only merge (a repeated intern key
+    /// panics there: the class was declared twice). The clones share the
+    /// harvest's class objects. Paint and registration read the
+    /// program-wide set on the artefact (`llbc_exception_class_hints`),
+    /// seeded in dependency order.
     exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// `_immutable_fields_<Struct>` harvested once for this artefact
     /// (`harvest_immutable_fields_from_llbcs`). Overlay dests and the
@@ -1850,12 +1868,17 @@ impl CrateLoweringState {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
-        // This crate's markers only. A later crate's copy is merged by
-        // `absorb_semantic_program`, which rejects a repeated intern key.
-        let exception_class_hints =
-            crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-                std::slice::from_ref(llbc),
-            );
+        // Read the seeded set first. An unseeded artefact's first read
+        // harvests once and caches those class objects; selecting own
+        // paths from that vec keeps the same arcs. A harvest here would
+        // build a second object. `finish` exports only this artefact's
+        // markers. `absorb_semantic_program` rejects a repeated intern
+        // key. Registration and paint use the program-wide set.
+        let program_exception_class_hints = llbc_exception_class_hints(llbc);
+        let exception_class_hints = crate::front::llbc_hints::own_exception_class_hints(
+            llbc,
+            program_exception_class_hints,
+        );
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1871,7 +1894,7 @@ impl CrateLoweringState {
             gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            &exception_class_hints,
+            program_exception_class_hints,
         );
         promote_cross_crate_stripped_keys(
             llbc,
@@ -1952,7 +1975,7 @@ impl CrateLoweringState {
             &mut struct_fields,
             &mut struct_ids,
             gc_struct_ids,
-            &exception_class_hints,
+            program_exception_class_hints,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
         // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
@@ -4157,16 +4180,419 @@ fn note_declared_gc_owner(
         .insert(majit_ir::descr::StructId::from_canonical(&leaf));
 }
 
+/// One declaring class's contribution to an inherited exception attr.
+///
+/// `row_ty` / `attr_ty` / `raw_owned` are the row registration already
+/// publishes for that declaration. `s_value` is
+/// `Bookkeeper::project_struct_field_type` of `row_ty`, the annotation
+/// `Attribute.merge` unions.
+struct ExceptionClassAttrDecl {
+    variant_name: String,
+    field_index: usize,
+    is_positional: bool,
+    is_atomic: bool,
+    /// `tyref_to_ast_string` of the declared type.
+    declared: String,
+    row_ty: String,
+    attr_ty: ValueType,
+    raw_owned: Option<crate::front::semantic::RawOwnedField>,
+    s_value: crate::annotator::model::SomeValue,
+    one_word: bool,
+    kind: ExceptionClassAttrKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExceptionClassAttrKind {
+    /// By-value `String` → `"str"` / `ValueType::Str`.
+    Str,
+    /// By-value `Vec<String>` → [`RPY_LIST_OF_STR`].
+    ListOfStr,
+    /// By-value raw-flavor struct → `*mut T` plus `raw_owned`.
+    RawOwned,
+    Ordinary,
+}
+
+struct ExceptionClassAttrGroup {
+    owner: String,
+    field: String,
+    decls: Vec<ExceptionClassAttrDecl>,
+}
+
+fn exception_class_attr_types_panic(
+    class_name: &str,
+    field_name: &str,
+    decls: &[&ExceptionClassAttrDecl],
+) -> ! {
+    let mut spellings = Vec::new();
+    for decl in decls {
+        if !spellings.iter().any(|spelling| spelling == &decl.declared) {
+            spellings.push(decl.declared.as_str());
+        }
+    }
+    panic!(
+        "exception class {class_name}.{field_name}: field type {}",
+        spellings.join(" ∪ ")
+    )
+}
+
+fn exception_class_annotation_is_uninformative(
+    annotation: &crate::annotator::model::SomeValue,
+) -> bool {
+    match annotation {
+        crate::annotator::model::SomeValue::Impossible => true,
+        // No `ClassDef`: `unionof` cannot see the pointee (`SomeInstance`
+        // with `classdef=None`). Two different names compare equal.
+        crate::annotator::model::SomeValue::Instance(instance) => instance.classdef.is_none(),
+        _ => false,
+    }
+}
+
+fn exception_class_annotation_is_list_of_str(
+    annotation: &crate::annotator::model::SomeValue,
+) -> bool {
+    let crate::annotator::model::SomeValue::List(list) = annotation else {
+        return false;
+    };
+    let item = list.listdef.listitem_rc();
+    let item = item.borrow();
+    !item.resized
+        && !item.mutated
+        && matches!(item.s_value, crate::annotator::model::SomeValue::String(_))
+}
+
+/// Storage spelling of a generalized annotation. Signed `SomeInteger` is
+/// `lltype.Signed` (`isize`); unsigned is `lltype.Unsigned` (`usize`).
+fn exception_class_annotation_repr(
+    annotation: &crate::annotator::model::SomeValue,
+) -> Option<(String, ValueType)> {
+    use crate::annotator::model::SomeValue;
+    match annotation {
+        SomeValue::Integer(int) => {
+            if int.unsigned {
+                Some(("usize".to_string(), ValueType::Unsigned))
+            } else {
+                Some(("isize".to_string(), ValueType::Int))
+            }
+        }
+        SomeValue::Bool(_) => Some(("bool".to_string(), ValueType::Bool)),
+        SomeValue::Float(_) => Some(("f64".to_string(), ValueType::Float)),
+        SomeValue::SingleFloat(_) => Some(("f32".to_string(), ValueType::SingleFloat)),
+        SomeValue::String(_) => Some(("str".to_string(), ValueType::Str)),
+        SomeValue::Char(_) | SomeValue::UnicodeCodePoint(_) => {
+            Some(("char".to_string(), ValueType::Int))
+        }
+        SomeValue::List(_) if exception_class_annotation_is_list_of_str(annotation) => Some((
+            RPY_LIST_OF_STR.to_string(),
+            ValueType::Ref(Some(RPY_LIST_OF_STR.to_string())),
+        )),
+        _ => None,
+    }
+}
+
+fn exception_class_declared_attr(
+    variant_name: &str,
+    field_index: usize,
+    field: &FieldDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    bk: &std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
+) -> ExceptionClassAttrDecl {
+    let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
+    let by_value_list_of_str = tyref_is_by_value_vec_string(&field.ty, llbc);
+    let raw_owned_attr = if by_value_string || by_value_list_of_str {
+        None
+    } else {
+        exception_class_raw_owned_attr(
+            &field.ty,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    };
+    let kind = if by_value_string {
+        ExceptionClassAttrKind::Str
+    } else if by_value_list_of_str {
+        ExceptionClassAttrKind::ListOfStr
+    } else if raw_owned_attr.is_some() {
+        ExceptionClassAttrKind::RawOwned
+    } else {
+        ExceptionClassAttrKind::Ordinary
+    };
+    // A by-value `alloc::string::String` is the rstr attr. `"str"` is the
+    // spelling `project_struct_field_type` maps to `s_str0()`. The register
+    // bank is `ValueType::Str`. A borrow or raw pointer keeps the address.
+    //
+    // A by-value `Vec<String>` is an unresized list of str
+    // (`ArgErrMissing.__init__` stores `missing` as that list). The row
+    // spelling is [`RPY_LIST_OF_STR`]: one pointer word,
+    // `SomeList(s_str0())`. It is not published as `Vec<String>`.
+    //
+    // A by-value raw-flavor struct is the one-word `*mut T` row
+    // (`PyCode._signature` / `BuiltinCode.sig`). `raw_owned` records the
+    // moved value so the store boxes it; a field declared as `*mut T` does
+    // not.
+    let (row_ty, attr_ty, raw_owned) = if by_value_string {
+        ("str".to_string(), ValueType::Str, None)
+    } else if by_value_list_of_str {
+        (
+            RPY_LIST_OF_STR.to_string(),
+            ValueType::Ref(Some(RPY_LIST_OF_STR.to_string())),
+            None,
+        )
+    } else if let Some(raw) = raw_owned_attr {
+        let raw_owned = crate::front::semantic::RawOwnedField {
+            type_path: raw.type_path,
+            size: raw.size,
+            align: raw.align,
+        };
+        (
+            raw.spelling,
+            ValueType::Ref(Some(raw.class_root)),
+            Some(raw_owned),
+        )
+    } else {
+        (
+            annotation_struct_field_type(&field.ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
+            tyref_to_attr_value_type_with(
+                &field.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ),
+            None,
+        )
+    };
+    let s_value = bk.project_struct_field_type(&row_ty);
+    ExceptionClassAttrDecl {
+        variant_name: variant_name.to_string(),
+        field_index,
+        is_positional: field.name.is_none(),
+        is_atomic: tyref_atomic_arg(&field.ty, llbc).is_some(),
+        declared: tyref_to_ast_string(&field.ty, llbc),
+        row_ty,
+        attr_ty,
+        raw_owned,
+        s_value,
+        one_word: exception_class_attr_is_one_word(
+            &field.ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        kind,
+    }
+}
+
+fn exception_class_order_owner<'a>(
+    owner: &str,
+    decls: &'a [ExceptionClassAttrDecl],
+) -> Vec<&'a ExceptionClassAttrDecl> {
+    let mut ordered = Vec::with_capacity(decls.len());
+    if let Some(owner_decl) = decls.iter().find(|decl| decl.variant_name == owner) {
+        ordered.push(owner_decl);
+    }
+    for decl in decls {
+        if decl.variant_name != owner {
+            ordered.push(decl);
+        }
+    }
+    ordered
+}
+
+fn exception_class_owner_field_row(
+    owner: &ExceptionClassAttrDecl,
+    field_name: &str,
+    row_ty: String,
+    raw_owned: Option<crate::front::semantic::RawOwnedField>,
+) -> crate::front::semantic::FieldRow {
+    let mut row = if owner.is_positional {
+        crate::front::semantic::FieldRow::positional(
+            majit_charon_reader::ullbc::positional_field_name(owner.field_index),
+            row_ty,
+        )
+    } else {
+        crate::front::semantic::FieldRow::named(field_name, row_ty)
+    };
+    row = row.with_atomic(owner.is_atomic);
+    if let Some(raw_owned) = raw_owned {
+        row = row.with_raw_owned(raw_owned);
+    }
+    row
+}
+
+fn exception_class_publish_owner(
+    owner: &ExceptionClassAttrDecl,
+    field_name: &str,
+) -> (crate::front::semantic::FieldRow, (String, ValueType)) {
+    let row = exception_class_owner_field_row(
+        owner,
+        field_name,
+        owner.row_ty.clone(),
+        owner.raw_owned.clone(),
+    );
+    (row, (field_name.to_string(), owner.attr_ty.clone()))
+}
+
+fn exception_class_rows_agree(decls: &[&ExceptionClassAttrDecl]) -> bool {
+    let owner = decls[0];
+    decls.iter().all(|decl| {
+        decl.row_ty == owner.row_ty
+            && decl.attr_ty == owner.attr_ty
+            && decl.raw_owned == owner.raw_owned
+    })
+}
+
+fn exception_class_flags_agree(
+    decls: &[&ExceptionClassAttrDecl],
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let owner_flag =
+        crate::codewriter::call::get_type_flag(&decls[0].row_ty, raw_alloc_flavor_structs);
+    decls.iter().all(|decl| {
+        crate::codewriter::call::get_type_flag(&decl.row_ty, raw_alloc_flavor_structs) == owner_flag
+    })
+}
+
+/// `ClassDef._generalize_attr` / `Attribute.merge` for one inherited name.
+///
+/// The owner's declaration is first (`getallsubdefs` yields the owner,
+/// then subclasses). `unionof` merges the projected `s_value`s. A
+/// `UnionError` is the `AnnotatorError`. The row is registered on the
+/// owner only.
+fn exception_class_generalized_owner_row(
+    class_name: &str,
+    field_name: &str,
+    owner_variant: &str,
+    decls: &[ExceptionClassAttrDecl],
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> (crate::front::semantic::FieldRow, (String, ValueType)) {
+    let ordered = exception_class_order_owner(owner_variant, decls);
+    if ordered.is_empty() || ordered[0].variant_name != owner_variant {
+        panic!(
+            "exception class {class_name}.{field_name}: {owner_variant} owns the field but has no declaration"
+        );
+    }
+    let distinct = ordered
+        .iter()
+        .any(|decl| decl.declared != ordered[0].declared);
+    // A single declaration that is not one word keeps the placement
+    // panic. Differing declarations name both types.
+    if !ordered[0].one_word && !distinct {
+        panic!(
+            "exception class {class_name}.{field_name}: field type {} is not a one-word attr",
+            ordered[0].declared
+        );
+    }
+    if ordered.iter().any(|decl| !decl.one_word) && distinct {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    // `SomeImpossibleValue` is bottom (`impossible ∪ X = X`). A
+    // declaration this bookkeeper cannot project must not disappear
+    // into the other side's annotation.
+    if ordered
+        .iter()
+        .any(|decl| exception_class_annotation_is_uninformative(&decl.s_value))
+        && distinct
+    {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    let acc = match crate::annotator::model::unionof(ordered.iter().map(|decl| &decl.s_value)) {
+        Ok(acc) => acc,
+        Err(_) => exception_class_attr_types_panic(class_name, field_name, &ordered),
+    };
+    let owner = ordered[0];
+    if ordered.iter().any(|decl| decl.raw_owned != owner.raw_owned) {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    match owner.kind {
+        ExceptionClassAttrKind::Str => {
+            if !matches!(acc, crate::annotator::model::SomeValue::String(_)) {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::ListOfStr => {
+            if !exception_class_annotation_is_list_of_str(&acc) {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::RawOwned | ExceptionClassAttrKind::Ordinary => {}
+    }
+    if exception_class_rows_agree(&ordered) {
+        return exception_class_publish_owner(owner, field_name);
+    }
+    match owner.kind {
+        // The by-value row is the representation of that annotation.
+        ExceptionClassAttrKind::Str | ExceptionClassAttrKind::ListOfStr => {
+            exception_class_publish_owner(owner, field_name)
+        }
+        ExceptionClassAttrKind::RawOwned => {
+            if exception_class_flags_agree(&ordered, raw_alloc_flavor_structs) {
+                exception_class_publish_owner(owner, field_name)
+            } else {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::Ordinary => {
+            // `i64` and `isize` share `get_type_flag` on a 64-bit target
+            // and `unionof` does not widen, so the owner's row is already
+            // that signed integer. A wider union takes the declaration
+            // whose flag is the annotation's (`lltype.Signed` / `Unsigned`),
+            // or that canonical spelling when none matches.
+            let widened = ordered.iter().any(|decl| decl.s_value != acc);
+            if exception_class_flags_agree(&ordered, raw_alloc_flavor_structs) && !widened {
+                return exception_class_publish_owner(owner, field_name);
+            }
+            let Some((canon_ty, canon_vt)) = exception_class_annotation_repr(&acc) else {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            };
+            let target =
+                crate::codewriter::call::get_type_flag(&canon_ty, raw_alloc_flavor_structs);
+            if crate::codewriter::call::get_type_flag(&owner.row_ty, raw_alloc_flavor_structs)
+                == target
+                && owner.attr_ty == canon_vt
+            {
+                return exception_class_publish_owner(owner, field_name);
+            }
+            if let Some(decl) = ordered.iter().find(|decl| {
+                crate::codewriter::call::get_type_flag(&decl.row_ty, raw_alloc_flavor_structs)
+                    == target
+                    && decl.attr_ty == canon_vt
+            }) {
+                return (
+                    exception_class_owner_field_row(owner, field_name, decl.row_ty.clone(), None),
+                    (field_name.to_string(), decl.attr_ty.clone()),
+                );
+            }
+            (
+                exception_class_owner_field_row(owner, field_name, canon_ty, None),
+                (field_name.to_string(), canon_vt),
+            )
+        }
+    }
+}
+
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
 /// Variant fields of a marked exception-class enum, on the minted classes.
 ///
-/// A name an ancestor already publishes is inherited and is not registered
-/// again. An empty variant and a variant whose fields are all inherited
-/// get no rows. The base class gets none. A field that is not one
-/// translated word panics with the enum, variant class, field, and type.
+/// Farthest declaring ancestor, same walk as registration
+/// ([`crate::front::llbc_hints::exception_class_field_owner`],
+/// `ClassDef.get_owner`). `ClassDef._generalize_attr` keeps one attribute
+/// on that owner: `Attribute.merge` unions every declaring class's value
+/// annotation (`unionof` of the `s_value`s) and the subclass copies are
+/// not registered. A `UnionError`, or a result that is not one translated
+/// word (`exception_class_attr_is_one_word`), panics with the owner class,
+/// the field, and both declared types. The owner's row is that generalized
+/// annotation and the representation derived from it. A by-value `String`,
+/// `Vec<String>`, or raw-flavor struct keeps that row kind only when the
+/// union is still that kind; `raw_owned` stays on the owner row. An empty
+/// variant and a variant whose fields are all inherited get no rows. The
+/// base class gets none.
 fn register_exception_class_variant_fields(
     td: &TypeDecl,
     hint: &crate::front::llbc_hints::ExceptionClassHint,
@@ -4195,6 +4621,50 @@ fn register_exception_class_variant_fields(
             .collect();
         published.push((variant.name.clone(), names));
     }
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let mut groups: Vec<ExceptionClassAttrGroup> = Vec::new();
+    let declares = |published: &[(String, Vec<String>)], variant_name: &str, fname: &str| {
+        published.iter().any(|(published_name, names)| {
+            published_name == variant_name && names.iter().any(|candidate| candidate == fname)
+        })
+    };
+    for variant_name in &hint.variants {
+        let Some(variant) = variants
+            .iter()
+            .find(|variant| variant.name == *variant_name)
+        else {
+            continue;
+        };
+        for (index, field) in variant.fields.iter().enumerate() {
+            let fname = field_decl_name(index, field);
+            let owner = crate::front::llbc_hints::exception_class_field_owner(
+                &links,
+                variant_name,
+                |name| declares(&published, name, &fname),
+            );
+            let decl = exception_class_declared_attr(
+                variant_name,
+                index,
+                field,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                &bk,
+            );
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.owner == owner && group.field == fname)
+            {
+                group.decls.push(decl);
+            } else {
+                groups.push(ExceptionClassAttrGroup {
+                    owner: owner.to_string(),
+                    field: fname,
+                    decls: vec![decl],
+                });
+            }
+        }
+    }
     for variant_name in &hint.variants {
         let Some(variant) = variants
             .iter()
@@ -4203,54 +4673,36 @@ fn register_exception_class_variant_fields(
             continue;
         };
         let class_name =
-            crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant_name));
+            crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(variant_name));
         let mut rows = Vec::new();
         let mut attrs = Vec::new();
         for (index, field) in variant.fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            if exception_ancestor_declares(&links, &published, variant_name, &fname) {
+            let owner = crate::front::llbc_hints::exception_class_field_owner(
+                &links,
+                variant_name,
+                |name| declares(&published, name, &fname),
+            );
+            if owner != variant_name.as_str() {
                 continue;
             }
-            if !exception_class_attr_is_one_word(
-                &field.ty,
-                llbc,
-                gc_struct_ids,
+            let group = groups
+                .iter()
+                .find(|group| group.owner == owner && group.field == fname)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "exception class {class_name}.{fname}: {owner} owns the field but has no declaration"
+                    )
+                });
+            let (row, attr) = exception_class_generalized_owner_row(
+                &class_name,
+                &fname,
+                owner,
+                &group.decls,
                 raw_alloc_flavor_structs,
-            ) {
-                let spelling = tyref_to_ast_string(&field.ty, llbc);
-                panic!(
-                    "exception class {class_name}.{fname}: field type {spelling} is not a one-word attr"
-                );
-            }
-            // A by-value `alloc::string::String` is the rstr attr.
-            // `"str"` is the spelling `project_struct_field_type` already
-            // maps to `s_str0()` (`SomeString`). The register bank is
-            // `ValueType::Str` (`Ptr(STR)`). A borrow or raw pointer is
-            // not this helper, so it keeps the address row.
-            let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
-            let row_ty = if by_value_string {
-                "str".to_string()
-            } else {
-                annotation_struct_field_type(
-                    &field.ty,
-                    llbc,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            };
-            let attr_ty = if by_value_string {
-                ValueType::Str
-            } else {
-                tyref_to_attr_value_type_with(
-                    &field.ty,
-                    llbc,
-                    no_tombstoned_leaves(),
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            };
-            attrs.push((fname.clone(), attr_ty));
-            rows.push(field_row_from_decl(index, field, row_ty, llbc));
+            );
+            rows.push(row);
+            attrs.push(attr);
         }
         if rows.is_empty() {
             continue;
@@ -4258,31 +4710,6 @@ fn register_exception_class_variant_fields(
         struct_fields.fields.insert(class_name.clone(), rows);
         struct_field_attrs.insert(class_name, attrs);
     }
-}
-
-fn exception_ancestor_declares(
-    links: &[(String, Option<String>)],
-    published: &[(String, Vec<String>)],
-    variant: &str,
-    field: &str,
-) -> bool {
-    let mut current = links
-        .iter()
-        .find(|(name, _)| name == variant)
-        .and_then(|(_, parent)| parent.clone());
-    while let Some(parent) = current {
-        if published.iter().any(|(name, names)| {
-            name == &parent && names.iter().any(|candidate| candidate == field)
-        }) {
-            return true;
-        }
-        let next = parent.clone();
-        current = links
-            .iter()
-            .find(|(name, _)| name == &next)
-            .and_then(|(_, parent)| parent.clone());
-    }
-    false
 }
 
 fn derive_program_metadata(
@@ -4605,7 +5032,16 @@ fn derive_program_metadata(
                 known_struct_names.insert(leaf.clone());
                 let marked_hint =
                     exception_class_hint_for_paths(exception_class_hints, &name, &canon_base);
-                if let Some(hint) = marked_hint {
+                // Variant field rows belong to the defining crate
+                // (`ItemMeta::is_local`). A later crate's copy spells a
+                // nested ADT as its leaf (`charon_adt_to_ast_string`'s
+                // Path arm) where the defining crate records the
+                // crate-stripped path (`field_row_struct_identity`).
+                // `absorb_struct_fields` keeps the row already stored,
+                // so the copy inserts none and the defining rows stay.
+                if let Some(hint) = marked_hint
+                    && td.item_meta.is_local
+                {
                     register_exception_class_variant_fields(
                         td,
                         hint,
@@ -5571,18 +6007,27 @@ pub(crate) struct DuplicateLeafFacts {
 }
 
 impl DuplicateLeafFacts {
-    pub(crate) fn discover(llbc: &Llbc) -> Self {
+    pub(crate) fn discover(
+        llbc: &Llbc,
+        program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut raw_alloc_flavor_structs =
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                llbc,
+            ));
+        // `_alloc_flavor_` is a class property (`rclass.py` `getgcflavor`,
+        // `ClassDesc.get_param`), one set for the program. This artefact's
+        // markers are harvested above; callers pass the same set
+        // `CrateLoweringState` lowers with, which already holds markers
+        // from the defining artefact when this one is a layout copy.
+        raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, enum_variant_by_discriminant, struct_origins, _, _, struct_ids) =
             derive_program_metadata(
                 llbc,
                 &harvest_declared_gc_facts(llbc).gc_struct_ids(),
                 no_immutable_fields(),
-                &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-                    std::slice::from_ref(llbc),
-                ),
-                &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-                    std::slice::from_ref(llbc),
-                ),
+                &raw_alloc_flavor_structs,
+                llbc_exception_class_hints(llbc),
             );
         let crate_name = llbc.crate_name().to_string();
         let prefix = format!("{crate_name}::");
@@ -5909,7 +6354,7 @@ pub(crate) fn enum_ctor_class_identity(
 
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
-    DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
+    DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
 }
 
 /// Withdraw the bare-leaf convenience aliases for struct leaves shared
@@ -6249,9 +6694,7 @@ impl<'a> LowerContext<'a> {
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-                std::slice::from_ref(llbc),
-            ),
+            llbc_exception_class_hints(llbc),
         );
         Self {
             llbc,
@@ -6617,7 +7060,7 @@ pub(crate) use self::gcroot::{
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
-    STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
+    RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
     charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
     collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
@@ -6626,9 +7069,9 @@ pub(crate) use self::lltype::{
     is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
     is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    output_type_is_objectptr, push_unichr, same_nominal_adt, seed_program_exception_class_hints,
+    strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
+    tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6636,7 +7079,9 @@ pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,
 };
 pub(crate) use self::removeassert::bind_array_view_len_in_block;
-pub(crate) use self::strformat::interpolant_is_rust_heap_string;
+pub(crate) use self::strformat::{
+    interpolant_is_rust_heap_string, interpolant_is_rust_heap_vec_string,
+};
 pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_len_field_name};
 
 /// Graphs that pass a pointer to `OwnerRootGuard` (or to an aggregate that
@@ -7155,10 +7600,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             );
             let mut conversions = Vec::with_capacity(foreign_sites.len());
             for site in &foreign_sites {
+                let conversion = if let Some(sum) = exception_sum.as_ref() {
+                    from_impl_conversion_declared(lo.llbc, &sum.identity, &sum.path, &site.error_ty)
+                } else {
+                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                };
                 conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
+                    conversion.map_err(|err| {
+                        LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                    })?,
                 );
             }
             crate::front::result_exc::apply_foreign_from_residuals(

@@ -551,13 +551,38 @@ fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
     }
 }
 
+fn attr_reverse_size_key(size: Option<usize>) -> Option<i64> {
+    size.map(|size| -(size as i64))
+}
+
 pub fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
-    lowleveltype_size_hint(lltype).map(|size| -(size as i64))
+    attr_reverse_size_key(lowleveltype_size_hint(lltype))
+}
+
+/// `InstanceRepr._setup_repr` orders `myllfields` by name, then stably by
+/// decreasing size (`attr_reverse_size`). `None` is the unsized key that
+/// function returns for `Void` and for a type `sizeof` rejects, and it
+/// sorts before every measured size.
+pub(crate) fn cmp_llfields_name_then_reverse_size(
+    left_name: &str,
+    left_size: Option<usize>,
+    right_name: &str,
+    right_size: Option<usize>,
+) -> std::cmp::Ordering {
+    attr_reverse_size_key(left_size)
+        .cmp(&attr_reverse_size_key(right_size))
+        .then_with(|| left_name.cmp(right_name))
 }
 
 fn sort_llfields(llfields: &mut [(String, LowLevelType)]) {
-    llfields.sort_by(|left, right| left.0.cmp(&right.0));
-    llfields.sort_by_key(attr_reverse_size);
+    llfields.sort_by(|left, right| {
+        cmp_llfields_name_then_reverse_size(
+            &left.0,
+            lowleveltype_size_hint(&left.1),
+            &right.0,
+            lowleveltype_size_hint(&right.1),
+        )
+    });
 }
 
 fn class_attr_family_key(
@@ -5265,6 +5290,22 @@ mod tests {
         );
         let n128 = rffi::number_from_forced_int("r_int128_rclass", true, 128);
         assert_eq!(attr_reverse_size(&("f".into(), n128)), Some(-16));
+    }
+
+    /// `InstanceRepr._setup_repr`: name order, then stable `attr_reverse_size`.
+    /// `Void` is the unsized key and sorts first. Equal sizes keep name order,
+    /// so `Signed` `a` precedes `Signed` `c`, and `Char` `b` follows both.
+    #[test]
+    fn sort_llfields_name_then_decreasing_size() {
+        let mut fields = vec![
+            ("b".into(), LowLevelType::Char),
+            ("a".into(), LowLevelType::Signed),
+            ("c".into(), LowLevelType::Signed),
+            ("v".into(), LowLevelType::Void),
+        ];
+        sort_llfields(&mut fields);
+        let names: Vec<_> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["v", "a", "c", "b"]);
     }
 
     #[test]

@@ -188,6 +188,7 @@ mod tests {
             total_blocks: 0,
             total_ops: 0,
             total_vable_rewrites: 0,
+            minted_exception_classes: Vec::new(),
         }
     }
 

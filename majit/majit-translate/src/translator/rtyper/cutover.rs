@@ -10748,9 +10748,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let ft =
-            crate::annotator::bookkeeper::func_type_from_fn_spelling("fn() -> i64", &|_| false)
-                .expect("fn() -> i64 spelling");
+        let ft = crate::annotator::bookkeeper::func_type_from_fn_spelling(
+            "fn() -> i64",
+            &|_| false,
+            &|_| false,
+        )
+        .expect("fn() -> i64 spelling");
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
         load.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Func(ft),
@@ -10823,9 +10826,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let ft =
-            crate::annotator::bookkeeper::func_type_from_fn_spelling("fn() -> i64", &|_| false)
-                .expect("fn() -> i64 spelling");
+        let ft = crate::annotator::bookkeeper::func_type_from_fn_spelling(
+            "fn() -> i64",
+            &|_| false,
+            &|_| false,
+        )
+        .expect("fn() -> i64 spelling");
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
         load.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Func(ft),

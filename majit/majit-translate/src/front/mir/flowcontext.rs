@@ -4170,8 +4170,27 @@ impl<'a> Lowering<'a> {
                 Some(args) => args[0].clone(),
                 None => discr_var.clone(),
             };
-            let class_name =
-                crate::front::llbc_hints::exception_class_qualname(&info.enum_path, Some(variant));
+            let class_host = {
+                let hints = llbc_exception_class_hints(self.llbc);
+                let hint = exception_class_hint_for_paths(hints, &info.enum_path, &info.enum_path)
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: exception class `{}` has no harvested hierarchy",
+                            info.enum_path
+                        ))
+                    })?;
+                hint.classes
+                    .variants
+                    .iter()
+                    .find(|(name, _)| name == variant)
+                    .map(|(_, host)| host.clone())
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: exception class `{}` has no host for variant `{variant}`",
+                            info.enum_path
+                        ))
+                    })?
+            };
             let class_var = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -4180,9 +4199,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(block).operations.push(SpaceOperation {
                 result: Some(class_var.clone()),
-                kind: crate::model::OpKind::ConstRef(
-                    crate::flowspace::model::HostObject::new_class(class_name, Vec::new()),
-                ),
+                kind: crate::model::OpKind::ConstRef(class_host),
             });
             self.graph.block_mut(block).operations.push(SpaceOperation {
                 result: Some(result.clone()),

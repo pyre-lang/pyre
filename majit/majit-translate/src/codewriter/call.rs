@@ -8787,14 +8787,16 @@ impl CallControl {
                 // `annrpython.py consider_op` never `recursivecall`s a
                 // helper whose Call `translate_op` rewrites to a
                 // high-level op (`rlist.py rtype_newlist` lowers to
-                // `gendirectcall` at rtyping). Empty callees is the
+                // `gendirectcall` at rtyping) or to `str.join`
+                // (`rstr.py rtype_method_join`) when the receiver is a
+                // list of str. Empty callees is the
                 // existing no-graph path: no block, no notify, no
                 // AccessDirect copy. `find_all_graphs` still follows
                 // the graph (`call.py guess_call_kind`).
                 if !bfs_phase
-                    && crate::translator::rtyper::flowspace_adapter::function_path_is_high_level_op(
+                    && crate::translator::rtyper::flowspace_adapter::call_rewritten_before_recursivecall(
                         target,
-                        args.len(),
+                        args,
                     )
                 {
                     return Vec::new();
@@ -15562,6 +15564,15 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
+        // Unresized list of str (`FixedSizeListRepr`): one
+        // `Ptr(GcArray(GCREF))` word (`externalvsinternal` wraps
+        // `Ptr(STR)`). `HighLevelOp.convertvar` stores that pointer.
+        // The three-word rust `Vec` header stays the next arm.
+        s if s == crate::front::mir::RPY_LIST_OF_STR => (
+            ArrayFlag::Pointer,
+            majit_ir::value::Type::Ref,
+            crate::layout::target_word_size(),
+        ),
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
@@ -16580,6 +16591,10 @@ fn try_array_type_id_of_lltype(
         match &of {
             LowLevelType::Signed => Some(LIST_INT_ITEMS_ARRAY.to_string()),
             LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+            // `GCREF` is `Ptr(GcOpaqueType('GCREF'))` (`llmemory.py`), so
+            // `_needsgc()` is true. `externalvsinternal(..., gcref=True)`
+            // stores every gc pointer item as that `GCREF`, and
+            // `get_array_descr` keys the resulting ARRAY once.
             LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
             of => Some(format!("GcArray<{}>", try_array_item_spelling(of)?)),
         }
@@ -18253,6 +18268,32 @@ mod tests {
         assert_eq!(
             array_of_lltype_identity_for(&LowLevelType::Signed, 4),
             LowLevelType::Signed
+        );
+    }
+
+    /// `GcArray(GCREF)` and a `GcArray` of gc struct pointers are one ARRAY.
+    /// `externalvsinternal(..., gcref=True)` (`rmodel.py`) wraps both items
+    /// as gc pointers, and `get_array_descr` caches on that ARRAY
+    /// (`LIST_OBJ_ITEMS_ARRAY`).
+    #[test]
+    fn array_type_id_gc_pointer_items_share_list_obj_items_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use majit_jitcode::codewriter::jtransform::LIST_OBJ_ITEMS_ARRAY;
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(GCREF.clone())),
+            LIST_OBJ_ITEMS_ARRAY
+        );
+        let point = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(
+                "Point",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }));
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(point)),
+            LIST_OBJ_ITEMS_ARRAY
         );
     }
 

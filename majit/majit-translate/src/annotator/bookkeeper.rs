@@ -510,6 +510,25 @@ struct MintedExceptionHierarchy {
     variants: Vec<(String, Rc<RefCell<ClassDef>>)>,
 }
 
+fn classdef_pyobj(classdef: &Rc<RefCell<ClassDef>>) -> HostObject {
+    classdef.borrow().classdesc.borrow().pyobj.clone()
+}
+
+fn minted_hierarchy_matches_hint(
+    stored: &MintedExceptionHierarchy,
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+) -> bool {
+    if classdef_pyobj(&stored.base) != hint.classes.base {
+        return false;
+    }
+    stored.variants.len() == hint.classes.variants.len()
+        && stored.variants.iter().zip(&hint.classes.variants).all(
+            |((name, classdef), (hint_name, host))| {
+                name == hint_name && classdef_pyobj(classdef) == *host
+            },
+        )
+}
+
 impl std::fmt::Debug for Bookkeeper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bookkeeper")
@@ -4434,35 +4453,58 @@ impl Bookkeeper {
         host
     }
 
-    /// Intern an RPython exception class under the literal name.
+    /// Intern the harvested class object under its declaration key.
     ///
-    /// `intern_class_key` resolves against this bookkeeper's registry
-    /// and already-interned classes, and a TypeDecl is interned under
-    /// its qualified path (`argument::ArgErr`), so the literal Python
-    /// `__name__` key keeps the exception class apart from the value
-    /// ADT. The key here is the name as given (`ArgErr`,
-    /// `ArgErrMissing`). First mint wins: a key that is already present
-    /// is returned unchanged.
-    fn intern_exception_class(&self, name: &str, bases: Vec<HostObject>) -> HostObject {
-        if let Some(existing) = self.struct_root_classes.borrow().get(name) {
-            return existing.clone();
+    /// `host` is the object the harvest created.
+    /// [`Self::intern_class_key`] is the resolution
+    /// [`Self::intern_class_by_qualname`] uses, so the minted host and
+    /// the value ADT's class are one [`Self::struct_root_classes`] entry.
+    /// The same arc is returned. A different arc under that key panics.
+    /// A different base chain panics first, with the chain text: a plain
+    /// class interned before the hierarchy is not reused.
+    fn intern_exception_class(&self, host: &HostObject) -> HostObject {
+        let key = self.intern_class_key(host.qualname());
+        let want = host.class_bases().unwrap_or(&[]);
+        if let Some(existing) = self.struct_root_classes.borrow().get(&key).cloned() {
+            if existing == *host {
+                return existing;
+            }
+            let actual = existing.class_bases().map(|got| got.to_vec());
+            let matches = actual.as_ref().is_some_and(|got| {
+                got.len() == want.len() && got.iter().zip(want).all(|(got, want)| got == want)
+            });
+            if !matches {
+                let got = actual
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|base| base.qualname().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let want_text = want
+                    .iter()
+                    .map(|base| base.qualname().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!(
+                    "exception class `{key}` is already interned with bases [{got}], expected [{want_text}]"
+                );
+            }
+            panic!("exception class `{key}` is already interned as a different class object");
         }
-        let host = HostObject::new_class(name.to_string(), bases);
-        crate::virtualizable_decl::stamp_host_virtualizable(&host, name);
-        self.stamp_raw_alloc_flavor(&host, name);
-        self.insert_struct_root_class(name.to_string(), host.clone());
-        host
+        crate::virtualizable_decl::stamp_host_virtualizable(host, &key);
+        self.stamp_raw_alloc_flavor(host, &key);
+        self.stamp_immutable_fields(host, &key);
+        self.insert_struct_root_class(key, host.clone());
+        host.clone()
     }
 
     /// Mint each `_exception_class_<Enum>` hierarchy.
     ///
-    /// The base subclasses the host `Exception`
-    /// (`HOST_ENV.lookup_exception_class`, the base
-    /// `default_class_bases` gives the error carrier). Each variant
-    /// subclasses its parent exception class, not the Rust enum variant.
-    /// Class names are `exception_class_qualname` (enum leaf, or that
-    /// leaf concatenated with the variant). `getuniqueclassdef` runs
-    /// here so `basedef` is wired. `assign_inheritance_ids` does not:
+    /// The hosts are the hint's. The base subclasses the host
+    /// `Exception`. Each variant subclasses its parent exception class,
+    /// not the Rust enum variant. `getuniqueclassdef` runs here so
+    /// `basedef` is wired. `assign_inheritance_ids` does not:
     /// `run_two_phase_prepass` numbers classdefs after phase A and
     /// before phase B, `CallRegistry::ensure_session` numbers the
     /// session prefix, and `RPythonTyper::convert_helper_exception_links`
@@ -4472,23 +4514,21 @@ impl Bookkeeper {
     /// `exception_class_llexitcase`.
     ///
     /// A hierarchy whose intern key is already recorded is left as it
-    /// is (`exception_class_enum_path_matches`).
+    /// is (`exception_class_enum_path_matches`). The arriving hosts
+    /// must be those recorded class objects; a different object panics
+    /// in every build, including release.
     pub fn mint_exception_class_hierarchies(
         self: &Rc<Self>,
         hints: &[crate::front::llbc_hints::ExceptionClassHint],
     ) {
         for hint in hints {
-            let already = self
-                .exception_class_hierarchies
-                .borrow()
-                .iter()
-                .any(|stored| {
-                    crate::front::llbc_hints::exception_class_enum_path_matches(
-                        &stored.enum_path,
-                        &hint.enum_path,
-                    )
-                });
-            if already {
+            if let Some(stored) = self.matched_exception_hierarchy(&hint.enum_path) {
+                let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+                assert!(
+                    minted_hierarchy_matches_hint(&stored, hint),
+                    "_exception_class_ {enum_name}: hierarchy `{}` arrived with a different class object",
+                    hint.enum_path
+                );
                 continue;
             }
             self.mint_one_exception_hierarchy(hint);
@@ -4500,60 +4540,30 @@ impl Bookkeeper {
         hint: &crate::front::llbc_hints::ExceptionClassHint,
     ) {
         let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
-        let order = crate::front::llbc_hints::parse_exception_class_overrides(
-            enum_name,
-            &hint.overrides,
-            &hint.variants,
-        );
-        let exception = crate::flowspace::model::HOST_ENV
-            .lookup_exception_class("Exception")
-            .expect("HOST_ENV missing builtin Exception");
-        let base_name = crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, None);
-        if base_name.is_empty() {
-            panic!("_exception_class_ {enum_name}: empty class name");
-        }
-        let base_host = self.intern_exception_class(&base_name, vec![exception]);
+        let base_name = hint.classes.base.qualname();
+        let base_host = self.intern_exception_class(&hint.classes.base);
         let base = self.getuniqueclassdef(&base_host).unwrap_or_else(|err| {
             panic!("_exception_class_ {enum_name}: getuniqueclassdef({base_name}): {err}")
         });
-        let mut hosts: Vec<(String, HostObject)> = Vec::new();
-        let mut variants = Vec::with_capacity(order.len());
-        for (variant, parent) in order {
-            let parent_host = match parent.as_deref() {
-                None => base_host.clone(),
-                Some(parent_name) => hosts
-                    .iter()
-                    .find(|(name, _)| name == parent_name)
-                    .map(|(_, host)| host.clone())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "_exception_class_ {enum_name}: parent `{parent_name}` was not minted \
-                             before `{variant}`"
-                        )
-                    }),
-            };
-            let class_name =
-                crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(&variant));
-            if class_name.is_empty() {
-                panic!("_exception_class_ {enum_name}: empty class name");
-            }
-            let host = self.intern_exception_class(&class_name, vec![parent_host]);
-            let classdef = self.getuniqueclassdef(&host).unwrap_or_else(|err| {
+        let mut variants = Vec::with_capacity(hint.classes.variants.len());
+        for (variant, host) in &hint.classes.variants {
+            let class_name = host.qualname();
+            let interned = self.intern_exception_class(host);
+            let classdef = self.getuniqueclassdef(&interned).unwrap_or_else(|err| {
                 panic!("_exception_class_ {enum_name}: getuniqueclassdef({class_name}): {err}")
             });
             let project = {
                 let guard = self.struct_fields.borrow();
                 guard
                     .as_ref()
-                    .is_some_and(|reg| reg.fields.contains_key(&class_name))
+                    .is_some_and(|reg| reg.fields.contains_key(class_name))
             };
             if project {
-                self.project_struct_rows(&class_name).unwrap_or_else(|err| {
+                self.project_struct_rows(class_name).unwrap_or_else(|err| {
                     panic!("_exception_class_ {enum_name}: project {class_name}: {err}")
                 });
             }
-            hosts.push((variant.clone(), host));
-            variants.push((variant, classdef));
+            variants.push((variant.clone(), classdef));
         }
         self.exception_class_hierarchies
             .borrow_mut()
@@ -4596,7 +4606,7 @@ impl Bookkeeper {
             .map(|hierarchy| hierarchy.base)
     }
 
-    /// The variant class `<Enum><Variant>` of the hierarchy `enum_path` names.
+    /// The variant class `{enum_path}::{variant}` of the hierarchy `enum_path` names.
     ///
     /// `None` when the hierarchy or the variant is absent.
     pub fn exception_class_variant(
@@ -4652,10 +4662,10 @@ impl Bookkeeper {
         })
     }
 
-    /// Literal variant class names of the hierarchy `enum_path` names.
+    /// Variant class keys of the hierarchy `enum_path` names.
     ///
     /// Empty when no hierarchy matches. The strings are
-    /// `exception_class_qualname` (`EA`), not the variant leaves.
+    /// `exception_class_key` (`synth::E::A`), not the variant leaves.
     pub fn exception_variant_class_names(&self, enum_path: &str) -> Vec<String> {
         self.matched_exception_hierarchy(enum_path)
             .map(|hierarchy| {
@@ -4663,7 +4673,7 @@ impl Bookkeeper {
                     .variants
                     .iter()
                     .map(|(variant, _)| {
-                        crate::front::llbc_hints::exception_class_qualname(
+                        crate::front::llbc_hints::exception_class_key(
                             &hierarchy.enum_path,
                             Some(variant),
                         )
@@ -5098,6 +5108,19 @@ impl Bookkeeper {
             }
             "()" => return super::model::s_none(),
             _ => {}
+        }
+        // Unresized list of str (`FixedSizeListRepr`, `Ptr(GcArray(GCREF))`
+        // after `externalvsinternal` wraps `Ptr(STR)`). A marked exception
+        // class stores a by-value `Vec<String>` as this one word.
+        // `HighLevelOp.convertvar` is the repr conversion at the store.
+        if stripped == crate::front::mir::RPY_LIST_OF_STR {
+            let listdef = super::listdef::ListDef::new(
+                Some(self.clone()),
+                super::model::s_str0(),
+                false,
+                false,
+            );
+            return SomeValue::List(super::model::SomeList::new(listdef));
         }
         for list_wrapper in ["Vec<", "VecDeque<", "Slice<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
@@ -6996,9 +7019,11 @@ pub(crate) fn fn_ptr_somevalue_for_spelling_in(
     bk: Option<&Bookkeeper>,
 ) -> Option<SomeValue> {
     use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
-    let ft = func_type_from_fn_spelling(spelling, &|e| {
-        bk.is_some_and(|bk| bk.exception_carrier_type_spelling(e))
-    })?;
+    let ft = func_type_from_fn_spelling(
+        spelling,
+        &|e| bk.is_some_and(|bk| bk.exception_carrier_type_spelling(e)),
+        &|_| false,
+    )?;
     Some(SomeValue::Ptr(super::model::SomePtr::new(Ptr {
         TO: PtrTarget::Func(ft),
     })))
@@ -7015,11 +7040,17 @@ fn empty_functype() -> crate::translator::rtyper::lltypesystem::lltype::FuncType
 /// `FuncType` of a Rust fn-pointer spelling. One Rust `fn` type is one
 /// `FuncType` (`lltype.py` `FuncType` / `getfunctionptr`), whether the
 /// producer is a parameter seed, a field read, or a reified fn item.
-/// `is_carrier` is the exception-carrier test (`exception_carrier_type_spelling`)
-/// so a `Result<T, E>` payload peels when `E` is that carrier.
+/// `is_carrier` peels `Result<T, E>` when `E` is the exception carrier.
+/// `is_exception_sum` peels when `E` is an exception sum. That predicate
+/// is declaration identity (`exception_class_enum_path_matches`), the
+/// comparison `names_declared_type` uses. A leaf compare is not it.
+/// `FuncType.RESULT` is then `valuetype_to_lltype` of `T`
+/// (`getfunctionptr` of `graph.getreturnvar().concretetype` after the
+/// exception transform).
 pub(crate) fn func_type_from_fn_spelling(
     spelling: &str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
     let t = spelling.trim();
@@ -7052,7 +7083,7 @@ pub(crate) fn func_type_from_fn_spelling(
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
     } else {
         let ret = after.strip_prefix("->")?;
-        fn_ptr_result_lltype(ret.trim(), is_carrier)
+        fn_ptr_result_lltype(ret.trim(), is_carrier, is_exception_sum)
     };
     Some(FuncType { args, result })
 }
@@ -7112,16 +7143,23 @@ fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
 }
 
 /// Ok payload of `Result<T, E>` when `E` is the exception carrier
-/// (`tyref_is_result_of_carrier`). Other `Result` types stay the ADT;
+/// (`tyref_is_result_of_carrier`) or an exception sum
+/// (`tyref_lowers_as_result_exc`). `is_exception_sum` is declaration
+/// identity, not a leaf compare. Any other `Result` stays the ADT;
 /// `FuncType.RESULT` is then `valuetype_to_lltype` of that payload,
 /// matching `getcallable` / `getfunctionptr`.
 fn result_ok_of_exception_carrier<'a>(
     spelling: &'a str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> Option<&'a str> {
     let args = spelling.trim().strip_prefix("Result<")?.strip_suffix('>')?;
     let parts = split_generic_args(args);
-    if parts.len() == 2 && is_carrier(parts[1].trim()) {
+    if parts.len() != 2 {
+        return None;
+    }
+    let err = parts[1].trim();
+    if is_carrier(err) || is_exception_sum(err) {
         Some(parts[0].trim())
     } else {
         None
@@ -7167,16 +7205,17 @@ fn fn_ptr_arg_lltype(
 /// set `FuncType.RESULT` to the callee return variable's lltype
 /// (`bindingrepr(v).lowleveltype`); `valuetype_to_lltype` is that
 /// projection from the return `ValueType`. A `Result<T, E>` whose `E` is
-/// the exception carrier is the residual-call payload `T`
-/// (`tyref_is_result_of_carrier`).
+/// the exception carrier or an exception sum is the residual-call payload
+/// `T` (`tyref_lowers_as_result_exc`).
 fn fn_ptr_result_lltype(
     spelling: &str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::model::ValueType;
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
-    if let Some(ok) = result_ok_of_exception_carrier(spelling, is_carrier) {
-        return fn_ptr_result_lltype(ok, is_carrier);
+    if let Some(ok) = result_ok_of_exception_carrier(spelling, is_carrier, is_exception_sum) {
+        return fn_ptr_result_lltype(ok, is_carrier, is_exception_sum);
     }
     let t = spelling.trim();
     if t == "()" {
@@ -8547,6 +8586,44 @@ mod tests {
                 result: LowLevelType::Signed,
             }),
             "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+
+        let is_synth_s = |err: &str| {
+            crate::front::llbc_hints::exception_class_enum_path_matches("synth::S", err)
+        };
+        let sum_signed = |spelling: &str| {
+            func_type_from_fn_spelling(spelling, &|_| false, &is_synth_s)
+                .unwrap_or_else(|| panic!("{spelling} is a fn pointer"))
+                .result
+        };
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, synth::S>"),
+            LowLevelType::Signed,
+            "an exception sum returns the Ok payload (`getfunctionptr`)"
+        );
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, fixture::synth::S>"),
+            LowLevelType::Signed,
+            "the crate-qualified path is the same declaration"
+        );
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, other::S>"),
+            OBJECTPTR.clone(),
+            "another module's S is not this sum"
+        );
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> Result<i64, Plain>", &|_| false, &|_| false)
+                .expect("plain Result is a fn pointer")
+                .result,
+            OBJECTPTR.clone(),
+            "a non-sum non-carrier ADT error stays OBJECTPTR"
+        );
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> Result<i64, synth::S>", &|_| false, &|_| false)
+                .expect("sum spelling without the predicate")
+                .result,
+            OBJECTPTR.clone(),
+            "the carrier predicate does not treat a sum as the carrier"
         );
     }
 

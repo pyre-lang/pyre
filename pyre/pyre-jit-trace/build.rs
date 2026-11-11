@@ -165,4 +165,11 @@ fn emit_llbc_extraction_placeholders() {
         bincode::serialize(&Vec::<(i64, String)>::new()).unwrap(),
     )
     .unwrap();
+    // Same text `render_minted_exception_classes_rs` writes for no rows.
+    // This path must not call majit-translate.
+    std::fs::write(
+        format!("{out_dir}/minted_exception_classes.rs"),
+        "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n",
+    )
+    .unwrap();
 }

@@ -13,8 +13,13 @@
 //!
 //! Items are non-pointer words, so the collector has no inner refs to trace.
 //!
-//! The `GcArray(OBJECTPTR)` body (rlist.py:84) is not here: it is reachable
-//! only from the object model that owns its item type.
+//! A fixed list of str is allocated here as well: `HighLevelOp.convertvar`
+//! from a rust-heap `Vec<String>` header to an unresized list of str.
+//! `FixedSizeListRepr._setup_repr` calls `externalvsinternal(..., gcref=True)`
+//! (`rmodel.py`), so the list is `Ptr(GcArray(GCREF))`. That ARRAY is the
+//! one gc-pointer items block (`gctypelayout.py get_type_id`): a length
+//! word, then pointer items. The host declares the slot
+//! ([`gc_object_items_array_gc_type_id`]).
 
 use std::alloc::{Layout, alloc, alloc_zeroed};
 
@@ -56,6 +61,15 @@ static GC_INT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 static GC_FLOAT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(UNSET_GC_TYPE_ID);
 
+/// GC type id for the one `GcArray` of gc pointers.
+///
+/// `externalvsinternal(..., gcref=True)` (`rmodel.py`) stores a `Ptr(STR)`
+/// and an instance pointer as `GCREF`, and `gctypelayout.py get_type_id`
+/// numbers that ARRAY once. A host declares the slot its registry gave
+/// that ARRAY ([`set_gc_object_items_array_gc_type_id`]).
+static GC_OBJECT_ITEMS_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(UNSET_GC_TYPE_ID);
+
 /// Publish `id` as the declaring host's slot for `lltype`.
 ///
 /// The cell is process-global because the collector it indexes is: `gc_sync`
@@ -68,7 +82,7 @@ static GC_FLOAT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 /// instance-owned, so two backends in one process keep separate ids. Pyre has
 /// no descriptor object at the allocation site — the block allocators take a
 /// bare `tid: u32` — so there is nothing instance-scoped for the id to live on
-/// until that plumbing exists, and moving only these two ids off the static
+/// until that plumbing exists, and moving only these ids off the static
 /// would buy no second host while the singleton and the allocator hook remain.
 ///
 /// Re-declaring the SAME slot is how `build_gc` (`pyre-jit::eval`)
@@ -101,13 +115,20 @@ pub fn set_gc_float_array_gc_type_id(id: u32) {
     declare_array_gc_type_id(&GC_FLOAT_ARRAY_GC_TYPE_ID, id, "GcArray(Float)");
 }
 
-/// Return both slots to [`UNSET_GC_TYPE_ID`] so a test can exercise the
+/// Declare the slot this host's `gc.register_type` returned for
+/// `GcArray(GCREF)`. Call it from the same place the host registers the type.
+pub fn set_gc_object_items_array_gc_type_id(id: u32) {
+    declare_array_gc_type_id(&GC_OBJECT_ITEMS_ARRAY_GC_TYPE_ID, id, "GcArray(GCREF)");
+}
+
+/// Return the slots to [`UNSET_GC_TYPE_ID`] so a test can exercise the
 /// declaration channel more than once. The production channel is
 /// declare-once-per-process; only the tests below need to undo it.
 #[cfg(test)]
 fn undeclare_array_gc_type_ids() {
     GC_INT_ARRAY_GC_TYPE_ID.store(UNSET_GC_TYPE_ID, std::sync::atomic::Ordering::Relaxed);
     GC_FLOAT_ARRAY_GC_TYPE_ID.store(UNSET_GC_TYPE_ID, std::sync::atomic::Ordering::Relaxed);
+    GC_OBJECT_ITEMS_ARRAY_GC_TYPE_ID.store(UNSET_GC_TYPE_ID, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// [`UNSET_GC_TYPE_ID`] until a host declares one.
@@ -129,6 +150,13 @@ pub fn gc_int_array_gc_type_id() -> u32 {
 #[majit_macros::dont_look_inside]
 pub fn gc_float_array_gc_type_id() -> u32 {
     GC_FLOAT_ARRAY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`UNSET_GC_TYPE_ID`] until a host declares the one `GcArray` of gc
+/// pointers. Same undeclared contract as [`gc_int_array_gc_type_id`].
+#[majit_macros::dont_look_inside]
+pub fn gc_object_items_array_gc_type_id() -> u32 {
+    GC_OBJECT_ITEMS_ARRAY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Route items-block allocations through the moving nursery instead of
@@ -186,6 +214,23 @@ pub const TYPED_ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(TypedItem
 
 /// Offset of the `capacity` header the collector reads as the GcArray length.
 pub const TYPED_ITEMS_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, capacity);
+
+/// Length word of that `GcArray` (`rlist.py` fixed-list `ll_length` /
+/// `getarraysize`). Offset 0.
+pub const OBJECT_ITEMS_LEN_OFFSET: usize = 0;
+
+/// `items[0]` — `get_array_token` `basesize`. One pointer word after the
+/// length.
+pub const OBJECT_ITEMS_OFFSET: usize = std::mem::size_of::<usize>();
+
+/// `sizeof(ARRAY.OF)` for a gc pointer item.
+pub const OBJECT_ITEMS_ITEM_SIZE: usize = std::mem::size_of::<*const ()>();
+
+const _: () = {
+    assert!(OBJECT_ITEMS_LEN_OFFSET == 0);
+    assert!(OBJECT_ITEMS_OFFSET == std::mem::size_of::<usize>());
+    assert!(OBJECT_ITEMS_ITEM_SIZE == std::mem::size_of::<*const ()>());
+};
 
 /// Items base pointer (`&items[0]`) of a `TypedItemsBlock`. Null-safe.
 #[inline]
@@ -696,6 +741,150 @@ pub fn _ll_fixed_alloc_and_set_nonnull_f_trampoline(count: i64, item: f64) -> *m
     }
 }
 
+/// Payload of an unresized list of str: the object-items `GcArray`.
+///
+/// Length word, then exactly `len` pointer slots (`ll_fixed_length` reads
+/// that word; a fixed list has no separate live-length). Each slot is a
+/// `GCREF` (`externalvsinternal` of `Ptr(STR)`). The tid is the slot
+/// [`gc_object_items_array_gc_type_id`] — the one ARRAY
+/// `gctypelayout.py get_type_id` numbers.
+///
+/// Zero the payload before the caller publishes the length word.
+/// `jit_ll_list_str_from_rust_vec` then allocates each `STR` through
+/// `mallocstr_rooted`, and `framework.py` `gct_fv_gc_malloc` `push_roots` /
+/// `pop_roots` can run a minor collection. IncrementalMiniMark does not
+/// zero-fill, so a walk of `items[0..length]` must see NULL until each
+/// `STR` is stored (`gc_malloc_array` leaves `GCREF` slots NULL). The
+/// payload allocation itself stays non-collecting `alloc_nursery_typed`.
+///
+/// Payload overflow is `_ll_compute_size` (`mallocHelpers`): MemoryError,
+/// then null. A null nursery or immortal block is
+/// `_ll_malloc_varsize_no_length`: MemoryError, then null. A collector
+/// whose object-items tid is still unset and `len > 0` is `fatalerror`.
+/// `get_type_id` assigns that id before any malloc, and an immortal
+/// header (`GCFLAG_NO_HEAP_PTRS`) must not hold nursery `STR` pointers.
+/// `len == 0` stays immortal. A declared slot is `alloc_nursery_typed`.
+/// With no collector the header tid is the declared slot, or `0` while
+/// the slot is unset.
+fn alloc_list_of_str_payload(len: usize) -> *mut u8 {
+    let Some(payload_size) = OBJECT_ITEMS_ITEM_SIZE
+        .checked_mul(len)
+        .and_then(|items_bytes| OBJECT_ITEMS_OFFSET.checked_add(items_bytes))
+    else {
+        // `_ll_compute_size`: ovfcheck overflow raises MemoryError.
+        majit_gc::raise_memory_error();
+        return std::ptr::null_mut();
+    };
+    let declared = gc_object_items_array_gc_type_id();
+    let unset = declared == UNSET_GC_TYPE_ID;
+    let collector = majit_gc::gc_allocator_installed();
+    if collector && unset && len > 0 {
+        // `get_type_id` has already run. Missing the tid is `fatalerror`.
+        eprintln!("fatal error: GcArray(GCREF) type id is unset with a collector installed");
+        std::process::abort();
+    }
+    let tid = if unset { 0 } else { declared };
+    let raw = if collector && !unset {
+        let gcref = majit_gc::alloc_nursery_typed(tid, payload_size);
+        if gcref.is_null() {
+            std::ptr::null_mut()
+        } else {
+            gcref.0 as *mut u8
+        }
+    } else {
+        majit_gc::header::alloc_varsize_with_gc_header_immortal(payload_size, tid)
+    };
+    if raw.is_null() {
+        // `_ll_malloc_varsize_no_length`: null from `allocate` raises MemoryError.
+        majit_gc::raise_memory_error();
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write_bytes(raw, 0, payload_size);
+    }
+    raw
+}
+
+/// `HighLevelOp.convertvar` from a rust-heap `Vec<String>` (`{cap, ptr, len}`)
+/// to an unresized list of str (`FixedSizeListRepr`, `Ptr(GcArray(GCREF))`).
+///
+/// The source moved the header into the field and elided `Drop`, so this
+/// helper consumes it. Each element's bytes are copied the way one `String`
+/// is copied into rstr `STR`: `mallocstr_rooted` writes the hash, the
+/// length, and the trailing NUL, and the bytes land at `STR_CHARS_OFFSET`.
+/// The array is one root across that call (`framework.py` `gct_fv_gc_malloc`
+/// `push_roots` / `pop_roots`); the reloaded address is what the next store
+/// uses. When a collector is installed, `framework.py`
+/// `transform_generic_set` runs `incminimark.py` `write_barrier_from_array`
+/// before each GC-pointer store. Each `String` buffer and the `Vec` buffer
+/// are then freed. A null source is an empty list. The array length is
+/// `len`, including zero. `mallocstr_rooted` returning `MemoryError`
+/// (`_ll_malloc_fixedsize` / `_ll_compute_size`) raises and returns null.
+/// The partial array is unreachable. The iterator drop frees the
+/// `String`s not yet copied and the `Vec` buffer.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_ll_list_str_from_rust_vec(
+    src: *mut std::vec::Vec<std::string::String>,
+) -> *mut u8 {
+    let vec = if src.is_null() {
+        std::vec::Vec::new()
+    } else {
+        unsafe { std::ptr::read(src) }
+    };
+    let len = vec.len();
+    let payload = alloc_list_of_str_payload(len);
+    if payload.is_null() {
+        drop(vec);
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        payload
+            .add(OBJECT_ITEMS_LEN_OFFSET)
+            .cast::<usize>()
+            .write(len);
+    }
+    // `gct_fv_gc_malloc` `push_roots` / `pop_roots`: this array is the live
+    // GC pointer across each string malloc. A minor collection rewrites the
+    // slot; every use after the call reads it back.
+    let mut roots = [majit_ir::GcRef(payload as usize)];
+    let collector = majit_gc::gc_allocator_installed();
+    for (index, item) in vec.into_iter().enumerate() {
+        let nbytes = item.len();
+        let gcref = match unsafe { super::rstr::mallocstr_rooted(nbytes, &mut roots) } {
+            Ok(gcref) => gcref,
+            Err(crate::rffi::MemoryError) => {
+                // `_ll_malloc_fixedsize` / `_ll_compute_size`. The partial
+                // array is unreachable. Dropping `item` and returning
+                // drops the iterator: the remaining `String`s and the
+                // `Vec` buffer.
+                majit_gc::raise_memory_error();
+                drop(item);
+                return std::ptr::null_mut();
+            }
+        };
+        let payload = roots[0].0 as *mut u8;
+        let bytes = item.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (gcref.0 as *mut u8).add(super::rstr::STR_CHARS_OFFSET),
+                bytes.len(),
+            );
+            if collector {
+                // `transform_generic_set` emits `write_barrier_from_array`
+                // before a GC-pointer store into an array.
+                majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(payload as usize), index);
+            }
+            payload
+                .add(OBJECT_ITEMS_OFFSET)
+                .cast::<usize>()
+                .add(index)
+                .write(gcref.0);
+        }
+    }
+    roots[0].0 as *mut u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +921,18 @@ mod tests {
 
         set_gc_float_array_gc_type_id(42);
         assert_eq!(gc_float_array_gc_type_id(), 42);
+    }
+
+    /// The object-items ARRAY is the third host-declared slot. `0` is a
+    /// real registry index (`TypeRegistry::register` returns
+    /// `entries.len()`), and the undeclared state must stay distinguishable
+    /// from it.
+    #[test]
+    fn object_items_array_gc_type_id_reads_back() {
+        let _guard = declaration_lock();
+        set_gc_object_items_array_gc_type_id(0);
+        assert_eq!(gc_object_items_array_gc_type_id(), 0);
+        assert_ne!(gc_object_items_array_gc_type_id(), UNSET_GC_TYPE_ID);
     }
 
     /// `build_gc` (`pyre-jit::eval`), called again by
@@ -901,8 +1102,10 @@ mod tests {
         fn hook() {
             HITS.fetch_add(1, Ordering::SeqCst);
         }
-        static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::RAISE_MEMORY_ERROR_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clear = crate::ClearRaiseHook;
         HITS.store(0, Ordering::SeqCst);
         majit_gc::set_active_raise_memory_error(Some(hook));
         let mut l = GcList {
@@ -914,5 +1117,156 @@ mod tests {
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
         assert!(l.items.is_null());
         assert_eq!(l.length, 0);
+    }
+
+    /// `_ll_compute_size` overflow raises MemoryError once and returns null.
+    ///
+    /// A `Vec<String>` cannot hold this length: `Vec::len` assumes
+    /// `len <= MAX_SLICE_LEN`, and `OBJECT_ITEMS_ITEM_SIZE` times that
+    /// bound still fits, so the raise is checked on
+    /// [`alloc_list_of_str_payload`]. [`jit_ll_list_str_from_rust_vec`]
+    /// `drop`s its source `Vec` when that returns null; the `Vec` here
+    /// is consumed by the helper and must not crash or leak the
+    /// moved-from local.
+    #[test]
+    fn jit_ll_list_str_from_rust_vec_payload_overflow_raises_memory_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        let _guard = crate::RAISE_MEMORY_ERROR_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _clear = crate::ClearRaiseHook;
+        HITS.store(0, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(hook));
+
+        let mul_overflow = usize::MAX / OBJECT_ITEMS_ITEM_SIZE + 1;
+        assert!(OBJECT_ITEMS_ITEM_SIZE.checked_mul(mul_overflow).is_none());
+        assert!(alloc_list_of_str_payload(mul_overflow).is_null());
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+
+        let add_overflow = usize::MAX / OBJECT_ITEMS_ITEM_SIZE;
+        let items_bytes = OBJECT_ITEMS_ITEM_SIZE
+            .checked_mul(add_overflow)
+            .expect("item bytes fit");
+        assert!(OBJECT_ITEMS_OFFSET.checked_add(items_bytes).is_none());
+        assert!(alloc_list_of_str_payload(add_overflow).is_null());
+        assert_eq!(HITS.load(Ordering::SeqCst), 2);
+
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let _decl = declaration_lock();
+        set_gc_object_items_array_gc_type_id(3);
+        let mut source = vec!["owned".to_string(), "data".to_string()];
+        let payload = jit_ll_list_str_from_rust_vec(&mut source);
+        std::mem::forget(source);
+        assert!(!payload.is_null());
+        assert_eq!(HITS.load(Ordering::SeqCst), 2);
+        unsafe { free_list_of_str(payload, &[5, 4]) };
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn jit_ll_list_str_from_rust_vec_is_published() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row
+                .path
+                .ends_with("lltypesystem::rlist::jit_ll_list_str_from_rust_vec")
+            {
+                found = true;
+                assert_ne!(row.get(), 0);
+                assert_eq!(row.arity, 1);
+            }
+        });
+        assert!(
+            found,
+            "HELPER_FNADDRS must publish jit_ll_list_str_from_rust_vec"
+        );
+    }
+
+    /// The helper `ptr::read`s the header, so the caller's `Vec` is
+    /// moved-from and must not be dropped. `mem::forget` is that contract.
+    /// The payload is the object-items `GcArray`: the host-declared tid,
+    /// a length word, then pointer items.
+    #[test]
+    fn jit_ll_list_str_from_rust_vec_copies_bytes_and_consumes_the_vec() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let _guard = declaration_lock();
+        set_gc_object_items_array_gc_type_id(3);
+
+        let empty = jit_ll_list_str_from_rust_vec(std::ptr::null_mut());
+        assert!(!empty.is_null());
+        unsafe {
+            assert_eq!(list_of_str_len(empty), 0);
+            free_list_of_str(empty, &[]);
+        }
+
+        let mut spare = std::vec::Vec::<String>::with_capacity(4);
+        let spare_ptr = &mut spare as *mut std::vec::Vec<String>;
+        let empty_cap = jit_ll_list_str_from_rust_vec(spare_ptr);
+        std::mem::forget(spare);
+        assert!(!empty_cap.is_null());
+        unsafe {
+            assert_eq!(list_of_str_len(empty_cap), 0);
+            free_list_of_str(empty_cap, &[]);
+        }
+
+        let mut items = vec!["a".to_string(), "bb".to_string(), String::new()];
+        let items_ptr = &mut items as *mut std::vec::Vec<String>;
+        let payload = jit_ll_list_str_from_rust_vec(items_ptr);
+        std::mem::forget(items);
+        assert!(!payload.is_null());
+        let expected = ["a", "bb", ""];
+        unsafe {
+            let hdr = majit_gc::header::header_of(payload as usize);
+            assert_eq!((*hdr).type_id(), gc_object_items_array_gc_type_id());
+            assert_eq!(list_of_str_len(payload), expected.len());
+            for (index, text) in expected.iter().enumerate() {
+                let word = list_of_str_item(payload, index);
+                let s = word as *const super::super::rstr::STR;
+                assert_eq!((*s).hash, 0);
+                assert_eq!((*s).length, text.len());
+                assert_eq!(super::super::rstr::str_as_bytes(s), text.as_bytes());
+                assert_eq!(
+                    *((s as *const u8).add(super::super::rstr::STR_CHARS_OFFSET + text.len())),
+                    0
+                );
+            }
+            free_list_of_str(payload, &expected.map(str::len));
+        }
+    }
+
+    unsafe fn list_of_str_len(payload: *mut u8) -> usize {
+        unsafe { *payload.add(OBJECT_ITEMS_LEN_OFFSET).cast::<usize>() }
+    }
+
+    unsafe fn list_of_str_item(payload: *mut u8, index: usize) -> usize {
+        unsafe { *payload.add(OBJECT_ITEMS_OFFSET).cast::<usize>().add(index) }
+    }
+
+    unsafe fn free_list_of_str(payload: *mut u8, item_lens: &[usize]) {
+        for (index, nbytes) in item_lens.iter().copied().enumerate() {
+            let word = unsafe { list_of_str_item(payload, index) };
+            let str_payload = super::super::rstr::STR_CHARS_OFFSET + nbytes + 1;
+            unsafe {
+                majit_gc::header::dealloc_varsize_with_gc_header(
+                    word as majit_gc::header::GCREF,
+                    str_payload,
+                );
+            }
+        }
+        let array_payload = OBJECT_ITEMS_OFFSET + OBJECT_ITEMS_ITEM_SIZE * item_lens.len();
+        unsafe {
+            majit_gc::header::dealloc_varsize_with_gc_header(
+                payload as majit_gc::header::GCREF,
+                array_payload,
+            );
+        }
     }
 }

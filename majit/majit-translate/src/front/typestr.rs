@@ -338,9 +338,19 @@ mod tests {
             "majit::object_ref_gcarray"
         );
         // `[str]` is `rlist.py` `get_itemarray_lowleveltype` after
-        // `rmodel.externalvsinternal(gcref=True)`: `GcArray(GCREF)`, a
-        // different ARRAY from `GcArray(OBJECTPTR)`.
-        assert_eq!(canonical_array_type_id("[str]").as_ref(), "[str]");
+        // `rmodel.externalvsinternal(..., gcref=True)`: `GcArray(GCREF)`.
+        // `get_type_id` / `get_array_descr` key that ARRAY once, the same
+        // key as `[*mut PyObject]`. The literal `GcArray<GCREF>` is not
+        // emitted; `try_array_type_id_of_lltype` spells the gc-pointer
+        // ARRAY as `LIST_OBJ_ITEMS_ARRAY`.
+        assert_eq!(
+            canonical_array_type_id("[str]").as_ref(),
+            "majit::object_ref_gcarray"
+        );
+        assert_eq!(
+            canonical_array_type_id("GcArray<GCREF>").as_ref(),
+            "GcArray<GCREF>"
+        );
         assert_eq!(
             canonical_array_type_id("majit::object_ref_gcarray").as_ref(),
             "majit::object_ref_gcarray"

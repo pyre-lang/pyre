@@ -10027,8 +10027,14 @@ fn cross_crate_same_module_leaf_keeps_distinct_rows() {
         vec![],
     );
     let mut facts = super::DuplicateLeafFacts::default();
-    facts.absorb(super::DuplicateLeafFacts::discover(&a));
-    facts.absorb(super::DuplicateLeafFacts::discover(&b));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &a,
+        &std::collections::HashSet::new(),
+    ));
+    facts.absorb(super::DuplicateLeafFacts::discover(
+        &b,
+        &std::collections::HashSet::new(),
+    ));
     let cross = facts.tombstoned_leaves();
     assert!(cross.contains("Code"));
     assert!(
