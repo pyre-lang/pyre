@@ -3958,11 +3958,23 @@ pub(crate) fn is_fresh_aggregate_ctor(kind: &OpKind) -> bool {
 /// store that initializes an uninit box, and the raw-write arm
 /// `sink_fused_boxing_aggregates_at_raw_writes` rematerializes.
 fn is_core_ptr_write_path(segments: &[String], args: &[LinkArg]) -> bool {
-    args.len() == 2
-        && segments
-            .iter()
-            .map(String::as_str)
-            .eq(["core", "ptr", "write"])
+    if args.len() != 2 {
+        return false;
+    }
+    // Same spellings as `desugar/rewire.rs` `is_core_ptr_write_path`.
+    match segments {
+        [a, b, c] if (a == "core" || a == "std") && b == "ptr" && c == "write" => true,
+        [a, b, c, d, e]
+            if (a == "core" || a == "std")
+                && b == "ptr"
+                && c == "mut_ptr"
+                && d == "<Impl>"
+                && e == "write" =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// True when `segments`/`args` spell `Box::assume_init` or

@@ -300,7 +300,12 @@ impl SomePtr {
                 Err(_) if attr == "as_ref" || attr == "as_mut" => Ok(SomeValue::BuiltinMethod(
                     SomeBuiltinMethod::new("ptr_method_as_ref", SomeValue::Ptr(self.clone()), attr),
                 )),
-                Err(e) => Err(AnnotatorError::new(e)),
+                Err(e) => {
+                    if let Some(parent) = self.ll_ptrtype.first_struct_ptr() {
+                        return SomePtr::new(parent).getattr(s_attr);
+                    }
+                    Err(AnnotatorError::new(e))
+                }
             },
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
@@ -375,13 +380,23 @@ impl SomePtr {
             );
         };
         let mut example = self.ll_ptrtype._example();
-        if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
-            let v_lltype = annotation_to_lltype(s_value, None)?;
-            example
-                .setattr(attr, v_lltype._defl())
-                .map_err(AnnotatorError::new)?;
+        match example.getattr(attr) {
+            Ok(v) => {
+                if v != lltype::LowLevelValue::Void {
+                    let v_lltype = annotation_to_lltype(s_value, None)?;
+                    example
+                        .setattr(attr, v_lltype._defl())
+                        .map_err(AnnotatorError::new)?;
+                }
+                Ok(SomeValue::Impossible)
+            }
+            Err(_) => {
+                if let Some(parent) = self.ll_ptrtype.first_struct_ptr() {
+                    return SomePtr::new(parent).setattr(s_attr, s_value);
+                }
+                Err(AnnotatorError::new(self.ll_ptrtype._nofield(attr)))
+            }
         }
-        Ok(SomeValue::Impossible)
     }
 }
 

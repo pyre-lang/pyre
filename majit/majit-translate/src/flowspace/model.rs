@@ -2241,7 +2241,7 @@ impl HostEnv {
         // so the module key matches the join shape.  Analyzers that
         // exist for these callables are registered in
         // `annotator/builtin.rs` (`std_ptr_eq`, `ptr_null_constant`,
-        // `std_ptr_copy_nonoverlapping`, `std_alloc_raw`).
+        // `std_ptr_copy_nonoverlapping`, `std_ptr_write`, `std_alloc_raw`).
         let std_ptr = HostObject::new_module("std.ptr");
         std_ptr.module_set(
             "null_mut",
@@ -2252,6 +2252,13 @@ impl HostEnv {
             "copy_nonoverlapping",
             HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
         );
+        // `std::ptr::write` / `core::ptr::write` — one-item store. Same
+        // unique-graph hazard as `copy_nonoverlapping`: a residual body
+        // `mergeinputargs`s every pointee into one slot. Bind one
+        // HostObject so the analyzer / BUILTIN_TYPER identity-key both
+        // spellings. rtype chooses `llop.raw_store` or
+        // `llmemory.raw_memcopy` from the dst pointee.
+        std_ptr.module_set("write", HostObject::new_builtin_callable("std.ptr.write"));
         let std_mem = HostObject::new_module("std.mem");
         std_mem.module_set(
             "align_of",
@@ -2568,12 +2575,36 @@ impl HostEnv {
                 .module_get("copy_nonoverlapping")
                 .expect("std.ptr.copy_nonoverlapping bound above"),
         );
+        core_ptr.module_set(
+            "write",
+            std_ptr
+                .module_get("write")
+                .expect("std.ptr.write bound above"),
+        );
         // `std.ptr` was already created above with `null_mut` / `eq` /
         // `copy_nonoverlapping`; extend that same module with `null`
         // instead of re-creating it.  A fresh `new_module` here would
         // shadow the earlier binding and drop its `eq` /
         // `copy_nonoverlapping` members before the `mods.insert` below.
         std_ptr.module_set("null", HostObject::new_builtin_callable("std.ptr.null"));
+
+        // `core::ptr::mut_ptr::<Impl>::write` is the method form of
+        // `ptr::write`. `host_env_callable` joins `segments[..-1]`, so
+        // the five-segment residual resolves only when this module exists.
+        let core_ptr_mut_ptr_impl = HostObject::new_module("core.ptr.mut_ptr.<Impl>");
+        core_ptr_mut_ptr_impl.module_set(
+            "write",
+            std_ptr
+                .module_get("write")
+                .expect("std.ptr.write bound above"),
+        );
+        let std_ptr_mut_ptr_impl = HostObject::new_module("std.ptr.mut_ptr.<Impl>");
+        std_ptr_mut_ptr_impl.module_set(
+            "write",
+            std_ptr
+                .module_get("write")
+                .expect("std.ptr.write bound above"),
+        );
 
         // `std::mem::size_of` / `align_of` re-export `core::mem::*`;
         // monomorphised LLBC spells the canonical `["core", "mem", _]`
@@ -2796,6 +2827,8 @@ impl HostEnv {
         mods.insert("rpython.rtyper.lltypesystem.ll2ctypes".into(), ll2ctypes);
         mods.insert("weakref".into(), weakref_mod);
         mods.insert("core.ptr".into(), core_ptr);
+        mods.insert("core.ptr.mut_ptr.<Impl>".into(), core_ptr_mut_ptr_impl);
+        mods.insert("std.ptr.mut_ptr.<Impl>".into(), std_ptr_mut_ptr_impl);
         mods.insert("core.mem".into(), core_mem);
         mods.insert("vec.Vec".into(), vec_crate);
         mods.insert("bigint.BigInt".into(), bigint_crate);

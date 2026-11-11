@@ -2716,8 +2716,18 @@ mod tests {
                 "type_decls": [utf8, key, obj, obj_key, vec_decl],
                 "fun_decls": [wrap, read, recv, wrap_obj],
                 "global_decls": [],
-                "trait_decls": [],
-                "trait_impls": []
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["majit_gc", "header", "GcType"])
+                }],
+                "trait_impls": [{
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {"types": [{"Value": [2, {
+                            "Adt": {"id": 2, "builtin": null, "generics": {"types": []}}
+                        }]}]}
+                    }
+                }]
             }
         });
         let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())

@@ -11049,6 +11049,77 @@ fn option_niche_null_cast_shared_u8_slice_is_window() {
     );
 }
 
+/// `None` of pointer-niche `Option<&mut RawStruct>` is the null int-bank
+/// `SomePtr` (`tyref_niche_option_payload_paint` /
+/// `raw_struct_ptr_annotation`). Painting `Ref` left `Result::ok` to
+/// union Instance with the Ok `Int`.
+#[test]
+fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
+    use crate::model::ValueType;
+
+    let mut raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    raw["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 4,
+            "align": 4,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let option_mut = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]}),
+    ));
+    assert!(
+        matches!(
+            lowering.option_niche_null_cast(&option_mut),
+            Some((_, ValueType::Int))
+        ),
+        "Option<&mut RawStruct> None is the null SomePtr int word, got {:?}",
+        lowering.option_niche_null_cast(&option_mut)
+    );
+}
+
 /// A cell parameter's startblock input is the `MutRef<T>` class, not the
 /// pointee. A `dont_look_inside` subject keeps the raw word.
 #[test]

@@ -194,6 +194,11 @@ pub struct RawOwnedField {
 /// `raw_owned` is set only when a marked exception class boxes a by-value
 /// raw-flavor struct into the `*mut T` word this row publishes. A field
 /// declared as that pointer stays `None`.
+///
+/// `is_fieldless_enum` is the enum identity
+/// `tyref_is_fieldless_enum_free` sees before harvest spells the field
+/// as its discriminant scalar (`u8`). The layout row stays that
+/// scalar; SomePtr setattr/getattr of the field is Signed (`s_int`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldRow {
     pub name: String,
@@ -204,6 +209,8 @@ pub struct FieldRow {
     pub is_atomic: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_owned: Option<RawOwnedField>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_fieldless_enum: bool,
 }
 
 impl FieldRow {
@@ -214,6 +221,7 @@ impl FieldRow {
             is_positional: false,
             is_atomic: false,
             raw_owned: None,
+            is_fieldless_enum: false,
         }
     }
 
@@ -224,6 +232,7 @@ impl FieldRow {
             is_positional: true,
             is_atomic: false,
             raw_owned: None,
+            is_fieldless_enum: false,
         }
     }
 
@@ -234,6 +243,11 @@ impl FieldRow {
 
     pub fn with_raw_owned(mut self, raw: RawOwnedField) -> Self {
         self.raw_owned = Some(raw);
+        self
+    }
+
+    pub fn with_fieldless_enum(mut self, is_fieldless_enum: bool) -> Self {
+        self.is_fieldless_enum = is_fieldless_enum;
         self
     }
 }
@@ -265,6 +279,8 @@ impl<'de> Deserialize<'de> for FieldRow {
                 is_atomic: bool,
                 #[serde(default)]
                 raw_owned: Option<RawOwnedField>,
+                #[serde(default)]
+                is_fieldless_enum: bool,
             },
         }
         match De::deserialize(deserializer)? {
@@ -275,12 +291,14 @@ impl<'de> Deserialize<'de> for FieldRow {
                 is_positional,
                 is_atomic,
                 raw_owned,
+                is_fieldless_enum,
             } => Ok(Self {
                 name,
                 ty,
                 is_positional,
                 is_atomic,
                 raw_owned,
+                is_fieldless_enum,
             }),
         }
     }
@@ -687,6 +705,17 @@ impl StructFieldRegistry {
             .iter()
             .find(|row| row.name == field_name)
             .map(|row| row.ty.as_str())
+    }
+
+    /// True when `class_root` or its generic-stripped lookup is in
+    /// `raw_word_owners`. An empty set (unharvested fixture) is never a
+    /// member, so the `GcKind::Raw` mint gate stays in force.
+    pub(crate) fn raw_word_owner_contains(&self, class_root: &str) -> bool {
+        let lookup = class_root
+            .split_once('<')
+            .map(|(bare, _)| bare)
+            .unwrap_or(class_root);
+        self.raw_word_owners.contains(lookup) || self.raw_word_owners.contains(class_root)
     }
 
     /// True when the harvested row for `owner.field_name` came from a
@@ -1204,12 +1233,7 @@ pub struct SemanticProgram {
     /// `FunctionDesc`-equivalent signature without becoming JitCode bodies.
     /// Feeds `CallControl.unsafe_fn_stubs` →
     /// `cutover::register_unsafe_fn_stubs`.
-    pub unsafe_fn_stubs: Vec<(
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        Option<String>,
-        Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
-    )>,
+    pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …) whose result is faithfully modelable, harvested from the LLBC by

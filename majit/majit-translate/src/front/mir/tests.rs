@@ -5191,6 +5191,119 @@ fn window_keep_gain_fmtarg_bytes_pos0_is_window_write() {
     );
 }
 
+/// Generic `&B` payload instantiated at `[u8]`: intern harvest keeps the
+/// declared `Ref` wrapper (`PtrRepr.rtype_getattr`) so the field is the
+/// two-word window (`rffi.get_nonmovingbuffer`), and the constructor
+/// stores FatData/FatLen.
+#[test]
+fn window_generic_ref_slice_payload_pos0_is_window_write() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let shared = window_shared_slice();
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let borrowed_field = serde_json::json!({"Ref": ["Erased", typevar, "Shared"]});
+    let cow_generics = serde_json::json!({
+        "regions": [],
+        "types": [window_slice()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cow_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": cow_generics}
+    });
+    let cow = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["alloc", "borrow", "Cow"], false),
+        "kind": {"Enum": [{
+            "name": "Borrowed",
+            "fields": [{
+                "name": null,
+                "ty": borrowed_field,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "window_generic_ref_slice"], true),
+        "signature": {"is_unsafe": false, "inputs": [shared.clone()], "output": cow_adt.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &cow_adt),
+                window_local(1, &shared)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &cow_adt),
+                        {"Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [{"Move": window_place(serde_json::json!({"Local": 1}), &shared)}]
+                        ]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![cow], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "window_generic_ref_slice")
+        .expect("lower generic Ref([u8]) payload ctor");
+    let ops = window_graph_ops(&graph);
+    let data_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, ty, .. }
+                if field.name == "__pos_0"
+                    && field.vec_part == Some(VecFieldPart::FatData)
+                    && !matches!(ty, ValueType::Str)
+        )
+    });
+    let len_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, ty, .. }
+                if field.name == "__pos_0"
+                    && field.vec_part == Some(VecFieldPart::FatLen)
+                    && !matches!(ty, ValueType::Str)
+        )
+    });
+    let whole_field_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.name == "__pos_0" && field.vec_part.is_none()
+        )
+    });
+    assert!(
+        data_write && len_write,
+        "generic &[u8] payload __pos_0 is FatData/FatLen; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !whole_field_write,
+        "generic &[u8] payload is not a whole-field CCHARP setattr; graph={}",
+        graph.dump()
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("intern generic Ref([u8]) payload");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "borrow::Cow<[u8]>::Borrowed",
+            "__pos_0"
+        ),
+        Some("&[u8]"),
+        "intern harvest keeps the declared Ref wrapper; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
 /// A STR-source local passed to `fn f(d: &[u8])` borrows a window at
 /// the call (`rffi.get_raw_address_of_string`), not at the definition.
 #[test]
@@ -7825,6 +7938,44 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
     dest_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
 ) -> Llbc {
+    std_extern_call_fixture_with_types_and_traits(
+        caller_name,
+        callee_name,
+        arg_tys,
+        dest_ty,
+        type_decls,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn fixture_gctype_trait_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    })
+}
+
+fn fixture_gctype_impl_for(type_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [type_id, {
+                "Adt": {"id": type_id, "builtin": null, "generics": {"types": []}}
+            }]}]}
+        }
+    })
+}
+
+pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
+    caller_name: &str,
+    callee_name: &[&str],
+    arg_tys: &[serde_json::Value],
+    dest_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    trait_decls: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
     let span = || {
         serde_json::json!({
             "data": {
@@ -7955,8 +8106,8 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
             "type_decls": type_decls,
             "fun_decls": [caller, callee],
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
@@ -8583,13 +8734,31 @@ fn lower_raw_ptr_is_null(
     ptr_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
 ) -> crate::model::FunctionGraph {
+    lower_raw_ptr_is_null_gc(ptr_ty, type_decls, false)
+}
+
+fn lower_raw_ptr_is_null_gc(
+    ptr_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    declared_gc: bool,
+) -> crate::model::FunctionGraph {
     let bool_ty = serde_json::json!({"Scalar": "Bool"});
-    let llbc = std_extern_call_fixture_with_types(
+    let (trait_decls, trait_impls) = if declared_gc {
+        (
+            vec![fixture_gctype_trait_decl()],
+            vec![fixture_gctype_impl_for(0)],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let llbc = std_extern_call_fixture_with_types_and_traits(
         "is_null_ptr",
         &["core", "ptr", "mut_ptr", "<Impl>", "is_null"],
         &[ptr_ty],
         bool_ty,
         type_decls,
+        trait_decls,
+        trait_impls,
     );
     super::lower_function(&llbc, "is_null_ptr").expect("lower is_null")
 }
@@ -8615,8 +8784,9 @@ fn is_null_is_none_form(ops: &[&SpaceOperation]) -> bool {
     has_none && has_is
 }
 
-/// `<*mut u8>::is_null` / raw-struct pointee is `eq(bool(p), False)`
-/// (`SomePtr.bool` / `AddressRepr.rtype_bool`).
+/// `<*mut u8>::is_null` / word-storage pointee is `eq(bool(p), False)`
+/// (`SomePtr.bool` / `AddressRepr.rtype_bool`). A classed non-GC ADT
+/// that is not word-storage stays `is_(p, None)` below.
 #[test]
 fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     let u8_ptr = serde_json::json!({
@@ -8655,19 +8825,58 @@ fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     );
 }
 
+/// `<*mut PyType>::is_null` of a classed non-GC ADT that is not
+/// word-storage (`rclass.py` `getgcflavor` / `InstanceRepr`; a type
+/// object stays an instance in `raw_struct_ptr_from_layout`) is
+/// `is_(p, None)` (`rnone.py` `rtype_is_None`). A GC pointer field
+/// keeps the owner off `adt_def_is_raw_storage`.
+#[test]
+fn raw_ptr_is_null_of_classed_nongc_keeps_is_none() {
+    let obj_adt = named_adt(0, vec![]);
+    let obj_ptr = serde_json::json!({"RawPtr": [obj_adt.clone(), "Mut"]});
+    let classed_adt = named_adt(1, vec![]);
+    let classed_ptr = serde_json::json!({"RawPtr": [classed_adt, "Mut"]});
+    let graph = lower_raw_ptr_is_null_gc(
+        classed_ptr,
+        vec![
+            type_decl_struct(
+                0,
+                &["pyobject", "PyObject"],
+                vec![struct_field_json("ob_type", obj_ptr.clone())],
+            ),
+            type_decl_struct(
+                1,
+                &["pyobject", "PyType"],
+                vec![struct_field_json("instantiate", obj_ptr)],
+            ),
+        ],
+        true,
+    );
+    let ops = graph_ops(&graph);
+    assert!(
+        is_null_is_none_form(&ops),
+        "*mut PyType is_null must stay is_(p, None); ops={ops:?}"
+    );
+    assert!(
+        !is_null_bool_form(&ops),
+        "*mut PyType is_null must not be bool; ops={ops:?}"
+    );
+}
+
 /// `<*mut PyObject>::is_null` and `<*mut Utf8Str>::is_null` stay
 /// `is_(p, None)` (`rnone.py` `rtype_is_None`).
 #[test]
 fn raw_ptr_is_null_of_gc_instance_and_gc_string_keeps_is_none() {
     let obj_adt = named_adt(0, vec![]);
     let obj_ptr = serde_json::json!({"RawPtr": [obj_adt.clone(), "Mut"]});
-    let obj_graph = lower_raw_ptr_is_null(
+    let obj_graph = lower_raw_ptr_is_null_gc(
         obj_ptr.clone(),
         vec![type_decl_struct(
             0,
             &["pyobject", "PyObject"],
             vec![struct_field_json("ob_type", obj_ptr)],
         )],
+        true,
     );
     let obj_ops = graph_ops(&obj_graph);
     assert!(
@@ -16295,9 +16504,8 @@ fn interned_result_tuple_ok_fieldless_err_payload_is_discriminant_int() {
 
 /// Intern of tagged `Option<Option<&MappedObj>>` spells `Some.__pos_0` as
 /// the inner niche pointer (`*mut` of the TypeDecl identity). CAST of
-/// `Option<&MappedObj>` strips `&`, so the leaf render is `Option<MappedObj>`
-/// — a tagged class whose getattr of `__pos_0` is `Instance`. The value is
-/// the nullable pointer. CAST intern suffix stays `<Option<MappedObj>>`.
+/// `Option<&MappedObj>` keeps `&`, so the intern key is
+/// `Option<Option<&MappedObj>>` and the ROW is the nullable pointer.
 #[test]
 fn interned_tagged_option_of_niche_option_payload_is_pointer() {
     let mapped = interior_struct(
@@ -16319,17 +16527,17 @@ fn interned_tagged_option_of_niche_option_payload_is_pointer() {
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "core::option::Option<Option<MappedObj>>::Some",
+            "core::option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
-        "intern ROW is the niche pointer, CAST suffix stays <Option<MappedObj>>; keys={:?}",
+        "intern ROW is the niche pointer, CAST suffix keeps <Option<&MappedObj>>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "option::Option<Option<MappedObj>>::Some",
+            "option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
@@ -16340,8 +16548,7 @@ fn interned_tagged_option_of_niche_option_payload_is_pointer() {
 
 /// Production `bool::then` call generics hash-cons `T`
 /// (`{"Value": [id, Option<&MappedObj>]}`). Intern ROW peels that
-/// wrapper so the payload is still the niche pointer, not CAST's
-/// `Option<MappedObj>` leaf.
+/// wrapper so the payload is still the niche pointer. CAST keeps `&`.
 #[test]
 fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
     let mapped = interior_struct(
@@ -16364,21 +16571,75 @@ fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "core::option::Option<Option<MappedObj>>::Some",
+            "core::option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
-        "intern ROW peels Value wrapper; keys={:?}",
+        "intern ROW peels Value wrapper; CAST suffix keeps <Option<&MappedObj>>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "option::Option<Option<MappedObj>>::Some",
+            "option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
         "crate-stripped intern KEY matches CAST owner after Value peel; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern ROW of `Result<&mut T, E>::Ok.__pos_0` is the pointer word, not
+/// the by-value referent. CAST suffix keeps `&mut`; stripping the Ref
+/// intern'd T as an Instance (GcRef) against a Signed overlay.
+#[test]
+fn interned_result_of_mut_ref_payload_is_pointer() {
+    let native = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "NativeMMap"],
+        &[(
+            "flags",
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let mut_ref = serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]});
+    let llbc =
+        intern_result_from_unwrap_call_llbc(vec![mut_ref, adt_node(2)], vec![native, pyerror]);
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<&mut NativeMMap, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<&mut NativeMMap,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::NativeMMap"),
+        "intern ROW is the mut-ref pointer word; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<&mut NativeMMap,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::NativeMMap"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }
@@ -24848,7 +25109,10 @@ fn deref_decl() -> Value {
         "item_meta": str_builder_meta(vec![
             ident_seg("rustpython_wtf8"),
             ident_seg("Wtf8Buf"),
-            wtf8buf_impl_seg(),
+            json!({"Impl": {
+                "Ty": {"skip_binder": {"Value": [0, wtf8_adt()]}},
+                "Trait": 0
+            }}),
             ident_seg("deref"),
         ], false),
         "signature": {
@@ -24857,6 +25121,30 @@ fn deref_decl() -> Value {
             "output": ref_wtf8("Shared")
         },
         "body": "Opaque"
+    })
+}
+
+fn ops_deref_trait_decl() -> Value {
+    json!({
+        "def_id": 0,
+        "item_meta": str_builder_meta(vec![
+            ident_seg("core"),
+            ident_seg("ops"),
+            ident_seg("deref"),
+            ident_seg("Deref"),
+        ], false),
+        "methods": [{"skip_binder": {"name": "deref"}}]
+    })
+}
+
+fn wtf8buf_ops_deref_impl(fn_id: u64) -> Value {
+    json!({
+        "impl_trait": {"id": 0, "generics": {"types": [wtf8_adt()]}},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{
+            "kind": {"TraitMethod": [0, 0]},
+            "skip_binder": {"id": fn_id}
+        }]
     })
 }
 
@@ -24903,6 +25191,18 @@ fn lower_owned_concat(
     funs: Vec<Value>,
 ) -> crate::model::FunctionGraph {
     let llbc = llbc_with_types("fixture", types, funs);
+    crate::test_support::lower_function(&llbc, name)
+        .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
+}
+
+fn lower_owned_concat_with_traits(
+    name: &str,
+    types: Vec<Value>,
+    funs: Vec<Value>,
+    trait_decls: Vec<Value>,
+    trait_impls: Vec<Value>,
+) -> crate::model::FunctionGraph {
+    let llbc = llbc_with_types_traits("fixture", types, funs, trait_decls, trait_impls);
     crate::test_support::lower_function(&llbc, name)
         .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
 }
@@ -25985,7 +26285,7 @@ fn owned_ctor_push_str_deref_as_bytes_lowers_to_stringbuilder() {
     let borrow = ref_wtf8("Mut");
     let shared = ref_wtf8("Shared");
     let bytes = bytes_slice_ty();
-    let graph = lower_owned_concat(
+    let graph = lower_owned_concat_with_traits(
         "ctor_push_deref_as_bytes",
         vec![wtf8buf_decl()],
         vec![
@@ -26050,6 +26350,8 @@ fn owned_ctor_push_str_deref_as_bytes_lowers_to_stringbuilder() {
             as_bytes_decl(),
             deref_decl(),
         ],
+        vec![ops_deref_trait_decl()],
+        vec![wtf8buf_ops_deref_impl(4)],
     );
     assert_builder_identity_lowering(&graph, "ctor_push_deref_as_bytes");
 }
@@ -27813,6 +28115,79 @@ fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
     );
 }
 
+/// Window → STR copy (`rffi.py` `charpsize2str`) is rstr `STR`, not a
+/// Call of the interned `Result<Vec<u8>, MemoryError>` graph.
+#[test]
+fn window_str_copy_is_str_not_result_charpsize2str() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "oefmt").expect("lower oefmt");
+    let mut str_copies = 0usize;
+    let mut result_charpsize = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let interned_result = segments
+            .windows(3)
+            .any(|w| w == ["rffi", "buffer", "charpsize2str"])
+            || segments.as_slice() == ["majit_rlib", "rffi", "buffer", "charpsize2str"];
+        if interned_result && *result_ty == ValueType::Str {
+            result_charpsize += 1;
+        }
+        if segments.as_slice() == [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            assert_eq!(
+                result_ty,
+                &ValueType::Str,
+                "window STR copy dest is Str; graph={}",
+                graph.dump()
+            );
+            let dest = op.result.as_ref().expect("window STR copy dest");
+            assert_eq!(
+                dest.concretetype().as_ref(),
+                Some(&*STRPTR),
+                "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            str_copies += 1;
+        }
+    }
+    assert_eq!(
+        result_charpsize,
+        0,
+        "window STR copy must not Call the Result-returning charpsize2str graph; graph={}",
+        graph.dump()
+    );
+    assert!(
+        str_copies >= 1,
+        "oefmt Bytes arm emits window STR copy; graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.as_deref(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp,
+        Some("CCHARP"),
+        "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
+        helper.dump()
+    );
+}
+
 /// `oefmt_single_t` `valuefmt.as_ptr()` is `rffi.get_raw_address_of_string`
 /// (`__majit_get_raw_address_of_string`).  A leftover
 /// `core::str::<Impl>::as_ptr` FunctionPath is the prepass wall.
@@ -28745,6 +29120,60 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
         ops().any(|op| crate::model::cast_instance_root(&op.kind)
             .is_some_and(|root| root.contains("PyObject"))),
         "prebuilt bool is cast_gcref_to_instance onto PyObject"
+    );
+}
+
+/// `space.fromcache(ClassDictStrategy)` holder (`classdict.py`). The
+/// accessor is the same OnceLock+immortal malloc as `w_none`; the refs
+/// row is the GC object, so `get_or_init` is `Bookkeeper.immutablevalue`.
+#[test]
+#[ignore = "requires the extracted pyre-interpreter LLBC"]
+fn class_dict_strategy_ref_get_or_init_folds_to_prebuilt() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let addr = 0x1234_5678i64;
+    let refs = [("objspace::std::classdict::CLASS_DICT_STRATEGY_REF", addr)];
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
+        "pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref",
+        crate::HostStaticAddrs {
+            refs: &refs,
+            ..Default::default()
+        },
+    )
+    .expect("lower class_dict_strategy_ref");
+    let residual: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.iter().any(|s| s == "get_or_init") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "get_or_init survived lowering: {residual:?}"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr)),
+        "refs row must fold to ConstRefAddr"
+    );
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind,
+                OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
+                    if owner.contains("OnceLock"))),
+        "OnceLock cell is not a class instance"
     );
 }
 

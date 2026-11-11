@@ -611,6 +611,12 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         Some(VecItemKind::Int)
     );
     assert_eq!(
+        super::spelling_pair_field_kind("&[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(super::spelling_pair_field_kind("&[u8]"), None);
+    assert_eq!(super::spelling_pair_field_kind("[u8]"), None);
+    assert_eq!(
         kind(serde_json::json!({
             "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
         })),

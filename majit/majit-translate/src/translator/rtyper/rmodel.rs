@@ -180,6 +180,43 @@ fn ptr_target_field_type(target: &lltype::PtrTarget, attr: &str) -> Option<LowLe
     ptr_target_struct(target).and_then(|struct_t| struct_t.getattr_field_type(attr))
 }
 
+fn field_on_first_struct_chain(ptr: &lltype::Ptr, attr: &str) -> bool {
+    let mut current = ptr.clone();
+    loop {
+        if ptr_target_field_type(&current.TO, attr).is_some() {
+            return true;
+        }
+        match current.first_struct_ptr() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
+/// Cast `vinst` along `_first_struct` until `attr` is a field of the
+/// current struct. rclass `InstanceRepr.getfield` does the same walk
+/// with `force_cast=True` on `rbase`.
+fn ptr_cast_along_first_struct(
+    hop: &HighLevelOp,
+    mut vinst: Hlvalue,
+    mut current: lltype::Ptr,
+    attr: &str,
+) -> Result<Hlvalue, TyperError> {
+    while ptr_target_field_type(&current.TO, attr).is_none() {
+        let next = current
+            .first_struct_ptr()
+            .ok_or_else(|| TyperError::message(current._nofield(attr)))?;
+        let parent_ll = LowLevelType::Ptr(Box::new(next.clone()));
+        vinst = hop
+            .genop("cast_pointer", vec![vinst], GenopResult::LLType(parent_ll))
+            .ok_or_else(|| {
+                TyperError::message("cast_pointer of inlined first-struct produced no result")
+            })?;
+        current = next;
+    }
+    Ok(vinst)
+}
+
 fn ptr_target_array_item_type(target: &lltype::PtrTarget) -> Option<LowLevelType> {
     match target {
         lltype::PtrTarget::Array(t) => Some(t.OF.clone()),
@@ -2026,6 +2063,25 @@ impl Repr for PtrRepr {
                 .clone();
             return HighLevelOp::inputconst(&r_result, &value).map(|c| Some(Hlvalue::Constant(c)));
         }
+        if ptr_target_field_type(&self.ptrtype().TO, &attr).is_none() {
+            if field_on_first_struct_chain(self.ptrtype(), &attr) {
+                let void = LowLevelType::Void;
+                let vlist =
+                    hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
+                let vinst = ptr_cast_along_first_struct(
+                    hop,
+                    vlist[0].clone(),
+                    self.ptrtype().clone(),
+                    &attr,
+                )?;
+                return Ok(hop.genop(
+                    "getfield",
+                    vec![vinst, vlist[1].clone()],
+                    GenopResult::LLType(r_result.lowleveltype().clone()),
+                ));
+            }
+            return Err(TyperError::message(self.ptrtype()._nofield(&attr)));
+        }
         let field_type = ptr_target_field_type(&self.ptrtype().TO, &attr)
             .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
         let newopname = if field_type.is_container_type() {
@@ -2079,8 +2135,21 @@ impl Repr for PtrRepr {
 
     fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let attr = hop_arg_const_string(hop, 1)?;
-        let field_type = ptr_target_field_type(&self.ptrtype().TO, &attr)
-            .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
+        let field_type = if let Some(t) = ptr_target_field_type(&self.ptrtype().TO, &attr) {
+            t
+        } else if field_on_first_struct_chain(self.ptrtype(), &attr) {
+            let mut current = self.ptrtype().clone();
+            loop {
+                current = current
+                    .first_struct_ptr()
+                    .expect("field_on_first_struct_chain found the field");
+                if let Some(t) = ptr_target_field_type(&current.TO, &attr) {
+                    break t;
+                }
+            }
+        } else {
+            return Err(TyperError::message(self.ptrtype()._nofield(&attr)));
+        };
         assert!(!field_type.is_container_type());
         let args_r = hop.args_r.borrow();
         let r_value = args_r
@@ -2093,7 +2162,16 @@ impl Repr for PtrRepr {
             ConvertedTo::from(&void),
             ConvertedTo::from(r_value),
         ])?;
-        hop.genop("setfield", vlist, GenopResult::Void);
+        let vinst = if ptr_target_field_type(&self.ptrtype().TO, &attr).is_some() {
+            vlist[0].clone()
+        } else {
+            ptr_cast_along_first_struct(hop, vlist[0].clone(), self.ptrtype().clone(), &attr)?
+        };
+        hop.genop(
+            "setfield",
+            vec![vinst, vlist[1].clone(), vlist[2].clone()],
+            GenopResult::Void,
+        );
         Ok(None)
     }
 
@@ -3778,6 +3856,125 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "setfield");
         assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    fn first_struct_outer_ptr() -> (
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let inner_ptr = Ptr {
+            TO: PtrTarget::Struct(inner.clone()),
+        };
+        let outer_ptr = Ptr {
+            TO: PtrTarget::Struct(Struct::new(
+                "Outer",
+                vec![
+                    ("x".into(), LowLevelType::Struct(Box::new(inner))),
+                    ("z".into(), LowLevelType::Signed),
+                ],
+            )),
+        };
+        (outer_ptr, inner_ptr)
+    }
+
+    #[test]
+    fn ptrrepr_rtype_getattr_of_first_struct_field_name_emits_cast_pointer() {
+        let (outer, inner) = first_struct_outer_ptr();
+        let r_ptr = Arc::new(PtrRepr::new(outer.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_inner: Arc<dyn Repr> = Arc::new(PtrRepr::new(inner.clone()));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "getattr");
+        let v_ptr = Variable::new();
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(outer.clone()))));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_ptr), void_field_const("x")]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(outer)),
+            const_string_annotation("x"),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(impossible_repr() as Arc<dyn Repr>)]);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Ptr(SomePtr::new(inner)));
+        *hop.r_result.borrow_mut() = Some(r_inner);
+
+        let result = r_ptr.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "cast_pointer");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_getattr_of_inherited_first_struct_field_casts_then_getfield() {
+        let (outer, _inner) = first_struct_outer_ptr();
+        let r_ptr = Arc::new(PtrRepr::new(outer.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "getattr");
+        let v_ptr = Variable::new();
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(outer.clone()))));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_ptr), void_field_const("y")]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(outer)),
+            const_string_annotation("y"),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(impossible_repr() as Arc<dyn Repr>)]);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "cast_pointer");
+        assert_eq!(ops.ops[1].opname, "getfield");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_setattr_of_inherited_first_struct_field_casts_then_setfield() {
+        let (outer, _inner) = first_struct_outer_ptr();
+        let r_ptr = Arc::new(PtrRepr::new(outer.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "setattr");
+        let v_ptr = Variable::new();
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(outer.clone()))));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_ptr),
+            void_field_const("y"),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(3),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(outer)),
+            const_string_annotation("y"),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(r_ptr_dyn),
+            Some(impossible_repr() as Arc<dyn Repr>),
+            Some(r_signed),
+        ]);
+
+        assert!(r_ptr.rtype_setattr(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "cast_pointer");
+        assert_eq!(ops.ops[1].opname, "setfield");
     }
 
     #[test]

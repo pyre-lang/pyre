@@ -571,13 +571,26 @@ mod tests {
             let returned = ann
                 .annotation(&lifted.graph.borrow().getreturnvar())
                 .expect("join result");
-            let SomeValue::Instance(instance) = returned else {
-                panic!("expected enum instance")
-            };
-            let base_host = bk.intern_class_by_qualname(root);
-            let base = bk.getuniqueclassdef(&base_host).unwrap();
-            assert!(Rc::ptr_eq(instance.classdef.as_ref().unwrap(), &base));
-            assert!(!base.borrow().attrs.contains_key("__pos_0"));
+            if matches!(payload_cell, SomeValue::List(_)) {
+                // `Option<Vec<T>>` noneify's (`model.py` `SomeList.noneify`
+                // / `binaryop.py` `pairtype(SomeObject, SomeNone).union`).
+                // The dest recast is that nullable list, not a tagged
+                // Option ClassDef. `option::Option<Vec<u8>>` and
+                // `Option<Vec<u8>>` are one spelling after
+                // `strip_generic_leaf`.
+                assert!(
+                    matches!(returned, SomeValue::List(_)),
+                    "option::Option<Vec<u8>> dest recast is the nullable list, got {returned:?}"
+                );
+            } else {
+                let SomeValue::Instance(instance) = returned else {
+                    panic!("expected enum instance, got {returned:?}")
+                };
+                let base_host = bk.intern_class_by_qualname(root);
+                let base = bk.getuniqueclassdef(&base_host).unwrap();
+                assert!(Rc::ptr_eq(instance.classdef.as_ref().unwrap(), &base));
+                assert!(!base.borrow().attrs.contains_key("__pos_0"));
+            }
         }
         // Re-check BOTH variants after the second graph has flowed through
         // the same annotator. No manual Attribute.modified or payload seeding.

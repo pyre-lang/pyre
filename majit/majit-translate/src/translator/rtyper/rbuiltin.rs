@@ -527,6 +527,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
         ("std.ptr", "copy_nonoverlapping", rtype_copy_nonoverlapping),
+        // `core.ptr` / `mut_ptr.<Impl>` share the `std.ptr.write` attr
+        // instance (model.rs), so one entry covers every spelling.
+        ("std.ptr", "write", rtype_ptr_write),
         // `std::alloc::alloc` / `alloc_zeroed` — residual `direct_call`
         // with `hop.r_result` (`PtrRepr` / `CCHARP`). `alloc::alloc`
         // shares the HOST_ENV callable.
@@ -2897,6 +2900,9 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
     };
     let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(classdesc)
         .map_err(|e| TyperError::message(e.to_string()))?;
+    if let Some(v_raw) = rtype_instantiate_raw_malloc(hop) {
+        return Ok(Some(v_raw));
+    }
     let mut llops = hop.llops.borrow_mut();
     let v_instance = crate::translator::rtyper::rclass::rtype_new_instance(
         &hop.rtyper,
@@ -2906,6 +2912,46 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
         nonmovable,
     )?;
     Ok(Some(v_instance))
+}
+
+/// `lltype.malloc(T, flavor='raw')` when instantiate annotated as
+/// `SomePtr` of a Raw struct (`robjmodel_instantiate` of a
+/// `raw_word_owner`). `hop.r_result` already carries that intern.
+fn rtype_instantiate_raw_malloc(hop: &HighLevelOp) -> Option<Hlvalue> {
+    use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let lltype = hop.r_result.borrow().as_ref()?.lowleveltype().clone();
+    let LowLevelType::Ptr(ptr) = &lltype else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = &ptr.TO else {
+        return None;
+    };
+    if st._gckind != GcKind::Raw {
+        return None;
+    }
+    let container = LowLevelType::Struct(Box::new(st.clone()));
+    let ctype = Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(container)),
+        LowLevelType::Void,
+    );
+    let mut flags_map = IndexMap::new();
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(b"raw".to_vec()),
+    );
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )
+    .ok()?;
+    hop.genop(
+        "malloc",
+        vec![Hlvalue::Constant(ctype), Hlvalue::Constant(cflags)],
+        GenopResult::LLType(lltype),
+    )
 }
 
 /// RPython `@typer_for(OrderedDict)`, `objectmodel.r_dict`, and
@@ -4537,6 +4583,181 @@ fn rtype_copy_nonoverlapping(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     Ok(Some(Hlvalue::Constant(void_const)))
 }
 
+/// `std::ptr::write(dst, src) -> ()`.
+///
+/// The hop is `(dst, src)` after `BuiltinFunctionRepr.rtype_simple_call`
+/// pops the callable. The declared pointee `T` of `dst: *mut T` chooses
+/// the store: `llop.raw_store` (`rawstorage.py` `specialize_call`) for a
+/// pointer / reference / integer word, and `llmemory.raw_memcopy` for a
+/// struct or fixed-size array written by value. `r_src` being `Ptr` is
+/// not that test — `*mut *mut W` and `*mut PyObjectRef` store the word,
+/// while initialising fresh storage copies `sizeof(T)`. Read `T` from
+/// the dst `SomePtr.ll_ptrtype.TO` (`lltype.py` `SomePtr`), or from
+/// `r_dst` when that is `lltype.Ptr`. A raw `*mut usize` is an integer
+/// address (`tyref_is_raw_pointer` banks it as `int`) and is a word
+/// store.
+///
+/// Integer annotations collapse Rust widths (`scalar_value_type`:
+/// `u8`/`u16`/`u32` → Unsigned). `jtransform.py` `rewrite_op_raw_store`
+/// takes the descr from `op.args[2].concretetype` — the stored value's
+/// lltype, which in RPython is the destination's declared width
+/// (`rawstorage.py` `llop.raw_store` is typed by the destination).
+/// Convert `src` with `hop.inputarg` of that lltype so the operand is
+/// Char / `r_uchar`, `rffi.USHORT`, `rffi.UINT`, Signed, … rather than
+/// a machine word.
+///
+/// `std_ptr_write` returns `s_None`. Hand back the Void constant after
+/// the store, as `rtype_copy_nonoverlapping` does.
+fn rtype_ptr_write(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    if hop.nb_args() != 2 {
+        return Err(TyperError::message(format!(
+            "ptr::write: expected 2 arguments, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_dst = arg_repr(hop, 0)?;
+    let r_src = arg_repr(hop, 1)?;
+    let pointee = ptr_write_effective_pointee(hop, r_dst.as_ref())?;
+    hop.exception_cannot_occur()?;
+    if ptr_write_copies_pointee_by_value(pointee.as_ref()) {
+        let v_dst = hop.inputarg(r_dst.as_ref(), 0)?;
+        let v_src = hop.inputarg(r_src.as_ref(), 1)?;
+        let v_dst = ptr_as_address(hop, v_dst, r_dst.lowleveltype())?;
+        let v_src = ptr_as_address(hop, v_src, r_src.lowleveltype())?;
+        let v_one = HighLevelOp::inputconst(&LowLevelType::Signed, &ConstValue::Int(1))?;
+        let v_nbytes = scale_copy_count(hop, r_dst.lowleveltype(), Hlvalue::Constant(v_one))?;
+        let _ = hop.genop(
+            "raw_memcopy",
+            vec![v_src, v_dst, v_nbytes],
+            GenopResult::Void,
+        );
+    } else {
+        let v_dst = hop.inputarg(r_dst.as_ref(), 0)?;
+        let v_dst = dst_as_store_address(hop, v_dst, r_dst.lowleveltype())?;
+        let v_zero = HighLevelOp::inputconst(&LowLevelType::Signed, &ConstValue::Int(0))?;
+        let v_src = ptr_write_store_value(hop, r_src.as_ref(), pointee.as_ref())?;
+        let _ = hop.genop(
+            "raw_store",
+            vec![v_dst, Hlvalue::Constant(v_zero), v_src],
+            GenopResult::Void,
+        );
+    }
+    let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(void_const)))
+}
+
+/// Declared pointee `T` of `dst: *mut T`. Prefer the dst `SomePtr`'s
+/// `ll_ptrtype.TO`; a `Ptr` repr without that annotation still has `TO`.
+fn ptr_write_dst_pointee(hop: &HighLevelOp, r_dst: &dyn Repr) -> Option<LowLevelType> {
+    let args_s = hop.args_s.borrow();
+    if let Some(SomeValue::Ptr(p)) = args_s.first() {
+        return Some(LowLevelType::from(p.ll_ptrtype.TO.clone()));
+    }
+    match r_dst.lowleveltype() {
+        LowLevelType::Ptr(p) => Some(LowLevelType::from(p.TO.clone())),
+        _ => None,
+    }
+}
+
+/// Pointee `T` used to choose the store. A `nolength` Array is a C
+/// pointer (`rffi.py` `CCHARP` / `UCHARP` / `USHORTP`); the write is
+/// one item of `OF`, not the unsized Array. A varsize Array / Struct
+/// cannot be sized here (`rgc.py` `ll_arraycopy` copies
+/// `sizeof(TP.OF) * length`, and `ptr::write` has no length).
+fn ptr_write_effective_pointee(
+    hop: &HighLevelOp,
+    r_dst: &dyn Repr,
+) -> Result<Option<LowLevelType>, TyperError> {
+    match ptr_write_dst_pointee(hop, r_dst) {
+        Some(LowLevelType::Array(arr))
+            if arr._hints.get("nolength") == Some(&ConstValue::Bool(true)) =>
+        {
+            Ok(Some(arr.OF.clone()))
+        }
+        Some(ll) if ll._is_varsize() => Err(TyperError::message(format!(
+            "ptr::write: cannot size varsize pointee {}",
+            ll.short_name()
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// `T` is a struct or a `FixedSizeArray` copied by value (`sizeof(T)`).
+fn ptr_write_copies_pointee_by_value(pointee: Option<&LowLevelType>) -> bool {
+    matches!(
+        pointee,
+        Some(LowLevelType::Struct(_)) | Some(LowLevelType::FixedSizeArray(_))
+    )
+}
+
+/// Value operand of `raw_store`. Convert to the pointee's declared
+/// primitive width (`hop.inputarg` of that lltype). Pointer / reference
+/// stores keep the source repr (Address / Ptr, one word).
+///
+/// Char is `CharRepr`, so `pairtype(IntegerRepr, IntegerRepr)` does not
+/// convert a collapsed integer annotation onto it; `rint.py`
+/// `convert_from_to` generic arm is still `cast_primitive`.
+fn ptr_write_store_value(
+    hop: &HighLevelOp,
+    r_src: &dyn Repr,
+    pointee: Option<&LowLevelType>,
+) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let Some(store_ll) = pointee else {
+        return hop.inputarg(r_src, 1);
+    };
+    if hop.rtyper.getprimitiverepr(store_ll).is_err() {
+        return hop.inputarg(r_src, 1);
+    }
+    match hop.inputarg(store_ll, 1) {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            if r_src.repr_class_id() == ReprClassId::IntegerRepr
+                && matches!(store_ll, LowLevelType::Char | LowLevelType::UniChar)
+            {
+                let v = hop.inputarg(r_src, 1)?;
+                hop.genop(
+                    "cast_primitive",
+                    vec![v],
+                    GenopResult::LLType(store_ll.clone()),
+                )
+                .ok_or_else(|| TyperError::message("ptr::write: cast_primitive returned void"))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Address operand of `raw_store`. A raw `*mut usize` is already an
+/// integer address (`tyref_is_raw_pointer`); `cast_int_to_adr` is
+/// `llmemory.cast_int_to_adr`.
+fn dst_as_store_address(
+    hop: &HighLevelOp,
+    v: crate::flowspace::model::Hlvalue,
+    ll: &LowLevelType,
+) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    match ll {
+        LowLevelType::Address | LowLevelType::Ptr(_) => ptr_as_address(hop, v, ll),
+        LowLevelType::Signed | LowLevelType::Unsigned => hop
+            .genop(
+                "cast_int_to_adr",
+                vec![v],
+                GenopResult::LLType(LowLevelType::Address),
+            )
+            .ok_or_else(|| TyperError::message("ptr::write: cast_int_to_adr returned void")),
+        other => Err(TyperError::message(format!(
+            "ptr::write: dst must be Ptr, Address, or an integer address, got {other:?}"
+        ))),
+    }
+}
+
 /// `cast_ptr_to_adr` when the operand is a `Ptr` (`raddress.py`
 /// `pairtype(PtrRepr, AddressRepr).convert_from_to`). An `Address` is
 /// already the llop's operand type (`rtype_raw_memcopy`).
@@ -4564,16 +4785,16 @@ fn ptr_as_address(
     }
 }
 
-/// Item whose `sizeof` scales `count`. A `nolength` Array is a C pointer
-/// (`rffi.py` `CCHARP`); the copy is `count` elements of `OF`, not the
-/// Array container (`lltype.py` Array with `nolength` has no length word).
+/// Item whose `sizeof` scales `count`. `rgc.py` `ll_arraycopy` copies
+/// `sizeof(TP.OF) * length`. Every Array — a `nolength` C pointer
+/// (`rffi.py` `CCHARP`) included — sizes by `OF`. A varsize Struct
+/// cannot be sized at `n=None` (`llmemory.py` `_sizeof_none`).
 fn copy_nonoverlapping_item_type(pointee: &LowLevelType) -> Result<LowLevelType, TyperError> {
     match pointee {
-        LowLevelType::Array(arr) if arr._hints.get("nolength") == Some(&ConstValue::Bool(true)) => {
-            Ok(arr.OF.clone())
-        }
+        LowLevelType::Array(arr) => Ok(arr.OF.clone()),
         other if other._is_varsize() => Err(TyperError::message(format!(
-            "copy_nonoverlapping: cannot size varsize pointee {other:?}"
+            "copy_nonoverlapping: cannot size varsize pointee {}",
+            other.short_name()
         ))),
         other => Ok(other.clone()),
     }
@@ -6213,6 +6434,32 @@ mod tests {
     }
 
     #[test]
+    fn ptr_write_typer_is_shared_by_core_and_std_ptr() {
+        let std_host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing std.ptr.write");
+        let core_host = HOST_ENV
+            .import_module("core.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing core.ptr.write");
+        let mut_ptr_host = HOST_ENV
+            .import_module("core.ptr.mut_ptr.<Impl>")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing core.ptr.mut_ptr.<Impl>.write");
+        assert_eq!(
+            std_host, core_host,
+            "core.ptr.write must be the std.ptr HostObject"
+        );
+        assert_eq!(std_host, mut_ptr_host);
+        assert_eq!(std_host.qualname(), "std.ptr.write");
+        assert!(
+            lookup_typer(&std_host).is_some(),
+            "BUILTIN_TYPER missing std.ptr.write"
+        );
+    }
+
+    #[test]
     fn copy_nonoverlapping_s_none_simple_call_emits_raw_memcopy() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInstance, SomeInteger, s_none};
@@ -6298,6 +6545,420 @@ mod tests {
             "Ptr operands must convert to Address, missing cast_ptr_to_adr in {names:?}"
         );
         assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn ptr_write_s_none_simple_call_emits_raw_memcopy() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing std.ptr.write");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let result = Variable::named("written");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(src.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("ptr::write hop setup");
+        for var in [&dst, &src] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("s_None simple_call must agree with the void write");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memcopy"),
+            "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "int_mul"),
+            "count 1 must scale by sizeof, missing int_mul in {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn ptr_write_of_an_integer_emits_raw_store() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing std.ptr.write");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // `*mut usize` is an integer address (`tyref_is_raw_pointer`).
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("written");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(src.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("ptr::write hop setup");
+        for var in [&dst, &src] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("integer ptr::write must store");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_store"),
+            "raw_store missing from {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "raw_memcopy"),
+            "primitive write is a store, not memcpy: {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn ptr_write_of_a_pointer_word_emits_raw_store() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomePtr, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing std.ptr.write");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // Declared pointee T is a function-pointer word (`*mut fn()`).
+        // `src` is an instance, so `r_src` is `Ptr` — the discriminator
+        // that must not choose `raw_memcopy`. `ll_ptrtype.TO` is Func.
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Ptr(SomePtr::new(Ptr {
+                TO: PtrTarget::Func(FuncType {
+                    args: vec![],
+                    result: LowLevelType::Void,
+                }),
+            })))));
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let result = Variable::named("written");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(src.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("ptr::write hop setup");
+        for var in [&dst, &src] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("pointer-word ptr::write must store");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_store"),
+            "raw_store missing from {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "raw_memcopy"),
+            "a pointer-word write is a store even when r_src is Ptr: {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    fn translate_ptr_write(
+        dst_ann: SomeValue,
+        src_ann: SomeValue,
+    ) -> (
+        Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
+        crate::flowspace::model::Variable,
+        Result<(), TyperError>,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::s_none;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("write"))
+            .expect("HOST_ENV missing std.ptr.write");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let dst = Variable::named("dst");
+        dst.annotation.replace(Some(Rc::new(dst_ann)));
+        let src = Variable::named("src");
+        src.annotation.replace(Some(Rc::new(src_ann)));
+        let result = Variable::named("written");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(src.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("ptr::write hop setup");
+        for var in [&dst, &src] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        let translated = rtyper.translate_hl_to_ll(&hop, &mut varmapping);
+        (llops, result, translated)
+    }
+
+    fn hlvalue_lltype(v: &Hlvalue) -> Option<LowLevelType> {
+        match v {
+            Hlvalue::Variable(var) => var.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        }
+    }
+
+    fn raw_store_value_lltype(ops: &[crate::flowspace::model::SpaceOperation]) -> LowLevelType {
+        let store = ops
+            .iter()
+            .find(|op| op.opname == "raw_store")
+            .unwrap_or_else(|| panic!("raw_store missing from {ops:?}"));
+        hlvalue_lltype(&store.args[2]).expect("raw_store value concretetype")
+    }
+
+    #[test]
+    fn ptr_write_of_u8_stores_char_width() {
+        use crate::annotator::model::{SomeInteger, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::{self, CCHARP};
+
+        // `*mut u8` annotates as `SomePtr(CCHARP)`. Integer annotations
+        // collapse `u8` to Unsigned (`scalar_value_type`); the store
+        // value must be Char (`jtransform.py` `rewrite_op_raw_store`
+        // reads `op.args[2].concretetype`).
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let (llops, result, translated) = translate_ptr_write(
+            SomeValue::Ptr(SomePtr::new((*ccharp).clone())),
+            SomeValue::Integer(SomeInteger::new(true, true)),
+        );
+        translated.expect("u8 ptr::write must store");
+        let ops = llops.borrow();
+        let names: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            names.contains(&"raw_store"),
+            "raw_store missing from {names:?}"
+        );
+        assert!(
+            !names.contains(&"raw_memcopy"),
+            "primitive write is a store, not memcpy: {names:?}"
+        );
+        let value_ll = raw_store_value_lltype(&ops.ops);
+        assert_eq!(
+            rffi::sizeof(&value_ll).expect("sized store value"),
+            ConstValue::Int(1)
+        );
+        assert!(
+            !matches!(value_ll, LowLevelType::Signed | LowLevelType::Unsigned),
+            "u8 store must not be a machine word, got {value_ll:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn ptr_write_of_u16_and_u32_stores_declared_width() {
+        use crate::annotator::model::{SomeInteger, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::{self, UINTP, USHORTP};
+
+        let src = SomeValue::Integer(SomeInteger::new(true, true));
+        for (ptr_ty, width) in [((*USHORTP).clone(), 2i64), ((*UINTP).clone(), 4i64)] {
+            let LowLevelType::Ptr(p) = ptr_ty else {
+                panic!("expected pointer");
+            };
+            let (llops, result, translated) =
+                translate_ptr_write(SomeValue::Ptr(SomePtr::new((*p).clone())), src.clone());
+            translated.unwrap_or_else(|err| panic!("{width}-byte ptr::write must store: {err}"));
+            let ops = llops.borrow();
+            let names: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+            assert!(
+                names.contains(&"raw_store"),
+                "raw_store missing from {names:?}"
+            );
+            assert!(
+                !names.contains(&"raw_memcopy"),
+                "primitive write is a store, not memcpy: {names:?}"
+            );
+            let value_ll = raw_store_value_lltype(&ops.ops);
+            assert_eq!(
+                rffi::sizeof(&value_ll).expect("sized store value"),
+                ConstValue::Int(width),
+                "declared width {width}, got {value_ll:?}"
+            );
+            assert!(
+                !matches!(value_ll, LowLevelType::Signed | LowLevelType::Unsigned),
+                "collapsed integer width must not remain a machine word: {value_ll:?}"
+            );
+            assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+        }
+    }
+
+    #[test]
+    fn ptr_write_array_arm_sizes_fixed_and_rejects_varsize() {
+        use crate::annotator::model::{SomeInteger, SomePtr};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, FixedSizeArray, Ptr, PtrTarget,
+        };
+
+        // FixedSizeArray is sized (`sizeof(T)`); `ptr::write` copies it.
+        let fixed = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 4)),
+        }));
+        let (llops, result, translated) = translate_ptr_write(fixed.clone(), fixed);
+        translated.expect("FixedSizeArray ptr::write copies sizeof(T)");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memcopy"),
+            "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "raw_store"),
+            "a sized array is memcpy, not a word store: {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+
+        // A varsize Array has no length on this hop (`ptr::write` is
+        // `(dst, src)`). `rgc.py` `ll_arraycopy` copies
+        // `sizeof(TP.OF) * length`; fail with the pointee named.
+        let varsize = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
+        }));
+        let (_, _, translated) =
+            translate_ptr_write(varsize, SomeValue::Integer(SomeInteger::new(true, true)));
+        let err = translated.expect_err("varsize Array pointee cannot be sized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ptr::write"),
+            "TyperError must name ptr::write: {msg}"
+        );
+        assert!(
+            msg.contains("Array Signed"),
+            "TyperError must name the pointee: {msg}"
+        );
     }
 
     #[test]
@@ -7396,6 +8057,57 @@ mod tests {
         assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
         assert_eq!(ops.ops[2].opname, "cast_pointer");
         assert_eq!(ops.ops[2].result, out);
+    }
+
+    #[test]
+    fn rtype_instantiate_of_raw_ptr_result_emits_malloc_raw() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, Ptr, PtrTarget, Struct};
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("rawinst::PosError", None);
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Class(classdef.borrow().classdesc.clone())],
+            false,
+        );
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::PBC(s_pbc));
+        let st = Struct::registry_fields(
+            "rawinst::PosError",
+            vec![("pos".into(), LowLevelType::Signed)],
+            GcKind::Raw,
+        );
+        let ptr = Ptr {
+            TO: PtrTarget::Struct(st),
+        };
+        let r_result: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let out = rtype_instantiate(&hop, &HashMap::new())
+            .expect("rtype_instantiate")
+            .expect("malloc result");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "malloc");
+        assert_eq!(ops.ops[0].result, out);
+        let Hlvalue::Constant(flags) = &ops.ops[0].args[1] else {
+            panic!("malloc flags");
+        };
+        let ConstValue::Dict(map) = &flags.value else {
+            panic!("malloc flags dict, got {:?}", flags.value);
+        };
+        assert_eq!(
+            map.get(&ConstValue::byte_str("flavor")),
+            Some(&ConstValue::byte_str("raw"))
+        );
     }
 
     #[test]

@@ -5455,6 +5455,25 @@ impl Ptr {
         }
     }
 
+    /// Pointer to the inlined `_first_struct` parent. Intern of a
+    /// harvested owner subclasses that first field (`intern_class_by_qualname`
+    /// header chain); `cast_pointer` to this type is the rclass
+    /// `force_cast` step for an inherited field.
+    pub fn first_struct_ptr(&self) -> Option<Ptr> {
+        let st = match &self.TO {
+            PtrTarget::Struct(s) => s.clone(),
+            PtrTarget::ForwardReference(fwd) => match fwd.resolved()? {
+                LowLevelType::Struct(s) => *s,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let (_, first) = st._first_struct_owned()?;
+        Some(Ptr {
+            TO: PtrTarget::Struct(first),
+        })
+    }
+
     pub fn _gckind(&self) -> GcKind {
         self.TO._gckind()
     }

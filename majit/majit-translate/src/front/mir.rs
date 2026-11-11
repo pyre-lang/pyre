@@ -802,8 +802,8 @@ fn ref_enum_instantiation_of_adt(
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
     // `Deref::Target` class so the payload attr and the cast agree. A
-    // pointer-niche Option payload is `*mut` of the pointee: CAST
-    // strips `&`, and intern of `Option<&T>` as `Option<T>` would
+    // pointer-niche Option payload is `*mut` of the pointee: CAST keeps
+    // `&` on `Option<&T>`, and intern of that as `Option<T>` would
     // getattr a tagged class over a pointer word. Type-arg nodes from
     // call generics are hash-consed (`Value` / `Deduplicated`); intern
     // ROW peels those wrappers so the niche test sees the Option ADT.
@@ -1140,12 +1140,59 @@ fn intern_call_trait_refs(generics: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// `Ref` / `RawPtr` prefixes `PtrRepr.rtype_getattr` keeps on a field
+/// whose payload is a type variable ([`tyref_subst_bound_typevar`]).
+/// `&B` with `B = [u8]` is `&[u8]`, the two-word window
+/// (`rffi.get_nonmovingbuffer`), not the peeled `[u8]` list.
+fn pointer_wrapper_spelling_prefixes<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> (Vec<&'static str>, &'l serde_json::Value) {
+    let mut prefixes = Vec::new();
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            break;
+        };
+        if let Some(r) = obj.get("Ref") {
+            let (inner, kind) = ref_inner_and_kind(r);
+            let Some(inner) = inner.and_then(|n| strip_ty_indirections(n, llbc)) else {
+                break;
+            };
+            prefixes.push(if json_ref_kind_is_mut(kind) {
+                "&mut "
+            } else {
+                "&"
+            });
+            node = inner;
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            let mut_kind = arr.get(1).and_then(serde_json::Value::as_str);
+            let Some(inner) = arr.first().and_then(|n| strip_ty_indirections(n, llbc)) else {
+                break;
+            };
+            prefixes.push(if json_ref_kind_is_mut(mut_kind) {
+                "*mut "
+            } else {
+                "*const "
+            });
+            node = inner;
+            continue;
+        }
+        break;
+    }
+    (prefixes, node)
+}
+
 /// Substitute the instantiation's concrete type args into a variant
 /// field's type: a bound type variable resolves to `args[idx]`; any other
 /// shape (a concrete field, or a `??…` placeholder for an unresolved node)
-/// renders as-is via [`tyref_to_ast_string`].  Only a bare type variable
-/// is substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
+/// renders as-is via [`tyref_to_ast_string`].  Only a type variable is
+/// substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
 /// inner rendering, which the caller treats as unresolved and skips.
+/// Declared `Ref` / `RawPtr` wrappers stay on the substituted arg
+/// (`PtrRepr.rtype_getattr`, [`tyref_subst_bound_typevar`]): `&T` with
+/// `T = [u8]` is `&[u8]`.
 fn substitute_field_type(
     ty: &TyRef,
     args: &[String],
@@ -1153,13 +1200,18 @@ fn substitute_field_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
-    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
-        && let Some(idx) = typevar_bound_index(node)
-    {
-        return args
-            .get(idx as usize)
-            .cloned()
-            .unwrap_or_else(|| "??typevar_oob".to_string());
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) {
+        let (prefixes, inner) = pointer_wrapper_spelling_prefixes(node, llbc);
+        if let Some(idx) = typevar_bound_index(inner) {
+            let mut spelling = args
+                .get(idx as usize)
+                .cloned()
+                .unwrap_or_else(|| "??typevar_oob".to_string());
+            for prefix in prefixes.iter().rev() {
+                spelling = format!("{prefix}{spelling}");
+            }
+            return spelling;
+        }
     }
     // A concrete payload that is itself the handle (a monomorphized
     // `Result::Err` field) has to name the same class the cast writes.
@@ -1516,11 +1568,11 @@ fn intern_payload_registry_spelling(
 }
 
 /// Publish an empty struct row for a `TypeDeclKind::Opaque` payload the
-/// interned variant names. `derive_program_metadata` skips Opaque decls,
-/// so `project_struct_field_type` of that leaf was Impossible and
-/// Blocked getattr of `Some.__pos_0` (`rclass.py` `s_getattr`). An empty
-/// registry entry is the same registered-struct arm a Struct TypeDecl
-/// already takes; the payload stays one GC word (`InstanceRepr`).
+/// interned variant names. `derive_program_metadata` harvests Opaque
+/// TypeDecls after the named field-row special cases; this pass still
+/// or-inserts for interned variant payload spellings that run later.
+/// An empty registry entry is the same registered-struct arm a Struct
+/// TypeDecl already takes; the payload stays one GC word (`InstanceRepr`).
 fn intern_opaque_payload_spelling(
     llbc: &Llbc,
     spelling: &str,
@@ -1558,6 +1610,197 @@ fn intern_opaque_payload_spelling(
                 .or_insert_with(Vec::new);
         }
         return;
+    }
+}
+
+/// Opaque TypeDecl ids that appear as a `*mut` / `*const` / `NonNull`
+/// pointee. By-value Opaque stays unharvested: empty field rows plus a
+/// StructId would make `compute_struct_size` treat a std `Condvar` as a
+/// known struct with no layout.
+fn opaque_raw_ptr_pointee_ids(llbc: &Llbc) -> std::collections::HashSet<u64> {
+    let mut ids = std::collections::HashSet::new();
+    let mut seen_dedup = std::collections::HashSet::new();
+    for td in llbc.iter_type_decls() {
+        match &td.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                for f in fields {
+                    collect_opaque_raw_ptr_from_ty(llbc, &f.ty, &mut ids, &mut seen_dedup);
+                }
+            }
+            TypeDeclKind::Enum(variants) => {
+                for v in variants {
+                    for f in &v.fields {
+                        collect_opaque_raw_ptr_from_ty(llbc, &f.ty, &mut ids, &mut seen_dedup);
+                    }
+                }
+            }
+            TypeDeclKind::Alias(body) => {
+                let node = body.get("aliased_ty").unwrap_or(body);
+                collect_opaque_raw_ptr_from_node(llbc, node, &mut ids, &mut seen_dedup, 0);
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+        }
+    }
+    for fd in llbc.iter_fun_decls() {
+        for ty in fd
+            .signature
+            .inputs
+            .iter()
+            .chain(std::iter::once(&fd.signature.output))
+        {
+            collect_opaque_raw_ptr_from_ty(llbc, ty, &mut ids, &mut seen_dedup);
+        }
+    }
+    ids
+}
+
+fn collect_opaque_raw_ptr_from_ty(
+    llbc: &Llbc,
+    ty: &TyRef,
+    ids: &mut std::collections::HashSet<u64>,
+    seen_dedup: &mut std::collections::HashSet<u64>,
+) {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return;
+    };
+    collect_opaque_raw_ptr_from_node(llbc, node, ids, seen_dedup, 0);
+}
+
+fn record_opaque_raw_ptr_pointee(
+    llbc: &Llbc,
+    node: &serde_json::Value,
+    ids: &mut std::collections::HashSet<u64>,
+) {
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
+        return;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return;
+    };
+    if llbc
+        .type_by_id(id)
+        .is_some_and(|td| matches!(td.kind, TypeDeclKind::Opaque))
+    {
+        ids.insert(id);
+    }
+}
+
+fn collect_opaque_raw_ptr_from_node(
+    llbc: &Llbc,
+    node: &serde_json::Value,
+    ids: &mut std::collections::HashSet<u64>,
+    seen_dedup: &mut std::collections::HashSet<u64>,
+    depth: usize,
+) {
+    if depth > 24 {
+        return;
+    }
+    match node {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_opaque_raw_ptr_from_node(llbc, item, ids, seen_dedup, depth + 1);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                if seen_dedup.insert(id)
+                    && let Some(body) = llbc.dedup_body(id)
+                {
+                    collect_opaque_raw_ptr_from_node(llbc, body, ids, seen_dedup, depth + 1);
+                }
+                return;
+            }
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                collect_opaque_raw_ptr_from_node(llbc, &arr[1], ids, seen_dedup, depth + 1);
+                return;
+            }
+            if let Some(pointee) = obj
+                .get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+            {
+                record_opaque_raw_ptr_pointee(llbc, pointee, ids);
+            }
+            if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object)
+                && type_decl_ref_adt_id(adt)
+                    .and_then(|id| llbc.type_by_id(id))
+                    .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
+                && let Some(pointee) = type_decl_ref_generics(adt, llbc)
+                    .and_then(|g| g.get("types"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|types| types.first())
+            {
+                record_opaque_raw_ptr_pointee(llbc, pointee, ids);
+            }
+            for value in obj.values() {
+                collect_opaque_raw_ptr_from_node(llbc, value, ids, seen_dedup, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Harvest Opaque TypeDecls that are raw-pointer pointees as declared ADTs.
+///
+/// `lltype.py` `Struct._first_struct` / `llannotation.py`
+/// `lltype_to_annotation` of `lltype.Ptr` of a raw Opaque. A pointee
+/// with no harvested layout is unknown; string intern then takes the
+/// non-classed fallback and a nullable `*mut` residual intern's a
+/// classdef-less `SomeInstance` whose `bool` is const-True. Bare-leaf
+/// dual-publish is skipped so a colliding std leaf cannot poison a
+/// StructId (`compute_struct_size` of `Condvar`).
+fn register_remaining_opaque_type_decls(
+    llbc: &Llbc,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    known_struct_names: &mut std::collections::HashSet<String>,
+) {
+    let pointees = opaque_raw_ptr_pointee_ids(llbc);
+    for td in llbc.iter_type_decls() {
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            continue;
+        }
+        if !pointees.contains(&td.def_id) {
+            continue;
+        }
+        if type_decl_is_builtin_adt(td) || td.published_struct_copy {
+            continue;
+        }
+        let name = td.item_meta.name_path();
+        if name.is_empty() || name.contains('<') {
+            continue;
+        }
+        let canonical_name = strip_crate_prefix(&name);
+        if struct_ids.contains_key(&name) || struct_ids.contains_key(&canonical_name) {
+            continue;
+        }
+        struct_fields
+            .fields
+            .entry(name.clone())
+            .or_insert_with(Vec::new);
+        struct_fields
+            .fields
+            .entry(canonical_name.clone())
+            .or_insert_with(Vec::new);
+        let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
+        record_struct_id(
+            struct_ids,
+            &mut struct_fields.class_identity,
+            name.clone(),
+            sid,
+            &canonical_name,
+        );
+        record_struct_id(
+            struct_ids,
+            &mut struct_fields.class_identity,
+            canonical_name.clone(),
+            sid,
+            &canonical_name,
+        );
+        known_struct_names.insert(name);
+        known_struct_names.insert(canonical_name);
     }
 }
 
@@ -3714,13 +3957,7 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
         s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
-        "str"
-        | "Wtf8"
-        | "Wtf8Buf"
-        | "Utf8Str"
-        | "UnicodeValueStorage"
-        | "BytesBlock"
-        | "LowlevelStringHeader" => ValueType::Str,
+        s if is_rstr_str_family_spelling(s) => ValueType::Str,
         _ => {
             if majit_ir::descr::is_shared_u8_slice_spelling(type_name)
                 || majit_ir::descr::is_option_of_u8_window_spelling(type_name)
@@ -3793,6 +4030,10 @@ fn field_row_from_decl(
 ) -> crate::front::semantic::FieldRow {
     field_decl_row(index, field, ty)
         .with_atomic(lltype::tyref_atomic_arg(&field.ty, llbc).is_some())
+        .with_fieldless_enum(
+            lltype::tyref_is_fieldless_enum_free(&field.ty, llbc)
+                || lltype::tyref_is_borrowed_fieldless_enum_free(&field.ty, llbc),
+        )
 }
 
 fn field_decl_name(index: usize, field: &FieldDecl) -> String {
@@ -5747,6 +5988,19 @@ fn derive_program_metadata(
         );
     }
 
+    // Opaque TypeDecls are declared ADTs (`lltype.py` `OpaqueType` /
+    // `Struct._first_struct`). Harvest them after the named field-row
+    // special cases so Constants / Vec / Layout keep their sids.
+    // Empty field rows plus a StructId is enough for `get_struct_layout`
+    // and `owner_layout_is_declared_with` (`llannotation.py`
+    // `lltype_to_annotation` of `lltype.Ptr` of a raw Opaque).
+    register_remaining_opaque_type_decls(
+        llbc,
+        &mut struct_fields,
+        &mut struct_ids,
+        &mut known_struct_names,
+    );
+
     for td in llbc.iter_trait_decls() {
         let name = td.item_meta.name_path();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
@@ -5780,6 +6034,10 @@ fn derive_program_metadata(
 /// declaration's crate and name (`majit_gc` + `GcType`), not by a list
 /// of payload type names. The facts are folded into
 /// [`crate::call::StructLayout::gckind`]; they are not a lookup table.
+/// rstr `STR` (`is_rstr_str_family_spelling`) is GC at the pointee
+/// (`pointee_is_raw_word`) without a `GcType` seed: putting it in
+/// `gc_struct_ids` would make `registered_gc_ptr_class_root_with` of
+/// `&Utf8Str` a nullable instance.
 #[derive(Default)]
 pub(crate) struct DeclaredGcFacts {
     seeds: Vec<majit_ir::descr::StructId>,
@@ -6699,6 +6957,11 @@ impl<'a> LowerContext<'a> {
         llbc: &'a Llbc,
         dependency_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ) -> Self {
+        // Fill `value_type_inputs` before the stack walk. `render_adt_type_args`
+        // reads that OnceLock with `get` (it cannot `get_or_init`: harvest
+        // re-enters through `is_unit_type`). Class-root spelling during
+        // `ensure_stack_sensitive_fns` then sees the declared-GC set.
+        let _ = value_type_inputs(llbc);
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
         // [`link_transparent_scalar_types`]. Publish the same external
@@ -7094,10 +7357,10 @@ pub(crate) use self::lltype::{
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
     is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
-    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
-    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
+    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
+    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, strip_crate_prefix, type_decl_ref_adt_id,
     type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };

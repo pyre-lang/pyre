@@ -341,6 +341,70 @@ pub(crate) fn register_struct_ids_serialized(
     guard
 }
 
+/// Layout table whose named owners use `gckind`. Binds
+/// [`register_struct_ids_serialized`]; keep the guard alive.
+#[must_use = "the returned guard holds the registry lock for the rest of \
+              the test; dropping it immediately re-opens the race"]
+pub(crate) fn layout_table_for(
+    names: &[&str],
+    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
+) -> (
+    crate::codewriter::call::StructLayoutTable,
+    parking_lot::MutexGuard<'static, ()>,
+) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut ids = HashMap::new();
+    let mut layouts = HashMap::new();
+    for name in names {
+        let id = majit_ir::descr::StructId::from_canonical(name);
+        ids.insert((*name).to_string(), Some(id));
+        layouts.insert(
+            id,
+            Rc::new(crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind,
+                fields: vec![],
+                host: None,
+                ll_struct: RefCell::new(None),
+                ll_struct_by_args: RefCell::new(HashMap::new()),
+            }),
+        );
+    }
+    let guard = register_struct_ids_serialized(ids);
+    (Rc::new(RefCell::new(layouts)), guard)
+}
+
+/// Layout table whose named owners are `GcKind::Gc`. Binds
+/// [`register_struct_ids_serialized`]; keep the guard alive.
+#[must_use = "the returned guard holds the registry lock for the rest of \
+              the test; dropping it immediately re-opens the race"]
+pub(crate) fn gc_layout_table_for(
+    names: &[&str],
+) -> (
+    crate::codewriter::call::StructLayoutTable,
+    parking_lot::MutexGuard<'static, ()>,
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    layout_table_for(names, GcKind::Gc)
+}
+
+/// Layout table whose named owners are `GcKind::Raw`. Binds
+/// [`register_struct_ids_serialized`]; keep the guard alive.
+#[must_use = "the returned guard holds the registry lock for the rest of \
+              the test; dropping it immediately re-opens the race"]
+pub(crate) fn raw_layout_table_for(
+    names: &[&str],
+) -> (
+    crate::codewriter::call::StructLayoutTable,
+    parking_lot::MutexGuard<'static, ()>,
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    layout_table_for(names, GcKind::Raw)
+}
+
 /// Publish an origin table while excluding tests that replace either global
 /// struct-name registry. Production publishes both together for one program;
 /// tests must likewise prevent one table from changing under another test's
