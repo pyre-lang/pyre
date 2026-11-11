@@ -996,10 +996,13 @@ const MINTED_EXC_NAME_LENMAX: usize = 50;
 /// `_alloc_fnaddr` companion, walking `rows` in order. `global_prefix`
 /// is `MINTED_EXC_` and `number_sep` is `_`. `C_IDENTIFIER` folds every
 /// non-identifier byte to `_` inside `NameManager.uniquename`.
-/// `with_number` is false: these basenames are not the `v` / `w_`
-/// generated-variable prefixes. A basename already in `seennames` — a
-/// sanitized collision or an earlier companion — comes back with the
-/// `_N` suffix from `NameManager._ensure_unique`. Claim order is the
+/// Each claim omits `with_number`, as `SourceGenerator.uniquecname`
+/// and `_LocalScope.uniquename` do. `NameManager.uniquename` then
+/// sets `with_number = basename in ('v', 'w_')`. When that holds and
+/// the last character is not a digit, `fmt = '%s%d'`, so basename
+/// `v` is claimed as `v0`. Any other basename already in `seennames`
+/// — a sanitized collision or an earlier companion — comes back with
+/// the `_N` suffix from `NameManager._ensure_unique`. Claim order is the
 /// bare ident, then `_destructor`, then `_alloc_with_del`, then
 /// `_alloc_fnaddr`, so a later row whose basename is an earlier
 /// `_destructor` still takes that companion's `_1` suffix.
@@ -1022,23 +1025,21 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
     let mut table =
         String::from("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
     for (index, row) in rows.iter().enumerate() {
-        // `NameManager.uniquename` (`gensupp.py`). Companions are
+        // `NameManager.uniquename` (`gensupp.py`) with the default
+        // `with_number=None` (`basename in ('v', 'w_')`). Companions are
         // claimed for every row, emitted or not, so a later ident
         // cannot take `{bare}_destructor` or `{bare}_alloc_with_del`.
-        let (bare, ident) = names.uniquename_bare(&row.name, Some(false), MINTED_EXC_NAME_LENMAX);
-        let destructor_name = names.uniquename(
-            &format!("{bare}_destructor"),
-            Some(false),
-            MINTED_EXC_NAME_LENMAX,
-        );
+        let (bare, ident) = names.uniquename_bare(&row.name, None, MINTED_EXC_NAME_LENMAX);
+        let destructor_name =
+            names.uniquename(&format!("{bare}_destructor"), None, MINTED_EXC_NAME_LENMAX);
         let alloc_name = names.uniquename(
             &format!("{bare}_alloc_with_del"),
-            Some(false),
+            None,
             MINTED_EXC_NAME_LENMAX,
         );
         let alloc_fnaddr_name = names.uniquename(
             &format!("{bare}_alloc_fnaddr"),
-            Some(false),
+            None,
             MINTED_EXC_NAME_LENMAX,
         );
         defs.push_str(&format!(
@@ -2721,6 +2722,20 @@ mod tests {
             !src.contains("static MINTED_EXC_pkg__E__A_destructor:"),
             "{src}"
         );
+    }
+
+    /// `NameManager.uniquename` with omitted `with_number` (`gensupp.py`)
+    /// sets `with_number = basename in ('v', 'w_')` after `C_IDENTIFIER`.
+    /// A key that sanitizes to `v` is claimed as `v0` (`fmt = '%s%d'`).
+    /// `NameManager.global_prefix` then prepends `MINTED_EXC_`.
+    #[test]
+    fn minted_exception_v_key_takes_default_with_number() {
+        let rows = vec![minted_emit("v", false)];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert!(src.contains("static MINTED_EXC_v0:"), "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_v0,"), "{src}");
+        assert!(!src.contains("static MINTED_EXC_v:"), "{src}");
+        assert!(!src.contains("MINTED_EXC_v_0"), "{src}");
     }
 
     /// Item name on a rendered `static` or `fn` line.
