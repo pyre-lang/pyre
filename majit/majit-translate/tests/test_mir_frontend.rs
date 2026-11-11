@@ -2249,7 +2249,7 @@ fn a_borrowed_primitive_banks_by_its_container() {
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
         vec![(
-            "ops::control_flow::ControlFlow<Option<Never>,&u8>::Continue".to_string(),
+            "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue".to_string(),
             ValueType::Unsigned
         ),],
         "Option<&u8> `?` is ControlFlow: Continue payload is the byte (Unsigned); Break's Option<Never> residual is lltype.Void so the Break arm has no payload FieldRead",
