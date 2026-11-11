@@ -193,6 +193,22 @@ mod gc_box {
         DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(ptr));
     }
 
+    /// Drop this thread's box before a replacement claims the cursor, so the
+    /// outgoing `Nursery` destructor still sees its own pair in the
+    /// thread-local words.
+    pub(super) fn drop_current() {
+        DYNASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let old = guard.take();
+            drop(old);
+            DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+        });
+        DYNASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(std::ptr::null()));
+    }
+
     /// Drop this thread's box and clear the raw mirror.
     ///
     /// The box goes first so reentrant ownership queries issued from its drop
@@ -607,11 +623,13 @@ fn dynasm_finalizer_queues() -> *const majit_gc::FinalizerQueueTable {
 /// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
 /// into one collector. Sequential replace on one thread is the test
 /// shape.
-fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> JitframeDescrFacts {
+fn install_gc_box(mut gc: Box<dyn majit_gc::GcAllocator>) -> JitframeDescrFacts {
     // This thread now answers heap queries from its own allocator, whose
     // nursery is not the singleton's, so the process-wide published range can
     // no longer stand in for `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    gc_box::drop_current();
+    gc.claim_nursery_cursor();
     let has_gcrootmap = gc.has_gcrootmap();
     majit_gc::note_gc_box_installed(has_gcrootmap);
     let supports_guard_gc_type = gc.supports_guard_gc_type();
@@ -697,32 +715,22 @@ fn dynasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
     with_dynasm_active_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
 }
 
-/// gc.py `get_nursery_free_addr` / `get_nursery_top_addr` parity:
-/// the backend reads nursery slot addresses from the active GC descriptor,
-/// NOT from a process-global singleton. Returns `(0, 0)` when no GC is
-/// bound so the assembler falls back to the slow-path helper.
-pub(crate) fn dynasm_nursery_addrs() -> (usize, usize) {
-    with_dynasm_active_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr())).unwrap_or((0, 0))
+/// Whether the active GC descriptor can back an inline nursery bump.
+pub(crate) fn dynasm_nursery_is_bound() -> bool {
+    with_dynasm_active_gc(|_| true).unwrap_or(false)
 }
 
-/// [`dynasm_nursery_addrs`] for an inline headerless bump. A collector that
+/// [`dynasm_nursery_is_bound`] for an inline headerless bump. A collector that
 /// is not headerless-aware (`GcAllocator::headerless_nursery`) answers
-/// `(0, 0)` as an absent nursery does, so the emitter keeps the allocation on
+/// false as an absent nursery does, so the emitter keeps the allocation on
 /// its helper instead of writing a raw base into a headered nursery.
-pub(crate) fn dynasm_headerless_nursery_addrs() -> (usize, usize) {
-    with_dynasm_active_gc(|gc| {
-        if gc.headerless_nursery() {
-            (gc.nursery_free_addr(), gc.nursery_top_addr())
-        } else {
-            (0, 0)
-        }
-    })
-    .unwrap_or((0, 0))
+pub(crate) fn dynasm_headerless_nursery_is_bound() -> bool {
+    with_dynasm_active_gc(|gc| gc.headerless_nursery()).unwrap_or(false)
 }
 
 /// `GcLLDescr_framework.max_size_of_young_obj`, consumed by
 /// `malloc_cond_varsize` before it computes `itemsize * length`.  Zero is the
-/// no-GC sentinel, paired with [`dynasm_nursery_addrs`]'s `(0, 0)` answer.
+/// no-GC sentinel, paired with [`dynasm_nursery_is_bound`]'s false answer.
 pub(crate) fn dynasm_max_size_of_young_obj() -> usize {
     with_dynasm_active_gc(|gc| gc.max_nursery_object_size()).unwrap_or(0)
 }
@@ -2422,8 +2430,6 @@ impl DynasmBackend {
     fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
         let collector = with_dynasm_active_gc(|gc| {
             (
-                gc.nursery_free_addr(),
-                gc.nursery_top_addr(),
                 gc.max_nursery_object_size(),
                 gc.get_write_barrier_descr(),
                 gc.headerless_fixedsize(),
@@ -2438,11 +2444,11 @@ impl DynasmBackend {
         // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
         // this flag carries the other two, below.
         let is_boehm = collector.is_none();
-        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr, headerless_fixedsize) =
-            collector.unwrap_or((0, 0, 0, None, false));
+        let (max_nursery_size, wb_descr, headerless_fixedsize) =
+            collector.unwrap_or((0, None, false));
         majit_gc::rewrite::GcRewriterImpl {
-            nursery_free_addr,
-            nursery_top_addr,
+            nursery_free_addr: 0,
+            nursery_top_addr: 0,
             max_nursery_size,
             // gc.py:401 `gc_ll_descr.write_barrier_descr` — ask the active
             // collector rather than assuming the MiniMark layout, so the
@@ -5292,6 +5298,61 @@ mod tests {
         assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 1);
         assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
         assert_eq!(unsafe { *((obj.0 + 16) as *const i64) }, 1);
+
+        // Inline `malloc_cond` addresses `tlfield_nursery_*` off the
+        // frame's `threadlocal_addr` slot, never an absolute cursor word.
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled loop")
+            .downcast_ref::<CompiledCode>()
+            .expect("dynasm compiled code");
+        let bytes: &[u8] = &compiled.buffer[compiled.entry_offset.0..];
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ldr x16,[sp,#48]=F9401BF0; ldr x0,[x16,#248]=F9407E00;
+            // ldr x17,[x16,#256]=F9408211
+            fn has_u32(bytes: &[u8], insn: u32) -> bool {
+                bytes
+                    .chunks_exact(4)
+                    .any(|c| u32::from_le_bytes(c.try_into().unwrap()) == insn)
+            }
+            assert!(
+                has_u32(bytes, 0xF940_1BF0),
+                "inline bump must load threadlocal base from [sp,#48]"
+            );
+            assert!(
+                has_u32(bytes, 0xF940_7E00),
+                "inline bump must load nursery_free from [x16,#248]"
+            );
+            assert!(
+                has_u32(bytes, 0xF940_8211),
+                "inline bump must load nursery_top from [x16,#256]"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            fn has_i32(bytes: &[u8], v: i32) -> bool {
+                bytes
+                    .windows(4)
+                    .any(|w| i32::from_le_bytes(w.try_into().unwrap()) == v)
+            }
+            assert!(
+                has_i32(bytes, crate::arch::THREADLOCAL_OFS as i32),
+                "inline bump must load threadlocal base from THREADLOCAL_OFS"
+            );
+            assert!(
+                has_i32(
+                    bytes,
+                    majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as i32
+                ),
+                "inline bump must address nursery_free at TLFIELD_NURSERY_FREE_OFS"
+            );
+            assert!(
+                has_i32(bytes, majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS as i32),
+                "inline bump must address nursery_top at TLFIELD_NURSERY_TOP_OFS"
+            );
+        }
     }
 
     #[test]

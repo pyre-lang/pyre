@@ -277,6 +277,8 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    gc_box::store(None);
+    gc.claim_nursery_cursor();
     majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let facts = check_jitframe_descr(gc.as_ref());
     gc.freeze_types();
@@ -771,14 +773,6 @@ pub fn jit_exc_value_raw() -> i64 {
 
 // ── Thread-local reference access shims ──
 
-/// `llop.threadlocalref_get`: the word at byte offset `offset` of this
-/// thread's `pypy_threadlocal_s`.
-///
-/// Called from JIT-compiled code for THREADLOCALREF_GET operations.
-extern "C" fn jit_threadlocalref_get(offset: i64) -> i64 {
-    majit_rlib::rthread::threadlocalref_get(offset as usize)
-}
-
 /// Write a value to a thread-local slot at the given offset.
 ///
 /// Called by the interpreter to set up thread-local state before entering
@@ -790,6 +784,13 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 /// `llmodel.py` `threadlocalref_addr`: this thread's `pypy_threadlocal_s`.
 pub fn jit_threadlocalref_base() -> *const i64 {
     majit_rlib::rthread::threadlocalref_addr()
+}
+
+/// C ABI for compiled bodies. Cranelift's execute_token is
+/// `(jf_ptr, dispatch_key)` and has no `threadlocal_addr` argument, so the
+/// prologue host-calls this; `THREADLOCALREF_GET` then loads off that base.
+extern "C" fn jit_threadlocalref_addr() -> usize {
+    majit_rlib::rthread::threadlocalref_addr() as usize
 }
 
 // ── GIL release/reacquire shims ──
@@ -3939,23 +3940,11 @@ extern "C" fn gc_alloc_nursery_shim(size: u64) -> u64 {
 }
 
 fn try_headerless_nursery_bump(gc: &mut dyn GcAllocator, size: usize) -> Option<u64> {
-    let nf_addr = gc.nursery_free_addr();
-    let nt_addr = gc.nursery_top_addr();
-    if nf_addr == 0 || nt_addr == 0 {
-        return None;
-    }
-
-    unsafe {
-        let nf = nf_addr as *mut usize;
-        let nt = nt_addr as *const usize;
-        let free = nf.read();
-        let top = nt.read();
-        let new_free = free.checked_add(size)?;
-        if new_free > top {
-            return None;
-        }
-        nf.write(new_free);
-        Some(free as u64)
+    let gcref = gc.alloc_nursery_headerless_no_collect(size);
+    if gcref.is_null() {
+        None
+    } else {
+        Some(gcref.0 as u64)
     }
 }
 
@@ -6626,6 +6615,37 @@ fn emit_scaled_index_addr(
         }
     };
     builder.ins().iadd(base, scaled_index)
+}
+
+fn load_nursery_cursor(
+    builder: &mut FunctionBuilder,
+    tl_base_var: Variable,
+    ptr_type: cranelift_codegen::ir::Type,
+) -> (CValue, CValue, CValue) {
+    let flags = MemFlagsData::trusted();
+    let base = builder.use_var(tl_base_var);
+    let free = builder.ins().load(
+        ptr_type,
+        flags,
+        base,
+        majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as i32,
+    );
+    let top = builder.ins().load(
+        ptr_type,
+        flags,
+        base,
+        majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS as i32,
+    );
+    (base, free, top)
+}
+
+fn store_nursery_free(builder: &mut FunctionBuilder, base: CValue, new_free: CValue) {
+    builder.ins().store(
+        MemFlagsData::trusted(),
+        new_free,
+        base,
+        majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as i32,
+    );
 }
 
 fn emit_host_call(
@@ -11476,14 +11496,8 @@ impl CraneliftBackend {
     /// (`can_use_nursery_malloc -> False`, gc.py, spelled
     /// `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156).
     fn gc_rewriter(&self) -> GcRewriterImpl {
-        let collector = with_cranelift_gc(|gc| {
-            (
-                gc.nursery_free_addr(),
-                gc.nursery_top_addr(),
-                gc.max_nursery_object_size(),
-                gc.get_write_barrier_descr(),
-            )
-        });
+        let collector =
+            with_cranelift_gc(|gc| (gc.max_nursery_object_size(), gc.get_write_barrier_descr()));
         // gc.py `get_ll_description(gcdescr)`: `gcdescr is None`
         // selects `GcLLDescr_boehm`, so upstream has no "no collector" state
         // at all — the configuration with none installed IS boehm, and
@@ -11493,11 +11507,10 @@ impl CraneliftBackend {
         // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
         // this flag carries the other two, below.
         let is_boehm = collector.is_none();
-        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            collector.unwrap_or((0, 0, 0, None));
+        let (max_nursery_size, wb_descr) = collector.unwrap_or((0, None));
         GcRewriterImpl {
-            nursery_free_addr,
-            nursery_top_addr,
+            nursery_free_addr: 0,
+            nursery_top_addr: 0,
             max_nursery_size,
             // gc.py:401 `gc_ll_descr.write_barrier_descr` — the collector
             // answers (gc.py WriteBarrierDescr parity, card marking
@@ -12575,8 +12588,9 @@ impl CraneliftBackend {
             absolute_homes.then_some(&bridge_var_slots),
         );
 
-        let gc_nursery_addrs =
-            with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
+        let gc_nursery_bound = cranelift_gc_active();
+        let gc_headerless_nursery =
+            with_cranelift_gc(|gc| gc.headerless_nursery()).unwrap_or(false);
         let gc_max_nursery_object_size = with_cranelift_gc(|gc| gc.max_nursery_object_size());
         // llmodel.py AbstractLLCPU.__init__ self.vtable_offset — backend
         // property used by bh_new_with_vtable. Capture for use in
@@ -13136,6 +13150,23 @@ impl CraneliftBackend {
         // base subject to register allocation and, under x86_64 pressure, spill
         // it to a stack slot reloaded on every access.
         builder.ins().set_pinned_reg(jf_ptr);
+
+        // Cranelift execute_token is `(jf_ptr, dispatch_key)`; there is no
+        // `threadlocal_addr` argument. Load `pypy_threadlocal_s` once here
+        // the way `THREADLOCALREF_GET` already host-calls
+        // `threadlocalref_addr`, then address `tlfield_nursery_*` off it.
+        let tl_base_var = builder.declare_var(ptr_type);
+        let tl_base_v = emit_host_call(
+            module,
+            &mut builder,
+            ptr_type,
+            call_conv,
+            jit_threadlocalref_addr as *const () as usize,
+            &[],
+            Some(ptr_type),
+        )
+        .expect("threadlocalref_addr");
+        builder.def_var(tl_base_var, tl_base_v);
 
         // `assembler.py genop_load_from_gc_table` holds the table in the
         // code buffer and loads PC-relative. cranelift's JITModule has no
@@ -16693,14 +16724,10 @@ impl CraneliftBackend {
                     // the overflow path — whoever declares `headerless_structs`
                     // upholds it. Without a bump surface (`nursery_free` /
                     // `nursery_top` reported as 0) the op stays on the helper.
-                    let inline_bump = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
-                    if let Some((nf_addr, nt_addr)) = inline_bump {
-                        let flags = MemFlagsData::trusted();
-                        let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
-                        let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
-                        let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                    if gc_headerless_nursery {
+                        let (nf_ptr, free, top) =
+                            load_nursery_cursor(&mut builder, tl_base_var, ptr_type);
                         let new_free = builder.ins().iadd(free, size);
-                        let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
                         // `nursery_top` is one-past-last, so the region is exhausted
                         // exactly when the bumped free pointer runs past it — the
                         // dynasm emitters' `b.hi` / `ja` slow-path edge.
@@ -16734,7 +16761,7 @@ impl CraneliftBackend {
                         // and no ref root is spilled.
                         builder.switch_to_block(fast_block);
                         builder.seal_block(fast_block);
-                        builder.ins().store(flags, new_free, nf_ptr, 0);
+                        store_nursery_free(&mut builder, nf_ptr, new_free);
                         let mut fast_args: Vec<BlockArg> =
                             vec![BlockArg::from(free), BlockArg::from(jf_ptr)];
                         for &(var_idx, _) in &live_refs {
@@ -16886,20 +16913,18 @@ impl CraneliftBackend {
                         // all live ref values + jf_ptr through the merge.
                         // Fast path passes originals (no memory ops).
                         // Slow path passes GC-updated values from jitframe.
-                        let (nf_addr, nt_addr) =
-                            gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                        let flags = MemFlagsData::trusted();
+                        if !gc_nursery_bound {
+                            return Err(missing_gc_runtime(op.opcode));
+                        }
                         let size_total = resolve_opref_or_imm(
                             &mut builder,
                             &opref_var_map,
                             &known_values,
                             op.arg(0).to_opref(),
                         );
-                        let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
-                        let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
-                        let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                        let (nf_ptr, free, top) =
+                            load_nursery_cursor(&mut builder, tl_base_var, ptr_type);
                         let new_free = builder.ins().iadd(free, size_total);
-                        let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
                         let fits =
                             builder
                                 .ins()
@@ -16927,7 +16952,7 @@ impl CraneliftBackend {
                         // (malloc_cond: MOV [nursery_free], edx; continue)
                         builder.switch_to_block(fast_block);
                         builder.seal_block(fast_block);
-                        builder.ins().store(flags, new_free, nf_ptr, 0);
+                        store_nursery_free(&mut builder, nf_ptr, new_free);
                         // `gen_initialize_tid` writes this word at `free`.
                         // Heap MemFlags match `GcStore` so the write aliases
                         // the later header stamp; `trusted()` does not.
@@ -17076,8 +17101,9 @@ impl CraneliftBackend {
                     // live refs, installs the gcmap, and calls the collecting
                     // helper.  The two comparisons are one combined SSA
                     // predicate here; their control-flow contract is the same.
-                    let (nf_addr, nt_addr) =
-                        gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    if !gc_nursery_bound {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let max_young =
                         gc_max_nursery_object_size.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let word = std::mem::size_of::<usize>();
@@ -17090,7 +17116,6 @@ impl CraneliftBackend {
                     debug_assert!(
                         ad.base_size() + GcHeader::SIZE >= GcHeader::MIN_NURSERY_OBJ_SIZE
                     );
-                    let flags = MemFlagsData::trusted();
                     let max_length_value = builder.ins().iconst(cl_types::I64, max_length as i64);
                     let length_fits = builder.ins().icmp(
                         IntCC::UnsignedLessThanOrEqual,
@@ -17103,11 +17128,9 @@ impl CraneliftBackend {
                         .iadd_imm_s(scaled, base_size_i64 + GcHeader::SIZE as i64 + 7);
                     let align_mask = builder.ins().iconst(cl_types::I64, -8);
                     let total = builder.ins().band(unaligned_total, align_mask);
-                    let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
-                    let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
-                    let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                    let (nf_ptr, free, top) =
+                        load_nursery_cursor(&mut builder, tl_base_var, ptr_type);
                     let new_free = builder.ins().iadd(free, total);
-                    let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
                     let nursery_fits =
                         builder
                             .ins()
@@ -17131,7 +17154,7 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
-                    builder.ins().store(flags, new_free, nf_ptr, 0);
+                    store_nursery_free(&mut builder, nf_ptr, new_free);
                     // Heap MemFlags match `GcStore` so the tid word aliases
                     // a later header stamp; `trusted()` does not.
                     builder
@@ -17217,9 +17240,9 @@ impl CraneliftBackend {
                     // Same fast-path/slow-path split as CallMallocNursery:
                     // the fast path is a bare bump allocation; only the
                     // slow path installs the gcmap and spills/reloads roots.
-                    let (nf_addr, nt_addr) =
-                        gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let flags = MemFlagsData::trusted();
+                    if !gc_nursery_bound {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let size_total = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
@@ -17227,11 +17250,9 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
 
-                    let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
-                    let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
-                    let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                    let (nf_ptr, free, top) =
+                        load_nursery_cursor(&mut builder, tl_base_var, ptr_type);
                     let new_free = builder.ins().iadd(free, size_total);
-                    let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
                     let fits = builder
                         .ins()
                         .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
@@ -17264,7 +17285,7 @@ impl CraneliftBackend {
                     // recycled nursery slot would keep `HAS_SHADOW`.
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
-                    builder.ins().store(flags, new_free, nf_ptr, 0);
+                    store_nursery_free(&mut builder, nf_ptr, new_free);
                     let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
@@ -19225,7 +19246,6 @@ impl CraneliftBackend {
                             .max(GcHeader::MIN_NURSERY_OBJ_SIZE);
                         let align = majit_gc::header::MEMORY_ALIGNMENT;
                         let total = (total + align - 1) & !(align - 1);
-                        let inline_addrs = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
                         // `framework.py malloc_fast` is annotated
                         // `s_False, s_False, s_False` (no destructor, no
                         // old-style finalizer, no weakref). The bump stores
@@ -19238,15 +19258,13 @@ impl CraneliftBackend {
                                 .unwrap_or(false);
                         let result = if is_plain
                             && gc_max_nursery_object_size.is_some_and(|max| total < max)
-                            && let Some((nf_addr, nt_addr)) = inline_addrs
+                            && gc_nursery_bound
                         {
                             let flags = MemFlagsData::trusted();
                             let total_val = builder.ins().iconst(cl_types::I64, total as i64);
-                            let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
-                            let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
-                            let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                            let (nf_ptr, free, top) =
+                                load_nursery_cursor(&mut builder, tl_base_var, ptr_type);
                             let new_free = builder.ins().iadd(free, total_val);
-                            let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
                             let fits =
                                 builder
                                     .ins()
@@ -19268,7 +19286,7 @@ impl CraneliftBackend {
 
                             builder.switch_to_block(fast_block);
                             builder.seal_block(fast_block);
-                            builder.ins().store(flags, new_free, nf_ptr, 0);
+                            store_nursery_free(&mut builder, nf_ptr, new_free);
                             builder.ins().store(flags, type_id_val, free, 0);
                             let fast_obj = builder.ins().iadd_imm_s(free, GcHeader::SIZE as i64);
                             let mut fast_args: Vec<BlockArg> =
@@ -19515,19 +19533,16 @@ impl CraneliftBackend {
 
                 // ── Thread-local reference get ──
                 OpCode::ThreadlocalrefGet => {
-                    // Load from a thread-local slot via runtime callback.
-                    // arg(0) = offset (in bytes) into the TLS area.
+                    // Load from a thread-local slot. arg(0) = offset in bytes
+                    // into `pypy_threadlocal_s`. The base is the prologue
+                    // `threadlocalref_addr` load.
                     let offset = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
-                    let result = emit_host_call(
-                        module,
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_threadlocalref_get as *const () as usize,
-                        &[offset],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_threadlocalref_get must return a value");
+                    let base = builder.use_var(tl_base_var);
+                    let addr = builder.ins().iadd(base, offset);
+                    let result =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
 
@@ -33788,6 +33803,20 @@ mod tests {
         assert!(
             tid_store_address_op(&clif, 7, "iadd"),
             "GcStore of tid 7 must still run:\n{clif}"
+        );
+        assert!(
+            clif.contains(&format!(
+                "+{}",
+                majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS
+            )),
+            "inline bump must load nursery_free at tlfield offset:\n{clif}"
+        );
+        assert!(
+            clif.contains(&format!(
+                "+{}",
+                majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS
+            )),
+            "inline bump must load nursery_top at tlfield offset:\n{clif}"
         );
     }
 

@@ -1500,10 +1500,11 @@ impl Drop for ActiveGcBox {
 /// Two live boxes at once is not a supported configuration: `ConstPtr`
 /// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
 /// into one collector.
-fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
+fn install_gc_box(mut gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    gc.claim_nursery_cursor();
     majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     let (generation, installed) = gc_box::store(gc);
@@ -2166,23 +2167,8 @@ pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
 }
 
 fn try_headerless_nursery_bump(gc: &mut dyn majit_gc::GcAllocator, size: usize) -> Option<usize> {
-    let nf_addr = gc.nursery_free_addr();
-    let nt_addr = gc.nursery_top_addr();
-    if nf_addr == 0 || nt_addr == 0 {
-        return None;
-    }
-    unsafe {
-        let nf = nf_addr as *mut usize;
-        let nt = nt_addr as *const usize;
-        let free = nf.read();
-        let top = nt.read();
-        let new_free = free.checked_add(size)?;
-        if new_free > top {
-            return None;
-        }
-        nf.write(new_free);
-        Some(free)
-    }
+    let gcref = gc.alloc_nursery_headerless_no_collect(size);
+    if gcref.is_null() { None } else { Some(gcref.0) }
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /

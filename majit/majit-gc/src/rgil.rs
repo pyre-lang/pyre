@@ -362,6 +362,7 @@ pub(crate) fn after_fork_child() {
     );
     init_mutexes();
     RPY_WAITING_THREADS.store(0, Ordering::SeqCst);
+    crate::gc_thread_run();
 }
 
 /// threadlocal.h:152-156 `_rpygil_acquire_fast_path`.
@@ -380,6 +381,7 @@ pub fn acquire() {
     if !acquire_fast_path(ident) {
         acquire_slow_path(ident);
     }
+    crate::gc_thread_run();
     after_thread_switch();
 }
 
@@ -403,6 +405,7 @@ pub fn release() {
         am_i_holding_the_gil(),
         "releasing the GIL without holding it"
     );
+    gc_sync::release_nursery_cursor_to_fallback();
     RPY_FASTGIL.store(0, Ordering::Release);
     release_signal();
 }
@@ -640,6 +643,138 @@ mod tests {
         let _guard = GilGuard::acquire();
         assert!(!yield_thread());
         assert!(am_i_holding_the_gil());
+    }
+
+    fn cursor_pair() -> (usize, usize) {
+        let p = crate::threadlocal::threadlocal_nursery_ptrs();
+        unsafe { ((*p).free as usize, (*p).top as usize) }
+    }
+
+    fn alloc_fast_one() -> usize {
+        let mut root = crate::GcRef(0);
+        let mut wb = false;
+        unsafe { crate::alloc_fast_nursery_collecting_typed_rooted(0, 16, &mut root, &mut wb).0 }
+    }
+
+    #[test]
+    fn nursery_cursor_travels_with_the_gil() {
+        let _serial = TEST_SERIAL.lock();
+        allocate();
+        {
+            let _g = GilGuard::acquire();
+            if !crate::gc_sync::is_initialized() {
+                crate::gc_sync::store_singleton(Box::new(crate::collector::MiniMarkGC::new()));
+            }
+            crate::gc_thread_run();
+        }
+
+        enum Cmd {
+            Run,
+            Report,
+            Release,
+            Quit,
+        }
+        let spawn = || {
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<Cmd>(0);
+            let (rep_tx, rep_rx) = std::sync::mpsc::sync_channel(0);
+            let handle = std::thread::spawn(move || {
+                let mut holding = false;
+                loop {
+                    match cmd_rx.recv() {
+                        Ok(Cmd::Run) => {
+                            if !holding {
+                                acquire_maybe_in_new_thread();
+                                holding = true;
+                            }
+                            let obj = alloc_fast_one();
+                            rep_tx.send((cursor_pair(), obj)).unwrap();
+                        }
+                        Ok(Cmd::Report) => {
+                            rep_tx.send((cursor_pair(), 0)).unwrap();
+                        }
+                        Ok(Cmd::Release) => {
+                            if holding {
+                                release();
+                                holding = false;
+                            }
+                            rep_tx.send((cursor_pair(), 0)).unwrap();
+                        }
+                        Ok(Cmd::Quit) | Err(_) => break,
+                    }
+                }
+            });
+            (cmd_tx, rep_rx, handle)
+        };
+
+        let (a_cmd, a_rep, a) = spawn();
+        let (b_cmd, b_rep, b) = spawn();
+        let mut objs = Vec::new();
+
+        for _ in 0..3 {
+            a_cmd.send(Cmd::Run).unwrap();
+            let (a_pair, a_obj) = a_rep.recv().unwrap();
+            b_cmd.send(Cmd::Report).unwrap();
+            let (b_pair, _) = b_rep.recv().unwrap();
+            assert_ne!(a_pair, (0, 0), "holder cursor is live");
+            assert_eq!(b_pair, (0, 0), "non-holder cursor is zero");
+            assert_ne!(a_obj, 0);
+            objs.push(a_obj);
+
+            a_cmd.send(Cmd::Release).unwrap();
+            let _ = a_rep.recv().unwrap();
+
+            b_cmd.send(Cmd::Run).unwrap();
+            let (b_pair, b_obj) = b_rep.recv().unwrap();
+            a_cmd.send(Cmd::Report).unwrap();
+            let (a_pair, _) = a_rep.recv().unwrap();
+            assert_ne!(b_pair, (0, 0), "holder cursor is live");
+            assert_eq!(a_pair, (0, 0), "non-holder cursor is zero");
+            assert_ne!(b_obj, 0);
+            objs.push(b_obj);
+
+            b_cmd.send(Cmd::Release).unwrap();
+            let _ = b_rep.recv().unwrap();
+        }
+
+        a_cmd.send(Cmd::Quit).unwrap();
+        b_cmd.send(Cmd::Quit).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let unique = {
+            let mut v = objs.clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(unique.len(), objs.len());
+        for &obj in &objs {
+            assert!(crate::gc_sync::peek_nursery_contains(obj));
+        }
+
+        let owner = std::thread::spawn(|| {
+            crate::shadow_stack::register_mutator();
+            crate::gc_sync::register_thread();
+            let obj = alloc_fast_one();
+            crate::gc_sync::gc_thread_die();
+            obj
+        });
+        let owner_obj = owner.join().unwrap();
+        assert!(crate::gc_sync::peek_nursery_cursor_is_fallback());
+        assert!(crate::gc_sync::peek_nursery_contains(owner_obj));
+
+        let third = std::thread::spawn(|| {
+            acquire_maybe_in_new_thread();
+            let pair = cursor_pair();
+            let obj = alloc_fast_one();
+            release();
+            (pair, obj)
+        });
+        let (pair, obj) = third.join().unwrap();
+        assert_ne!(pair, (0, 0));
+        assert_ne!(obj, 0);
+        assert_ne!(obj, owner_obj);
+        assert!(crate::gc_sync::peek_nursery_contains(obj));
     }
 
     /// thread_gil.c's rpy_init_mutexes must leave only the surviving thread

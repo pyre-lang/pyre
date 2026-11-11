@@ -224,6 +224,20 @@ what supplies its exclusive-heap-access requirement has changed once.
   a TLS raw pointer into unsynchronized shared mutable state — the gh#396
   defect. Staged execution plan (P0 soundness core → P1 TLAB/SSB/back-edge
   polls → P2 `_thread` + object-model epic) is recorded on gh#396.
+- *2026-11:* the nursery bump cursor (`nursery_free` / `nursery_top`) lives
+  in two adjacent `ThreadLocalField` words of `pypy_threadlocal_s`
+  (`tlfield_nursery_free` / `tlfield_nursery_top`). Compiled code reaches
+  them through the frame's `threadlocal_addr` slot; Rust `malloc_fast`
+  through the published address pair (`PUBLISHED_BUMP`). `gc_thread_run`
+  (`rthread.py`) hands the live pair to the new GIL holder and zeros the
+  previous owner; `rgil::release` returns it to a GC-owned fallback pair, so
+  a thread without the GIL never owns the cursor. Measured cost of the alternatives on
+  `synth/int_mul_ovf_bignum_promote` (40.0 M Rust-side nursery allocations
+  per run): an extra per-allocation thread-base read costs about +9.7
+  instructions / +1.4 cycles through `_tlv_get_addr`, about the same
+  through a direct `tpidrro_el0` TSD read, and +3.3 instructions / +0.4
+  cycles through a cached block pointer, which is why Rust code keeps the
+  published address pair while the GIL exists.
 
 ### 3.4 Backends: three thin backends, not six hand-written
 
