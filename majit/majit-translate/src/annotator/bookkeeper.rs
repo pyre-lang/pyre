@@ -4659,10 +4659,10 @@ impl Bookkeeper {
                 // `Ptr`). Replace ONLY that exact FORCE shell: leaving it
                 // unions `Integer ∪ Ptr(T)` at setattr of a capture of
                 // the same field. A scalar Int field intern is Integer
-                // and stays. A bare `fn` field projects `Impossible` and
-                // `Option<fn>` projects `s_None` (`ExecutionContext.__init__`
-                // stores None), so the Int FORCE shell of a function-pointer
-                // spelling is replaced too.
+                // and stays. A `fn` / `Option<fn>` field projects
+                // `Impossible` (no declared field seed; setattr unions), so
+                // the Int FORCE shell of a function-pointer spelling is
+                // replaced too.
                 let is_ptr_integer_force_shell = (matches!(&s_value, SomeValue::Ptr(_))
                     || fn_ptr_somevalue_for_spelling_in(&row.ty, Some(self)).is_some())
                     && crate::codewriter::annotation_state::valuetype_to_someshell(
@@ -5657,19 +5657,14 @@ impl Bookkeeper {
             return self.profilefunc_pbc_or_none();
         }
         // A function-pointer field is lattice bottom. RPython does not
-        // seed a function-typed attr as `SomePtr`; `ExecutionContext.__init__`
-        // stores `None` and `setllprofile` stores the trampoline, then
-        // `ClassDef.generalize_attr` unions `s_None` ∪ `SomePBC`. Seeding
-        // `SomePtr(FuncType)` here unions `SomePtr ∪ SomePBC`
-        // (`llannotation.py` `pairtype(SomePtr, SomeObject).union`).
-        // `fn_ptr_somevalue_for_spelling_in` is the recogniser; the lltype
-        // is still `Ptr(FuncType)` (`stamp_fn_ptr` / `FunctionsPBCRepr`).
-        // `Option<fn>` starts as that `None` (`s_None`); a bare `fn` has
-        // no None and stays Impossible until a PBC store.
+        // seed a function-typed attr from the declared type;
+        // `ClassDef.generalize_attr` unions setattr sources / prebuilt
+        // instances (`classdesc.py`). Seeding `SomePtr(FuncType)` here
+        // unions `SomePtr ∪ SomePBC` (`llannotation.py`
+        // `pairtype(SomePtr, SomeObject).union`). `fn` and `Option<fn>`
+        // stay Impossible until a store (`ExecutionContext.__init__`
+        // writes None; `setllprofile` writes the trampoline).
         if fn_ptr_somevalue_for_spelling_in(t, Some(self)).is_some() {
-            if spelling_is_option_fn(t) {
-                return super::model::s_none();
-            }
             return SomeValue::Impossible;
         }
         // A transparent scalar field is the inner word
@@ -5906,12 +5901,12 @@ impl Bookkeeper {
             {
                 return self.profilefunc_pbc_or_none();
             }
-            // `Option<fn>` None is `s_None` (`fn_null_constant` of a
-            // spelled null). setattr of a trampoline `SomePBC` unions
-            // the family. Do not seed `SomePtr`
+            // `Option<fn>` field is Impossible until setattr /
+            // `see_instance` unions (`classdesc.py ClassDef.generalize_attr`).
+            // Do not seed `SomePtr` or `s_None`
             // (`pairtype(SomePtr, SomeObject).union`).
             if fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)).is_some() {
-                return super::model::s_none();
+                return SomeValue::Impossible;
             }
             // Charon spells `Option<&[u8]>` as `Option<[u8]>` / `Option<Slice<u8>>`.
             // The payload is a nullable window: `None` is a null data word,
@@ -7859,11 +7854,12 @@ pub(crate) fn exception_carrier_type_spelling_keys(
 }
 
 /// Recogniser / lltype helper: `SomePtr(FuncType)` when `spelling`
-/// names a function pointer or a nullable `Option<fn>`. Field and
-/// param *annotation* seeds are `Impossible`; this helper is not that
-/// seed. A full `fn(inputs) -> output` spelling yields the same
-/// `FuncType` as `getfunctionptr` / `declared_funcptr_type_from_legacy`
-/// for that signature (`stamp_fn_ptr`).
+/// names a function pointer or a nullable `Option<fn>`. An *entry*
+/// graph's declared `fn` / `Option<fn>` argument seeds this value
+/// (`annrpython.py` `build_types` / `annlowlevel` `lltype_to_annotation`);
+/// a field stays Impossible until setattr. A full `fn(inputs) -> output`
+/// spelling yields the same `FuncType` as `getfunctionptr` /
+/// `declared_funcptr_type_from_legacy` for that signature (`stamp_fn_ptr`).
 #[cfg(test)]
 pub(crate) fn fn_ptr_somevalue_for_spelling(spelling: &str) -> Option<SomeValue> {
     fn_ptr_somevalue_for_spelling_in(spelling, getbookkeeper().as_deref())
@@ -8116,15 +8112,9 @@ fn fn_ptr_result_lltype(
 
 /// Charon spelling of a Rust function-pointer type (`fn`, `fn(…)`,
 /// `unsafe fn(…)`).  Not a named struct.
-fn is_fn_type_spelling(t: &str) -> bool {
+pub(crate) fn is_fn_type_spelling(t: &str) -> bool {
     let t = t.trim();
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
-}
-
-/// `Option<fn…>` / `Option<unsafe fn…>`. None is `s_None`; a bare `fn`
-/// has no None and seeds `Impossible`.
-pub(crate) fn spelling_is_option_fn(spelling: &str) -> bool {
-    option_payload_spelling(spelling).is_some_and(is_fn_type_spelling)
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
@@ -9426,16 +9416,16 @@ mod tests {
         assert!(
             matches!(
                 bk.project_struct_field_type("Option<fn() -> i64>"),
-                SomeValue::None_(_)
+                SomeValue::Impossible
             ),
-            "Option<fn> seeds s_None (`ExecutionContext.__init__` stores None)"
+            "Option<fn> field stays Impossible until setattr"
         );
         assert!(
             matches!(
                 bk.project_struct_field_type("option::Option<fn() -> i64>"),
-                SomeValue::None_(_)
+                SomeValue::Impossible
             ),
-            "option::Option<fn> seeds s_None"
+            "option::Option<fn> field stays Impossible until setattr"
         );
         assert!(
             matches!(
@@ -10103,9 +10093,6 @@ mod tests {
         );
         assert!(result_generic_args("core::result::Result<(),PyError>").is_some());
         assert!(result_generic_args("core::result::Result<(),PyError>::Ok").is_none());
-        assert!(spelling_is_option_fn(
-            "Option<fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>>"
-        ));
         fn_ptr_somevalue_for_spelling("Option<fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>>")
             .expect("Option wrapping a fn with a Result return peels to that FuncType");
     }
@@ -18953,7 +18940,7 @@ mod tests {
         let bk = bk();
         // `tyref_to_attr_value_type` banks `Ptr(FuncType)` as Int, so FORCE
         // shells the field `SomeInteger`. Pass-2 must replace that with
-        // `s_None` (`ExecutionContext.__init__` stores None on `Option<fn>`).
+        // Impossible (no declared `Option<fn>` field seed).
         crate::annotator::classdesc::register_struct_fields(
             "ProfileHolder",
             &[("profilefunc".to_string(), crate::model::ValueType::Int)],
@@ -18973,8 +18960,8 @@ mod tests {
             .get("profilefunc")
             .expect("profilefunc attr present");
         assert!(
-            matches!(slot.s_value, SomeValue::None_(_)),
-            "Option<fn> field must project to s_None, got {:?}",
+            matches!(slot.s_value, SomeValue::Impossible),
+            "Option<fn> field must project to Impossible, got {:?}",
             slot.s_value
         );
     }
@@ -19617,8 +19604,8 @@ mod tests {
         );
         let generic = bk.project_struct_field_type("Option<fn()>");
         assert!(
-            matches!(generic, SomeValue::None_(_)),
-            "generic Option<fn> starts as s_None, got {generic:?}"
+            matches!(generic, SomeValue::Impossible),
+            "generic Option<fn> is lattice bottom until a PBC store, got {generic:?}"
         );
     }
 }

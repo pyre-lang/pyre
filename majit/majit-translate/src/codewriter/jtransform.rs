@@ -35303,59 +35303,114 @@ mod tests {
         }
     }
 
-    /// `lltype.nullptr(FUNC)` is a Constant (`rtype_const_result`).
-    /// `specialize_block` rewrites the hop; publication copies that
-    /// Constant onto the FunctionGraph as Signed 0 (`history.getkind`
-    /// of `Ptr(FuncType)` is `'int'`).
+    /// Untyped `ptr::null_fn()` is `ann_nullptr` / `SomePtr`
+    /// (`lltype.ann_nullptr`). `rtype_const_result` folds it to
+    /// `nullptr(FUNC)`; `history.getkind` of `Ptr(FuncType)` is `'int'`,
+    /// so publication is Signed 0.
     #[test]
-    fn ptr_null_fn_builtin_rewrites_to_int_constant_zero() {
+    fn ptr_null_fn_untyped_rewrites_to_int_constant_zero() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_fn_untyped");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+        graph.set_return(entry, Some(result_var.clone()));
+        apply_rtyper_const_results_match(&mut graph);
+
+        let result = transform_graph(&graph, &config);
+        let folded = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("null_fn result must survive as a constant definition");
+        assert!(
+            matches!(folded.kind, OpKind::ConstInt(0)),
+            "untyped null_fn stayed {:?}",
+            folded.kind
+        );
+        assert!(
+            !result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| is_null_fn_call_kind(&op.kind)),
+            "null_fn Call must not survive"
+        );
+    }
+
+    /// Isolated spelled `null_fn("fn() -> i64")` is `s_None` /
+    /// `NoneRepr` Void (`rnone.py`). Publication is `ConstNone`;
+    /// `jtransform` erases Void (`flatten.py` drops Void).
+    #[test]
+    fn ptr_null_fn_spelled_isolated_is_const_none_erased_by_jtransform() {
         use crate::flowspace::model::ConstValue;
 
-        for args in [
-            crate::model::call_args(vec![]),
-            vec![LinkArg::from(ConstValue::byte_str("fn() -> i64"))],
-        ] {
-            let config = GraphTransformConfig::default();
-            let mut graph = FunctionGraph::new("ptr_null_fn_constant");
-            let entry = graph.startblock;
-            let result_var = graph
-                .push_op_var(
-                    entry,
-                    OpKind::Call {
-                        target: CallTarget::function_path(["core", "ptr", "null_fn"]),
-                        args,
-                        result_ty: ValueType::Int,
-                    },
-                    true,
-                )
-                .unwrap();
-            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
-            graph.set_return(entry, Some(result_var.clone()));
-            apply_rtyper_const_results_match(&mut graph);
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_fn_spelled");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: vec![LinkArg::from(ConstValue::byte_str("fn() -> i64"))],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+        graph.set_return(entry, Some(result_var.clone()));
+        apply_rtyper_const_results_match(&mut graph);
 
-            let result = transform_graph(&graph, &config);
-            let folded = result
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Void
+        );
+        let folded = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var));
+        assert!(
+            folded.is_some_and(|op| matches!(op.kind, OpKind::ConstNone)),
+            "isolated spelled null_fn is NoneRepr Void, got {:?}",
+            folded.map(|op| &op.kind),
+        );
+
+        let result = transform_graph(&graph, &config);
+        assert!(
+            !result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| is_null_fn_call_kind(&op.kind)),
+            "null_fn Call must not survive"
+        );
+        assert!(
+            result
                 .graph
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
                 .find(|op| op.result.as_ref() == Some(&result_var))
-                .expect("null_fn result must survive as a constant definition");
-            assert!(
-                matches!(folded.kind, OpKind::ConstInt(0)),
-                "null_fn stayed {:?}",
-                folded.kind
-            );
-            assert!(
-                !result
-                    .graph
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.operations)
-                    .any(|op| is_null_fn_call_kind(&op.kind)),
-                "null_fn Call must not survive"
-            );
-        }
+                .is_none(),
+            "jtransform erases ConstNone Void (flatten drops Void)",
+        );
     }
 
     /// Generated `Option<fn>::is_some` (`push_niche_is_some` /

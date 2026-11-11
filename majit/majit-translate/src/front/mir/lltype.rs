@@ -9431,8 +9431,9 @@ pub(in crate::front::mir) fn stamp_raw_c_void_ptr(var: &Variable, ty: &TyRef, ll
 /// `getfunctionptr` / `FunctionsPBCRepr.lowleveltype` for one row).
 /// Prefer the Charon `FnPtr` skip_binder lowered through
 /// `tyref_to_value_type` / `valuetype_to_lltype`; fall back to the
-/// rendered spelling so `Result<(), E>` is `Void`. The annotation of a
-/// spelled `null_fn` is `s_None`; this stamp is the lltype only.
+/// rendered spelling so `Result<(), E>` is `Void`. A spelled `null_fn`
+/// dest is `NoneRepr` Void (`push_null_fn_ptr_with_spelling`); this
+/// stamp is the live fn / untyped `ann_nullptr` lltype.
 pub(in crate::front::mir) fn stamp_fn_ptr(
     var: &Variable,
     ty: &TyRef,

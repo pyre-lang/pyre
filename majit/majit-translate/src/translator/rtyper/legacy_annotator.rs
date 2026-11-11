@@ -31,7 +31,7 @@ use crate::annotator::model::{
     r#typeof,
 };
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::{ConstValue, HostObject, Variable};
 use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType, VecFieldPart};
 use crate::translator::rtyper::error::TyperError;
 
@@ -184,6 +184,7 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| fn_const_incoming(bookkeeper, &op.kind))
                         .or_else(|| fn_ptr_annotation_incoming(bookkeeper, result, &op.kind))
                         .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
                         .or_else(|| type_someobject_incoming(&op.kind))
@@ -800,8 +801,9 @@ fn type_someobject_incoming(kind: &OpKind) -> Option<Incoming> {
 }
 
 /// Typed `null_fn` (`model.rs push_null_fn_ptr_with_spelling`). A spelled
-/// `fn` / `Option<fn>` null is `s_None` (`fn_null_constant`); untyped
-/// `ptr::null_fn()` stays constant `SomePtr` (`ann_nullptr`).
+/// `fn` / `Option<fn>` null is `s_None` (`fn_null_constant`); its dest
+/// is `NoneRepr` Void. Untyped `ptr::null_fn()` stays constant
+/// `SomePtr` (`ann_nullptr`) with `Ptr(FuncType)`.
 fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
     let bk = bookkeeper?;
     let OpKind::Call { target, args, .. } = kind else {
@@ -839,10 +841,75 @@ fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) ->
     }
 }
 
+/// Value-used FnDef (`fn_const_segments` 0-arg Call). Twin of
+/// [`typed_null_fn_incoming`]. The real path (`legacy_const_define_hlvalue`)
+/// materialises `CallRegistry.entry.host_object`; `bookkeeper.py`
+/// `immutablevalue` / `getdesc` of that host is `SomePBC([FunctionDesc])`.
+/// The walker has the Bookkeeper only: recover the already-inserted host
+/// from `descs` (the cache `register_callee` / `getdesc` populate). Do not
+/// mint a second HostObject (`getdesc_for_const` Function arm).
+fn fn_const_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::Call { target, args, .. } = kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let segments = crate::model::fn_const_segments(target)?;
+    let host = fn_const_registered_host(bk, segments)?;
+    match bk.immutablevalue(&ConstValue::HostObject(host)) {
+        Ok(sv @ SomeValue::PBC(_)) => Some(Incoming::Annotation(Rc::new(sv))),
+        _ => None,
+    }
+}
+
+fn fn_const_name_matches(name: &str, segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if name == leaf {
+        return true;
+    }
+    let dotted = segments.join(".");
+    let colon = segments.join("::");
+    name == dotted || name == colon
+}
+
+fn fn_const_registered_host(bk: &Bookkeeper, segments: &[String]) -> Option<HostObject> {
+    let mut found: Option<HostObject> = None;
+    for entry in bk.descs.borrow().values() {
+        let Some(fd) = entry.as_function() else {
+            continue;
+        };
+        let fd = fd.borrow();
+        let Some(host) = fd.base.pyobj.clone() else {
+            continue;
+        };
+        let Some(gf) = host.user_function() else {
+            continue;
+        };
+        if !fn_const_name_matches(&gf.name, segments)
+            && !fn_const_name_matches(&fd.name, segments)
+            && !fn_const_name_matches(host.qualname(), segments)
+        {
+            continue;
+        }
+        match &found {
+            None => found = Some(host.clone()),
+            Some(prev) if prev == &host => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
 /// A function-pointer FieldRead / Call / Input seeds lattice bottom.
-/// `stamp_fn_ptr` still stamps `Ptr(FuncType)` on the dest
-/// (`FunctionsPBCRepr.lowleveltype` for one row). Forcing `SomePtr`
-/// here unions `SomePtr ∪ SomePBC` (`llannotation.py`
+/// `stamp_fn_ptr` still stamps `Ptr(FuncType)` on a live fn dest
+/// (`FunctionsPBCRepr.lowleveltype` for one row). An `Option<fn>` Input
+/// is `s_None` (`derive_subject_inputcells`); its dest is `NoneRepr`
+/// Void (`rnone.py` `NoneRepr.lowleveltype`), not `Ptr(FuncType)`.
+/// Forcing `SomePtr` here unions `SomePtr ∪ SomePBC` (`llannotation.py`
 /// `pairtype(SomePtr, SomeObject).union`); leaving the dest as
 /// `Flat(Int)` unions `Integer ∪ PBC`. Match-path getattr / pycall
 /// writes the family onto this bottom (`derive_subject_inputcells`).
@@ -868,24 +935,25 @@ fn fn_ptr_annotation_incoming(
             crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(root, Some(bk.as_ref()))
                 .is_some()
                 .then(|| {
-                    // Skip-path Input has no MIR `stamp_fn_ptr`. Keep
-                    // `Ptr(FuncType)` on the dest (`FunctionsPBCRepr.lowleveltype`
-                    // / `history.getkind` `'int'`). A bare `fn` is lattice
-                    // bottom; `Option<fn>` None is `s_None` (same as
-                    // `derive_subject_inputcells` / `store_profilefunc`
-                    // setattr of None). `commit_concretetype` refuses to
-                    // replace that stamp with the kind-only overlay.
-                    crate::front::mir::stamp_fn_ptr_spelling(
-                        result,
-                        root,
-                        crate::ErrorCarrierSpec::default(),
-                    );
-                    let s = if crate::annotator::bookkeeper::spelling_is_option_fn(root) {
-                        crate::annotator::model::s_none()
+                    // Skip-path Input has no MIR `stamp_fn_ptr`. A bare
+                    // `fn` keeps `Ptr(FuncType)` (`FunctionsPBCRepr.lowleveltype`
+                    // / `history.getkind` `'int'`). `Option<fn>` is `s_None`
+                    // (`derive_subject_inputcells` / `store_profilefunc`
+                    // setattr of None) and stamps `NoneRepr` Void — the
+                    // same seed rule as `stamp_fn_ptr_legacy_dests`.
+                    if super::flowspace_adapter::fn_ptr_input_seeds_s_none(root) {
+                        result.set_concretetype(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                        ));
+                        Incoming::Annotation(Rc::new(crate::annotator::model::s_none()))
                     } else {
-                        SomeValue::Impossible
-                    };
-                    Incoming::Annotation(Rc::new(s))
+                        crate::front::mir::stamp_fn_ptr_spelling(
+                            result,
+                            root,
+                            crate::ErrorCarrierSpec::default(),
+                        );
+                        Incoming::Annotation(Rc::new(SomeValue::Impossible))
+                    }
                 })
         }
         _ => None,
@@ -3775,6 +3843,93 @@ mod tests {
             }
             other => panic!("expected constant s_None join, got {other:?}"),
         }
+    }
+
+    /// A 0-arg `fn_const_segments` Call annotates as `SomePBC([FunctionDesc])`
+    /// (`bookkeeper.py` `immutablevalue` / `getdesc` of the registry host).
+    /// Join with spelled `null_fn` (`s_None`) is `SomePBC(can_be_None=True)`
+    /// (`model.py` `SomePBC.noneify`).
+    #[test]
+    fn fn_const_incoming_is_somepbc_and_join_with_spelled_null_fn_noneifies() {
+        use crate::flowspace::model::{GraphFunc, HostObject};
+
+        let bk = Rc::new(Bookkeeper::new());
+        let gf = GraphFunc::new(
+            "fn_const_callee",
+            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let host = HostObject::new_user_function(gf);
+        bk.getdesc(&host).expect("FunctionDesc in descs");
+
+        let mut incoming_graph = FunctionGraph::new("fn_const_incoming");
+        let entry = incoming_graph.startblock;
+        let fn_var = incoming_graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        crate::model::FN_CONST_HEAD,
+                        "fn_const_callee",
+                    ]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        incoming_graph.set_return(entry, Some(fn_var.clone()));
+        annotate_with_bookkeeper(&incoming_graph, Some(&bk));
+        match read_binding_some(&fn_var).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(!pbc.can_be_none, "fn_const dest is SomePBC, got {pbc:?}");
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("fn_const dest expected SomePBC, got {other:?}"),
+        }
+        assert_eq!(
+            read_binding(&fn_var),
+            ValueType::Int,
+            "FunctionsPBCRepr Ptr(FuncType) word is Int"
+        );
+
+        let mixed = {
+            let mut graph = FunctionGraph::new("fn_const_null_fn_join");
+            let pred_fn = graph.create_block();
+            let pred_none = graph.create_block();
+            let fn_var = graph
+                .push_op_var(
+                    pred_fn,
+                    OpKind::Call {
+                        target: CallTarget::function_path([
+                            crate::model::FN_CONST_HEAD,
+                            "fn_const_callee",
+                        ]),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            let null_var = graph.push_null_fn_ptr_with_spelling(pred_none, Some("fn() -> i64"));
+            let (join, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            branch_start_to_preds(&mut graph, pred_fn, pred_none);
+            graph.set_goto(pred_fn, join, vec![fn_var]);
+            graph.set_goto(pred_none, join, vec![null_var]);
+            graph.set_return(join, Some(phi_var.clone()));
+            annotate_with_bookkeeper(&graph, Some(&bk));
+            phi_var
+        };
+        match read_binding_some(&mixed).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(
+                    pbc.can_be_none,
+                    "s_None ∪ fn_const PBC noneifies, got {pbc:?}"
+                );
+            }
+            other => panic!("expected noneified SomePBC join, got {other:?}"),
+        }
+        assert_eq!(read_binding(&mixed), ValueType::Int);
     }
 
     fn builtin_code_fn_spelling() -> &'static str {

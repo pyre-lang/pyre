@@ -346,6 +346,7 @@ impl CodeWriter {
             callcontrol.function_graphs(),
             callcontrol.builtin_wrapper_indirect_graphs(),
             &portals,
+            callcontrol.bfs_entry_roots(),
         );
         // The annotator is complete and no graph is built after it. The
         // pending bodies share their graphs with `function_graphs`, which

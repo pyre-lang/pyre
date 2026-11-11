@@ -2245,6 +2245,11 @@ pub(crate) struct CrateLoweringState {
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+    /// Artefacts of this program, so an Opaque-imported generic can
+    /// enqueue `FunctionDesc.cachedgraph` on the crate that holds its
+    /// body. `None` on the `lower_all` path, which drops each crate's
+    /// state after lowering.
+    cross_crate: Option<std::rc::Rc<dyn crate::front::clause_spec::CrossCrateLookup>>,
     skipped: LoweringSkips,
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
@@ -2520,6 +2525,7 @@ impl CrateLoweringState {
             func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            cross_crate: None,
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
@@ -2569,6 +2575,21 @@ impl CrateLoweringState {
     #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn raw_alloc_flavor_structs(&self) -> &std::collections::HashSet<String> {
         &self.raw_alloc_flavor_structs
+    }
+
+    pub(crate) fn attach_cross_crate(
+        &mut self,
+        cross: std::rc::Rc<dyn crate::front::clause_spec::CrossCrateLookup>,
+    ) {
+        self.cross_crate = Some(cross);
+    }
+
+    pub(crate) fn spec_queue(&self) -> &std::cell::RefCell<crate::front::clause_spec::SpecQueue> {
+        &self.spec
+    }
+
+    pub(crate) fn cross_crate(&self) -> Option<&dyn crate::front::clause_spec::CrossCrateLookup> {
+        self.cross_crate.as_deref()
     }
 }
 
@@ -2943,6 +2964,7 @@ impl<'l> CrateLowering<'l> {
             false,
             None,
             Some(value_type_by_id),
+            self.state.cross_crate(),
         ) {
             Ok(g) => g,
             Err(error) => {
@@ -3203,6 +3225,7 @@ impl<'l> CrateLowering<'l> {
             true,
             Some(spec.segments.join("::")),
             Some(value_type_by_id),
+            self.state.cross_crate(),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -7540,6 +7563,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -7932,6 +7956,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec_body: bool,
     graph_name: Option<String>,
     value_type_by_id: Option<&std::cell::RefCell<Vec<Option<ValueType>>>>,
+    cross_crate: Option<&dyn crate::front::clause_spec::CrossCrateLookup>,
 ) -> Result<FunctionGraph, LowerError> {
     // A clause specialization's readable name (`RDict::new__spec_…`) is
     // known to the caller. The body is still the template `FunDecl`, so
@@ -8850,6 +8875,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        if let Some(cross) = cross_crate {
+            lo.set_cross_crate(cross);
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -8911,6 +8939,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    if let Some(cross) = cross_crate {
+        lo.set_cross_crate(cross);
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -8957,6 +8988,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 if spec_body {
                     lo.set_spec_body();
                 }
+            }
+            if let Some(cross) = cross_crate {
+                lo.set_cross_crate(cross);
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
