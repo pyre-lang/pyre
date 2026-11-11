@@ -7376,9 +7376,29 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         ),
         // `W_SetObject.strategy` holds the holder the same way; `w_set_new`
         // stores `EmptySetStrategy`'s.
-        ref_addr!(
+        (
+            "setobject::OBJECT_SET_STRATEGY_REF",
+            pyre_object::setobject::object_set_strategy_ref() as *const _ as i64,
+        ),
+        (
             "setobject::EMPTY_SET_STRATEGY_REF",
-            setobject::EMPTY_SET_STRATEGY_REF
+            pyre_object::setobject::empty_set_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "setobject::INTEGER_SET_STRATEGY_REF",
+            pyre_object::setobject::integer_set_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "setobject::BYTES_SET_STRATEGY_REF",
+            pyre_object::setobject::bytes_set_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "setobject::ASCII_SET_STRATEGY_REF",
+            pyre_object::setobject::ascii_set_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "setobject::IDENTITY_SET_STRATEGY_REF",
+            pyre_object::setobject::identity_set_strategy_ref() as *const _ as i64,
         ),
         (
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
@@ -9146,6 +9166,30 @@ mod tests {
         assert_eq!(
             bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],
             crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::OBJECT_SET_STRATEGY_REF"],
+            pyre_object::setobject::object_set_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::EMPTY_SET_STRATEGY_REF"],
+            pyre_object::setobject::empty_set_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::INTEGER_SET_STRATEGY_REF"],
+            pyre_object::setobject::integer_set_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::BYTES_SET_STRATEGY_REF"],
+            pyre_object::setobject::bytes_set_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::ASCII_SET_STRATEGY_REF"],
+            pyre_object::setobject::ascii_set_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["setobject::IDENTITY_SET_STRATEGY_REF"],
+            pyre_object::setobject::identity_set_strategy_ref() as *const _ as i64
         );
         assert_eq!(
             bindings["stack_check::PYRE_STACKTOOBIG"],

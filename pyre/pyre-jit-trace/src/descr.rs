@@ -2526,12 +2526,13 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// field back through the slot `derive_index_in_parent` finds for its name.
 ///
 /// `dstorage` is the GC storage box (`Type::Ref`, FLAG_POINTER from
-/// `runtime_array_flag`). `dstrategy` is the static singleton pointer
-/// (`kwargsdict.py` immortal strategy): constructors write it as a `Ref`
-/// (`setfield_gc_r`) and the group field uses the same FLAG_POINTER, one
-/// coherent pointer descr. `dstrategy_word` / `dstorage_lookup_ns` are
-/// distinct Int cache keys minted outside the group by
-/// `mint_w_dict_int_alias`, so `getfield_gc_i` folds and the `dict.lookup`
+/// `runtime_array_flag`). `dstrategy` points at a `DictStrategyRef` holder, a
+/// GC object: a prebuilt immortal holder (`space.fromcache`,
+/// `GCTypeLayoutBuilder.consider_constant`) or a per-dict holder: constructors
+/// write it as a `Ref` (`setfield_gc_r`) and the group field uses the same
+/// FLAG_POINTER, one coherent pointer descr. `dstrategy_word` /
+/// `dstorage_lookup_ns` are distinct Int cache keys minted outside the group
+/// by `mint_w_dict_int_alias`, so `getfield_gc_i` folds and the `dict.lookup`
 /// oopspec keep their identity without occupying a virtual slot.
 static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(

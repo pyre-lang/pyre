@@ -804,6 +804,10 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let w_dict = obj_addr as pyre_object::PyObjectRef;
     let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
     f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // Grey `dstrategy`. Upstream `W_DictObject.dstrategy` is a GC pointer
+    // (`dictmultiobject.py set_strategy`); `module_dict_object_custom_trace`
+    // greys `mstrategy` the same way.
+    f(std::ptr::addr_of_mut!(dict.dstrategy) as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     // Keep the storage box alive by forwarding its owning `dstorage` field
     // slot. The box's own custom_trace (`object_dict_storage_custom_trace`)
@@ -1180,8 +1184,10 @@ unsafe fn module_user_object_custom_trace(
 ///
 ///   * `dstorage` → `ModuleDictStorage.entries` (Vec<(String,
 ///     PyObjectRef)>) — every entry's value
-///   * `mstrategy` → `DictStrategyRef`, whose traced `owner` points to
-///     `ModuleDictStrategy.caches` while the module strategy is active
+///   * `mstrategy` → `DictStrategyRef`; the holder's own type traces
+///     `owner` (`gctypelayout.py offsets_to_gc_pointers`), which points
+///     at `ModuleDictStrategy` (and its `caches`) while the module
+///     strategy is active
 ///
 /// `mutate_mstrategy` is a host `QuasiImmutField` (`quasiimmut.py
 /// QuasiImmut` is never a GC object), so this walk does not mention it.
@@ -1209,10 +1215,11 @@ unsafe fn module_dict_object_custom_trace(
     let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
     f(&mut md.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Grey each GC-managed storage box through its field slot so a major GC
-    // keeps it live. The strategy box's own type walks `version`; the walk
-    // below forwards storage value slots.  Non-moving, so the minor-GC
-    // forward is a no-op.  Guard on GC ownership: a `tid == 0`
-    // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
+    // keeps it live. The holder's own type walks `owner`; the strategy
+    // box's type walks `version`; the walk below forwards storage value
+    // slots.  Non-moving, so the minor-GC forward is a no-op.  Guard on
+    // GC ownership: a `tid == 0` `malloc_raw` fallback box (unit tests /
+    // pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
         // Same as `dict_object_custom_trace`: a young-nonmoving
         // dicttable must be greyd even when `try_gc_owns_object` is
@@ -1224,26 +1231,6 @@ unsafe fn module_dict_object_custom_trace(
         let mstrategy = std::ptr::addr_of_mut!(md.mstrategy);
         if !(*mstrategy).is_null() {
             f(mstrategy.cast());
-        }
-        // A module holder owns the concrete ModuleDictStrategy.  Forward the
-        // actual owner slot after forwarding `mstrategy`, so the holder and
-        // its version/cache state have the same reachability chain as PyPy's
-        // strategy instance.  Process-wide immortal holders have a null owner.
-        // Only the per-module MiniMark holder is collector-owned.  After
-        // promotion the slot points at the immortal process-wide
-        // ObjectDictStrategy holder; do not manufacture a mutable reference
-        // to that prebuilt.
-        if !md.mstrategy.is_null()
-            && pyre_object::gc_hook::try_gc_owns_object(md.mstrategy as pyre_object::gc_hook::GCREF)
-        {
-            let holder = &mut *md.mstrategy;
-            if !holder.owner.is_null()
-                && pyre_object::gc_hook::try_gc_owns_object(
-                    holder.owner as pyre_object::gc_hook::GCREF,
-                )
-            {
-                f(std::ptr::addr_of_mut!(holder.owner) as *mut majit_ir::GcRef);
-            }
         }
     }
     // Delegate to the shared module-dict walk so this (GC-managed dict)
@@ -1290,6 +1277,9 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // Grey `strategy`. Upstream `W_BaseSetObject.strategy` is a GC pointer
+    // (`setobject.py`); `dict_object_custom_trace` greys `dstrategy` the same way.
+    f(std::ptr::addr_of_mut!(set.strategy) as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
     // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`,
@@ -3238,10 +3228,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // W_DICT and W_SET would shift every subsequent tid by one and
     // break descr ↔ GC tid correspondence.
     // W_ModuleDictObject carries erased `dstorage` and `mstrategy` slots.
-    // The latter points to DictStrategyRef; its owner points to the concrete
-    // ModuleDictStrategy while that strategy is active. Register a custom
-    // trace hook so the GC walks this indirect ownership chain — matching
-    // the W_DictObject pattern.
+    // The latter points to DictStrategyRef; greying that holder walks
+    // `owner` through the holder's type (`gctypelayout.py
+    // offsets_to_gc_pointers`) onto the concrete ModuleDictStrategy
+    // while that strategy is active. Register a custom trace hook so the
+    // GC greys the box-pointer field slots and walks storage interiors —
+    // matching the W_DictObject pattern.
     // Storage boxes (`dstorage` / the per-module `mstrategy` holder) keep
     // their own tid drop glue (`storage_box_destructor`). The destructor
     // here reclaims only the host `mutate_mstrategy` watcher
@@ -5010,7 +5002,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
-    // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
+    // traces itself. `set_object_custom_trace` greys the `sstorage` slot and
+    // `strategy`.
     // Keep this runtime id at the absolute registration tail.
     register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
@@ -5063,7 +5056,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // Module-dict `dstorage`, holder and owner storage boxes. The traced
     // `ModuleDictStorage` box walks value slots; the strategy box traces
-    // `version` (a GC `VersionTag` pointer); the owner box is a leaf.
+    // `version` (a GC `VersionTag` pointer); the holder traces `owner`.
     // The post-switch `dstorage` reuses the ObjectDictStorage box tid
     // registered above. Keep these ids at the absolute tail.
     register_traced_storage_box::<pyre_object::celldict::ModuleDictStorage>(
@@ -5106,13 +5099,58 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::dictmultiobject::DictStrategyRef>(
+    register_storage_box_with_gc_ptrs::<pyre_object::dictmultiobject::DictStrategyRef>(
         &mut gc,
+        vec![std::mem::offset_of!(
+            pyre_object::dictmultiobject::DictStrategyRef,
+            owner
+        )],
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::DictStrategyRef,
         >,
         pyre_object::dictmultiobject::set_dict_strategy_ref_gc_type_id,
     );
+    // GCTypeLayoutBuilder.consider_constant visits prebuilt constants after
+    // type ids are assigned. Accessors may have allocated at tid 0; restamp
+    // the live tid on every holder.
+    {
+        let tid = pyre_object::dictmultiobject::dict_strategy_ref_gc_type_id();
+        for holder in [
+            pyre_object::dictmultiobject::object_dict_strategy_ref(),
+            pyre_object::dictmultiobject::empty_dict_strategy_ref(),
+            pyre_object::dictmultiobject::empty_kwargs_dict_strategy_ref(),
+            pyre_object::dictmultiobject::bytes_dict_strategy_ref(),
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
+            pyre_object::dictmultiobject::int_dict_strategy_ref(),
+            pyre_object::identitydict::identity_dict_strategy_ref(),
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
+            pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref(),
+            pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref(),
+        ] {
+            pyre_object::dictmultiobject::stamp_prebuilt_dict_strategy_ref(holder, tid);
+        }
+    }
+    register_leaf_storage_box::<pyre_object::setobject::SetStrategyRef>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetStrategyRef>,
+        pyre_object::setobject::set_set_strategy_ref_gc_type_id,
+    );
+    // GCTypeLayoutBuilder.consider_constant visits prebuilt constants after
+    // type ids are assigned. Accessors may have allocated at tid 0; restamp
+    // the live tid on every holder.
+    {
+        let tid = pyre_object::setobject::set_strategy_ref_gc_type_id();
+        for holder in [
+            pyre_object::setobject::object_set_strategy_ref(),
+            pyre_object::setobject::empty_set_strategy_ref(),
+            pyre_object::setobject::integer_set_strategy_ref(),
+            pyre_object::setobject::bytes_set_strategy_ref(),
+            pyre_object::setobject::ascii_set_strategy_ref(),
+            pyre_object::setobject::identity_set_strategy_ref(),
+        ] {
+            pyre_object::setobject::stamp_prebuilt_set_strategy_ref(holder, tid);
+        }
+    }
     // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
     // refs); `bytearray_object_custom_trace` greys it through the `data` field
     // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this
@@ -19759,6 +19797,20 @@ mod tests {
         assert_eq!(
             majit_ir::descr::gc_cache().lock().resolve_array_tid(key),
             Some(tid)
+        );
+    }
+
+    /// `gctypelayout.py offsets_to_gc_pointers` / `GCTypeLayoutBuilder`:
+    /// the holder itself declares `owner` as a GC pointer, so greying
+    /// `mstrategy` reaches `ModuleDictStrategy` through the holder's type.
+    #[test]
+    fn dict_strategy_ref_gc_type_id_lists_owner_offset() {
+        let gc = build_gc();
+        let tid = pyre_object::dictmultiobject::dict_strategy_ref_gc_type_id();
+        let owner = std::mem::offset_of!(pyre_object::dictmultiobject::DictStrategyRef, owner);
+        assert!(
+            gc.types.get(tid).gc_ptr_offsets.contains(&owner),
+            "DictStrategyRef type info must list owner among GC pointer offsets"
         );
     }
 
