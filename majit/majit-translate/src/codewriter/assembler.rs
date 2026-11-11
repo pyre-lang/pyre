@@ -5965,6 +5965,23 @@ fn minted_exception_instance_layout(
     (super_size, specs, drops, gc_ptr_offsets)
 }
 
+/// Whether a minted class layout owns a raw-owned attribute.
+///
+/// `render_minted_exception_classes_rs` emits `MINTED_EXC_*_destructor`
+/// from that same list, including an ancestor attr repeated on a subclass
+/// instance. `jtransform.py` `Transformer.rewrite_op_malloc` reads it as
+/// `getRuntimeTypeInfo(STRUCT)` / `destructor_funcptr`. A STRUCT that is
+/// not a minted host has none. The walk is [`minted_exception_instance_layout`],
+/// the one [`attach_minted_exception_raw_owned_drops`] runs after jitcodes.
+pub(crate) fn minted_exception_has_destructor(cc: &CallControl, owner: &str) -> bool {
+    let Some(key) = minted_exception_size_owner(cc, owner, 0) else {
+        return false;
+    };
+    let chain = minted_exception_chain_for_key(cc, &key);
+    let (_size, _specs, drops, _gc_ptr_offsets) = minted_exception_instance_layout(cc, &chain);
+    !drops.is_empty()
+}
+
 /// Fill `size`, `gc_ptr_offsets`, and `raw_owned` from one instance layout.
 ///
 /// The field row stays on the declaring class. A subclass instance is

@@ -2749,6 +2749,34 @@ pub unsafe fn write_new_with_vtable_header(
     }
 }
 
+/// `support.py` `LLtypeHelpers.build_ll_0_alloc_with_del`: the body of
+/// `_ll_0_alloc_with_del` is `lltype.malloc` of the STRUCT, then
+/// `OBJECTPTR.typeptr = vtable`.
+///
+/// The malloc is [`MiniMarkGC::alloc_with_type`](majit_gc::collector::MiniMarkGC::alloc_with_type).
+/// Its nursery tail is `finish_nursery_object`, which calls
+/// `register_young_object_if_needed`. `transform.py` `_ll_malloc_fixedsize`
+/// raises MemoryError and returns NULL when that allocation does not.
+/// The header stores are [`write_new_with_vtable_header`] (`llmodel.py`
+/// `bh_new_with_vtable`).
+pub fn alloc_with_del(
+    tid: u32,
+    size: usize,
+    vtable: usize,
+    vtable_offset: Option<usize>,
+    w_class_offset: Option<usize>,
+) -> i64 {
+    let obj = majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(tid, size));
+    if obj.is_null() {
+        majit_gc::raise_memory_error();
+        return 0;
+    }
+    unsafe {
+        write_new_with_vtable_header(obj.0 as *mut u8, vtable, vtable_offset, w_class_offset);
+    }
+    obj.0 as i64
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.

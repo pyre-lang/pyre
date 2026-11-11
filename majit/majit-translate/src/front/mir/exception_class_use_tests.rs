@@ -3588,8 +3588,16 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
     assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooManyMethod_destructor"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooManyMethod_destructor)"));
+    assert!(src.contains("unsafe extern \"C\" fn MINTED_EXC_Arg__TooMany_alloc_with_del"));
+    assert!(src.contains("unsafe extern \"C\" fn MINTED_EXC_Arg__TooManyMethod_alloc_with_del"));
+    assert!(src.contains("build_ll_0_alloc_with_del::Arg::TooMany"));
+    assert!(src.contains("build_ll_0_alloc_with_del::Arg::TooManyMethod"));
+    assert!(
+        !src.contains("fn MINTED_EXC_Arg_alloc_with_del"),
+        "the base owns no raw attr; src={src}"
+    );
     assert!(src.contains(&format!(
-        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None }}",
+        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }}",
         base.size
     )));
     assert!(

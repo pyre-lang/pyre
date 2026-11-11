@@ -4374,6 +4374,15 @@ impl<'a> Transformer<'a> {
                 }
                 other => other,
             }
+        } else if has_vtable
+            && self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::codewriter::assembler::minted_exception_has_destructor(cc, &owner)
+            })
+        {
+            // `jtransform.py` `Transformer.rewrite_op_malloc`: a vtable STRUCT
+            // whose rtti has `destructor_funcptr` is
+            // `_do_builtin_call(..., 'alloc_with_del', [], extra=(RESULT, vtable), extrakey=STRUCT)`.
+            self.rewrite_alloc_with_del(graph_name, graph, result, owner, extra_ops)
         } else {
             let mut ops = Vec::with_capacity(1 + extra_ops.len());
             ops.push(SpaceOperation {
@@ -4383,6 +4392,101 @@ impl<'a> Transformer<'a> {
             ops.extend(extra_ops);
             RewriteResult::Replace(ops)
         }
+    }
+
+    /// `jtransform.py` `Transformer.rewrite_op_malloc` destructor arm, via
+    /// `_do_builtin_call` / `handle_residual_call`.
+    ///
+    /// `support.py` `builtin_func_for_spec('alloc_with_del', [], RESULT,
+    /// extra=(RESULT, vtable), extrakey=STRUCT)` resolves
+    /// `build_ll_0_alloc_with_del`. The residual has an empty argument
+    /// list and an `'r'` result. `EF_CAN_RAISE` is the builtin effect
+    /// (`MemoryError`). `collectanalyze.py` answers true because
+    /// `_ll_0_alloc_with_del` is `lltype.malloc` (`canmallocgc` on the
+    /// graph-less funcobj). Field initialisers in `extra_ops` stay after
+    /// the call, including the trailing `-live-`.
+    fn rewrite_alloc_with_del(
+        &mut self,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        result: Option<crate::flowspace::model::Variable>,
+        owner: String,
+        extra_ops: Vec<SpaceOperation>,
+    ) -> RewriteResult {
+        assert!(
+            result.is_some(),
+            "jtransform.py rewrite_op_malloc: alloc_with_del RESULT is the malloc result"
+        );
+        let target = CallTarget::function_path(["build_ll_0_alloc_with_del", owner.as_str()]);
+        let path = target
+            .function_call_path()
+            .expect("build_ll_0_alloc_with_del is a function path");
+        let fnaddr = crate::call::symbolic_fnaddr_for_path(&path);
+        {
+            let cc = self.callcontrol.as_mut().expect(
+                "setup_extra_builtin: alloc_with_del needs CallControl to register build_ll_0_alloc_with_del",
+            );
+            cc.register_builtin_factory("build_ll_0_alloc_with_del", &owner, fnaddr);
+            // `LL_OPERATIONS['malloc'].canmallocgc` for the closed-over malloc.
+            cc.mark_canmallocgc(path);
+        }
+        let extra = [format!("Ptr({owner})"), "0".to_string()];
+        let spec = crate::codewriter::support::builtin_func_for_spec(
+            self.callcontrol.as_deref(),
+            "alloc_with_del",
+            &[],
+            majit_ir::value::Type::Ref,
+            Some(&extra),
+            Some(owner.as_str()),
+            None,
+        );
+        assert_eq!(
+            spec.fnaddr, fnaddr,
+            "support.py build_ll_0_alloc_with_del: factory fnaddr must be the residual path"
+        );
+        let result_ty = ValueType::Ref(Some(owner));
+        let call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(Vec::<crate::flowspace::model::Variable>::new()),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let non_void_args = resolve_non_void_arg_types_from_vars(&[]);
+        let result_ir_type = self
+            .resolve_call_result(result.as_ref(), &result_ty)
+            .ir_type;
+        let descriptor = {
+            let cc: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc.getcalldescr(
+                &call,
+                non_void_args,
+                result_ir_type,
+                OopSpecIndex::None,
+                Some(ExtraEffect::CanRaise),
+                &mut self.analysis_cache,
+                None,
+            )
+        };
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(
+            descriptor.extra_info.can_collect,
+            "collectanalyze.py: _ll_0_alloc_with_del mallocs (canmallocgc)"
+        );
+        let RewriteResult::Replace(mut ops) = self.handle_residual_call(
+            graph,
+            &call,
+            &target,
+            descriptor,
+            &[],
+            &result_ty,
+            graph_name,
+        ) else {
+            panic!("jtransform.py handle_residual_call replaces the direct_call");
+        };
+        ops.extend(extra_ops);
+        RewriteResult::Replace(ops)
     }
 
     /// `history.getkind` of a raw-flavor `Ptr` is `'int'` (`rclass.py
@@ -33849,6 +33953,304 @@ mod tests {
         let asm_d = assemble_marked_ctor(&lowered_d, transformer.callcontrol.as_deref());
         assert_minted_assembly(&asm_b, "synth::E::B", true, n_offset, flag_offset);
         assert_minted_assembly(&asm_d, "synth::E::D", false, n_offset, flag_offset);
+    }
+
+    /// `test_jtransform.py` `test_malloc_new_with_destructor`.
+    ///
+    /// `Transformer.rewrite_op_malloc` emits `alloc_with_del` when the
+    /// STRUCT's rtti has `destructor_funcptr`, and `new_with_vtable`
+    /// otherwise. The destructor fact is a non-empty `raw_owned` list,
+    /// the same list `render_minted_exception_classes_rs` uses for
+    /// `MINTED_EXC_*_destructor`. `C(B) B(A)` puts B's raw-owned attr on
+    /// C's chain too. `parse_exception_class_overrides` splits the marker
+    /// on whitespace, so the tokens are `C(B)` and `B(A)`.
+    #[test]
+    fn malloc_new_with_destructor_lowers_to_alloc_with_del() {
+        use crate::front::semantic::{FieldRow, RawOwnedField};
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::Del",
+            "C(B) B(A)",
+            vec!["A".into(), "B".into(), "C".into(), "D".into()],
+        );
+        let header_owner = crate::codewriter::assembler::host_header_owner();
+        let header_id = majit_ir::descr::StructId::from_canonical(header_owner);
+        let mut ids = std::collections::HashMap::new();
+        ids.insert(header_owner.to_string(), Some(header_id));
+        let _header_ids = crate::test_support::register_struct_ids_serialized(ids);
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            header_owner.to_string(),
+            crate::codewriter::assembler::host_header_rows(),
+        );
+        struct_fields.fields.insert(
+            "synth::Del::A".to_string(),
+            vec![FieldRow::named("n", "i64")],
+        );
+        struct_fields.fields.insert(
+            "synth::Del::B".to_string(),
+            vec![
+                FieldRow::named("n", "i64"),
+                FieldRow::named("signature", "*mut fixture::Signature").with_raw_owned(
+                    RawOwnedField {
+                        type_path: "fixture::Signature".into(),
+                        size: 8,
+                        align: 8,
+                    },
+                ),
+            ],
+        );
+        struct_fields.fields.insert(
+            "synth::Del::C".to_string(),
+            vec![FieldRow::named("extra", "i64")],
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            header_id,
+            crate::codewriter::assembler::host_header_layout(),
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.exception_class_hints = vec![hint];
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let lowered_a = transformer
+            .transform(&destructor_ctor_graph(
+                "build_a",
+                "A",
+                "synth::Del::A",
+                &[("n", "synth::Del::A", 7)],
+            ))
+            .graph;
+        let lowered_b = transformer
+            .transform(&destructor_ctor_graph(
+                "build_b",
+                "B",
+                "synth::Del::B",
+                &[("n", "synth::Del::B", 7)],
+            ))
+            .graph;
+        let lowered_c = transformer
+            .transform(&destructor_ctor_graph(
+                "build_c",
+                "C",
+                "synth::Del::C",
+                &[("extra", "synth::Del::C", 3)],
+            ))
+            .graph;
+        let lowered_d = transformer
+            .transform(&destructor_ctor_graph("build_d", "D", "synth::Del::D", &[]))
+            .graph;
+        assert_new_with_vtable_ctor(&lowered_a, "synth::Del::A", Some(("n", "synth::Del::A")));
+        assert_alloc_with_del_ctor(&lowered_b, "synth::Del::B", Some(("n", "synth::Del::B")));
+        assert_alloc_with_del_ctor(
+            &lowered_c,
+            "synth::Del::C",
+            Some(("extra", "synth::Del::C")),
+        );
+        assert_new_with_vtable_ctor(&lowered_d, "synth::Del::D", None);
+
+        // `rewrite_op_malloc` appends the malloc's field initialisers
+        // (`extra_ops`) after the residual call, including its `-live-`.
+        let mut extra_graph = FunctionGraph::new("extra_ops_follow_live");
+        let extra_result = extra_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let extra_write = int_field_write(extra_result.clone(), "n", "synth::Del::B", 9);
+        let RewriteResult::Replace(extra_ops) = transformer.rewrite_ctor_malloc(
+            "extra_ops_follow_live",
+            &mut extra_graph,
+            Some(extra_result),
+            "synth::Del::B".to_string(),
+            true,
+            vec![extra_write],
+        ) else {
+            panic!("jtransform.py rewrite_op_malloc replaces the malloc");
+        };
+        assert_eq!(extra_ops.len(), 4, "{extra_ops:?}");
+        assert!(matches!(
+            &extra_ops[2].kind,
+            OpKind::Live { forced } if forced.is_empty()
+        ));
+        assert!(matches!(
+            &extra_ops[3].kind,
+            OpKind::FieldWrite { field, .. }
+                if field.name == "n" && field.owner_root.as_deref() == Some("synth::Del::B")
+        ));
+        assert_residual_alloc_with_del(&extra_ops[0], &extra_ops[1], "synth::Del::B");
+    }
+
+    fn destructor_ctor_graph(
+        name: &str,
+        variant: &str,
+        owner: &str,
+        fields: &[(&str, &str, i64)],
+    ) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        let bb = graph.startblock;
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["synth".into(), "Del".into()],
+            variant,
+            0,
+        );
+        graph.push_op_with_result_var(
+            bb,
+            OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
+            },
+            result.clone(),
+        );
+        for (field, field_owner, value) in fields {
+            graph.push_op_var(
+                bb,
+                int_field_write(result.clone(), field, field_owner, *value).kind,
+                false,
+            );
+        }
+        graph.set_return(bb, Some(result));
+        graph
+    }
+
+    fn int_field_write(
+        base: crate::flowspace::model::Variable,
+        field: &str,
+        field_owner: &str,
+        value: i64,
+    ) -> SpaceOperation {
+        SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new(field, Some(field_owner.into())),
+                value: LinkArg::Const(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(value),
+                )),
+                ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn ctor_ops(graph: &FunctionGraph) -> Vec<&SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect()
+    }
+
+    fn assert_new_with_vtable_ctor(
+        graph: &FunctionGraph,
+        owner: &str,
+        field: Option<(&str, &str)>,
+    ) {
+        let ops = ctor_ops(graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner: allocated, vtable: 0 } if allocated == owner
+            )),
+            "{owner} must allocate with new_with_vtable: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Call { .. }
+                    | OpKind::CallResidual { .. }
+                    | OpKind::New { .. }
+                    | OpKind::Live { .. }
+                    | OpKind::ConstFnAddr { .. }
+            )),
+            "{owner} must stay new_with_vtable: {ops:?}"
+        );
+        assert_ctor_field_write(&ops, field);
+    }
+
+    fn assert_alloc_with_del_ctor(graph: &FunctionGraph, owner: &str, field: Option<(&str, &str)>) {
+        let ops = ctor_ops(graph);
+        let fn_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::ConstFnAddr { path, symbolic: true, .. }
+                        if path == &format!("build_ll_0_alloc_with_del::{owner}")
+                )
+            })
+            .unwrap_or_else(|| panic!("{owner} missing alloc_with_del fnaddr: {ops:?}"));
+        assert_residual_alloc_with_del(&ops[fn_at], &ops[fn_at + 1], owner);
+        assert!(
+            matches!(&ops[fn_at + 2].kind, OpKind::Live { forced } if forced.is_empty()),
+            "{owner} residual call must be followed by -live-: {ops:?}"
+        );
+        if let Some((name, field_owner)) = field {
+            match &ops[fn_at + 3].kind {
+                OpKind::FieldWrite { field, .. } => {
+                    assert_eq!(field.name, name);
+                    assert_eq!(field.owner_root.as_deref(), Some(field_owner));
+                }
+                other => panic!("{owner} field init must follow -live-: {other:?}"),
+            }
+        }
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::NewWithVtable { .. } | OpKind::New { .. } | OpKind::Call { .. }
+            )),
+            "{owner} must not stay a vtable malloc: {ops:?}"
+        );
+    }
+
+    fn assert_residual_alloc_with_del(fnaddr: &SpaceOperation, call: &SpaceOperation, owner: &str) {
+        assert!(
+            matches!(
+                &fnaddr.kind,
+                OpKind::ConstFnAddr { path, symbolic: true, .. }
+                    if path == &format!("build_ll_0_alloc_with_del::{owner}")
+            ),
+            "{owner} fnaddr: {fnaddr:?}"
+        );
+        match &call.kind {
+            OpKind::CallResidual {
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                descriptor,
+                indirect_targets,
+                ..
+            } => {
+                assert!(args_i.is_empty(), "{owner} int args: {args_i:?}");
+                assert!(args_r.is_empty(), "{owner} ref args: {args_r:?}");
+                assert!(args_f.is_empty(), "{owner} float args: {args_f:?}");
+                assert_eq!(*result_kind, 'r', "{owner}");
+                assert!(indirect_targets.is_none(), "{owner}");
+                assert!(descriptor.arg_classes.is_empty(), "{owner} {descriptor:?}");
+                assert_eq!(descriptor.result_type, 'r', "{owner}");
+                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+                assert!(
+                    descriptor.extra_info.can_collect,
+                    "{owner} _ll_0_alloc_with_del mallocs"
+                );
+            }
+            other => panic!("{owner} must be residual alloc_with_del: {other:?}"),
+        }
+    }
+
+    fn assert_ctor_field_write(ops: &[&SpaceOperation], field: Option<(&str, &str)>) {
+        let writes: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => {
+                    Some((field.name.as_str(), field.owner_root.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        match field {
+            Some((name, owner)) => assert_eq!(writes, vec![(name, Some(owner))]),
+            None => assert!(writes.is_empty(), "{writes:?}"),
+        }
     }
 
     fn marked_exception_ctor_graph(

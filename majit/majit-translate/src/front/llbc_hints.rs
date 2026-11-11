@@ -991,19 +991,28 @@ const MINTED_EXC_NAME_LENMAX: usize = 50;
 ///
 /// Included in the module that defines `MintedExceptionClass`, so the
 /// table uses that short name. An empty `rows` is an empty table.
-/// One `NameManager` (`gensupp.py`) claims each static and each
-/// `_destructor` companion, walking `rows` in order. `global_prefix`
+/// One `NameManager` (`gensupp.py`) claims each static, each
+/// `_destructor` companion, and each `_alloc_with_del` /
+/// `_alloc_fnaddr` companion, walking `rows` in order. `global_prefix`
 /// is `MINTED_EXC_` and `number_sep` is `_`. `C_IDENTIFIER` folds every
 /// non-identifier byte to `_` inside `NameManager.uniquename`.
 /// `with_number` is false: these basenames are not the `v` / `w_`
 /// generated-variable prefixes. A basename already in `seennames` — a
 /// sanitized collision or an earlier companion — comes back with the
-/// `_N` suffix from `NameManager._ensure_unique`.
+/// `_N` suffix from `NameManager._ensure_unique`. Claim order is the
+/// bare ident, then `_destructor`, then `_alloc_with_del`, then
+/// `_alloc_fnaddr`, so a later row whose basename is an earlier
+/// `_destructor` still takes that companion's `_1` suffix.
 ///
 /// Every emitted `static` and `fn` name is `MINTED_EXC_` plus a
 /// `NameManager.uniquename` claim. The including module defines no
 /// `MINTED_EXC_`-prefixed item, so the table and the module's names
 /// sit outside the claimed namespace.
+///
+/// A non-empty `raw_owned` list also emits `support.py`
+/// `build_ll_0_alloc_with_del`: a zero-argument `extern "C"` wrapper
+/// closed over the row index and the row `PyType`, registered on
+/// `HELPER_FNADDRS` under `build_ll_0_alloc_with_del::{intern key}`.
 pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> String {
     if rows.is_empty() {
         return "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n".to_string();
@@ -1012,13 +1021,23 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
     let mut defs = String::new();
     let mut table =
         String::from("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
-    for row in rows {
-        // `NameManager.uniquename` (`gensupp.py`). The companion is
+    for (index, row) in rows.iter().enumerate() {
+        // `NameManager.uniquename` (`gensupp.py`). Companions are
         // claimed for every row, emitted or not, so a later ident
-        // cannot take `{bare}_destructor`.
+        // cannot take `{bare}_destructor` or `{bare}_alloc_with_del`.
         let (bare, ident) = names.uniquename_bare(&row.name, Some(false), MINTED_EXC_NAME_LENMAX);
         let destructor_name = names.uniquename(
             &format!("{bare}_destructor"),
+            Some(false),
+            MINTED_EXC_NAME_LENMAX,
+        );
+        let alloc_name = names.uniquename(
+            &format!("{bare}_alloc_with_del"),
+            Some(false),
+            MINTED_EXC_NAME_LENMAX,
+        );
+        let alloc_fnaddr_name = names.uniquename(
+            &format!("{bare}_alloc_fnaddr"),
             Some(false),
             MINTED_EXC_NAME_LENMAX,
         );
@@ -1044,9 +1063,29 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
                 ));
             }
             defs.push_str("    }\n}\n");
+            // `support.py` `build_ll_0_alloc_with_del(RESULT, vtable)`:
+            // zero arguments; RESULT and the vtable are closed over.
+            // `HELPER_FNADDRS` publishes the path `handle_residual_call`
+            // records on `ConstFnAddr`. wasm32 has no `linkme` slice
+            // (`helper_fnaddr.rs` `register`).
+            defs.push_str(&format!(
+                "unsafe extern \"C\" fn {alloc_name}() -> i64 {{\n    alloc_with_del_for_index({index}, &{ident} as *const _ as usize)\n}}\n"
+            ));
+            let fnaddr_path = format!(
+                "build_ll_0_alloc_with_del::{}",
+                escape_rust_string(&row.name)
+            );
+            defs.push_str(&format!(
+                "#[cfg(not(target_arch = \"wasm32\"))]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n}}\n"
+            ));
         }
         let destructor_field = if emit_destructor {
             format!("Some({destructor_name})")
+        } else {
+            "None".to_string()
+        };
+        let alloc_field = if emit_destructor {
+            format!("Some({alloc_name})")
         } else {
             "None".to_string()
         };
@@ -1056,7 +1095,7 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
         };
         let offsets = render_gc_ptr_offsets(&row.gc_ptr_offsets);
         table.push_str(&format!(
-            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor_field} }},\n",
+            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor_field}, alloc_with_del: {alloc_field} }},\n",
             escape_rust_string(&row.name),
             size = row.size,
         ));
@@ -2687,6 +2726,8 @@ mod tests {
     /// Item name on a rendered `static` or `fn` line.
     fn rendered_item_ident(line: &str) -> Option<&str> {
         let rest = [
+            "pub unsafe extern \"C\" fn ",
+            "unsafe extern \"C\" fn ",
             "pub unsafe fn ",
             "pub static ",
             "pub fn ",
@@ -2719,15 +2760,21 @@ mod tests {
             };
             if line.starts_with("static ") {
                 statics += 1;
-            } else if line.starts_with("unsafe fn ") || line.starts_with("fn ") {
+            } else if line.starts_with("unsafe extern \"C\" fn ")
+                || line.starts_with("unsafe fn ")
+                || line.starts_with("fn ")
+            {
                 fns += 1;
             } else {
                 continue;
             }
             assert!(ident.starts_with("MINTED_EXC_"), "{ident}\n{src}");
         }
-        assert_eq!(statics, rows.len(), "{src}");
-        assert_eq!(fns, rows.len(), "{src}");
+        // Each raw-owned row emits a pytype static and a `HELPER_FNADDRS`
+        // static, plus a destructor, an `alloc_with_del` extern, and a
+        // wasm32 ctor.
+        assert_eq!(statics, rows.len() * 2, "{src}");
+        assert_eq!(fns, rows.len() * 3, "{src}");
         let definitions: Vec<&str> = src
             .lines()
             .filter(|line| rendered_item_ident(line) == Some("MINTED_EXCEPTION_CLASSES"))
