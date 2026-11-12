@@ -67,7 +67,8 @@ pub(super) fn msvc_platform(host_triple: String, x64: bool, cc: Option<String>) 
     }
     if cc.is_none() {
         if let Ok(tool) = host_c_compiler(&plat.host_triple, None, Some(&c_environ)) {
-            c_environ = merged_compiler_environ(Some(&c_environ), tool.env());
+            let tool_env = vcvars_tool_env(tool.env(), tool.path());
+            c_environ = merged_compiler_environ(Some(&c_environ), &tool_env);
         }
         plat.cc_command = Some("cl.exe".to_string());
     } else {
@@ -149,6 +150,24 @@ pub(super) fn msvc_compiler_environ(
             value.push(&existing_value);
         }
         env.push((OsString::from(name), value));
+    }
+    env
+}
+
+/// The environment `_get_msvc_env` reads back from `vcvarsall.bat`, whose
+/// PATH starts with the MSVC bin directory that holds `cl.exe`, `link.exe`
+/// and `ml64.exe`.  `cc` skips that script when the process already carries
+/// a developer environment and returns the tool with no environment, so
+/// PATH keeps the inherited order, where a shell's `link` (Git's coreutils
+/// `link.exe`) can come before MSVC's.  The directory `cc` found `cl.exe` in
+/// stands in for the script's PATH head.
+fn vcvars_tool_env(tool_env: &[(OsString, OsString)], cl: &Path) -> Vec<(OsString, OsString)> {
+    let mut env = tool_env.to_vec();
+    let has_path = env.iter().any(|(key, _)| {
+        env_name_eq(key, "PATH") || key.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH"))
+    });
+    if !has_path && let Some(dir) = cl.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        env.push((OsString::from("PATH"), dir.as_os_str().to_os_string()));
     }
     env
 }
@@ -564,6 +583,36 @@ mod tests {
             .find(|(k, _)| env_name_eq(k, "INCLUDE"))
             .map(|(_, v)| v.as_os_str());
         assert_eq!(include, Some(std::ffi::OsStr::new(r"C:\vc\include")));
+    }
+
+    #[test]
+    fn vcvars_tool_env_puts_cl_dir_first_when_cc_reports_no_path() {
+        // Built with the host separator: this module is tested on every host,
+        // and only on Windows does `\` split a path component.
+        let vc_bin = Path::new("vc").join("bin");
+        let cl = vc_bin.join("cl.exe");
+        let mut inherited = OsString::from("git-usr-bin;");
+        inherited.push(&vc_bin);
+        let snapshot = [(OsString::from("PATH"), inherited.clone())];
+        let tool_env = vcvars_tool_env(&[], &cl);
+        let merged = merged_compiler_environ(Some(&snapshot), &tool_env);
+        let path = merged
+            .iter()
+            .find(|(k, _)| env_name_eq(k, "PATH"))
+            .map(|(_, v)| v.clone());
+        let mut expected = vc_bin.as_os_str().to_os_string();
+        expected.push(";");
+        expected.push(&inherited);
+        assert_eq!(path, Some(expected));
+
+        // A PATH from the script itself is kept as is.
+        let script = [(OsString::from("Path"), OsString::from(r"C:\vs\bin"))];
+        let tool_env = vcvars_tool_env(&script, &cl);
+        assert_eq!(tool_env.len(), 1);
+        assert_eq!(tool_env[0].1, OsString::from(r"C:\vs\bin"));
+
+        // A bare `cl.exe` names no directory to add.
+        assert!(vcvars_tool_env(&[], Path::new("cl.exe")).is_empty());
     }
 
     #[test]
