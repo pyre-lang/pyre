@@ -10522,11 +10522,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ns_slot,
             "dup2",
             crate::gateway::function_set_null_positional_defaults(
-                crate::make_builtin_function_with_arity_and_maybe_sig(
-                    "dup2",
-                    dup2,
-                    dup2_pyre_arity(),
-                    dup2_pyre_sig(),
+                crate::gateway::function_set_text_signature(
+                    crate::make_builtin_function_with_arity_and_maybe_sig(
+                        "dup2",
+                        dup2,
+                        dup2_pyre_arity(),
+                        dup2_pyre_sig(),
+                    ),
+                    dup2_pyre_text_sig(),
                 ),
                 dup2_pyre_ndef(),
             )
@@ -14381,11 +14384,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ns_slot,
             "dup2",
             crate::gateway::function_set_null_positional_defaults(
-                crate::make_builtin_function_with_arity_and_maybe_sig(
-                    "dup2",
-                    dup2,
-                    dup2_pyre_arity(),
-                    dup2_pyre_sig(),
+                crate::gateway::function_set_text_signature(
+                    crate::make_builtin_function_with_arity_and_maybe_sig(
+                        "dup2",
+                        dup2,
+                        dup2_pyre_arity(),
+                        dup2_pyre_sig(),
+                    ),
+                    dup2_pyre_text_sig(),
                 ),
                 dup2_pyre_ndef(),
             )
