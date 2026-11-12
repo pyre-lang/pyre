@@ -154,6 +154,18 @@ pub fn GetACP() -> i64 {
     host_winapi::get_acp() as i64
 }
 
+/// `_winapi.GetOEMCP()` — the system's OEM code page.
+#[pyre_interpreter::pyre_function]
+pub fn GetOEMCP() -> i64 {
+    unsafe { windows_sys::Win32::Globalization::GetOEMCP() as i64 }
+}
+
+/// `_winapi.GetTickCount64()` — milliseconds since the system started.
+#[pyre_interpreter::pyre_function]
+pub fn GetTickCount64() -> i64 {
+    rustpython_host_env::time::tick_count64() as i64
+}
+
 /// `_winapi.GetVersion()` — the packed version word `GetVersion` reports.
 #[pyre_interpreter::pyre_function]
 pub fn GetVersion() -> i64 {
@@ -1055,6 +1067,8 @@ pub fn install(ns: PyObjectRef) {
             DeregisterEventSource,
             ExitProcess,
             GetACP,
+            GetOEMCP,
+            GetTickCount64,
             GetVersion,
             MapViewOfFile,
             OpenFileMapping,

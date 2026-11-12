@@ -937,6 +937,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         hc!("IPV6_CHECKSUM", IPV6_CHECKSUM, ws::IPV6_CHECKSUM);
         hc!("IPV6_DONTFRAG", IPV6_DONTFRAG, ws::IPV6_DONTFRAG);
         hc!("IPV6_HOPLIMIT", IPV6_HOPLIMIT, ws::IPV6_HOPLIMIT);
+        // ws2ipdef.h; `rustpython_host_env::socket` does not re-export it.
+        cst!(
+            "IPV6_HDRINCL",
+            windows_sys::Win32::Networking::WinSock::IPV6_HDRINCL
+        );
         hc!("IPV6_HOPOPTS", IPV6_HOPOPTS, ws::IPV6_HOPOPTS);
         hc!("IPV6_JOIN_GROUP", IPV6_JOIN_GROUP, ws::IPV6_JOIN_GROUP);
         hc!("IPV6_LEAVE_GROUP", IPV6_LEAVE_GROUP, ws::IPV6_LEAVE_GROUP);

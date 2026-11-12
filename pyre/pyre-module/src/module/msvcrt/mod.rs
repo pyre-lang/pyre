@@ -284,4 +284,17 @@ pyre_interpreter::py_module! {
             host_msvcrt::get_error_mode()
         }
     },
+    extra_init: |ns| {
+        // `msvcrtmodule.c`: present only when crtversion.h defines all four
+        // `_VC_CRT_*_VERSION` parts (probed by build.rs).
+        let crt_assembly_version: Option<&str> =
+            include!(concat!(env!("OUT_DIR"), "/msvcrt_crt_assembly_version.rs"));
+        if let Some(version) = crt_assembly_version {
+            pyre_interpreter::__pyre_store!(
+                ns,
+                "CRT_ASSEMBLY_VERSION",
+                pyre_object::w_str_new(version)
+            );
+        }
+    },
 }
