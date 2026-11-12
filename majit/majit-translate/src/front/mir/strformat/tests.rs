@@ -1790,6 +1790,593 @@ fn niche_option_str_ne_lowers_to_string_binop() {
     );
 }
 
+fn result_partial_eq_fixture(leaf: &str) -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let str_ty = serde_json::json!({
+        "Adt": {"builtin": "Str", "generics": generics}
+    });
+    let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+    let token_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let result_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [str_ref, token_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty, "Shared"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "result", "Result"]),
+                    "kind": {"Enum": [
+                        {
+                            "name": "Ok",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                        },
+                        {
+                            "name": "Err",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                        }
+                    ]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "Token"]),
+                    "kind": {"Struct": [{
+                        "name": "tag",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "U8"}}}
+                    }]}
+                }
+            ],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_result_str"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 2, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 2, "name": "rhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(1, &result_ref)},
+                                        {"Read": place(2, &result_ref)}
+                                    ]}, "dest": place(3, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(3, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "result", "Result", leaf]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "marker", "StructuralPartialEq"]),
+                "methods": []
+            }],
+            "trait_impls": [{
+                "def_id": 0,
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [token_ty.clone()],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                },
+                "methods": [],
+                "src": "Normal"
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("result-str fixture parses")
+}
+
+fn assert_result_str_cmp_shape(graph: &crate::model::FunctionGraph, leaf: &str) {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+
+    let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+    assert_eq!(
+        ops()
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => super::fmt_path_ends_with_owner_method(
+                    segments,
+                    &["result", "Result"],
+                    &["core", "cmp", "PartialEq"],
+                    leaf,
+                ),
+                _ => false,
+            })
+            .count(),
+        0,
+        "no residual `Result::{leaf}` call survives the structural derive"
+    );
+    assert!(
+        ops().any(
+            |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+        ),
+        "Result PartialEq switches on both discriminants"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .any(|b| matches!(b.exitswitch, Some(ExitSwitch::Value(_)))),
+        "Result PartialEq emits a discriminant switch"
+    );
+    assert!(
+        ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == leaf)),
+        "both-Ok compares the &str payloads with string BinOp({leaf})"
+    );
+}
+
+/// `<Result<&str, E> as PartialEq>::ne` (`opt != Ok(lit)`).
+/// `trait_default_call_segments` rewrites `PartialEq::ne` to
+/// `["result", "Result", "ne"]`; the fold emits the structural derive
+/// (discriminant switch + string `BinOp`) instead of leaving that
+/// FunctionPath residual.
+#[test]
+fn result_str_ne_lowers_to_disc_switch_and_string_binop() {
+    let llbc = result_partial_eq_fixture("ne");
+    let graph =
+        crate::test_support::lower_function(&llbc, "cmp_result_str").expect("lower cmp_result_str");
+    assert_result_str_cmp_shape(&graph, "ne");
+}
+
+/// The `eq` half of the same structural `Result` derive.
+#[test]
+fn result_str_eq_lowers_to_disc_switch_and_string_binop() {
+    let llbc = result_partial_eq_fixture("eq");
+    let graph =
+        crate::test_support::lower_function(&llbc, "cmp_result_str").expect("lower cmp_result_str");
+    assert_result_str_cmp_shape(&graph, "eq");
+}
+
+/// `Result<&str, E>` whose `E` is a derived two-field struct: the
+/// `StructuralPartialEq` marker plus TypeDecl fields lower to a
+/// field-wise `eq` AND-chain. No unresolved `FunctionPath`.
+#[test]
+fn result_derived_two_field_err_lowers_without_unresolved_path() {
+    use crate::model::{CallTarget, OpKind};
+
+    let llbc = result_derived_err_fixture();
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower derived-err Result::ne");
+    let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+    assert_eq!(
+        ops()
+            .filter(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        fun_decl_id: None,
+                        ..
+                    },
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "derived Err payload must not emit an unresolved FunctionPath"
+    );
+    assert!(
+        ops().any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "a")),
+        "derived Err reads field a"
+    );
+    assert!(
+        ops().any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "b")),
+        "derived Err reads field b"
+    );
+    assert!(
+        ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "and")),
+        "derived Err AND-chains field eq"
+    );
+}
+
+/// A Result whose Err payload kind cannot be decided declines: the
+/// `Result::ne` call is left as-is and the graph is not rewritten into
+/// a discriminant diamond.
+#[test]
+fn result_undecidable_err_payload_declines() {
+    use crate::model::{CallTarget, OpKind};
+
+    let llbc = result_undecidable_err_fixture();
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower undecidable-err Result::ne");
+    let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+    assert_eq!(
+        ops()
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => super::fmt_path_ends_with_owner_method(
+                    segments,
+                    &["result", "Result"],
+                    &["core", "cmp", "PartialEq"],
+                    "ne",
+                ),
+                _ => false,
+            })
+            .count(),
+        1,
+        "undecidable Err payload leaves the Result::ne call in place"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .all(|b| !matches!(b.exitswitch, Some(crate::model::ExitSwitch::Value(_)))),
+        "declined Result::ne does not emit a discriminant switch"
+    );
+}
+
+fn result_err_kind_fixture(
+    err_kind: serde_json::Value,
+    trait_decls: serde_json::Value,
+    trait_impls: serde_json::Value,
+) -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let str_ty = serde_json::json!({
+        "Adt": {"builtin": "Str", "generics": generics}
+    });
+    let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+    let err_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let result_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [str_ref.clone(), err_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty, "Shared"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "result", "Result"]),
+                    "kind": {"Enum": [
+                        {
+                            "name": "Ok",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                        },
+                        {
+                            "name": "Err",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                        }
+                    ]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "ErrPayload"]),
+                    "kind": err_kind
+                }
+            ],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_result_str"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 2, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 2, "name": "rhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(1, &result_ref)},
+                                        {"Read": place(2, &result_ref)}
+                                    ]}, "dest": place(3, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(3, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "result", "Result", "ne"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("result err-kind fixture parses")
+}
+
+fn result_derived_err_fixture() -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let err_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    result_err_kind_fixture(
+        serde_json::json!({"Struct": [
+            {"name": "a", "ty": {"Scalar": {"Integer": {"Unsigned": "U8"}}}},
+            {"name": "b", "ty": {"Scalar": {"Integer": {"Unsigned": "U16"}}}}
+        ]}),
+        serde_json::json!([{
+            "def_id": 0,
+            "item_meta": meta(&["core", "marker", "StructuralPartialEq"]),
+            "methods": []
+        }]),
+        serde_json::json!([{
+            "def_id": 0,
+            "impl_trait": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [err_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            },
+            "methods": [],
+            "src": "Normal"
+        }]),
+    )
+}
+
+fn result_undecidable_err_fixture() -> Llbc {
+    result_err_kind_fixture(
+        serde_json::json!("Opaque"),
+        serde_json::json!([]),
+        serde_json::json!([]),
+    )
+}
+
+/// A payload-carrying non-`Result` ADT `ne` is unchanged: the Result
+/// matcher keys on `core::result::Result`, not on the `ne` leaf.
+#[test]
+fn non_result_adt_ne_is_unchanged() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+    let choice_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let choice_ref = serde_json::json!({"Ref": ["Erased", choice_ty, "Shared"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["fixture", "Choice"]),
+                "kind": {"Enum": [
+                    {
+                        "name": "A",
+                        "fields": [{"name": null, "ty": i32_ty.clone()}],
+                        "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                    },
+                    {
+                        "name": "B",
+                        "fields": [{"name": null, "ty": i32_ty}],
+                        "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                    }
+                ]}
+            }],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_choice"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [choice_ref.clone(), choice_ref.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 2, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": choice_ref.clone()},
+                            {"index": 2, "name": "rhs", "span": span, "ty": choice_ref.clone()},
+                            {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(1, &choice_ref)},
+                                        {"Read": place(2, &choice_ref)}
+                                    ]}, "dest": place(3, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(3, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "Choice", "ne"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [choice_ref.clone(), choice_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("choice fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "cmp_choice").expect("lower cmp_choice");
+    let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+    assert_eq!(
+        ops()
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => super::fmt_path_ends_with(segments, &["Choice", "ne"]),
+                _ => false,
+            })
+            .count(),
+        1,
+        "a non-Result ADT `ne` stays a residual FunctionPath"
+    );
+}
+
 /// The `ne` half of the same fold, on the real lowered IR of
 /// `getattr_str_impl` — `err.kind != PyErrorKind::AttributeError` over the
 /// fieldless `PyErrorKind`.  `derive` generates only `eq`, so `!=` resolves

@@ -523,6 +523,70 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
     Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
 }
 
+/// Unique trait declaration whose `name_path` is `path`.
+/// Zero or several matches stay unresolved (`ClassDesc.lookup`).
+pub(in crate::front::mir) fn unique_trait_decl_id(llbc: &Llbc, path: &str) -> Option<u64> {
+    let mut found = None;
+    for decl in llbc.iter_trait_decls() {
+        if decl.item_meta.name_path_str() != path {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(decl.def_id);
+    }
+    found
+}
+
+/// Unique `impl Trait for T` row whose Self ADT is `adt_id`.
+///
+/// [`trait_impl_rows_of`] plus the row's `impl_trait` Self via
+/// [`tyexpr_to_adt_def_id`]. `Llbc::trait_impl_generics` is the
+/// row-level length lens and `trait_impl_types` the associated-type
+/// table; Self stays on the reconstructed `impl_trait.generics.types`
+/// (`has_explicit_drop_impl`). A later type argument that names a
+/// different ADT is another instantiation (`PartialEq<U> for T`) and
+/// does not match. Zero or several matches stay unresolved
+/// (`ClassDesc.lookup`).
+pub(in crate::front::mir) fn unique_trait_impl_for_adt(
+    llbc: &Llbc,
+    trait_id: u64,
+    adt_id: u64,
+) -> Option<u64> {
+    let mut found = None;
+    for (row_index, row) in llbc.trait_impl_rows_of(trait_id) {
+        if row.get("is_negative").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(types) = row
+            .get("impl_trait")
+            .and_then(|impl_trait| impl_trait.get("generics"))
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let Some(self_id) = types.first().and_then(|ty| tyexpr_to_adt_def_id(llbc, ty)) else {
+            continue;
+        };
+        if self_id != adt_id && !same_nominal_adt(llbc, self_id, adt_id) {
+            continue;
+        }
+        if types.iter().skip(1).any(|ty| {
+            tyexpr_to_adt_def_id(llbc, ty)
+                .is_some_and(|rhs_id| rhs_id != self_id && !same_nominal_adt(llbc, rhs_id, self_id))
+        }) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(row_index as u64);
+    }
+    found
+}
+
 /// The std alias an inherent `impl Atomic<T>` block's methods are spelled
 /// under: `AtomicU8` for `Atomic<u8>`, `AtomicPtr` for `Atomic<*mut T>`.
 /// `core::sync::atomic` declares each width as a type alias of `Atomic<T>`

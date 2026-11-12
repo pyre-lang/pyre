@@ -6333,6 +6333,22 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // FunctionPath `result::Result::eq` / `ne`. Same
+                // `partial_eq_eq_ne_leaf` matcher as the niche Option
+                // fold; Result is a tagged sum, so the body is the
+                // structural derive (disc switch + payload compare).
+                if self.try_lower_result_eq_ne(
+                    mir_bb,
+                    &segments,
+                    method_hint.as_ref(),
+                    &args,
+                    first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                    second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `<T as ToString>::to_string(x)` is `str(x)` (`ll_str`)
                 // only when `x` already has an rstr `ll_str`: an integer
                 // (`ll_int2dec`) or rstr `STR` (identity). A Rust-heap
@@ -6627,6 +6643,18 @@ impl<'a> Lowering<'a> {
                             &args,
                             first_arg_ty.as_ref(),
                             second_arg_ty.as_ref(),
+                            dest_local,
+                            target,
+                        )? {
+                            return Ok(());
+                        }
+                        if self.try_lower_result_eq_ne(
+                            mir_bb,
+                            &segments,
+                            method_hint.as_ref(),
+                            &args,
+                            first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                            second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
                             dest_local,
                             target,
                         )? {
