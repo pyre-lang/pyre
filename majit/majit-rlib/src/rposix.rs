@@ -31,6 +31,12 @@ pub use cConfig::TIOCGWINSZ;
 /// `rposix.py` `uts_config` `UTSNAME`.
 #[cfg(unix)]
 pub use cConfig::UTSNAME;
+/// `rposix.py` `CConfig` `AT_*` / `UTIME_*` / `TIMESPEC`.
+#[cfg(unix)]
+pub use cConfig::{
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    TIMESPEC, UTIME_NOW, UTIME_OMIT,
+};
 #[cfg(any(unix, windows))]
 pub use cConfig::{
     CLOCK_T, F_LOCK, F_TEST, F_TLOCK, F_ULOCK, GETPGRP_HAVE_ARG, HAVE_D_TYPE, HAVE_DUP3,
@@ -38,6 +44,9 @@ pub use cConfig::{
     PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
     SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
 };
+/// `rposix.py` `ConfConfig` `pathconf_names` / `confstr_names` / `sysconf_names`.
+#[cfg(unix)]
+pub use cConfig::{CONFSTR_NAMES, PATHCONF_NAMES, SYSCONF_NAMES};
 /// `rposix.py` `constants` (`pipe_config`).
 #[cfg(any(unix, windows))]
 pub use cConfig::{
@@ -50,6 +59,16 @@ pub use cConfig::{
 pub use cConfig::{DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN};
 #[cfg(unix)]
 pub use cConfig::{GID_T, ID_T, NCCS, TMS, UID_T};
+/// `rposix.py` `CConfig` "f... and ...at families".
+#[cfg(any(unix, windows))]
+pub use cConfig::{
+    HAVE_CHFLAGS, HAVE_FACCESSAT, HAVE_FCHDIR, HAVE_FCHMOD, HAVE_FCHMODAT, HAVE_FCHOWN,
+    HAVE_FCHOWNAT, HAVE_FDOPENDIR, HAVE_FEXECVE, HAVE_FPATHCONF, HAVE_FSTAT, HAVE_FSTATAT,
+    HAVE_FSTATVFS, HAVE_FTRUNCATE, HAVE_FUTIMENS, HAVE_FUTIMES, HAVE_FUTIMESAT, HAVE_LCHFLAGS,
+    HAVE_LCHMOD, HAVE_LCHOWN, HAVE_LINKAT, HAVE_LSTAT, HAVE_LUTIMES, HAVE_MKDIRAT, HAVE_MKFIFOAT,
+    HAVE_MKNODAT, HAVE_OPENAT, HAVE_READLINKAT, HAVE_RENAMEAT, HAVE_SCHED_GETPARAM, HAVE_SYMLINKAT,
+    HAVE_UNLINKAT, HAVE_UTIMENSAT,
+};
 /// `rposix.py` `advise_config`.
 #[cfg(rposix_have_fadvise)]
 pub use cConfig::{
@@ -1399,20 +1418,28 @@ crate::rffi::llexternal!(
 // `rposix.py` `CConfig` `HAVE_CHFLAGS` / `HAVE_LCHFLAGS`.  The product
 // `interp_posix.py` names are documentation stubs; the calls are the
 // llexternals those stubs would use.  Flags are `unsigned int` on Apple
-// and OpenBSD, `unsigned long` on FreeBSD/NetBSD/DragonFly.
+// and OpenBSD, `unsigned long` on FreeBSD/NetBSD/DragonFly. The remaining
+// unix hosts keep `unsigned long` so `rposix_have_chflags` can be true
+// off the BSD list.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "openbsd"))]
 pub type ChflagsFlags = libc::c_uint;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "dragonfly"))]
 pub type ChflagsFlags = libc::c_ulong;
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+#[cfg(all(
+    unix,
+    any(rposix_have_chflags, rposix_have_lchflags),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "openbsd",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))
 ))]
+pub type ChflagsFlags = libc::c_ulong;
+
+#[cfg(rposix_have_chflags)]
 crate::rffi::llexternal!(
     pub c_chflags = "chflags",
     [*const libc::c_char, ChflagsFlags],
@@ -1421,14 +1448,7 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
+#[cfg(rposix_have_lchflags)]
 crate::rffi::llexternal!(
     pub c_lchflags = "lchflags",
     [*const libc::c_char, ChflagsFlags],
@@ -1465,11 +1485,11 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_futimens` and `rposix.c_utimensat` save errno. The time
-// argument is `TIMESPEC2P`, a pointer to two `struct timespec` values.
+// argument is `TIMESPEC2P`, a pointer to two `TIMESPEC` values.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_futimens = "futimens",
-    [crate::rffi::INT, *const libc::timespec],
+    [crate::rffi::INT, *const TIMESPEC],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
@@ -1481,7 +1501,7 @@ crate::rffi::llexternal!(
     [
         crate::rffi::INT,
         *const libc::c_char,
-        *const libc::timespec,
+        *const TIMESPEC,
         crate::rffi::INT
     ],
     crate::rffi::INT,
@@ -1888,7 +1908,7 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_fexecve` is behind `HAVE_FEXECVE` and saves errno.
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(rposix_have_fexecve)]
 crate::rffi::llexternal!(
     pub c_fexecve = "fexecve",
     [
@@ -3620,6 +3640,13 @@ mod tests {
             std::mem::size_of::<TIMEVAL>(),
             std::mem::size_of::<libc::timeval>()
         );
+        assert_eq!(
+            std::mem::size_of::<TIMESPEC>(),
+            std::mem::size_of::<libc::timespec>()
+        );
+        assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
+        assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
+        assert_eq!(AT_SYMLINK_NOFOLLOW, Some(libc::AT_SYMLINK_NOFOLLOW as i32));
         #[cfg(rposix_have_d_type)]
         {
             assert_eq!(DT_UNKNOWN, libc::DT_UNKNOWN as i32);
@@ -3795,14 +3822,7 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ))]
+    #[cfg(all(rposix_have_chflags, rposix_have_lchflags))]
     #[test]
     fn c_chflags_zero_on_temp_file() {
         use std::os::unix::ffi::OsStrExt;
@@ -4393,6 +4413,7 @@ mod tests {
     #[test]
     fn c_futimens_utimensat_and_pipe() {
         use std::os::unix::ffi::OsStrExt;
+        let at_fdcwd = AT_FDCWD.expect("missing AT_FDCWD");
         let dir = std::env::temp_dir().join(format!("pyre-rffi-utime-{}", std::process::id()));
         let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
         assert_eq!(
@@ -4411,10 +4432,9 @@ mod tests {
             )
         };
         assert!(fd >= 0, "c_open errno {}", get_saved_errno());
-        let stamp = libc::timespec {
-            tv_sec: 1_700_000_000,
-            tv_nsec: 0,
-        };
+        let mut stamp = unsafe { std::mem::zeroed::<TIMESPEC>() };
+        stamp.c_tv_sec = 1_700_000_000 as _;
+        stamp.c_tv_nsec = 0 as _;
         let times = [stamp, stamp];
         assert_eq!(
             unsafe { c_futimens(fd, times.as_ptr()) },
@@ -4429,13 +4449,12 @@ mod tests {
         assert!(unsafe { c_futimens(-1, times.as_ptr()) } < 0);
         assert_eq!(get_saved_errno(), libc::EBADF);
 
-        let later = libc::timespec {
-            tv_sec: 1_700_000_111,
-            tv_nsec: 0,
-        };
+        let mut later = unsafe { std::mem::zeroed::<TIMESPEC>() };
+        later.c_tv_sec = 1_700_000_111 as _;
+        later.c_tv_nsec = 0 as _;
         let later_times = [later, later];
         assert_eq!(
-            unsafe { c_utimensat(libc::AT_FDCWD, c_file.as_ptr(), later_times.as_ptr(), 0) },
+            unsafe { c_utimensat(at_fdcwd, c_file.as_ptr(), later_times.as_ptr(), 0,) },
             0,
             "c_utimensat errno {}",
             get_saved_errno()
@@ -4445,7 +4464,7 @@ mod tests {
         assert!(
             unsafe {
                 c_utimensat(
-                    libc::AT_FDCWD,
+                    at_fdcwd,
                     c"/no/such/pyre-rffi-utime".as_ptr(),
                     later_times.as_ptr(),
                     0,
@@ -4542,6 +4561,7 @@ mod tests {
     #[test]
     fn c_at_process_and_conf_round_trip() {
         use std::os::unix::ffi::OsStrExt;
+        let at_fdcwd = AT_FDCWD.expect("missing AT_FDCWD");
         let dir = std::env::temp_dir().join(format!("pyre-rffi-at-{}", std::process::id()));
         let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
         let _ = unsafe { c_rmdir(c_dir.as_ptr()) };
@@ -4556,7 +4576,7 @@ mod tests {
         let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
         let fd = unsafe {
             c_openat(
-                libc::AT_FDCWD,
+                at_fdcwd,
                 c_file.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
                 0o600,
@@ -4567,7 +4587,7 @@ mod tests {
         assert!(
             unsafe {
                 c_openat(
-                    libc::AT_FDCWD,
+                    at_fdcwd,
                     c"/no/such/pyre-rffi-openat".as_ptr(),
                     libc::O_RDONLY,
                     0,
@@ -4577,27 +4597,27 @@ mod tests {
         assert_eq!(get_saved_errno(), libc::ENOENT);
 
         assert_eq!(
-            unsafe { c_fchmodat(libc::AT_FDCWD, c_file.as_ptr(), 0o600, 0) },
+            unsafe { c_fchmodat(at_fdcwd, c_file.as_ptr(), 0o600, 0,) },
             0,
             "c_fchmodat errno {}",
             get_saved_errno()
         );
         assert_eq!(
-            unsafe { c_fchownat(libc::AT_FDCWD, c_file.as_ptr(), -1, -1, 0) },
+            unsafe { c_fchownat(at_fdcwd, c_file.as_ptr(), -1, -1, 0,) },
             0,
             "c_fchownat errno {}",
             get_saved_errno()
         );
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(
-            unsafe { c_fstatat(libc::AT_FDCWD, c_file.as_ptr(), &mut st, 0) },
+            unsafe { c_fstatat(at_fdcwd, c_file.as_ptr(), &mut st, 0,) },
             0,
             "c_fstatat errno {}",
             get_saved_errno()
         );
         assert_eq!(unsafe { c_access(c_file.as_ptr(), libc::R_OK) }, 0);
         assert_eq!(
-            unsafe { c_faccessat(libc::AT_FDCWD, c_file.as_ptr(), libc::R_OK, 0) },
+            unsafe { c_faccessat(at_fdcwd, c_file.as_ptr(), libc::R_OK, 0,) },
             0
         );
         assert!(unsafe { c_access(c"/no/such/pyre-rffi-access".as_ptr(), libc::R_OK) } != 0);
@@ -4605,15 +4625,7 @@ mod tests {
         let link = dir.join("l");
         let c_link = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
         assert_eq!(
-            unsafe {
-                c_linkat(
-                    libc::AT_FDCWD,
-                    c_file.as_ptr(),
-                    libc::AT_FDCWD,
-                    c_link.as_ptr(),
-                    0,
-                )
-            },
+            unsafe { c_linkat(at_fdcwd, c_file.as_ptr(), at_fdcwd, c_link.as_ptr(), 0,) },
             0,
             "c_linkat errno {}",
             get_saved_errno()
@@ -4621,7 +4633,7 @@ mod tests {
         let soft = dir.join("s");
         let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
         assert_eq!(
-            unsafe { c_symlinkat(c"t".as_ptr(), libc::AT_FDCWD, c_soft.as_ptr()) },
+            unsafe { c_symlinkat(c"t".as_ptr(), at_fdcwd, c_soft.as_ptr(),) },
             0,
             "c_symlinkat errno {}",
             get_saved_errno()
@@ -4629,7 +4641,7 @@ mod tests {
         let mut target = [0u8; 16];
         let n = unsafe {
             c_readlinkat(
-                libc::AT_FDCWD,
+                at_fdcwd,
                 c_soft.as_ptr(),
                 target.as_mut_ptr().cast(),
                 target.len(),
@@ -4647,14 +4659,7 @@ mod tests {
             get_saved_errno()
         );
         assert_eq!(
-            unsafe {
-                c_renameat(
-                    libc::AT_FDCWD,
-                    c_renamed.as_ptr(),
-                    libc::AT_FDCWD,
-                    c_link.as_ptr(),
-                )
-            },
+            unsafe { c_renameat(at_fdcwd, c_renamed.as_ptr(), at_fdcwd, c_link.as_ptr(),) },
             0,
             "c_renameat errno {}",
             get_saved_errno()
@@ -4670,7 +4675,7 @@ mod tests {
 
         let fifo = dir.join("p");
         let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        let made = unsafe { c_mkfifoat(libc::AT_FDCWD, c_fifo.as_ptr(), 0o600) };
+        let made = unsafe { c_mkfifoat(at_fdcwd, c_fifo.as_ptr(), 0o600) };
         if made < 0 {
             let err = get_saved_errno();
             assert!(
@@ -4683,13 +4688,13 @@ mod tests {
                 "c_mkfifoat errno {err}"
             );
         } else {
-            assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_fifo.as_ptr(), 0) }, 0);
+            assert_eq!(unsafe { c_unlinkat(at_fdcwd, c_fifo.as_ptr(), 0) }, 0);
         }
 
         let sub = dir.join("sub");
         let c_sub = std::ffi::CString::new(sub.as_os_str().as_bytes()).unwrap();
         assert_eq!(
-            unsafe { c_mkdirat(libc::AT_FDCWD, c_sub.as_ptr(), 0o700) },
+            unsafe { c_mkdirat(at_fdcwd, c_sub.as_ptr(), 0o700) },
             0,
             "c_mkdirat errno {}",
             get_saved_errno()
@@ -4730,10 +4735,16 @@ mod tests {
             "c_fpathconf {name_max_fd} errno {name_max_err}"
         );
 
-        assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_link.as_ptr(), 0) }, 0);
-        assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_file.as_ptr(), 0) }, 0);
+        assert_eq!(unsafe { c_unlinkat(at_fdcwd, c_link.as_ptr(), 0) }, 0);
+        assert_eq!(unsafe { c_unlinkat(at_fdcwd, c_file.as_ptr(), 0) }, 0);
         assert_eq!(
-            unsafe { c_unlinkat(libc::AT_FDCWD, c_sub.as_ptr(), libc::AT_REMOVEDIR) },
+            unsafe {
+                c_unlinkat(
+                    at_fdcwd,
+                    c_sub.as_ptr(),
+                    AT_REMOVEDIR.expect("missing AT_REMOVEDIR"),
+                )
+            },
             0
         );
 

@@ -154,11 +154,14 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
-/// `interp_posix.py DEFAULT_DIR_FD` — `rposix.AT_FDCWD` when the host
-/// header defines it, else `-100`. `_unwrap_dirfd` maps `None` to it, so
-/// an explicit `dir_fd=AT_FDCWD` is the same as an omitted one.
+/// `interp_posix.py` `DEFAULT_DIR_FD = rposix.AT_FDCWD if _HAVE_AT_FDCWD else -100`.
+/// `_unwrap_dirfd` maps `None` to it, so an explicit `dir_fd=AT_FDCWD` is the
+/// same as an omitted one.
 #[cfg(unix)]
-const DEFAULT_DIR_FD: i32 = libc::AT_FDCWD;
+const DEFAULT_DIR_FD: i32 = match majit_rlib::rposix::AT_FDCWD {
+    Some(fd) => fd,
+    None => -100,
+};
 #[cfg(not(unix))]
 const DEFAULT_DIR_FD: i32 = -100;
 
@@ -301,140 +304,6 @@ fn collect_env_entries(
         env.push(entry);
     }
     Ok(env)
-}
-
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
-fn sysconf_names() -> &'static [(&'static str, i32)] {
-    &[
-        ("SC_2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
-        ("SC_2_C_BIND", libc::_SC_2_C_BIND),
-        ("SC_2_C_DEV", libc::_SC_2_C_DEV),
-        ("SC_2_FORT_DEV", libc::_SC_2_FORT_DEV),
-        ("SC_2_FORT_RUN", libc::_SC_2_FORT_RUN),
-        ("SC_2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
-        ("SC_2_SW_DEV", libc::_SC_2_SW_DEV),
-        ("SC_2_UPE", libc::_SC_2_UPE),
-        ("SC_2_VERSION", libc::_SC_2_VERSION),
-        ("SC_AIO_LISTIO_MAX", libc::_SC_AIO_LISTIO_MAX),
-        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
-        ("SC_AIO_PRIO_DELTA_MAX", libc::_SC_AIO_PRIO_DELTA_MAX),
-        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
-        ("SC_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
-        ("SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
-        ("SC_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
-        ("SC_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
-        ("SC_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
-        ("SC_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
-        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
-        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
-        ("SC_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
-        ("SC_DELAYTIMER_MAX", libc::_SC_DELAYTIMER_MAX),
-        ("SC_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
-        ("SC_FSYNC", libc::_SC_FSYNC),
-        ("SC_GETGR_R_SIZE_MAX", libc::_SC_GETGR_R_SIZE_MAX),
-        ("SC_GETPW_R_SIZE_MAX", libc::_SC_GETPW_R_SIZE_MAX),
-        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
-        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
-        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
-        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
-        ("SC_MAPPED_FILES", libc::_SC_MAPPED_FILES),
-        ("SC_MEMLOCK", libc::_SC_MEMLOCK),
-        ("SC_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
-        ("SC_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
-        ("SC_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
-        ("SC_MQ_OPEN_MAX", libc::_SC_MQ_OPEN_MAX),
-        ("SC_MQ_PRIO_MAX", libc::_SC_MQ_PRIO_MAX),
-        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
-        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
-        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
-        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
-        ("SC_PAGE_SIZE", libc::_SC_PAGE_SIZE),
-        ("SC_PAGESIZE", libc::_SC_PAGE_SIZE),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_PASS_MAX", libc::_SC_PASS_MAX),
-        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
-        ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
-        ("SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
-        ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
-        ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
-        ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
-        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
-        ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
-        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
-        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
-        ("SC_SHARED_MEMORY_OBJECTS", libc::_SC_SHARED_MEMORY_OBJECTS),
-        ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
-        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
-        ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
-        ("SC_THREADS", libc::_SC_THREADS),
-        ("SC_THREAD_ATTR_STACKADDR", libc::_SC_THREAD_ATTR_STACKADDR),
-        ("SC_THREAD_ATTR_STACKSIZE", libc::_SC_THREAD_ATTR_STACKSIZE),
-        (
-            "SC_THREAD_DESTRUCTOR_ITERATIONS",
-            libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
-        ),
-        ("SC_THREAD_KEYS_MAX", libc::_SC_THREAD_KEYS_MAX),
-        (
-            "SC_THREAD_PRIORITY_SCHEDULING",
-            libc::_SC_THREAD_PRIORITY_SCHEDULING,
-        ),
-        ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
-        ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
-        ("SC_THREAD_PROCESS_SHARED", libc::_SC_THREAD_PROCESS_SHARED),
-        ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
-        ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
-        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
-        ("SC_TIMERS", libc::_SC_TIMERS),
-        ("SC_TIMER_MAX", libc::_SC_TIMER_MAX),
-        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
-        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
-        ("SC_VERSION", libc::_SC_VERSION),
-        ("SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
-        ("SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
-        ("SC_XOPEN_LEGACY", libc::_SC_XOPEN_LEGACY),
-        ("SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
-        (
-            "SC_XOPEN_REALTIME_THREADS",
-            libc::_SC_XOPEN_REALTIME_THREADS,
-        ),
-        ("SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
-        ("SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
-        ("SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
-        ("SC_XOPEN_XCU_VERSION", libc::_SC_XOPEN_XCU_VERSION),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_ILP32_OFF32", libc::_SC_XBS5_ILP32_OFF32),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_ILP32_OFFBIG", libc::_SC_XBS5_ILP32_OFFBIG),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_LP64_OFF64", libc::_SC_XBS5_LP64_OFF64),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_LPBIG_OFFBIG", libc::_SC_XBS5_LPBIG_OFFBIG),
-    ]
 }
 
 pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
@@ -4408,7 +4277,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rposix::c_unlinkat(
                                 _dir_fd,
                                 c_path.as_ptr(),
-                                libc::AT_REMOVEDIR,
+                                majit_rlib::rposix::AT_REMOVEDIR.expect("missing AT_REMOVEDIR"),
                             )
                         }
                     } else {
@@ -4594,15 +4463,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// descriptor onto someone else's file answers `utime(fd)` and refuses
     /// `utime(fd, ns=(now, now))` with EPERM.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn timespec_of(t: UTime, now: bool) -> libc::timespec {
-        libc::timespec {
-            tv_sec: t.sec as libc::time_t,
-            tv_nsec: if now {
-                libc::UTIME_NOW as _
-            } else {
-                t.nsec as _
-            },
-        }
+    fn timespec_of(t: UTime, now: bool) -> majit_rlib::rposix::TIMESPEC {
+        let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rposix::TIMESPEC>() };
+        ts.c_tv_sec = t.sec as _;
+        ts.c_tv_nsec = if now {
+            majit_rlib::rposix::UTIME_NOW.expect("missing UTIME_NOW") as _
+        } else {
+            t.nsec as _
+        };
+        ts
     }
 
     // PyPy `interp_posix.utime` → rposix `utimensat`/`SetFileTime`.  `times` is a
@@ -4914,7 +4783,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flag = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
@@ -6195,11 +6064,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     const HOST_WINDOWS_CRT: bool =
         cfg!(all(windows, feature = "host_env", not(feature = "sandbox")));
 
-    /// The `HAVE_*` macros `_have_functions` advertises, each spelled as the
-    /// condition under which the entry point it names really does take an open
-    /// descriptor. `os.py:140-155` reads them into `supports_fd`, so a bit set
-    /// where the call still rejects an integer hands the caller a capability it
-    /// cannot use.
+    /// The `HAVE_*` macros `_have_functions` advertises. Each is
+    /// `getattr(rposix, "HAVE_%s" % name)` (`interp_posix.py` `have_functions`)
+    /// and the pyre condition under which the matching entry point is compiled.
+    /// `os.py` reads them into `supports_fd`, so a bit set where the
+    /// call still rejects an integer hands the caller a capability it cannot
+    /// use.
     /// `rposix.HAVE_FACCESSAT` — what `access` types its `dir_fd` as
     /// (`interp_posix.py`) and what its two flag modifiers are tested
     /// against (`:771-775`). All three of `access`'s modifiers are the one
@@ -6207,102 +6077,105 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// it into `supports_dir_fd`, `supports_effective_ids` and
     /// `supports_follow_symlinks` alike, and it is the only bit any of those
     /// three reads for `access`.
-    const HAVE_FACCESSAT: bool = HOST_POSIX;
-    const HAVE_FCHDIR: bool = HOST_POSIX;
-    const HAVE_FCHMOD: bool = HOST_POSIX;
-    const HAVE_FCHOWN: bool = HOST_POSIX;
+    const HAVE_FACCESSAT: bool = majit_rlib::rposix::HAVE_FACCESSAT && HOST_POSIX;
+    const HAVE_FCHDIR: bool = majit_rlib::rposix::HAVE_FCHDIR && HOST_POSIX;
+    const HAVE_FCHMOD: bool = majit_rlib::rposix::HAVE_FCHMOD && HOST_POSIX;
+    const HAVE_FCHOWN: bool = majit_rlib::rposix::HAVE_FCHOWN && HOST_POSIX;
     /// `chown` resolves a name against `dir_fd` and honours
     /// `follow_symlinks=False` through the one `fchownat` call
     /// (`interp_posix.py`), which is also how `lchown` is spelled.
-    const HAVE_FCHOWNAT: bool = HOST_POSIX;
-    const HAVE_FPATHCONF: bool = HOST_POSIX;
-    const HAVE_FSTATVFS: bool = HOST_POSIX;
+    const HAVE_FCHOWNAT: bool = majit_rlib::rposix::HAVE_FCHOWNAT && HOST_POSIX;
+    const HAVE_FPATHCONF: bool = majit_rlib::rposix::HAVE_FPATHCONF && HOST_POSIX;
+    const HAVE_FSTATVFS: bool = majit_rlib::rposix::HAVE_FSTATVFS && HOST_POSIX;
+    /// [3.15-spec] ours: rposix HAVE_FTRUNCATE on POSIX, plus the C runtime's _chsize_s on Windows ↔ pypy: getattr(rposix, "HAVE_FTRUNCATE") only — "HAVE_FTRUNCATE" in os._have_functions on Windows; evidence: posixmodule.c have_functions[] `defined HAVE_FTRUNCATE || defined MS_WINDOWS`.
     /// Windows serves this one too — `_chsize_s` behind `os.ftruncate` — so
     /// `os.truncate` belongs in `supports_fd` on both.
-    const HAVE_FTRUNCATE: bool = HOST_POSIX || HOST_WINDOWS_CRT;
+    const HAVE_FTRUNCATE: bool =
+        (majit_rlib::rposix::HAVE_FTRUNCATE && HOST_POSIX) || HOST_WINDOWS_CRT;
     /// `utime` reaches `futimens` and `utimensat` through `libc` rather than
     /// `host_env`, so it needs one less condition than the rest.
-    const HAVE_FUTIMENS: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FUTIMENS: bool =
+        majit_rlib::rposix::HAVE_FUTIMENS && cfg!(all(unix, not(feature = "sandbox")));
     /// The name form of `utime` is one `utimensat`, so the same bit carries
     /// both of its modifiers: `dir_fd` is the descriptor the name resolves
     /// against and `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
-    const HAVE_UTIMENSAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_UTIMENSAT: bool =
+        majit_rlib::rposix::HAVE_UTIMENSAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
     /// (`interp_posix.py`). `stat_at` calls `fstatat` through `libc`.
-    const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FSTATAT: bool =
+        majit_rlib::rposix::HAVE_FSTATAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FCHMODAT` — what `chmod` types its `dir_fd` as
     /// (`interp_posix.py`), and what `_chmod_path` calls to honour either
     /// modifier. `os.py:118` reads it as `chmod` honouring `dir_fd`; `os.py:179`
     /// deliberately does *not* read it for `follow_symlinks`, because a host can
     /// have `fchmodat` and still not honour `AT_SYMLINK_NOFOLLOW`.
-    const HAVE_FCHMODAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FCHMODAT: bool =
+        majit_rlib::rposix::HAVE_FCHMODAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `os.py:183` reads this as `chmod` honouring `follow_symlinks`, which is
     /// the `AT_SYMLINK_NOFOLLOW` arm of that same `fchmodat`. It is a narrower
     /// claim than `HAVE_FCHMODAT`: `os.py:159-177` records that where a host's
     /// `lchmod` is a stub returning ENOTSUP, the flag does not work either, so
     /// only the hosts that carry a working `lchmod` may say it — and those are
     /// exactly the ones `os.lchmod` is registered on below.
-    const HAVE_LCHMOD: bool = HOST_POSIX && BSD_FLAVOURED;
+    const HAVE_LCHMOD: bool = majit_rlib::rposix::HAVE_LCHMOD && HOST_POSIX;
     /// `os.py` reads this as `chflags` honouring `follow_symlinks`, which
     /// is the `lchflags` arm of the pair. `chflags` is a BSD interface, so the
     /// two names exist on exactly the hosts this is true for — and where they
     /// do not, `shutil.copystat`'s `lookup("chflags")` finds nothing and skips
     /// the flags rather than believing a stub that copied none.
-    const HAVE_LCHFLAGS: bool = HOST_POSIX && BSD_FLAVOURED;
-    /// Where `lchmod` and `chflags` are the host's own calls rather than stubs
-    /// that report ENOTSUP — the platform half of the two bits above.
-    const BSD_FLAVOURED: bool = cfg!(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ));
+    const HAVE_LCHFLAGS: bool = majit_rlib::rposix::HAVE_LCHFLAGS && HOST_POSIX;
     /// `rposix.HAVE_MKNODAT` — what `mknod` types its `dir_fd` as
     /// (`interp_posix.py`). Registered beside `mkfifo`, so it carries the
     /// same condition.
-    const HAVE_MKNODAT: bool = HOST_POSIX;
+    const HAVE_MKNODAT: bool = majit_rlib::rposix::HAVE_MKNODAT && HOST_POSIX;
     /// `rposix.HAVE_OPENAT` — what `open` types its `dir_fd` as
     /// (`interp_posix.py`). `openat` is reached through `libc`, so it needs
     /// no `host_env`; the Windows arm serves the name through `_wopen` and
     /// resolves nothing against a descriptor.
-    const HAVE_OPENAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_OPENAT: bool =
+        majit_rlib::rposix::HAVE_OPENAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_MKDIRAT` — `mkdir`'s (`interp_posix.py`).
-    const HAVE_MKDIRAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_MKDIRAT: bool =
+        majit_rlib::rposix::HAVE_MKDIRAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_UNLINKAT`. `os.py:131-132` reads it twice, for `unlink` and
     /// for `rmdir`, which are the same `unlinkat` told apart by `AT_REMOVEDIR`
     /// (`rposix.py`) — so the two cannot be advertised apart.
-    const HAVE_UNLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_UNLINKAT: bool =
+        majit_rlib::rposix::HAVE_UNLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_MKFIFOAT` — `mkfifo`'s (`interp_posix.py`). Narrower
     /// than the three above only because `os.mkfifo` itself is registered on
     /// the `host_env` POSIX builds; elsewhere the name is a noop placeholder
     /// that resolves nothing.
-    const HAVE_MKFIFOAT: bool = HOST_POSIX;
+    const HAVE_MKFIFOAT: bool = majit_rlib::rposix::HAVE_MKFIFOAT && HOST_POSIX;
     /// `rposix.HAVE_LINKAT` — what `link` takes its `src_dir_fd`/`dst_dir_fd`
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
-    const HAVE_LINKAT: bool = HOST_POSIX;
+    const HAVE_LINKAT: bool = majit_rlib::rposix::HAVE_LINKAT && HOST_POSIX;
     /// `rposix.HAVE_READLINKAT` — what `readlink` types its `dir_fd` as.
-    const HAVE_READLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_READLINKAT: bool =
+        majit_rlib::rposix::HAVE_READLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_RENAMEAT` — what `rename`/`replace` take `src_dir_fd` and
     /// `dst_dir_fd` as.
-    const HAVE_RENAMEAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_RENAMEAT: bool =
+        majit_rlib::rposix::HAVE_RENAMEAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_SYMLINKAT` — what `symlink` types its `dir_fd` as.
-    const HAVE_SYMLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_SYMLINKAT: bool =
+        majit_rlib::rposix::HAVE_SYMLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `os.py` reads this as `listdir` and `scandir` taking a
     /// descriptor, which `fdlistdir` serves through `fdopendir`. `readdir`
     /// reports the end of a directory and a failure alike, so reading it apart
     /// needs the errno seam the host layer wraps — hence `HOST_POSIX` and not
     /// `HAVE_FSTATAT`'s weaker condition, which `HOST_POSIX` implies anyway for
     /// the `fstatat` a descriptor's entries stat themselves with.
-    const HAVE_FDOPENDIR: bool = HOST_POSIX;
+    const HAVE_FDOPENDIR: bool = majit_rlib::rposix::HAVE_FDOPENDIR && HOST_POSIX;
     /// `os.py:118` reads this as `lstat` honouring `dir_fd`, which is the same
     /// `fstatat` `stat` resolves one with — so the two cannot be advertised
     /// apart. `os.py:189` reads it a second time as `stat` honouring
     /// `follow_symlinks`; where this bit is false, `MS_WINDOWS` carries that
     /// second claim instead (`os.py:192`).
-    const HAVE_LSTAT: bool = HAVE_FSTATAT;
+    const HAVE_LSTAT: bool =
+        majit_rlib::rposix::HAVE_LSTAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `_WIN32` (`interp_posix.py`). `os.py` reads it as `chmod`
     /// taking a descriptor (`:143`), and as `chmod` and `stat` honouring
     /// `follow_symlinks` (`:184`, `:192`) — all three of which the C runtime
@@ -6342,7 +6215,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flags = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             // `rposix_stat.c_fstatat` releases the GIL and saves errno.
             let ret = unsafe {
@@ -6456,7 +6329,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let flags = if follow_symlinks {
             0
         } else {
-            libc::AT_SYMLINK_NOFOLLOW
+            majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
         };
         // `rposix_stat.c_fstatat` releases the GIL and saves errno.
         let ret = unsafe {
@@ -10983,14 +10856,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // rather than an unknown keyword.
         #[cfg(all(
             not(feature = "sandbox"),
-            any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly",
-            )
+            rposix_have_chflags,
+            rposix_have_lchflags
         ))]
         {
             fn chflags_entry(
@@ -11501,7 +11368,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         Some(w) => crate::baseobjspace::is_true(w)?,
                         None => true,
                     };
-                    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+                    let flags = if follow {
+                        majit_rlib::rposix::AT_SYMLINK_FOLLOW.expect("missing AT_SYMLINK_FOLLOW")
+                    } else {
+                        0
+                    };
                     let ret = unsafe {
                         majit_rlib::rposix::c_linkat(
                             src_dir_fd,
@@ -11612,7 +11483,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let flag = if follow_symlinks {
                         0
                     } else {
-                        libc::AT_SYMLINK_NOFOLLOW
+                        majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
                     };
                     unsafe {
                         majit_rlib::rposix::c_fchmodat(
@@ -11905,7 +11776,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flag = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             loop {
                 let ret = unsafe {
@@ -13505,60 +13376,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             pyre_object::w_int_new(majit_rlib::rposix::PRIO_USER.expect("missing PRIO_USER") as i64)
         );
 
-        // `posixmodule.c` `pathconf_names` — the `_PC_*` table
-        // `conv_path_confname` resolves a string `name` argument through.
-        // `libc` exports the constants only on the BSD family, so the glibc
-        // values (`bits/confname.h`) are spelled out for Linux.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_ALLOC_SIZE_MIN", libc::_PC_ALLOC_SIZE_MIN),
-            ("PC_ASYNC_IO", libc::_PC_ASYNC_IO),
-            ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
-            ("PC_FILESIZEBITS", libc::_PC_FILESIZEBITS),
-            ("PC_LINK_MAX", libc::_PC_LINK_MAX),
-            ("PC_MAX_CANON", libc::_PC_MAX_CANON),
-            ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
-            ("PC_MIN_HOLE_SIZE", libc::_PC_MIN_HOLE_SIZE),
-            ("PC_NAME_MAX", libc::_PC_NAME_MAX),
-            ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
-            ("PC_PATH_MAX", libc::_PC_PATH_MAX),
-            ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
-            ("PC_PRIO_IO", libc::_PC_PRIO_IO),
-            ("PC_REC_INCR_XFER_SIZE", libc::_PC_REC_INCR_XFER_SIZE),
-            ("PC_REC_MAX_XFER_SIZE", libc::_PC_REC_MAX_XFER_SIZE),
-            ("PC_REC_MIN_XFER_SIZE", libc::_PC_REC_MIN_XFER_SIZE),
-            ("PC_REC_XFER_ALIGN", libc::_PC_REC_XFER_ALIGN),
-            ("PC_SYMLINK_MAX", libc::_PC_SYMLINK_MAX),
-            ("PC_SYNC_IO", libc::_PC_SYNC_IO),
-            ("PC_VDISABLE", libc::_PC_VDISABLE),
-        ];
-        // glibc `bits/confname.h`. `libc` does not export `_PC_*` on linux.
-        #[cfg(target_os = "linux")]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_2_SYMLINKS", 20),
-            ("PC_ALLOC_SIZE_MIN", 18),
-            ("PC_ASYNC_IO", 10),
-            ("PC_CHOWN_RESTRICTED", 6),
-            ("PC_FILESIZEBITS", 13),
-            ("PC_LINK_MAX", 0),
-            ("PC_MAX_CANON", 1),
-            ("PC_MAX_INPUT", 2),
-            ("PC_NAME_MAX", 3),
-            ("PC_NO_TRUNC", 7),
-            ("PC_PATH_MAX", 4),
-            ("PC_PIPE_BUF", 5),
-            ("PC_PRIO_IO", 11),
-            ("PC_REC_INCR_XFER_SIZE", 14),
-            ("PC_REC_MAX_XFER_SIZE", 15),
-            ("PC_REC_MIN_XFER_SIZE", 16),
-            ("PC_REC_XFER_ALIGN", 17),
-            ("PC_SOCK_MAXBUF", 12),
-            ("PC_SYMLINK_MAX", 19),
-            ("PC_SYNC_IO", 9),
-            ("PC_VDISABLE", 8),
-        ];
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[];
+        // `interp_posix.py` `pathconf_names` / `sysconf_names` return
+        // `rposix.pathconf_names` / `rposix.sysconf_names`.
+        const PATHCONF_NAMES: &[(&str, i32)] = majit_rlib::rposix::PATHCONF_NAMES;
+        const SYSCONF_NAMES: &[(&str, i32)] = majit_rlib::rposix::SYSCONF_NAMES;
         /// The dict a `conv_confname` table is published as — `pathconf_names`
         /// for `pathconf`, `confstr_names` for `confstr`.
         fn store_names_dict(ns: PyObjectRef, key: &str, table: &[(&str, i32)]) {
@@ -13736,7 +13557,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("sysconf() requires name"));
                     }
-                    let name = confname_arg(args[0], sysconf_names())?;
+                    let name = confname_arg(args[0], SYSCONF_NAMES)?;
                     // `rposix.c_sysconf` uses `RFFI_FULL_ERRNO_ZERO`. `-1`
                     // with errno 0 is a published answer.
                     let v = unsafe { majit_rlib::rposix::c_sysconf(name) };
@@ -13755,7 +13576,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_sysconf_names);
         let names_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        for (name, value) in sysconf_names() {
+        for (name, value) in SYSCONF_NAMES {
             // Build the value first: call arguments evaluate left to right, so
             // reading the rooted dict inline would take its address before
             // `w_int_new` allocates, and a collection there would leave the
@@ -13775,72 +13596,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             pyre_object::gc_roots::shadow_stack_get(names_slot)
         );
 
-        // `posixmodule.c` `posix_constants_confstr` — the `_CS_*` table
-        // `conv_confstr_confname` resolves a string `name` argument through,
-        // and the same candidate set `rposix.py:2248-2300` names. Every entry
-        // there is `#ifdef`-guarded, so a host publishes exactly the names its
-        // own `<unistd.h>` defines; `libc` carries `_CS_PATH` alone, and the
-        // two numberings disagree from that first entry on — it is 1 on the
-        // Apple targets and 0 in glibc's `bits/confname.h` enum. The ten names
-        // the candidate set carries for the System V hosts (`CS_ARCHITECTURE`,
-        // `CS_HOSTNAME`, `CS_HW_PROVIDER`, `CS_HW_SERIAL`, `CS_INITTAB_NAME`,
-        // `CS_MACHINE`, `CS_RELEASE`, `CS_SRPC_DOMAIN`, `CS_SYSNAME`,
-        // `CS_VERSION`) are defined by neither header, so neither table has
-        // them.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[
-            ("CS_PATH", 1),
-            ("CS_XBS5_ILP32_OFF32_CFLAGS", 20),
-            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 21),
-            ("CS_XBS5_ILP32_OFF32_LIBS", 22),
-            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 23),
-            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 24),
-            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 25),
-            ("CS_XBS5_ILP32_OFFBIG_LIBS", 26),
-            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 27),
-            ("CS_XBS5_LP64_OFF64_CFLAGS", 28),
-            ("CS_XBS5_LP64_OFF64_LDFLAGS", 29),
-            ("CS_XBS5_LP64_OFF64_LIBS", 30),
-            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 31),
-            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 32),
-            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 33),
-            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 34),
-            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 35),
-        ];
-        // glibc numbers the enum from zero and restarts it twice, at 1000 for
-        // the large-file names and at 1100 for the XBS5 ones.
-        #[cfg(target_os = "linux")]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[
-            ("CS_PATH", 0),
-            ("CS_GNU_LIBC_VERSION", 2),
-            ("CS_GNU_LIBPTHREAD_VERSION", 3),
-            ("CS_LFS_CFLAGS", 1000),
-            ("CS_LFS_LDFLAGS", 1001),
-            ("CS_LFS_LIBS", 1002),
-            ("CS_LFS_LINTFLAGS", 1003),
-            ("CS_LFS64_CFLAGS", 1004),
-            ("CS_LFS64_LDFLAGS", 1005),
-            ("CS_LFS64_LIBS", 1006),
-            ("CS_LFS64_LINTFLAGS", 1007),
-            ("CS_XBS5_ILP32_OFF32_CFLAGS", 1100),
-            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 1101),
-            ("CS_XBS5_ILP32_OFF32_LIBS", 1102),
-            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 1103),
-            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 1104),
-            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 1105),
-            ("CS_XBS5_ILP32_OFFBIG_LIBS", 1106),
-            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 1107),
-            ("CS_XBS5_LP64_OFF64_CFLAGS", 1108),
-            ("CS_XBS5_LP64_OFF64_LDFLAGS", 1109),
-            ("CS_XBS5_LP64_OFF64_LIBS", 1110),
-            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 1111),
-            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 1112),
-            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 1113),
-            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 1114),
-            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 1115),
-        ];
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[];
+        // `interp_posix.py` `confstr_names` returns `rposix.confstr_names`.
+        const CONFSTR_NAMES: &[(&str, i32)] = majit_rlib::rposix::CONFSTR_NAMES;
         store_names_dict(
             pyre_object::gc_roots::shadow_stack_get(ns_slot),
             "confstr_names",
@@ -14248,10 +14005,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let mut flags = 0;
                     if !follow_symlinks {
-                        flags |= libc::AT_SYMLINK_NOFOLLOW;
+                        flags |= majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW");
                     }
                     if effective_ids {
-                        flags |= libc::AT_EACCESS;
+                        flags |= majit_rlib::rposix::AT_EACCESS.expect("missing AT_EACCESS");
                     }
                     unsafe {
                         majit_rlib::rposix::c_faccessat(dir_fd, c_path.as_ptr(), mode, flags) == 0
