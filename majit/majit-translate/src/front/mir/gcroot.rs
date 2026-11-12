@@ -2191,8 +2191,7 @@ pub(in crate::front::mir) fn trait_default_method_id(
     llbc.trait_by_id(trait_id)?
         .methods
         .get(method as usize)?
-        .pointer("/skip_binder/default/id")?
-        .as_u64()
+        .default_id
 }
 
 /// The function item a `FnDef` node names, spelled as the `RegularCall`
@@ -4509,24 +4508,20 @@ pub(in crate::front::mir) fn scope_owner_rendered_name(llbc: &Llbc, fd: &FunDecl
                     out.push_str(&disambiguator.to_string());
                 }
             }
-            NameSeg::Other(value) => {
-                if value.as_object().and_then(|map| map.get("Impl")).is_some() {
+            other => {
+                if other.is_impl() {
                     match owner.as_deref() {
                         Some(path) => out.push_str(path),
                         None => out.push_str("<Impl>"),
                     }
                     continue;
                 }
-                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(value) {
+                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(other) {
                     out.push_str(&label);
                     continue;
                 }
-                let label = value
-                    .as_object()
-                    .and_then(|map| map.keys().next().cloned())
-                    .unwrap_or_else(|| "?".into());
                 out.push('<');
-                out.push_str(&label);
+                out.push_str(other.first_key_label());
                 out.push('>');
             }
         }

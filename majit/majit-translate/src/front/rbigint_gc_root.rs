@@ -72,7 +72,10 @@ pub(super) enum Op {
 }
 
 pub(super) fn is_root_path(path: &str) -> bool {
-    path == PATH || path.ends_with(&format!("::{PATH}"))
+    path == PATH
+        || path
+            .strip_suffix(PATH)
+            .is_some_and(|head| head.ends_with("::"))
 }
 
 fn is_rbigint_path(path: &str) -> bool {
@@ -80,14 +83,17 @@ fn is_rbigint_path(path: &str) -> bool {
 }
 
 fn is_rbigint_decl_path(path: &str) -> bool {
-    path == RBIGINT_PATH || path.ends_with(&format!("::{RBIGINT_PATH}"))
+    path == RBIGINT_PATH
+        || path
+            .strip_suffix(RBIGINT_PATH)
+            .is_some_and(|head| head.ends_with("::"))
 }
 
 fn type_id_is_root(id: u64, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    if is_root_path(&td.item_meta.name_path()) {
+    if is_root_path(td.item_meta.name_path_str()) {
         return true;
     }
     let TypeDeclKind::Alias(body) = &td.kind else {
@@ -98,12 +104,12 @@ fn type_id_is_root(id: u64, llbc: &Llbc) -> bool {
 
 fn type_id_is_rbigint(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id)
-        .is_some_and(|td| is_rbigint_path(&td.item_meta.name_path()))
+        .is_some_and(|td| is_rbigint_path(td.item_meta.name_path_str()))
 }
 
 fn type_id_is_option(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id)
-        .is_some_and(|td| td.item_meta.name_path() == OPTION_PATH)
+        .is_some_and(|td| td.item_meta.name_path_str() == OPTION_PATH)
 }
 
 /// `node` is the handle ADT, after dedup, hash-cons wrappers, and aliases.
@@ -113,7 +119,7 @@ pub(super) fn type_node_is_root(node: &serde_json::Value, llbc: &Llbc) -> bool {
     };
     super::adt_node_def_id(node).is_some_and(|id| {
         llbc.type_by_id(id)
-            .is_some_and(|td| is_root_path(&td.item_meta.name_path()))
+            .is_some_and(|td| is_root_path(td.item_meta.name_path_str()))
     })
 }
 
@@ -156,7 +162,7 @@ pub(super) fn erased_value_ty(id: u64, llbc: &Llbc) -> Option<TyRef> {
 
 fn resolved_root_id(id: u64, llbc: &Llbc) -> Option<u64> {
     let td = llbc.type_by_id(id)?;
-    if is_root_path(&td.item_meta.name_path()) {
+    if is_root_path(td.item_meta.name_path_str()) {
         return Some(id);
     }
     let TypeDeclKind::Alias(body) = &td.kind else {
@@ -166,7 +172,7 @@ fn resolved_root_id(id: u64, llbc: &Llbc) -> Option<u64> {
     let peeled = super::type_node_peel_aliases(node, llbc)?;
     super::adt_node_def_id(peeled).filter(|&peeled_id| {
         llbc.type_by_id(peeled_id)
-            .is_some_and(|td| is_root_path(&td.item_meta.name_path()))
+            .is_some_and(|td| is_root_path(td.item_meta.name_path_str()))
     })
 }
 
@@ -185,7 +191,7 @@ fn erased_value_from_fields(id: u64, llbc: &Llbc) -> Option<TyRef> {
 
 fn rbigint_tyref_by_path(llbc: &Llbc) -> Option<TyRef> {
     llbc.iter_type_decls().find_map(|td| {
-        is_rbigint_decl_path(&td.item_meta.name_path())
+        is_rbigint_decl_path(td.item_meta.name_path_str())
             .then(|| super::type_decl_adt_tyref(td.def_id))
     })
 }
@@ -201,7 +207,7 @@ fn rbigint_type_node(id: u64, llbc: &Llbc) -> Option<serde_json::Value> {
 /// `RBigInt`. Classify erases values only when this is true.
 fn root_erasure_ready(llbc: &Llbc) -> bool {
     llbc.iter_type_decls().all(|td| {
-        !is_root_path(&td.item_meta.name_path()) || erased_value_ty(td.def_id, llbc).is_some()
+        !is_root_path(td.item_meta.name_path_str()) || erased_value_ty(td.def_id, llbc).is_some()
     })
 }
 
@@ -310,16 +316,9 @@ fn rewrite_seq(
 fn fn_leaf(fd: &FunDecl) -> Option<&str> {
     match fd.item_meta.name.last()? {
         NameSeg::Ident { ident: (leaf, _) } => Some(leaf.as_str()),
-        NameSeg::Other(value) => builtin_leaf(value),
+        NameSeg::Builtin { kind, .. } => Some(kind.as_str()),
+        _ => None,
     }
-}
-
-fn builtin_leaf(value: &serde_json::Value) -> Option<&str> {
-    let builtin = value.as_object()?.get("Builtin")?;
-    if let Some(arr) = builtin.as_array() {
-        return arr.first()?.as_str();
-    }
-    None
 }
 
 /// Adt id of the inherent or trait impl this method belongs to.
@@ -331,11 +330,11 @@ fn impl_self_id(fd: &FunDecl, llbc: &Llbc) -> Option<u64> {
     if last_ident == 0 {
         return None;
     }
-    let NameSeg::Other(value) = &segs[last_ident - 1] else {
+    let impl_seg = &segs[last_ident - 1];
+    if !impl_seg.is_impl() {
         return None;
-    };
-    let payload = value.as_object()?.get("Impl")?;
-    super::resolve_impl_owner_adt_def_id_free(llbc, payload)
+    }
+    super::resolve_impl_owner_adt_def_id_free(llbc, impl_seg)
 }
 
 fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
@@ -446,7 +445,21 @@ fn contains_ty(ty: &TyRef, llbc: &Llbc, depth: usize, seen: &mut Vec<u64>) -> bo
 }
 
 fn type_exposes_root(ty: &TyRef, llbc: &Llbc) -> bool {
-    contains_ty(ty, llbc, 0, &mut Vec::new())
+    let id = match ty {
+        TyRef::Dedup { id } => Some(*id),
+        TyRef::Inline { value: (id, _) } => Some(*id),
+        TyRef::Other(_) => None,
+    };
+    if let Some(id) = id
+        && let Some(cached) = llbc.type_flag_memo_get(id)
+    {
+        return cached;
+    }
+    let value = contains_ty(ty, llbc, 0, &mut Vec::new());
+    if let Some(id) = id {
+        llbc.type_flag_memo_set(id, value);
+    }
+    value
 }
 
 fn arg_is_erased_drop(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -454,23 +467,19 @@ fn arg_is_erased_drop(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 fn path_is(path: &str, item: &str) -> bool {
-    path == item || path.ends_with(&format!("::{item}"))
+    path == item
+        || path
+            .strip_suffix(item)
+            .is_some_and(|head| head.ends_with("::"))
 }
 
 /// Charon `PathElem::Builtin(DropGlue, n)` — the drop-glue item whose
 /// `name_path` leaf is rendered `drop_in_place`.
 fn is_drop_glue_item(fd: &FunDecl) -> bool {
-    fd.item_meta.template_name().last().is_some_and(|seg| {
-        let NameSeg::Other(value) = seg else {
-            return false;
-        };
-        value
-            .get("Builtin")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(serde_json::Value::as_str)
-            == Some("DropGlue")
-    })
+    fd.item_meta
+        .template_name()
+        .last()
+        .is_some_and(|seg| matches!(seg, NameSeg::Builtin { kind, .. } if kind == "DropGlue"))
 }
 
 /// `SimpleCall.eval` (`rpython/flowspace/operation.py`) keys special
@@ -479,14 +488,14 @@ fn is_destructor_callable(fd: &FunDecl) -> bool {
     if is_drop_glue_item(fd) {
         return true;
     }
-    let path = fd.item_meta.name_path();
-    path_is(&path, "core::ptr::drop_in_place") || path_is(&path, "core::ops::drop::Drop::drop")
+    let path = fd.item_meta.name_path_str();
+    path_is(path, "core::ptr::drop_in_place") || path_is(path, "core::ops::drop::Drop::drop")
 }
 
 fn is_deref_callable(fd: &FunDecl) -> bool {
-    let path = fd.item_meta.name_path();
-    path_is(&path, "core::ops::deref::Deref::deref")
-        || path_is(&path, "core::ops::deref::DerefMut::deref_mut")
+    let path = fd.item_meta.name_path_str();
+    path_is(path, "core::ops::deref::Deref::deref")
+        || path_is(path, "core::ops::deref::DerefMut::deref_mut")
 }
 
 fn arg_is_root_or_borrow(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -594,7 +603,7 @@ fn callee_stays_residual(
     if fd.unstructured().is_none() {
         return true;
     }
-    let path = super::strip_crate_prefix(&fd.item_meta.name_path());
+    let path = super::strip_crate_prefix(fd.item_meta.name_path_str());
     dont_look_inside.contains(&path)
 }
 
@@ -1440,11 +1449,11 @@ mod tests {
         assert_eq!(residual_escape(&call, &lowered, &empty), None);
 
         let opaque_path = super::super::strip_crate_prefix(
-            &lowered
+            lowered
                 .fn_by_id(0)
                 .expect("is_some fixture")
                 .item_meta
-                .name_path(),
+                .name_path_str(),
         );
         let mut dont_look_inside = HashSet::new();
         dont_look_inside.insert(opaque_path);

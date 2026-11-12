@@ -90,16 +90,9 @@ pub(super) fn tyref_is_erased_drop(ty: &TyRef, llbc: &Llbc) -> bool {
 fn fn_leaf(fd: &FunDecl) -> Option<&str> {
     match fd.item_meta.name.last()? {
         NameSeg::Ident { ident: (leaf, _) } => Some(leaf.as_str()),
-        NameSeg::Other(value) => builtin_leaf(value),
+        NameSeg::Builtin { kind, .. } => Some(kind.as_str()),
+        _ => None,
     }
-}
-
-fn builtin_leaf(value: &serde_json::Value) -> Option<&str> {
-    let builtin = value.as_object()?.get("Builtin")?;
-    if let Some(arr) = builtin.as_array() {
-        return arr.first()?.as_str();
-    }
-    None
 }
 
 /// Adt id of the inherent or trait impl this method belongs to.
@@ -111,11 +104,11 @@ fn impl_self_id(fd: &FunDecl, llbc: &Llbc) -> Option<u64> {
     if last_ident == 0 {
         return None;
     }
-    let NameSeg::Other(value) = &segs[last_ident - 1] else {
+    let impl_seg = &segs[last_ident - 1];
+    if !impl_seg.is_impl() {
         return None;
-    };
-    let payload = value.as_object()?.get("Impl")?;
-    super::resolve_impl_owner_adt_def_id_free(llbc, payload)
+    }
+    super::resolve_impl_owner_adt_def_id_free(llbc, impl_seg)
 }
 
 fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {

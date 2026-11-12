@@ -753,14 +753,48 @@ fn raw_object_first_key_is(raw: &str, key: &str) -> bool {
 
 /// Static or const item referenced via [`PlaceKind::Global`].
 ///
-/// `rest` holds only `global_kind`, `ty` and `value`, the keys the
-/// translator reads.
+/// Keeps `global_kind`, the integer width of `ty` (or its dedup id), and
+/// `value` projected to an init-fun id or a const-expr the literal
+/// readers accept. serde skips `generics`, `size`, `align`,
+/// `ptr_metadata`, `src`.
 #[derive(Debug, Deserialize)]
 #[serde(from = "GlobalDeclFields")]
 pub struct GlobalDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
-    pub rest: std::collections::BTreeMap<String, Value>,
+    pub global_kind: GlobalKind,
+    pub ty: Option<GlobalTy>,
+    pub value: Option<GlobalValue>,
+}
+
+/// `global_kind` string labels the translator compares, plus `Static`
+/// objects that never match [`GlobalDecl::global_kind_str`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlobalKind {
+    NamedConst,
+    AnonConst,
+    ThreadLocal,
+    Static,
+    #[default]
+    Other,
+}
+
+/// Primitive integer width of a global's `ty`, or a dedup id resolved
+/// at the MIN/MAX associated-const site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GlobalTy {
+    Dedup(u64),
+    Signed(String),
+    Unsigned(String),
+}
+
+/// Projected `value`: an initializer FunDecl id, or a const-expr
+/// [`crate::Llbc::const_expr_literal`] accepts (`Value` / `Deduplicated`
+/// wrappers around Integer / Bool / Char / Float / Str / ByteStr).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GlobalValue {
+    InitFun(u64),
+    ConstExpr(Value),
 }
 
 /// The `GlobalDecl` fields the translator reads; serde skips the others
@@ -779,29 +813,110 @@ struct GlobalDeclFields {
 
 impl From<GlobalDeclFields> for GlobalDecl {
     fn from(fields: GlobalDeclFields) -> Self {
-        let mut rest = std::collections::BTreeMap::new();
-        if let Some(global_kind) = fields.global_kind {
-            rest.insert("global_kind".to_string(), global_kind);
-        }
-        if let Some(ty) = fields.ty {
-            rest.insert("ty".to_string(), ty);
-        }
-        if let Some(value) = fields.value {
-            rest.insert("value".to_string(), value);
-        }
         GlobalDecl {
             def_id: fields.def_id,
             item_meta: fields.item_meta,
-            rest,
+            global_kind: fields
+                .global_kind
+                .map(project_global_kind)
+                .unwrap_or(GlobalKind::Other),
+            ty: fields.ty.and_then(project_global_ty),
+            value: fields.value.and_then(project_global_value),
         }
     }
 }
 
+fn project_global_kind(kind: Value) -> GlobalKind {
+    if let Some(label) = kind.as_str() {
+        return match label {
+            "NamedConst" => GlobalKind::NamedConst,
+            "AnonConst" => GlobalKind::AnonConst,
+            "ThreadLocal" => GlobalKind::ThreadLocal,
+            _ => GlobalKind::Other,
+        };
+    }
+    if kind
+        .as_object()
+        .is_some_and(|map| map.contains_key("Static"))
+    {
+        GlobalKind::Static
+    } else {
+        GlobalKind::Other
+    }
+}
+
+fn project_global_ty(ty: Value) -> Option<GlobalTy> {
+    if let Some(id) = ty.get("Deduplicated").and_then(Value::as_u64) {
+        return Some(GlobalTy::Dedup(id));
+    }
+    let body = ty
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|pair| pair.get(1))
+        .unwrap_or(&ty);
+    integer_width_ty(body)
+}
+
+fn integer_width_ty(ty: &Value) -> Option<GlobalTy> {
+    let literal = ty.get("Scalar")?.as_object()?;
+    let literal = literal
+        .get("Integer")
+        .and_then(Value::as_object)
+        .unwrap_or(literal);
+    if let Some(width) = literal.get("Signed").and_then(Value::as_str) {
+        return Some(GlobalTy::Signed(width.to_string()));
+    }
+    if let Some(width) = literal.get("Unsigned").and_then(Value::as_str) {
+        return Some(GlobalTy::Unsigned(width.to_string()));
+    }
+    None
+}
+
+fn project_global_value(value: Value) -> Option<GlobalValue> {
+    if let Some(id) = init_fun_id_from_value(&value) {
+        return Some(GlobalValue::InitFun(id));
+    }
+    const_expr_shape(&value).then_some(GlobalValue::ConstExpr(value))
+}
+
+fn const_expr_shape(value: &Value) -> bool {
+    if value.get("Deduplicated").and_then(Value::as_u64).is_some() {
+        return true;
+    }
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|pair| pair.get(1))
+        .unwrap_or(value);
+    let Some(kind) = body.as_array().and_then(|arr| arr.first()) else {
+        return false;
+    };
+    ["Integer", "Bool", "Char", "Float", "Str", "ByteStr"]
+        .iter()
+        .any(|lit| kind.get(*lit).is_some())
+}
+
+/// Init fun id stored in a global `value` as `Value[1][0].Call[0].kind.Fun`.
+fn init_fun_id_from_value(value: &Value) -> Option<u64> {
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let lit = body.as_array()?.first()?;
+    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
+}
+
 impl GlobalDecl {
     /// `"NamedConst"` / `"AnonConst"` / `"ThreadLocal"`, or `None` when
-    /// `global_kind` is an object (`{"Static": {..}}`).
+    /// `global_kind` is an object (`{"Static": {..}}`) or another label.
     pub fn global_kind_str(&self) -> Option<&str> {
-        self.rest.get("global_kind").and_then(Value::as_str)
+        match self.global_kind {
+            GlobalKind::NamedConst => Some("NamedConst"),
+            GlobalKind::AnonConst => Some("AnonConst"),
+            GlobalKind::ThreadLocal => Some("ThreadLocal"),
+            GlobalKind::Static | GlobalKind::Other => None,
+        }
     }
 
     /// A translation-time value: a named `const`, or rustc's promoted
@@ -809,7 +924,27 @@ impl GlobalDecl {
     /// The promoted form copies the named const and returns a shared
     /// reference to it; both kinds fold as the same host value.
     pub fn is_const_value(&self) -> bool {
-        matches!(self.global_kind_str(), Some("NamedConst" | "AnonConst"))
+        matches!(
+            self.global_kind,
+            GlobalKind::NamedConst | GlobalKind::AnonConst
+        )
+    }
+
+    /// FunDecl id of the initializer `Call` in `value`, when that is how
+    /// the const is stored.
+    pub fn init_fun_id(&self) -> Option<u64> {
+        match self.value {
+            Some(GlobalValue::InitFun(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Const-expr wrapper [`crate::Llbc::const_expr_literal`] accepts.
+    pub fn const_expr(&self) -> Option<&Value> {
+        match &self.value {
+            Some(GlobalValue::ConstExpr(value)) => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -844,8 +979,10 @@ pub struct TypeDecl {
     layout_exprs: std::sync::OnceLock<Option<Vec<TargetLayoutExprs>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
     /// closure environment is `{"Closure": …}`; an ordinary ADT is the
-    /// string `"Normal"`. The first key (or string label) is kept; unread
-    /// payloads are skipped so an unmodelled origin cannot fail the load.
+    /// string `"Normal"`. Closure keeps `info.kind`, `info.closure_body.id`,
+    /// and `info.fn_mut_impl.skip_binder.id`; a Builtin payload is kept only
+    /// when it is a string. Other unread payloads are skipped so an
+    /// unmodelled origin cannot fail the load.
     #[serde(default)]
     pub src: TypeDeclSrc,
     /// Thin vs fat pointer metadata for this type. Charon writes the
@@ -863,17 +1000,26 @@ pub struct TypeDecl {
 }
 
 /// Origin of a [`TypeDecl`]: the first JSON key or string label. A Closure
-/// keeps its payload's `info` (`kind`, `closure_body`, `fn_mut_impl`); a
-/// VTable payload is skipped; a Builtin payload is kept only when it is a
-/// string (`"Box"`).
+/// keeps `info.kind`, `info.closure_body.id`, and
+/// `info.fn_mut_impl.skip_binder.id`; a Builtin payload is kept only when
+/// it is a string (`"Box"`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TypeDeclSrc {
     #[default]
     Normal,
-    Closure(Option<Box<Value>>),
+    Closure(ClosureSrc),
     Builtin(Option<String>),
     VTable,
     Other(String),
+}
+
+/// `TypeDecl.src.Closure.info` fields `array_from_fn_plan` reads to name
+/// the `call_mut` / `call` FunDecl.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClosureSrc {
+    pub kind: Option<String>,
+    pub closure_body_id: Option<u64>,
+    pub fn_mut_impl_id: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for TypeDeclSrc {
@@ -925,10 +1071,7 @@ impl<'de> serde::de::Visitor<'de> for TypeDeclSrcVisitor {
             return Ok(TypeDeclSrc::Normal);
         };
         let src = match key.as_str() {
-            "Closure" => {
-                let mut payload = map.next_value::<Value>()?;
-                TypeDeclSrc::Closure(payload.get_mut("info").map(|info| Box::new(info.take())))
-            }
+            "Closure" => TypeDeclSrc::Closure(map.next_value::<ClosureSrcRow>()?.into_src()),
             "VTable" => {
                 let _ = map.next_value::<serde::de::IgnoredAny>()?;
                 TypeDeclSrc::VTable
@@ -978,6 +1121,65 @@ impl<'de> serde::de::Visitor<'de> for TypeDeclSrcVisitor {
     fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
         Ok(TypeDeclSrc::Normal)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClosureSrcRow {
+    Obj {
+        #[serde(default)]
+        info: Option<ClosureInfoRow>,
+    },
+    Other(serde::de::IgnoredAny),
+}
+
+impl ClosureSrcRow {
+    fn into_src(self) -> ClosureSrc {
+        let ClosureSrcRow::Obj { info: Some(info) } = self else {
+            return ClosureSrc::default();
+        };
+        ClosureSrc {
+            kind: info.kind.and_then(|kind| match kind {
+                Value::String(s) => Some(s),
+                _ => None,
+            }),
+            closure_body_id: match info.closure_body {
+                Some(crate::schema::Nullable::Some(body)) => body.id.and_then(|id| id.as_u64()),
+                _ => None,
+            },
+            fn_mut_impl_id: match info.fn_mut_impl {
+                Some(crate::schema::Nullable::Some(impl_ref)) => match impl_ref.skip_binder {
+                    Some(crate::schema::Nullable::Some(binder)) => {
+                        binder.id.and_then(|id| id.as_u64())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ClosureInfoRow {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    kind: Option<Value>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    closure_body: Option<crate::schema::Nullable<ClosureIdRow>>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    fn_mut_impl: Option<crate::schema::Nullable<ClosureImplRow>>,
+}
+
+#[derive(Deserialize)]
+struct ClosureIdRow {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    id: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ClosureImplRow {
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    skip_binder: Option<crate::schema::Nullable<ClosureIdRow>>,
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].
@@ -1713,16 +1915,87 @@ impl VariantDecl {
 }
 
 /// Trait declaration — referenced when populating
-/// `SemanticProgram.known_trait_names`. Body intentionally minimal:
-/// only `item_meta.name_path()` is consumed.
+/// `SemanticProgram.known_trait_names`. `methods` carries the name a
+/// `CallKind::Trait` payload indexes, the provided-body id, and whether
+/// the signature lists a receiver.
 #[derive(Debug, Deserialize)]
 pub struct TraitDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     /// `methods[i].skip_binder.name` is the method a `CallKind::Trait`
     /// payload names by index. The payload no longer carries a fun-decl id.
-    #[serde(default)]
-    pub methods: Vec<Value>,
+    /// Also `skip_binder.default.id` and whether `signature.inputs` is a
+    /// nonempty array.
+    #[serde(default, deserialize_with = "trait_methods")]
+    pub methods: Vec<TraitMethod>,
+}
+
+/// One `TraitDecl.methods[]` row: name, provided-body id, and whether
+/// the signature lists a receiver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TraitMethod {
+    pub name: Option<String>,
+    pub default_id: Option<u64>,
+    pub has_inputs: bool,
+}
+
+fn trait_methods<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<TraitMethod>, D::Error> {
+    Ok(Vec::<Option<TraitMethodRow>>::deserialize(d)?
+        .into_iter()
+        .map(|row| row.map(TraitMethodRow::into_method).unwrap_or_default())
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct TraitMethodRow {
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    skip_binder: Option<crate::schema::Nullable<TraitMethodBinder>>,
+}
+
+impl TraitMethodRow {
+    fn into_method(self) -> TraitMethod {
+        let Some(crate::schema::Nullable::Some(binder)) = self.skip_binder else {
+            return TraitMethod::default();
+        };
+        TraitMethod {
+            name: binder.name.and_then(|name| match name {
+                Value::String(s) => Some(s),
+                _ => None,
+            }),
+            default_id: match binder.default {
+                Some(crate::schema::Nullable::Some(default)) => {
+                    default.id.and_then(|id| id.as_u64())
+                }
+                _ => None,
+            },
+            has_inputs: match binder.signature {
+                Some(crate::schema::Nullable::Some(sig)) => sig.inputs,
+                _ => false,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TraitMethodBinder {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    name: Option<Value>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    default: Option<crate::schema::Nullable<TraitMethodDefault>>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    signature: Option<crate::schema::Nullable<TraitMethodSig>>,
+}
+
+#[derive(Deserialize)]
+struct TraitMethodDefault {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    id: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct TraitMethodSig {
+    #[serde(default, deserialize_with = "nonempty_json_array")]
+    inputs: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1757,10 +2030,7 @@ impl ItemMeta {
     /// The last such segment wins: an item nested inside a trait impl
     /// belongs to the innermost one.
     pub fn trait_impl_id(&self) -> Option<u64> {
-        self.name.iter().rev().find_map(|seg| match seg {
-            NameSeg::Other(v) => v.get("Impl")?.get("Trait")?.as_u64(),
-            NameSeg::Ident { .. } => None,
-        })
+        self.name.iter().rev().find_map(NameSeg::impl_trait_id)
     }
 
     /// `"crate::module::item"`-style flattened name. Trait-impl
@@ -1806,17 +2076,13 @@ impl ItemMeta {
                         out.push_str(&disambiguator.to_string());
                     }
                 }
-                NameSeg::Other(v) => {
-                    if let Some(label) = builtin_path_label(v) {
+                other => {
+                    if let Some(label) = builtin_path_label(other) {
                         out.push_str(&label);
                         continue;
                     }
-                    let label = v
-                        .as_object()
-                        .and_then(|m| m.keys().next().cloned())
-                        .unwrap_or_else(|| "?".into());
                     out.push('<');
-                    out.push_str(&label);
+                    out.push_str(other.first_key_label());
                     out.push('>');
                 }
             }
@@ -1831,7 +2097,7 @@ impl ItemMeta {
     pub fn template_name(&self) -> impl DoubleEndedIterator<Item = &NameSeg> {
         self.name
             .iter()
-            .filter(|seg| !matches!(seg, NameSeg::Other(v) if instantiated_args(v).is_some()))
+            .filter(|seg| !matches!(seg, NameSeg::Instantiated { .. }))
     }
 
     /// The generic arguments of a monomorphized item: the `skip_binder` of
@@ -1843,16 +2109,10 @@ impl ItemMeta {
     /// indexes by; [`Self::name_path`] is the desc's name.
     pub fn instantiation(&self) -> Option<&Value> {
         self.name.iter().rev().find_map(|seg| match seg {
-            NameSeg::Other(v) => instantiated_args(v),
-            NameSeg::Ident { .. } => None,
+            NameSeg::Instantiated { skip_binder } => Some(skip_binder.as_ref()),
+            _ => None,
         })
     }
-}
-
-/// The `skip_binder` generic arguments of a `PathElem::Instantiated`
-/// segment, spelled `{"Instantiated": {"params": .., "skip_binder": ..}}`.
-fn instantiated_args(seg: &Value) -> Option<&Value> {
-    seg.as_object()?.get("Instantiated")?.get("skip_binder")
 }
 
 /// Whether a struct-root leaf names a closure env — the bare `closure`
@@ -1898,10 +2158,15 @@ fn numbered_builtin_leaf(kind: &str, n: u64) -> String {
 ///   `<Builtin>` path.
 ///
 /// Other builtins stay on the `<Builtin>` label.
-pub fn builtin_path_label(seg: &Value) -> Option<String> {
-    let arr = seg.as_object()?.get("Builtin")?.as_array()?;
-    let n = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
-    match arr.first().and_then(Value::as_str)? {
+pub fn builtin_path_label(seg: &NameSeg) -> Option<String> {
+    match seg {
+        NameSeg::Builtin { kind, n } => builtin_kind_path_label(kind, *n),
+        _ => None,
+    }
+}
+
+fn builtin_kind_path_label(kind: &str, n: u64) -> Option<String> {
+    match kind {
         "Closure" => Some(numbered_builtin_leaf("closure", n)),
         "DropGlue" => Some("drop_in_place".to_string()),
         "VTable" => Some("{vtable}".to_string()),
@@ -1913,14 +2178,235 @@ pub fn builtin_path_label(seg: &Value) -> Option<String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// One path element of [`ItemMeta::name`].
+#[derive(Clone, Debug, PartialEq)]
 pub enum NameSeg {
     Ident {
-        #[serde(rename = "Ident")]
         ident: (String, u64),
     },
-    Other(Value),
+    /// `{"Impl": …}`. `Trait` and `Ty` may both be present; a kind-only
+    /// inherent impl carries neither.
+    Impl {
+        trait_id: Option<u64>,
+        skip_binder: Option<Box<Value>>,
+    },
+    Builtin {
+        kind: String,
+        n: u64,
+    },
+    Instantiated {
+        skip_binder: Box<Value>,
+    },
+    Other {
+        label: String,
+    },
+}
+
+impl NameSeg {
+    /// `{"Impl": {"Trait": id}}`.
+    pub fn impl_trait_id(&self) -> Option<u64> {
+        match self {
+            NameSeg::Impl { trait_id, .. } => *trait_id,
+            _ => None,
+        }
+    }
+
+    /// `{"Impl": {"Ty": {"skip_binder": …}}}` (or `Ty.value` when
+    /// `skip_binder` is absent).
+    pub fn impl_ty_skip_binder(&self) -> Option<&Value> {
+        match self {
+            NameSeg::Impl { skip_binder, .. } => skip_binder.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Inherent or trait impl segment, including a kind-only `Impl`.
+    pub fn is_impl(&self) -> bool {
+        matches!(self, NameSeg::Impl { .. })
+    }
+
+    /// First JSON object key, the label [`ItemMeta::name_path`] wraps in
+    /// `<…>` when [`builtin_path_label`] does not apply.
+    pub fn first_key_label(&self) -> &str {
+        match self {
+            NameSeg::Ident { .. } => "Ident",
+            NameSeg::Impl { .. } => "Impl",
+            NameSeg::Builtin { .. } => "Builtin",
+            NameSeg::Instantiated { .. } => "Instantiated",
+            NameSeg::Other { label } => label,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NameSeg {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(NameSegVisitor)
+    }
+}
+
+struct NameSegVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NameSegVisitor {
+    type Value = NameSeg;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a name segment")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Some(key) = map.next_key::<String>()? else {
+            return Ok(NameSeg::Other {
+                label: "?".to_string(),
+            });
+        };
+        let seg = match key.as_str() {
+            "Ident" => match map.next_value::<IdentPayload>()? {
+                IdentPayload::Pair(ident) => NameSeg::Ident { ident },
+                IdentPayload::Other(_) => NameSeg::Other {
+                    label: "Ident".to_string(),
+                },
+            },
+            "Impl" => {
+                let payload = map.next_value::<ImplPayload>()?;
+                let trait_id = payload.trait_.as_ref().and_then(Value::as_u64);
+                let skip_binder = payload
+                    .ty
+                    .and_then(|ty| ty.skip_binder.or(ty.value))
+                    .map(Box::new);
+                NameSeg::Impl {
+                    trait_id,
+                    skip_binder,
+                }
+            }
+            "Builtin" => match map.next_value::<BuiltinPayload>()? {
+                BuiltinPayload::Pair((kind, n)) => NameSeg::Builtin { kind, n },
+                BuiltinPayload::Arr(arr) => match arr.first().and_then(Value::as_str) {
+                    Some(kind) => NameSeg::Builtin {
+                        kind: kind.to_string(),
+                        n: arr.get(1).and_then(Value::as_u64).unwrap_or(0),
+                    },
+                    None => NameSeg::Other {
+                        label: "Builtin".to_string(),
+                    },
+                },
+                BuiltinPayload::Other(_) => NameSeg::Other {
+                    label: "Builtin".to_string(),
+                },
+            },
+            "Instantiated" => {
+                let payload = map.next_value::<InstantiatedPayload>()?;
+                match payload.skip_binder {
+                    Some(skip_binder) => NameSeg::Instantiated {
+                        skip_binder: Box::new(skip_binder),
+                    },
+                    None => NameSeg::Other {
+                        label: "Instantiated".to_string(),
+                    },
+                }
+            }
+            _ => {
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                NameSeg::Other { label: key }
+            }
+        };
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(seg)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_string<E: serde::de::Error>(self, _: String) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(NameSeg::Other {
+            label: "?".to_string(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IdentPayload {
+    Pair((String, u64)),
+    Other(serde::de::IgnoredAny),
+}
+
+#[derive(Deserialize)]
+struct ImplPayload {
+    #[serde(default, rename = "Trait", deserialize_with = "crate::schema::present")]
+    trait_: Option<Value>,
+    #[serde(default, rename = "Ty")]
+    ty: Option<ImplTyPayload>,
+}
+
+#[derive(Deserialize)]
+struct ImplTyPayload {
+    #[serde(default)]
+    skip_binder: Option<Value>,
+    #[serde(default)]
+    value: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BuiltinPayload {
+    Pair((String, u64)),
+    Arr(Vec<Value>),
+    Other(serde::de::IgnoredAny),
+}
+
+#[derive(Deserialize)]
+struct InstantiatedPayload {
+    #[serde(default)]
+    skip_binder: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2341,7 +2827,7 @@ fn promoted_init_from_global(
     gd: &GlobalDecl,
     dedup_const: &[(u64, crate::DedupBody)],
 ) -> Option<PromotedRead> {
-    if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
+    if gd.global_kind != GlobalKind::AnonConst {
         return None;
     }
     if !gd
@@ -2352,7 +2838,7 @@ fn promoted_init_from_global(
     {
         return None;
     }
-    if let Some(init_id) = global_init_fun_id(gd) {
+    if let Some(init_id) = gd.init_fun_id() {
         let init_fd = file
             .translated
             .fun_decls
@@ -2362,7 +2848,7 @@ fn promoted_init_from_global(
             &init_fd.unstructured()?,
         )?));
     }
-    let value = gd.rest.get("value")?;
+    let value = gd.const_expr()?;
     let str_lit = |const_id: u64, body: &Value| -> Option<PromotedRead> {
         let kind = body.as_array()?.first()?;
         kind.get("Str").and_then(Value::as_str)?;
@@ -2382,27 +2868,10 @@ fn promoted_init_from_global(
 }
 
 fn is_promoted_const_segment(seg: &NameSeg) -> bool {
-    let NameSeg::Other(v) = seg else {
-        return false;
-    };
-    v.get("Builtin")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(Value::as_str)
-        == Some("PromotedConst")
-}
-
-/// Init fun id stored in `gd.rest["value"]` as
-/// `Value[1][0].Call[0].kind.Fun`.
-fn global_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
-    let value = gd.rest.get("value")?;
-    let body = value
-        .get("Value")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.get(1))
-        .unwrap_or(value);
-    let lit = body.as_array()?.first()?;
-    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
+    matches!(
+        seg,
+        NameSeg::Builtin { kind, .. } if kind == "PromotedConst"
+    )
 }
 
 fn is_return_terminator(kind: &Value) -> bool {
@@ -3918,10 +4387,10 @@ mod tests {
             (r#"{"Builtin":["VTableMethod",0]}"#, "{vtable_method}"),
         ];
         for (json, want) in cases {
-            let v: Value = serde_json::from_str(json).unwrap();
+            let v: NameSeg = serde_json::from_str(json).unwrap();
             assert_eq!(builtin_path_label(&v).as_deref(), Some(want), "{json}");
         }
-        let unknown: Value = serde_json::from_str(r#"{"Builtin":["OtherKind",0]}"#).unwrap();
+        let unknown: NameSeg = serde_json::from_str(r#"{"Builtin":["OtherKind",0]}"#).unwrap();
         assert_eq!(builtin_path_label(&unknown), None);
 
         let meta = item_meta(serde_json::json!([
@@ -4438,7 +4907,10 @@ mod tests {
         assert_eq!(parse(Value::Null), TypeDeclSrc::Normal);
         assert_eq!(
             parse(serde_json::json!({"Closure": {"info": {"kind": "FnOnce"}}})),
-            TypeDeclSrc::Closure(Some(Box::new(serde_json::json!({"kind": "FnOnce"}))))
+            TypeDeclSrc::Closure(ClosureSrc {
+                kind: Some("FnOnce".into()),
+                ..ClosureSrc::default()
+            })
         );
         assert_eq!(
             parse(serde_json::json!({"Builtin": "Box"})),
@@ -4460,6 +4932,152 @@ mod tests {
             parse(serde_json::json!({"Mystery": {"keep": false}})),
             TypeDeclSrc::Other("Mystery".into())
         );
+    }
+
+    #[test]
+    fn name_seg_classifies_impl_builtin_and_instantiated() {
+        let parse = |v: Value| serde_json::from_value::<NameSeg>(v).expect("NameSeg parses");
+        assert_eq!(
+            parse(serde_json::json!({"Ident": ["foo", 1]})),
+            NameSeg::Ident {
+                ident: ("foo".into(), 1)
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"Impl": {"Trait": 7}})),
+            NameSeg::Impl {
+                trait_id: Some(7),
+                skip_binder: None,
+            }
+        );
+        let ty = parse(
+            serde_json::json!({"Impl": {"Ty": {"skip_binder": {"Deduplicated": 3}, "kind": "InherentImplBlock"}}}),
+        );
+        match ty {
+            NameSeg::Impl {
+                trait_id: None,
+                skip_binder: Some(skip_binder),
+            } => assert_eq!(*skip_binder, serde_json::json!({"Deduplicated": 3})),
+            other => panic!("expected Impl Ty, got {other:?}"),
+        }
+        let both = parse(serde_json::json!({
+            "Impl": {
+                "Ty": {"skip_binder": {"Deduplicated": 3}},
+                "Trait": 7
+            }
+        }));
+        match both {
+            NameSeg::Impl {
+                trait_id: Some(7),
+                skip_binder: Some(skip_binder),
+            } => assert_eq!(*skip_binder, serde_json::json!({"Deduplicated": 3})),
+            other => panic!("expected Impl with Trait and Ty, got {other:?}"),
+        }
+        let kind_only = parse(serde_json::json!({"Impl": {"kind": "InherentImplBlock"}}));
+        assert!(kind_only.is_impl());
+        assert_eq!(kind_only.impl_trait_id(), None);
+        assert_eq!(kind_only.impl_ty_skip_binder(), None);
+        assert_eq!(
+            parse(serde_json::json!({"Builtin": ["PromotedConst", 2]})),
+            NameSeg::Builtin {
+                kind: "PromotedConst".into(),
+                n: 2
+            }
+        );
+        let inst = parse(
+            serde_json::json!({"Instantiated": {"params": {}, "skip_binder": {"types": [1]}, "kind": "Other"}}),
+        );
+        match inst {
+            NameSeg::Instantiated { skip_binder } => {
+                assert_eq!(*skip_binder, serde_json::json!({"types": [1]}))
+            }
+            other => panic!("expected Instantiated, got {other:?}"),
+        }
+        assert_eq!(
+            parse(serde_json::json!({"Mystery": {"keep": false}})),
+            NameSeg::Other {
+                label: "Mystery".into()
+            }
+        );
+        let meta = item_meta(serde_json::json!([
+            {"Ident": ["core", 0]},
+            {"Impl": {"Trait": 1}},
+            {"Ident": ["f", 0]}
+        ]));
+        assert_eq!(meta.name_path(), "core::<Impl>::f");
+        assert_eq!(meta.trait_impl_id(), Some(1));
+    }
+
+    #[test]
+    fn global_decl_projects_kind_value_and_ty() {
+        let parse = |v: Value| serde_json::from_value::<GlobalDecl>(v).expect("GlobalDecl parses");
+        let named = parse(serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [{"Ident": ["c", 0]}],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"inline": null, "rename": null, "public": true}
+            },
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "value": {"Value": [1, [{"Call": [{"kind": {"Fun": 9}}]}, null]]}
+        }));
+        assert_eq!(named.global_kind_str(), Some("NamedConst"));
+        assert_eq!(named.init_fun_id(), Some(9));
+        assert!(named.const_expr().is_none());
+        assert_eq!(named.ty, Some(GlobalTy::Signed("I64".into())));
+
+        let static_gd = parse(serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["c", 0]}],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"inline": null, "rename": null, "public": true}
+            },
+            "global_kind": {"Static": {"mut": false}},
+            "ty": {"Deduplicated": 4},
+            "value": {"Deduplicated": 8}
+        }));
+        assert_eq!(static_gd.global_kind_str(), None);
+        assert_eq!(static_gd.global_kind, GlobalKind::Static);
+        assert_eq!(static_gd.ty, Some(GlobalTy::Dedup(4)));
+        assert_eq!(
+            static_gd.const_expr(),
+            Some(&serde_json::json!({"Deduplicated": 8}))
+        );
+    }
+
+    #[test]
+    fn trait_decl_methods_keep_name_default_and_inputs() {
+        let td: TraitDecl = serde_json::from_value(serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [{"Ident": ["T", 0]}],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"inline": null, "rename": null, "public": true}
+            },
+            "methods": [
+                null,
+                {
+                    "skip_binder": {
+                        "name": "head",
+                        "default": {"id": 3, "generics": {}},
+                        "signature": {"inputs": [{"Adt": {"id": 0}}], "output": null}
+                    }
+                },
+                {"skip_binder": {"name": "empty", "signature": {"inputs": []}}}
+            ]
+        }))
+        .expect("TraitDecl parses");
+        assert!(td.methods[0].name.is_none());
+        assert_eq!(td.methods[1].name.as_deref(), Some("head"));
+        assert_eq!(td.methods[1].default_id, Some(3));
+        assert!(td.methods[1].has_inputs);
+        assert_eq!(td.methods[2].name.as_deref(), Some("empty"));
+        assert!(!td.methods[2].has_inputs);
     }
 
     fn bb(kind: Value, is_cleanup: bool, term_span: u64) -> Value {

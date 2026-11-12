@@ -127,9 +127,9 @@ fn ty_json_body<'l>(v: &'l serde_json::Value, llbc: &'l Llbc) -> Option<&'l serd
 }
 
 /// `{"Adt": {"id": <id>, …}}` → the TypeDecl's full name path.
-fn adt_path_of(v: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+fn adt_path_of<'a>(v: &serde_json::Value, llbc: &'a Llbc) -> Option<&'a str> {
     let id = crate::front::mir::type_decl_ref_adt_id(v.get("Adt")?.as_object()?)?;
-    Some(llbc.type_by_id(id)?.item_meta.name_path())
+    Some(llbc.type_by_id(id)?.item_meta.name_path_str())
 }
 
 /// True when `ty` is `core::result::Result<T, E>` with `E` resolving to the
@@ -152,7 +152,7 @@ pub(crate) fn tyref_is_result_of_carrier(
             None => return false,
         },
     };
-    if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
+    if adt_path_of(body, llbc) != Some("core::result::Result") {
         return false;
     }
     let Some(err_slot) = body
@@ -175,7 +175,7 @@ pub(crate) fn tyref_is_result_of_carrier(
         let Some(path) = adt_path_of(err_body, llbc) else {
             break;
         };
-        if !spec.carrier_wrappers.contains(&path.as_str()) {
+        if !spec.carrier_wrappers.contains(&path) {
             break;
         }
         let Some(inner) = err_body
@@ -272,7 +272,7 @@ pub(crate) fn exception_sum_of_result(
     let path = decl.item_meta.name_path();
     let identity = crate::front::mir::class_identity_spelling(
         &path,
-        &crate::front::mir::tombstoned_leaves_of(llbc),
+        crate::front::mir::tombstoned_leaves_of(llbc),
     );
     Some(ExceptionSum {
         identity,
@@ -438,7 +438,7 @@ fn field_json_is_carrier(
         let Some(path) = adt_path_of(err_body, llbc) else {
             break;
         };
-        if !spec.carrier_wrappers.contains(&path.as_str()) {
+        if !spec.carrier_wrappers.contains(&path) {
             break;
         }
         let Some(inner) = err_body
@@ -504,7 +504,7 @@ pub(crate) fn tyref_is_option(ty: &TyRef, llbc: &Llbc) -> bool {
             None => return false,
         },
     };
-    adt_path_of(body, llbc).as_deref() == Some("core::option::Option")
+    adt_path_of(body, llbc) == Some("core::option::Option")
 }
 
 /// True when `ty` is `core::option::Option<T>` **after peeling any leading
@@ -555,7 +555,7 @@ pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
         }
         break;
     }
-    adt_path_of(v, llbc).as_deref() == Some("core::option::Option")
+    adt_path_of(v, llbc) == Some("core::option::Option")
 }
 
 /// True when `ty` is `core::result::Result<T, RBigIntError>` — the host
@@ -590,7 +590,7 @@ pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
             None => return false,
         },
     };
-    adt_path_of(body, llbc).as_deref() == Some("core::result::Result")
+    adt_path_of(body, llbc) == Some("core::result::Result")
 }
 
 /// True when `owner` names `core::result::Result` after stripping a
@@ -654,7 +654,7 @@ fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::V
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
-    if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
+    if adt_path_of(body, llbc) != Some("core::result::Result") {
         return None;
     }
     body.get("Adt")
@@ -671,7 +671,7 @@ fn result_err_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
-    if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
+    if adt_path_of(body, llbc) != Some("core::result::Result") {
         return None;
     }
     body.get("Adt")
@@ -705,7 +705,7 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
-    if adt_path_of(body, llbc).as_deref() != Some("core::option::Option") {
+    if adt_path_of(body, llbc) != Some("core::option::Option") {
         return None;
     }
     body.get("Adt")

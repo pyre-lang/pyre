@@ -1765,7 +1765,10 @@ fn function_local_static_key_keeps_ident_disambiguator() {
     assert_ne!(owner(0), owner(1));
     // Trait-impl Other segments still render as a label, matching
     // `name_path`, so existing `f64::<Impl>::NAN` keys keep matching.
-    let impl_seg = NameSeg::Other(serde_json::json!({"Impl": {"Trait": 1}}));
+    let impl_seg = NameSeg::Impl {
+        trait_id: Some(1),
+        skip_binder: None,
+    };
     assert_eq!(
         static_key_segments(&[
             NameSeg::Ident {

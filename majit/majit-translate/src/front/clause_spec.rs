@@ -1109,18 +1109,28 @@ fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> Str
                     name.clone()
                 }
             }
-            NameSeg::Other(v) => {
-                if let Some(id) = v.pointer("/Impl/Trait").and_then(Value::as_u64) {
-                    let name = render_trait_impl(llbc, id).unwrap_or_else(|| "?".to_string());
-                    return format!("<impl {name}>");
+            NameSeg::Impl {
+                trait_id,
+                skip_binder,
+            } => {
+                if let Some(id) = trait_id {
+                    let name = render_trait_impl(llbc, *id).unwrap_or_else(|| "?".to_string());
+                    format!("<impl {name}>")
+                } else if let Some(skip_binder) = skip_binder {
+                    format!("<impl {}>", spec_type_name(skip_binder, llbc, 0, false))
+                } else {
+                    "<Impl>".to_string()
                 }
-                if let Some(ty) = v
-                    .pointer("/Impl/Ty/skip_binder")
-                    .or_else(|| v.pointer("/Impl/Ty/value"))
-                {
-                    return format!("<impl {}>", spec_type_name(ty, llbc, 0, false));
+            }
+            NameSeg::Builtin { kind, n } => {
+                canonical_type_json(&serde_json::json!({"Builtin": [kind, n]}), llbc, 0)
+            }
+            other => {
+                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(other) {
+                    label
+                } else {
+                    format!("<{}>", other.first_key_label())
                 }
-                canonical_type_json(v, llbc, 0)
             }
         })
         .collect::<Vec<_>>();

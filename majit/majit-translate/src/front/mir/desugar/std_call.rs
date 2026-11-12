@@ -162,33 +162,26 @@ fn closure_env_of_operand<'a>(op: &Operand, llbc: &'a Llbc) -> Option<&'a TypeDe
 }
 
 fn closure_call_fn_id(td: &TypeDecl, llbc: &Llbc) -> Option<u64> {
-    let majit_charon_reader::TypeDeclSrc::Closure(Some(info)) = &td.src else {
+    let TypeDeclSrc::Closure(info) = &td.src else {
         return None;
     };
-    let info: &serde_json::Value = info;
-    if let Some(fn_id) = fn_mut_impl_method_id(info, llbc)
+    if let Some(fn_id) = info
+        .fn_mut_impl_id
+        .and_then(|impl_id| crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, 0))
         && llbc
             .fn_by_id(fn_id)
             .is_some_and(FunDecl::has_unstructured_body)
     {
         return Some(fn_id);
     }
-    let kind = info.get("kind").and_then(serde_json::Value::as_str)?;
+    let kind = info.kind.as_deref()?;
     if !matches!(kind, "Fn" | "FnMut") {
         return None;
     }
-    let body_id = info.pointer("/closure_body/id")?.as_u64()?;
+    let body_id = info.closure_body_id?;
     llbc.fn_by_id(body_id)
         .filter(|fd| fd.has_unstructured_body())
         .map(|fd| fd.def_id)
-}
-
-fn fn_mut_impl_method_id(info: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
-    let impl_id = info
-        .get("fn_mut_impl")
-        .and_then(|impl_ref| impl_ref.pointer("/skip_binder/id"))
-        .and_then(serde_json::Value::as_u64)?;
-    crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, 0)
 }
 
 impl<'a> Lowering<'a> {
@@ -7466,8 +7459,7 @@ impl<'a> Lowering<'a> {
             NameSeg::Ident { ident: (s, _) } => s.as_str(),
             _ => return false,
         };
-        matches!(module_leaf, "const_ptr" | "mut_ptr")
-            && matches!(&segs[last_idx - 1], NameSeg::Other(v) if v.get("Impl").is_some())
+        matches!(module_leaf, "const_ptr" | "mut_ptr") && segs[last_idx - 1].is_impl()
     }
 
     pub(in crate::front::mir) fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
@@ -8467,28 +8459,9 @@ impl<'a> Lowering<'a> {
     ///   inline-or-dedup path.
     pub(in crate::front::mir) fn resolve_impl_owner_adt_def_id(
         &self,
-        impl_payload: &serde_json::Value,
+        impl_seg: &NameSeg,
     ) -> Option<u64> {
-        let obj = impl_payload.as_object()?;
-        if let Some(ty) = obj.get("Ty") {
-            let sb = ty.as_object()?.get("skip_binder")?;
-            return self.resolve_tyexpr_to_adt_def_id(sb);
-        }
-        if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
-            let trait_impls = self.llbc.trait_impls_raw();
-            let ti = trait_impls.get(trait_impl_id as usize)?;
-            let first_ty = ti
-                .as_object()?
-                .get("impl_trait")?
-                .as_object()?
-                .get("generics")?
-                .as_object()?
-                .get("types")?
-                .as_array()?
-                .first()?;
-            return self.resolve_tyexpr_to_adt_def_id(first_ty);
-        }
-        None
+        resolve_impl_owner_adt_def_id_free(self.llbc, impl_seg)
     }
 
     /// Resolve a Charon type expression to the underlying ADT

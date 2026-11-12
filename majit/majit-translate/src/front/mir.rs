@@ -859,13 +859,21 @@ fn collect_ref_enum_instantiations(
     let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
     let mut queue: Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
+    let mut visited: Vec<bool> = Vec::new();
     let filtered = module_filter.is_some() || function_filter.is_some();
     // TypeDecl field types (`Vec<Option<T>>` on a struct) are not in any
     // Unstructured body. Walk them when the harvest is whole-program so a
     // payload that only lives in a field still intern's its variant rows.
     if !filtered {
         for td in llbc.iter_type_decls() {
-            intern_enums_from_type_decl(llbc, gc_struct_ids, td, &mut found, tombstoned);
+            intern_enums_from_type_decl(
+                llbc,
+                gc_struct_ids,
+                td,
+                &mut found,
+                tombstoned,
+                &mut visited,
+            );
         }
     }
     for fd in llbc.iter_local_fns() {
@@ -880,11 +888,25 @@ fn collect_ref_enum_instantiations(
                 continue;
             }
         }
-        intern_enums_from_signature(llbc, gc_struct_ids, fd, &mut found, tombstoned);
+        intern_enums_from_signature(
+            llbc,
+            gc_struct_ids,
+            fd,
+            &mut found,
+            tombstoned,
+            &mut visited,
+        );
         let Some(u) = fd.unstructured() else {
             continue;
         };
-        intern_enums_from_unstructured(llbc, gc_struct_ids, &u, &mut found, tombstoned);
+        intern_enums_from_unstructured(
+            llbc,
+            gc_struct_ids,
+            &u,
+            &mut found,
+            tombstoned,
+            &mut visited,
+        );
         intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
     }
     // Spec copies are not in original LLBC (`specialize.py`
@@ -902,7 +924,14 @@ fn collect_ref_enum_instantiations(
             &const_generics,
         );
         for ty in sig.inputs.iter().chain(std::iter::once(&sig.output)) {
-            intern_enum_from_ty(llbc, gc_struct_ids, ty, &mut found, tombstoned);
+            intern_enum_from_ty(
+                llbc,
+                gc_struct_ids,
+                ty,
+                &mut found,
+                tombstoned,
+                &mut visited,
+            );
         }
         if let Some(u) = crate::front::clause_spec::substituted_unstructured(
             callee,
@@ -911,7 +940,14 @@ fn collect_ref_enum_instantiations(
             &types,
             &const_generics,
         ) {
-            intern_enums_from_unstructured(llbc, gc_struct_ids, &u, &mut found, tombstoned);
+            intern_enums_from_unstructured(
+                llbc,
+                gc_struct_ids,
+                &u,
+                &mut found,
+                tombstoned,
+                &mut visited,
+            );
             intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
         }
     }
@@ -926,7 +962,21 @@ fn intern_enum_from_ty(
     ty: &TyRef,
     found: &mut std::collections::HashSet<RefEnumInst>,
     tombstoned: &std::collections::HashSet<String>,
+    visited: &mut Vec<bool>,
 ) {
+    if let Some(id) = match ty {
+        TyRef::Dedup { id } => Some(*id as usize),
+        TyRef::Inline { value: (id, _) } => Some(*id as usize),
+        TyRef::Other(_) => None,
+    } {
+        if id >= visited.len() {
+            visited.resize(id + 1, false);
+        }
+        if visited[id] {
+            return;
+        }
+        visited[id] = true;
+    }
     intern_enum_from_ty_at(llbc, gc_struct_ids, ty, found, tombstoned, 0);
 }
 
@@ -974,6 +1024,7 @@ fn intern_enums_from_signature(
     fd: &FunDecl,
     found: &mut std::collections::HashSet<RefEnumInst>,
     tombstoned: &std::collections::HashSet<String>,
+    visited: &mut Vec<bool>,
 ) {
     for ty in fd
         .signature
@@ -981,7 +1032,7 @@ fn intern_enums_from_signature(
         .iter()
         .chain(std::iter::once(&fd.signature.output))
     {
-        intern_enum_from_ty(llbc, gc_struct_ids, ty, found, tombstoned);
+        intern_enum_from_ty(llbc, gc_struct_ids, ty, found, tombstoned, visited);
     }
 }
 
@@ -991,17 +1042,18 @@ fn intern_enums_from_type_decl(
     td: &TypeDecl,
     found: &mut std::collections::HashSet<RefEnumInst>,
     tombstoned: &std::collections::HashSet<String>,
+    visited: &mut Vec<bool>,
 ) {
     match &td.kind {
         TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
             for f in fields {
-                intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found, tombstoned);
+                intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found, tombstoned, visited);
             }
         }
         TypeDeclKind::Enum(variants) => {
             for v in variants {
                 for f in &v.fields {
-                    intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found, tombstoned);
+                    intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found, tombstoned, visited);
                 }
             }
         }
@@ -1012,6 +1064,7 @@ fn intern_enums_from_type_decl(
                 &TyRef::Other(body.clone()),
                 found,
                 tombstoned,
+                visited,
             );
         }
         TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
@@ -1024,6 +1077,7 @@ fn intern_enums_from_unstructured(
     u: &Unstructured,
     found: &mut std::collections::HashSet<RefEnumInst>,
     tombstoned: &std::collections::HashSet<String>,
+    visited: &mut Vec<bool>,
 ) {
     // Constructor heads that exist only on an `on_unwind` cleanup chain
     // are not part of the lowered body. The local-type scan below still
@@ -1034,11 +1088,25 @@ fn intern_enums_from_unstructured(
             continue;
         }
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
-            intern_enum_from_ty(llbc, gc_struct_ids, &call.dest.ty, found, tombstoned);
+            intern_enum_from_ty(
+                llbc,
+                gc_struct_ids,
+                &call.dest.ty,
+                found,
+                tombstoned,
+                visited,
+            );
             for arg in &call.args {
                 match arg {
                     Operand::Copy(place) | Operand::Move(place) => {
-                        intern_enum_from_ty(llbc, gc_struct_ids, &place.ty, found, tombstoned);
+                        intern_enum_from_ty(
+                            llbc,
+                            gc_struct_ids,
+                            &place.ty,
+                            found,
+                            tombstoned,
+                            visited,
+                        );
                     }
                     Operand::Const(_) => {}
                 }
@@ -1048,7 +1116,7 @@ fn intern_enums_from_unstructured(
             let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
                 continue;
             };
-            intern_enum_from_ty(llbc, gc_struct_ids, &place.ty, found, tombstoned);
+            intern_enum_from_ty(llbc, gc_struct_ids, &place.ty, found, tombstoned, visited);
             match rvalue {
                 Rvalue::Aggregate(kind, _) => {
                     if let Some(head) = kind
@@ -1063,14 +1131,14 @@ fn intern_enums_from_unstructured(
                     }
                 }
                 Rvalue::Discriminant(src) => {
-                    intern_enum_from_ty(llbc, gc_struct_ids, &src.ty, found, tombstoned);
+                    intern_enum_from_ty(llbc, gc_struct_ids, &src.ty, found, tombstoned, visited);
                 }
                 _ => {}
             }
         }
     }
     for local in &u.locals.locals {
-        intern_enum_from_ty(llbc, gc_struct_ids, &local.ty, found, tombstoned);
+        intern_enum_from_ty(llbc, gc_struct_ids, &local.ty, found, tombstoned, visited);
     }
 }
 
@@ -6663,8 +6731,11 @@ pub(crate) fn enum_ctor_class_identity(
 }
 
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
-pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
-    DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
+/// Computed on first use and kept with the artefact's derived state.
+pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> &std::collections::HashSet<String> {
+    llbc_derived(llbc).tombstoned_leaves.get_or_init(|| {
+        DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
+    })
 }
 
 /// Withdraw the bare-leaf convenience aliases for struct leaves shared
@@ -7016,7 +7087,7 @@ impl<'a> LowerContext<'a> {
             struct_field_attrs,
             struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
-            tombstoned_leaves: tombstoned_leaves_of(llbc),
+            tombstoned_leaves: tombstoned_leaves_of(llbc).clone(),
             gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,

@@ -270,19 +270,13 @@ fn dedup_body_resolves_inline_shape() {
 }
 
 fn is_promoted_anon_const(gd: &GlobalDecl) -> bool {
-    if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
+    if gd.global_kind_str() != Some("AnonConst") {
         return false;
     }
-    match gd.item_meta.name.last() {
-        Some(NameSeg::Other(v)) => {
-            v.get("Builtin")
-                .and_then(Value::as_array)
-                .and_then(|arr| arr.first())
-                .and_then(Value::as_str)
-                == Some("PromotedConst")
-        }
-        _ => false,
-    }
+    matches!(
+        gd.item_meta.name.last(),
+        Some(NameSeg::Builtin { kind, .. }) if kind == "PromotedConst"
+    )
 }
 
 fn json_global_ids(v: &Value, out: &mut Vec<u64>) {

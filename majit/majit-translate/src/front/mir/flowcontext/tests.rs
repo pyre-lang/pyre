@@ -7270,13 +7270,12 @@ fn unify_receiver_ty_distinguishes_adt_const_generics() {
         &mut const_subst,
         &llbc
     ));
-    let row = serde_json::json!({
-        "generics": {
-            "const_generics": [{"Var": 0}],
-            "trait_refs": []
-        }
-    });
-    let got = super::reconstructed_impl_generics(&subst, &const_subst, &row)
+    let lens = majit_charon_reader::ImplGenericsLens {
+        types_len: None,
+        const_generics_len: Some(1),
+        trait_refs: Some(serde_json::json!([])),
+    };
+    let got = super::reconstructed_impl_generics(&subst, &const_subst, Some(&lens))
         .expect("const N bound from Buffer<4>");
     assert_eq!(got["const_generics"], serde_json::json!([cg("4")]));
 }
@@ -7319,14 +7318,13 @@ fn reconstructed_impl_generics_binds_swapped_const_params() {
         &mut const_subst,
         &llbc
     ));
-    let row = serde_json::json!({
-        "generics": {
-            "const_generics": [{"Var": 0}, {"Var": 1}],
-            "trait_refs": []
-        }
-    });
-    let got =
-        super::reconstructed_impl_generics(&subst, &const_subst, &row).expect("N and M bound");
+    let lens = majit_charon_reader::ImplGenericsLens {
+        types_len: None,
+        const_generics_len: Some(2),
+        trait_refs: Some(serde_json::json!([])),
+    };
+    let got = super::reconstructed_impl_generics(&subst, &const_subst, Some(&lens))
+        .expect("N and M bound");
     assert_eq!(got["const_generics"], serde_json::json!([cg("3"), cg("2")]));
     let mut subst = Vec::new();
     let mut const_subst = Vec::new();

@@ -28,7 +28,7 @@ pub(in crate::front::mir) fn fundecl_module(fd: &FunDecl) -> Option<String> {
         .iter()
         .map_while(|seg| match seg {
             NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
-            NameSeg::Other(_) => None,
+            _ => None,
         })
         .collect();
     if segs.len() == name.len() {
@@ -67,11 +67,11 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
     if last_idx == 0 {
         return None;
     }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    let owner_qualified = match resolve_impl_owner_adt_def_id_free(llbc, impl_payload) {
+    let impl_seg = &segs[last_idx - 1];
+    if !impl_seg.is_impl() {
+        return None;
+    }
+    let owner_qualified = match resolve_impl_owner_adt_def_id_free(llbc, impl_seg) {
         Some(adt_def_id) => {
             let td = llbc.type_by_id(adt_def_id)?;
             // Owner-qualification convention: bare ident qualified by the
@@ -82,7 +82,7 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
             // `lib.rs` cannot find the graph keyed by
             // `[qualified_owner, method]`.
             let owner = strip_crate_prefix(&td.item_meta.name_path());
-            match impl_atomic_alias_leaf(llbc, impl_payload) {
+            match impl_atomic_alias_leaf(llbc, impl_seg) {
                 Some(alias) => match owner.rsplit_once("::") {
                     Some((module, _)) => format!("{module}::{alias}"),
                     None => alias,
@@ -389,23 +389,20 @@ pub(in crate::front::mir) fn trait_generic_args_match(
 pub(in crate::front::mir) fn reconstructed_impl_generics(
     subst: &[Option<serde_json::Value>],
     const_subst: &[Option<serde_json::Value>],
-    row: &serde_json::Value,
+    lens: Option<&majit_charon_reader::ImplGenericsLens>,
 ) -> Option<serde_json::Value> {
-    let type_n = row
-        .pointer("/generics/types")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
+    let type_n = lens
+        .and_then(|lens| lens.types_len)
+        .map(|n| n as usize)
         .unwrap_or(subst.len());
-    let const_n = row
-        .pointer("/generics/const_generics")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
+    let const_n = lens
+        .and_then(|lens| lens.const_generics_len)
+        .map(|n| n as usize)
         .unwrap_or(const_subst.len());
     let types = filled_subst(subst, type_n)?;
     let const_generics = filled_subst(const_subst, const_n)?;
-    let trait_refs = row
-        .pointer("/generics/trait_refs")
-        .cloned()
+    let trait_refs = lens
+        .and_then(|lens| lens.trait_refs.clone())
         .unwrap_or_else(|| serde_json::json!([]));
     Some(serde_json::json!({
         "types": types,
@@ -496,7 +493,8 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
         if found.is_some() {
             return None;
         }
-        let impl_generics = reconstructed_impl_generics(&subst, &const_subst, row)?;
+        let impl_generics =
+            reconstructed_impl_generics(&subst, &const_subst, llbc.trait_impl_generics(i))?;
         found = Some((impl_id, fn_id, impl_generics));
     }
     found
@@ -533,9 +531,9 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
 /// for any other impl.
 pub(in crate::front::mir) fn impl_atomic_alias_leaf(
     llbc: &Llbc,
-    impl_payload: &serde_json::Value,
+    impl_seg: &NameSeg,
 ) -> Option<String> {
-    let self_ty = impl_payload.get("Ty")?.get("skip_binder")?;
+    let self_ty = impl_seg.impl_ty_skip_binder()?;
     let self_ty: TyRef = serde_json::from_value(self_ty.clone()).ok()?;
     if tyref_atomic_is_ptr(&self_ty, llbc) {
         return Some("AtomicPtr".to_string());
@@ -578,11 +576,11 @@ pub(in crate::front::mir) fn impl_owner_path(llbc: &Llbc, fd: &FunDecl) -> Optio
     if last_idx == 0 {
         return None;
     }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let impl_seg = &segs[last_idx - 1];
+    if !impl_seg.is_impl() {
+        return None;
+    }
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_seg)?;
     Some(llbc.type_by_id(adt_def_id)?.item_meta.name_path())
 }
 
@@ -1417,11 +1415,11 @@ pub(in crate::front::mir) fn impl_owner_adt_def_id_for_fundecl(
     if last_idx == 0 {
         return None;
     }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    resolve_impl_owner_adt_def_id_free(llbc, impl_payload)
+    let impl_seg = &segs[last_idx - 1];
+    if !impl_seg.is_impl() {
+        return None;
+    }
+    resolve_impl_owner_adt_def_id_free(llbc, impl_seg)
 }
 
 /// Free-function twin of [`Lowering::first_input_is_adt`]: true when the
@@ -1543,13 +1541,12 @@ pub(in crate::front::mir) fn output_adt_def_id_free(ty: &TyRef, llbc: &Llbc) -> 
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
 pub(in crate::front::mir) fn impl_payload_self_ty<'a>(
     llbc: &'a Llbc,
-    impl_payload: &'a serde_json::Value,
+    impl_seg: &'a NameSeg,
 ) -> Option<&'a serde_json::Value> {
-    let obj = impl_payload.as_object()?;
-    if let Some(ty) = obj.get("Ty") {
-        return ty.as_object()?.get("skip_binder");
+    if let Some(skip_binder) = impl_seg.impl_ty_skip_binder() {
+        return Some(skip_binder);
     }
-    if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
+    if let Some(trait_impl_id) = impl_seg.impl_trait_id() {
         let ti = llbc.trait_impls_raw().get(trait_impl_id as usize)?;
         return ti
             .as_object()?
@@ -1566,9 +1563,9 @@ pub(in crate::front::mir) fn impl_payload_self_ty<'a>(
 
 pub(in crate::front::mir) fn resolve_impl_owner_adt_def_id_free(
     llbc: &Llbc,
-    impl_payload: &serde_json::Value,
+    impl_seg: &NameSeg,
 ) -> Option<u64> {
-    resolve_tyexpr_to_adt_def_id_free(llbc, impl_payload_self_ty(llbc, impl_payload)?)
+    resolve_tyexpr_to_adt_def_id_free(llbc, impl_payload_self_ty(llbc, impl_seg)?)
 }
 
 /// When `fd` is a trait-impl method (i.e. its NameSeg's penultimate
@@ -1597,14 +1594,7 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
     if last_idx == 0 {
         return None;
     }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    let trait_impl_id = impl_payload
-        .as_object()?
-        .get("Trait")
-        .and_then(serde_json::Value::as_u64)?;
+    let trait_impl_id = segs[last_idx - 1].impl_trait_id()?;
     let trait_impls = llbc.trait_impls_raw();
     let ti = trait_impls.get(trait_impl_id as usize)?;
     // `impl_trait` is a TraitDeclRef `{"id": <trait_decl_id>,
@@ -1640,11 +1630,10 @@ pub(in crate::front::mir) fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u
         .name
         .iter()
         .rposition(|segment| matches!(segment, NameSeg::Ident { .. }))?;
-    let impl_payload = match fd.item_meta.name.get(last_idx.checked_sub(1)?)? {
-        NameSeg::Other(value) => value.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    impl_payload.as_object()?.get("Trait")?.as_u64()
+    fd.item_meta
+        .name
+        .get(last_idx.checked_sub(1)?)?
+        .impl_trait_id()
 }
 
 /// A local trait-impl method whose first parameter is a ZST `&self`.
@@ -1878,7 +1867,7 @@ fn adt_def_id_of_type_json(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
 fn type_decl_identity(llbc: &Llbc, def_id: u64) -> Option<(String, String)> {
     let td = llbc.type_by_id(def_id)?;
     let path = td.item_meta.name_path();
-    let identity = class_identity_spelling(&path, &tombstoned_leaves_of(llbc));
+    let identity = class_identity_spelling(&path, tombstoned_leaves_of(llbc));
     Some((identity, path))
 }
 
@@ -3194,6 +3183,9 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// FunDecl paths whose artefact-local `oopspec_*` marker consts spell
     /// `jit.*`. Built from this `Llbc`'s global decls.
     pub(in crate::front::mir) oopspec_fn_paths:
+        std::sync::OnceLock<std::collections::HashSet<String>>,
+    /// Duplicate-leaf tombstones of this artefact. Computed on first use.
+    pub(in crate::front::mir) tombstoned_leaves:
         std::sync::OnceLock<std::collections::HashSet<String>>,
     /// Decoded marker-const strings. The payload is a property of the artefact.
     global_marker_strs:
@@ -7428,32 +7420,20 @@ pub(in crate::front::mir) enum DerefTargetBind<'a> {
 ///
 /// Two bindings for the same trait are not a guess: the caller peels.
 pub(in crate::front::mir) fn deref_impl_target_bind(
-    row: &serde_json::Value,
+    types: &[Option<majit_charon_reader::AssocType>],
     trait_id: u64,
 ) -> DerefTargetBind<'_> {
-    let Some(entries) = row.get("types").and_then(|types| types.as_array()) else {
-        return DerefTargetBind::Absent;
-    };
     let mut count = 0usize;
     let mut value = None;
-    for entry in entries {
-        let Some(kind) = entry
-            .get("kind")
-            .and_then(|kind| kind.get("TraitType"))
-            .and_then(|kind| kind.as_array())
-        else {
-            continue;
-        };
-        if kind.first().and_then(|id| id.as_u64()) != Some(trait_id) {
+    for entry in types.iter().flatten() {
+        if entry.trait_id != Some(trait_id) {
             continue;
         }
         count += 1;
         if count > 1 {
             return DerefTargetBind::Ambiguous;
         }
-        value = entry
-            .get("skip_binder")
-            .and_then(|binder| binder.get("value"));
+        value = entry.value.as_ref();
     }
     match value {
         Some(value) if count == 1 => DerefTargetBind::Value(value),
@@ -7588,7 +7568,7 @@ pub(in crate::front::mir) fn transparent_deref_target_class(
     }
     let trait_id = deref_trait_decl_id(llbc)?;
     let mut class = None;
-    for row in llbc.trait_impls_of(trait_id) {
+    for (i, row) in llbc.trait_impl_rows_of(trait_id) {
         let Some(self_ty) = row.pointer("/impl_trait/generics/types/0") else {
             continue;
         };
@@ -7598,7 +7578,7 @@ pub(in crate::front::mir) fn transparent_deref_target_class(
         if !same_nominal_adt(llbc, self_id, wrapper_id) {
             continue;
         }
-        let target_ty = match deref_impl_target_bind(row, trait_id) {
+        let target_ty = match deref_impl_target_bind(llbc.trait_impl_types(i), trait_id) {
             DerefTargetBind::Ambiguous => return None,
             DerefTargetBind::Absent => continue,
             DerefTargetBind::Value(target_ty) => target_ty,
@@ -12577,7 +12557,7 @@ fn assoc_value_for_matching_impl<'a>(
         return None;
     }
     let mut found = None;
-    for row in llbc.trait_impls_of(trait_id) {
+    for (i, row) in llbc.trait_impl_rows_of(trait_id) {
         let Some(impl_types) = row
             .pointer("/impl_trait/generics/types")
             .and_then(serde_json::Value::as_array)
@@ -12594,7 +12574,7 @@ fn assoc_value_for_matching_impl<'a>(
         {
             continue;
         }
-        let Some(value) = trait_row_assoc_value(row, assoc) else {
+        let Some(value) = trait_row_assoc_value(llbc.trait_impl_types(i), assoc) else {
             continue;
         };
         if found.is_some() {
@@ -12619,22 +12599,14 @@ fn tyexpr_same(left: &serde_json::Value, right: &serde_json::Value, llbc: &Llbc)
 }
 
 fn trait_row_assoc_value<'a>(
-    row: &'a serde_json::Value,
+    types: &'a [Option<majit_charon_reader::AssocType>],
     assoc: &serde_json::Value,
 ) -> Option<&'a serde_json::Value> {
-    let entries = row.get("types")?.as_array()?;
-    for entry in entries {
-        let Some(kind) = entry
-            .get("kind")
-            .and_then(|kind| kind.get("TraitType"))
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        if kind.len() != 2 || &kind[1] != assoc {
+    for entry in types.iter().flatten() {
+        if entry.assoc.as_ref() != Some(assoc) {
             continue;
         }
-        return entry.get("skip_binder")?.get("value");
+        return entry.value.as_ref();
     }
     None
 }
@@ -12647,7 +12619,7 @@ pub(in crate::front::mir) fn trait_impl_assoc_value<'a>(
     impl_id: u64,
     assoc: &serde_json::Value,
 ) -> Option<&'a serde_json::Value> {
-    trait_row_assoc_value(llbc.trait_impls_raw().get(impl_id as usize)?, assoc)
+    trait_row_assoc_value(llbc.trait_impl_types(impl_id as usize), assoc)
 }
 
 /// Recover the trait decl id a `TraitRef` names —
@@ -14254,7 +14226,7 @@ pub(in crate::front::mir) fn field_label_from_payload(payload: &serde_json::Valu
 /// name.
 ///
 /// Distinct from [`Lowering::impl_method_owner`], which looks for an
-/// `Impl` `NameSeg::Other` segment preceding the leaf — that arm
+/// `Impl` name segment preceding the leaf — that arm
 /// fires for inherent / trait-impl methods Charon already resolved
 /// at extraction time.  Trait method declarations have no `Impl`
 /// segment because the body is the trait's default impl.
@@ -14352,8 +14324,7 @@ pub(in crate::front::mir) fn abstract_trait_call_target(
         .methods
         .get(payload.get(1)?.as_u64()? as usize)
     {
-        let inputs = method.pointer("/skip_binder/signature/inputs")?;
-        if inputs.as_array().is_none_or(|rows| rows.is_empty()) {
+        if !method.has_inputs {
             return None;
         }
     }

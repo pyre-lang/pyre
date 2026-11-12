@@ -83,19 +83,8 @@ fn ty_adt_leaf(llbc: &Llbc, ty: &Value) -> Option<String> {
     None
 }
 
-fn global_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
-    let value = gd.rest.get("value")?;
-    let body = value
-        .get("Value")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.get(1))
-        .unwrap_or(value);
-    let lit = body.as_array()?.first()?;
-    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
-}
-
 fn dyn_impl_trait_leaf(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
-    let init_id = global_init_fun_id(gd)?;
+    let init_id = gd.init_fun_id()?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     for block in &body.body {
         for stmt in &block.statements {

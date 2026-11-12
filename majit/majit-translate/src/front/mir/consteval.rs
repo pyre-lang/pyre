@@ -90,12 +90,7 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn fold_named_const_global(&self, def_id: u64) -> Option<OpKind> {
         fold_named_const_on_llbc(self.llbc, def_id).or_else(|| {
             let gd = self.llbc.global_by_id(def_id)?;
-            if gd
-                .rest
-                .get("global_kind")
-                .and_then(serde_json::Value::as_str)
-                != Some("NamedConst")
-            {
+            if gd.global_kind_str() != Some("NamedConst") {
                 return None;
             }
             named_const_fold_for_path(&gd.item_meta.name_path())
@@ -181,12 +176,7 @@ impl<'a> Lowering<'a> {
         def_id: u64,
     ) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if gd.global_kind_str() != Some("NamedConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -310,12 +300,7 @@ impl<'a> Lowering<'a> {
         def_id: u64,
     ) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if gd.global_kind_str() != Some("NamedConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -411,12 +396,7 @@ impl<'a> Lowering<'a> {
         let Some(global) = self.llbc.global_by_id(def_id) else {
             return false;
         };
-        if global
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if global.global_kind_str() != Some("NamedConst") {
             return false;
         }
         let Some(type_path) = tyref_node(ty, self.llbc)
@@ -626,12 +606,7 @@ impl<'a> Lowering<'a> {
     ///     a pointer / tuple / unresolved layout stays residual.
     pub(in crate::front::mir) fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if gd.global_kind_str() != Some("NamedConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -725,12 +700,7 @@ impl<'a> Lowering<'a> {
         def_id: u64,
     ) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if gd.global_kind_str() != Some("NamedConst") {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -829,10 +799,7 @@ pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> 
 }
 
 pub(in crate::front::mir) fn global_is_thread_local(g: &GlobalDecl) -> bool {
-    g.rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("ThreadLocal")
+    g.global_kind_str() == Some("ThreadLocal")
 }
 
 pub(in crate::front::mir) fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
@@ -840,11 +807,6 @@ pub(in crate::front::mir) fn global_source_text_is_static_mut(g: &GlobalDecl) ->
         .source_text
         .as_deref()
         .is_some_and(|s| s.contains("static mut"))
-        || g.rest
-            .get("item_meta")
-            .and_then(|m| m.get("source_text"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| s.contains("static mut"))
 }
 
 /// Harvest foldable const literals from one artefact.
@@ -1121,15 +1083,11 @@ pub(in crate::front::mir) fn static_key_segment(seg: &NameSeg) -> String {
                 s.clone()
             }
         }
-        NameSeg::Other(v) => {
-            if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(v) {
+        other => {
+            if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(other) {
                 return label;
             }
-            let label = v
-                .as_object()
-                .and_then(|m| m.keys().next().cloned())
-                .unwrap_or_else(|| "?".into());
-            format!("<{label}>")
+            format!("<{}>", other.first_key_label())
         }
     }
 }
@@ -1547,12 +1505,7 @@ pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMa
         if !gd.item_meta.is_local {
             continue;
         }
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
+        if gd.global_kind_str() != Some("NamedConst") {
             continue;
         }
         let Some(op) = fold_named_const_on_llbc(llbc, gd.def_id)
@@ -1573,11 +1526,7 @@ pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMa
 /// The named const still has no address.
 pub(in crate::front::mir) fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u64) -> Option<u64> {
     let g = llbc.global_by_id(def_id)?;
-    if g.rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("AnonConst")
-    {
+    if g.global_kind_str() != Some("AnonConst") {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
@@ -1598,12 +1547,7 @@ pub(in crate::front::mir) fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u
                 continue;
             };
             let inner = llbc.global_by_id(id)?;
-            if inner
-                .rest
-                .get("global_kind")
-                .and_then(serde_json::Value::as_str)
-                != Some("NamedConst")
-            {
+            if inner.global_kind_str() != Some("NamedConst") {
                 continue;
             }
             if named.is_some() {
@@ -1625,11 +1569,7 @@ pub(in crate::front::mir) fn promoted_int_range_inclusive_bounds(
     def_id: u64,
 ) -> Option<(i64, i64)> {
     let g = llbc.global_by_id(def_id)?;
-    if g.rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("AnonConst")
-    {
+    if g.global_kind_str() != Some("AnonConst") {
         return None;
     }
     let leaf = g.item_meta.name_path().rsplit("::").next()?.to_string();
@@ -1720,12 +1660,7 @@ pub(in crate::front::mir) fn decoded_named_const_on_llbc(
     def_id: u64,
 ) -> Option<DecodedConst> {
     let gd = llbc.global_by_id(def_id)?;
-    if gd
-        .rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("NamedConst")
-    {
+    if gd.global_kind_str() != Some("NamedConst") {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -1950,12 +1885,7 @@ pub(in crate::front::mir) fn const_eval_init_body(llbc: &Llbc, u: &Unstructured)
 /// const fn is the translation-time value RPython already has.
 pub(in crate::front::mir) fn const_fn_int_array_op(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
     let gd = llbc.global_by_id(def_id)?;
-    if gd
-        .rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("NamedConst")
-    {
+    if gd.global_kind_str() != Some("NamedConst") {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
@@ -2535,12 +2465,7 @@ pub(in crate::front::mir) fn const_struct_field_lits(
     global_id: u64,
 ) -> Option<Vec<u64>> {
     let global = llbc.global_by_id(global_id)?;
-    if global
-        .rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("NamedConst")
-    {
+    if global.global_kind_str() != Some("NamedConst") {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
@@ -3132,12 +3057,7 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
     def_id: u64,
 ) -> Option<ConstLit> {
     let global = llbc.global_by_id(def_id)?;
-    if global
-        .rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some("NamedConst")
-    {
+    if global.global_kind_str() != Some("NamedConst") {
         return None;
     }
     let path = global.item_meta.name_path();
@@ -3146,24 +3066,35 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
         return None;
     }
 
-    let tyref = global.rest.get("ty")?;
-    let ty = if let Some(id) = tyref
-        .get("Deduplicated")
-        .and_then(serde_json::Value::as_u64)
-    {
-        llbc.dedup_body(id)?
-    } else if let Some(pair) = tyref.get("Value").and_then(serde_json::Value::as_array) {
-        pair.get(1)?
-    } else {
-        tyref
-    };
-    let literal = ty.get("Scalar")?.as_object()?;
-    let literal = literal
-        .get("Integer")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or(literal);
+    match &global.ty {
+        Some(majit_charon_reader::GlobalTy::Signed(width)) => {
+            core_num_minmax_lit(leaf, true, width)
+        }
+        Some(majit_charon_reader::GlobalTy::Unsigned(width)) => {
+            core_num_minmax_lit(leaf, false, width)
+        }
+        Some(majit_charon_reader::GlobalTy::Dedup(id)) => {
+            let ty = llbc.dedup_body(*id)?;
+            let literal = ty.get("Scalar")?.as_object()?;
+            let literal = literal
+                .get("Integer")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or(literal);
+            if let Some(width) = literal.get("Signed").and_then(serde_json::Value::as_str) {
+                core_num_minmax_lit(leaf, true, width)
+            } else if let Some(width) = literal.get("Unsigned").and_then(serde_json::Value::as_str)
+            {
+                core_num_minmax_lit(leaf, false, width)
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
 
-    if let Some(width) = literal.get("Signed").and_then(serde_json::Value::as_str) {
+fn core_num_minmax_lit(leaf: &str, signed: bool, width: &str) -> Option<ConstLit> {
+    if signed {
         let (min, max) = match width {
             "I8" => (i8::MIN as i64, i8::MAX as i64),
             "I16" => (i16::MIN as i64, i16::MAX as i64),
@@ -3171,9 +3102,8 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
             "I64" => (i64::MIN, i64::MAX),
             _ => return None,
         };
-        return Some(ConstLit::Int(if leaf == "MIN" { min } else { max }));
-    }
-    if let Some(width) = literal.get("Unsigned").and_then(serde_json::Value::as_str) {
+        Some(ConstLit::Int(if leaf == "MIN" { min } else { max }))
+    } else {
         let max = match width {
             "U8" => u8::MAX as u64,
             "U16" => u16::MAX as u64,
@@ -3181,9 +3111,8 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
             "U64" => u64::MAX,
             _ => return None,
         };
-        return Some(ConstLit::UInt(if leaf == "MIN" { 0 } else { max }));
+        Some(ConstLit::UInt(if leaf == "MIN" { 0 } else { max }))
     }
-    None
 }
 
 pub(in crate::front::mir) fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {

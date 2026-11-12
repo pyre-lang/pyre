@@ -9991,7 +9991,7 @@ pub(in crate::front::mir) fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> 
         .template_name()
         .filter_map(|seg| match seg {
             NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
-            NameSeg::Other(_) => None,
+            _ => None,
         })
         .collect();
     if idents != ["alloc", "vec", "Vec"] {

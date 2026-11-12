@@ -118,10 +118,7 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                         "_jit_look_inside_ marker `{path}` has an undecodable bool \
                          initializer; init={:?} value={}",
                         marker_init_fun_id(gd),
-                        gd.rest
-                            .get("value")
-                            .map(|v| v.to_string())
-                            .unwrap_or_default()
+                        gd.const_expr().map(|v| v.to_string()).unwrap_or_default()
                     )
                 });
                 let hint = if look_inside {
@@ -1460,7 +1457,7 @@ fn strip_crate_prefix(path: &str) -> String {
 }
 
 fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
-    if let Some(value) = gd.rest.get("value")
+    if let Some(value) = gd.const_expr()
         && let Some(b) = decode_bool_const(llbc, value)
     {
         return Some(b);
@@ -1470,15 +1467,7 @@ fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
 }
 
 pub(crate) fn marker_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
-    let value = gd.rest.get("value")?;
-    let body = value
-        .get("Value")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.get(1))
-        .unwrap_or(value);
-    let lit = body.as_array()?.first()?;
-    lit.pointer("/Call/0/kind/Fun")
-        .and_then(serde_json::Value::as_u64)
+    gd.init_fun_id()
 }
 
 fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
@@ -1515,7 +1504,7 @@ pub(crate) fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> 
 }
 
 fn global_marker_str_uncached(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
-    if let Some(value) = gd.rest.get("value")
+    if let Some(value) = gd.const_expr()
         && let Some(spec) = decode_str_const(llbc, value)
     {
         return Some(spec);

@@ -19,7 +19,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{Locals, NameSeg, RegularCall, TyRef, TypeDeclKind},
+    ullbc::{Locals, RegularCall, TyRef, TypeDeclKind},
 };
 
 use crate::front::mir::tests::{
@@ -12115,11 +12115,7 @@ fn fundecl_module_is_the_crate_qualified_defining_module() {
             fd.item_meta
                 .name_path()
                 .starts_with("pyre_module::module::")
-                && fd
-                    .item_meta
-                    .name
-                    .iter()
-                    .any(|seg| matches!(seg, NameSeg::Other(_)))
+                && fd.item_meta.name.iter().any(|seg| seg.is_impl())
         })
         .expect("a method under pyre_module::module");
     let module = super::fundecl_module(method).expect("method module");

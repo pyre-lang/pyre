@@ -2787,17 +2787,10 @@ pub(in crate::front::mir) fn regular_call_is_panicking_abort(
 
 /// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
 pub(in crate::front::mir) fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
-    fd.item_meta.name.last().is_some_and(|seg| match seg {
-        NameSeg::Other(v) => {
-            v.as_object()
-                .and_then(|m| m.get("Builtin"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| arr.first())
-                .and_then(serde_json::Value::as_str)
-                == Some("PromotedConst")
-        }
-        _ => false,
-    })
+    fd.item_meta
+        .name
+        .last()
+        .is_some_and(|seg| matches!(seg, NameSeg::Builtin { kind, .. } if kind == "PromotedConst"))
 }
 
 pub(in crate::front::mir) fn inner_global_id(place: &Place) -> u64 {

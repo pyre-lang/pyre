@@ -9704,11 +9704,11 @@ impl<'a> Lowering<'a> {
         if last_idx == 0 {
             return None;
         }
-        let impl_payload = match &segs[last_idx - 1] {
-            NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-            _ => return None,
-        };
-        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_payload)?;
+        let impl_seg = &segs[last_idx - 1];
+        if !impl_seg.is_impl() {
+            return None;
+        }
+        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_seg)?;
         if !self.first_input_is_adt(fd, adt_def_id) {
             return None;
         }
@@ -9740,13 +9740,10 @@ impl<'a> Lowering<'a> {
     /// FunDecl's trait-impl id; an inherent method leaves it `None`.
     ///
     /// Charon serialises an impl method's name as:
-    ///   `[Ident("crate"), Ident("mod"), Other({"Impl": ...}), Ident("method_name")]`
-    /// where the `Impl` segment carries either
-    ///   `{"Ty": {"skip_binder": {"Deduplicated": <type_id>}, "kind": "InherentImplBlock"}}`
-    /// for inherent impls or `{"Trait": <trait_impl_id>}` for trait-impls.
-    /// Trait-impl lookups indirect through the top-level `trait_impls`
-    /// table, kept opaque (`schema::Translated.rest["trait_impls"]`)
-    /// because no other consumer needs it typed.
+    ///   `[Ident("crate"), Ident("mod"), Impl…, Ident("method_name")]`
+    /// where the impl segment carries `skip_binder` (inherent `Self`)
+    /// and/or a trait-impl id. Trait-impl lookups indirect through the
+    /// top-level `trait_impls` table.
     pub(in crate::front::mir) fn impl_method_owner(
         &self,
         fd: &FunDecl,
@@ -9762,11 +9759,11 @@ impl<'a> Lowering<'a> {
         if last_idx == 0 {
             return None;
         }
-        let impl_payload = match &segs[last_idx - 1] {
-            NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-            _ => return None,
-        };
-        let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
+        let impl_seg = &segs[last_idx - 1];
+        if !impl_seg.is_impl() {
+            return None;
+        }
+        let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_seg) {
             Some(adt_def_id) => {
                 // The hint is only valid when the fn actually receives
                 // the impl owner as `self` (`Owner` / `&Owner` /

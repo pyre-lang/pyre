@@ -49,11 +49,11 @@ pub struct Translated {
     /// trait-associated-type resolution. Each row keeps only the paths
     /// the translator reads: `def_id`; `impl_trait.id`,
     /// `impl_trait.generics.types`, `impl_trait.generics.const_generics`;
-    /// `generics.types`, `generics.const_generics`, `generics.trait_refs`;
-    /// `implied_trait_refs`; `consts`; `types[].kind`,
-    /// `types[].skip_binder.value`. Method ids live on the parallel
-    /// [`Translated::trait_impl_methods`] table. A new reader of another
-    /// path must add it to `TraitImplRow`.
+    /// `implied_trait_refs`; `consts`. Method ids live on
+    /// [`Translated::trait_impl_methods`]; row-generic lengths on
+    /// [`Translated::trait_impl_generics`]; associated types on
+    /// [`Translated::trait_impl_types`]. A new reader of another path
+    /// must add it to `TraitImplRow`.
     ///
     /// Every other top-level surface Charon emits (`ordered_decls`,
     /// `options`, `item_names`, `short_names`, …) is intentionally not
@@ -67,6 +67,12 @@ pub struct Translated {
     /// `None`. A missing `methods` key is `None`; JSON `null` slots stay
     /// `None` inside the inner vec.
     pub(crate) trait_impl_methods: Vec<Option<Vec<Option<ImplMethod>>>>,
+    /// Per-row `generics.types` / `const_generics` lengths and
+    /// `trait_refs` of [`Self::trait_impls`], same indices.
+    pub(crate) trait_impl_generics: Vec<Option<ImplGenericsLens>>,
+    /// Per-row associated types of [`Self::trait_impls`], same indices.
+    /// Holes stay `None`. A missing `types` key is `None`.
+    pub(crate) trait_impl_types: Vec<Option<Vec<Option<AssocType>>>>,
     /// Source files, indexed by the `file_id` every
     /// [`crate::ullbc::SpanData`] carries.  Without it a span names a
     /// line in a file nothing can name.
@@ -103,6 +109,8 @@ struct TranslatedDe {
 struct TraitImplTable {
     rows: Vec<Value>,
     methods: Vec<Option<Vec<Option<ImplMethod>>>>,
+    generics: Vec<Option<ImplGenericsLens>>,
+    types: Vec<Option<Vec<Option<AssocType>>>>,
 }
 
 impl<'de> Deserialize<'de> for Translated {
@@ -118,6 +126,8 @@ impl<'de> Deserialize<'de> for Translated {
             assoc_item_names: de.assoc_item_names,
             trait_impls: de.trait_impls.rows,
             trait_impl_methods: de.trait_impls.methods,
+            trait_impl_generics: de.trait_impls.generics,
+            trait_impl_types: de.trait_impls.types,
             files: de.files,
         })
     }
@@ -195,18 +205,6 @@ pub(crate) fn insert_present(
     }
 }
 
-pub(crate) fn option_array_into_value<T>(entries: Vec<Option<T>>, f: impl Fn(T) -> Value) -> Value {
-    Value::Array(
-        entries
-            .into_iter()
-            .map(|entry| match entry {
-                None => Value::Null,
-                Some(entry) => f(entry),
-            })
-            .collect(),
-    )
-}
-
 /// A `trait_impls` row reduced to the paths the translator reads.
 #[derive(Deserialize)]
 struct TraitImplRow {
@@ -229,7 +227,7 @@ struct TraitImplRow {
 }
 
 impl TraitImplRow {
-    fn into_value_and_methods(self) -> (Value, Option<Vec<Option<ImplMethod>>>) {
+    fn into_parts(self) -> TraitImplParts {
         let methods = match self.methods {
             None => None,
             Some(Nullable::Null) => Some(Vec::new()),
@@ -237,6 +235,21 @@ impl TraitImplRow {
                 entries
                     .into_iter()
                     .map(|entry| entry.map(MethodEntry::into_impl_method))
+                    .collect(),
+            ),
+        };
+        let generics = match self.generics {
+            None => None,
+            Some(Nullable::Null) => Some(ImplGenericsLens::default()),
+            Some(Nullable::Some(row)) => Some(row.into_lens()),
+        };
+        let types = match self.types {
+            None => None,
+            Some(Nullable::Null) => Some(Vec::new()),
+            Some(Nullable::Some(entries)) => Some(
+                entries
+                    .into_iter()
+                    .map(|entry| entry.map(AssocTypeEntry::into_assoc_type))
                     .collect(),
             ),
         };
@@ -248,22 +261,22 @@ impl TraitImplRow {
             self.impl_trait
                 .map(|n| n.into_value(ImplTraitRef::into_value)),
         );
-        insert_present(
-            &mut map,
-            "generics",
-            self.generics.map(|n| n.into_value(RowGenerics::into_value)),
-        );
         insert_present(&mut map, "implied_trait_refs", self.implied_trait_refs);
         insert_present(&mut map, "consts", self.consts);
-        insert_present(
-            &mut map,
-            "types",
-            self.types.map(|n| {
-                n.into_value(|es| option_array_into_value(es, AssocTypeEntry::into_value))
-            }),
-        );
-        (Value::Object(map), methods)
+        TraitImplParts {
+            value: Value::Object(map),
+            methods,
+            generics,
+            types,
+        }
     }
+}
+
+struct TraitImplParts {
+    value: Value,
+    methods: Option<Vec<Option<ImplMethod>>>,
+    generics: Option<ImplGenericsLens>,
+    types: Option<Vec<Option<AssocType>>>,
 }
 
 #[derive(Deserialize)]
@@ -305,24 +318,95 @@ impl TraitRefGenerics {
     }
 }
 
+/// Lengths of a `trait_impls` row's `generics.types` /
+/// `generics.const_generics`, and the `trait_refs` array when present.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImplGenericsLens {
+    pub types_len: Option<u32>,
+    pub const_generics_len: Option<u32>,
+    pub trait_refs: Option<Value>,
+}
+
 #[derive(Deserialize)]
 struct RowGenerics {
-    #[serde(default, deserialize_with = "present")]
-    types: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    const_generics: Option<Value>,
+    #[serde(default, deserialize_with = "json_array_len")]
+    types: Option<u32>,
+    #[serde(default, deserialize_with = "json_array_len")]
+    const_generics: Option<u32>,
     #[serde(default, deserialize_with = "present")]
     trait_refs: Option<Value>,
 }
 
 impl RowGenerics {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        insert_present(&mut map, "types", self.types);
-        insert_present(&mut map, "const_generics", self.const_generics);
-        insert_present(&mut map, "trait_refs", self.trait_refs);
-        Value::Object(map)
+    fn into_lens(self) -> ImplGenericsLens {
+        ImplGenericsLens {
+            types_len: self.types,
+            const_generics_len: self.const_generics,
+            trait_refs: self.trait_refs,
+        }
     }
+}
+
+fn json_array_len<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    struct ArrayLen;
+    impl<'de> serde::de::Visitor<'de> for ArrayLen {
+        type Value = Option<u32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut n = 0u32;
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                n = n.saturating_add(1);
+            }
+            Ok(Some(n))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(ArrayLen)
 }
 
 #[derive(Deserialize)]
@@ -333,17 +417,35 @@ struct AssocTypeEntry {
     skip_binder: Option<Nullable<AssocBinder>>,
 }
 
+/// One `trait_impls[].types[]` associated type: `kind.TraitType` ids and
+/// `skip_binder.value`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssocType {
+    pub trait_id: Option<u64>,
+    pub assoc: Option<Value>,
+    pub value: Option<Value>,
+}
+
 impl AssocTypeEntry {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        insert_present(&mut map, "kind", self.kind);
-        insert_present(
-            &mut map,
-            "skip_binder",
-            self.skip_binder
-                .map(|n| n.into_value(AssocBinder::into_value)),
-        );
-        Value::Object(map)
+    fn into_assoc_type(self) -> AssocType {
+        let (trait_id, assoc) = match self.kind {
+            Some(Value::Object(map)) => match map.get("TraitType").and_then(Value::as_array) {
+                Some(arr) if arr.len() == 2 => {
+                    (arr.first().and_then(Value::as_u64), arr.get(1).cloned())
+                }
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+        let value = match self.skip_binder {
+            Some(Nullable::Some(binder)) => binder.value,
+            _ => None,
+        };
+        AssocType {
+            trait_id,
+            assoc,
+            value,
+        }
     }
 }
 
@@ -351,14 +453,6 @@ impl AssocTypeEntry {
 struct AssocBinder {
     #[serde(default, deserialize_with = "present")]
     value: Option<Value>,
-}
-
-impl AssocBinder {
-    fn into_value(self) -> Value {
-        let mut map = serde_json::Map::new();
-        insert_present(&mut map, "value", self.value);
-        Value::Object(map)
-    }
 }
 
 /// One impl method: `kind.TraitMethod` ids and `skip_binder.id`.
@@ -479,17 +573,23 @@ fn trait_impl_table<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TraitImplT
     let mut table = TraitImplTable {
         rows: Vec::with_capacity(rows.len()),
         methods: Vec::with_capacity(rows.len()),
+        generics: Vec::with_capacity(rows.len()),
+        types: Vec::with_capacity(rows.len()),
     };
     for row in rows {
         match row {
             None => {
                 table.rows.push(Value::Null);
                 table.methods.push(None);
+                table.generics.push(None);
+                table.types.push(None);
             }
             Some(row) => {
-                let (value, methods) = row.into_value_and_methods();
-                table.rows.push(value);
-                table.methods.push(methods);
+                let parts = row.into_parts();
+                table.rows.push(parts.value);
+                table.methods.push(parts.methods);
+                table.generics.push(parts.generics);
+                table.types.push(parts.types);
             }
         }
     }

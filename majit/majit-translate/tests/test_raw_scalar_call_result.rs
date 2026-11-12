@@ -65,7 +65,6 @@
 mod common;
 
 use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named};
-use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
     ErrorCarrierSpec, HostStaticAddrs,
@@ -159,11 +158,10 @@ fn call_result(kind: &OpKind) -> Option<(&ValueType, Option<&str>)> {
 /// `ActionFlag::ticker_addr` and `SpaceActionFlag::ticker_addr` share one
 /// suffix. The impl segment's `Self` type is the receiver.
 fn receiver_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
-    let id = fd.item_meta.name.iter().find_map(|seg| match seg {
-        NameSeg::Other(value) => value
-            .pointer("/Impl/Ty/skip_binder/Deduplicated")
-            .and_then(|value| value.as_u64()),
-        NameSeg::Ident { .. } => None,
+    let id = fd.item_meta.name.iter().find_map(|seg| {
+        seg.impl_ty_skip_binder()
+            .and_then(|value| value.get("Deduplicated"))
+            .and_then(|value| value.as_u64())
     })?;
     let def_id = llbc.dedup_to_adt_def_id(id)?;
     Some(llbc.type_by_id(def_id)?.item_meta.name_path())

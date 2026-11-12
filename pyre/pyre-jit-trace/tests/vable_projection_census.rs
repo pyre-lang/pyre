@@ -129,25 +129,23 @@ fn struct_field_index(payload: &Value) -> Option<usize> {
     arr[1].as_u64().map(|i| i as usize)
 }
 
-fn impl_owner_adt_id(llbc: &Llbc, impl_payload: &Value) -> Option<u64> {
-    let ty = impl_payload.get("Ty")?;
-    let sb = ty.get("skip_binder")?;
-    if let Some(arr) = sb.get("Value").and_then(Value::as_array)
+fn impl_owner_adt_id(llbc: &Llbc, skip_binder: &Value) -> Option<u64> {
+    if let Some(arr) = skip_binder.get("Value").and_then(Value::as_array)
         && let Some(body) = arr.get(1)
     {
         return adt_def_id_from_node(body, llbc);
     }
-    if let Some(id) = sb.get("Deduplicated").and_then(Value::as_u64) {
+    if let Some(id) = skip_binder.get("Deduplicated").and_then(Value::as_u64) {
         return llbc.dedup_to_adt_def_id(id).or_else(|| {
             llbc.dedup_body(id)
                 .and_then(|b| adt_def_id_from_node(b, llbc))
         });
     }
-    adt_def_id_from_node(sb, llbc)
+    adt_def_id_from_node(skip_binder, llbc)
 }
 
-fn impl_owner_leaf(llbc: &Llbc, impl_payload: &Value) -> Option<String> {
-    let adt_id = impl_owner_adt_id(llbc, impl_payload)?;
+fn impl_owner_leaf(llbc: &Llbc, skip_binder: &Value) -> Option<String> {
+    let adt_id = impl_owner_adt_id(llbc, skip_binder)?;
     let td = llbc.type_by_id(adt_id)?;
     td.item_meta
         .name_path_str()
@@ -173,25 +171,23 @@ fn display_fn_name(llbc: &Llbc, fd: &FunDecl) -> String {
                     out.push_str(&disambiguator.to_string());
                 }
             }
-            NameSeg::Other(v) => {
-                if let Some(impl_p) = v.get("Impl") {
-                    if let Some(leaf) = impl_owner_leaf(llbc, impl_p) {
+            other => {
+                if other.is_impl() {
+                    if let Some(leaf) = other
+                        .impl_ty_skip_binder()
+                        .and_then(|skip_binder| impl_owner_leaf(llbc, skip_binder))
+                    {
                         out.push('{');
                         out.push_str(&leaf);
                         out.push('}');
                     } else {
                         out.push_str("<Impl>");
                     }
-                } else if let Some(label) = builtin_path_label(v) {
+                } else if let Some(label) = builtin_path_label(other) {
                     out.push_str(&label);
                 } else {
-                    let label = v
-                        .as_object()
-                        .and_then(|m| m.keys().next())
-                        .map(String::as_str)
-                        .unwrap_or("?");
                     out.push('<');
-                    out.push_str(label);
+                    out.push_str(other.first_key_label());
                     out.push('>');
                 }
             }
