@@ -3562,7 +3562,7 @@ where
 
 pub fn execute_store_name<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
@@ -3573,13 +3573,14 @@ where
         unreachable!()
     };
     let idx = u32_as_usize(namei.get(op_arg));
-    executor.store_name(code.names[idx].as_ref(), idx)?;
+    let name = executor.getname_u(idx)?;
+    executor.store_name(name, idx)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_store_global<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
@@ -3590,7 +3591,8 @@ where
         unreachable!()
     };
     let idx = u32_as_usize(namei.get(op_arg));
-    executor.store_global(code.names[idx].as_ref(), idx)?;
+    let name = executor.getname_u(idx)?;
+    executor.store_global(name, idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -3615,7 +3617,7 @@ where
 
 pub fn execute_load_global<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
@@ -3629,13 +3631,14 @@ where
     let name_idx = raw >> 1;
     let push_null = (raw & 1) != 0;
     // pyopcode.py LOAD_GLOBAL: `getname_w` then `LOAD_GLOBAL_cached`.
-    executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
+    let name = executor.getname_u(name_idx)?;
+    executor.load_global(name, name_idx, push_null)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_delete_name<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -3643,39 +3646,44 @@ pub fn execute_delete_name<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let nameindex = u32_as_usize(namei.get(op_arg));
-    executor.delete_name(code.names[nameindex].as_ref(), nameindex)?;
+    let name = executor.getname_u(nameindex)?;
+    executor.delete_name(name, nameindex)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_delete_global<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     let Instruction::DeleteGlobal { namei } = instruction else {
         unreachable!()
     };
-    executor.delete_global(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    let nameindex = u32_as_usize(namei.get(op_arg));
+    let name = executor.getname_u(nameindex)?;
+    executor.delete_global(name)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_delete_attr<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     let Instruction::DeleteAttr { namei } = instruction else {
         unreachable!()
     };
-    executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    let nameindex = u32_as_usize(namei.get(op_arg));
+    let name = executor.getname_u(nameindex)?;
+    executor.delete_attr(name)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_store_attr<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -3683,7 +3691,8 @@ pub fn execute_store_attr<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let name_idx = u32_as_usize(namei.get(op_arg));
-    executor.store_attr_cached(code.names[name_idx].as_ref(), name_idx)?;
+    let name = executor.getname_u(name_idx)?;
+    executor.store_attr_cached(name, name_idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -3698,7 +3707,7 @@ pub fn import_name_index(packed: u32) -> usize {
 
 pub fn execute_import_name<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -3707,13 +3716,14 @@ pub fn execute_import_name<E: OpcodeStepExecutor>(
     };
     let packed = namei.get(op_arg);
     let name_idx = import_name_index(packed);
-    executor.import_name(code.names[name_idx].as_ref(), name_idx, packed & 3)?;
+    let name = executor.getname_u(name_idx)?;
+    executor.import_name(name, name_idx, packed & 3)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_import_from<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -3721,13 +3731,14 @@ pub fn execute_import_from<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let name_idx = u32_as_usize(namei.get(op_arg));
-    executor.import_from(code.names[name_idx].as_ref())?;
+    let name = executor.getname_u(name_idx)?;
+    executor.import_from(name)?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_load_attr<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
@@ -3739,7 +3750,7 @@ where
     };
     let attr = namei.get(op_arg);
     let name_idx = u32_as_usize(attr.name_idx());
-    let name = code.names[name_idx].as_ref();
+    let name = executor.getname_u(name_idx)?;
     if attr.is_method() {
         executor.load_method(name)?;
     } else {
@@ -3750,7 +3761,7 @@ where
 
 pub fn execute_load_from_dict_or_globals<E: OpcodeStepExecutor>(
     executor: &mut E,
-    code: &CodeObject,
+    _code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -3758,7 +3769,8 @@ pub fn execute_load_from_dict_or_globals<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let idx = u32_as_usize(i.get(op_arg));
-    executor.load_from_dict_or_globals(code.names[idx].as_ref(), idx)?;
+    let name = executor.getname_u(idx)?;
+    executor.load_from_dict_or_globals(name, idx)?;
     Ok(StepResult::Continue)
 }
 
