@@ -207,7 +207,6 @@ pub unsafe fn object_lock_release_held(lock: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Distinct raw stripe indices: `(addr >> 4) & 255` is 0 and 1.
     const OLD_ADDR: usize = 0x1111_0000;
@@ -216,10 +215,23 @@ mod tests {
     /// new addresses map to one `id_or_identityhash` result.
     const STABLE: usize = 0x2222_00F0;
 
-    static IDENTITY_HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    // Per-thread: once the GIL-ready word is published every other test
+    // thread's striped acquire also goes through the registered hook, and
+    // only this thread's calls are what the assertions count.
+    thread_local! {
+        static IDENTITY_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn identity_hash_calls() -> usize {
+        IDENTITY_HASH_CALLS.with(|cell| cell.get())
+    }
+
+    fn reset_identity_hash_calls() {
+        IDENTITY_HASH_CALLS.with(|cell| cell.set(0));
+    }
 
     fn mapping_identity_hash(addr: usize) -> usize {
-        IDENTITY_HASH_CALLS.fetch_add(1, Ordering::SeqCst);
+        IDENTITY_HASH_CALLS.with(|cell| cell.set(cell.get() + 1));
         if addr == OLD_ADDR || addr == NEW_ADDR {
             STABLE
         } else {
@@ -255,17 +267,17 @@ mod tests {
 
         let family: &'static LockFamily = Box::leak(Box::new(LockFamily::new()));
 
-        IDENTITY_HASH_CALLS.store(0, Ordering::SeqCst);
+        reset_identity_hash_calls();
         if crate::gil_ready::gil_ready_word() == 0 {
             assert!(!stripes_taken());
             assert_eq!(family.acquire(OLD_ADDR), 0);
             assert_eq!(family.try_acquire(OLD_ADDR), Some(0));
-            assert_eq!(IDENTITY_HASH_CALLS.load(Ordering::SeqCst), 0);
+            assert_eq!(identity_hash_calls(), 0);
         }
 
         crate::gil_ready::publish_gil_ready_for_test();
 
-        IDENTITY_HASH_CALLS.store(0, Ordering::SeqCst);
+        reset_identity_hash_calls();
         let _gil = {
             majit_gc::rgil::acquire();
             GilHold
@@ -274,19 +286,19 @@ mod tests {
         assert!(!stripes_taken());
         assert_eq!(family.acquire(OLD_ADDR), 0);
         assert_eq!(family.try_acquire(OLD_ADDR), Some(0));
-        assert_eq!(IDENTITY_HASH_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(identity_hash_calls(), 0);
         drop(_gil);
         assert!(!majit_gc::rgil::am_i_holding_the_gil());
 
         assert!(stripes_taken());
         assert_eq!(stable_stripe_index(OLD_ADDR), stable_stripe_index(NEW_ADDR));
 
-        IDENTITY_HASH_CALLS.store(0, Ordering::SeqCst);
+        reset_identity_hash_calls();
         let first = unsafe { ObjectLockGuard::from_word(family.acquire(OLD_ADDR)) };
         let second = unsafe { ObjectLockGuard::from_word(family.acquire(NEW_ADDR)) };
         assert_ne!(first.word(), 0);
         assert_eq!(first.word(), second.word());
-        assert!(IDENTITY_HASH_CALLS.load(Ordering::SeqCst) >= 2);
+        assert!(identity_hash_calls() >= 2);
         drop(second);
         drop(first);
 
