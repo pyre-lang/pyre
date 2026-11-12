@@ -1519,6 +1519,40 @@ fn fat_box_field_lltype(
     two_word_fat_struct(spelling)
 }
 
+/// A `Box<[T]>` field of an `_alloc_flavor_ = "raw"` owner, annotated as
+/// the two words [`fat_box_field_lltype`] lays out (`two_word_fat_struct`),
+/// in `fat_ptr_layout::probe()` order. The data word is a raw nolength
+/// `Ptr(Array(ITEM))` (`rlist.rs` `rust_vec_items_array_ptr_lltype`), which
+/// `history.getkind` reads as `'int'`; the length word is a non-negative
+/// Signed, as `len()` of a list is. A raw struct holds no GC array
+/// (`rclass.py` `getgcflavor`), so the `SomeList` → `GcArray` projection
+/// of a GC owner's field does not apply. `None` for an item with no
+/// scalar lltype: a raw `Ptr(Array(STRPTR))` item would annotate as
+/// `SomePtr`, not the `SomeString` its readers union with, and no
+/// `annlowlevel.hlstr` conversion is ported, so a `String` item keeps
+/// the list projection.
+pub(crate) fn raw_owner_boxed_slice_annotation(spelling: &str) -> Option<SomeValue> {
+    fat_box_field_lltype(spelling)?;
+    let inner = angle_wrapper_inner(spelling, &["Box"])?;
+    let item_spelling = inner
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(str::trim)?;
+    let item = scalar_lltype(item_spelling)?;
+    let data = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::rlist::rust_vec_items_array_ptr_lltype(&item),
+    );
+    let len = SomeValue::Integer(SomeInteger::new(true, false));
+    let layout = crate::fat_ptr_layout::probe();
+    let items = if layout.len_offset < layout.data_offset {
+        vec![len, data]
+    } else {
+        vec![data, len]
+    };
+    Some(SomeValue::Tuple(super::model::SomeTuple::new(items)))
+}
+
 /// `*mut dyn Trait` / `*const [T]` / `&dyn Trait` / `Option<*mut dyn ..>`:
 /// data + metadata. `Box<[T]>` stays on `fat_box_field_lltype`.
 fn fat_dyn_pointer_field_lltype(
@@ -1883,12 +1917,18 @@ impl Bookkeeper {
         self.raw_alloc_flavor_structs.borrow().clone()
     }
 
+    /// `rclass.py getgcflavor(classdef) == 'raw'` for a struct path, over
+    /// the harvested `_alloc_flavor_ = raw` set.
+    pub(crate) fn is_raw_alloc_flavor(&self, path: &str) -> bool {
+        crate::front::llbc_hints::alloc_flavor_raw_contains(
+            &self.raw_alloc_flavor_structs.borrow(),
+            path,
+        )
+    }
+
     /// `classdesc.get_param('_alloc_flavor_')` carrier on the interned class.
     fn stamp_raw_alloc_flavor(&self, host: &HostObject, key: &str) {
-        if crate::front::llbc_hints::alloc_flavor_raw_contains(
-            &self.raw_alloc_flavor_structs.borrow(),
-            key,
-        ) {
+        if self.is_raw_alloc_flavor(key) {
             host.class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
         }
     }
@@ -4372,6 +4412,16 @@ impl Bookkeeper {
                 } else {
                     self.project_struct_field_type(&row.ty)
                 };
+            // A raw owner's `Box<[T]>` is the raw two-word pair, not a list
+            // (`raw_owner_boxed_slice_annotation`).
+            let raw_owner_boxed_slice = !row.is_positional && self.is_raw_alloc_flavor(n);
+            let (s_value, substituted_pair) = match raw_owner_boxed_slice
+                .then(|| raw_owner_boxed_slice_annotation(&row.ty))
+                .flatten()
+            {
+                Some(s_pair) => (s_pair, true),
+                None => (s_value, false),
+            };
             // `rlist.py` `ll_length` is `return l.length`. A Vec field's
             // length word is the parent `{name}.len` Signed getfield
             // (`assembler` suffixes `.len`); getattr of that name must
@@ -4430,10 +4480,21 @@ impl Bookkeeper {
                             &crate::model::ValueType::Int,
                         )
                         .is_some_and(|shell| shell == attr.s_value);
+                // `tyref_to_attr_value_type` banks a raw owner's `Box<[T]>`
+                // data word as Int, so FORCE may shell the field as the
+                // Int-bank shell. Replace ONLY that exact shell with the pair.
+                let is_raw_boxed_slice_integer_force_shell =
+                    matches!(&s_value, SomeValue::Tuple(_))
+                        && substituted_pair
+                        && crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value);
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
                     || is_window_integer_force_shell
+                    || is_raw_boxed_slice_integer_force_shell
                 {
                     attr.s_value = s_value;
                 }
@@ -17255,6 +17316,82 @@ mod tests {
             matches!(varnames.s_value, SomeValue::List(_)),
             "varnames must project to SomeList, got {:?}",
             varnames.s_value
+        );
+    }
+
+    #[test]
+    fn raw_owner_boxed_slice_field_is_the_raw_word_pair() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let bk = bk();
+        crate::annotator::classdesc::register_struct_fields(
+            "CodeObject",
+            &[
+                ("varnames".to_string(), crate::model::ValueType::Ref(None)),
+                ("localspluskinds".to_string(), crate::model::ValueType::Int),
+            ],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "PyFrame".to_string(),
+            vec![("code".to_string(), "CodeObject".to_string())],
+        );
+        reg.fields.insert(
+            "CodeObject".to_string(),
+            vec![
+                ("varnames".to_string(), "Box<[String]>".to_string()),
+                ("localspluskinds".to_string(), "Box<[u8]>".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.set_raw_alloc_flavor_structs(["CodeObject".to_string()].into_iter().collect());
+        let _root = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame registers");
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("CodeObject")
+            .expect("CodeObject registered");
+        let g = cd.borrow();
+        let layout = crate::fat_ptr_layout::probe();
+        let data_idx = layout.word_index(false) as usize;
+        let len_idx = layout.word_index(true) as usize;
+        let attr = g
+            .attrs
+            .get("localspluskinds")
+            .expect("boxed-slice attr present");
+        let SomeValue::Tuple(tuple) = &attr.s_value else {
+            panic!(
+                "localspluskinds must project to the raw two-word pair, got {:?}",
+                attr.s_value
+            );
+        };
+        assert_eq!(tuple.items.len(), 2, "localspluskinds pair is two words");
+        let SomeValue::Ptr(ptr) = &tuple.items[data_idx] else {
+            panic!(
+                "localspluskinds data word is SomePtr, got {:?}",
+                tuple.items[data_idx]
+            );
+        };
+        let PtrTarget::Array(array) = &ptr.ll_ptrtype.TO else {
+            panic!(
+                "localspluskinds data word is Ptr(Array), got {:?}",
+                ptr.ll_ptrtype.TO
+            );
+        };
+        assert_eq!(
+            array._gckind,
+            GcKind::Raw,
+            "localspluskinds items array is raw"
+        );
+        assert!(
+            matches!(&tuple.items[len_idx], SomeValue::Integer(i) if i.nonneg),
+            "length word is a non-negative Signed"
+        );
+        let varnames = g.attrs.get("varnames").expect("varnames attr present");
+        assert!(
+            matches!(varnames.s_value, SomeValue::List(_)),
+            "a String item keeps the list projection"
         );
     }
 

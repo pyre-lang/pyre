@@ -8,7 +8,6 @@ direct-skip (never reaches unported_category)	option::Option::<impl core::ops::t
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::<Impl>::class_dict_strategy
 direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::delete_fast__AccessDirect_None
 direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::load_local_checked_value__AccessDirect_None
-direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::cell_slot
 direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::deref_name_and_kind
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_ConstIdx_TryFrom____0___const_generics______regi_6644b6a8b30a0282

@@ -3572,11 +3572,12 @@ pub fn translate_op(
             // field, not by `getattr` of the slice itself.
             if field.vec_part == Some(crate::model::VecFieldPart::FatMeta)
                 || (field.vec_part == Some(crate::model::VecFieldPart::FatLen)
-                    && field_spelling_is_dyn_fat(call_registry, field))
+                    && (field_spelling_is_dyn_fat(call_registry, field)
+                        || field_is_raw_owner_boxed_slice(call_registry, field)))
             {
-                // Dyn metadata word: `getitem` of `two_word_fat_struct`
-                // (`rtuple.py` `rtype_getitem`). Slice `FatLen` stays
-                // `len(getattr)` below (`ListRepr.rtype_len`).
+                // Dyn metadata / raw-owner `Box<[T]>` length: `getitem` of
+                // the pair (`rtuple.py` `rtype_getitem`). A GC owner's
+                // slice FatLen stays `len(getattr)` below.
                 return Ok(getattr_then_getitem(
                     base_hl,
                     &field.name,
@@ -3592,9 +3593,9 @@ pub fn translate_op(
                 )
             {
                 // Owner-less window word: the base is already the
-                // `SomeTuple` (`rtuple.py` `TupleRepr.getitem`).
-                // `CodeObject.varnames` FatLen has an owner_root and
-                // stays `len(getattr)` below.
+                // `SomeTuple` (`rtuple.py` `TupleRepr.getitem`). A GC
+                // owner's slice FatLen stays `len(getattr)` below; a raw
+                // owner's `Box<[T]>` takes the pair `getitem`.
                 let metadata = field.vec_part == Some(crate::model::VecFieldPart::FatLen);
                 return Ok(vec![FlowspaceOp::new(
                     "getitem",
@@ -3608,7 +3609,7 @@ pub fn translate_op(
                 )]);
             }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
-                // Slice / `Box<[T]>` FatLen is `len(getattr(owner, field))`
+                // A GC owner's slice FatLen is `len(getattr(owner, field))`
                 // (`ListRepr.rtype_len`).
                 let list = Hlvalue::Variable(Variable::new());
                 return Ok(vec![
@@ -3624,7 +3625,8 @@ pub fn translate_op(
                 ]);
             }
             if field.vec_part == Some(crate::model::VecFieldPart::FatData)
-                && field_spelling_is_dyn_fat(call_registry, field)
+                && (field_spelling_is_dyn_fat(call_registry, field)
+                    || field_is_raw_owner_boxed_slice(call_registry, field))
             {
                 return Ok(getattr_then_getitem(
                     base_hl,
@@ -6487,6 +6489,26 @@ fn field_spelling_is_dyn_fat(
     crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(&ty)
         || majit_ir::descr::is_shared_u8_slice_spelling(&ty)
         || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
+}
+
+/// A `Box<[T]>` field of an `_alloc_flavor_ = "raw"` owner: the bookkeeper
+/// annotates it as the raw two-word pair
+/// (`bookkeeper::raw_owner_boxed_slice_annotation`), so its FatData /
+/// FatLen words are `getitem` of that pair, as for a fat `&dyn` field,
+/// not `getattr` / `len(getattr)` of a list.
+fn field_is_raw_owner_boxed_slice(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    field: &crate::model::FieldDescriptor,
+) -> bool {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return false;
+    };
+    if !call_registry.bookkeeper().is_raw_alloc_flavor(owner) {
+        return false;
+    }
+    projected_owner_field_spelling(call_registry, field).is_some_and(|ty| {
+        crate::annotator::bookkeeper::raw_owner_boxed_slice_annotation(&ty).is_some()
+    })
 }
 
 /// Index of the metadata (`true`) or data (`false`) word in
@@ -14141,6 +14163,82 @@ mod tests {
         };
         let expected = fat_dyn_word_index(true);
         assert!(matches!(idx.value, ConstValue::Int(n) if n == expected));
+    }
+
+    #[test]
+    fn translate_op_raw_owner_boxed_slice_lowers_to_getattr_getitem() {
+        let fields = {
+            let mut fields = crate::front::StructFieldRegistry::default();
+            fields.fields.insert(
+                "CodeObject".to_string(),
+                vec![("localspluskinds".to_string(), "Box<[u8]>".to_string())],
+            );
+            Rc::new(fields)
+        };
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(fields.clone());
+        bk.set_raw_alloc_flavor_structs(std::collections::HashSet::from(
+            ["CodeObject".to_string()],
+        ));
+        let registry = CallRegistry::new(bk);
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 5);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let len_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "localspluskinds",
+                    Some("CodeObject".into()),
+                )
+                .with_vec_part(crate::model::VecFieldPart::FatLen),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&len_op, &value_map, &registry).expect("raw boxed slice len");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "getitem"]);
+        let Hlvalue::Constant(ref idx) = translated[1].args[1] else {
+            panic!("getitem index");
+        };
+        let expected_len = fat_dyn_word_index(true);
+        assert!(matches!(idx.value, ConstValue::Int(n) if n == expected_len));
+
+        let data_op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "localspluskinds",
+                    Some("CodeObject".into()),
+                )
+                .with_vec_part(crate::model::VecFieldPart::FatData),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&data_op, &value_map, &registry).expect("raw boxed slice data");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "getitem"]);
+        let Hlvalue::Constant(ref idx) = translated[1].args[1] else {
+            panic!("getitem index");
+        };
+        let expected_data = fat_dyn_word_index(false);
+        assert!(matches!(idx.value, ConstValue::Int(n) if n == expected_data));
+
+        let bk_gc = Rc::new(Bookkeeper::new());
+        bk_gc.set_struct_fields(fields);
+        let registry_gc = CallRegistry::new(bk_gc);
+        let translated =
+            translate_op(&len_op, &value_map, &registry_gc).expect("gc boxed slice len");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "len"]);
     }
 
     #[test]
