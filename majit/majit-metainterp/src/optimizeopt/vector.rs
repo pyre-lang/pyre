@@ -715,22 +715,6 @@ impl VectorLoop {
         }
     }
 
-    /// Convenience constructor: extract VectorLoop from a trace by finding
-    /// Label..Jump. Not in RPython — the caller splits the trace before
-    /// constructing VectorLoop. Kept for backward compatibility with tests.
-    pub fn from_trace(ops: &[Op]) -> Option<Self> {
-        let label_pos = ops.iter().position(|op| op.opcode == OpCode::Label)?;
-        let jump_pos = ops.iter().rposition(|op| op.opcode == OpCode::Jump)?;
-        if jump_pos <= label_pos {
-            return None;
-        }
-        Some(VectorLoop::new(
-            ops[label_pos].clone(),
-            ops[label_pos + 1..jump_pos].to_vec(),
-            ops[jump_pos].clone(),
-        ))
-    }
-
     /// vector.py: setup_vectorization — attach a `VectorizationInfo`
     /// to every loop operation (`for op in self.operations:
     /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
@@ -2656,34 +2640,6 @@ mod tests {
     }
 
     // ── VectorLoop tests ──
-
-    #[test]
-    fn test_vector_loop_from_trace() {
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
-            ),
-            Op::new(OpCode::Label, &[bx(OpRef::input_arg_int(100))]),
-            Op::new(
-                OpCode::IntAdd,
-                &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
-            ),
-            Op::new(
-                OpCode::IntMul,
-                &[bx(OpRef::int_op(2)), bx(OpRef::input_arg_int(102))],
-            ),
-            Op::new(OpCode::Jump, &[bx(OpRef::int_op(3))]),
-        ];
-        for (i, op) in ops.iter_mut().enumerate() {
-            op.pos().set(OpRef::op_typed(i as u32, op.result_type()));
-        }
-        let vloop = VectorLoop::from_trace(&ops).unwrap();
-        assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul
-        assert_eq!(vloop.label.opcode, OpCode::Label);
-        assert_eq!(vloop.jump.opcode, OpCode::Jump);
-        assert_eq!(vloop.inputargs.len(), 1);
-    }
 
     #[test]
     fn test_vector_loop_new() {

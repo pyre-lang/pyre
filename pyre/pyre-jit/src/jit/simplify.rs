@@ -1228,26 +1228,6 @@ mod tests {
         assert_eq!(start.borrow().exits[0].borrow().args.len(), 0);
     }
 
-    /// The op-scanning structural-adaptation no-ops leave a walker-shaped graph
-    /// (empty operations) untouched and do not trip their tripwires.
-    #[test]
-    fn op_scanning_noops_are_inert_on_empty_ops() {
-        let start = Block::shared(vec![]);
-        let graph = FunctionGraph::new("f", start.clone(), None);
-        let returnblock = graph.returnblock.clone();
-        start.closeblock(vec![
-            Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),
-        ]);
-
-        // None of these should panic on an empty-operations graph.
-        coalesce_bool(&graph);
-        transform_xxxitem(&graph);
-        transform_ovfcheck(&graph);
-        remove_dead_exceptions(&graph);
-        remove_assertion_errors(&graph);
-        simplify_exceptions(&graph);
-    }
-
     /// The full `simplify_graph` driver runs every pass in order, collapses a
     /// trivial link, and passes `checkgraph` without panicking.
     #[test]

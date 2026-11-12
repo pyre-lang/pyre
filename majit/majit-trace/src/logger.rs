@@ -344,14 +344,6 @@ mod tests {
         assert_eq!(log.total_ops_after(), 75);
     }
 
-    #[test]
-    fn test_jit_timer() {
-        let timer = JitTimer::start();
-        // Just verify it doesn't panic and returns a non-negative duration
-        let elapsed = timer.elapsed();
-        assert!(elapsed.as_nanos() < 1_000_000_000); // less than 1 second
-    }
-
     // ── Jitprof parity tests (rpython/jit/metainterp/test/test_jitprof.py) ──
 
     #[test]

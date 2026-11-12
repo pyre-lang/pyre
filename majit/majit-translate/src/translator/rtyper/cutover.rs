@@ -5779,14 +5779,6 @@ fn drive_lifted_subject(
     // poison a later subject's session-global `specialize_more_blocks`.
     _subject_block_scope.commit();
 
-    // Inert opname-reachability gauge over the rtyped flowspace graph this
-    // subject specialized cleanly. The two-phase path reports after Phase B;
-    // `do_rtype = false` is only Phase A and must not expose high-level
-    // operations as a post-rtype lowering backlog.
-    if do_rtype && crate::codewriter::jtransform_shadow::is_enabled() {
-        crate::codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
-    }
-
     if do_rtype {
         select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates, Some(&rtyper))?;
         reconcile_projection_aliases(
@@ -7469,19 +7461,6 @@ fn run_phase_b_rtype_isolated(
     }
     if rtyper_verbose_enabled() {
         emit_disposition_histogram("phaseB", &phase_b_reasons);
-    }
-    // Upstream's codewriter consumes graphs after `RPythonTyper.specialize`.
-    // Report the same surface: Phase B has rewritten each retained GraphRef in
-    // place, and `rtype_skipped` identifies graphs that did not specialize.
-    if crate::codewriter::jtransform_shadow::is_enabled() {
-        let tp = call_registry.two_phase();
-        let mut subjects: Vec<_> = tp.subjects.values().collect();
-        subjects.sort_by_key(|subject| subject.graph.borrow().name.clone());
-        for subject in subjects {
-            if !tp.rtype_skipped.contains(&subject.graph_key) {
-                crate::codewriter::jtransform_shadow::report_if_enabled(&subject.graph.borrow());
-            }
-        }
     }
     // MixLevelHelperAnnotator drain (rtyper.py:238-241) is a no-op while R4 is
     // unported — specialize_block never queues helper graphs today. When R4

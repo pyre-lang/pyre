@@ -10376,26 +10376,6 @@ mod tests {
     }
 
     #[test]
-    fn assemble_basic() {
-        let mut flat = SSARepr {
-            name: "test".into(),
-            insns: vec![],
-            num_blocks: 1,
-            insns_pos: None,
-        };
-
-        let regallocs = empty_regallocs();
-        let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
-
-        assert_eq!(flat.name, "test");
-        assert_eq!(body.c_num_regs_i as usize, 0);
-        assert_eq!(body.c_num_regs_r as usize, 0);
-        assert_eq!(body.c_num_regs_f as usize, 0);
-        assert_eq!(asm.count_jitcodes(), 1);
-    }
-
-    #[test]
     fn assemble_fused_goto_if_not_routes_to_reserved_opcode() {
         // the GotoIfNotOp lowering: a `FlatOp::GotoIfNotOp` assembles through the
         // registered `goto_if_not_<op>/<argcodes>` jitcode key — the

@@ -8,7 +8,7 @@
 //!
 //! A few files are local Rust boundaries, not missing upstream ports:
 //! `annotation_state`, `insns`, `jtransform_opname`,
-//! `jtransform_shadow`, `transform_profile`, and `type_state`.
+//! and `type_state`.
 //! Each of those modules documents the upstream surface it adapts or the
 //! diagnostic role it owns. Do not treat them as candidates for blind
 //! deletion solely because `rpython/jit/codewriter/` has no same-named
@@ -59,17 +59,10 @@ pub mod list_to_raw;
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s
 // `_rewrite_ops[op.opname]` dispatch; see the module docs.
 pub(crate) mod jtransform_opname;
-// No upstream sibling: an inert, env-gated diagnostic that gauges how much
-// of the rtyped flowspace graph an opname-dispatching jtransform would
-// already accept. Never on the production path; see the module docs.
-pub(crate) mod jtransform_shadow;
 pub mod liveness;
 pub mod policy;
 pub mod regalloc;
 pub mod support;
-// Local env-gated profiler for the drain pipeline, with no upstream
-// sibling and no effect unless `MAJIT_PROFILE_DRAIN` is set.
-pub(crate) mod transform_profile;
 // Local Rust boundary for concretetype projection and temporary import
 // compatibility while concretetype data migrates onto Variables.
 pub(crate) mod type_state;

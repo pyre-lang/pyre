@@ -154,8 +154,6 @@ INTENTIONAL_EXTRA: dict[str, dict[str, str]] = {
         "annotation_state": "local Rust boundary for temporary ValueType/SomeValue projection",
         "insns": "local stable byte table derived from assembler.py's dynamic insns table",
         "jtransform_opname": "local transducer for rtyped helper graphs into jtransform shape",
-        "jtransform_shadow": "env-gated diagnostic, never production path",
-        "transform_profile": "env-gated drain profiler with no upstream runtime effect",
         "type_state": "local concretetype projection boundary during rtyper cutover",
     },
     "rpython/jit/metainterp": {
