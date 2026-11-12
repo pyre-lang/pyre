@@ -682,10 +682,7 @@ impl CodeWriter {
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
         // `FunctionGraph::concretetype_of(&v)` directly.
-        let published = crate::codewriter::transform_profile::time_phase(
-            "step0_dual_gate_publish_concretetypes",
-            || self.dual_gate_publish_concretetypes(graph, callcontrol, path),
-        );
+        let published = self.dual_gate_publish_concretetypes(graph, callcontrol, path);
 
         // Indirect calls were lowered in place on the graphs `CallControl`
         // owns (`CallControl::lower_registered_indirect_calls`), before this
@@ -756,10 +753,7 @@ impl CodeWriter {
         // getmethoddesc` classdef-keyed dispatch). Ops whose receiver
         // carries no SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            crate::codewriter::transform_profile::time_phase(
-                "step0c_stamp_classdef_hints_on_graph",
-                || stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var),
-            );
+            stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var);
         }
         // `ll_copy` (`rlist.py`) of a fixed GcArray into a raw `Vec`.
         // The rich graph still names `<[T]>::to_vec`; retarget a
@@ -810,14 +804,13 @@ impl CodeWriter {
             .session_if_started()
             .and_then(|(_, rt)| rt.exceptiondata().ok())
             .and_then(|ed| ed.fn_exception_match.borrow().clone());
-        let mut rewritten =
-            crate::codewriter::transform_profile::time_phase("step1_jtransform_transform", || {
-                let mut transformer = crate::jtransform::Transformer::new(config)
-                    .with_callcontrol(callcontrol)
-                    .with_portal_jd(portal_jd_index)
-                    .with_excmatch(excmatch.as_ref());
-                transformer.transform_owned(graph_owned)
-            });
+        let mut rewritten = {
+            let mut transformer = crate::jtransform::Transformer::new(config)
+                .with_callcontrol(callcontrol)
+                .with_portal_jd(portal_jd_index)
+                .with_excmatch(excmatch.as_ref());
+            transformer.transform_owned(graph_owned)
+        };
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
         // RPython stores `.concretetype` on each Variable. Pyre merges
@@ -852,14 +845,9 @@ impl CodeWriter {
         // `stamped > post_result > post_resolve > original` is
         // preserved; the graph IS the merge target, no intermediate
         // type side-table survives the call.
-        let post_result_types = crate::codewriter::transform_profile::time_phase(
-            "step1b_authoritative_result_types",
-            || {
-                crate::codewriter::type_state::authoritative_result_types(
-                    &rewritten.graph,
-                    &callcontrol.raw_alloc_flavor_structs,
-                )
-            },
+        let post_result_types = crate::codewriter::type_state::authoritative_result_types(
+            &rewritten.graph,
+            &callcontrol.raw_alloc_flavor_structs,
         );
         // `post_resolve` is intentionally empty here: jtransform now
         // writes resolved kinds straight to each backing
@@ -1011,10 +999,7 @@ impl CodeWriter {
         // A fused `int_*` guard reads the int bank. An operand whose cell
         // is now `GcRef` is cast before the guard (`cast_ptr_to_int`).
         super::type_state::reint_fused_int_ref_operands(rewritten_graph);
-        let mut regallocs = crate::codewriter::transform_profile::time_phase(
-            "step2_perform_all_register_allocations",
-            || crate::regalloc::perform_all_register_allocations(rewritten_graph),
-        );
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(rewritten_graph);
 
         // Flatten the graph after register allocation.
         // Each Variable's `.concretetype` cell is the kind source
@@ -1024,18 +1009,14 @@ impl CodeWriter {
         // startblock inputarg colors land in the dense `0..N` prefix
         // of each kind, and the rotation persists into the assembler
         // assembly, matching the upstream invocation order.
-        let mut ssarepr =
-            crate::codewriter::transform_profile::time_phase("step3_flatten_graph", || {
-                crate::flatten::flatten_graph(rewritten_graph, &mut regallocs)
-            });
+        let mut ssarepr = crate::flatten::flatten_graph(rewritten_graph, &mut regallocs);
 
         // `assemble_with_callcontrol` computes liveness internally and returns
         // the body so call descriptors can be filled before `set_body` commits
         // the JitCode shell.
-        let body = crate::codewriter::transform_profile::time_phase("step4_assemble", || {
+        let body =
             self.assembler
-                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))
-        });
+                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol));
 
         // call.py `get_jitcode_calldescr`:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -1173,20 +1154,14 @@ impl CodeWriter {
         // `lower_graph` leaves `direct_call` as `OpKind::Call`. Assembler
         // encodes a leftover Call as `direct_call_*`; there is no such
         // opcode in a jitcode (`jtransform.py rewrite_op_direct_call`).
-        let mut rewritten =
-            crate::codewriter::transform_profile::time_phase("step1_jtransform_transform", || {
-                let mut transformer =
-                    crate::jtransform::Transformer::new(config).with_callcontrol(callcontrol);
-                transformer.transform_owned(lowered)
-            });
-        let post_result_types = crate::codewriter::transform_profile::time_phase(
-            "step1b_authoritative_result_types",
-            || {
-                crate::codewriter::type_state::authoritative_result_types(
-                    &rewritten.graph,
-                    &callcontrol.raw_alloc_flavor_structs,
-                )
-            },
+        let mut rewritten = {
+            let mut transformer =
+                crate::jtransform::Transformer::new(config).with_callcontrol(callcontrol);
+            transformer.transform_owned(lowered)
+        };
+        let post_result_types = crate::codewriter::type_state::authoritative_result_types(
+            &rewritten.graph,
+            &callcontrol.raw_alloc_flavor_structs,
         );
         for (var, kind) in &post_result_types {
             if !matches!(kind, crate::model::ConcreteType::Unknown) {
@@ -1250,14 +1225,10 @@ impl CodeWriter {
         // RPython's enum_pending_graphs() pops from unfinished_graphs (LIFO).
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
-        let profile = std::env::var_os("MAJIT_PROFILE_DRAIN").is_some();
-        let mut drain_count = 0usize;
-        let drain_start = std::time::Instant::now();
         loop {
             let Some((path, jitcode)) = callcontrol.enum_pending_graphs() else {
                 break;
             };
-            let iter_start = std::time::Instant::now();
             // Spine B (opname-dispatch convergence): rtyper low-level helper
             // graphs are registered as opname `SpaceOperation`s and have no
             // rich-`OpKind` twin in `function_graphs`, so they are routed here
@@ -1279,16 +1250,6 @@ impl CodeWriter {
                 callcontrol.finish_jitcode(jitcode.clone());
                 // Helper graphs are never portal graphs, so no
                 // `jitdriver_sd` wiring is needed (Spine A handles that).
-                if profile {
-                    drain_count += 1;
-                    let elapsed = iter_start.elapsed().as_secs_f64();
-                    if elapsed >= 0.5 {
-                        eprintln!(
-                            "[MAJIT_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
-                            drain_count, elapsed, jitcode.name,
-                        );
-                    }
-                }
                 continue;
             }
             let Some(graph) = callcontrol
@@ -1341,24 +1302,6 @@ impl CodeWriter {
                     jitcode.set_jitdriver_sd(jd.index);
                 }
             }
-            if profile {
-                drain_count += 1;
-                let elapsed = iter_start.elapsed().as_secs_f64();
-                if elapsed >= 0.5 {
-                    eprintln!(
-                        "[MAJIT_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
-                        drain_count, elapsed, jitcode.name,
-                    );
-                }
-            }
-        }
-        if profile {
-            eprintln!(
-                "[MAJIT_PROFILE_DRAIN] DRAIN TOTAL {:>7.3}s  {} graphs",
-                drain_start.elapsed().as_secs_f64(),
-                drain_count,
-            );
-            crate::codewriter::transform_profile::dump_transform_phase_totals();
         }
         if let Some(registry) = self.real_rtyper_registry.borrow().as_ref() {
             crate::translator::rtyper::cutover::emit_graphstore_tdc_cut_summary(registry);

@@ -80,7 +80,6 @@ pub mod cpyext;
 pub mod display;
 pub mod error;
 pub mod executioncontext;
-pub mod frame_array;
 pub mod function;
 pub mod gateway;
 mod host_seam_stub;

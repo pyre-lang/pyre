@@ -1749,14 +1749,6 @@ pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
 pub(crate) const STATUS_SHIFT: u32 = 3;
 pub(crate) const STATUS_SHIFT_MASK: u64 = !((1u64 << STATUS_SHIFT) - 1);
 
-// MetaFailDescr removed: pyre-introduced placeholder for non-resume
-// FailDescr is no longer needed.  All factories
-// (`make_fail_descr_typed`, `make_fail_descr`, `make_fail_descr_with_index`)
-// now route through `make_resume_guard_descr_typed` to produce a
-// `ResumeGuardDescr` (compile.py), matching PyPy's class hierarchy
-// where placeholder guard descrs are the same `ResumeGuardDescr`
-// instances backfilled by `store_final_boxes_in_guard` (compile.py:869).
-
 // ResumeGuardDescr moved to majit-backend::resume_guard_descr (Phase
 // C-1 cascade endpoint).  Re-exported here for caller compatibility;
 // all impl Descr / impl FailDescr live in majit-backend along with
@@ -1803,9 +1795,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
 /// non-finish guard-placeholder factory through the same
 /// `ResumeGuardDescr` constructor `make_resume_guard_descr_typed` uses;
 /// the result's `is_resume_guard()` returns true and the empty
-/// `payload` is filled later by `store_final_boxes_in_guard`
-/// (`compile.py:869`).  This collapses pyre's earlier
-/// `MetaFailDescr` placeholder into the PyPy class.
+/// `payload` is filled later by `store_final_boxes_in_guard`.
 pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     make_resume_guard_descr_typed(types)
 }

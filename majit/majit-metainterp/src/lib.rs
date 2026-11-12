@@ -139,7 +139,6 @@ pub mod memmgr;
 pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
-pub(crate) mod parity;
 mod pyjitpl;
 pub use pyjitpl::{HostHooks, host_hooks, publish_host_hooks};
 #[cfg(not(target_arch = "wasm32"))]
@@ -240,7 +239,6 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // declare a `majit-translate` dependency.  The same pattern is used
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs`).
 pub use majit_jitcode::codewriter::assembler::Assembler;
-pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 /// The walker's own `getfield_gc` / `setfield_gc` descr resolution
 /// (`blackhole.py bhimpl_getfield_gc_i` reads the descr straight out of the constant
 /// pool).  Exported so the descr-identity census can compare it against the

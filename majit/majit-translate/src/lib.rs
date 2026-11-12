@@ -3789,19 +3789,6 @@ pub fn generate_trace_code_from_pipeline(result: &pipeline::ProgramPipelineResul
     codegen::generate_from_pipeline(result)
 }
 
-/// Like [`generate_trace_code_from_pipeline`] but takes a
-/// [`codegen::CodegenFlavor`]. The flavor is currently a no-op (the
-/// pyre-specific helpers it used to gate now live in
-/// `pyre-jit-trace/src/trace_helpers.rs`); retained for external callers.
-pub fn generate_trace_code_from_pipeline_with_flavor(
-    result: &pipeline::ProgramPipelineResult,
-    flavor: codegen::CodegenFlavor,
-) -> String {
-    codegen::generate_from_pipeline_with_flavor(result, flavor)
-}
-
-pub use codegen::CodegenFlavor;
-
 /// Produce a recognition report for canonical driver and JitCode output.
 pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::RecognitionReport {
     codegen::recognition_report(result)

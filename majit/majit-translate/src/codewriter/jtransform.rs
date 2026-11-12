@@ -11082,8 +11082,8 @@ impl<'a> Transformer<'a> {
         // `support.py _ll_1_cast_uint_to_float`.
         //
         // Production still feeds jtransform the rich MIR graph while the
-        // real rtyper specializes an ephemeral flowspace graph (see
-        // `jtransform_shadow.rs`).  Project this one source-level
+        // real rtyper specializes an ephemeral flowspace graph.
+        // Project this one source-level
         // `float(r_uint)` call to the exact low-level op the rtyper produced,
         // then dispatch through the ordinary rewrite arm above.  This keeps
         // the helper address/effect descriptor and unsigned rounding on the

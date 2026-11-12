@@ -30,7 +30,6 @@ cover the condition they diagnose.
 | `MAJIT_HELPER_FNADDR_SKIP` | OFF | Counts each `#[dont_look_inside]` / `#[elidable]`-family function that got no residual trampoline, by reason (`generic`, `fat-pointer arg`, `Result return`, `method receiver`, `other`); remove when every annotated residual is either published or covered by an ordinary skip test. |
 | `MAJIT_GC_ITEMSBLOCK` | ON | Selects GC-managed list item blocks; `0`, `off`, or `false` restores the fallback, which can be removed after deleting the alternate representation. |
 | `MAJIT_GC_ROOT_CENSUS` | OFF | Tallies per root walker what one major cycle re-seeded, since `collect_roots` costs one `is_managed_heap_object` probe per root and the root count, not the live-object count, is what a major on a small heap spends that phase on; remove when the off-GC immortal type and module dicts are ordinary GC objects, which is what makes their slots traceable children instead of registered roots. |
-| `MAJIT_JTRANSFORM_SHADOW` | OFF | Compares shadow and primary jtransform results; remove after deleting the shadow implementation. |
 | `MAJIT_MIR_FRAMESTATE` | ON | Selects framestate-threaded MIR lowering; `0` or `false` restores the older lowering, and the escape hatch retires with that path. |
 | `MAJIT_MIR_FRAMESTATE_DEBUG` | OFF | Prints framestate merge diagnostics; remove when merge failures are covered by focused tests. |
 | `MAJIT_MIR_FRAMESTATE_STRICT` | OFF | Turns framestate fallback into a hard failure; remove after deleting the fallback. |
@@ -41,7 +40,6 @@ cover the condition they diagnose.
 | `MAJIT_NO_UNROLL` | OFF | Skips the unroll optimizer for diagnosis; remove when the optimizer no longer needs a runtime comparison path. |
 | `MAJIT_PORTAL_RCA` | OFF | Reports portal-selection decisions; remove when portal selection is covered by focused tests. |
 | `MAJIT_PROBE_SUBSCR` | OFF | Reports subscription tracing and dispatch decisions; remove when the relevant opcode paths have focused coverage. |
-| `MAJIT_PROFILE_DRAIN` | OFF | Profiles codewriter queue draining; remove when pipeline performance no longer needs phase attribution. |
 | `MAJIT_PROFILE_PIPELINE` | OFF | Reports translation phase time and memory; retain while translation performance needs phase attribution. |
 | `MAJIT_ROOT_BRACKET_ERASE` | ON | Keeps a root bracket out of the jitcode when its read-backs are answerable without the shadow stack; `0` or `false` restores the residual bracket, and the escape hatch retires when the erasure covers every bracket shape. |
 | `MAJIT_RTYPER_FRONTIER` | OFF | Makes the flowspace adapter resume past an unresolvable call and report the subject's whole call-wall set instead of the first; remove when the census no longer needs sole-blocker ranking. |
