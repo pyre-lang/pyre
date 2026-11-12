@@ -6839,6 +6839,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // value is an ordinary collectable runtime string.
         Ok(pyre_object::w_str_from_wtf8_managed(out))
     }
+    /// The scandir types' qualified names.
+    ///
+    /// [3.15-spec] `interp_scandir.py` names the typedefs `'posix.DirEntry'`
+    /// and `'posix.ScandirIterator'` on every host; `posixmodule.c` builds
+    /// both specs from `MODNAME`, which is `"nt"` under `MS_WINDOWS`, so
+    /// `os.DirEntry` reprs as `nt.DirEntry` there. Windows only; evidence is a
+    /// measured 3.15 run.
+    const DIR_ENTRY_NAME: &str = if cfg!(windows) {
+        "nt.DirEntry"
+    } else {
+        "posix.DirEntry"
+    };
+    const SCANDIR_ITERATOR_NAME: &str = if cfg!(windows) {
+        "nt.ScandirIterator"
+    } else {
+        "posix.ScandirIterator"
+    };
     /// `interp_scandir.py descr_reduce_ex` — an entry names a live
     /// position in a directory listing, so it refuses to be pickled.  `%T` is
     /// `error.py space.type(value).name`, the qualified typedef name
@@ -6848,7 +6865,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     fn dir_entry_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let type_name = match crate::typedef::r#type(args[0]) {
             Some(tp) => unsafe { pyre_object::typeobject::w_type_get_name(tp.as_ptr()) },
-            None => "posix.DirEntry",
+            None => DIR_ENTRY_NAME,
         };
         Err(crate::PyError::type_error(format!(
             "cannot pickle '{type_name}' object"
@@ -6858,18 +6875,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         static CELL: pyre_object::gc_roots::RootedOnceRef =
             pyre_object::gc_roots::RootedOnceRef::new();
         CELL.get_or_init(|| {
-            // `interp_scandir.py` names the typedef `'posix.DirEntry'`.
+            // [`DIR_ENTRY_NAME`] is the qualified typedef name.
             // `typedef.rs`'s `new_typeobject_with_base_and_layout` turns the
             // leading component of a qualified
             // builtin name into a `__module__` entry, so `type(e).__module__`
-            // reports `posix` and every type-name-bearing error message is
+            // reports the os module and every type-name-bearing error message is
             // spelled the way the typedef spells it.
             // The native `W_DirEntry` layout backs the type; `name`/`path` are
             // read-only getset descriptors over the inline fields, so instances
             // carry no `__dict__` (matching a `W_DirEntry` typedef with no
             // `makedict`).
             let tp = crate::typedef::make_builtin_type_with_layout(
-                "posix.DirEntry",
+                DIR_ENTRY_NAME,
                 |ns| {
                     let _root_scope = pyre_object::gc_roots::push_roots();
                     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7144,9 +7161,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         static CELL: pyre_object::gc_roots::RootedOnceRef =
             pyre_object::gc_roots::RootedOnceRef::new();
         CELL.get_or_init(|| {
-            // `interp_scandir.py` names the typedef `'posix.ScandirIterator'`.
             let tp = crate::typedef::make_builtin_type_with_layout(
-                "posix.ScandirIterator",
+                SCANDIR_ITERATOR_NAME,
                 |ns| {
                     let _roots = pyre_object::gc_roots::push_roots();
                     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -15848,7 +15864,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
     }
 
-    crate::__pyre_put_new!(ns_slot, "error", crate::typedef::w_object());
+    // `app_posix.py`: `error = OSError`.
+    if let Some(os_error) = crate::builtins::lookup_exc_class("OSError") {
+        crate::__pyre_put_new!(ns_slot, "error", os_error);
+    }
     Ok(())
 }
 
