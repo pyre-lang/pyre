@@ -1088,7 +1088,7 @@ fn gc_write_barrier_leaf(leaf: &str) -> bool {
     )
 }
 
-fn is_gc_write_barrier_path(segments: &[String]) -> bool {
+pub(crate) fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };

@@ -12266,6 +12266,15 @@ impl CallControl {
                         {
                             false
                         }
+                        // `RaiseAnalyzer.analyze_simple_operation` answers
+                        // False: `LL_OPERATIONS['gc_writebarrier']` has no
+                        // canraise (`lloperation.py`). The Call is the llop.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {
+                            false
+                        }
                         OpKind::Call { target, .. }
                             if crate::model::fn_const_segments(target).is_some() =>
                         {
@@ -12388,6 +12397,14 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) => {}
+                        // `VirtualizableAnalyzer.analyze_simple_operation`
+                        // matches only `jit_force_virtualizable` /
+                        // `jit_force_virtual`. `lloperation.py`
+                        // `gc_writebarrier` is the simple op, not a recurse.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -12478,6 +12495,13 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) => {}
+                        // `RandomEffectsAnalyzer.analyze_simple_operation`
+                        // is False (`effectinfo.py`). `lloperation.py`
+                        // `gc_writebarrier` is that simple op, not a recurse.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {}
                         // `malloc` is a simple operation
                         // (`RandomEffectsAnalyzer.analyze_simple_operation`
                         // is False). Walking the GC helper would publish
@@ -12823,6 +12847,14 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) => {}
+                        // `CollectAnalyzer.analyze_simple_operation` is True
+                        // only for GC `malloc` / `malloc_varsize` and
+                        // `LL_OPERATIONS[op].canmallocgc`; `lloperation.py`
+                        // `gc_writebarrier` has neither.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {}
                         OpKind::Call { target, .. } => {
                             // graphanalyze.py: analyze_direct_call — recurse
                             let callee_path = match self.target_to_path(target) {
@@ -13654,6 +13686,16 @@ impl CallControl {
                             self, target,
                         ) =>
                     {
+                        ReadWriteEffects::bottom_result()
+                    }
+                    // `WriteAnalyzer.analyze_simple_operation`
+                    // (`writeanalyze.py`) answers `empty_set` for
+                    // `gc_writebarrier` (`lloperation.py`). The Call is
+                    // the llop; do not recurse into the hook.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {
                         ReadWriteEffects::bottom_result()
                     }
                     // `WriteAnalyzer.analyze_simple_operation`
@@ -26392,6 +26434,65 @@ mod tests {
             "CollectAnalyzer.analyze_simple_operation does not match \
              jit_force_quasi_immutable"
         );
+    }
+
+    /// `gc_hook::try_gc_write_barrier` is `llop.gc_writebarrier`
+    /// (`lloperation.py`). `RaiseAnalyzer` / `VirtualizableAnalyzer` /
+    /// `RandomEffectsAnalyzer` / `CollectAnalyzer` /
+    /// `WriteAnalyzer.analyze_simple_operation` answer the simple-op
+    /// bottom and do not recurse into the hook body.
+    #[test]
+    fn gc_write_barrier_call_is_the_gc_writebarrier_simple_operation() {
+        let mut cc = CallControl::new();
+
+        let mut callee = FunctionGraph::new("pyre_object::gc_hook::try_gc_write_barrier");
+        let callee_start = callee.startblock;
+        callee.blocks[callee_start.0]
+            .operations
+            .push(indirect_call_op(None));
+        callee.set_return(callee_start, None);
+        cc.register_function_graph(
+            CallPath::from_segments(["pyre_object", "gc_hook", "try_gc_write_barrier"]),
+            callee,
+        );
+
+        let mut caller = FunctionGraph::new("caller");
+        let obj = caller.alloc_value_var();
+        caller.push_op_var(
+            caller.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path([
+                    "pyre_object",
+                    "gc_hook",
+                    "try_gc_write_barrier",
+                ]),
+                args: crate::model::call_args(vec![obj]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        caller.set_return(caller.startblock, None);
+        cc.register_function_graph(CallPath::from_segments(["caller"]), caller);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["caller"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            !descriptor
+                .extra_info
+                .check_forces_virtual_or_virtualizable()
+        );
+        assert!(!descriptor.extra_info.has_random_effects());
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(!descriptor.extra_info.check_can_collect());
     }
 
     #[test]

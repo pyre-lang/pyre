@@ -5869,12 +5869,6 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
                 | "module_spec_get_initializing"
                 | "bootstrap_handle_fromlist"
                 | "default_importlib_import_word"
-                // `dont_look_inside` write barrier: `list_write_barrier` then
-                // the stored word. The graph is top so the opcode is may-force,
-                // but the helper does not re-enter Python (`GUARD_NOT_FORCED`
-                // cannot fail for a callback). `ll_append` residual-calls it
-                // between `_ll_resize_ge` and `ll_setitem_fast`.
-                | "prepare_list_ref_store"
         )
     })
 }

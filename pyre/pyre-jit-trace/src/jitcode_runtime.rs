@@ -3641,11 +3641,10 @@ pub(crate) fn catch_predecessor_is_reachable(
             continue;
         }
         let mut landing = op.next_pc;
-        while let Some(next) = decode_op_at(code, landing) {
-            if next.opname != "live" {
-                break;
+        if let Some(next) = decode_op_at(code, landing) {
+            if next.opname == "live" {
+                landing = next.next_pc;
             }
-            landing = next.next_pc;
         }
         if landing == catch_pc {
             return true;
