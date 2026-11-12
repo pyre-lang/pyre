@@ -2278,6 +2278,127 @@ fn int_to_registered_gc_ptr_emits_cast_int_to_ptr_then_instance() {
     );
 }
 
+/// `0usize as *mut PyObject` is `lltype.py` `cast_int_to_ptr(PTRTYPE, 0)`
+/// → `nullptr(PTRTYPE.TO)`. UnaryOp `Cast(RawPtr)` (the shadow-stack
+/// erase spelling) and `Rvalue::Cast` both emit the same Ref-bank null
+/// a niche None lowers to, not an integer.
+#[test]
+fn const_zero_as_gc_ptr_lowers_to_ref_bank_null() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let span = fixture_span();
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let object_decl = struct_decl(
+        0,
+        ident_path(&["pyobject", "PyObject"]),
+        serde_json::json!([]),
+        false,
+    );
+    let dest_ty = serde_json::json!({"RawPtr": [adt.clone(), "Mut"]});
+    let zero = serde_json::json!({
+        "Const": [{"Integer": {"Unsigned": ["Usize", "0"]}}, usize_ty]
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let cast_fn = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [place(0, &dest_ty), rvalue]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = cast_fn(
+        0,
+        "unary_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [usize_ty.clone(), dest_ty.clone()]}},
+            zero.clone()
+        ]}),
+    );
+    let rvalue = cast_fn(
+        1,
+        "rvalue_cast",
+        serde_json::json!({"Cast": [
+            {"RawPtr": [usize_ty.clone(), dest_ty.clone()]},
+            zero,
+            dest_ty.clone()
+        ]}),
+    );
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [{"Value": [0, adt]}]}}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [object_decl],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype],
+            "trait_impls": [impl_row]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_null_mut = |kind: &OpKind| match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty: ValueType::Ref(_),
+            ..
+        } => segments.as_slice() == ["core", "ptr", "null_mut"],
+        _ => false,
+    };
+    let is_int_zero = |kind: &OpKind| matches!(kind, OpKind::ConstUInt(0) | OpKind::ConstInt(0));
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| is_null_mut(&op.kind)),
+            "{name} 0usize as *mut PyObject is a Ref-bank null; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !ops.iter().any(|op| is_int_zero(&op.kind)),
+            "{name} 0usize as *mut PyObject is not an integer; graph={}",
+            graph.dump()
+        );
+    }
+}
+
 fn graph_has_cast_instance(graph: &crate::model::FunctionGraph) -> bool {
     graph.blocks.iter().any(|block| {
         block

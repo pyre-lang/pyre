@@ -2817,6 +2817,15 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                         return Ok((Some(OpKind::ConstInt(bits as i64)), res));
                     }
+                    // `lltype.py` `cast_int_to_ptr` returns `nullptr(PTRTYPE.TO)`
+                    // for 0; a GC destination is the same null a niche None
+                    // lowers to. Before `resolve_operand` materializes the
+                    // integer, and before the int-source arms fall through.
+                    if let Some(nullc) =
+                        self.try_emit_const_zero_as_gc_null(mir_bb, &operand, dest_ty)
+                    {
+                        return Ok((None, nullc));
+                    }
                     // Signedness-aware source classification.  Both the
                     // value projection and the attribute projection preserve
                     // `uN` as Unsigned; the latter remains the source of
@@ -3631,6 +3640,14 @@ impl<'a> Lowering<'a> {
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
             Rvalue::Cast(kind, operand, ty) => {
+                // `lltype.py` `cast_int_to_ptr` returns `nullptr(PTRTYPE.TO)`
+                // for 0; a GC destination is the same null a niche None
+                // lowers to. Before `resolve_operand` materializes the
+                // integer, and before the int-source arms fall through.
+                if let Some(nullc) = self.try_emit_const_zero_as_gc_null(mir_bb, &operand, dest_ty)
+                {
+                    return Ok((None, nullc));
+                }
                 // Classify the source BEFORE `resolve_operand` consumes
                 // `operand` (mirrors the `UnaryOp::Cast` twin above). A
                 // Ref source may narrow or erase; a raw scalar pointer
@@ -5449,6 +5466,34 @@ impl<'a> Lowering<'a> {
             },
             _ => None,
         }
+    }
+
+    /// `lltype.py` `cast_int_to_ptr` returns `nullptr(PTRTYPE.TO)` for 0;
+    /// a GC destination is the same null a niche None lowers to.
+    ///
+    /// Int-bank destinations (`*mut u8`, `*mut c_void`, raw-flavor
+    /// structs, CCHARP/VOIDP) stay on the existing int-source arms:
+    /// this fires only for a `ValueType::Ref(_)` destination that is
+    /// not a raw scalar address or a flavor-raw instance pointer.
+    pub(in crate::front::mir) fn try_emit_const_zero_as_gc_null(
+        &mut self,
+        mir_bb: usize,
+        operand: &Operand,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        if !const_operand_is_zero(operand, self.llbc) {
+            return None;
+        }
+        if !matches!(self.value_type_of(dest_ty), ValueType::Ref(_)) {
+            return None;
+        }
+        if raw_scalar_address_value_type(dest_ty, self.llbc).is_some()
+            || flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
+                .is_some()
+        {
+            return None;
+        }
+        Some(self.push_niche_null_ptr(mir_bb, dest_ty))
     }
 
     /// Int-kind source to CCHARP / VOIDP / VOIDPP (`rffi.py`,
