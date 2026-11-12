@@ -36,12 +36,11 @@ default = ["dynasm", "host_env", "mimalloc", "pyre-module"]
 # fast-building core: `--no-default-features --features dynasm,mimalloc`.
 pyre-module = ["dep:pyre-module", "pyre-jit/pyre-module"]
 host_env = ["pyre-interpreter/host_env", "pyre-module?/host_env"]
-jit = []  # meta feature: enabled by cranelift or dynasm
 # The native launchers run the interpreter's importlib bootstrap.  Keep the
 # caller and the interpreter owner under the same cfg when defaults are off;
 # otherwise the generated module surface omits `init_importlib_bootstrap`.
-cranelift = ["jit", "host_env", "pyre-jit/cranelift"]
-dynasm = ["jit", "host_env", "pyre-jit/dynasm"]
+cranelift = ["host_env", "pyre-jit/cranelift"]
+dynasm = ["host_env", "pyre-jit/dynasm"]
 # Compile heavyweight JIT audits only in binaries built explicitly for
 # diagnosis. Ordinary debug and release binaries contain no audit call sites.
 jit-audits = ["pyre-jit/jit-audits", "majit-metainterp/jit-audits"]
@@ -63,11 +62,6 @@ sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox", "pyre-module?/sandbox
 # Off by default; it also exports the C-API entry points the loaded object
 # resolves against, see build.rs.
 cpyext = ["pyre-interpreter/cpyext", "pyre-module?/cpyext"]
-# Backwards-compatible alias. The seccomp-bpf syscall allowlist is now installed
-# by default in any Linux `sandbox` build (see the install site in lib.rs and
-# pyre-sandbox::seccomp), so this adds nothing over `sandbox`; it is retained so
-# `--features seccomp` keeps working.
-seccomp = ["sandbox"]
 
 [dependencies]
 parking_lot = { workspace = true }

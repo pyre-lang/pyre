@@ -4050,7 +4050,7 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.store_token_in_vable_setfield() {
-        ctx.trace_ctx.record_guard(OpCode::GuardNotForced2, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced2, &[]);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)
     } else {
         Ok(())

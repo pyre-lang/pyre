@@ -17946,7 +17946,7 @@ impl<M: Clone> MetaInterp<M> {
             // walker patch runs.
             let guard_op = if let Some(ctx) = self.tracing.as_mut() {
                 let exc_class_box = ctx.const_int(typeptr);
-                Some(ctx.guard_exception(exc_class_box, 0))
+                Some(ctx.guard_exception(exc_class_box))
             } else {
                 None
             };
@@ -17981,7 +17981,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             if self.tracing.is_some() {
                 if let Some(ctx) = self.tracing.as_mut() {
-                    ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                    ctx.record_guard(OpCode::GuardNoException, &[]);
                 }
                 self.capture_guard_resumedata_after_residual();
             }
@@ -18164,7 +18164,7 @@ impl<M: Clone> MetaInterp<M> {
         if self.ovf_flag {
             // pyjitpl.py:1883-1885: GUARD_OVERFLOW + frame.pc = label
             if let Some(ctx) = self.tracing.as_mut() {
-                ctx.record_guard(OpCode::GuardOverflow, &[], 0);
+                ctx.record_guard(OpCode::GuardOverflow, &[]);
             }
             if !self.framestack.is_empty() {
                 self.framestack.current_mut().pc = frame_pc_target;
@@ -18173,7 +18173,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             // pyjitpl.py:1888-1890: GUARD_NO_OVERFLOW + return resbox
             if let Some(ctx) = self.tracing.as_mut() {
-                ctx.record_guard(OpCode::GuardNoOverflow, &[], 0);
+                ctx.record_guard(OpCode::GuardNoOverflow, &[]);
             }
             Some(resbox)
         }
@@ -20634,7 +20634,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py: generate_guard(rop.GUARD_NOT_FORCED)
             // → capture_resumedata(after_residual_call=True)
             if let Some(ctx) = self.tracing.as_mut() {
-                ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+                ctx.record_guard(OpCode::GuardNotForced, &[]);
                 if ctx.recorder.has_byte_buffer() {
                     let snapshot_id =
                         ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
@@ -32640,7 +32640,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
@@ -33795,7 +33795,7 @@ mod tests {
         let (item, _) =
             meta.opimpl_getarrayitem_vable_int(0, OpRef::input_arg_ref(0), index, 1, fd24, adesc);
         if let Some(ctx) = meta.trace_ctx() {
-            let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[item]);
             // This trace HAS a virtualizable, so its guard snapshot must carry
             // the vable section — `pyjitpl.py capture_resumedata`
             // passes `self.virtualizable_boxes` whenever `vinfo is not None`.
@@ -33942,7 +33942,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -34011,7 +34011,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -34102,7 +34102,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -34150,7 +34150,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -34247,7 +34247,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -34272,7 +34272,7 @@ mod tests {
                 let i0 = OpRef::input_arg_int(0);
                 let const_one = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
@@ -35167,7 +35167,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardOverflow, &[], 0);
+            let g = ctx.record_guard(OpCode::GuardOverflow, &[]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -35242,7 +35242,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -35283,7 +35283,7 @@ mod tests {
                 let const_one = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
                 let sum2 = ctx.record_op(OpCode::IntAdd, &[sum, const_one]);
-                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }

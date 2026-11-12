@@ -9651,7 +9651,7 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     )?;
     ctx.live_after_jit_pc = op.next_pc;
     if emit_guard_not_forced {
-        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     if recorded_residual.raised {
@@ -9666,7 +9666,7 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         )));
     }
     if recorded_residual.can_raise {
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard_scoped(
             ctx,
             op.pc,
@@ -12569,7 +12569,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // including `GUARD_NO_EXCEPTION` when `!emit_guard_not_forced`.
         ctx.live_after_jit_pc = op.next_pc;
         if emit_guard_not_forced {
-            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         // `metainterp.handle_possible_exception()` —
@@ -12601,7 +12601,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
-                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
                 // Request that this residual call's no-exception-guard resume
                 // route through the call's OWN post-call catch
                 // (`GuardCaptureScope::residual_call_catch_resume`).  The
@@ -13993,7 +13993,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
-            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise && !is_list_wb {
@@ -14009,7 +14009,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
-                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
                 // The mixed int/ref residual-call shape must use the same
                 // exception-region resume as the one-ref shape above.  In
                 // particular, UNPACK_SEQUENCE and UNPACK_EX pass their arity
@@ -14205,7 +14205,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
-            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise && !is_list_wb {
@@ -14221,7 +14221,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
-                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             }
         }
@@ -14345,7 +14345,7 @@ fn cond_record_handle_exception<Sym: WalkSym>(
             )));
         }
     } else if can_raise {
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     Ok(None)

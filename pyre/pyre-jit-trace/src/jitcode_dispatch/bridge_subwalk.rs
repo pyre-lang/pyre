@@ -566,7 +566,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 );
                 let exc_class_const = wc.trace_ctx.const_int(exc_edge_class);
                 wc.trace_ctx
-                    .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+                    .record_guard(OpCode::GuardException, &[exc_class_const]);
                 value_op
             };
             // `handle_possible_exception` captures resume data at the MIFrame's
@@ -718,7 +718,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 let class_op = wc.trace_ctx.save_exc_class();
                 let value_op = wc.trace_ctx.save_exception();
                 wc.trace_ctx.restore_exception(class_op, value_op);
-                wc.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                wc.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
             }
             if emit_entry_guard {
                 // `position` is already the post-call resume coordinate —
@@ -1495,7 +1495,7 @@ fn route_deepest_carrier_exc_edge<Sym: WalkSym>(
     let exc_class_const = sub_wc.trace_ctx.const_int(class_word);
     sub_wc
         .trace_ctx
-        .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+        .record_guard(OpCode::GuardException, &[exc_class_const]);
     // `position` is already the failing guard's post-call resume. Carry it
     // verbatim so the twin lookup does not advance into the handler.
     walker_capture_snapshot_for_last_guard_impl(
@@ -2340,7 +2340,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     let exc_class_const = sub_wc.trace_ctx.const_int(exc_class);
                     sub_wc
                         .trace_ctx
-                        .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+                        .record_guard(OpCode::GuardException, &[exc_class_const]);
                     value_op
                 };
                 if !exception_resume_prepared {

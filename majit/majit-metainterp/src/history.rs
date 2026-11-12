@@ -2675,9 +2675,6 @@ impl TraceCtx {
         resbox
     }
 
-    /// Record a guard with auto-generated FailDescr.
-    ///
-    /// `num_live` is the number of live integer values (for the FailDescr).
     /// `opencoder.py` `capture_resumedata`: capture a snapshot of the interpreter
     /// frame state. Returns the `_snapshot_data` byte offset used as
     /// `rd_resume_position` (`create_top_snapshot`).
@@ -3093,12 +3090,9 @@ impl TraceCtx {
     /// `pyjitpl.py generate_guard()` parity: tracer-stage guards
     /// carry `descr=None`. The optimizer's `store_final_boxes_in_guard`
     /// (`optimizeopt/mod.rs`) mints the descr via
-    /// `invent_fail_descr_for_op`-style dispatch. `num_live` was a
-    /// placeholder used by the prior `make_resume_guard_descr(num_live)`
-    /// stamping — kept on the signature for caller compatibility but
-    /// no longer used.
-    pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
-        self.record_guard_with_value(opcode, args, num_live, None)
+    /// `invent_fail_descr_for_op`-style dispatch.
+    pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
+        self.record_guard_with_value(opcode, args, None)
     }
 
     /// Sibling of [`Self::record_guard`] that attaches `value` at
@@ -3109,10 +3103,8 @@ impl TraceCtx {
         &mut self,
         opcode: OpCode,
         args: &[OpRef],
-        num_live: usize,
         value: Option<Value>,
     ) -> OpRef {
-        let _ = num_live;
         let opref = Self::do_record_guard_with_value(&mut self.recorder, opcode, args, None, value);
         // pyjitpl.py `count_ops(opnum, Counters.GUARDS)` — counted
         // here at the record chokepoint so every recording call site
@@ -3411,12 +3403,7 @@ impl TraceCtx {
     /// Upstream's `self.metainterp.replace_box(box, promoted_box)` is not here:
     /// it walks the `MIFrame` register banks, which live a layer above the
     /// recorder. Callers that need the rebind do it themselves.
-    fn implement_guard_value(
-        &mut self,
-        opref: OpRef,
-        promoted_box: OpRef,
-        num_live: usize,
-    ) -> OpRef {
+    fn implement_guard_value(&mut self, opref: OpRef, promoted_box: OpRef) -> OpRef {
         // `if isinstance(box, Const): return box  # no promotion needed`.
         // Structurally first: a `GuardValue` over an already-constant box can
         // only ever succeed, and it would still hang a full resume snapshot
@@ -3430,7 +3417,7 @@ impl TraceCtx {
         // owner: dispatch `record_state_guard` / `implement_guard_value`,
         // walker `walker_implement_guard_value`. Callers without a
         // framestack record the op and leave `rd_resume_position == -1`.
-        self.record_guard(OpCode::GuardValue, &[opref, promoted_box], num_live);
+        self.record_guard(OpCode::GuardValue, &[opref, promoted_box]);
         promoted_box
     }
 
@@ -3443,23 +3430,23 @@ impl TraceCtx {
     ///
     /// `opref` is the traced value, `runtime_value` is the current concrete
     /// value seen at trace time.
-    pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+    pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64) -> OpRef {
         let const_ref = self.const_int(runtime_value);
-        self.implement_guard_value(opref, const_ref, num_live)
+        self.implement_guard_value(opref, const_ref)
     }
 
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
-    pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+    pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64) -> OpRef {
         let const_ref = self.const_ref(runtime_value);
-        self.implement_guard_value(opref, const_ref, num_live)
+        self.implement_guard_value(opref, const_ref)
     }
 
     /// Record a float-typed promote (GUARD_VALUE for floats).
     ///
     /// pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
-    pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+    pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64) -> OpRef {
         let const_ref = self.const_float(runtime_value);
-        self.implement_guard_value(opref, const_ref, num_live)
+        self.implement_guard_value(opref, const_ref)
     }
 
     /// Record a call to an elidable (pure) function.
@@ -3529,18 +3516,18 @@ impl TraceCtx {
     /// `record_state_guard`, and the walker pairs its
     /// `record_guard(GuardNotForced, …)` with
     /// `walker_capture_snapshot_for_last_guard`.
-    pub fn guard_not_forced(&mut self, num_live: usize) -> OpRef {
-        self.record_guard(OpCode::GuardNotForced, &[], num_live)
+    pub fn guard_not_forced(&mut self) -> OpRef {
+        self.record_guard(OpCode::GuardNotForced, &[])
     }
 
     /// Record GUARD_NO_EXCEPTION (check no pending exception).
-    pub fn guard_no_exception(&mut self, num_live: usize) -> OpRef {
-        self.record_guard(OpCode::GuardNoException, &[], num_live)
+    pub fn guard_no_exception(&mut self) -> OpRef {
+        self.record_guard(OpCode::GuardNoException, &[])
     }
 
     /// Record GUARD_NOT_INVALIDATED (check loop not invalidated).
-    pub fn guard_not_invalidated(&mut self, num_live: usize) -> OpRef {
-        self.record_guard(OpCode::GuardNotInvalidated, &[], num_live)
+    pub fn guard_not_invalidated(&mut self) -> OpRef {
+        self.record_guard(OpCode::GuardNotInvalidated, &[])
     }
 
     /// Record a function call with explicit argument and return types.
@@ -5464,8 +5451,8 @@ impl TraceCtx {
 
     /// Record GUARD_EXCEPTION: assert that the pending exception matches
     /// the given class, and produce a ref to the exception value.
-    pub fn guard_exception(&mut self, exc_class: OpRef, num_live: usize) -> OpRef {
-        self.record_guard(OpCode::GuardException, &[exc_class], num_live)
+    pub fn guard_exception(&mut self, exc_class: OpRef) -> OpRef {
+        self.record_guard(OpCode::GuardException, &[exc_class])
     }
 
     /// Record SAVE_EXCEPTION: capture the pending exception value as a ref.
@@ -5546,23 +5533,23 @@ impl TraceCtx {
     ///
     /// Returns the result OpRef. On overflow at trace time, the caller
     /// should abort tracing.
-    pub fn int_add_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+    pub fn int_add_ovf(&mut self, lhs: OpRef, rhs: OpRef) -> OpRef {
         let result = self.record_op(OpCode::IntAddOvf, &[lhs, rhs]);
-        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        self.record_guard(OpCode::GuardNoOverflow, &[]);
         result
     }
 
     /// Record overflow-checked integer sub + GuardNoOverflow.
-    pub fn int_sub_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+    pub fn int_sub_ovf(&mut self, lhs: OpRef, rhs: OpRef) -> OpRef {
         let result = self.record_op(OpCode::IntSubOvf, &[lhs, rhs]);
-        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        self.record_guard(OpCode::GuardNoOverflow, &[]);
         result
     }
 
     /// Record overflow-checked integer mul + GuardNoOverflow.
-    pub fn int_mul_ovf(&mut self, lhs: OpRef, rhs: OpRef, num_live: usize) -> OpRef {
+    pub fn int_mul_ovf(&mut self, lhs: OpRef, rhs: OpRef) -> OpRef {
         let result = self.record_op(OpCode::IntMulOvf, &[lhs, rhs]);
-        self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
+        self.record_guard(OpCode::GuardNoOverflow, &[]);
         result
     }
 
@@ -5659,11 +5646,11 @@ mod history_record_tests {
         let before = ctx.num_guards();
 
         let i = OpRef::const_int(7);
-        assert_eq!(ctx.promote_int(i, 7, 0), i);
+        assert_eq!(ctx.promote_int(i, 7), i);
         let f = OpRef::const_float(1.5);
-        assert_eq!(ctx.promote_float(f, 1.5f64.to_bits() as i64, 0), f);
+        assert_eq!(ctx.promote_float(f, 1.5f64.to_bits() as i64), f);
         let r = OpRef::const_ptr(majit_ir::GcRef(0));
-        assert_eq!(ctx.promote_ref(r, 0, 0), r);
+        assert_eq!(ctx.promote_ref(r, 0), r);
 
         assert_eq!(ctx.num_guards(), before, "a Const needs no promotion");
     }
@@ -5674,7 +5661,7 @@ mod history_record_tests {
     fn promoting_a_non_constant_box_records_the_guard() {
         let (mut ctx, args) = make_ctx_with_mixed_inputs();
         let before = ctx.num_guards();
-        assert_eq!(ctx.promote_int(args[2], 7, 0), OpRef::const_int(7));
+        assert_eq!(ctx.promote_int(args[2], 7), OpRef::const_int(7));
         assert_eq!(ctx.num_guards(), before + 1);
     }
 
@@ -5844,7 +5831,7 @@ mod history_record_tests {
         assert!(ctx.recorder.has_byte_buffer());
         let box0 = OpRef::input_arg_int(0);
 
-        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.record_guard(OpCode::GuardTrue, &[box0]);
         ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
         let id_a = ctx
             .recorder
@@ -5852,7 +5839,7 @@ mod history_record_tests {
             .expect("first guard resume position");
         assert!(ctx.get_snapshot(id_a).is_some());
 
-        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.record_guard(OpCode::GuardTrue, &[box0]);
         ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
         let id_b = ctx
             .recorder

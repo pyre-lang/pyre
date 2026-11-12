@@ -13298,7 +13298,7 @@ mod tests {
                 .trace_ctx()
                 .expect("trace starts at threshold 1");
             let i0 = OpRef::input_arg_int(0);
-            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
@@ -13440,7 +13440,7 @@ mod tests {
                 .trace_ctx()
                 .expect("trace starts at threshold 1");
             let i0 = OpRef::input_arg_int(0);
-            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
@@ -15167,7 +15167,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let r1 = OpRef::input_arg_ref(1);
             let f2 = OpRef::input_arg_float(2);
-            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         };
@@ -15232,7 +15232,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let r1 = OpRef::input_arg_ref(1);
             let f2 = OpRef::input_arg_float(2);
-            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         }
@@ -15444,7 +15444,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef::input_arg_int(0);
             ctx.const_int(42);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         }
@@ -15685,7 +15685,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -15766,7 +15766,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             ctx.set_green_key(key_b.get_uhash(), (0, 1));
@@ -15858,7 +15858,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
@@ -16340,7 +16340,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0); // input arg from on_back_edge
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
@@ -16369,7 +16369,7 @@ mod tests {
         for _ in 0..n_adds {
             sum = ctx.record_op(OpCode::IntAdd, &[sum, c1]);
         }
-        let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+        let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
         ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
         ctx.set_fail_args(g, &[sum]);
         sum
@@ -16523,7 +16523,7 @@ mod tests {
                 let i0 = OpRef::input_arg_int(0);
                 let c1 = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
@@ -16569,7 +16569,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0); // input arg (non-constant = won't be folded)
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
@@ -16664,7 +16664,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
@@ -16718,7 +16718,7 @@ mod tests {
             // at runtime → GuardTrue fails.
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef::input_arg_int(0);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(g, &[]);
         }
@@ -16812,7 +16812,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -16930,7 +16930,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -17030,7 +17030,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -17125,7 +17125,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -17312,7 +17312,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -17469,7 +17469,7 @@ mod tests {
         ));
         {
             let ctx = driver.meta.trace_ctx().unwrap();
-            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
@@ -17554,7 +17554,7 @@ mod tests {
             let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
@@ -18457,7 +18457,7 @@ mod tests {
                 .trace_ctx()
                 .expect("trace starts at threshold 1");
             let i0 = OpRef::input_arg_int(0);
-            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
@@ -18642,7 +18642,7 @@ mod cross_loop_cut_close_tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             // The optimizer rejects a guardless loop.
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             if cut {
@@ -18675,7 +18675,7 @@ mod cross_loop_cut_close_tests {
         let i0 = OpRef::input_arg_int(0);
         let c2 = ctx.const_int(2);
         let sum = ctx.record_op(OpCode::IntAdd, &[i0, c2]);
-        let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+        let g = ctx.record_guard(OpCode::GuardTrue, &[i0]);
         ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
         ctx.set_fail_args(g, &[sum]);
     }

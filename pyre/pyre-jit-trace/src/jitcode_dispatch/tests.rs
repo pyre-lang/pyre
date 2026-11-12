@@ -2570,7 +2570,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
 
     let mut tc = fresh_trace_ctx();
     let cond = tc.const_int(1);
-    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond], 0);
+    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond]);
     let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
     let mut mode = test_fbw_mode();
     mode.snapshot_sym = &snapshot_sym;
@@ -29245,7 +29245,7 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
     // `MetaInterp.capture_resumedata` encodes existing boxes, including a
     // declared `ConstPtr(NULL)`. Capture records nothing after the guard.
     let cond = tc.const_int(1);
-    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond], 0);
+    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond]);
     assert_eq!(tc.last_op_opcode(), Some(majit_ir::OpCode::GuardTrue));
     let ops_at_guard = tc.num_recorded_ops();
     assert!(tc.virtualizable_boxes_declared_through(array_len));
@@ -31492,7 +31492,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
     // a pop that has not happened.
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let start = tc.get_trace_position();
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
     assert!(
         !subwalk_guard_follows_store(&tc, start),
@@ -31505,7 +31505,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let start = tc.get_trace_position();
     tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     assert!(
         subwalk_guard_follows_store(&tc, start),
         "a guard past the body's first store is the double-apply shape"
@@ -31516,7 +31516,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
     let start = tc.get_trace_position();
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     assert!(
         !subwalk_guard_follows_store(&tc, start),
         "ops recorded before the sub-walk are outside the window"
@@ -31526,7 +31526,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let start = tc.get_trace_position();
     tc.record_op(majit_ir::OpCode::SetarrayitemGc, &[obj, value, value]);
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     assert!(
         subwalk_guard_follows_store(&tc, start),
         "SetarrayitemGc is a committed store too"
@@ -31556,7 +31556,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
         !subwalk_guard_follows_store(&tc, start),
         "an empty recorded window is not a guard after a store"
     );
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
     assert!(
         !subwalk_guard_follows_store(&tc, start),
@@ -31566,7 +31566,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
         TraceCtx::for_test_input_layout(&[Type::Ref, Type::Int, Type::Int], &[true, true, false]);
     let start = tc.get_trace_position();
     tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
-    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj]);
     assert!(
         subwalk_guard_follows_store(&tc, start),
         "a guard past the body's first store still declines with a hole"
@@ -32031,7 +32031,7 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
         "the last setfield_vable_i of last_instr is the call opcode"
     );
 
-    tc.record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNoException, &[]);
 
     let mut snapshot_sym = PyreSym::new_uninit(vable);
     snapshot_sym.jitcode = installed;
@@ -32321,7 +32321,7 @@ fn after_residual_pcdep_does_not_publish_stack_slot_at_or_above_valuestackdepth(
         "pre-capture dead slot holds the last setarrayitem_vable box"
     );
 
-    tc.record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNoException, &[]);
 
     let mut snapshot_sym = PyreSym::new_uninit(vable);
     snapshot_sym.jitcode = installed;
@@ -32564,7 +32564,7 @@ fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdept
         "pre-capture dead slot holds the last setarrayitem_vable box"
     );
 
-    tc.record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+    tc.record_guard(majit_ir::OpCode::GuardNoException, &[]);
 
     let mut snapshot_sym = PyreSym::new_uninit(vable);
     snapshot_sym.jitcode = installed;
