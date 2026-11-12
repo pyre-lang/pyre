@@ -459,6 +459,7 @@ def main() -> None:
         "--self-test",
         "--prune-store",
         "--compact-store",
+        "--prune-charon-targets",
     }
     if not modes_without_an_artefact.intersection(sys.argv[1:]):
         requested = [arg for arg in sys.argv[1:] if not arg.startswith("-")]

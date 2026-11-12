@@ -20,6 +20,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1555,6 +1556,11 @@ def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     return platform_key, charon_dest, charon_dest / charon_exe
 
 
+def charon_target_key(root: Path) -> str:
+    """16-hex directory name under `<shared>/charon-target` for one worktree."""
+    return hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:16]
+
+
 def charon_cargo_target_dir(root: Path) -> Path:
     """Cargo target dir for Charon's nightly rustc, not the workspace `target/`.
 
@@ -1572,8 +1578,7 @@ def charon_cargo_target_dir(root: Path) -> Path:
     if value := os.environ.get("CHARON_TARGET_DIR"):
         return Path(value)
     shared = shared_build_dir(root)
-    key = hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:16]
-    return shared / "charon-target" / key
+    return shared / "charon-target" / charon_target_key(root)
 
 
 def llbc_dest_path(out_dir: Path, root: Path) -> Path:
@@ -2361,6 +2366,104 @@ def prune_store_cli(eng: Engine, args: argparse.Namespace) -> None:
     print(status)
     if store is not None:
         prune_llbc_store(store, max_age_days=args.store_max_age_days)
+
+
+_CHARON_TARGET_KEY = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _charon_target_dir_size(path: Path) -> int:
+    """Sum of regular-file sizes under `path`; does not follow symlinks."""
+    total = 0
+    for dirpath, _, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+    return total
+
+
+def prune_charon_targets(root: Path) -> list[tuple[Path, int]]:
+    """Delete hashed Charon cargo target dirs whose git worktree no longer exists.
+
+    Candidates are 16-hex children of `<shared>/charon-target`. A directory
+    stays if a live worktree hashes to its name, or if `CHARON_TARGET_DIR`
+    resolves to it. Returns `(path, size)` for each removed directory.
+    """
+    parent = shared_build_dir(root) / "charon-target"
+    if not parent.is_dir():
+        return []
+
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        print(
+            f"extract-llbc.py: git worktree list failed ({exc}); "
+            "leaving charon-target directories untouched",
+            file=sys.stderr,
+        )
+        return []
+    if result.returncode != 0:
+        print(
+            "extract-llbc.py: git worktree list failed; "
+            "leaving charon-target directories untouched",
+            file=sys.stderr,
+        )
+        return []
+
+    live: set[str] = set()
+    prefix = "worktree "
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith(prefix):
+            continue
+        worktree = Path(line[len(prefix) :])
+        if not worktree.is_dir():
+            continue
+        live.add(charon_target_key(worktree))
+
+    env_live: Path | None = None
+    if value := os.environ.get("CHARON_TARGET_DIR"):
+        env_live = Path(value).resolve()
+
+    try:
+        children = sorted(parent.iterdir())
+    except OSError:
+        return []
+
+    removed: list[tuple[Path, int]] = []
+    for child in children:
+        if not child.is_dir() or _CHARON_TARGET_KEY.fullmatch(child.name) is None:
+            continue
+        if child.name in live:
+            continue
+        if env_live is not None:
+            try:
+                if child.resolve() == env_live:
+                    continue
+            except OSError:
+                pass
+        size = _charon_target_dir_size(child)
+        shutil.rmtree(child)
+        removed.append((child, size))
+    return removed
+
+
+def prune_charon_targets_cli(eng: Engine) -> None:
+    removed = prune_charon_targets(eng.root)
+    gib = 1024 ** 3
+    total = 0
+    for path, size in removed:
+        print(f"removed {path} ({size / gib:.2f} GiB)")
+        total += size
+    print(f"removed {len(removed)} directories ({total / gib:.2f} GiB)")
 
 
 def _remove_empty_store_dirs(store: Path) -> None:
@@ -4678,6 +4781,11 @@ def run_cli(
         action="store_true",
         help="compress legacy uncompressed LLBC store entries; never extracts",
     )
+    modes.add_argument(
+        "--prune-charon-targets",
+        action="store_true",
+        help="remove hashed Charon target directories whose worktree is gone; never extracts",
+    )
     parser.add_argument(
         "--store-max-age-days",
         type=int,
@@ -4817,6 +4925,9 @@ def run_cli(
         return
     if args.compact_store:
         compact_store_cli(eng, args)
+        return
+    if args.prune_charon_targets:
+        prune_charon_targets_cli(eng)
         return
     extract(eng, args)
 

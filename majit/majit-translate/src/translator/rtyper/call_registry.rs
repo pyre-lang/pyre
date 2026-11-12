@@ -339,6 +339,8 @@ pub struct FunctionEntry {
     /// fails closed exactly as before.
     pub declared_funcptr_type:
         RefCell<Option<crate::translator::rtyper::lltypesystem::lltype::FuncType>>,
+    /// The `entries` key this entry was registered under.
+    pub(crate) canonical_key: FunctionPathKey,
 }
 
 impl FunctionEntry {
@@ -1233,10 +1235,9 @@ impl CallRegistry {
     /// created it. Aliases resolve through [`Self::lookup_registered`];
     /// [`Self::alias`] needs the canonical key.
     pub(crate) fn canonical_key_of(&self, entry: &Rc<FunctionEntry>) -> Option<FunctionPathKey> {
-        self.entries
-            .borrow()
-            .iter()
-            .find_map(|(key, existing)| Rc::ptr_eq(existing, entry).then(|| key.clone()))
+        let entries = self.entries.borrow();
+        let existing = entries.get(&entry.canonical_key)?;
+        Rc::ptr_eq(existing, entry).then(|| entry.canonical_key.clone())
     }
 
     /// Same as [`Self::lookup`] with a narrowly-scoped cross-module
@@ -1527,6 +1528,7 @@ impl CallRegistry {
             host_object,
             function_desc,
             declared_funcptr_type: RefCell::new(None),
+            canonical_key: key.clone(),
         });
         self.entries.borrow_mut().insert(key, entry.clone());
         entry

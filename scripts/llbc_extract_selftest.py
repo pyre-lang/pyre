@@ -372,6 +372,69 @@ def run_charon_target_dir(engine) -> int:
     return failures
 
 
+def run_prune_charon_targets(engine) -> int:
+    """Hashed Charon target dirs whose worktree is gone are deleted."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    saved = {
+        key: os.environ.pop(key, None)
+        for key in ("CHARON_TARGET_DIR", "PYRE_SHARED_BUILD")
+    }
+    tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        live = tmp / "live"
+        live.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=live, check=True)
+
+        shared = tmp / "shared"
+        os.environ["PYRE_SHARED_BUILD"] = str(shared)
+        parent = shared / "charon-target"
+        parent.mkdir(parents=True)
+
+        live_key = engine.charon_target_key(live)
+        live_dir = parent / live_key
+        live_dir.mkdir()
+        (live_dir / "keep.bin").write_bytes(b"keep")
+
+        orphan_key = "deadbeefdeadbeef"
+        if orphan_key == live_key:
+            orphan_key = "cafebabecafebabe"
+        orphan_dir = parent / orphan_key
+        orphan_dir.mkdir()
+        payload = b"orphan-payload"
+        (orphan_dir / "gone.bin").write_bytes(payload)
+
+        other = parent / "not-a-hash-name"
+        other.mkdir()
+        (other / "stay.bin").write_bytes(b"stay")
+
+        removed = engine.prune_charon_targets(live)
+        expect(
+            "removes only the orphan hashed directory",
+            [path.name for path, _ in removed] == [orphan_key],
+        )
+        expect("removed size is the payload", removed and removed[0][1] == len(payload))
+        expect("orphan directory is gone", not orphan_dir.exists())
+        expect("live hashed directory remains", live_dir.is_dir())
+        expect("non-hex child remains", other.is_dir())
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
 def _run_llbc_store_pass(engine, root, expect, *, compress: bool) -> None:
     """One store layout: legacy (`LLBC_STORE_COMPRESS=off`) or compressed."""
     store = pathlib.Path(tempfile.mkdtemp()).resolve()
@@ -680,6 +743,7 @@ def main() -> None:
         + run_stamp_skip(engine)
         + run_child_dirs_whose_rs_mention(engine)
         + run_charon_target_dir(engine)
+        + run_prune_charon_targets(engine)
         + run_llbc_store(engine)
     )
     if failures:

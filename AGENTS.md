@@ -108,6 +108,8 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
   `LLBC_STORE`) and import a matching artefact (zstd-compressed, decompressed
   on import; cloned when no zstd codec exists) instead of re-running Charon.
   `LLBC_STORE=off` disables it; `--prune-store` drops unused entries.
+  `--prune-charon-targets` removes hashed Charon target directories under
+  `<shared>/charon-target` whose worktree is gone.
   `LLBC_STORE_MAX_BYTES` caps the store (default 20 GiB). `--compact-store`
   converts older uncompressed entries.
 - `cargo clean` drops `target/llbc`; the next extract re-imports it from the
