@@ -12814,28 +12814,28 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
 /// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
 /// merge-point next_instr.
 ///
-/// `interp_jit.py` `dispatch` passes `handle_bytecode`'s returned local
-/// into the next `jit_merge_point`. Pyre stores that local on the frame;
-/// BH already interpreted the write. The merge-point green can still hold
-/// the loop-entry pc (the label inputarg). Prefer the live field when it
-/// has moved.
+/// `handle_jitexception` (`warmspot.py`) calls `portal_ptr(*args)` with the
+/// greens `bhimpl_jit_merge_point` decoded. The live `last_instr` here is
+/// still the guard snapshot `consume_vable_info` restored (`setfield_vable`
+/// of the opcode the guard sat on). `next_instr()` is that field plus one,
+/// so treating any difference as "BH advanced" resumes on the unit after
+/// the jump (then the fallthrough arm) instead of the taken-arm merge.
+/// A green of 0 would store `last_instr = -1`; leave the
+/// field as the blackhole wrote it.
 ///
-/// `handle_jitexception` (`warmspot.py`) calls `portal_ptr(*args)` and does
-/// not rewrite `valuestackdepth`; `bhimpl_setfield_vable_i` /
-/// `bhimpl_setarrayitem_vable_r` (`blackhole.py`) already wrote those fields,
-/// and `dispatch` (`interp_jit.py`) promotes the live `valuestackdepth`.
+/// `handle_jitexception` does not rewrite `valuestackdepth`;
+/// `bhimpl_setfield_vable_i` / `bhimpl_setarrayitem_vable_r` (`blackhole.py`)
+/// already wrote those fields, and `dispatch` (`interp_jit.py`) promotes
+/// the live `valuestackdepth`.
 #[majit_macros::dont_look_inside]
 fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     let Some(green_pc) = green_int.first().copied().and_then(green_pc_position) else {
         return;
     };
-    let live_pc = frame.next_instr();
-    let advanced = live_pc != 0 && live_pc != green_pc;
-    let ni = if advanced { live_pc } else { green_pc };
-    if ni == 0 {
+    if green_pc == 0 {
         return;
     }
-    frame.set_last_instr_from_next_instr(ni);
+    frame.set_last_instr_from_next_instr(green_pc);
 }
 
 /// compile.py handle_fail.

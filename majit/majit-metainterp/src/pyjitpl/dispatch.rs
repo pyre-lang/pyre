@@ -1688,7 +1688,7 @@ pub struct JitCodeMachine<'mi, S, R> {
     frames: &'mi mut MIFrameStack,
     pub(super) last_exception_box: Option<OpRef>,
     pub(super) last_exception_value: i64,
-    class_of_last_exc_is_const: bool,
+    pub(super) class_of_last_exc_is_const: bool,
     cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     issubclass: Option<fn(i64, i64) -> bool>,
     /// Outer interpreter pc captured BEFORE the
@@ -3305,6 +3305,100 @@ where
     pub fn clear_exception(&mut self) {
         self.last_exception_value = 0;
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    }
+
+    /// pyjitpl.py `MetaInterp.execute_ll_raised(llexception, constant=False)`.
+    fn execute_ll_raised(&mut self, llexception: i64, constant: bool) {
+        self.last_exception_value = llexception;
+        self.class_of_last_exc_is_const = constant;
+    }
+
+    /// pyjitpl.py `MetaInterp.handle_possible_exception`.
+    ///
+    /// Records `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` at `resume_pc`, then
+    /// `finishframe_exception` (`unwind_to_exception_handler`) when an
+    /// exception is standing. The class-const flag becomes true because this
+    /// guard was recorded.
+    fn handle_possible_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        resume_pc: usize,
+    ) -> TraceAction {
+        if self.last_exception_value != 0 {
+            let exc = self.last_exception_value;
+            let class_is_const = self.class_of_last_exc_is_const;
+            let typeptr = self.read_typeptr_from_exception(exc);
+            let exc_class_box = ctx.const_int(typeptr);
+            let guard_op = self.record_state_guard_with_value(
+                ctx,
+                sym,
+                OpCode::GuardException,
+                &[exc_class_box],
+                resume_pc,
+                /* after_residual_call */ true,
+                Some(Value::Ref(majit_ir::GcRef(exc as usize))),
+            );
+            self.last_exception_box = Some(if class_is_const {
+                ctx.const_ref(exc)
+            } else {
+                guard_op
+            });
+            self.class_of_last_exc_is_const = true;
+            self.unwind_to_exception_handler(ctx)
+        } else {
+            self.record_state_guard(
+                ctx,
+                sym,
+                OpCode::GuardNoException,
+                &[],
+                resume_pc,
+                /* after_residual_call */ true,
+            );
+            TraceAction::Continue
+        }
+    }
+
+    /// pyjitpl.py `MetaInterp.prepare_resume_from_failure` exception-guard
+    /// arm: `RESTORE_EXCEPTION`, `execute_ll_raised` / `clear_exception`,
+    /// then `handle_possible_exception`. Unique walk of an exception-guard
+    /// bridge starts on a fresh machine; this is the same call sequence
+    /// `_handle_guard_failure` runs before `interpret()`.
+    fn prepare_resume_from_failure(&mut self, ctx: &mut TraceCtx, sym: &mut S) -> TraceAction {
+        if !(ctx.is_bridge_trace && ctx.bridge_source_is_exception_guard())
+            || ctx.bridge_exception_resume_prepared()
+        {
+            return TraceAction::Continue;
+        }
+        if let (Some(op1), Some(op2)) = (ctx.bridge_saved_exc_class_op, ctx.bridge_saved_exc_op) {
+            ctx.restore_exception(op1, op2);
+        }
+        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
+        if exception != 0 {
+            self.execute_ll_raised(exception, false);
+        } else {
+            self.clear_exception();
+        }
+        let (source_pc, source_jitcode) = match self.frames.frames.last() {
+            Some(frame) => (
+                Some(frame.pc),
+                frame.jitcode.try_index().map(|index| index as i32),
+            ),
+            None => (None, None),
+        };
+        let resume_pc = source_pc.unwrap_or(0);
+        let action = self.handle_possible_exception(ctx, sym, resume_pc);
+        if matches!(action, TraceAction::Continue) {
+            ctx.bridge_exception_resume_prepared = true;
+            ctx.bridge_exception_source_pc = source_pc;
+            ctx.bridge_exception_source_jitcode = source_jitcode;
+            if let Some(frame) = self.frames.frames.last() {
+                ctx.bridge_exception_resume_pc = Some(frame.pc);
+                ctx.bridge_exception_resume_jitcode =
+                    frame.jitcode.try_index().map(|index| index as i32);
+            }
+        }
+        action
     }
 
     /// Pop the current frame during a return / exception unwind.  Restores
@@ -6112,7 +6206,15 @@ where
 
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_program_pc);
-    let action = machine.run_to_end(ctx, sym, runtime);
+    machine.set_cpu(ctx.metainterp_cpu.clone());
+    // pyjitpl.py `_handle_guard_failure`: `prepare_resume_from_failure`
+    // then `interpret()`. Unique walk of an exception-guard bridge has
+    // no MetaInterp machine, so the same sequence runs here before
+    // `run_to_end`.
+    let action = match machine.prepare_resume_from_failure(ctx, sym) {
+        TraceAction::Continue => machine.run_to_end(ctx, sym, runtime),
+        other => other,
+    };
     drop(machine);
     publish_walk_abort_handoff(ctx, &action, &mut standalone);
     action

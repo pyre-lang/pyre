@@ -7785,11 +7785,12 @@ impl<M: Clone> MetaInterp<M> {
         let issubclass = self.issubclass;
         let pending_exc_box = self.last_exc_box;
         let pending_exc_value = self.last_exc_value;
+        let pending_exc_class_is_const = self.class_of_last_exc_is_const;
         let portals: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> =
             (0..self.staticdata.jitdrivers_sd.len())
                 .map(|index| self.mainjitcode_of(index).cloned())
                 .collect();
-        let (action, last_exc_box, last_exc_value) = self
+        let (action, last_exc_box, last_exc_value, last_exc_class_is_const) = self
             .with_trace_ctx_and_framestack(
                 |ctx, framestack, target, decision, exec_i, exec_r, exec_f, exec_v| {
                     let runtime = crate::pyjitpl::ClosureRuntimeWithResolver::new(
@@ -7808,18 +7809,21 @@ impl<M: Clone> MetaInterp<M> {
                     machine.set_issubclass(issubclass);
                     machine.last_exception_box = pending_exc_box;
                     machine.last_exception_value = pending_exc_value;
+                    machine.class_of_last_exc_is_const = pending_exc_class_is_const;
                     machine.set_outer_program_pc(portal_pc);
                     let action = machine.run_to_end(ctx, sym, &runtime);
                     (
                         action,
                         machine.last_exception_box,
                         machine.last_exception_value,
+                        machine.class_of_last_exc_is_const,
                     )
                 },
             )
             .expect("MetaInterp.interpret requires an active trace");
         self.last_exc_box = last_exc_box;
         self.last_exc_value = last_exc_value;
+        self.class_of_last_exc_is_const = last_exc_class_is_const;
         // pyjitpl.py `_interpret`:
         //
         //     self.framestack[-1].run_one_step()
@@ -17022,6 +17026,7 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
             );
         }
+        ctx.bridge_saved_exc_class_op = Some(op1);
         ctx.bridge_saved_exc_op = Some(op2);
         self.exc_resume = Some((op1, op2));
     }

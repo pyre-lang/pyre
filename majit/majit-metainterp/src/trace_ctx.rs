@@ -908,6 +908,10 @@ pub struct TraceCtx {
     pub(crate) bridge_exception_resume_pc: Option<usize>,
     /// `JitCode` index of the frame that holds `bridge_exception_resume_pc`.
     pub(crate) bridge_exception_resume_jitcode: Option<i32>,
+    /// `SAVE_EXC_CLASS` op from `_prepare_exception_resumption`.
+    /// `prepare_resume_from_failure` restores both this and
+    /// `bridge_saved_exc_op` as `RESTORE_EXCEPTION`.
+    pub(crate) bridge_saved_exc_class_op: Option<OpRef>,
     /// `SAVE_EXCEPTION` op from `_prepare_exception_resumption`. The
     /// walker reads it as the handler's exception box when the guard
     /// was already recorded. `reached_loop_header` consumes it with
@@ -2532,6 +2536,7 @@ impl TraceCtx {
             bridge_exception_source_jitcode: None,
             bridge_exception_resume_pc: None,
             bridge_exception_resume_jitcode: None,
+            bridge_saved_exc_class_op: None,
             bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
@@ -2634,6 +2639,7 @@ impl TraceCtx {
             bridge_exception_source_jitcode: None,
             bridge_exception_resume_pc: None,
             bridge_exception_resume_jitcode: None,
+            bridge_saved_exc_class_op: None,
             bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
@@ -2934,6 +2940,7 @@ impl TraceCtx {
     /// `SAVE_EXCEPTION` producer.
     pub fn consume_bridge_exception_resume(&mut self) {
         self.bridge_exception_resume_prepared = false;
+        self.bridge_saved_exc_class_op = None;
         self.bridge_saved_exc_op = None;
         self.bridge_exception_resume_pc = None;
         self.bridge_exception_resume_jitcode = None;
