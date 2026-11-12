@@ -179,6 +179,11 @@ pub(crate) mod modules {
     /// Crate-stripped Layer-3b prefix after `canonical_dedup_key` drops
     /// the local `pyre_object` root. Same HostObject Arc as [`OBJECT_ARRAY`].
     pub(crate) const OBJECT_ARRAY_STRIPPED: &str = "object_array";
+    /// `majit_gc` crate root — the rgc API module (`rpython/rlib/rgc.py`).
+    pub(crate) const GC: &str = "majit_gc";
+    /// `majit_gc::add_memory_pressure` — `rgc.add_memory_pressure`
+    /// (`rgc.py` `AddMemoryPressureEntry`).
+    pub(crate) const ADD_MEMORY_PRESSURE: &str = "majit_gc.add_memory_pressure";
     /// `majit_gc::header` varsize helpers (`init_gc_object_immortal` /
     /// `malloc_varsize` analogue). Concrete, so they need the same HOST_ENV
     /// residual as `malloc_typed` rather than a look-inside graph.

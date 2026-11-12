@@ -7459,8 +7459,9 @@ pub(crate) use self::lltype::{
     is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, strip_crate_prefix, type_decl_ref_adt_id,
-    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    seed_program_exception_class_hints, strip_crate_prefix,
+    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -7842,6 +7843,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             Vec::new()
         };
+        let iterator_any_synthesized = if !lo.iterator_any_sites.is_empty() {
+            crate::front::iter_adapter::rewire_iterator_any_sites(
+                &mut lo.graph,
+                &lo.iterator_any_sites,
+            )
+        } else {
+            Vec::new()
+        };
         let residual_slice_iter_next =
             crate::front::iter_next::graph_has_residual_slice_iter_next(&lo.graph);
         if !lo.result_exc_call_results.is_empty()
@@ -7878,6 +7887,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             )?;
         }
         lo.next_call_results.extend(map_collect_synthesized);
+        lo.next_call_results.extend(iterator_any_synthesized);
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangefrom_sites(

@@ -1613,22 +1613,27 @@ fn unsigned_cast_to_utf8str_emits_cast_instance_str() {
 }
 
 /// A genuine `usize` (`ValueType::Unsigned`) cast onto rstr `STR` is
-/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`), not the
-/// pointer-only dest-Str restore. UnaryOp Cast and Rvalue RawPtr both
-/// skip `__cast_instance_intrinsic`.
-#[test]
-fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
+/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`) then dest-Str
+/// restore (`op_gc_restore_root`). UnaryOp Cast and Rvalue RawPtr both
+/// emit that pair: dest-Str restore is not a substitute for `gen_cast`.
+/// Restore root is the destination layout, not a hardcoded Utf8Str.
+fn assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+    module: &str,
+    leaf: &str,
+    expected_root: &str,
+) {
+    use crate::model::{CallTarget, OpKind, ValueType};
     let span = fixture_span();
     let empty_g = empty_generics();
-    let utf8_adt = serde_json::json!({
+    let dest_adt = serde_json::json!({
         "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
     });
     let src_ty = usize_ty();
-    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [dest_adt, "Mut"]});
     let n = usize_ty();
-    let utf8 = serde_json::json!({
+    let dest_decl = serde_json::json!({
         "def_id": 0,
-        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "item_meta": window_meta(&["pyre_object", module, leaf], true),
         "kind": {"Struct": [
             {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
             {"name": "length", "ty": n, "attr_info": null}
@@ -1685,7 +1690,7 @@ fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [utf8],
+            "type_decls": [dest_decl],
             "fun_decls": [unary, rvalue],
             "global_decls": [],
             "trait_decls": [gctype_trait_decl()],
@@ -1693,26 +1698,76 @@ fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let has_cast_instance = |graph: &crate::model::FunctionGraph| {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| crate::model::cast_instance_root(&op.kind).is_some())
+    let has_cast_int_to_ptr = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+                _ => false,
+            })
+        })
     };
+    let dest_str_restore_root = |graph: &crate::model::FunctionGraph| -> Option<String> {
+        graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                )
+                .then(|| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+                .flatten()
+            })
+        })
+    };
+    let dest_label = format!("*mut {module}::{leaf}");
     let unary_graph = crate::test_support::lower_function(&llbc, "unary_usize_str_cast")
-        .expect("lower UnaryOp Cast usize to *mut Utf8Str");
+        .unwrap_or_else(|_| panic!("lower UnaryOp Cast usize to {dest_label}"));
     assert!(
-        !has_cast_instance(&unary_graph),
-        "UnaryOp Cast usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        has_cast_int_to_ptr(&unary_graph),
+        "UnaryOp Cast usize as {dest_label} emits gen_cast Primitive→Ptr; graph={}",
+        unary_graph.dump()
+    );
+    assert_eq!(
+        dest_str_restore_root(&unary_graph).as_deref(),
+        Some(expected_root),
+        "UnaryOp Cast usize as {dest_label} dest-Str restores with dest root; graph={}",
         unary_graph.dump()
     );
     let rvalue_graph = crate::test_support::lower_function(&llbc, "rvalue_usize_str_cast")
-        .expect("lower Rvalue RawPtr Cast usize to *mut Utf8Str");
+        .unwrap_or_else(|_| panic!("lower Rvalue RawPtr Cast usize to {dest_label}"));
     assert!(
-        !has_cast_instance(&rvalue_graph),
-        "Rvalue::Cast RawPtr usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        has_cast_int_to_ptr(&rvalue_graph),
+        "Rvalue::Cast RawPtr usize as {dest_label} emits gen_cast Primitive→Ptr; graph={}",
         rvalue_graph.dump()
+    );
+    assert_eq!(
+        dest_str_restore_root(&rvalue_graph).as_deref(),
+        Some(expected_root),
+        "Rvalue::Cast RawPtr usize as {dest_label} dest-Str restores with dest root; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+#[test]
+fn usize_cast_to_utf8str_emits_cast_int_to_ptr_then_dest_str() {
+    assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+        "unicodeobject",
+        "Utf8Str",
+        "unicodeobject::Utf8Str",
+    );
+}
+
+#[test]
+fn usize_cast_to_bytesblock_emits_cast_int_to_ptr_then_dest_str() {
+    assert_usize_cast_to_rstr_emits_gen_cast_then_dest_str(
+        "bytesobject",
+        "BytesBlock",
+        "bytesobject::BytesBlock",
     );
 }
 
@@ -16644,6 +16699,80 @@ fn interned_result_of_mut_ref_payload_is_pointer() {
     );
 }
 
+/// Intern ROW of `Result<&mut T, E>::Ok.__pos_0` is the pointer word even
+/// when T is a declared-GC ADT (`descr.py` `get_type_flag` of a Ptr).
+#[test]
+fn interned_result_of_mut_ref_declared_gc_payload_is_pointer() {
+    let w = interior_struct(
+        1,
+        &["module", "ctypeobj", "W"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        )],
+        200,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        2,
+        &["error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let mut_ref = serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]});
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [{"Value": [1, adt_node(1)]}]
+            }
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![result_enum(0), w, pyerror],
+        vec![
+            intern_map_caller(0, "call_unwrap", 1, vec![mut_ref, adt_node(2)]),
+            generic_result_unwrap_decl(1, 0),
+        ],
+        vec![gctype],
+        vec![impl_row],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc).expect(
+        "build semantic program for interned Result<&mut W, PyError> with declared-GC pointee",
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<&mut W,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut ctypeobj::W"),
+        "declared-GC mut-ref intern ROW is the pointer word; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<&mut W,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut ctypeobj::W"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
 /// Intern of `Result<G<u8>, PyError>` keeps the CAST leaf render
 /// (`G<u8>`) as `Ok.__pos_0`. Identity-with-args (`g::G<u8>`) would be a
 /// different `struct_fields` key than CAST's `<G<u8>>` suffix.
@@ -17905,6 +18034,170 @@ fn map_or_reference_payload_class_is_narrowed() {
         vec!["WordHasher"],
         "Some.__pos_0 of a GC-instance niche Option is cast to the pointee class; ops={:?}",
         graph_ops(&body)
+    );
+}
+
+/// `ControlFlow<B, C>` with Continue = `C` (types[1]) and Break = `B`
+/// (types[0]), matching `core::ops::control_flow::ControlFlow`.
+fn control_flow_bc_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["ops", 0]},
+                {"Ident": ["control_flow", 0]},
+                {"Ident": ["ControlFlow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Continue",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Break",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+fn interior_mut_ref(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, inner, "Mut"]})
+}
+
+/// `?` on `Option<&mut T>` is `Try::branch` plus a ControlFlow switch;
+/// the Continue arm is `Field[0, 0]` of that ControlFlow (`Continue.__pos_0`).
+fn lower_control_flow_continue_mut_payload(payload_id: u64) -> FunctionGraph {
+    let payload = interior_mut_ref(interior_adt(payload_id));
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_i64(), payload.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cf_place = interior_place(1, &cf_ty);
+    let payload_place = serde_json::json!({
+        "kind": {"Projection": [cf_place, {"Field": [0, 0]}]},
+        "ty": payload
+    });
+    let caller = interior_caller(
+        "read_continue",
+        1,
+        vec![cf_ty.clone()],
+        payload.clone(),
+        vec![
+            interior_local(0, None, &payload),
+            interior_local(1, Some("cf"), &cf_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &payload),
+                interior_use(payload_place),
+            )],
+            interior_return(),
+        )],
+    );
+    let base = interior_struct(
+        1,
+        &["fixture", "Base"],
+        &[("word", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let sub = interior_struct(
+        2,
+        &["fixture", "Sub"],
+        &[("ob", interior_adt(1)), ("slot", interior_i64())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![control_flow_bc_enum(0), base, sub],
+        vec![caller],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+        })],
+        vec![serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{"Value": [0, interior_adt(1)]}]}
+            }
+        })],
+    );
+    lower_interior(&llbc, "read_continue")
+}
+
+fn continue_pos0_cast_roots(graph: &FunctionGraph) -> Vec<&str> {
+    use crate::model::OpKind;
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.windows(2))
+        .filter_map(|ops| {
+            let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                return None;
+            };
+            if field.name != "__pos_0" {
+                return None;
+            }
+            if !field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.contains("ControlFlow"))
+            {
+                return None;
+            }
+            crate::model::cast_instance_root(&ops[1].kind)
+        })
+        .collect()
+}
+
+/// `?` on `Option<&mut Sub>`: Continue's payload is `&mut Sub`. Sub's first
+/// field is the GcType base; the `__pos_0` recast keeps Sub's class root.
+#[test]
+fn control_flow_continue_mut_subclass_payload_keeps_subclass_class_root() {
+    let graph = lower_control_flow_continue_mut_payload(2);
+    let roots = continue_pos0_cast_roots(&graph);
+    assert_eq!(
+        roots,
+        vec!["Sub"],
+        "Continue.__pos_0 of `&mut Sub` must recast to Sub, not the base; ops={:?} graph={}",
+        graph_ops(&graph),
+        graph.dump()
+    );
+}
+
+/// An explicit `&mut Base` Continue payload stays the base class root.
+#[test]
+fn control_flow_continue_mut_base_payload_stays_base_class_root() {
+    let graph = lower_control_flow_continue_mut_payload(1);
+    let roots = continue_pos0_cast_roots(&graph);
+    assert_eq!(
+        roots,
+        vec!["Base"],
+        "Continue.__pos_0 of `&mut Base` must recast to Base; ops={:?} graph={}",
+        graph_ops(&graph),
+        graph.dump()
     );
 }
 
@@ -35758,16 +36051,33 @@ fn ascii_setitem_writes_items_block() {
         .iter()
         .find(|op| op.result.as_ref() == Some(base))
         .unwrap_or_else(|| panic!("ArrayWrite base must be defined; ops={ops:?}"));
-    let items = if crate::model::cast_instance_root(&producer.kind) == Some("[str]") {
-        match &producer.kind {
-            OpKind::Call { args, .. } => args
-                .first()
-                .and_then(LinkArg::as_variable)
-                .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
-            other => panic!("[str] narrow is a call, got {other:?}"),
-        }
-    } else {
-        base
+    assert_eq!(
+        crate::model::cast_instance_root(&producer.kind),
+        Some("[str]"),
+        "write base is the [str] view; ops={ops:?}"
+    );
+    let gcref = match &producer.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+        other => panic!("[str] narrow is a call, got {other:?}"),
+    };
+    let gcref_op = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(gcref))
+        .unwrap_or_else(|| panic!("[str] operand must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&gcref_op.kind),
+        Some("GCREF"),
+        "ItemsBlock ListDef is erased before the [str] view; ops={ops:?}"
+    );
+    let items = match &gcref_op.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("GCREF cast needs a value arg; ops={ops:?}")),
+        other => panic!("GCREF erase is a call, got {other:?}"),
     };
     let items_op = ops
         .iter()
@@ -35783,6 +36093,93 @@ fn ascii_setitem_writes_items_block() {
             );
         }
         other => panic!("write base must be FieldRead block, got {other:?}"),
+    }
+}
+
+/// Positive: `ll_list_bytes_getitem_fast` is `l.bytes_items[index]`.
+/// The shared `ItemsBlock` intern is `SomeList` of `PyObject`; a direct
+/// `[str]` narrow would pass that ListDef through (`cast_instance_intrinsic`
+/// list arm) and wrap would see `String ∪ Instance(PyObject)`. Erase to
+/// GCREF first, project `[str]`, then recast the element to `"str"`
+/// (`rlist.py` `AbstractBaseListRepr.recast`).
+#[test]
+fn bytes_getitem_erases_items_block_list_before_str_view() {
+    let graph = lower_object_fn("pyre_object::listobject::ll_list_bytes_getitem_fast");
+    let ops = graph_ops(&graph);
+    let read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::ArrayRead {
+            base,
+            item_ty: ValueType::Str,
+            array_type_id: Some(array_type_id),
+            array: _,
+            ..
+        } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID => {
+            Some((base, op.result.as_ref()))
+        }
+        _ => None,
+    });
+    let Some((base, result)) = read else {
+        panic!("bytes getitem must emit getarrayitem on [str]; ops={ops:?}");
+    };
+    let producer = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(base))
+        .unwrap_or_else(|| panic!("ArrayRead base must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&producer.kind),
+        Some("[str]"),
+        "read base is the [str] view; ops={ops:?}"
+    );
+    let gcref = match &producer.kind {
+        OpKind::Call { args, .. } => args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+        other => panic!("[str] narrow is a call, got {other:?}"),
+    };
+    let gcref_op = ops
+        .iter()
+        .find(|op| op.result.as_ref() == Some(gcref))
+        .unwrap_or_else(|| panic!("[str] operand must be defined; ops={ops:?}"));
+    assert_eq!(
+        crate::model::cast_instance_root(&gcref_op.kind),
+        Some("GCREF"),
+        "ItemsBlock ListDef is erased before the [str] view; ops={ops:?}"
+    );
+    assert!(
+        result.is_some_and(|loaded| ops.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind) == Some("str")
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { args, .. }
+                        if args.first().and_then(LinkArg::as_variable) == Some(loaded)
+                )
+        })),
+        "getitem recasts the GCREF word onto str; ops={ops:?}"
+    );
+}
+
+/// Negative: an object-item array keeps `[PyObject]` and does not dest-Str
+/// the element. The GCREF erase + `"str"` recast is the string-list
+/// `externalvsinternal` boundary, not a generic array recast.
+#[test]
+fn object_array_index_does_not_recast_element_to_str() {
+    for name in [
+        "pyre_object::kwargsdict::kwargs_at",
+        "pyre_object::tupleobject::w_tuple_new_from_slice",
+    ] {
+        let graph = lower_object_fn(name);
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")),
+            "{name} must narrow through [PyObject]; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| crate::model::cast_instance_root(&op.kind) != Some("str")),
+            "{name} must not dest-Str an object-array element; ops={ops:?}"
+        );
     }
 }
 

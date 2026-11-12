@@ -32,9 +32,16 @@
 //! lives on the **construction site**, not inside the polymorphic shim:
 //! the caller holds a concrete closure ADT, so this pass rewrites
 //! `map(it, f).collect()` into the loop it denotes and calls that
-//! closure's inherent `call_mut` on a reborrow of the env.  `FilterMap::next` / `Iter::position`
-//! still stay residual — they need an early-exit match on the predicate
-//! result, which is a different CFG.
+//! closure's inherent `call_mut` on a reborrow of the env.
+//!
+//! `Iterator::any` is the same construction-site combinator with an
+//! early-exit CFG: `any(it, f)` is the loop `for x in it { if f(x) { return
+//! true } }; false` (`rpython/annotator/unaryop.py` `SomeList.iter` /
+//! `SomeIterator.next`, then the predicate).  The foreign default body is
+//! Opaque and one residual stub is shared across instantiations, so this
+//! pass rewrites at the call site — where `it` and `f` are concrete —
+//! instead of letting `mergeinputargs` union unrelated iterator items.
+//! `FilterMap::next` / `Iter::position` still stay residual.
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::iter_next::{
@@ -591,6 +598,30 @@ pub(crate) struct MapCollectSite {
     pub rust_vec_kind: Option<majit_ir::rvec::VecItemKind>,
 }
 
+/// A recognized `Iterator::any(it, f)` construction site. Types are
+/// resolved while the receiver iterator and the predicate closure are
+/// still MIR `TyRef`s; the post-pass only needs the closure's inherent
+/// `call_once` owner and the inner-item kind.
+#[derive(Clone)]
+pub(crate) struct IteratorAnySite {
+    /// The `any` call result (the `bool`) — locates block A.
+    pub result_var: Variable,
+    /// The closure env ADT `name_path` — the `call_once` inherent-method owner.
+    pub call_once_owner: String,
+    /// `I::Item` projected to a [`ValueType`] — the `next` element and the
+    /// `(x,)` args-tuple payload the synthesized `call_mut` writes.
+    pub payload_ty: ValueType,
+    /// Concrete class of a reference payload, matching
+    /// `InstanceRepr._setup_repr` (`rclass.py`) on the synthesized
+    /// `(x,)` tuple field.
+    pub payload_class_root: Option<String>,
+    /// `<X>` suffix for the closure `Args` tuple `(payload,)`.
+    pub args_tuple_suffix: String,
+    /// Element kind recorded beside the synthesized `next` so
+    /// `front::iter_next` can pick the list vs range answer.
+    pub inner_item_ty: ValueType,
+}
+
 /// `true` iff `path` names the `Map` adapter ADT
 /// (`core::iter::adapters::map::Map`).
 pub(crate) fn is_map_adapter_path(path: &str) -> bool {
@@ -609,6 +640,22 @@ pub(crate) fn is_map_collect_target(target: &CallTarget) -> bool {
             segments.last().map(String::as_str),
             Some("collect" | "from_iter")
         ),
+        _ => false,
+    }
+}
+
+/// Residual `Iterator::any` / `slice::iter::Iter::any`. The capture site
+/// still proves the dest is `bool` and the predicate is a closure ADT;
+/// this only names the leaf so an unrelated `any` Method is not rejected
+/// before that type gate. `trait_default_call_segments` spells a
+/// concrete `slice::iter::Iter` call as `["slice","iter","Iter","any"]`.
+pub(crate) fn is_iterator_any_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method { name, .. } => name == "any",
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().map(String::as_str) == Some("any")
+        }
+        CallTarget::Indirect { method_name, .. } => method_name == "any",
         _ => false,
     }
 }
@@ -1225,11 +1272,279 @@ fn rewire_one_map_collect_site(
     Ok(opt)
 }
 
+/// Rewrite every recorded `any(it, f)` into
+/// `loop { next(it) -> None => false; Some(x) => if f(x) { true } else continue }`.
+/// The synthesized `next` is returned so `front::iter_next` can fold it.
+/// Fail-safe: a structural mismatch leaves the residual `any` (census Skip).
+pub(crate) fn rewire_iterator_any_sites(
+    graph: &mut FunctionGraph,
+    sites: &[IteratorAnySite],
+) -> Vec<(Variable, ValueType)> {
+    let mut next_results = Vec::new();
+    for site in sites {
+        if site.call_once_owner.is_empty() {
+            continue;
+        }
+        match rewire_one_iterator_any_site(graph, site) {
+            Ok(next_opt) => next_results.push((next_opt, site.inner_item_ty.clone())),
+            Err(decline) => {
+                crate::decline::record_reason(
+                    crate::decline::gate::ITER_ADAPTER,
+                    "iterator-any-site-declined",
+                    &decline,
+                    &graph.name,
+                );
+            }
+        }
+    }
+    next_results
+}
+
+fn rewire_one_iterator_any_site(
+    graph: &mut FunctionGraph,
+    site: &IteratorAnySite,
+) -> Result<Variable, String> {
+    let name = graph.name.clone();
+    let a = graph
+        .blocks
+        .iter()
+        .position(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.result_var))
+        })
+        .ok_or_else(|| format!("{name}: Iterator::any result var has no producer block"))?;
+    let ci = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .ok_or_else(|| format!("{name}: Iterator::any call op not found in block {a}"))?;
+    if ci + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: Iterator::any call is not the last op of block {a}"
+        ));
+    }
+    let (inner, env) = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call { args, .. } if args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
+        other => {
+            return Err(format!(
+                "{name}: Iterator::any producer op is not a 2-arg call: {other:?}"
+            ));
+        }
+    };
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!(
+            "{name}: Iterator::any call block {a} does not have a single exit"
+        ));
+    };
+    if exit.exitcase.is_some() || exit.last_exception.is_some() || exit.last_exc_value.is_some() {
+        return Err(format!(
+            "{name}: Iterator::any call block {a} exit is not a plain goto"
+        ));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    if !inner_is_list_or_range(graph, &inner) {
+        return Err(format!(
+            "{name}: Iterator::any inner is neither a list iter nor an exclusive Range"
+        ));
+    }
+    if !var_in_block_scope(graph, a, &inner) || !var_in_block_scope(graph, a, &env) {
+        return Err(format!(
+            "{name}: any(it, f) operands are not in scope at the call"
+        ));
+    }
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != site.result_var
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+    for v in &carried {
+        if !var_in_block_scope(graph, a, v) {
+            return Err(format!(
+                "{name}: any continuation value is not in scope at the call"
+            ));
+        }
+    }
+
+    graph.blocks[a].operations.remove(ci);
+
+    let mut header_sources = vec![inner.clone(), env.clone()];
+    for v in &carried {
+        if !header_sources.contains(v) {
+            header_sources.push(v.clone());
+        }
+    }
+    let (header, header_inputs) = graph.create_block_with_arg_vars(header_sources.len());
+    let it_h = header_inputs[0].clone();
+
+    let opt = graph.alloc_value_var();
+    graph.block_mut(header).operations.push(SpaceOperation {
+        result: Some(opt.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::method("next", None),
+            args: crate::model::call_args(vec![it_h]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+
+    let mut switch_sources = vec![opt.clone()];
+    switch_sources.extend(header_inputs.iter().cloned());
+    let (switch_bb, switch_inputs) = graph.create_block_with_arg_vars(switch_sources.len());
+    let opt_c = switch_inputs[0].clone();
+    close_goto_mixed(
+        graph,
+        header,
+        switch_bb,
+        switch_sources.iter().cloned().map(LinkArg::Value).collect(),
+    );
+
+    let mut done_sources = Vec::with_capacity(carried.len());
+    for v in &carried {
+        let idx = header_sources
+            .iter()
+            .position(|s| s == v)
+            .expect("carried any-call values are header sources");
+        done_sources.push(switch_inputs[1 + idx].clone());
+    }
+    let body_sources: Vec<Variable> = switch_inputs.clone();
+    let (body_bb, body_inputs) = graph.create_block_with_arg_vars(body_sources.len());
+    let (done_false, done_false_inputs) = graph.create_block_with_arg_vars(done_sources.len());
+    let (done_true, done_true_inputs) = graph.create_block_with_arg_vars(done_sources.len());
+
+    let disc = graph.alloc_value_var();
+    graph.block_mut(switch_bb).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::FieldRead {
+            base: opt_c.clone(),
+            field: FieldDescriptor::new("__discriminant", None),
+            ty: ValueType::Int,
+            pure: true,
+        },
+    });
+    let none_link = Link::new_mixed(
+        done_sources.iter().cloned().map(LinkArg::Value).collect(),
+        done_false,
+        Some(ExitCase::Const(ConstValue::Int(0))),
+    )
+    .with_llexitcase_from_exitcase();
+    let some_link = Link::new_mixed(
+        body_sources.iter().cloned().map(LinkArg::Value).collect(),
+        body_bb,
+        Some(ExitCase::Const(ConstValue::Int(1))),
+    )
+    .with_llexitcase_from_exitcase();
+    graph.set_control_flow_metadata(
+        switch_bb,
+        Some(ExitSwitch::Value(disc)),
+        vec![none_link, some_link],
+    );
+
+    // Header sources are `[it, env, ...carried]`; the body prepends the
+    // Option, so the slots are `[opt, it, env, ...carried]` — the same
+    // layout `rewire_one_map_collect_site` uses (plus `out` there).
+    let opt_b = body_inputs[0].clone();
+    let it_b = body_inputs[1].clone();
+    let env_b = body_inputs[2].clone();
+    let payload = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(payload.clone()),
+        kind: OpKind::FieldRead {
+            base: opt_b,
+            field: FieldDescriptor::new("__pos_0", None),
+            ty: site.payload_ty.clone(),
+            pure: true,
+        },
+    });
+    let call_result = emit_call_mut(
+        graph,
+        body_bb,
+        env_b.clone(),
+        Some((
+            payload,
+            site.payload_ty.clone(),
+            site.payload_class_root.clone(),
+        )),
+        &site.call_once_owner,
+        ValueType::Bool,
+        &site.args_tuple_suffix,
+    );
+    let true_args: Vec<Variable> = {
+        let mut args = Vec::with_capacity(carried.len());
+        for v in &carried {
+            let idx = header_sources
+                .iter()
+                .position(|s| s == v)
+                .expect("carried any-call values are header sources");
+            args.push(body_inputs[1 + idx].clone());
+        }
+        args
+    };
+    let mut false_args = vec![it_b, env_b];
+    false_args.extend(body_inputs.iter().skip(3).cloned());
+    graph.set_branch(
+        body_bb,
+        call_result,
+        done_true,
+        true_args,
+        header,
+        false_args,
+    );
+
+    let false_val = graph.alloc_value_var();
+    graph.block_mut(done_false).operations.push(SpaceOperation {
+        result: Some(false_val.clone()),
+        kind: OpKind::ConstBool(false),
+    });
+    let false_link_args = reproduce_exit_args(
+        &saved_exit,
+        &site.result_var,
+        &false_val,
+        &carried,
+        &done_false_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, done_false, b_target, false_link_args);
+
+    let true_val = graph.alloc_value_var();
+    graph.block_mut(done_true).operations.push(SpaceOperation {
+        result: Some(true_val.clone()),
+        kind: OpKind::ConstBool(true),
+    });
+    let true_link_args = reproduce_exit_args(
+        &saved_exit,
+        &site.result_var,
+        &true_val,
+        &carried,
+        &done_true_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, done_true, b_target, true_link_args);
+
+    let emit_id = graph.blocks[a].id;
+    close_goto_mixed(
+        graph,
+        emit_id,
+        header,
+        header_sources.into_iter().map(LinkArg::Value).collect(),
+    );
+    Ok(opt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, Variable};
-    use crate::front::iter_next::{is_iter_op_segments, rewire_next_call_sites};
+    use crate::front::iter_next::{
+        is_iter_op_segments, originates_from_iter_op, rewire_next_call_sites,
+    };
     use crate::model::{ExitCase, ExitSwitch, Link};
 
     #[test]
@@ -3033,6 +3348,279 @@ mod tests {
             count_calls(&g, is_map_ctor_target),
             0,
             "Range::map residual must be gone"
+        );
+    }
+
+    fn iterator_any_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["slice", "iter", "Iter", "any"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    /// Production `trait_default_call_segments` spelling of
+    /// `Iterator::any` on `slice::iter::Iter` — the crate-stripped path
+    /// plus the impl-identity segment Charon records.
+    fn iterator_any_production_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: [
+                "slice",
+                "iter",
+                "Iter",
+                "<impl core::iter::traits::iterator::Iterator<core::slice::iter::Iter<v0>>>",
+                "any",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    fn iterator_any_site(result_var: Variable) -> IteratorAnySite {
+        IteratorAnySite {
+            result_var,
+            call_once_owner: "test::closure".into(),
+            payload_ty: ValueType::Int,
+            payload_class_root: None,
+            args_tuple_suffix: "<i64>".into(),
+            inner_item_ty: ValueType::Int,
+        }
+    }
+
+    /// `it.any(f)` across two blocks — the Call-terminator shape Charon
+    /// emits for an opaque `Iterator::any`.
+    fn build_iterator_any_two_blocks() -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_iterator_any");
+        let n = g.startblock;
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "some".to_string(),
+                            "container".to_string(),
+                            "make".to_string(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: iter_target(),
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let env = g.push_op_var(n, OpKind::ConstInt(7), true).unwrap();
+        let (a, a_args) = g.create_block_with_arg_vars(2);
+        let it_a = a_args[0].clone();
+        let env_a = a_args[1].clone();
+        let found = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: iterator_any_target(),
+                    args: crate::model::call_args(vec![it_a, env_a]),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(n, a, vec![it.clone(), env.clone()]);
+        g.set_goto(a, b, vec![found.clone()]);
+        (g, found)
+    }
+
+    #[test]
+    fn iterator_any_path_is_recognised() {
+        assert!(is_iterator_any_target(&iterator_any_target()));
+        assert!(is_iterator_any_target(&iterator_any_production_target()));
+        assert!(is_iterator_any_target(&CallTarget::method("any", None)));
+        assert!(!is_iterator_any_target(&map_collect_target()));
+        assert!(!is_iterator_any_target(&iter_target()));
+        assert!(!is_map_collect_target(&iterator_any_target()));
+    }
+
+    /// `xs.iter().any(f)` becomes `next` + `call_mut` + a bool early-exit
+    /// (`SomeList.iter` / `SomeIterator.next`, then the predicate). The
+    /// Opaque `any` residual must not survive, and the inner list
+    /// iterator must be the `next` operand so `front::iter_next` can
+    /// fold it.
+    #[test]
+    fn rewrite_lowers_iterator_any_to_next_call_mut_bool_branch() {
+        let (mut g, found) = build_iterator_any_two_blocks();
+        let nexts = rewire_iterator_any_sites(&mut g, &[iterator_any_site(found)]);
+        assert_eq!(nexts.len(), 1, "the any chain must fold");
+        assert_eq!(
+            count_calls(&g, is_iterator_any_target),
+            0,
+            "Iterator::any residual must be gone"
+        );
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_mut")
+            ),
+            1,
+            "the Some arm calls the closure through call_mut"
+        );
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "next")
+            ),
+            1,
+            "synthesized next on the inner iterator"
+        );
+        // `FnMut::call_mut(&mut env, (x,))` — the receiver is a same_as
+        // of the predicate closure, not of the list iterator.
+        let call_mut_recv = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|space| match &space.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    args,
+                    ..
+                } if name == "call_mut" => args.first().cloned(),
+                _ => None,
+            })
+            .expect("call_mut present");
+        let recv_var = call_mut_recv.into_variable();
+        let env_operand = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|space| match (&space.result, &space.kind) {
+                (Some(res), OpKind::UnaryOp { op, operand, .. })
+                    if op == "same_as" && res == &recv_var =>
+                {
+                    Some(operand.clone())
+                }
+                _ => None,
+            })
+            .expect("call_mut receiver is a same_as reborrow of the env");
+        assert!(
+            !originates_from_iter_op(&g, &env_operand),
+            "call_mut env is the closure, not the list iterator"
+        );
+        let next_arg = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|space| match &space.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    args,
+                    ..
+                } if name == "next" => args.first().cloned(),
+                _ => None,
+            })
+            .expect("synthesized next present");
+        assert!(
+            originates_from_iter_op(&g, &next_arg.into_variable()),
+            "synthesized next runs on the inner list iterator"
+        );
+        let bools: Vec<bool> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::ConstBool(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        assert!(bools.contains(&true), "None/true arms emit ConstBool(true)");
+        assert!(
+            bools.contains(&false),
+            "None/false arms emit ConstBool(false)"
+        );
+        assert!(
+            g.blocks.iter().any(|b| {
+                matches!(b.exitswitch, Some(ExitSwitch::Value(_)))
+                    && b.exits
+                        .iter()
+                        .any(|l| matches!(l.exitcase, Some(ExitCase::Bool(true))))
+                    && b.exits
+                        .iter()
+                        .any(|l| matches!(l.exitcase, Some(ExitCase::Bool(false))))
+            }),
+            "predicate closes with a bool early-exit"
+        );
+        let folded = rewire_next_call_sites(&mut g, &nexts);
+        assert_eq!(folded, 1, "the synthesized next diamond must fold");
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::FunctionPath { segments, .. } if segments == &["__iter_next".to_string()]
+            )),
+            1,
+            "native next op on the inner list iterator"
+        );
+    }
+
+    /// An adapter whose inner iterator is not a list `iter` and not a
+    /// Range stays residual — synthesizing `next` without the
+    /// StopIteration diamond would drop exhaustion. Unrelated `any`
+    /// spelling is unchanged.
+    #[test]
+    fn rewrite_declines_iterator_any_over_non_list_inner() {
+        let mut g = FunctionGraph::new("test_iterator_any_non_list");
+        let n = g.startblock;
+        let foreign = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["foreign".to_string(), "chars".to_string()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let env = g.push_op_var(n, OpKind::ConstInt(7), true).unwrap();
+        let found = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: iterator_any_target(),
+                    args: crate::model::call_args(vec![foreign, env]),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(n, Some(found.clone()));
+        let nexts = rewire_iterator_any_sites(&mut g, &[iterator_any_site(found)]);
+        assert!(nexts.is_empty(), "non-list inner must decline");
+        assert_eq!(
+            count_calls(&g, is_iterator_any_target),
+            1,
+            "Iterator::any residual survives a decline"
         );
     }
 }

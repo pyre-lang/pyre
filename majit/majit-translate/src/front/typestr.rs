@@ -46,6 +46,16 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
     if args.is_empty() { None } else { Some(args) }
 }
 
+/// Peel one `*const ` / `*mut ` / `&mut ` / `&` prefix.
+pub fn peel_pointer_prefix(ty: &str) -> Option<&str> {
+    let t = ty.trim();
+    t.strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+        .or_else(|| t.strip_prefix("&mut "))
+        .or_else(|| t.strip_prefix('&'))
+        .map(str::trim)
+}
+
 /// Index of `sep` at bracket depth 0. Nested `[]` / `<>` / `()` do not split.
 pub fn depth0_sep(spelling: &str, sep: char) -> Option<usize> {
     let mut depth = 0usize;
@@ -147,16 +157,8 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
         return false;
     };
     let mut inner = s.trim();
-    loop {
-        let stripped = inner
-            .strip_prefix("*const ")
-            .or_else(|| inner.strip_prefix("*mut "))
-            .or_else(|| inner.strip_prefix("&mut "))
-            .or_else(|| inner.strip_prefix('&'));
-        match stripped {
-            Some(rest) => inner = rest.trim_start(),
-            None => break,
-        }
+    while let Some(rest) = peel_pointer_prefix(inner) {
+        inner = rest;
     }
     if inner.starts_with('[') && inner.ends_with(']') {
         // Length-prefixed synthetic ARRAY identities. Everything else
@@ -207,16 +209,8 @@ pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::A
         return crate::model::ArrayGcKind::Gc;
     };
     let mut inner = s.trim();
-    loop {
-        let stripped = inner
-            .strip_prefix("*const ")
-            .or_else(|| inner.strip_prefix("*mut "))
-            .or_else(|| inner.strip_prefix("&mut "))
-            .or_else(|| inner.strip_prefix('&'));
-        match stripped {
-            Some(rest) => inner = rest.trim_start(),
-            None => break,
-        }
+    while let Some(rest) = peel_pointer_prefix(inner) {
+        inner = rest;
     }
     let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
     if vec_tail.starts_with("Vec<") {
@@ -230,9 +224,19 @@ pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::A
 mod tests {
     use super::{
         canonical_array_type_id, depth0_sep, fat_box_scalar_array_id, gckind_from_array_type_id,
-        nolength_from_array_type_id,
+        nolength_from_array_type_id, peel_pointer_prefix,
     };
     use crate::model::ArrayGcKind;
+
+    #[test]
+    fn peel_pointer_prefix_strips_one_raw_or_ref_prefix() {
+        assert_eq!(peel_pointer_prefix("*mut T"), Some("T"));
+        assert_eq!(peel_pointer_prefix("*const T"), Some("T"));
+        assert_eq!(peel_pointer_prefix("&mut T"), Some("T"));
+        assert_eq!(peel_pointer_prefix("&T"), Some("T"));
+        assert_eq!(peel_pointer_prefix("T"), None);
+        assert_eq!(peel_pointer_prefix("Box<T>"), None);
+    }
 
     #[test]
     fn fat_box_scalar_slice_uses_the_headerless_vec_identity() {

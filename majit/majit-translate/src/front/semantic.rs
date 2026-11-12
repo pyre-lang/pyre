@@ -921,6 +921,21 @@ impl StructFieldRegistry {
         self.fields.get(key).map(Vec::as_slice)
     }
 
+    /// Registry key [`Self::lookup_fields`] resolved `owner` to.
+    pub(crate) fn resolved_owner_key(&self, owner: &str) -> Option<String> {
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let owner = stripped.as_ref();
+        if self.fields.contains_key(owner) {
+            return Some(owner.to_string());
+        }
+        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
+        if canonical != receiver_leaf && self.fields.contains_key(&canonical) {
+            return Some(canonical);
+        }
+        self.unique_suffix_owner_key(owner).map(str::to_string)
+    }
+
     /// Seed a declared-`Gc` identity from a harvested or fixture name.
     /// Inserts the spelling and its leaf so annotation lookup from either
     /// hits (`note_declared_gc_owner`).

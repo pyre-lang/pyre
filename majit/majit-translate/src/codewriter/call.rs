@@ -5895,14 +5895,29 @@ impl CallControl {
             (array_type_id.clone(), len_offset, ir_type)
         };
         let array_type_id = &array_type_id;
-        // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
-        let elem_name = array_type_id
-            .as_deref()
-            .and_then(|s| extract_element_type_from_str(s).or_else(|| Some(s.to_string())))
-            .as_deref()
-            .map(String::from);
+        // `descr.py get_array_descr`: `isinstance(ARRAY.OF, lltype.Struct)`
+        // is the interned ARRAY's OF when present. Dump-only peels the
+        // TypeDecl path harvest stored on an `[ADT; N]` row.
+        let interned_of_struct = arr.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
+                Some(s._name)
+            }
+            _ => None,
+        });
+        let elem_name = interned_of_struct.clone().or_else(|| {
+            array_type_id.as_deref().and_then(|s| {
+                extract_element_type_from_str(s)
+                    .or_else(|| Some(s.to_string()))
+                    .map(|n| majit_ir::descr::strip_generic_args(&n).into_owned())
+            })
+        });
         let elem_ref = elem_name.as_deref();
-        let is_struct = elem_ref.is_some_and(|n| self.is_known_struct(n));
+        // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
+        // answer (`descr.py get_array_descr`). Dump-only peels the
+        // harvest path; an interned non-Struct OF is not Struct even
+        // when the dump spelling names a field-row owner.
+        let is_struct = interned_of_struct.is_some()
+            || (arr.is_none() && elem_ref.is_some_and(|n| self.is_known_struct(n)));
         // descr.py — flag = get_type_flag(ARRAY_INSIDE.OF).
         // descr.py — itemsize from symbolic.get_array_token().
         // descr.py — ArrayDescr(basesize, itemsize, ..., flag).
@@ -6760,7 +6775,21 @@ impl CallControl {
     )> {
         use majit_ir::descr::ArrayFlag;
         let intern_id = array.as_ref().map(|arr| self.intern_array(arr));
-        if let Some(id) = intern_id
+        let interned_of_struct =
+            array
+                .as_ref()
+                .and_then(|arr| match array_of_lltype_identity(&arr.OF) {
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
+                        Some(s._name)
+                    }
+                    _ => None,
+                });
+        // Interned ARRAY.OF Struct is `cpu.arraydescrof(ARRAY)` identity.
+        // An interned pointer-item ARRAY sharing a dump STRUCT spelling
+        // must not reuse that intern id (`descr.py` `isinstance(ARRAY.OF,
+        // lltype.Struct)`).
+        if interned_of_struct.is_some()
+            && let Some(id) = intern_id
             && let Some(cached) = self
                 .interiorfield_descrs
                 .borrow()
@@ -6789,13 +6818,17 @@ impl CallControl {
             }
             (None, None) => return None,
         };
-        // ARRAY.OF.fieldname — extract the element type from the
-        // container type, then look up field info in `self.struct_fields`.
-        let elem_name =
-            extract_element_type_from_str(array_str).or_else(|| Some(array_str.to_string()))?;
-        // Validate the element is a known struct (`consider_array(ARRAY)`
-        // filter at `effectinfo.py`).
-        if !self.is_known_struct(&elem_name) {
+        // ARRAY.OF.fieldname — interned OF is the TypeDecl path harvest
+        // stored on the `[ADT; N]` row. Dump-only peels that path from
+        // the container spelling (`consider_array(ARRAY)`).
+        let elem_name = if let Some(name) = interned_of_struct.clone() {
+            name
+        } else {
+            let raw =
+                extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
+            majit_ir::descr::strip_generic_args(&raw).into_owned()
+        };
+        if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
         }
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
@@ -6940,8 +6973,16 @@ impl CallControl {
                 // keys the cache on the atid alone.
                 let base_size =
                     self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
-                let interned_atid = if let Some(id) = intern_id {
-                    array_type_id_of_lltype(&self.interned_array(id))
+                // Interned ARRAY.OF Struct is the ARRAY identity
+                // (`descr.py get_array_descr`). A pointer-item interned
+                // ARRAY must not publish InteriorField under that ARRAY's
+                // identity; the dump harvest path is the STRUCT ARRAY.
+                let interned_atid = if interned_of_struct.is_some() {
+                    if let Some(id) = intern_id {
+                        array_type_id_of_lltype(&self.interned_array(id))
+                    } else {
+                        array_str.to_string()
+                    }
                 } else {
                     array_str.to_string()
                 };
@@ -7020,7 +7061,9 @@ impl CallControl {
                     descr_from_gc
                 };
                 descr.set_index(idx);
-                if let Some(id) = intern_id {
+                if interned_of_struct.is_some()
+                    && let Some(id) = intern_id
+                {
                     self.interiorfield_descrs
                         .borrow_mut()
                         .insert((id, field_name.to_string()), descr.clone());
@@ -18034,6 +18077,46 @@ mod tests {
         assert_eq!(layout.size, 8);
     }
 
+    /// A pointer-typed field of a known struct pointee is FLAG_POINTER /
+    /// word-size (`descr.py` `get_type_flag` of a Ptr). The by-value
+    /// spelling of the same pointee stays FLAG_STRUCT with the listed size.
+    #[test]
+    fn from_type_strings_pointer_field_of_known_struct_pointee_is_flag_pointer_word() {
+        use majit_ir::descr::ArrayFlag;
+
+        let pointee = "ctypeobj::W".to_string();
+        let mut known = std::collections::HashSet::new();
+        known.insert(pointee.clone());
+        let sizes = std::collections::HashMap::from([(pointee.clone(), 200)]);
+        let aligns = std::collections::HashMap::from([(pointee.clone(), 8)]);
+        let empty_ranks = std::collections::HashMap::new();
+        let empty_raw = HashSet::new();
+        let word = crate::layout::target_word_size();
+        let layout = StructLayout::from_type_strings(
+            &[("__pos_0".into(), format!("*mut {pointee}"))],
+            &known,
+            &sizes,
+            &aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "__pos_0");
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(layout.fields[0].size, word);
+
+        let by_value = StructLayout::from_type_strings(
+            &[("__pos_0".into(), pointee)],
+            &known,
+            &sizes,
+            &aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        assert_eq!(by_value.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(by_value.fields[0].size, 200);
+    }
+
     /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential
     /// layout then places `must_advance` at 41 for an 8-byte `string`.
     #[test]
@@ -18737,6 +18820,152 @@ mod tests {
             .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
             .expect("float interiorfield");
         assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
+    }
+
+    /// Harvest stores `[module::Item; N]`. ARRAY.OF is that TypeDecl path,
+    /// so `get_array_descr` is FLAG_STRUCT even when the leaf is not in
+    /// `known_struct_names` (`descr.py` `isinstance(ARRAY.OF, lltype.Struct)`).
+    #[test]
+    fn arraydescrof_interned_struct_is_flag_struct_without_leaf_name() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["storage::Slot".to_string()].into_iter().collect());
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "storage::Slot".to_string(),
+            vec![("v".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        let array = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "storage::Slot",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let dump = Some("GcArray<Slot>".to_string());
+        let descr = cc.arraydescrof_for_op(
+            &crate::model::ValueType::Ref(None),
+            &dump,
+            &Some(array.clone()),
+            majit_ir::value::Type::Ref,
+            Some(0),
+        );
+        let array_descr = descr
+            .as_array_descr()
+            .expect("arraydescrof of interned STRUCT ARRAY");
+        assert!(
+            array_descr.is_array_of_structs(),
+            "interned ARRAY.OF Struct must be FLAG_STRUCT"
+        );
+        cc.interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+            .expect("interiorfield of interned STRUCT ARRAY");
+    }
+
+    /// Dump-only of the interned identity `GcArray<{OF._name}>` first.
+    /// Harvest puts that TypeDecl path in `known_struct_names`; dump
+    /// FLAG_STRUCT is `isinstance(ARRAY.OF, lltype.Struct)`, not a
+    /// field-row hit. A later interned InteriorField must not HIT a
+    /// POINTER slot.
+    #[test]
+    fn arraydescrof_dump_only_first_of_interned_struct_identity_is_flag_struct() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["storage::Slot".to_string()].into_iter().collect());
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "storage::Slot".to_string(),
+            vec![("v".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        let dump = Some("GcArray<storage::Slot>".to_string());
+        let dump_descr = cc.arraydescrof_for_type(
+            &crate::model::ValueType::Ref(None),
+            &dump,
+            majit_ir::value::Type::Ref,
+            Some(0),
+        );
+        let dump_array = dump_descr.as_array_descr().expect("dump-only arraydescrof");
+        assert!(
+            dump_array.is_array_of_structs(),
+            "dump-only of interned STRUCT identity must be FLAG_STRUCT"
+        );
+        let array = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "storage::Slot",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let interned = cc.arraydescrof_for_op(
+            &crate::model::ValueType::Ref(None),
+            &dump,
+            &Some(array.clone()),
+            majit_ir::value::Type::Ref,
+            Some(0),
+        );
+        assert!(
+            interned
+                .as_array_descr()
+                .expect("interned arraydescrof")
+                .is_array_of_structs()
+        );
+        let ifd = cc
+            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+            .expect("interiorfield of interned STRUCT ARRAY");
+        assert!(
+            ifd.as_interior_field_descr()
+                .expect("InteriorFieldDescr")
+                .array_descr()
+                .is_array_of_structs()
+        );
+    }
+
+    /// Interned ARRAY.OF is a GC pointer. InteriorField of a dump STRUCT
+    /// identity must mint FLAG_STRUCT under the dump ARRAY, not under the
+    /// interned pointer ARRAY (`descr.py` `isinstance(ARRAY.OF, lltype.Struct)`).
+    #[test]
+    fn interiorfielddescrof_struct_dump_does_not_use_interned_pointer_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "storage::Slot".to_string(),
+            vec![("v".to_string(), "i64".to_string())],
+        );
+        cc.set_known_struct_names(["storage::Slot".to_string()].into_iter().collect());
+        cc.set_struct_fields(registry);
+        let array = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let dump = Some("GcArray<storage::Slot>".to_string());
+        let descr = cc.arraydescrof_for_op(
+            &crate::model::ValueType::Ref(None),
+            &dump,
+            &Some(array.clone()),
+            majit_ir::value::Type::Ref,
+            Some(0),
+        );
+        assert!(
+            !descr
+                .as_array_descr()
+                .expect("interned pointer arraydescrof")
+                .is_array_of_structs(),
+            "interned ARRAY.OF Ptr must not be FLAG_STRUCT"
+        );
+        let ifd = cc
+            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+            .expect("dump STRUCT InteriorField");
+        assert!(
+            ifd.as_interior_field_descr()
+                .expect("InteriorFieldDescr")
+                .array_descr()
+                .is_array_of_structs(),
+            "dump STRUCT InteriorField must not reuse the interned Ptr ARRAY descr"
+        );
+        assert!(
+            !descr
+                .as_array_descr()
+                .expect("interned pointer arraydescrof after InteriorField")
+                .is_array_of_structs(),
+            "interned Ptr ARRAY descr must stay POINTER"
+        );
     }
 
     /// `descr.py get_type_flag`: a Ptr whose TO._gckind == 'raw' is

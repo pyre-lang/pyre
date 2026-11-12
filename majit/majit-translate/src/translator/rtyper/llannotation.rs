@@ -30,7 +30,7 @@ use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeAddress, SomeBool, SomeBuiltinMethod, SomeChar, SomeFloat,
     SomeInstance, SomeInteger, SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeRustVec,
-    SomeSingleFloat, SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none,
+    SomeSingleFloat, SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none, s_str0,
 };
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
@@ -269,10 +269,7 @@ impl SomePtr {
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => match example.getattr(attr) {
-                Ok(v) => {
-                    let s = ll_to_annotation(v);
-                    Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
-                }
+                Ok(v) => Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v))),
                 // A raw-pointer `p.is_null()` whose receiver keeps its
                 // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
                 // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
@@ -408,9 +405,7 @@ impl SomePtr {
 /// `ll_to_annotation` of `Ptr(GcStruct)` of a class); `rclass.OBJECTPTR`
 /// is the root instance. `GCREF` stays `SomePtr`.
 fn ll_fn_ptr_result_annotation(s: SomeValue) -> SomeValue {
-    if let Some(inst) = gc_class_root_ptr_as_instance(&s) {
-        return inst;
-    }
+    let s = highlevel_of_ptr_field_annotation(s);
     if let SomeValue::Ptr(p) = &s {
         let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
         if ty == *crate::translator::rtyper::rclass::OBJECTPTR {
@@ -436,6 +431,50 @@ fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
     match &p.TO {
         lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
         lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
+        _ => false,
+    }
+}
+
+/// `ll_to_annotation` of a pointer field, then the high-level annotation
+/// `project_struct_field_type` gives the same spelling: `rstr.STRPTR` is
+/// nullable SomeString, a registered class-root `Ptr(GcStruct)` is the
+/// nullable instance. `llannotation.py` `lltype_to_annotation` of `Ptr`
+/// is SomePtr; the conversion is the same Rust adaptation as
+/// [`gc_class_root_ptr_as_instance`].
+fn highlevel_of_ptr_field_annotation(s: SomeValue) -> SomeValue {
+    if let Some(s_str) = strptr_as_somestring(&s) {
+        return s_str;
+    }
+    gc_class_root_ptr_as_instance(&s).unwrap_or(s)
+}
+
+/// A field whose lltype is `rstr.STRPTR` (`Ptr(GcStruct('rpy_string'))`)
+/// reads as nullable SomeString. `project_struct_field_type` of
+/// `*mut Utf8Str` / `*mut BytesBlock` is that annotation; wrap
+/// (`BytesDictStrategy.wrap` / `newbytes`) takes the STR, not a W_Root.
+fn strptr_as_somestring(s: &SomeValue) -> Option<SomeValue> {
+    let SomeValue::Ptr(p) = s else {
+        return None;
+    };
+    let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
+    if !lltype_is_strptr(&ty) {
+        return None;
+    }
+    s_str0().noneify().ok()
+}
+
+fn lltype_is_strptr(ty: &lltype::LowLevelType) -> bool {
+    if ty == &*crate::translator::rtyper::lltypesystem::rstr::STRPTR {
+        return true;
+    }
+    let lltype::LowLevelType::Ptr(p) = ty else {
+        return false;
+    };
+    match &p.TO {
+        lltype::PtrTarget::Struct(st) => st._name == "rpy_string",
+        lltype::PtrTarget::ForwardReference(fwd) => fwd.resolved().is_some_and(|resolved| {
+            matches!(resolved, lltype::LowLevelType::Struct(st) if st._name == "rpy_string")
+        }),
         _ => false,
     }
 }
@@ -624,7 +663,7 @@ impl SomeInteriorPtr {
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => {
                 let v = example.getattr(attr).map_err(AnnotatorError::new)?;
-                Ok(ll_to_annotation(v))
+                Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
             }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
@@ -1465,5 +1504,81 @@ mod tests {
             terminator.getattr(&attr("other")).unwrap(),
             SomeValue::Ptr(_)
         ));
+    }
+
+    /// An ENTRY-shaped raw struct whose `key` field is `rstr.STRPTR`
+    /// reads as nullable SomeString (`project_struct_field_type` of
+    /// `*mut Utf8Str`). A neighbouring OBJECTPTR field is not String.
+    #[test]
+    fn raw_struct_strptr_field_reads_as_somestring() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _pos = bk.at_position(None);
+
+        let entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![
+                    ("key".into(), STRPTR.clone()),
+                    ("value".into(), OBJECTPTR.clone()),
+                ],
+            )),
+        });
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+
+        let SomeValue::String(key) = entry.getattr(&attr("key")).unwrap() else {
+            panic!("STRPTR key must read as SomeString");
+        };
+        assert!(key.inner.can_be_none, "a STR pointer can be NULL");
+
+        let value = entry.getattr(&attr("value")).unwrap();
+        assert!(
+            !matches!(value, SomeValue::String(_)),
+            "OBJECTPTR value must not read as SomeString, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn interior_ptr_strptr_field_reads_as_somestring() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _pos = bk.at_position(None);
+
+        let entry = lltype::Struct::new(
+            "Entry",
+            vec![
+                ("key".into(), STRPTR.clone()),
+                ("value".into(), OBJECTPTR.clone()),
+            ],
+        );
+        let interior = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(entry.clone()))),
+            TO: Box::new(lltype::LowLevelType::Struct(Box::new(entry))),
+            offsets: vec![],
+        });
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+
+        let SomeValue::String(key) = interior.getattr(&attr("key")).unwrap() else {
+            panic!("interior STRPTR key must read as SomeString");
+        };
+        assert!(key.inner.can_be_none);
+
+        let value = interior.getattr(&attr("value")).unwrap();
+        assert!(
+            !matches!(value, SomeValue::String(_)),
+            "interior OBJECTPTR value must not read as SomeString, got {value:?}"
+        );
     }
 }

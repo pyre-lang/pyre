@@ -2096,6 +2096,62 @@ pub fn rtype_longlong2float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
     ))
 }
 
+/// `rgc.py` `AddMemoryPressureEntry.specialize_call`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     v_size = hop.inputarg(lltype.Signed, 0)
+///     if len(hop.args_v) == 2:
+///         v_obj = hop.inputarg(hop.args_r[1], 1)
+///         args = [v_size, v_obj]
+///     else:
+///         args = [v_size]
+///     hop.exception_cannot_occur()
+///     return hop.genop('gc_add_memory_pressure', args,
+///                      resulttype=lltype.Void)
+/// ```
+pub(super) fn rtype_add_memory_pressure(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let v_size = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?;
+    let mut args = vec![v_size];
+    match hop.nb_args() {
+        1 => {}
+        2 => {
+            let r_obj = hop
+                .args_r
+                .borrow()
+                .get(1)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "rtype_add_memory_pressure: object repr missing (rgc.py \
+                         AddMemoryPressureEntry.specialize_call hop.args_r[1])"
+                            .to_string(),
+                    )
+                })?;
+            args.push(hop.inputarg(&r_obj, 1)?);
+        }
+        n => {
+            return Err(TyperError::message(format!(
+                "rtype_add_memory_pressure: expected 1 or 2 args, got {n}"
+            )));
+        }
+    }
+    hop.exception_cannot_occur()?;
+    // `s_None` annotation: `genop(..., resulttype=lltype.Void)` returns
+    // the Void Variable (`AddMemoryPressureEntry.specialize_call`).
+    Ok(hop.genop(
+        "gc_add_memory_pressure",
+        args,
+        GenopResult::LLType(LowLevelType::Void),
+    ))
+}
+
 /// `@typer_for(pyre_object.lltype.malloc_raw)` — residual external
 /// lowering of the raw (non-GC) typed allocation intrinsic
 /// `malloc_raw::<T>(value: T) -> *mut T` (`malloc_raw_alloc` annotator
@@ -7975,6 +8031,104 @@ mod tests {
         // nb_args = 0 → should err.
         let err = rtype_builtin_bool(&hop, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("rtype_builtin_bool"));
+    }
+
+    /// `rgc.py` `AddMemoryPressureEntry.specialize_call` genops
+    /// `gc_add_memory_pressure` with a Signed size and the object arg,
+    /// result Void.
+    #[test]
+    fn rtype_add_memory_pressure_emits_gc_add_memory_pressure_void_llop() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let hop = dummy_hop();
+        let size = Variable::named("v_size");
+        size.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(size));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        let signed_repr: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
+        hop.args_r.borrow_mut().push(Some(signed_repr.clone()));
+
+        let obj = Variable::named("v_obj");
+        obj.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(obj));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(signed_repr));
+
+        let result = rtype_add_memory_pressure(&hop, &HashMap::new())
+            .unwrap()
+            .expect("s_None specialize_call must return its Void Variable");
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("gc_add_memory_pressure is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "gc_add_memory_pressure");
+        assert_eq!(last.args.len(), 2, "specialize_call emits [v_size, v_obj]");
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("size must stay a Signed Variable, got {other:?}"),
+        }
+        match &last.args[1] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("object must keep its source repr, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("result must be a Void Variable, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "the typer must declare that add_memory_pressure cannot raise",
+        );
+    }
+
+    #[test]
+    fn rtype_add_memory_pressure_one_arg_omits_object() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let hop = dummy_hop();
+        let size = Variable::named("v_size");
+        size.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(size));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        let signed_repr: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
+        hop.args_r.borrow_mut().push(Some(signed_repr));
+
+        rtype_add_memory_pressure(&hop, &HashMap::new())
+            .unwrap()
+            .expect("one-arg specialize_call still returns Void");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("gc_add_memory_pressure is emitted");
+        assert_eq!(last.opname, "gc_add_memory_pressure");
+        assert_eq!(last.args.len(), 1, "object=None form is [v_size] only");
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("result must be a Void Variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findbltintyper_resolves_add_memory_pressure_from_extregistry() {
+        let host = HOST_ENV
+            .import_module(crate::runtime_names::modules::GC)
+            .and_then(|m| m.module_get("add_memory_pressure"))
+            .expect("HOST_ENV missing majit_gc.add_memory_pressure");
+        assert_findbltintyper(
+            host,
+            rtype_add_memory_pressure,
+            "majit_gc.add_memory_pressure",
+        );
     }
 
     /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`

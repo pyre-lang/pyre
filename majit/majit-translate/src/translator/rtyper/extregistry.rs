@@ -279,6 +279,11 @@ pub enum ExtRegistryEntry {
     /// spells them in source, so specialize_call is the
     /// `EntryNonConstant` identity (`return hop.inputarg(arg=0)`).
     GcRootReload,
+    /// `rpython/rlib/rgc.py` `class AddMemoryPressureEntry(ExtRegistryEntry):
+    /// _about_ = add_memory_pressure`. Keyed on the majit-owned rgc API
+    /// `majit_gc::add_memory_pressure`. `compute_result_annotation` returns
+    /// `s_None`; `specialize_call` genops `gc_add_memory_pressure`.
+    AddMemoryPressure,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -408,6 +413,8 @@ pub enum ExtRegistryEntryKey {
     HintFreshVirtualizable,
     HintNoAccessDirectly,
     GcRootReload,
+    /// Singleton key for `rgc.py` `AddMemoryPressureEntry`.
+    AddMemoryPressure,
 }
 
 impl ExtRegistryEntry {
@@ -465,6 +472,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::HintFreshVirtualizable => ExtRegistryEntryKey::HintFreshVirtualizable,
             ExtRegistryEntry::HintNoAccessDirectly => ExtRegistryEntryKey::HintNoAccessDirectly,
             ExtRegistryEntry::GcRootReload => ExtRegistryEntryKey::GcRootReload,
+            ExtRegistryEntry::AddMemoryPressure => ExtRegistryEntryKey::AddMemoryPressure,
         }
     }
 
@@ -675,6 +683,15 @@ impl ExtRegistryEntry {
                 None,
                 Some("reload_top_root".to_string()),
             ))),
+            // `AddMemoryPressureEntry` inherits the base
+            // `compute_annotation` (`SomeBuiltin(compute_result_annotation)`).
+            // The call-time result is `s_None`
+            // (`compute_annotation_with_kwds`).
+            ExtRegistryEntry::AddMemoryPressure => Ok(SomeValue::Builtin(SomeBuiltin::new(
+                crate::runtime_names::modules::ADD_MEMORY_PRESSURE,
+                None,
+                Some("add_memory_pressure".to_string()),
+            ))),
         }
     }
 
@@ -708,6 +725,11 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
             ExtRegistryEntry::JitForceVirtualizable => Ok(s_none()),
             ExtRegistryEntry::JitForceQuasiImmutable => Ok(s_none()),
+            // `rgc.py` `AddMemoryPressureEntry.compute_result_annotation`
+            // returns `annmodel.s_None`. Recording
+            // `bookkeeper.memory_pressure_types` needs the bookkeeper field,
+            // which this port does not have.
+            ExtRegistryEntry::AddMemoryPressure => Ok(s_none()),
             // `ForTypeEntry.compute_result_annotation(self, *args_s,
             // **kwds_s)` returns `SomeInteger(knowntype=int_type)`.
             // Signedness is derived inside `new_with_knowntype`
@@ -845,6 +867,11 @@ impl ExtRegistryEntry {
             // gctransform insert after rtype: identity of the root.
             ExtRegistryEntry::GcRootReload => {
                 Ok(super::rbuiltin::rtype_non_constant as BuiltinTyperFn)
+            }
+            // `rgc.py` `AddMemoryPressureEntry.specialize_call` —
+            // `hop.genop('gc_add_memory_pressure', [v_size(, v_obj)], Void)`.
+            ExtRegistryEntry::AddMemoryPressure => {
+                Ok(super::rbuiltin::rtype_add_memory_pressure as BuiltinTyperFn)
             }
         }
     }
@@ -1185,6 +1212,11 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     ) {
         return Some(ExtRegistryEntry::GcRootReload);
     }
+    // `rgc.py` `AddMemoryPressureEntry._about_ = add_memory_pressure`.
+    // The majit-owned rgc API is `majit_gc::add_memory_pressure`.
+    if host.qualname() == crate::runtime_names::modules::ADD_MEMORY_PRESSURE {
+        return Some(ExtRegistryEntry::AddMemoryPressure);
+    }
     // `BigInt.from` residual external — keyed by the qualname the
     // `BigInt.from` `BUILTIN_ANALYZERS` annotation entry uses, so the
     // rtyper's `findbltintyper` → `extregistry.lookup` resolves the same
@@ -1462,6 +1494,42 @@ mod tests {
         assert!(matches!(
             entry.compute_annotation_with_kwds(&bookkeeper, &std::collections::HashMap::new()),
             Ok(SomeValue::None_(_))
+        ));
+    }
+
+    /// `rgc.py` `AddMemoryPressureEntry._about_ = add_memory_pressure`.
+    /// Keyed on `majit_gc.add_memory_pressure`; `specialize_call` is
+    /// `rtype_add_memory_pressure`; the call annotates `s_None`.
+    #[test]
+    fn add_memory_pressure_resolves_specialize_call() {
+        let host =
+            HostObject::new_builtin_callable(crate::runtime_names::modules::ADD_MEMORY_PRESSURE);
+        let cv = ConstValue::HostObject(host);
+        assert!(is_registered(&cv));
+        let entry = lookup(&cv).expect("add_memory_pressure must surface an entry");
+        assert!(matches!(entry, ExtRegistryEntry::AddMemoryPressure));
+        assert!(entry.specialize_call().is_ok());
+        let bookkeeper = Rc::new(Bookkeeper::new());
+        assert!(matches!(
+            entry.compute_annotation_with_kwds(&bookkeeper, &std::collections::HashMap::new()),
+            Ok(SomeValue::None_(_))
+        ));
+        assert!(matches!(
+            entry.compute_annotation(),
+            Ok(SomeValue::Builtin(_))
+        ));
+        let env_host = crate::flowspace::model::host_env_callable(&[
+            "majit_gc".into(),
+            "add_memory_pressure".into(),
+        ])
+        .expect("HOST_ENV majit_gc.add_memory_pressure");
+        assert_eq!(
+            env_host.qualname(),
+            crate::runtime_names::modules::ADD_MEMORY_PRESSURE
+        );
+        assert!(matches!(
+            lookup(&ConstValue::HostObject(env_host)),
+            Some(ExtRegistryEntry::AddMemoryPressure)
         ));
     }
 

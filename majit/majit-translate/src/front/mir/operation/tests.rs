@@ -305,23 +305,29 @@ fn restore_offset_pointer_type_recasts_ccharp_to_entry_ptr() {
     );
 }
 
-#[test]
-fn emit_cast_int_to_strptr_is_two_arg_strptr() {
-    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+fn emit_cast_int_to_strptr_graph(
+    dest_root: Option<&str>,
+) -> (
+    FunctionGraph,
+    crate::model::BlockId,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+) {
     let mut graph = FunctionGraph::new("test");
     let bb = graph.startblock;
     let addr = graph
         .push_op_var(bb, OpKind::ConstInt(0x1000), true)
         .expect("address word");
-    let raw = super::emit_cast_int_to_strptr(&mut graph, bb, addr.clone());
-    assert_eq!(
-        raw.concretetype().as_ref(),
-        Some(&*STRPTR),
-        "result is Ptr(STR)"
-    );
-    let op = graph
-        .block(bb)
-        .operations
+    let result = super::emit_cast_int_to_strptr(&mut graph, bb, addr.clone(), dest_root);
+    (graph, bb, addr, result)
+}
+
+fn two_arg_strptr_raw<'a>(
+    ops: &'a [crate::model::SpaceOperation],
+    addr: &crate::flowspace::model::Variable,
+) -> &'a crate::flowspace::model::Variable {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let op = ops
         .iter()
         .find(|op| match &op.kind {
             OpKind::Call {
@@ -331,11 +337,19 @@ fn emit_cast_int_to_strptr_is_two_arg_strptr() {
             _ => false,
         })
         .expect("cast_int_to_ptr");
+    let raw = op
+        .result
+        .as_ref()
+        .expect("cast_int_to_ptr produces a result");
+    assert_eq!(
+        raw.concretetype().as_ref(),
+        Some(&*STRPTR),
+        "cast_int_to_ptr result is Ptr(STR)"
+    );
     match &op.kind {
         OpKind::Call {
             args, result_ty, ..
         } => {
-            assert_eq!(op.result.as_ref(), Some(&raw));
             assert_eq!(*result_ty, ValueType::Str);
             assert_eq!(
                 args.len(),
@@ -354,9 +368,77 @@ fn emit_cast_int_to_strptr_is_two_arg_strptr() {
                 "PTRTYPE is Ptr(STR), got {:?}",
                 args[0]
             );
-            assert_eq!(args[1], crate::model::LinkArg::Value(addr));
+            assert_eq!(args[1], crate::model::LinkArg::Value(addr.clone()));
         }
         other => panic!("expected cast_int_to_ptr call, got {other:?}"),
+    }
+    raw
+}
+
+#[test]
+fn emit_cast_int_to_strptr_is_two_arg_strptr() {
+    let dest_root = "unicodeobject::Utf8Str";
+    let (graph, bb, addr, restored) = emit_cast_int_to_strptr_graph(Some(dest_root));
+    let ops = &graph.block(bb).operations;
+    let raw = two_arg_strptr_raw(ops, &addr);
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, raw).is_some())
+        .unwrap_or_else(|| panic!("dest-Str restore after cast_int_to_ptr; ops={ops:?}"));
+    assert_eq!(recast.result.as_ref(), Some(&restored));
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(*result_ty, ValueType::Str);
+        }
+        other => panic!("dest-Str restore is a Call, got {other:?}"),
+    }
+    assert_eq!(
+        crate::model::cast_instance_root(&recast.kind),
+        Some(dest_root),
+        "dest-Str restore root is the destination rstr layout"
+    );
+}
+
+#[test]
+fn emit_cast_int_to_strptr_restores_non_utf8str_rstr_root() {
+    for dest_root in [
+        "bytesobject::BytesBlock",
+        "unicodeobject::UnicodeValueStorage",
+        "lowlevel_string::LowlevelStringHeader",
+    ] {
+        let (graph, bb, addr, restored) = emit_cast_int_to_strptr_graph(Some(dest_root));
+        let ops = &graph.block(bb).operations;
+        let raw = two_arg_strptr_raw(ops, &addr);
+        let recast = ops
+            .iter()
+            .find(|op| crate::model::cast_instance_of(&op.kind, raw).is_some())
+            .unwrap_or_else(|| {
+                panic!("dest-Str restore after cast_int_to_ptr for {dest_root}; ops={ops:?}")
+            });
+        assert_eq!(recast.result.as_ref(), Some(&restored));
+        assert_eq!(
+            crate::model::cast_instance_root(&recast.kind),
+            Some(dest_root),
+            "non-Utf8Str rstr dest keeps its own restore root"
+        );
+    }
+}
+
+#[test]
+fn emit_cast_int_to_strptr_skips_restore_without_rstr_root() {
+    for dest_root in [None, Some("pyobject::PyObject")] {
+        let (graph, bb, addr, result) = emit_cast_int_to_strptr_graph(dest_root);
+        let ops = &graph.block(bb).operations;
+        let raw = two_arg_strptr_raw(ops, &addr);
+        assert_eq!(
+            &result, raw,
+            "plain cast_int_to_ptr result when dest has no rstr layout"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| crate::model::cast_instance_of(&op.kind, raw).is_none()),
+            "no dest-Str restore without an rstr dest root; ops={ops:?}"
+        );
     }
 }
 

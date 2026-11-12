@@ -8778,10 +8778,14 @@ mod tests {
     }
 
     #[test]
-    fn derive_subject_inputcells_seeds_suffixed_gc_entries_as_list() {
+    fn derive_subject_inputcells_seeds_suffixed_gc_entries_as_gcarray_ptr() {
         // Harvest registers the unsuffixed template; Input class_root
         // is `GcEntries<K,V>`. `known` is false (only Entry is the
-        // split-struct exception); `_arrayfld` still seeds SomeList.
+        // split-struct exception). A struct ITEM is
+        // `DICTENTRYARRAY = GcArray(DICTENTRY)` (`rordereddict.py`),
+        // so Input seeds SomePtr like TypedItemsBlock.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
         let registry_key = "rordereddict_entries::GcEntries";
         let class_root = "rordereddict_entries::GcEntries<StrKey, PyObject>";
         let mut graph = LegacyGraph::new("entries_allocated_len");
@@ -8821,15 +8825,33 @@ mod tests {
             ],
         );
         fields.note_declared_gc_name(registry_key);
+        fields.class_identity.insert(
+            "PyObject".to_string(),
+            Some(crate::front::semantic::ClassIdentity {
+                id: majit_ir::descr::StructId::from_canonical("PyObject"),
+                spelling: "PyObject".to_string(),
+            }),
+        );
         bk.set_struct_fields(Rc::new(fields));
 
         let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("suffixed GcEntries input must seed");
-        assert!(
-            matches!(cells[0], SomeValue::List(_)),
-            "suffixed GcEntries must seed SomeList, got {:?}",
-            cells[0]
-        );
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!(
+                "suffixed GcEntries must seed SomePtr(GcArray(ENTRY)), got {:?}",
+                cells[0]
+            );
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Array(arr) => match &arr.OF {
+                LowLevelType::Struct(st) => assert!(
+                    st.getattr_field_type("f_valid").is_some(),
+                    "suffixed GcEntries ITEM STRUCT must have f_valid"
+                ),
+                other => panic!("suffixed GcEntries ITEM must be STRUCT, got {other:?}"),
+            },
+            other => panic!("suffixed GcEntries must be Ptr(GcArray), got {other:?}"),
+        }
     }
 
     #[test]

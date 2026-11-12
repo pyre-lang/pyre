@@ -1195,6 +1195,60 @@ fn enumerate_slice_iter_next_records_the_list_item() {
     assert_eq!(peeled, Some(ValueType::Int));
 }
 
+/// Opaque `core::cell::Ref` / `RefMut` / `RefCell` type as generic 0.
+/// RPython has no RefCell; the borrow flag has no lltype counterpart.
+#[test]
+fn std_cell_ref_wrappers_type_as_generic0() {
+    let llbc = llbc_with_types(
+        "core",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "Ref"]),
+            opaque_type_decl(1, &["core", "cell", "RefMut"]),
+            opaque_type_decl(2, &["core", "cell", "RefCell"]),
+            type_decl_struct(3, &["alloc", "vec", "Vec"], vec![]),
+            opaque_type_decl(4, &["my_crate", "cell", "Ref"]),
+        ],
+        vec![],
+    );
+    let i64 = i64_ty();
+    let vec_i64 = named_adt(3, vec![i64.clone()]);
+    let ref_i64 = TyRef::Other(named_adt(0, vec![i64.clone()]));
+    assert_eq!(
+        tyref_to_value_type(&ref_i64, &llbc),
+        ValueType::Int,
+        "Ref<i64> occupies i64's bank"
+    );
+    let refmut_i64 = TyRef::Other(named_adt(1, vec![i64.clone()]));
+    assert_eq!(tyref_to_value_type(&refmut_i64, &llbc), ValueType::Int);
+    let refcell_i64 = TyRef::Other(named_adt(2, vec![i64.clone()]));
+    assert_eq!(tyref_to_value_type(&refcell_i64, &llbc), ValueType::Int);
+
+    let ref_vec = TyRef::Other(named_adt(0, vec![vec_i64.clone()]));
+    assert_eq!(
+        tyref_to_value_type(&ref_vec, &llbc),
+        ValueType::Int,
+        "Ref<Vec<i64>> occupies the RustVec int bank"
+    );
+    let refcell_vec = TyRef::Other(named_adt(2, vec![vec_i64]));
+    assert_eq!(tyref_to_value_type(&refcell_vec, &llbc), ValueType::Int);
+
+    let borrowed_ref = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", named_adt(0, vec![i64.clone()]), "Shared"]
+    }));
+    assert_eq!(
+        tyref_to_value_type(&borrowed_ref, &llbc),
+        ValueType::Int,
+        "&Ref<i64> peels to the same bank as Ref<i64>"
+    );
+
+    let user = TyRef::Other(named_adt(4, vec![i64]));
+    assert_eq!(
+        tyref_to_value_type(&user, &llbc),
+        ValueType::Ref(None),
+        "a user cell::Ref is not the std wrapper"
+    );
+}
+
 #[test]
 fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
     let llbc = fixture_llbc();
@@ -1412,6 +1466,59 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
         matches!(ptr_ty.TO, PtrTarget::Func(_)),
         "stamp is Ptr(FuncType)"
     );
+}
+
+#[test]
+fn fn_ptr_str_family_pointer_is_strptr_not_objectptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let utf8 = type_decl_struct(0, &["unicodeobject", "Utf8Str"], vec![]);
+    let inst = type_decl_struct(1, &["owner", "Inst"], vec![]);
+    let other = type_decl_struct(2, &["other", "Utf8Str"], vec![]);
+    let llbc = llbc_with_types("fixture", vec![utf8, inst, other], vec![]);
+    let raw = |id: u64| {
+        serde_json::json!({
+            "RawPtr": [{"Adt": {"id": id, "generics": empty_generics()}}, "Const"]
+        })
+    };
+    let fnptr = |id: u64| {
+        TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [raw(id)],
+                    "output": {"Tuple": []},
+                    "is_unsafe": false
+                }
+            }
+        }))
+    };
+    let spec = crate::ErrorCarrierSpec::default();
+    let str_ft = super::func_type_from_fn_ptr_ty(&fnptr(0), &llbc, spec).expect("Utf8Str fn-ptr");
+    assert_eq!(
+        str_ft.args,
+        vec![STRPTR.clone()],
+        "FUNC.ARGS of *const unicodeobject::Utf8Str is STRPTR; ast={}",
+        super::tyref_to_ast_string(&TyRef::Other(raw(0)), &llbc)
+    );
+    let inst_ft = super::func_type_from_fn_ptr_ty(&fnptr(1), &llbc, spec).expect("Inst fn-ptr");
+    assert_eq!(inst_ft.args, vec![OBJECTPTR.clone()]);
+    let other_ty = TyRef::Other(raw(2));
+    let other_ft =
+        super::func_type_from_fn_ptr_ty(&fnptr(2), &llbc, spec).expect("other::Utf8Str fn-ptr");
+    assert!(
+        !super::tyref_raw_ptr_pointee_is_string_value(&other_ty, &llbc),
+        "other::Utf8Str is not the STR layout; intern ast={}",
+        super::tyref_to_ast_string(&other_ty, &llbc)
+    );
+    assert_eq!(
+        other_ft.args,
+        vec![OBJECTPTR.clone()],
+        "other::Utf8Str is not the STR layout; intern ast={}",
+        super::tyref_to_ast_string(&other_ty, &llbc)
+    );
+    let str_ty = super::fn_ptr_tyref_to_lltype(&TyRef::Other(raw(0)), &llbc, spec);
+    assert_eq!(str_ty, *STRPTR);
 }
 
 #[test]
@@ -5091,6 +5198,65 @@ fn fixed_array_suffix_separates_item_type_and_length() {
     assert_eq!(tyref_array_suffix(&array(i64_ty, "2"), &llbc), "<i64;2>");
     assert_eq!(tyref_array_suffix(&array(bool_ty, "1"), &llbc), "<bool;1>");
     assert_eq!(shaped_array_parts("Array<[i64;2];3>"), Some(("[i64;2]", 3)));
+}
+
+#[test]
+fn field_row_struct_identity_qualifies_array_of_adt_element() {
+    // `charon_adt_to_ast_string` renders the ADT leaf, so a harvested
+    // `[Entry;0]` would collide with a second TypeDecl of the same leaf.
+    // The array-of-ADT row carries the TypeDecl path, the same way a
+    // by-value ADT field does.
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(0, &["host", "rordereddict_entries", "Entry"], vec![]),
+            type_decl_struct(1, &["host", "counter", "Entry"], vec![]),
+        ],
+        vec![],
+    );
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = TyRef::Other(serde_json::json!({
+        "Array": [
+            named_adt(
+                0,
+                vec![
+                    serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+                    serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+                ],
+            ),
+            array_len,
+            null
+        ]
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let layout = super::tyref_to_field_layout_string(&array_ty, &llbc, &gc, &raw);
+    assert_eq!(layout, "[Entry<??TypeVar#0,??TypeVar#1>;0]");
+    assert_eq!(
+        super::field_row_struct_identity(&array_ty, &llbc, &layout).as_deref(),
+        Some("[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]")
+    );
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let primitive = TyRef::Other(serde_json::json!({
+        "Array": [
+            i64_ty,
+            [
+                {"Integer": {"Unsigned": ["Usize", "0"]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ],
+            null
+        ]
+    }));
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    assert_eq!(primitive_layout, "[i64;0]");
+    assert_eq!(
+        super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
 }
 
 #[test]
@@ -13045,5 +13211,205 @@ fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
         token("f2"),
         Some("ref"),
         "Rust's erased managed-byte pointer is unchanged"
+    );
+}
+
+fn field_row_visited() -> std::collections::HashSet<String> {
+    std::collections::HashSet::new()
+}
+
+fn note_class_identity(reg: &mut crate::front::StructFieldRegistry, spelling: &str) {
+    let id = majit_ir::descr::StructId::from_canonical(spelling);
+    reg.class_identity.insert(
+        spelling.to_string(),
+        Some(crate::front::semantic::ClassIdentity {
+            id,
+            spelling: spelling.to_string(),
+        }),
+    );
+}
+
+fn slot_block_registry(value_ty: &str) -> crate::front::StructFieldRegistry {
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "storage::SlotBlock".to_string(),
+        vec![
+            ("length".to_string(), "usize".to_string()),
+            ("items".to_string(), "[storage::Slot; 0]".to_string()),
+        ],
+    );
+    reg.fields.insert(
+        "storage::Slot".to_string(),
+        vec![
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), value_ty.to_string()),
+        ],
+    );
+    reg.note_declared_gc_name("storage::SlotBlock");
+    reg
+}
+
+#[test]
+fn field_row_classed_pointer_is_objectptr() {
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    note_class_identity(&mut reg, "owner::Inst");
+    let got = super::field_row_lltype(&reg, "*mut owner::Inst", &mut field_row_visited())
+        .expect("classed pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+}
+
+#[test]
+fn field_row_unknown_pointer_declines() {
+    let reg = crate::front::StructFieldRegistry::default();
+    assert!(super::field_row_lltype(&reg, "*mut owner::Inst", &mut field_row_visited()).is_none());
+    assert!(
+        super::field_row_lltype(&reg, "*const owner::Inst", &mut field_row_visited()).is_none()
+    );
+    assert!(super::field_row_lltype(&reg, "&mut owner::Inst", &mut field_row_visited()).is_none());
+}
+
+#[test]
+fn field_row_fat_pointer_declines() {
+    let reg = crate::front::StructFieldRegistry::default();
+    assert!(super::field_row_lltype(&reg, "&[u8]", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "&dyn Trait", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "&str", &mut field_row_visited()).is_none());
+    assert!(super::field_row_lltype(&reg, "*mut [u8]", &mut field_row_visited()).is_none());
+}
+
+#[test]
+fn field_row_scalar_pointer_is_address() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let reg = crate::front::StructFieldRegistry::default();
+    let got = super::field_row_lltype(&reg, "*mut u8", &mut field_row_visited())
+        .expect("scalar pointer field");
+    assert_eq!(got, LowLevelType::Address);
+}
+
+#[test]
+fn field_row_declared_gc_pointer_is_gcref() {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("owner::GcAdt");
+    let got = super::field_row_lltype(&reg, "*mut owner::GcAdt", &mut field_row_visited())
+        .expect("declared-GC pointer field");
+    assert_eq!(got, (*GCREF).clone());
+}
+
+#[test]
+fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("unicodeobject::Utf8Str");
+    note_class_identity(&mut reg, "unicodeobject::Utf8Str");
+    let got = super::field_row_lltype(
+        &reg,
+        "*mut unicodeobject::Utf8Str",
+        &mut field_row_visited(),
+    )
+    .expect("str-family pointer field");
+    assert_eq!(got, *STRPTR);
+    let got = super::field_row_lltype(
+        &reg,
+        "*const bytesobject::BytesBlock",
+        &mut field_row_visited(),
+    )
+    .expect("BytesBlock pointer field");
+    assert_eq!(got, *STRPTR);
+}
+
+#[test]
+fn field_row_raw_word_pointer_is_ptr_struct() {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "host::RawWord".to_string(),
+        vec![("save_point".to_string(), "usize".to_string())],
+    );
+    reg.raw_word_owners.insert("host::RawWord".to_string());
+    let got = super::field_row_lltype(&reg, "*mut host::RawWord", &mut field_row_visited())
+        .expect("raw-word pointer field");
+    match got {
+        LowLevelType::Ptr(p) => match p.TO {
+            PtrTarget::Struct(_) => {}
+            other => panic!("raw-word pointer must be Ptr(Struct), got {other:?}"),
+        },
+        other => panic!("raw-word pointer must be Ptr, got {other:?}"),
+    }
+}
+
+#[test]
+fn struct_item_gcarray_classed_pointer_field_interns_objectptr() {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let mut reg = slot_block_registry("*mut owner::Inst");
+    note_class_identity(&mut reg, "owner::Inst");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("classed pointer ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let PtrTarget::Array(arr) = &ptr.ll_ptrtype.TO else {
+        panic!("must intern Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+    };
+    let LowLevelType::Struct(st) = &arr.OF else {
+        panic!("ITEM must be STRUCT, got {:?}", arr.OF)
+    };
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(OBJECTPTR.clone()),
+        "classed pointer field is the instance pointer"
+    );
+}
+
+#[test]
+fn struct_item_gcarray_str_family_pointer_field_interns_strptr() {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let mut reg = slot_block_registry("*mut unicodeobject::Utf8Str");
+    reg.note_declared_gc_name("unicodeobject::Utf8Str");
+    note_class_identity(&mut reg, "unicodeobject::Utf8Str");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("str-family pointer ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let PtrTarget::Array(arr) = &ptr.ll_ptrtype.TO else {
+        panic!("must intern Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+    };
+    let LowLevelType::Struct(st) = &arr.OF else {
+        panic!("ITEM must be STRUCT, got {:?}", arr.OF)
+    };
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(STRPTR.clone()),
+        "str-family pointer field is STRPTR, not GCREF or OBJECTPTR"
+    );
+}
+
+#[test]
+fn struct_item_gcarray_unknown_pointer_field_declines() {
+    let reg = slot_block_registry("*mut owner::Inst");
+    assert!(
+        super::struct_item_flexible_gcarray_block_annotation(
+            &reg,
+            "storage::SlotBlock",
+            "[storage::Slot; 0]",
+        )
+        .is_none(),
+        "undecidable pointer ITEM field must decline"
     );
 }

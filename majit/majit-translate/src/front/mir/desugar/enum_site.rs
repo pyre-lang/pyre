@@ -2,6 +2,187 @@
 
 use super::*;
 
+/// `PartialEq::eq` / `ne` on a named ADT owner.
+///
+/// `trait_default_call_segments` rewrites a provided `PartialEq::ne` to
+/// `[owner…, leaf]`. The Method spelling carries the same leaf on the
+/// impl owner. Shared by the niche-`Option` fold and the tagged-`Result`
+/// structural derive.
+fn partial_eq_eq_ne_leaf(
+    segments: &[String],
+    method_hint: Option<&(String, String, Option<String>)>,
+    owner_path: &[&str],
+    owner_leaf: &str,
+) -> Option<&'static str> {
+    let from_path = if fmt_path_ends_with_owner_method(
+        segments,
+        owner_path,
+        &["core", "cmp", "PartialEq"],
+        "eq",
+    ) {
+        Some("eq")
+    } else if fmt_path_ends_with_owner_method(
+        segments,
+        owner_path,
+        &["core", "cmp", "PartialEq"],
+        "ne",
+    ) {
+        Some("ne")
+    } else {
+        None
+    };
+    // `CallControl.graphs_from` / `FunctionReprBase.call` call the
+    // function the pointer names. Only `core::cmp::PartialEq`'s
+    // `eq`/`ne` lower through this matcher; an extension trait's
+    // same-named method stays a call.
+    let from_method = method_hint.and_then(|(owner, name, trait_identity)| {
+        let identity = trait_identity.as_ref()?;
+        (owner == owner_leaf
+            && matches!(name.as_str(), "eq" | "ne")
+            && trait_impl_identity_names_trait(
+                &format!("<impl {identity}>"),
+                &["core", "cmp", "PartialEq"],
+            ))
+        .then_some(if name == "ne" { "ne" } else { "eq" })
+    });
+    from_path.or(from_method)
+}
+
+fn diamond_arm_sources(carried: &[Variable], extras: &[Variable]) -> Vec<Variable> {
+    let mut sources = carried.to_vec();
+    for extra in extras {
+        if !sources.contains(extra) {
+            sources.push(extra.clone());
+        }
+    }
+    sources
+}
+
+fn push_block_op(graph: &mut FunctionGraph, block: BlockId, kind: OpKind) -> Variable {
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind,
+    });
+    res
+}
+
+/// How one Result/Option/struct payload compares, decided before the
+/// diamond is built. A payload that cannot be classified makes the
+/// whole `Result` `eq`/`ne` decline (`Ok(false)`), graph untouched.
+#[derive(Clone)]
+enum PayloadEqPlan {
+    /// Fieldless variant: `eq` is True, `ne` is False.
+    NoPayload,
+    String,
+    Scalar,
+    /// Impl FunDecl with an `Unstructured` body (`ClassDesc.lookup`).
+    /// `ne` is PartialEq's provided method (`not eq`) unless the impl
+    /// itself defines `ne` with a body.
+    FunDecl {
+        eq_id: u64,
+        eq_segments: Vec<String>,
+        ne: Option<(u64, Vec<String>)>,
+    },
+    /// `#[derive(PartialEq)]` body is not in the LLBC; the TypeDecl
+    /// fields AND-chain in declaration order. Presence of a
+    /// `StructuralPartialEq` impl is the derive marker.
+    Structural {
+        owner: String,
+        fields: Vec<StructuralFieldPlan>,
+    },
+    /// Nested `Option` (None=0 / Some=1) or `Result` (Ok=0 / Err=1).
+    Tagged {
+        owner: String,
+        arm0_owner: String,
+        arm1_owner: String,
+        arm0_ty: ValueType,
+        arm1_ty: ValueType,
+        arm0_raw_u8: bool,
+        arm1_raw_u8: bool,
+        arm0: Box<PayloadEqPlan>,
+        arm1: Box<PayloadEqPlan>,
+        arm0_has: bool,
+        arm1_has: bool,
+    },
+}
+
+#[derive(Clone)]
+struct StructuralFieldPlan {
+    name: String,
+    ty: ValueType,
+    plan: Box<PayloadEqPlan>,
+}
+
+fn fundecl_path_leaf(fd: &FunDecl) -> Option<&str> {
+    fd.item_meta
+        .name_path_str()
+        .rsplit("::")
+        .next()
+        .filter(|leaf| !leaf.is_empty())
+}
+
+fn emit_eq_false(graph: &mut FunctionGraph, block: BlockId, val: Variable) -> Variable {
+    let f = push_block_op(graph, block, OpKind::ConstBool(false));
+    push_block_op(
+        graph,
+        block,
+        OpKind::BinOp {
+            op: "eq".to_string(),
+            lhs: val,
+            rhs: f,
+            result_ty: ValueType::Int,
+        },
+    )
+}
+
+fn emit_named_field_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    owner: &str,
+    name: &str,
+    ty: ValueType,
+) -> Variable {
+    let field = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(field.clone()),
+        kind: OpKind::FieldRead {
+            base: recv,
+            field: crate::model::FieldDescriptor::new(name, Some(owner.to_string())),
+            ty,
+            pure: true,
+        },
+    });
+    field
+}
+
+fn remap_payload_goto_args(
+    link_args: &[Variable],
+    placeholder: &Variable,
+    produced: &Variable,
+    same_sources: &[Variable],
+    same_inputs: &[Variable],
+    arm_inputs: &[Variable],
+    arm_exit: &[Variable],
+) -> Vec<Variable> {
+    link_args
+        .iter()
+        .map(|v| {
+            if v == placeholder {
+                produced.clone()
+            } else {
+                let mid = crate::front::option_variant::map_source(same_sources, same_inputs, v)
+                    .expect("diamond edge arg carried");
+                let mid = crate::front::option_variant::map_source(same_inputs, arm_inputs, &mid)
+                    .expect("nested diamond edge arg carried");
+                crate::front::option_variant::map_source(arm_inputs, arm_exit, &mid)
+                    .expect("payload-cmp exit arg carried")
+            }
+        })
+        .collect()
+}
+
 impl<'a> Lowering<'a> {
     /// Named fields of a struct lltype, after peeling a borrow. `None`
     /// when the declaration is missing or opaque, so a wrapper call
@@ -458,6 +639,30 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         )
         .is_some()
+    }
+
+    /// Class of a nullable instance-pointer payload (`&mut T`, `*mut T`,
+    /// niche `Option<&mut T>`). An instance pointer keeps that class's
+    /// classdef (`bookkeeper.py` `getuniqueclassdef`; `rclass.py`
+    /// `InstanceRepr`); only an explicit upcast goes to the base
+    /// (`annlowlevel.py` `cast_base_ptr_to_instance`).
+    pub(in crate::front::mir) fn nullable_instance_payload_class_root(
+        &self,
+        payload_ty: &TyRef,
+    ) -> Option<String> {
+        self.option_niche_payload_class_root(payload_ty)
+            .or_else(|| {
+                registered_gc_ptr_class_root_with(
+                    payload_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+            })
+            .or_else(|| {
+                enum_payload_instance_class_root(payload_ty, self.llbc, self.tombstoned_leaves)
+            })
     }
 
     /// Resolve a destination `Option` into its `(option_owner, some_owner,
@@ -2295,38 +2500,9 @@ impl<'a> Lowering<'a> {
         if args.len() != 2 {
             return Ok(false);
         }
-        let from_path = if fmt_path_ends_with_owner_method(
-            segments,
-            &["option", "Option"],
-            &["core", "cmp", "PartialEq"],
-            "eq",
-        ) {
-            Some("eq")
-        } else if fmt_path_ends_with_owner_method(
-            segments,
-            &["option", "Option"],
-            &["core", "cmp", "PartialEq"],
-            "ne",
-        ) {
-            Some("ne")
-        } else {
-            None
-        };
-        // `CallControl.graphs_from` / `FunctionReprBase.call` call the
-        // function the pointer names. Only `core::cmp::PartialEq`'s
-        // `eq`/`ne` lower to this `BinOp`; an extension trait's
-        // same-named method on `Option` stays a call.
-        let from_method = method_hint.and_then(|(owner, name, trait_identity)| {
-            let identity = trait_identity.as_ref()?;
-            (owner == "Option"
-                && matches!(name.as_str(), "eq" | "ne")
-                && trait_impl_identity_names_trait(
-                    &format!("<impl {identity}>"),
-                    &["core", "cmp", "PartialEq"],
-                ))
-            .then_some(name.as_str())
-        });
-        let Some(leaf) = from_path.or(from_method) else {
+        let Some(leaf) =
+            partial_eq_eq_ne_leaf(segments, method_hint, &["option", "Option"], "Option")
+        else {
             return Ok(false);
         };
         if ![first_arg_ty, second_arg_ty]
@@ -2352,6 +2528,790 @@ impl<'a> Lowering<'a> {
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Operand of `<Result<T, E> as PartialEq>::eq` / `ne`: `&Result<T, E>`
+    /// peeled to `core::result::Result`. Keyed on the ADT path, never on
+    /// a caller symbol.
+    pub(in crate::front::mir) fn result_eq_ne_ty(&self, ty: Option<&TyRef>) -> Option<TyRef> {
+        let peeled = self.peel_to_option_or_result(ty?)?;
+        crate::front::result_exc::tyref_is_result(&peeled, self.llbc).then_some(peeled)
+    }
+
+    fn result_variant_carries_payload(&self, ty: &TyRef, disc: i64) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return true;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return true;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return true;
+        };
+        let variant = variants
+            .iter()
+            .find(|v| v.discriminant_i64() == Some(disc))
+            .or_else(|| usize::try_from(disc).ok().and_then(|idx| variants.get(idx)));
+        variant.map(|v| !v.fields.is_empty()).unwrap_or(true)
+    }
+
+    fn classify_payload_eq(
+        &self,
+        ty: &TyRef,
+        carries: bool,
+        stack: &mut Vec<u64>,
+    ) -> Option<PayloadEqPlan> {
+        if !carries {
+            return Some(PayloadEqPlan::NoPayload);
+        }
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        if self.tyref_compares_as_string(ty) || tyref_strips_to_str(ty, self.llbc) {
+            return Some(PayloadEqPlan::String);
+        }
+        if self.scalar_cmp_bank(ty).is_some()
+            || self.tyref_is_fieldless_enum(ty)
+            || self.tyref_is_borrowed_fieldless_enum(ty)
+        {
+            return Some(PayloadEqPlan::Scalar);
+        }
+        if let Some(plan) = self.classify_fun_decl_payload_eq(ty) {
+            return Some(plan);
+        }
+        if crate::front::result_exc::tyref_is_option(ty, self.llbc) {
+            return self.classify_option_payload_eq(ty, stack);
+        }
+        if crate::front::result_exc::tyref_is_result(ty, self.llbc) {
+            return self.classify_result_payload_eq(ty, stack);
+        }
+        self.classify_structural_payload_eq(ty, stack)
+    }
+
+    /// Unique `PartialEq` impl whose `eq` FunDecl has an `Unstructured`
+    /// body. `unique_trait_impl_for_adt` / `ClassDesc.lookup`.
+    fn classify_fun_decl_payload_eq(&self, ty: &TyRef) -> Option<PayloadEqPlan> {
+        let adt_id = self.tyref_adt_def_id(ty)?;
+        let trait_id = unique_trait_decl_id(self.llbc, "core::cmp::PartialEq")?;
+        let impl_id = unique_trait_impl_for_adt(self.llbc, trait_id, adt_id)?;
+        let eq_fn = crate::front::clause_spec::impl_method_fn_id(self.llbc, impl_id, 0)?;
+        let eq_fd = self.llbc.fn_by_id(eq_fn)?;
+        if !crate::front::clause_spec::decl_has_unstructured_body(eq_fd) {
+            return None;
+        }
+        let eq_leaf = fundecl_path_leaf(eq_fd)?;
+        let eq_segments = spec_segments(self.llbc, eq_fd, eq_leaf);
+        let ne =
+            crate::front::clause_spec::impl_method_fn_id(self.llbc, impl_id, 1).and_then(|id| {
+                let fd = self.llbc.fn_by_id(id)?;
+                if fd.is_trait_default()
+                    || !crate::front::clause_spec::decl_has_unstructured_body(fd)
+                {
+                    return None;
+                }
+                let leaf = fundecl_path_leaf(fd)?;
+                Some((id, spec_segments(self.llbc, fd, leaf)))
+            });
+        Some(PayloadEqPlan::FunDecl {
+            eq_id: eq_fn,
+            eq_segments,
+            ne,
+        })
+    }
+
+    fn classify_option_payload_eq(
+        &self,
+        ty: &TyRef,
+        stack: &mut Vec<u64>,
+    ) -> Option<PayloadEqPlan> {
+        if self.option_niche_payload_compares_as_string(ty) {
+            return Some(PayloadEqPlan::String);
+        }
+        if self.option_niche_payload_compares_by_address(ty) {
+            return Some(PayloadEqPlan::Scalar);
+        }
+        let (option_owner, some_owner, some_ty) = self.resolve_option_dest_owners(ty)?;
+        let payload = crate::front::result_exc::tyref_option_payload(ty, self.llbc)?;
+        let has = self.result_variant_carries_payload(ty, 1);
+        let arm1 = Box::new(self.classify_payload_eq(&payload, has, stack)?);
+        Some(PayloadEqPlan::Tagged {
+            owner: option_owner.clone(),
+            arm0_owner: option_owner,
+            arm1_owner: some_owner,
+            arm0_ty: ValueType::Int,
+            arm1_ty: some_ty,
+            arm0_raw_u8: false,
+            arm1_raw_u8: tyref_is_raw_u8_ptr(&payload, self.llbc),
+            arm0: Box::new(PayloadEqPlan::NoPayload),
+            arm1,
+            arm0_has: false,
+            arm1_has: has,
+        })
+    }
+
+    fn classify_result_payload_eq(
+        &self,
+        ty: &TyRef,
+        stack: &mut Vec<u64>,
+    ) -> Option<PayloadEqPlan> {
+        let (result_owner, ok_owner, err_owner, ok_ty, err_ty, _) =
+            self.resolve_result_owners(ty)?;
+        let ok_tyref = crate::front::result_exc::tyref_result_ok(ty, self.llbc)?;
+        let err_tyref = crate::front::result_exc::tyref_result_err(ty, self.llbc)?;
+        let ok_has = self.result_variant_carries_payload(ty, 0);
+        let err_has = self.result_variant_carries_payload(ty, 1);
+        let arm0 = Box::new(self.classify_payload_eq(&ok_tyref, ok_has, stack)?);
+        let arm1 = Box::new(self.classify_payload_eq(&err_tyref, err_has, stack)?);
+        Some(PayloadEqPlan::Tagged {
+            owner: result_owner,
+            arm0_owner: ok_owner,
+            arm1_owner: err_owner,
+            arm0_ty: ok_ty,
+            arm1_ty: err_ty,
+            arm0_raw_u8: tyref_is_raw_u8_ptr(&ok_tyref, self.llbc),
+            arm1_raw_u8: tyref_is_raw_u8_ptr(&err_tyref, self.llbc),
+            arm0,
+            arm1,
+            arm0_has: ok_has,
+            arm1_has: err_has,
+        })
+    }
+
+    fn classify_structural_payload_eq(
+        &self,
+        ty: &TyRef,
+        stack: &mut Vec<u64>,
+    ) -> Option<PayloadEqPlan> {
+        let adt_id = self.tyref_adt_def_id(ty)?;
+        if !self.tyref_has_structural_partial_eq(adt_id) {
+            return None;
+        }
+        let td = self.llbc.type_by_id(adt_id)?;
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return None;
+        };
+        if stack.contains(&adt_id) {
+            return None;
+        }
+        stack.push(adt_id);
+        let owner = td.item_meta.name_path().to_string();
+        let mut planned = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let name = field
+                .name
+                .clone()
+                .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+            let field_ty = tyref_to_value_type_with(
+                &field.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            );
+            let plan = self.classify_payload_eq(&field.ty, true, stack);
+            let Some(plan) = plan else {
+                stack.pop();
+                return None;
+            };
+            planned.push(StructuralFieldPlan {
+                name,
+                ty: field_ty,
+                plan: Box::new(plan),
+            });
+        }
+        stack.pop();
+        Some(PayloadEqPlan::Structural {
+            owner,
+            fields: planned,
+        })
+    }
+
+    fn tyref_has_structural_partial_eq(&self, adt_id: u64) -> bool {
+        let Some(trait_id) = unique_trait_decl_id(self.llbc, "core::marker::StructuralPartialEq")
+        else {
+            return false;
+        };
+        unique_trait_impl_for_adt(self.llbc, trait_id, adt_id).is_some()
+    }
+
+    /// Payload `PartialEq` of one Result variant. `&str` is string
+    /// `BinOp` (`rstr.py` `AbstractStringRepr.rtype_eq` / `rtype_ne` →
+    /// `ll_streq`). A scalar or fieldless enum is the same integer
+    /// `BinOp`. An impl with an `Unstructured` body is that FunDecl
+    /// (`ClassDesc.lookup`); a derived body missing from the LLBC is
+    /// the TypeDecl field AND-chain. Anything else has already
+    /// declined the lowering.
+    fn emit_result_payload_cmp(
+        &mut self,
+        block: BlockId,
+        thread: &[Variable],
+        leaf: &str,
+        lhs: Variable,
+        rhs: Variable,
+        payload_owner: &str,
+        payload_ty: &ValueType,
+        payload_tyref: &TyRef,
+        plan: &PayloadEqPlan,
+    ) -> (Variable, BlockId, Vec<Variable>) {
+        if matches!(plan, PayloadEqPlan::NoPayload) {
+            let val = push_block_op(&mut self.graph, block, OpKind::ConstBool(leaf == "eq"));
+            return (val, block, thread.to_vec());
+        }
+        let raw_u8 = tyref_is_raw_u8_ptr(payload_tyref, self.llbc);
+        let a = emit_payload_read(
+            &mut self.graph,
+            block,
+            lhs,
+            payload_owner,
+            payload_ty.clone(),
+            raw_u8,
+        );
+        let b = emit_payload_read(
+            &mut self.graph,
+            block,
+            rhs,
+            payload_owner,
+            payload_ty.clone(),
+            raw_u8,
+        );
+        self.emit_payload_eq_plan(block, thread, leaf, a, b, plan)
+    }
+
+    fn emit_payload_eq_plan(
+        &mut self,
+        block: BlockId,
+        thread: &[Variable],
+        leaf: &str,
+        lhs: Variable,
+        rhs: Variable,
+        plan: &PayloadEqPlan,
+    ) -> (Variable, BlockId, Vec<Variable>) {
+        match plan {
+            PayloadEqPlan::NoPayload => {
+                let val = push_block_op(&mut self.graph, block, OpKind::ConstBool(leaf == "eq"));
+                (val, block, thread.to_vec())
+            }
+            PayloadEqPlan::String => {
+                stamp_as_rstr_str(&lhs);
+                stamp_as_rstr_str(&rhs);
+                let val = push_block_op(
+                    &mut self.graph,
+                    block,
+                    OpKind::BinOp {
+                        op: leaf.to_string(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Int,
+                    },
+                );
+                (val, block, thread.to_vec())
+            }
+            PayloadEqPlan::Scalar => {
+                let val = push_block_op(
+                    &mut self.graph,
+                    block,
+                    OpKind::BinOp {
+                        op: leaf.to_string(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Int,
+                    },
+                );
+                (val, block, thread.to_vec())
+            }
+            PayloadEqPlan::FunDecl {
+                eq_id,
+                eq_segments,
+                ne,
+            } => {
+                let (fn_id, segments, negate) = if leaf == "ne" {
+                    if let Some((ne_id, ne_segments)) = ne {
+                        (*ne_id, ne_segments.clone(), false)
+                    } else {
+                        (*eq_id, eq_segments.clone(), true)
+                    }
+                } else {
+                    (*eq_id, eq_segments.clone(), false)
+                };
+                let val = push_block_op(
+                    &mut self.graph,
+                    block,
+                    OpKind::Call {
+                        target: CallTarget::function_path(segments).with_fun_decl_id(fn_id),
+                        args: crate::model::call_args(vec![lhs, rhs]),
+                        result_ty: ValueType::Int,
+                    },
+                );
+                let val = if negate {
+                    emit_eq_false(&mut self.graph, block, val)
+                } else {
+                    val
+                };
+                (val, block, thread.to_vec())
+            }
+            PayloadEqPlan::Structural { owner, fields } => {
+                self.emit_structural_eq(block, thread, leaf, lhs, rhs, owner, fields)
+            }
+            PayloadEqPlan::Tagged {
+                owner,
+                arm0_owner,
+                arm1_owner,
+                arm0_ty,
+                arm1_ty,
+                arm0_raw_u8,
+                arm1_raw_u8,
+                arm0,
+                arm1,
+                arm0_has,
+                arm1_has,
+            } => self.emit_tagged_eq(
+                block,
+                thread,
+                leaf,
+                lhs,
+                rhs,
+                owner,
+                arm0_owner,
+                arm1_owner,
+                arm0_ty,
+                arm1_ty,
+                *arm0_raw_u8,
+                *arm1_raw_u8,
+                arm0,
+                arm1,
+                *arm0_has,
+                *arm1_has,
+            ),
+        }
+    }
+
+    fn emit_structural_eq(
+        &mut self,
+        block: BlockId,
+        thread: &[Variable],
+        leaf: &str,
+        lhs: Variable,
+        rhs: Variable,
+        owner: &str,
+        fields: &[StructuralFieldPlan],
+    ) -> (Variable, BlockId, Vec<Variable>) {
+        let mut live = thread.to_vec();
+        if !live.contains(&lhs) {
+            live.push(lhs.clone());
+        }
+        if !live.contains(&rhs) {
+            live.push(rhs.clone());
+        }
+        let mut sources = live.clone();
+        let mut block = block;
+        let mut acc: Option<Variable> = None;
+        for field in fields {
+            let lhs_now = crate::front::option_variant::map_source(&sources, &live, &lhs)
+                .expect("structural eq lhs still live");
+            let rhs_now = crate::front::option_variant::map_source(&sources, &live, &rhs)
+                .expect("structural eq rhs still live");
+            let fa = emit_named_field_read(
+                &mut self.graph,
+                block,
+                lhs_now,
+                owner,
+                &field.name,
+                field.ty.clone(),
+            );
+            let fb = emit_named_field_read(
+                &mut self.graph,
+                block,
+                rhs_now,
+                owner,
+                &field.name,
+                field.ty.clone(),
+            );
+            let (cmp, next_block, next_live) =
+                self.emit_payload_eq_plan(block, &live, "eq", fa, fb, &field.plan);
+            if let Some(prev) = acc.as_ref() {
+                acc = crate::front::option_variant::map_source(&live, &next_live, prev).or(acc);
+            }
+            sources = live;
+            block = next_block;
+            live = next_live;
+            acc = Some(match acc {
+                None => cmp,
+                Some(prev) => push_block_op(
+                    &mut self.graph,
+                    block,
+                    OpKind::BinOp {
+                        op: "and".to_string(),
+                        lhs: prev,
+                        rhs: cmp,
+                        result_ty: ValueType::Int,
+                    },
+                ),
+            });
+        }
+        let mut val =
+            acc.unwrap_or_else(|| push_block_op(&mut self.graph, block, OpKind::ConstBool(true)));
+        if leaf == "ne" {
+            val = emit_eq_false(&mut self.graph, block, val);
+        }
+        let exit_thread = if live.len() >= thread.len() {
+            live[..thread.len()].to_vec()
+        } else {
+            thread.to_vec()
+        };
+        (val, block, exit_thread)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn emit_tagged_eq(
+        &mut self,
+        entry: BlockId,
+        thread: &[Variable],
+        leaf: &str,
+        lhs: Variable,
+        rhs: Variable,
+        owner: &str,
+        arm0_owner: &str,
+        arm1_owner: &str,
+        arm0_ty: &ValueType,
+        arm1_ty: &ValueType,
+        arm0_raw_u8: bool,
+        arm1_raw_u8: bool,
+        arm0: &PayloadEqPlan,
+        arm1: &PayloadEqPlan,
+        arm0_has: bool,
+        arm1_has: bool,
+    ) -> (Variable, BlockId, Vec<Variable>) {
+        let d1 = emit_enum_disc_read(&mut self.graph, entry, lhs.clone(), owner);
+        let d2 = emit_enum_disc_read(&mut self.graph, entry, rhs.clone(), owner);
+        let discs_ne = push_block_op(
+            &mut self.graph,
+            entry,
+            OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: d1,
+                rhs: d2,
+                result_ty: ValueType::Int,
+            },
+        );
+        let mixed_sources = diamond_arm_sources(thread, &[]);
+        let same_sources = diamond_arm_sources(thread, &[lhs.clone(), rhs.clone()]);
+        let (mixed_bb, mixed_inputs) = self.graph.create_block_with_arg_vars(mixed_sources.len());
+        let (same_bb, same_inputs) = self.graph.create_block_with_arg_vars(same_sources.len());
+        let mixed_val = push_block_op(&mut self.graph, mixed_bb, OpKind::ConstBool(leaf == "ne"));
+        let lhs_same = crate::front::option_variant::map_source(&same_sources, &same_inputs, &lhs)
+            .expect("tagged eq lhs threaded into same-variant arm");
+        let rhs_same = crate::front::option_variant::map_source(&same_sources, &same_inputs, &rhs)
+            .expect("tagged eq rhs threaded into same-variant arm");
+        let d_same = emit_enum_disc_read(&mut self.graph, same_bb, lhs_same.clone(), owner);
+        let (arm0_bb, arm0_inputs) = self.graph.create_block_with_arg_vars(same_inputs.len());
+        let (arm1_bb, arm1_inputs) = self.graph.create_block_with_arg_vars(same_inputs.len());
+        let arm0_lhs =
+            crate::front::option_variant::map_source(&same_inputs, &arm0_inputs, &lhs_same)
+                .expect("tagged eq lhs threaded into arm0");
+        let arm0_rhs =
+            crate::front::option_variant::map_source(&same_inputs, &arm0_inputs, &rhs_same)
+                .expect("tagged eq rhs threaded into arm0");
+        let arm1_lhs =
+            crate::front::option_variant::map_source(&same_inputs, &arm1_inputs, &lhs_same)
+                .expect("tagged eq lhs threaded into arm1");
+        let arm1_rhs =
+            crate::front::option_variant::map_source(&same_inputs, &arm1_inputs, &rhs_same)
+                .expect("tagged eq rhs threaded into arm1");
+        let (arm0_val, arm0_exit, arm0_exit_thread) = if arm0_has {
+            let a = emit_payload_read(
+                &mut self.graph,
+                arm0_bb,
+                arm0_lhs,
+                arm0_owner,
+                arm0_ty.clone(),
+                arm0_raw_u8,
+            );
+            let b = emit_payload_read(
+                &mut self.graph,
+                arm0_bb,
+                arm0_rhs,
+                arm0_owner,
+                arm0_ty.clone(),
+                arm0_raw_u8,
+            );
+            self.emit_payload_eq_plan(arm0_bb, &arm0_inputs, leaf, a, b, arm0)
+        } else {
+            let val = push_block_op(&mut self.graph, arm0_bb, OpKind::ConstBool(leaf == "eq"));
+            (val, arm0_bb, arm0_inputs.clone())
+        };
+        let (arm1_val, arm1_exit, arm1_exit_thread) = if arm1_has {
+            let a = emit_payload_read(
+                &mut self.graph,
+                arm1_bb,
+                arm1_lhs,
+                arm1_owner,
+                arm1_ty.clone(),
+                arm1_raw_u8,
+            );
+            let b = emit_payload_read(
+                &mut self.graph,
+                arm1_bb,
+                arm1_rhs,
+                arm1_owner,
+                arm1_ty.clone(),
+                arm1_raw_u8,
+            );
+            self.emit_payload_eq_plan(arm1_bb, &arm1_inputs, leaf, a, b, arm1)
+        } else {
+            let val = push_block_op(&mut self.graph, arm1_bb, OpKind::ConstBool(leaf == "eq"));
+            (val, arm1_bb, arm1_inputs.clone())
+        };
+        let (join, join_inputs) = self.graph.create_block_with_arg_vars(thread.len() + 1);
+        let join_thread = join_inputs[..thread.len()].to_vec();
+        let join_val = join_inputs[thread.len()].clone();
+        let mixed_thread: Vec<Variable> = thread
+            .iter()
+            .map(|v| {
+                crate::front::option_variant::map_source(&mixed_sources, &mixed_inputs, v)
+                    .expect("tagged mixed thread")
+            })
+            .collect();
+        let mut mixed_goto = mixed_thread;
+        mixed_goto.push(mixed_val);
+        self.graph.set_goto(mixed_bb, join, mixed_goto);
+        let arm0_thread: Vec<Variable> = thread
+            .iter()
+            .map(|v| {
+                let mid = crate::front::option_variant::map_source(&same_sources, &same_inputs, v)
+                    .expect("tagged arm0 thread");
+                let mid =
+                    crate::front::option_variant::map_source(&same_inputs, &arm0_inputs, &mid)
+                        .expect("tagged arm0 inner thread");
+                crate::front::option_variant::map_source(&arm0_inputs, &arm0_exit_thread, &mid)
+                    .expect("tagged arm0 exit thread")
+            })
+            .collect();
+        let mut arm0_goto = arm0_thread;
+        arm0_goto.push(arm0_val);
+        self.graph.set_goto(arm0_exit, join, arm0_goto);
+        let arm1_thread: Vec<Variable> = thread
+            .iter()
+            .map(|v| {
+                let mid = crate::front::option_variant::map_source(&same_sources, &same_inputs, v)
+                    .expect("tagged arm1 thread");
+                let mid =
+                    crate::front::option_variant::map_source(&same_inputs, &arm1_inputs, &mid)
+                        .expect("tagged arm1 inner thread");
+                crate::front::option_variant::map_source(&arm1_inputs, &arm1_exit_thread, &mid)
+                    .expect("tagged arm1 exit thread")
+            })
+            .collect();
+        let mut arm1_goto = arm1_thread;
+        arm1_goto.push(arm1_val);
+        self.graph.set_goto(arm1_exit, join, arm1_goto);
+        self.graph.set_branch(
+            same_bb,
+            d_same,
+            arm1_bb,
+            same_inputs.clone(),
+            arm0_bb,
+            same_inputs,
+        );
+        self.graph.set_branch(
+            entry,
+            discs_ne,
+            mixed_bb,
+            mixed_sources,
+            same_bb,
+            same_sources,
+        );
+        (join_val, join, join_thread)
+    }
+
+    /// `<Result<T, E> as PartialEq>::eq` / `ne`. Twin of
+    /// [`Self::try_lower_option_niche_eq_ne`]: same `PartialEq` path
+    /// rewrite, tagged-sum layout instead of a niche word.
+    ///
+    /// The derived body is a discriminant switch (`rclass.py`
+    /// `InstanceRepr._setup_repr`: tag on the enum root, payload on the
+    /// variant subclass). Mixed tags → `ne` is True / `eq` is False;
+    /// both `Ok` compare `T`; both `Err` compare `E`. Result convention
+    /// is Ok=0 / Err=1, so `bool(disc)` takes Err as the true arm.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    pub(in crate::front::mir) fn try_lower_result_eq_ne(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        method_hint: Option<&(String, String, Option<String>)>,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let Some(leaf) =
+            partial_eq_eq_ne_leaf(segments, method_hint, &["result", "Result"], "Result")
+        else {
+            return Ok(false);
+        };
+        let Some(lhs_ty) = self.result_eq_ne_ty(first_arg_ty) else {
+            return Ok(false);
+        };
+        if second_arg_ty.is_some() && self.result_eq_ne_ty(second_arg_ty).is_none() {
+            return Ok(false);
+        }
+        let Some((result_owner, ok_owner, err_owner, ok_ty, err_ty, _)) =
+            self.resolve_result_owners(&lhs_ty)
+        else {
+            return Ok(false);
+        };
+        let Some(ok_tyref) = crate::front::result_exc::tyref_result_ok(&lhs_ty, self.llbc) else {
+            return Ok(false);
+        };
+        let Some(err_tyref) = crate::front::result_exc::tyref_result_err(&lhs_ty, self.llbc) else {
+            return Ok(false);
+        };
+        let ok_has_payload = self.result_variant_carries_payload(&lhs_ty, 0);
+        let err_has_payload = self.result_variant_carries_payload(&lhs_ty, 1);
+        let mut stack = Vec::new();
+        let Some(ok_plan) = self.classify_payload_eq(&ok_tyref, ok_has_payload, &mut stack) else {
+            return Ok(false);
+        };
+        stack.clear();
+        let Some(err_plan) = self.classify_payload_eq(&err_tyref, err_has_payload, &mut stack)
+        else {
+            return Ok(false);
+        };
+
+        let bb_id = self.emit_bb(mir_bb);
+        let d1 = emit_enum_disc_read(&mut self.graph, bb_id, args[0].clone(), &result_owner);
+        let d2 = emit_enum_disc_read(&mut self.graph, bb_id, args[1].clone(), &result_owner);
+        let discs_ne = push_block_op(
+            &mut self.graph,
+            bb_id,
+            OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: d1,
+                rhs: d2,
+                result_ty: ValueType::Int,
+            },
+        );
+
+        let placeholder = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+
+        let mut carried: Vec<Variable> = Vec::new();
+        for v in &link_args {
+            if *v != placeholder && !carried.contains(v) {
+                carried.push(v.clone());
+            }
+        }
+        let mixed_sources = diamond_arm_sources(&carried, &[]);
+        let same_sources = diamond_arm_sources(&carried, &[args[0].clone(), args[1].clone()]);
+        let (mixed_bb, mixed_inputs) = self.graph.create_block_with_arg_vars(mixed_sources.len());
+        let (same_bb, same_inputs) = self.graph.create_block_with_arg_vars(same_sources.len());
+
+        let mixed_val = push_block_op(&mut self.graph, mixed_bb, OpKind::ConstBool(leaf == "ne"));
+        let lhs_same =
+            crate::front::option_variant::map_source(&same_sources, &same_inputs, &args[0])
+                .expect("Result eq/ne lhs threaded into same-variant arm");
+        let rhs_same =
+            crate::front::option_variant::map_source(&same_sources, &same_inputs, &args[1])
+                .expect("Result eq/ne rhs threaded into same-variant arm");
+        let d_same = emit_enum_disc_read(&mut self.graph, same_bb, lhs_same.clone(), &result_owner);
+
+        let (ok_bb, ok_inputs) = self.graph.create_block_with_arg_vars(same_inputs.len());
+        let (err_bb, err_inputs) = self.graph.create_block_with_arg_vars(same_inputs.len());
+        let ok_lhs = crate::front::option_variant::map_source(&same_inputs, &ok_inputs, &lhs_same)
+            .expect("Result eq/ne lhs threaded into Ok arm");
+        let ok_rhs = crate::front::option_variant::map_source(&same_inputs, &ok_inputs, &rhs_same)
+            .expect("Result eq/ne rhs threaded into Ok arm");
+        let err_lhs =
+            crate::front::option_variant::map_source(&same_inputs, &err_inputs, &lhs_same)
+                .expect("Result eq/ne lhs threaded into Err arm");
+        let err_rhs =
+            crate::front::option_variant::map_source(&same_inputs, &err_inputs, &rhs_same)
+                .expect("Result eq/ne rhs threaded into Err arm");
+        let (ok_val, ok_exit, ok_exit_thread) = self.emit_result_payload_cmp(
+            ok_bb, &ok_inputs, leaf, ok_lhs, ok_rhs, &ok_owner, &ok_ty, &ok_tyref, &ok_plan,
+        );
+        let (err_val, err_exit, err_exit_thread) = self.emit_result_payload_cmp(
+            err_bb,
+            &err_inputs,
+            leaf,
+            err_lhs,
+            err_rhs,
+            &err_owner,
+            &err_ty,
+            &err_tyref,
+            &err_plan,
+        );
+
+        let (join, join_inputs) = self.graph.create_block_with_arg_vars(link_args.len());
+        let mixed_args = remap_diamond_goto_args(
+            &link_args,
+            &placeholder,
+            &mixed_val,
+            &mixed_sources,
+            &mixed_inputs,
+        );
+        self.graph.set_goto(mixed_bb, join, mixed_args);
+        let ok_args = remap_payload_goto_args(
+            &link_args,
+            &placeholder,
+            &ok_val,
+            &same_sources,
+            &same_inputs,
+            &ok_inputs,
+            &ok_exit_thread,
+        );
+        self.graph.set_goto(ok_exit, join, ok_args);
+        let err_args = remap_payload_goto_args(
+            &link_args,
+            &placeholder,
+            &err_val,
+            &same_sources,
+            &same_inputs,
+            &err_inputs,
+            &err_exit_thread,
+        );
+        self.graph.set_goto(err_exit, join, err_args);
+        self.graph.set_branch(
+            same_bb,
+            d_same,
+            err_bb,
+            same_inputs.clone(),
+            ok_bb,
+            same_inputs,
+        );
+        self.graph.set_branch(
+            bb_id,
+            discs_ne,
+            mixed_bb,
+            mixed_sources,
+            same_bb,
+            same_sources,
+        );
+
+        let mut remap: std::collections::HashMap<u64, Variable> = std::collections::HashMap::new();
+        for (src, dst) in link_args.iter().zip(join_inputs.iter()) {
+            remap.insert(src.id(), dst.clone());
+        }
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
+        }
+        self.remap_forwarded_provenance(&remap);
+        self.emit_block.set(mir_bb, join);
+        let join_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(join, target_bb, join_args);
         Ok(true)
     }
 

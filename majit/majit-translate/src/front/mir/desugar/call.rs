@@ -1191,6 +1191,7 @@ impl<'a> Lowering<'a> {
                             args[0].clone(),
                             op,
                             result_ty,
+                            Some(&call.dest.ty),
                         );
                     }
                 }
@@ -2484,11 +2485,17 @@ impl<'a> Lowering<'a> {
                     // `result_narrow_root` cannot recover the pointee name,
                     // but the canonical object-array identity is already the
                     // positive proof that the element is `PyObjectRef` (the
-                    // int/float workspaces have non-Ref banks). A string
-                    // index's element is already `Str`; casting it to a
-                    // class drops that.
-                    let item_narrow_root = if string_index_owner.is_some() {
-                        None
+                    // int/float workspaces have non-Ref banks). String-list
+                    // getitem is `rlist.py` `AbstractBaseListRepr.recast`
+                    // after a GCREF-backed `getarrayitem`: the `"str"`
+                    // string root is identity on an already-String operand
+                    // and dest-Str of Instance. A class root would drop
+                    // `Str`.
+                    let item_narrow_root = if string_index_owner.is_some()
+                        || first_arg_is_string_array_view
+                        || array_type_id.as_deref() == Some(STRING_GCREF_GCARRAY_TYPE_ID)
+                    {
+                        Some("str".to_string())
                     } else {
                         result_narrow_root.clone().or_else(|| {
                             (array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID))
@@ -2520,27 +2527,18 @@ impl<'a> Lowering<'a> {
                     } else {
                         item_ty
                     };
-                    let (array_base, item_ty, array_type_id) =
-                        if let Some(owner) = string_index_owner {
-                            let block =
-                                self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
-                            let view = self
-                                .narrow_value_to_instance_root(
-                                    bb_id,
-                                    LinkArg::Value(block),
-                                    STRING_GCREF_GCARRAY_TYPE_ID,
-                                )
-                                .as_variable()
-                                .expect("a string-items view stays a Variable")
-                                .clone();
-                            (
-                                view,
-                                ValueType::Str,
-                                Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
-                            )
-                        } else {
-                            (array_base, item_ty, array_type_id)
-                        };
+                    let (array_base, item_ty, array_type_id) = if let Some(owner) =
+                        string_index_owner
+                    {
+                        let view = self.emit_string_array_items_view(bb_id, args[0].clone(), owner);
+                        (
+                            view,
+                            ValueType::Str,
+                            Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        )
+                    } else {
+                        (array_base, item_ty, array_type_id)
+                    };
                     if !write_only {
                         let read = match rust_vec_header {
                             Some(kind) => OpKind::Call {
@@ -2649,16 +2647,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let block = self.emit_string_array_items_read(bb_id, list, owner);
-                    let array = self
-                        .narrow_value_to_instance_root(
-                            bb_id,
-                            LinkArg::Value(block),
-                            STRING_GCREF_GCARRAY_TYPE_ID,
-                        )
-                        .as_variable()
-                        .expect("a string-items view stays a Variable")
-                        .clone();
+                    let array = self.emit_string_array_items_view(bb_id, list, owner);
                     let one = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -3606,7 +3595,13 @@ impl<'a> Lowering<'a> {
                         && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && tyref_raw_ptr_pointee_is_string_value(&call.dest.ty, self.llbc)
                     {
-                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, args[0].clone());
+                        let dest_root = self.dest_rstr_str_layout_root(&call.dest.ty);
+                        let raw = emit_cast_int_to_strptr(
+                            &mut self.graph,
+                            bb_id,
+                            args[0].clone(),
+                            dest_root.as_deref(),
+                        );
                         self.local_var[dest_local] = Some(LocalValue::One(raw));
                     } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
@@ -4042,11 +4037,8 @@ impl<'a> Lowering<'a> {
                 // `from_raw_parts(base, logical_len)` cannot discard its
                 // second word.
                 if args.len() == 2 && self.is_string_array_view_from_raw_parts(&reg) {
-                    let view = self.narrow_value_to_instance_root(
-                        bb_id,
-                        args[0].clone().into(),
-                        STRING_GCREF_GCARRAY_TYPE_ID,
-                    );
+                    let view =
+                        LinkArg::Value(self.narrow_gcref_items_to_str_list(bb_id, args[0].clone()));
                     self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")
@@ -4424,6 +4416,7 @@ impl<'a> Lowering<'a> {
                             args[0].clone(),
                             op,
                             result_ty,
+                            Some(&call.dest.ty),
                         );
                     }
                 }
@@ -5331,14 +5324,13 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && let Some(owner) = self.string_array_slice_view_owner(&reg)
                 {
-                    let block = self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
+                    let view = LinkArg::Value(self.emit_string_array_items_view(
+                        bb_id,
+                        args[0].clone(),
+                        owner,
+                    ));
                     let logical_len =
                         self.emit_string_array_len_read(bb_id, args[0].clone(), owner);
-                    let view = self.narrow_value_to_instance_root(
-                        bb_id,
-                        LinkArg::Value(block),
-                        STRING_GCREF_GCARRAY_TYPE_ID,
-                    );
                     self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")
@@ -6341,6 +6333,22 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // FunctionPath `result::Result::eq` / `ne`. Same
+                // `partial_eq_eq_ne_leaf` matcher as the niche Option
+                // fold; Result is a tagged sum, so the body is the
+                // structural derive (disc switch + payload compare).
+                if self.try_lower_result_eq_ne(
+                    mir_bb,
+                    &segments,
+                    method_hint.as_ref(),
+                    &args,
+                    first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                    second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `<T as ToString>::to_string(x)` is `str(x)` (`ll_str`)
                 // only when `x` already has an rstr `ll_str`: an integer
                 // (`ll_int2dec`) or rstr `STR` (identity). A Rust-heap
@@ -6635,6 +6643,18 @@ impl<'a> Lowering<'a> {
                             &args,
                             first_arg_ty.as_ref(),
                             second_arg_ty.as_ref(),
+                            dest_local,
+                            target,
+                        )? {
+                            return Ok(());
+                        }
+                        if self.try_lower_result_eq_ne(
+                            mir_bb,
+                            &segments,
+                            method_hint.as_ref(),
+                            &args,
+                            first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                            second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
                             dest_local,
                             target,
                         )? {
@@ -8205,6 +8225,62 @@ impl<'a> Lowering<'a> {
                         call_result_ty,
                         inner_item_ty: payload_ty,
                         rust_vec_kind: tyref_rust_vec_item_kind(&call.dest.ty, self.llbc),
+                    });
+            }
+        }
+        // Capture `Iterator::any(it, f)` at the construction site, where
+        // the closure env is a concrete ADT.  The default body is
+        // polymorphic (Charon does not monomorphise per iterator item);
+        // the caller is not.  A miss — non-bool dest, or env that does
+        // not resolve to a closure ADT — leaves the residual.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && crate::front::iter_adapter::is_iterator_any_target(target)
+            && tyref_to_value_type_with(
+                &call.dest.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ) == ValueType::Bool
+            && let Some(recv_ty) = first_arg_ty.as_ref()
+            && let Some(pred_ty) = second_arg_ty.as_ref()
+            && let Some(env_def_id) = self
+                .tyref_adt_def_id(pred_ty)
+                .or_else(|| self.tyref_ref_adt_def_id(pred_ty))
+            && let Some(env_td) = self.llbc.type_by_id(env_def_id)
+            && type_decl_is_closure_env(env_td)
+        {
+            let call_once_owner = closure_env_call_once_owner(env_td);
+            if !call_once_owner.is_empty() {
+                let iter_ty = match self.tyref_peel_ref_to_pointee(recv_ty) {
+                    Some(ty) => ty,
+                    None => recv_ty.clone(),
+                };
+                let item_tyref = self
+                    .tyref_adt_type_arg(&iter_ty, 0)
+                    .unwrap_or_else(|| clone_tyref(&iter_ty));
+                let payload_ty = tyref_to_value_type_with(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                let payload_class_root = enum_payload_instance_class_root(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                );
+                let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
+                self.iterator_any_sites
+                    .push(crate::front::iter_adapter::IteratorAnySite {
+                        result_var: result_var.clone(),
+                        call_once_owner,
+                        payload_ty: payload_ty.clone(),
+                        payload_class_root,
+                        args_tuple_suffix,
+                        inner_item_ty: payload_ty,
                     });
             }
         }

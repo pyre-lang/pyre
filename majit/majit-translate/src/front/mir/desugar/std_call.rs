@@ -7038,6 +7038,55 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    /// Logical `[str]` view of a GCREF-backed string-list items block.
+    ///
+    /// `rmodel.externalvsinternal(..., gcref=True)` stores `Ptr(STR)` as
+    /// `GcArray(GCREF)`. The high-level list is still `[str]`
+    /// (`STRING_GCREF_GCARRAY_TYPE_ID`); `rlist.py`
+    /// `AbstractBaseListRepr.recast` / `rgcref.py`
+    /// `GCRefRepr.convert_from_to` (`cast_opaque_ptr`) is the
+    /// STRPTR↔GCREF boundary.
+    ///
+    /// `__cast_instance_intrinsic` of a list root pass-throughs an operand
+    /// that is already `SomeList` (`cast_instance_intrinsic` list arm).
+    /// `ItemsBlock` intern is `SomeList` of `PyObject`
+    /// (`FixedSizeListRepr`), so a direct `[str]` narrow would keep that
+    /// ListDef and `getitem` would return `Instance(PyObject)`. Erase to
+    /// GCREF first (`annlowlevel.py` `cast_instance_to_gcref`) so the
+    /// list-root arm uses the projected `[str]` ListDef (`SomeString`
+    /// items). `rstr.STRPTR` and `rclass.OBJECTPTR` never share a ListDef.
+    pub(in crate::front::mir) fn narrow_gcref_items_to_str_list(
+        &mut self,
+        bb_id: BlockId,
+        block: Variable,
+    ) -> Variable {
+        let (kind, gcref) = self.recast_instance_to_gcref(&block);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(gcref.clone()),
+            kind,
+        });
+        self.narrow_value_to_instance_root(
+            bb_id,
+            LinkArg::Value(gcref),
+            STRING_GCREF_GCARRAY_TYPE_ID,
+        )
+        .as_variable()
+        .expect("a string-items view stays a Variable")
+        .clone()
+    }
+
+    /// `ll_items(l)` for BytesArray / UnicodeArray: field-read `block`,
+    /// then the GCREF→`[str]` view [`Self::narrow_gcref_items_to_str_list`].
+    pub(in crate::front::mir) fn emit_string_array_items_view(
+        &mut self,
+        bb_id: BlockId,
+        list: Variable,
+        owner: &str,
+    ) -> Variable {
+        let block = self.emit_string_array_items_read(bb_id, list, owner);
+        self.narrow_gcref_items_to_str_list(bb_id, block)
+    }
+
     /// The logical `l.length` of a string-list storage record — the second
     /// word the `from_raw_parts` view fold drops.  Upstream reads it as the
     /// list's own field (`ll_length`, `rlist.py`), strictly apart
@@ -8016,6 +8065,10 @@ impl<'a> Lowering<'a> {
     /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host call
     /// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` accept.
     /// `normalize_unary_op_name` rejects a unary op of either name.
+    /// `dest_ty` is the call dest; dest-Str restore after Primitive→Ptr
+    /// uses that dest's rstr layout, or keeps the plain `cast_int_to_ptr`
+    /// when dest has none.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::front::mir) fn emit_host_cast_llop(
         &mut self,
         mir_bb: usize,
@@ -8024,10 +8077,13 @@ impl<'a> Lowering<'a> {
         operand: crate::flowspace::model::Variable,
         op: &str,
         result_ty: ValueType,
+        dest_ty: Option<&TyRef>,
     ) -> Result<(), LowerError> {
         let bb_id = self.emit_bb(mir_bb);
         if op == "cast_int_to_ptr" && matches!(result_ty, ValueType::Str) {
-            let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, operand);
+            let dest_root = dest_ty.and_then(|ty| self.dest_rstr_str_layout_root(ty));
+            let raw =
+                emit_cast_int_to_strptr(&mut self.graph, bb_id, operand, dest_root.as_deref());
             self.local_var[dest_local] = Some(LocalValue::One(raw));
             let target_bb = self.block_id[target];
             let link_args = self.edge_args(mir_bb, target)?;

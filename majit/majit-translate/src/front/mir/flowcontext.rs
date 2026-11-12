@@ -537,6 +537,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `front::iter_adapter` synthesizes before the `next`-diamond runs
     /// (see [`crate::front::iter_adapter::MapCollectSite`]).
     pub(in crate::front::mir) map_collect_sites: Vec<crate::front::iter_adapter::MapCollectSite>,
+    /// `Iterator::any` construction sites recorded for the early-exit
+    /// loop rewrite `front::iter_adapter` synthesizes beside Map::collect
+    /// (see [`crate::front::iter_adapter::IteratorAnySite`]).
+    pub(in crate::front::mir) iterator_any_sites: Vec<crate::front::iter_adapter::IteratorAnySite>,
     /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
     /// recorded for the checked-arith rewiring pass
     /// (`front::checked_arith`) that runs after the body lowering
@@ -2142,6 +2146,7 @@ impl<'a> Lowering<'a> {
             result_map_err_sites: Vec::new(),
             next_call_results: Vec::new(),
             map_collect_sites: Vec::new(),
+            iterator_any_sites: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
