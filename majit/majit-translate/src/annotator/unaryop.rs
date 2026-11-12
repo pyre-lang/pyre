@@ -4317,12 +4317,12 @@ fn init_someptr_overrides(
                     &s,
                     |ptr| {
                         ptr.getattr(&s_attr).unwrap_or_else(|e| {
-                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint"))
                         })
                     },
                     |ptr| {
                         ptr.getattr(&s_attr).unwrap_or_else(|e| {
-                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint"))
                         })
                     },
                 )
@@ -4413,12 +4413,12 @@ fn init_someptr_overrides(
                     &s,
                     |ptr| {
                         ptr.setattr(&s_attr, &s_value).unwrap_or_else(|e| {
-                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint"))
                         })
                     },
                     |ptr| {
                         ptr.setattr(&s_attr, &s_value).unwrap_or_else(|e| {
-                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint"))
                         })
                     },
                 );
@@ -6085,71 +6085,115 @@ mod tests {
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
+    fn someptr_nonconst_attr_error(
+        sv: SomeValue,
+        set: bool,
+    ) -> super::super::model::AnnotatorError {
+        let ann = mk_ann();
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(&mut v_ptr, sv);
+        let mut v_attr = Variable::named("name");
+        ann.setbinding(
+            &mut v_attr,
+            SomeValue::String(super::super::model::SomeString::new(false, false)),
+        );
+        let hl = if set {
+            let mut v_value = Variable::named("value");
+            ann.setbinding(
+                &mut v_value,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+            );
+            HLOperation::new(
+                OpKind::SetAttr,
+                vec![
+                    Hlvalue::Variable(v_ptr),
+                    Hlvalue::Variable(v_attr),
+                    Hlvalue::Variable(v_value),
+                ],
+            )
+        } else {
+            HLOperation::new(
+                OpKind::GetAttr,
+                vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_attr)],
+            )
+        };
+        let err = hl
+            .consider(&ann)
+            .expect_err("non-constant field-name must reify as AnnotatorError");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("non-constant field-name"),
+            "missing field-name diagnostic: {err:?}"
+        );
+        assert!(
+            msg.contains("compute_at_fixpoint"),
+            "stage must stay on the typed payload: {err:?}"
+        );
+        err
+    }
+
     #[test]
-    #[should_panic(expected = "non-constant field-name")]
     fn consider_someptr_getattr_uses_ptr_override() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             FuncType, LowLevelType, Ptr, PtrTarget,
         };
 
-        let ann = mk_ann();
         let s_ptr = super::super::model::SomePtr::new(Ptr {
             TO: PtrTarget::Func(FuncType {
                 args: vec![],
                 result: LowLevelType::Void,
             }),
         });
-        let mut v_ptr = Variable::named("p");
-        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
-        let mut v_attr = Variable::named("name");
-        ann.setbinding(
-            &mut v_attr,
-            SomeValue::String(super::super::model::SomeString::new(false, false)),
-        );
-        let hl = HLOperation::new(
-            OpKind::GetAttr,
-            vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_attr)],
-        );
-
-        let _ = hl.consider(&ann);
+        let _ = someptr_nonconst_attr_error(SomeValue::Ptr(s_ptr), false);
     }
 
     #[test]
-    #[should_panic(expected = "non-constant field-name")]
     fn consider_someptr_setattr_uses_ptr_override() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             FuncType, LowLevelType, Ptr, PtrTarget,
         };
 
-        let ann = mk_ann();
         let s_ptr = super::super::model::SomePtr::new(Ptr {
             TO: PtrTarget::Func(FuncType {
                 args: vec![],
                 result: LowLevelType::Void,
             }),
         });
-        let mut v_ptr = Variable::named("p");
-        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
-        let mut v_attr = Variable::named("name");
-        ann.setbinding(
-            &mut v_attr,
-            SomeValue::String(super::super::model::SomeString::new(false, false)),
-        );
-        let mut v_value = Variable::named("value");
-        ann.setbinding(
-            &mut v_value,
-            SomeValue::Integer(SomeInteger::new(false, false)),
-        );
-        let hl = HLOperation::new(
-            OpKind::SetAttr,
-            vec![
-                Hlvalue::Variable(v_ptr),
-                Hlvalue::Variable(v_attr),
-                Hlvalue::Variable(v_value),
-            ],
-        );
+        let _ = someptr_nonconst_attr_error(SomeValue::Ptr(s_ptr), true);
+    }
 
-        let _ = hl.consider(&ann);
+    #[test]
+    fn consider_someinteriorptr_getattr_reifies_annotator_error() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let s_ptr = super::super::model::SomeInteriorPtr::new(InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )))),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Field("x".into())],
+        });
+        let _ = someptr_nonconst_attr_error(SomeValue::InteriorPtr(s_ptr), false);
+    }
+
+    #[test]
+    fn consider_someinteriorptr_setattr_reifies_annotator_error() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let s_ptr = super::super::model::SomeInteriorPtr::new(InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )))),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Field("x".into())],
+        });
+        let _ = someptr_nonconst_attr_error(SomeValue::InteriorPtr(s_ptr), true);
     }
 
     #[test]

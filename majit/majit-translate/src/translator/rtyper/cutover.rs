@@ -4090,7 +4090,16 @@ fn declared_return_annotation(
     }
     // `*mut T` / `*const T` whose T has no harvested layout is unknown.
     // Do not intern a ClassDef of the pointer spelling.
+    // `llannotation.py` `lltype_to_annotation` of `Ptr(OpaqueType)`
+    // (`rffi.py` `COpaquePtr`) is a classdef-less nullable instance so
+    // `SomeInstance.bool_behavior` / `binaryop.py` `is__default` does
+    // not fold the live null arm.
     if root.trim().starts_with("*mut ") || root.trim().starts_with("*const ") {
+        if token == Some("ref") && graph.return_can_be_none {
+            if let Some(s) = bk.undeclared_raw_ptr_nullable_annotation(root) {
+                return Some(s);
+            }
+        }
         return None;
     }
     let classdef = bk
@@ -5367,6 +5376,20 @@ fn foreign_opaque_method_return_shell(
         }
         if crate::front::semantic::is_list_family_spelling(root) {
             return Some(projected);
+        }
+        // Pointer-niche `Option<&T>` of a GC instance / str-family
+        // pointee is the nullable payload (`annotator/model.py`
+        // `SomeInstance.noneify` / `SomeString.noneify`). Intern the
+        // same shell `declared_return_annotation` uses. A ClassDef of
+        // the Option or pointer spelling would leave `can_be_None`
+        // false and `binaryop.py` `is__default` folds `is None`.
+        if bk.is_niche_option_gc_payload_spelling(root) {
+            return Some(
+                crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
+                    Some(bk),
+                    root,
+                ),
+            );
         }
         let host = bk.intern_class_by_qualname(root);
         if let Ok(classdef) = bk.getuniqueclassdef(&host) {
@@ -9473,6 +9496,20 @@ mod tests {
             None,
             "the write leaf is shared with other functions"
         );
+        let mut origin = LegacyGraph::new("write");
+        origin.source_identity = Some("core::ptr::write".into());
+        assert_eq!(
+            registration_decline_graph_origin(&origin, &[]),
+            Some(SKIP_PTR_WRITE),
+            "bare-leaf write whose source_identity is core::ptr::write is declined"
+        );
+        let mut foreign_origin = LegacyGraph::new("write");
+        foreign_origin.source_identity = Some("user_mod::write".into());
+        assert_eq!(
+            registration_decline_graph_origin(&foreign_origin, &[]),
+            None,
+            "an unrelated write source_identity is not ptr::write"
+        );
         assert_eq!(
             registration_decline(&["core".into(), "ptr".into(), "write_unaligned".into()]),
             None
@@ -9498,11 +9535,22 @@ mod tests {
             graph.set_return(graph.startblock.clone(), None);
             graphs.insert(path, graph);
         }
+        let alias_path = crate::parse::CallPath::from_segments(["write"]);
+        let mut alias_graph = LegacyGraph::new("write");
+        alias_graph.set_return(alias_graph.startblock.clone(), None);
+        alias_graph.source_identity = Some("core::ptr::write".into());
+        graphs.insert(alias_path, alias_graph);
+        let foreign_path = crate::parse::CallPath::from_segments(["user_mod", "write"]);
+        let mut foreign_graph = LegacyGraph::new("write");
+        foreign_graph.set_return(foreign_graph.startblock.clone(), None);
+        foreign_graph.source_identity = Some("user_mod::write".into());
+        graphs.insert(foreign_path, foreign_graph);
         populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         for segments in [
             &["core", "ptr", "write"][..],
             &["std", "ptr", "write"][..],
             &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
+            &["write"][..],
         ] {
             let key = FunctionPathKey::from_segments(segments.iter().copied());
             assert!(
@@ -9510,6 +9558,12 @@ mod tests {
                 "user graph still registered for {segments:?}"
             );
         }
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["user_mod", "write"]))
+                .is_some(),
+            "an unrelated write stays registered"
+        );
         let host = crate::flowspace::model::host_env_callable(
             &["core", "ptr", "write"]
                 .into_iter()
@@ -19885,6 +19939,62 @@ mod tests {
     }
 
     #[test]
+    fn foreign_opaque_niche_option_ref_result_annotates_nullable_instance() {
+        // HashMap::get-shaped residual `Option<&T>` of a GC instance.
+        // `tyref_to_value_type_with` names the pointee; collection keeps
+        // the Option spelling so intern uses
+        // `Bookkeeper::niche_option_gc_payload_annotation`
+        // (`annotator/model.py` `SomeInstance.noneify`). A non-nullable
+        // ClassDef would let `binaryop.py` `is__default` fold `is None`.
+        use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let result_ty = crate::model::ValueType::Ref(Some("Option<&pyobject::PyObject>".into()));
+        let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
+            .expect("a pointer-niche Option residual has a shell");
+        let SomeValue::Instance(inst) = &shell else {
+            panic!("niche Option<&GC> residual is SomeInstance, got {shell:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "niche Option<&GC> residual is SomeInstance(can_be_None=True)"
+        );
+    }
+
+    #[test]
+    fn foreign_opaque_scalar_option_mut_result_does_not_noneify() {
+        // HashMap::get_mut-shaped residual `Option<&mut i64>`. Collection
+        // declines that spelling (`tyref_niche_option_gc_payload_spelling`);
+        // intern's GC-niche predicate
+        // (`Bookkeeper::is_niche_option_gc_payload_spelling`) also
+        // declines a scalar pointee, so the shell must not noneify
+        // (`annotator/model.py` `SomeInstance.noneify`).
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let result_ty = crate::model::ValueType::Ref(Some("Option<&mut i64>".into()));
+        assert!(
+            !registry
+                .bookkeeper()
+                .is_niche_option_gc_payload_spelling("Option<&mut i64>"),
+            "scalar Option<&mut i64> is not a GC-niche payload"
+        );
+        let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
+            .expect("a named Ref residual has a shell");
+        match &shell {
+            SomeValue::Instance(inst) => {
+                assert!(
+                    !inst.can_be_none,
+                    "scalar Option<&mut i64> residual is not SomeInstance(can_be_None=True)"
+                );
+            }
+            other => panic!("scalar Option<&mut i64> intern's SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn declared_return_annotation_raw_class_root_is_someptr() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
@@ -20037,6 +20147,36 @@ mod tests {
     }
 
     #[test]
+    fn declared_return_annotation_undeclared_raw_ptr_nullable_when_return_can_be_none() {
+        // Unknown `*mut T` with residual `"ref"` and `return_can_be_none`
+        // is `llannotation.py` `lltype_to_annotation` of
+        // `Ptr(OpaqueType)` (`rffi.py` `COpaquePtr`): a classdef-less
+        // nullable instance. Interning a ClassDef of the pointer
+        // spelling would leave `can_be_None` false and
+        // `binaryop.py` `is__default` folds the live null arm.
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("dont_look_inside_unknown_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut UnknownAdt".into());
+        graph.return_can_be_none = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("unknown *mut T with return_can_be_none intern's");
+        let SomeValue::Instance(inst) = declared else {
+            panic!("undeclared *mut T residual is SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "undeclared *mut T residual is SomeInstance(can_be_None=True)"
+        );
+        assert!(
+            inst.classdef.is_none(),
+            "do not intern a ClassDef of the pointer spelling"
+        );
+    }
+
+    #[test]
     fn declared_return_annotation_lowercase_declared_raw_ptr_follows_projector() {
         use crate::annotator::model::SomeValue;
 
@@ -20110,9 +20250,9 @@ mod tests {
         use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::transform::link_not_in_links_followed;
 
+        let _lock = anchor_lock();
         let (layouts, _ids) =
             crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
-        let _lock = anchor_lock();
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
         registry.set_struct_layouts(layouts);
         let specs = vec![(

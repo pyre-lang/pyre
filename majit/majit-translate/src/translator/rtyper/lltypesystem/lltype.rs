@@ -5055,18 +5055,19 @@ fn castable_ptr_types(ptrtype: &Ptr, curtype: &Ptr) -> Result<i32, String> {
     if curtype == ptrtype {
         return Ok(0);
     }
-    let (PtrTarget::Struct(curstruc), PtrTarget::Struct(ptrstruc)) = (&curtype.TO, &ptrtype.TO)
-    else {
+    let cur_to = LowLevelType::from(curtype.TO.clone()).become_container();
+    let ptr_to = LowLevelType::from(ptrtype.TO.clone()).become_container();
+    let (LowLevelType::Struct(curstruc), LowLevelType::Struct(ptrstruc)) = (cur_to, ptr_to) else {
         return Err(format!(
             "invalid cast between {:?} and {:?}",
             curtype, ptrtype
         ));
     };
-    let d = castdepth(curstruc, ptrstruc);
+    let d = castdepth(&curstruc, &ptrstruc);
     if d >= 0 {
         return Ok(d);
     }
-    let u = castdepth(ptrstruc, curstruc);
+    let u = castdepth(&ptrstruc, &curstruc);
     if u == -1 {
         return Err(format!(
             "invalid cast between {:?} and {:?}",
@@ -5244,6 +5245,17 @@ impl LowLevelType {
                 | LowLevelType::Opaque(_)
                 | LowLevelType::ForwardReference(_)
         )
+    }
+
+    /// Real container after `ForwardReference.become` (`lltype.py`).
+    /// The enum variant stays `ForwardReference`; `isinstance(TO, Struct)`
+    /// after become is this projection. An unresolved forward reference
+    /// stays itself.
+    pub fn become_container(&self) -> LowLevelType {
+        match self {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().unwrap_or_else(|| self.clone()),
+            other => other.clone(),
+        }
     }
 
     /// RPython `LowLevelType._is_varsize` (`lltype.py`). Default
@@ -8208,6 +8220,39 @@ mod tests {
         let mut right = std::collections::hash_map::DefaultHasher::new();
         real.hash(&mut right);
         assert_eq!(left.finish(), right.finish());
+    }
+
+    #[test]
+    fn castable_accepts_resolved_forward_reference_like_its_struct() {
+        // `castable` (`lltype.py`) does `isinstance(TO, Struct)` after
+        // `ForwardReference.become`. A `Ptr(ForwardReference)` source that
+        // resolved to Outer must cast to Inner along `_first_struct` at
+        // the same depth as `Ptr(Struct(Outer))`.
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let outer = Struct::new(
+            "Outer",
+            vec![
+                ("x".into(), LowLevelType::Struct(Box::new(inner.clone()))),
+                ("z".into(), LowLevelType::Signed),
+            ],
+        );
+        let dest = Ptr {
+            TO: PtrTarget::Struct(inner),
+        };
+        let src_struct = Ptr {
+            TO: PtrTarget::Struct(outer.clone()),
+        };
+        let fwd = ForwardReference::new();
+        fwd.r#become(LowLevelType::Struct(Box::new(outer))).unwrap();
+        let src_fwd = Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        };
+        let expected = castable(&dest, &src_struct).expect("Struct parent is castable");
+        assert_eq!(
+            castable(&dest, &src_fwd).expect("resolved ForwardReference must cast like its Struct"),
+            expected
+        );
+        assert!(expected > 0);
     }
 
     #[test]

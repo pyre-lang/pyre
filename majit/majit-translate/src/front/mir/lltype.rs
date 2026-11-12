@@ -1512,9 +1512,12 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// (`is_str_family_class_root`) which keeps `Ref(Some(root))`; a
 /// payload-carrying enum keeps `Ref(Some(root))` when
 /// `tyref_to_value_type` painted a class root (`unaryop.py`
-/// `SomeInstance.getattr` needs `self.classdef`). A payload enum with
-/// no class root is declined. A fieldless enum, tuple, reference, or
-/// non-opaque struct is declined.
+/// `SomeInstance.getattr` needs `self.classdef`). A pointer-niche
+/// `Option<&T>` of a GC / str-family pointee keeps the Option spelling
+/// ([`tyref_niche_option_gc_payload_spelling`]) so intern noneifies
+/// (`Bookkeeper::niche_option_gc_payload_annotation`). A payload enum
+/// with no class root is declined. A fieldless enum, tuple, reference,
+/// or non-opaque struct is declined.
 pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
     output: &TyRef,
     llbc: &Llbc,
@@ -1553,9 +1556,27 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   keep `Ref(Some(root))` so registration intern's the
         //   enum-base ClassDef a caller `match` getattr's.
         //
-        // A non-opaque struct / `Option` / fieldless enum would be
-        // mis-typed as an opaque GcRef, so decline it.
+        // A non-opaque struct / tagged `Option<i64>` / fieldless enum
+        // would be mis-typed as an opaque GcRef, so decline it. A
+        // pointer-niche `Option<&T>` of a GC instance / str-family
+        // pointee is the nullable payload word (`annotator/model.py`
+        // `SomeObject.noneify`); keep that Option spelling so intern
+        // noneifies (`Bookkeeper::niche_option_gc_payload_annotation`).
+        // [`tyref_niche_option_gc_payload_spelling`] is the collection
+        // side of that intern predicate; a scalar pointee such as
+        // `Option<&mut i64>` falls through.
         ValueType::Ref(root) => {
+            if tyref_is_niche_option(output, llbc) {
+                let inputs = value_type_inputs(llbc);
+                if let Some(opt_root) = tyref_niche_option_gc_payload_spelling(
+                    output,
+                    llbc,
+                    &inputs.gc_struct_ids,
+                    &inputs.raw_alloc_flavor_structs,
+                ) {
+                    return Some(ValueType::Ref(Some(opt_root)));
+                }
+            }
             let def_id = output_adt_def_id_free(output, llbc)?;
             let td = llbc.type_by_id(def_id)?;
             let str_family_root = root
@@ -2563,6 +2584,10 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
         // `Option<usize>` is a raw word by layout, but intern is still
         // the tagged Instance and assembler `getfield_raw_r` of that
         // field is refused (`rewrite_op_getfield`).
+        // Instantiation of a generic (`Option<Option<T>>`) re-enters this
+        // def_id by value. `lltype.py` `Struct._first_struct` classifies
+        // by the declared field types; the pointer-cycle `stack` is only
+        // for an actual pointer cycle in `adt_def_is_raw_storage_at`.
         if !adt_node_type_subst(node, llbc).is_empty() {
             if adt_node_type_subst_names_an_adt(node, llbc) {
                 return adt_def_is_raw_storage_at(
@@ -2571,10 +2596,16 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
                     llbc,
                     gc_struct_ids,
                     immutable_fields,
-                    stack,
+                    &mut Vec::new(),
                 );
             }
-            return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
+            return adt_def_is_raw_storage(
+                def_id,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+                &mut Vec::new(),
+            );
         }
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
@@ -2670,12 +2701,13 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
             return false;
         }
         // rstr `STR` (`GcStruct('rpy_string')`): `TO._gckind == 'gc'`.
-        // A `*mut Utf8Str` / `*mut BytesBlock` is a GC pointer, so an
-        // enum that holds one (`BlockRoute::Managed`) is not a raw
-        // word bag (`adt_def_is_raw_storage`).
-        let path = td.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
-        if is_rstr_str_family_spelling(leaf) {
+        // Identity is the declaration path
+        // (`is_rstr_str_layout_declaration`); `other::Utf8Str` is a
+        // different type. A `*mut Utf8Str` / `*mut BytesBlock` of that
+        // layout is a GC pointer, so an enum that holds one
+        // (`BlockRoute::Managed`) is not a raw word bag
+        // (`adt_def_is_raw_storage`).
+        if is_rstr_str_layout_declaration(td.item_meta.name_path_str()) {
             return false;
         }
         return match &td.kind {
@@ -3195,7 +3227,9 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // class (`model.py` `SomeObject.noneify`). Name the pointee so dest
     // intern's `SomePtr` of that owner (`by_value_payload_annotation`)
     // rather than the tagged `Option<T>` class `tyref_to_ast_string`
-    // would strip `&` onto.
+    // would strip `&` onto. Residual collection keeps the Option
+    // spelling (`foreign_opaque_method_result_valuetype`) so intern
+    // can noneify (`Bookkeeper::niche_option_gc_payload_annotation`).
     if tyref_is_niche_option(ty, llbc)
         && let Some(root) = niche_option_pointee_class_root(ty, llbc, tombstoned)
     {
@@ -5522,8 +5556,7 @@ pub(in crate::front::mir) fn is_rust_heap_string_root(root: &str) -> bool {
 /// Leaf spellings of the rstr `STR` family (`ValueType::Str`).
 ///
 /// `rstr.py` `GcStruct('rpy_string', ...)`: `TO._gckind == 'gc'`.
-/// Shared by [`super::tuple_field_value_type`] and the raw-storage
-/// pointee predicate (`pointee_is_raw_word`). A Rust-heap `String` is
+/// Shared by [`super::tuple_field_value_type`]. A Rust-heap `String` is
 /// not this family (`is_rust_heap_string_root`).
 pub(crate) fn is_rstr_str_family_spelling(spelling: &str) -> bool {
     matches!(
@@ -6903,19 +6936,26 @@ pub(in crate::front::mir) fn is_deref_call_for(
     false
 }
 
-/// String/Vec deref is identity in the lifted model (`rpy_string` /
-/// `rpy_list`). Box is identity only when the dest is a slice
-/// (`Box<[T]>` → `&[T]`); `Box<Struct>` is [`deref_cast_root`] and
-/// `Box<i64>` is a thin integer pointer.
+/// `alloc::string::String` / `alloc::vec::Vec` deref is identity in the
+/// lifted model (`rpy_string` / `rpy_list`). `alloc::boxed::Box` is
+/// identity only when the dest is a slice (`Box<[T]>` → `&[T]`);
+/// `Box<Struct>` is [`deref_cast_root`] and `Box<i64>` is a thin integer
+/// pointer. `owner_path` is the impl owner's declaration path
+/// (`rclass.py` `getgcflavor`), compared whole-path with
+/// [`path_eq_ignoring_raw`]. A user `foo::alloc::vec::Vec` is not identity.
 pub(in crate::front::mir) fn container_identity_deref_owner(
-    owner_leaf: &str,
+    owner_path: &str,
     dest_ty: Option<&TyRef>,
     llbc: &Llbc,
 ) -> bool {
-    match owner_leaf {
-        "String" | "Vec" => true,
-        "Box" => dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc)),
-        _ => false,
+    if path_eq_ignoring_raw(owner_path, "alloc::vec::Vec")
+        || path_eq_ignoring_raw(owner_path, "alloc::string::String")
+    {
+        true
+    } else if path_eq_ignoring_raw(owner_path, "alloc::boxed::Box") {
+        dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc))
+    } else {
+        false
     }
 }
 
@@ -13058,7 +13098,7 @@ fn type_arg_referent_is_raw_storage(
     let canon = strip_crate_prefix(&path);
     if is_str_family_class_root(&canon)
         || is_str_family_class_root(leaf)
-        || is_rstr_str_family_spelling(leaf)
+        || is_rstr_str_layout_declaration(td.item_meta.name_path_str())
     {
         return false;
     }

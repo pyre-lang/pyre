@@ -4243,16 +4243,32 @@ pub(in crate::front::mir) fn spelling_pair_field_kind(
     spelling: &str,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let spelling = spelling.trim();
-    // `PtrRepr.rtype_getattr` keeps declared `&` / `*const` wrappers, so a
-    // substituted `&[T]` field still spells the borrowed slice. Peel those
-    // constructors: no field holds an unsized `[T]` by value.
-    let spelling = spelling
+    // Same shapes as [`tyref_pair_field_kind`]: one `Ref` / `RawPtr` over
+    // a slice ([`tyref_pair_slice_item_kind`]), or one extra `Ref` after
+    // [`strip_ty_indirections`]. `*const &[T]` is one pointer word.
+    spelling_bare_slice_pair_kind(spelling)
+        .or_else(|| spelling_one_level_pair_slice(spelling))
+        .or_else(|| {
+            let inner = spelling
+                .strip_prefix("&mut ")
+                .or_else(|| spelling.strip_prefix('&'))?;
+            spelling_one_level_pair_slice(inner.trim())
+        })
+}
+
+/// One `&` / `&mut` / `*const` / `*mut` over a pair slice, the spelling
+/// of [`tyref_pair_slice_item_kind`].
+fn spelling_one_level_pair_slice(spelling: &str) -> Option<majit_ir::rvec::VecItemKind> {
+    let inner = spelling
         .strip_prefix("*const ")
         .or_else(|| spelling.strip_prefix("*mut "))
         .or_else(|| spelling.strip_prefix("&mut "))
-        .or_else(|| spelling.strip_prefix('&'))
-        .map(str::trim)
-        .unwrap_or(spelling);
+        .or_else(|| spelling.strip_prefix('&'))?;
+    spelling_bare_slice_pair_kind(inner.trim())
+}
+
+fn spelling_bare_slice_pair_kind(spelling: &str) -> Option<majit_ir::rvec::VecItemKind> {
+    let spelling = spelling.trim();
     if !(spelling.starts_with('[') && spelling.ends_with(']'))
         || shaped_array_parts(spelling).is_some()
     {

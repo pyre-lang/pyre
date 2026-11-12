@@ -24562,30 +24562,36 @@ mod tests {
         // Intern residual of `*mut T` whose projector is SomePtr (a
         // raw-word owner): token stays `"ref"`, FUNC.RESULT is Int.
         let owner = "ffi_raw::NativeSession";
+        let alias = "NativeSession";
+        let generic_owner = "Owner";
         let sid = majit_ir::descr::StructId::from_canonical(owner);
-        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
-            owner.to_string(),
-            Some(sid),
-        )]));
+        let generic_sid = majit_ir::descr::StructId::from_canonical(generic_owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            (owner.to_string(), Some(sid)),
+            (alias.to_string(), Some(sid)),
+            (generic_owner.to_string(), Some(generic_sid)),
+        ]));
         let mut cc = CallControl::new();
         let mut fields = crate::front::StructFieldRegistry::default();
-        fields
-            .fields
-            .insert(owner.to_string(), vec![("handle".into(), "usize".into())]);
+        let handle = vec![("handle".into(), "usize".into())];
+        fields.fields.insert(owner.to_string(), handle.clone());
+        fields.fields.insert(alias.to_string(), handle.clone());
+        fields.fields.insert(generic_owner.to_string(), handle);
         fields.raw_word_owners.insert(owner.to_string());
+        fields.raw_word_owners.insert(alias.to_string());
+        fields.raw_word_owners.insert(generic_owner.to_string());
         cc.set_struct_fields(fields);
-        cc.set_struct_layout(
-            sid,
-            StructLayout {
-                size: 16,
-                align: 8,
-                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
-                fields: vec![],
-                host: None,
-                ll_struct: std::cell::RefCell::new(None),
-                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
-            },
-        );
+        let raw_layout = || StructLayout {
+            size: 16,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            fields: vec![],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+        };
+        cc.set_struct_layout(sid, raw_layout());
+        cc.set_struct_layout(generic_sid, raw_layout());
         let path = CallPath::from_segments(["connection_session"]);
         let target = CallTarget::function_path(["connection_session"]);
         let mut graph = simple_graph("connection_session").with_return_type("ref");
@@ -24606,6 +24612,42 @@ mod tests {
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Int);
+
+        let generic_path = CallPath::from_segments(["connection_session_generic"]);
+        let generic_target = CallTarget::function_path(["connection_session_generic"]);
+        let mut generic_graph = simple_graph("connection_session_generic").with_return_type("ref");
+        generic_graph.return_class_root = Some("*mut Owner<T>".into());
+        generic_graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(generic_path.clone(), generic_graph);
+        assert_eq!(
+            cc.declared_result_type_for_target(&generic_target),
+            Some(Type::Int)
+        );
+        assert_eq!(cc.declared_return_kind(&generic_path), Some('i'));
+
+        let alias_path = CallPath::from_segments(["connection_session_alias"]);
+        let alias_target = CallTarget::function_path(["connection_session_alias"]);
+        let mut alias_graph = simple_graph("connection_session_alias").with_return_type("ref");
+        alias_graph.return_class_root = Some("*mut NativeSession".into());
+        alias_graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(alias_path.clone(), alias_graph);
+        assert_eq!(
+            cc.declared_result_type_for_target(&alias_target),
+            Some(Type::Int)
+        );
+        assert_eq!(cc.declared_return_kind(&alias_path), Some('i'));
+
+        let unknown_path = CallPath::from_segments(["connection_session_unknown"]);
+        let unknown_target = CallTarget::function_path(["connection_session_unknown"]);
+        let mut unknown_graph = simple_graph("connection_session_unknown").with_return_type("ref");
+        unknown_graph.return_class_root = Some("*mut UnknownAdt".into());
+        unknown_graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(unknown_path.clone(), unknown_graph);
+        assert_eq!(
+            cc.declared_result_type_for_target(&unknown_target),
+            Some(Type::Ref)
+        );
+        assert_eq!(cc.declared_return_kind(&unknown_path), Some('r'));
     }
 
     #[test]

@@ -2998,8 +2998,8 @@ impl<'a> Lowering<'a> {
         if !is_deref_fundecl(fd, self.llbc) {
             return false;
         }
-        deref_impl_owner_leaf(self.llbc, fd)
-            .is_some_and(|leaf| container_identity_deref_owner(&leaf, dest_ty, self.llbc))
+        impl_owner_path(self.llbc, fd)
+            .is_some_and(|path| container_identity_deref_owner(&path, dest_ty, self.llbc))
     }
 
     /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
@@ -9118,3 +9118,6 @@ pub(in crate::front::mir) fn join_atomic_class(
         _ => (AtomicClass::Invalid, None),
     }
 }
+
+#[cfg(test)]
+mod tests;

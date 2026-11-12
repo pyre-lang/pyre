@@ -3133,7 +3133,7 @@ pub(crate) fn rffi_cast(
 }
 
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
-/// (builtin.py:229-242). A harvested `raw_word_owner` (or a variant
+/// (`builtin.py`). A harvested `raw_word_owner` (or a variant
 /// whose enum base is one) is `lltype.malloc(T, flavor='raw')`:
 /// `SomePtr` of the same intern `by_value_payload_annotation` gives.
 pub fn robjmodel_instantiate(

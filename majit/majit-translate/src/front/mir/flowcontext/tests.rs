@@ -11233,13 +11233,15 @@ fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
         0,
         serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]}),
     ));
+    let Some((root, ty)) = lowering.option_niche_null_cast(&option_mut) else {
+        panic!(
+            "Option<&mut RawStruct> None is the null SomePtr int word, got {:?}",
+            lowering.option_niche_null_cast(&option_mut)
+        );
+    };
     assert!(
-        matches!(
-            lowering.option_niche_null_cast(&option_mut),
-            Some((_, ValueType::Int))
-        ),
-        "Option<&mut RawStruct> None is the null SomePtr int word, got {:?}",
-        lowering.option_niche_null_cast(&option_mut)
+        matches!(ty, ValueType::Int) && root.contains("RawCell"),
+        "Option<&mut RawStruct> None is the null SomePtr int word of RawCell, got ({root:?}, {ty:?})"
     );
 }
 

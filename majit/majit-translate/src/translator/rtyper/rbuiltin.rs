@@ -4738,23 +4738,29 @@ fn ptr_write_effective_pointee(
     r_dst: &dyn Repr,
 ) -> Result<Option<LowLevelType>, TyperError> {
     match ptr_write_dst_pointee(hop, r_dst) {
-        Some(LowLevelType::Array(arr))
-            if arr._hints.get("nolength") == Some(&ConstValue::Bool(true)) =>
-        {
-            Ok(Some(arr.OF.clone()))
+        Some(ll) => {
+            let ll = ll.become_container();
+            match ll {
+                LowLevelType::Array(arr)
+                    if arr._hints.get("nolength") == Some(&ConstValue::Bool(true)) =>
+                {
+                    Ok(Some(arr.OF.become_container()))
+                }
+                ref ll if ll._is_varsize() => Err(TyperError::message(format!(
+                    "ptr::write: cannot size varsize pointee {}",
+                    ll.short_name()
+                ))),
+                other => Ok(Some(other)),
+            }
         }
-        Some(ll) if ll._is_varsize() => Err(TyperError::message(format!(
-            "ptr::write: cannot size varsize pointee {}",
-            ll.short_name()
-        ))),
-        other => Ok(other),
+        None => Ok(None),
     }
 }
 
 /// `T` is a struct or a `FixedSizeArray` copied by value (`sizeof(T)`).
 fn ptr_write_copies_pointee_by_value(pointee: Option<&LowLevelType>) -> bool {
     matches!(
-        pointee,
+        pointee.map(LowLevelType::become_container).as_ref(),
         Some(LowLevelType::Struct(_)) | Some(LowLevelType::FixedSizeArray(_))
     )
 }
@@ -5049,13 +5055,14 @@ fn ptr_as_address(
 /// (`rffi.py` `CCHARP`) included — sizes by `OF`. A varsize Struct
 /// cannot be sized at `n=None` (`llmemory.py` `_sizeof_none`).
 fn copy_nonoverlapping_item_type(pointee: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    let pointee = pointee.become_container();
     match pointee {
-        LowLevelType::Array(arr) => Ok(arr.OF.clone()),
+        LowLevelType::Array(arr) => Ok(arr.OF.become_container()),
         other if other._is_varsize() => Err(TyperError::message(format!(
             "copy_nonoverlapping: cannot size varsize pointee {}",
             other.short_name()
         ))),
-        other => Ok(other.clone()),
+        other => Ok(other),
     }
 }
 
@@ -7218,6 +7225,52 @@ mod tests {
             msg.contains("Array Signed"),
             "TyperError must name the pointee: {msg}"
         );
+    }
+
+    #[test]
+    fn ptr_write_of_resolved_forward_reference_struct_copies_by_value() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ForwardReference, Ptr, PtrTarget, Struct,
+        };
+
+        // `ForwardReference.become` (`lltype.py`) makes the pointee a
+        // Struct before `sizeof` / `raw_memcopy`. The enum variant stays
+        // `ForwardReference` until `become_container`.
+        let real = LowLevelType::Struct(Box::new(Struct::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let fwd = ForwardReference::new();
+        fwd.r#become(real.clone()).unwrap();
+        let pointee = LowLevelType::ForwardReference(Box::new(fwd.clone()));
+        assert!(
+            ptr_write_copies_pointee_by_value(Some(&pointee)),
+            "resolved ForwardReference Struct is copied by value"
+        );
+        let item = copy_nonoverlapping_item_type(&pointee).expect("sizeof path resolves");
+        assert_eq!(item, real);
+
+        let dst = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+        let (llops, result, translated) = translate_ptr_write(dst.clone(), dst);
+        translated.expect("resolved ForwardReference struct ptr::write copies sizeof(T)");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memcopy"),
+            "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "raw_store"),
+            "a resolved ForwardReference Struct is memcpy, not a word store: {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
     }
 
     #[test]

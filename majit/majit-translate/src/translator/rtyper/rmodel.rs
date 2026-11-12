@@ -195,13 +195,14 @@ fn field_on_first_struct_chain(ptr: &lltype::Ptr, attr: &str) -> bool {
 
 /// Cast `vinst` along `_first_struct` until `attr` is a field of the
 /// current struct. rclass `InstanceRepr.getfield` does the same walk
-/// with `force_cast=True` on `rbase`.
+/// with `force_cast=True` on `rbase`. Returns the pointer value and
+/// the struct that owns `attr`.
 fn ptr_cast_along_first_struct(
     hop: &HighLevelOp,
     mut vinst: Hlvalue,
     mut current: lltype::Ptr,
     attr: &str,
-) -> Result<Hlvalue, TyperError> {
+) -> Result<(Hlvalue, lltype::Ptr), TyperError> {
     while ptr_target_field_type(&current.TO, attr).is_none() {
         let next = current
             .first_struct_ptr()
@@ -214,7 +215,46 @@ fn ptr_cast_along_first_struct(
             })?;
         current = next;
     }
-    Ok(vinst)
+    Ok((vinst, current))
+}
+
+/// `rptr.py` `PtrRepr.rtype_getattr` once `FIELD_TYPE` is on `TO`:
+/// `isinstance(FIELD_TYPE, ContainerType)` chooses `cast_pointer` /
+/// InteriorPtr / `getsubstruct`, else `getfield`.
+fn ptrrepr_getattr_from_field_type(
+    hop: &HighLevelOp,
+    vinst: Hlvalue,
+    current: &lltype::Ptr,
+    attr: &str,
+    field_type: &LowLevelType,
+    r_result: &dyn Repr,
+    v_attr: Hlvalue,
+) -> RTypeResult {
+    let field_type = field_type.become_container();
+    let newopname = if field_type.is_container_type() {
+        if let Some(struct_t) = ptr_target_struct(&current.TO)
+            && let Some((first_attr, first_struct)) = struct_t._first_struct()
+            && first_attr == attr
+            && matches!(&field_type, LowLevelType::Struct(t) if t.as_ref() == first_struct)
+        {
+            return Ok(hop.genop(
+                "cast_pointer",
+                vec![vinst],
+                GenopResult::LLType(r_result.lowleveltype().clone()),
+            ));
+        } else if r_result.class_name() == "InteriorPtrRepr" {
+            return Ok(Some(vinst));
+        } else {
+            "getsubstruct"
+        }
+    } else {
+        "getfield"
+    };
+    Ok(hop.genop(
+        newopname,
+        vec![vinst, v_attr],
+        GenopResult::LLType(r_result.lowleveltype().clone()),
+    ))
 }
 
 fn ptr_target_array_item_type(target: &lltype::PtrTarget) -> Option<LowLevelType> {
@@ -2063,54 +2103,26 @@ impl Repr for PtrRepr {
                 .clone();
             return HighLevelOp::inputconst(&r_result, &value).map(|c| Some(Hlvalue::Constant(c)));
         }
-        if ptr_target_field_type(&self.ptrtype().TO, &attr).is_none() {
-            if field_on_first_struct_chain(self.ptrtype(), &attr) {
-                let void = LowLevelType::Void;
-                let vlist =
-                    hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
-                let vinst = ptr_cast_along_first_struct(
-                    hop,
-                    vlist[0].clone(),
-                    self.ptrtype().clone(),
-                    &attr,
-                )?;
-                return Ok(hop.genop(
-                    "getfield",
-                    vec![vinst, vlist[1].clone()],
-                    GenopResult::LLType(r_result.lowleveltype().clone()),
-                ));
-            }
+        if ptr_target_field_type(&self.ptrtype().TO, &attr).is_none()
+            && !field_on_first_struct_chain(self.ptrtype(), &attr)
+        {
             return Err(TyperError::message(self.ptrtype()._nofield(&attr)));
         }
-        let field_type = ptr_target_field_type(&self.ptrtype().TO, &attr)
-            .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
-        let newopname = if field_type.is_container_type() {
-            if let Some(struct_t) = ptr_target_struct(&self.ptrtype().TO)
-                && let Some((first_attr, first_struct)) = struct_t._first_struct()
-                && first_attr == attr
-                && matches!(&field_type, LowLevelType::Struct(t) if t.as_ref() == first_struct)
-            {
-                let v_self = hop.inputarg(self, 0)?;
-                return Ok(hop.genop(
-                    "cast_pointer",
-                    vec![v_self],
-                    GenopResult::LLType(r_result.lowleveltype().clone()),
-                ));
-            } else if r_result.class_name() == "InteriorPtrRepr" {
-                return hop.inputarg(self, 0).map(Some);
-            } else {
-                "getsubstruct"
-            }
-        } else {
-            "getfield"
-        };
         let void = LowLevelType::Void;
         let vlist = hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
-        Ok(hop.genop(
-            newopname,
-            vlist,
-            GenopResult::LLType(r_result.lowleveltype().clone()),
-        ))
+        let (vinst, current) =
+            ptr_cast_along_first_struct(hop, vlist[0].clone(), self.ptrtype().clone(), &attr)?;
+        let field_type = ptr_target_field_type(&current.TO, &attr)
+            .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
+        ptrrepr_getattr_from_field_type(
+            hop,
+            vinst,
+            &current,
+            &attr,
+            &field_type,
+            r_result.as_ref(),
+            vlist[1].clone(),
+        )
     }
 
     /// `BuiltinMethodRepr.rtype_simple_call` dispatch target for the ptr
@@ -2165,7 +2177,7 @@ impl Repr for PtrRepr {
         let vinst = if ptr_target_field_type(&self.ptrtype().TO, &attr).is_some() {
             vlist[0].clone()
         } else {
-            ptr_cast_along_first_struct(hop, vlist[0].clone(), self.ptrtype().clone(), &attr)?
+            ptr_cast_along_first_struct(hop, vlist[0].clone(), self.ptrtype().clone(), &attr)?.0
         };
         hop.genop(
             "setfield",
@@ -3939,6 +3951,61 @@ mod tests {
         assert_eq!(ops.ops.len(), 2);
         assert_eq!(ops.ops[0].opname, "cast_pointer");
         assert_eq!(ops.ops[1].opname, "getfield");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_getattr_of_inherited_container_field_casts_then_getsubstruct() {
+        // `rptr.py` `PtrRepr.rtype_getattr`: after the `_first_struct`
+        // walk, `isinstance(FIELD_TYPE, ContainerType)` selects
+        // `getsubstruct` (the field is not the parent's first struct).
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+        let nested = Struct::new("Nested", vec![("n".into(), LowLevelType::Signed)]);
+        let nested_ptr = Ptr {
+            TO: PtrTarget::Struct(nested.clone()),
+        };
+        let inner = Struct::new(
+            "Inner",
+            vec![
+                ("y".into(), LowLevelType::Signed),
+                ("nested".into(), LowLevelType::Struct(Box::new(nested))),
+            ],
+        );
+        let outer_ptr = Ptr {
+            TO: PtrTarget::Struct(Struct::new(
+                "Outer",
+                vec![
+                    ("x".into(), LowLevelType::Struct(Box::new(inner))),
+                    ("z".into(), LowLevelType::Signed),
+                ],
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(outer_ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_nested: Arc<dyn Repr> = Arc::new(PtrRepr::new(nested_ptr.clone()));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "getattr");
+        let v_ptr = Variable::new();
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(outer_ptr.clone()))));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_ptr), void_field_const("nested")]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(outer_ptr)),
+            const_string_annotation("nested"),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(impossible_repr() as Arc<dyn Repr>)]);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Ptr(SomePtr::new(nested_ptr)));
+        *hop.r_result.borrow_mut() = Some(r_nested);
+
+        let result = r_ptr.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "cast_pointer");
+        assert_eq!(ops.ops[1].opname, "getsubstruct");
     }
 
     #[test]

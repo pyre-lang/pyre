@@ -650,9 +650,10 @@ mod tests {
         assert!(cc.has_function_graph(&path));
         register_ll_charpsize2str_helper(&mut cc);
         assert!(cc.has_function_graph(&path));
-        let mut g = build_ll_charpsize2str_graph()
-            .with_return_type(crate::translator::rtyper::cutover::STR_RETURN_TYPE);
-        g.return_is_str = true;
+        let g = cc
+            .function_graphs()
+            .get_built(&path)
+            .expect("registered helper graph");
         assert!(g.return_is_str);
         assert_eq!(
             g.return_type.as_deref(),

@@ -1774,7 +1774,12 @@ fn collect_opaque_raw_ptr_from_node(
                 if seen_dedup.insert(id)
                     && let Some(body) = llbc.dedup_body(id)
                 {
-                    collect_opaque_raw_ptr_from_node(llbc, body, ids, seen_dedup, depth + 1);
+                    // A Deduplicated body is a hash-cons root. Restart
+                    // depth so a first visit through nested generics that
+                    // hits the cutoff cannot hide an Opaque pointee from a
+                    // later shallower occurrence. `seen_dedup` is the
+                    // cycle guard.
+                    collect_opaque_raw_ptr_from_node(llbc, body, ids, seen_dedup, 0);
                 }
                 return;
             }
@@ -2190,6 +2195,12 @@ impl CrateLoweringState {
         module_filter: Option<&std::collections::HashSet<String>>,
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Self {
+        // Fill `value_type_inputs` before the stack walk. `render_adt_type_args`
+        // reads that OnceLock with `get` (it cannot `get_or_init`: harvest
+        // re-enters through `is_unit_type`). Class-root spelling during
+        // `ensure_stack_sensitive_fns` / `derive_program_metadata` then
+        // sees the declared-GC set.
+        let _ = value_type_inputs(llbc);
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
