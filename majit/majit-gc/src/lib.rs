@@ -10,20 +10,17 @@ pub use header::{
 #[doc(hidden)]
 pub use paste;
 
+/// Install the `const_ptr_table` GC hooks (`gc_current_object_address`,
+/// `gc_is_young_object`, `remember_const_pool`).
+///
 /// `history.py` `ConstPtr` is rooted by the holder that stores the box
 /// (`trace_index`), not by every slot `intern` has ever recorded.
-/// The registration stays so a collector still has a named walker; it
-/// does not keep dead trace constants alive. Compiled-code constants
-/// use `gcreftracer.GcTable`.
-/// Idempotent: `register_extra_root_walker` dedups by function address.
+/// Compiled-code constants use `gcreftracer.GcTable`.
 pub fn install_const_ptr_table_walker() {
-    shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
     majit_ir::set_gc_is_young_object(Some(gc_is_young_object));
     majit_ir::set_remember_const_pool(Some(gc_remember_const_pool));
 }
-
-fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 
 /// GC traits and interfaces for the JIT.
 ///

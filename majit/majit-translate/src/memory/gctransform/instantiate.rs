@@ -50,10 +50,11 @@ pub(crate) enum TraitCallRes {
 /// `generics` is the call site's generic arguments (`trait_refs`).
 ///
 /// During [`build_call_graph`] this creates a specialized node when the
-/// callee body has a `Clause` / `ParentClause` Trait call that resolves
-/// to a `TraitImpl` method. After the graph is built, it is lookup-only
-/// on `spec_memo` and falls back to `callee` when the instantiation was
-/// not recorded — never narrower than the generic node.
+/// callee body has a `Clause` / `ParentClause` Trait call — or a Regular
+/// `Fun` that forwards such a clause in `generics.trait_refs` — that
+/// resolves to a `TraitImpl` method. After the graph is built, it is
+/// lookup-only on `spec_memo` and falls back to `callee` when the
+/// instantiation was not recorded — never narrower than the generic node.
 pub(crate) fn callee_node_for_call(
     graph: &CallGraph,
     llbc: &Llbc,
@@ -325,8 +326,10 @@ impl<'a> Builder<'a> {
             self.graph.spec_memo.insert(key, callee);
             return callee;
         };
-        if !has_resolvable_trait_call(self.llbc, &body, &bindings) {
-            self.graph.spec_memo.insert(key, callee);
+        // Identity while this instantiation is in progress so a Regular
+        // forward that mutually recurses terminates (`node == callee`).
+        self.graph.spec_memo.insert(key.clone(), callee);
+        if !self.has_resolvable_trait_call(&body, &bindings, depth) {
             return callee;
         }
         let spec_id = self.next_id;
@@ -433,6 +436,10 @@ impl<'a> Builder<'a> {
                         }
                     }
                     CallKind::Ptr(v) => {
+                        // A `global_hook!` wrapper with a closed trampoline
+                        // family is recovered by
+                        // `CallGraph::apply_hook_call_families`
+                        // (`GraphAnalyzer.analyze_indirect_call`).
                         unresolved = true;
                         if note_opaque {
                             self.note_opaque(Some(v), "Ptr");
@@ -446,6 +453,7 @@ impl<'a> Builder<'a> {
                     }
                 },
                 CallFunc::Dynamic(op, _) => {
+                    // Same closed-family recovery as `CallKind::Ptr`.
                     unresolved = true;
                     if note_opaque {
                         let ty = match op {
@@ -506,6 +514,7 @@ impl<'a> Builder<'a> {
     }
 
     fn finish(mut self) -> CallGraph {
+        self.graph.apply_hook_call_families();
         for (&caller, cs) in &self.graph.callees {
             for &c in cs {
                 self.graph.callers.entry(c).or_default().insert(caller);
@@ -513,34 +522,57 @@ impl<'a> Builder<'a> {
         }
         self.graph
     }
-}
 
-fn has_resolvable_trait_call(llbc: &Llbc, body: &Unstructured, bindings: &[Value]) -> bool {
-    let forward = crate::front::mir::forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
-        if !call_graph_walks_block(bb, forward[bb_idx]) {
-            continue;
+    /// True when a clause-bound Trait terminator resolves to a method body,
+    /// or a Regular `Fun` that still carries a `Clause` / `ParentClause`
+    /// substitutes to a `TraitImpl` whose callee itself specializes.
+    fn has_resolvable_trait_call(
+        &mut self,
+        body: &Unstructured,
+        bindings: &[Value],
+        depth: usize,
+    ) -> bool {
+        let forward = crate::front::mir::forward_reachable_mask(self.llbc, body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !call_graph_walks_block(bb, forward[bb_idx]) {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            match &reg.kind {
+                CallKind::Trait(v) => {
+                    if !payload_is_clause_or_parent(self.llbc, v) {
+                        continue;
+                    }
+                    if matches!(
+                        resolve_trait_call(self.llbc, v, bindings),
+                        TraitCallRes::Method { .. }
+                    ) {
+                        return true;
+                    }
+                }
+                CallKind::Fun(FunId::Regular { id: callee }) => {
+                    if !generics_has_clause_or_parent(self.llbc, &reg.generics) {
+                        continue;
+                    }
+                    if instantiation_memo_key(self.llbc, bindings, *callee, &reg.generics).is_none()
+                    {
+                        continue;
+                    }
+                    let node = self.callee_node_for_call(bindings, *callee, &reg.generics, depth);
+                    if node != *callee {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
-            continue;
-        };
-        let CallFunc::Regular(reg) = &call.func else {
-            continue;
-        };
-        let CallKind::Trait(v) = &reg.kind else {
-            continue;
-        };
-        if !payload_is_clause_or_parent(llbc, v) {
-            continue;
-        }
-        if matches!(
-            resolve_trait_call(llbc, v, bindings),
-            TraitCallRes::Method { .. }
-        ) {
-            return true;
-        }
+        false
     }
-    false
 }
 
 fn body_has_clause_trait_call(llbc: &Llbc, body: &Unstructured) -> bool {
@@ -555,20 +587,39 @@ fn body_has_clause_trait_call(llbc: &Llbc, body: &Unstructured) -> bool {
         let CallFunc::Regular(reg) = &call.func else {
             continue;
         };
-        let CallKind::Trait(v) = &reg.kind else {
-            continue;
-        };
-        if payload_is_clause_or_parent(llbc, v) {
-            return true;
+        match &reg.kind {
+            CallKind::Trait(v) => {
+                if payload_is_clause_or_parent(llbc, v) {
+                    return true;
+                }
+            }
+            CallKind::Fun(FunId::Regular { .. }) => {
+                if generics_has_clause_or_parent(llbc, &reg.generics) {
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
     false
+}
+
+fn generics_has_clause_or_parent(llbc: &Llbc, generics: &Value) -> bool {
+    let generics = peel_generic_args(generics);
+    let Some(refs) = generics.get("trait_refs").and_then(Value::as_array) else {
+        return false;
+    };
+    refs.iter().any(|tref| ref_is_clause_or_parent(llbc, tref))
 }
 
 fn payload_is_clause_or_parent(llbc: &Llbc, payload: &Value) -> bool {
     let Some(tref) = payload.as_array().and_then(|a| a.first()) else {
         return false;
     };
+    ref_is_clause_or_parent(llbc, tref)
+}
+
+fn ref_is_clause_or_parent(llbc: &Llbc, tref: &Value) -> bool {
     let Some((obj, _)) = unwrap_ref_binders(tref, llbc, 0) else {
         return false;
     };

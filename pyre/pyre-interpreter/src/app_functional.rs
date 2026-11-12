@@ -203,21 +203,15 @@ pub(crate) fn install_applevel_builtins() {
     let _ = pyre_object::gc_roots::pin_root(w_builtin);
     if sorted_placeholder {
         publish_one(
-            pyre_object::gc_roots::shadow_stack_get(builtins_slot),
+            builtins_slot,
             "sorted",
             sorted_slot,
             SIGS[SORTED],
-            pyre_object::gc_roots::shadow_stack_get(w_builtin_slot),
+            w_builtin_slot,
         );
     }
     if sum_placeholder {
-        publish_one(
-            pyre_object::gc_roots::shadow_stack_get(builtins_slot),
-            "sum",
-            sum_slot,
-            SIGS[SUM],
-            pyre_object::gc_roots::shadow_stack_get(w_builtin_slot),
-        );
+        publish_one(builtins_slot, "sum", sum_slot, SIGS[SUM], w_builtin_slot);
     }
 }
 
@@ -244,26 +238,20 @@ fn is_placeholder(binding: PyObjectRef, name: &str) -> bool {
 }
 
 fn publish_one(
-    builtins: PyObjectRef,
+    builtins_slot: usize,
     name: &str,
     func_slot: usize,
     sig_text: &str,
-    w_builtin: PyObjectRef,
+    w_builtin_slot: usize,
 ) {
-    // Caller already opened `push_roots`. Pin `builtins` and `w_builtin`
-    // into that bracket the same way `func` lives at `func_slot`;
-    // `module_ns_store` / `w_str_new` / `fset_func_text_signature` can
-    // collect (`shadowstack.py push_roots` / `pop_roots`).
-    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(builtins);
-    let w_builtin_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_builtin);
+    // Caller already opened `push_roots` and pinned `builtins` / `w_builtin`.
+    // Reload those slots for every use (`shadowstack.py pop_roots`); a raw
+    // `PyObjectRef` local must not stay live across `module_ns_store`.
     crate::module_ns_delete(pyre_object::gc_roots::shadow_stack_get(builtins_slot), name);
-    let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     crate::module_ns_store(
         pyre_object::gc_roots::shadow_stack_get(builtins_slot),
         name,
-        func,
+        pyre_object::gc_roots::shadow_stack_get(func_slot),
     );
     // `func` is the old-gen BuiltinFunction; `w_str_new` may allocate in
     // the nursery.  Reload `func` after that alloc (it cannot move) and
