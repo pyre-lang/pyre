@@ -19,18 +19,43 @@ pub mod cConfig {
     include!(concat!(env!("OUT_DIR"), "/rposix_cconfig.rs"));
 }
 
+/// `rposix.py` `dirent_config` `DIRENT`.
+#[cfg(unix)]
+pub use cConfig::DIRENT;
+/// `rposix.py` `times_config` `TIMEVAL`.
+#[cfg(rposix_have_utimes)]
+pub use cConfig::TIMEVAL;
 /// `rposix.TIOCGWINSZ` (`CConfig`).
 #[cfg(unix)]
 pub use cConfig::TIOCGWINSZ;
+/// `rposix.py` `uts_config` `UTSNAME`.
+#[cfg(unix)]
+pub use cConfig::UTSNAME;
 #[cfg(any(unix, windows))]
 pub use cConfig::{
-    CLOCK_T, F_LOCK, F_TEST, F_TLOCK, F_ULOCK, GETPGRP_HAVE_ARG, HAVE_D_TYPE, HAVE_FADVISE,
-    HAVE_FALLOCATE, HAVE_UTIMES, O_NONBLOCK, OFF_T, OFF_T_SIZE, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
-    SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR, SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG,
-    UTIMBUF,
+    CLOCK_T, F_LOCK, F_TEST, F_TLOCK, F_ULOCK, GETPGRP_HAVE_ARG, HAVE_D_TYPE, HAVE_DUP3,
+    HAVE_FADVISE, HAVE_FALLOCATE, HAVE_PIPE2, HAVE_UTIMES, O_NONBLOCK, OFF_T, OFF_T_SIZE,
+    PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
+    SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
 };
+/// `rposix.py` `constants` (`pipe_config`).
+#[cfg(any(unix, windows))]
+pub use cConfig::{
+    COPYFILE_DATA, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS,
+    O_CLOEXEC,
+};
+/// `rposix.py` `dirent_config` `DT_*`.
+#[cfg(rposix_have_d_type)]
+pub use cConfig::{DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN};
 #[cfg(unix)]
 pub use cConfig::{GID_T, ID_T, NCCS, TMS, UID_T};
+/// `rposix.py` `advise_config`.
+#[cfg(rposix_have_fadvise)]
+pub use cConfig::{
+    POSIX_FADV_DONTNEED, POSIX_FADV_NOREUSE, POSIX_FADV_NORMAL, POSIX_FADV_RANDOM,
+    POSIX_FADV_SEQUENTIAL, POSIX_FADV_WILLNEED,
+};
 
 /// `rposix.py` `assert OFF_T_SIZE == rffi.sizeof(rffi.LONGLONG)`.
 #[cfg(unix)]
@@ -839,7 +864,7 @@ crate::rffi::llexternal!(
 crate::rffi::llexternal!(
     pub c_readdir = "readdir",
     [*mut libc::DIR],
-    *mut libc::dirent,
+    *mut DIRENT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO,
     macro = true
@@ -905,9 +930,9 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_posix_fallocate` and `rposix.c_posix_fadvise` save errno.
-// `HAVE_FALLOCATE` / `HAVE_FADVISE` are linux here. `rposix.posix_fadvise`
-// uses the C return value as the errno.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// `rposix.posix_fadvise` uses the C return value as the errno.
+// `rposix.py` `if HAVE_FALLOCATE:`.
+#[cfg(rposix_have_fallocate)]
 crate::rffi::llexternal!(
     pub c_posix_fallocate = "posix_fallocate",
     [crate::rffi::INT, OFF_T, OFF_T],
@@ -916,7 +941,8 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// `rposix.py` `if HAVE_FADVISE:`.
+#[cfg(rposix_have_fadvise)]
 crate::rffi::llexternal!(
     pub c_posix_fadvise = "posix_fadvise",
     [crate::rffi::INT, OFF_T, OFF_T, crate::rffi::INT],
@@ -1432,7 +1458,7 @@ crate::rffi::llexternal!(
 #[cfg(rposix_have_utimes)]
 crate::rffi::llexternal!(
     pub c_utimes = "utimes",
-    [*const libc::c_char, *const libc::timeval],
+    [*const libc::c_char, *const TIMEVAL],
     crate::rffi::INT,
     compilation_info = UTIME_ECI,
     save_err = RFFI_SAVE_ERRNO
@@ -1464,20 +1490,21 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_lutimes` is behind `HAVE_LUTIMES`. `rposix.c_futimes` is
-// behind `HAVE_FUTIMES`. Both save errno.
-#[cfg(unix)]
+// behind `HAVE_FUTIMES`. Both save errno. `TIMEVAL2P` is `times_config`
+// `TIMEVAL`, so these share `rposix_have_utimes` with `c_utimes`.
+#[cfg(rposix_have_utimes)]
 crate::rffi::llexternal!(
     pub c_lutimes = "lutimes",
-    [*const libc::c_char, *const libc::timeval],
+    [*const libc::c_char, *const TIMEVAL],
     crate::rffi::INT,
     compilation_info = UTIME_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(unix)]
+#[cfg(rposix_have_utimes)]
 crate::rffi::llexternal!(
     pub c_futimes = "futimes",
-    [crate::rffi::INT, *const libc::timeval],
+    [crate::rffi::INT, *const TIMEVAL],
     crate::rffi::INT,
     compilation_info = UTIME_ECI,
     save_err = RFFI_SAVE_ERRNO
@@ -1784,8 +1811,11 @@ pub fn _listdir(
             error = get_saved_errno();
             break;
         }
-        let name =
-            unsafe { crate::rffi::charp2str((*direntp).d_name.as_ptr() as crate::rffi::CCHARP)? };
+        let name = unsafe {
+            crate::rffi::charp2str(
+                (*direntp).c_d_name.as_ptr() as *const libc::c_char as crate::rffi::CCHARP
+            )?
+        };
         if name != b"." && name != b".." {
             result.push(name);
         }
@@ -1914,6 +1944,122 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+/// `rposix.py` `WAIT_MACROS`.
+#[cfg(unix)]
+pub const WAIT_MACROS: [&str; 8] = [
+    "WCOREDUMP",
+    "WIFSTOPPED",
+    "WIFSIGNALED",
+    "WIFEXITED",
+    "WEXITSTATUS",
+    "WSTOPSIG",
+    "WTERMSIG",
+    "WIFCONTINUED",
+];
+
+/// `rposix.py` `_make_waitmacro`: `external(name, [rffi.INT], lltype.Signed,
+/// macro=_MACRO_ON_POSIX)`. `WAIT_ECI` already includes `sys/wait.h`.
+#[cfg(unix)]
+#[allow(non_snake_case)]
+mod wait_macros {
+    crate::rffi::llexternal!(
+        pub c_WCOREDUMP = "WCOREDUMP",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WIFSTOPPED = "WIFSTOPPED",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WIFSIGNALED = "WIFSIGNALED",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WIFEXITED = "WIFEXITED",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WEXITSTATUS = "WEXITSTATUS",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WSTOPSIG = "WSTOPSIG",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WTERMSIG = "WTERMSIG",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+    crate::rffi::llexternal!(
+        pub c_WIFCONTINUED = "WIFCONTINUED",
+        [crate::rffi::INT],
+        crate::rffi::SIGNED,
+        compilation_info = super::WAIT_ECI,
+        macro = true
+    );
+
+    #[majit_macros::replace_os_function("WCOREDUMP")]
+    pub fn WCOREDUMP(status: i32) -> bool {
+        unsafe { c_WCOREDUMP(status) != 0 }
+    }
+    #[majit_macros::replace_os_function("WIFSTOPPED")]
+    pub fn WIFSTOPPED(status: i32) -> bool {
+        unsafe { c_WIFSTOPPED(status) != 0 }
+    }
+    #[majit_macros::replace_os_function("WIFSIGNALED")]
+    pub fn WIFSIGNALED(status: i32) -> bool {
+        unsafe { c_WIFSIGNALED(status) != 0 }
+    }
+    #[majit_macros::replace_os_function("WIFEXITED")]
+    pub fn WIFEXITED(status: i32) -> bool {
+        unsafe { c_WIFEXITED(status) != 0 }
+    }
+    #[majit_macros::replace_os_function("WEXITSTATUS")]
+    pub fn WEXITSTATUS(status: i32) -> i64 {
+        unsafe { c_WEXITSTATUS(status) as i64 }
+    }
+    #[majit_macros::replace_os_function("WSTOPSIG")]
+    pub fn WSTOPSIG(status: i32) -> i64 {
+        unsafe { c_WSTOPSIG(status) as i64 }
+    }
+    #[majit_macros::replace_os_function("WTERMSIG")]
+    pub fn WTERMSIG(status: i32) -> i64 {
+        unsafe { c_WTERMSIG(status) as i64 }
+    }
+    #[majit_macros::replace_os_function("WIFCONTINUED")]
+    pub fn WIFCONTINUED(status: i32) -> bool {
+        unsafe { c_WIFCONTINUED(status) != 0 }
+    }
+}
+
+#[cfg(unix)]
+pub use wait_macros::{
+    WCOREDUMP, WEXITSTATUS, WIFCONTINUED, WIFEXITED, WIFSIGNALED, WIFSTOPPED, WSTOPSIG, WTERMSIG,
+    c_WCOREDUMP, c_WEXITSTATUS, c_WIFCONTINUED, c_WIFEXITED, c_WIFSIGNALED, c_WIFSTOPPED,
+    c_WSTOPSIG, c_WTERMSIG,
+};
+
 // `rposix.c_getlogin` is `releasegil=False` and saves errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -1974,7 +2120,7 @@ crate::rffi::external_compilation_info! {
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_uname = "uname",
-    [*mut libc::utsname],
+    [*mut UTSNAME],
     crate::rffi::INT,
     compilation_info = UTSNAME_ECI,
     save_err = RFFI_SAVE_ERRNO
@@ -2859,15 +3005,8 @@ crate::rffi::llexternal!(
     compilation_info = STATUS_FLAGS_ECI
 );
 
-// `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
+// `rposix.c_pipe2` saves errno. `rposix.py` `if HAVE_PIPE2:`.
+#[cfg(rposix_have_pipe2)]
 crate::rffi::llexternal!(
     pub c_pipe2 = "pipe2",
     [*mut libc::c_int, crate::rffi::INT],
@@ -3440,11 +3579,54 @@ mod tests {
         assert_eq!(F_TLOCK, Some(libc::F_TLOCK));
         assert_eq!(F_ULOCK, Some(libc::F_ULOCK));
         assert_eq!(F_TEST, Some(libc::F_TEST));
+        assert_eq!(O_CLOEXEC, Some(libc::O_CLOEXEC as i32));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            // `rposix.eci` does not include `copyfile.h`; `DefinedConstantInteger`
+            // leaves `COPYFILE_DATA` None. pypy3 `posix` has no `_COPYFILE_DATA`.
+            assert_eq!(COPYFILE_DATA, None);
+            assert!(!HAVE_PIPE2);
+            assert!(!HAVE_DUP3);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(HAVE_PIPE2);
+            assert!(HAVE_DUP3);
+            assert_eq!(POSIX_FADV_WILLNEED, Some(libc::POSIX_FADV_WILLNEED as i32));
+            assert_eq!(POSIX_FADV_NORMAL, Some(libc::POSIX_FADV_NORMAL as i32));
+            assert_eq!(
+                POSIX_FADV_SEQUENTIAL,
+                Some(libc::POSIX_FADV_SEQUENTIAL as i32)
+            );
+            assert_eq!(POSIX_FADV_RANDOM, Some(libc::POSIX_FADV_RANDOM as i32));
+            assert_eq!(POSIX_FADV_NOREUSE, Some(libc::POSIX_FADV_NOREUSE as i32));
+            assert_eq!(POSIX_FADV_DONTNEED, Some(libc::POSIX_FADV_DONTNEED as i32));
+        }
         assert_eq!(std::mem::size_of::<TMS>(), std::mem::size_of::<libc::tms>());
         assert_eq!(
             std::mem::size_of::<UTIMBUF>(),
             std::mem::size_of::<libc::utimbuf>()
         );
+        assert_eq!(
+            std::mem::size_of::<DIRENT>(),
+            std::mem::size_of::<libc::dirent>()
+        );
+        assert_eq!(
+            std::mem::size_of::<UTSNAME>(),
+            std::mem::size_of::<libc::utsname>()
+        );
+        #[cfg(rposix_have_utimes)]
+        assert_eq!(
+            std::mem::size_of::<TIMEVAL>(),
+            std::mem::size_of::<libc::timeval>()
+        );
+        #[cfg(rposix_have_d_type)]
+        {
+            assert_eq!(DT_UNKNOWN, libc::DT_UNKNOWN as i32);
+            assert_eq!(DT_REG, libc::DT_REG as i32);
+            assert_eq!(DT_DIR, libc::DT_DIR as i32);
+            assert_eq!(DT_LNK, libc::DT_LNK as i32);
+        }
         assert!(HAVE_UTIMES);
     }
 
@@ -3775,7 +3957,10 @@ mod tests {
                 assert_eq!(get_saved_errno(), 0);
                 break;
             }
-            let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+            let name = unsafe {
+                std::ffi::CStr::from_ptr((*ent).c_d_name.as_ptr() as *const libc::c_char)
+            }
+            .to_bytes();
             if name == b"f" {
                 saw = true;
             }
@@ -4282,10 +4467,9 @@ mod tests {
         assert_eq!(st.st_mtime, 1_700_000_222);
         #[cfg(rposix_have_utimes)]
         {
-            let tv = libc::timeval {
-                tv_sec: 1_700_000_333,
-                tv_usec: 0,
-            };
+            let mut tv = unsafe { std::mem::zeroed::<TIMEVAL>() };
+            tv.c_tv_sec = 1_700_000_333 as _;
+            tv.c_tv_usec = 0 as _;
             let tvs = [tv, tv];
             assert_eq!(
                 unsafe { c_utimes(c_file.as_ptr(), tvs.as_ptr()) },
@@ -4295,38 +4479,36 @@ mod tests {
             );
             assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
             assert_eq!(st.st_mtime, 1_700_000_333);
+            let fd = unsafe { c_open(c_file.as_ptr(), libc::O_RDWR, 0) };
+            assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+            let mut later_tv = unsafe { std::mem::zeroed::<TIMEVAL>() };
+            later_tv.c_tv_sec = 1_700_000_444 as _;
+            later_tv.c_tv_usec = 0 as _;
+            let later_tvs = [later_tv, later_tv];
+            assert_eq!(
+                unsafe { c_futimes(fd, later_tvs.as_ptr()) },
+                0,
+                "c_futimes errno {}",
+                get_saved_errno()
+            );
+            assert_eq!(unsafe { c_close(fd) }, 0);
+            assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+            assert_eq!(st.st_mtime, 1_700_000_444);
+            let soft = dir.join("s");
+            let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { c_symlink(c_file.as_ptr(), c_soft.as_ptr()) }, 0);
+            let mut link_tv = unsafe { std::mem::zeroed::<TIMEVAL>() };
+            link_tv.c_tv_sec = 1_700_000_555 as _;
+            link_tv.c_tv_usec = 0 as _;
+            let link_tvs = [link_tv, link_tv];
+            assert_eq!(
+                unsafe { c_lutimes(c_soft.as_ptr(), link_tvs.as_ptr()) },
+                0,
+                "c_lutimes errno {}",
+                get_saved_errno()
+            );
+            assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
         }
-        let fd = unsafe { c_open(c_file.as_ptr(), libc::O_RDWR, 0) };
-        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
-        let later_tv = libc::timeval {
-            tv_sec: 1_700_000_444,
-            tv_usec: 0,
-        };
-        let later_tvs = [later_tv, later_tv];
-        assert_eq!(
-            unsafe { c_futimes(fd, later_tvs.as_ptr()) },
-            0,
-            "c_futimes errno {}",
-            get_saved_errno()
-        );
-        assert_eq!(unsafe { c_close(fd) }, 0);
-        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
-        assert_eq!(st.st_mtime, 1_700_000_444);
-        let soft = dir.join("s");
-        let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { c_symlink(c_file.as_ptr(), c_soft.as_ptr()) }, 0);
-        let link_tv = libc::timeval {
-            tv_sec: 1_700_000_555,
-            tv_usec: 0,
-        };
-        let link_tvs = [link_tv, link_tv];
-        assert_eq!(
-            unsafe { c_lutimes(c_soft.as_ptr(), link_tvs.as_ptr()) },
-            0,
-            "c_lutimes errno {}",
-            get_saved_errno()
-        );
-        assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
 
         let mut fds = [0; 2];
         assert_eq!(
@@ -4622,14 +4804,14 @@ mod tests {
                 assert!(getloadavg().is_ok());
             }
         }
-        let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
+        let mut uts = unsafe { std::mem::zeroed::<UTSNAME>() };
         assert_eq!(
             unsafe { c_uname(&mut uts) },
             0,
             "c_uname errno {}",
             get_saved_errno()
         );
-        assert_ne!(uts.sysname[0], 0);
+        assert_ne!(uts.c_sysname[0], 0);
 
         let mut tms = unsafe { std::mem::zeroed::<TMS>() };
         let ticks = unsafe { c_times(&mut tms) } as i64;
@@ -4737,10 +4919,10 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(rposix_have_fadvise, rposix_have_fallocate))]
     #[test]
     fn c_posix_fadvise_and_fallocate_reject_bad_fd() {
-        let advice = libc::POSIX_FADV_NORMAL as crate::rffi::INT;
+        let advice = POSIX_FADV_NORMAL.unwrap();
         let err = unsafe { c_posix_fadvise(-1, 0, 0, advice) };
         assert_ne!(err, 0, "c_posix_fadvise(-1) succeeded");
         let ret = unsafe { c_posix_fallocate(-1, 0, 0) };

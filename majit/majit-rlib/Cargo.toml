@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "RPython rlib runtime support library"
+# Dependents read `DEP_MAJIT_RLIB_HAVE_PIPE2` / `HAVE_FADVISE` / `HAVE_FALLOCATE`.
+links = "majit_rlib"
 
 [features]
 host_env = []

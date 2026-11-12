@@ -43,7 +43,12 @@ pub fn cdecl(ctype: &str, cname: &str) -> String {
 pub enum Resolved {
     Alias(syn::Type, Vec<String>),
     Extern(Vec<String>),
-    LocalStruct(String),
+    /// A crate-local `#[repr(C)]` struct. `c_name` is `rffi.CStruct`
+    /// `hints['c_name']` when the collector saw `#[doc = "c_name: …"]`.
+    LocalStruct {
+        name: String,
+        c_name: Option<String>,
+    },
     /// A platform typedef whose class `rffi_platform` measured.
     Int(crate::rffi_platform::IntType),
 }
@@ -94,7 +99,7 @@ pub fn functype_result(
         Type::Array(_) => return Err(container_msg.into()),
         Type::Path(type_path) if type_path.qself.is_none() => {
             match resolve(&type_path.path, &target_module) {
-                Some(Resolved::LocalStruct(_)) => return Err(container_msg.into()),
+                Some(Resolved::LocalStruct { .. }) => return Err(container_msg.into()),
                 Some(Resolved::Extern(p))
                     if p.last()
                         .is_some_and(|last| STRUCT_TAGS.contains(&last.as_str())) =>
@@ -208,11 +213,15 @@ pub fn gettype(
                         tokens(ty)
                     )),
                 },
-                Some(Resolved::LocalStruct(n)) => {
+                Some(Resolved::LocalStruct { name, c_name }) => {
                     // `database.py gettype` spells an `lltype.Struct` as
-                    // `struct <c_name>` unless it has a `typedef` hint; a crate
-                    // `#[repr(C)]` struct is such a struct.
-                    Ok(format!("struct {n} @"))
+                    // `struct <c_name>` unless it has a `typedef` hint;
+                    // `rffi_platform.py` `Struct.build_result` stores that in
+                    // `rffi.CStruct` `hints['c_name']`.
+                    match c_name {
+                        Some(c_name) => Ok(format!("{c_name} @")),
+                        None => Ok(format!("struct {name} @")),
+                    }
                 }
                 None => Err(format!(
                     "cannot resolve type `{}` for generate_macro_wrapper",

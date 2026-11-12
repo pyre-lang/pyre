@@ -1,7 +1,7 @@
 //! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
 //! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
 //! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
-//! `configure(CConfig)`), and `dup3` (`rposix.py` `HAVE_DUP3`)
+//! `configure(CConfig)`), `rposix.py` `pipe_config`, and `advise_config`
 //! probes go through `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -42,26 +42,47 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rtime_gettimeofday_no_tz)");
     println!("cargo:rustc-check-cfg=cfg(rtime_have_ftime)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_utimes)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_d_type)");
     println!("cargo:rustc-check-cfg=cfg(rposix_getpgrp_have_arg)");
     println!("cargo:rustc-check-cfg=cfg(rposix_setpgrp_have_arg)");
-    let have_dup3 = have_dup3();
-    majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
-        pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
-        ..Default::default()
-    });
-
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_pipe2)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_fadvise)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_fallocate)");
+    let pipe_config = if target_is_unix_or_windows() {
+        Some(rposix_pipe_config())
+    } else {
+        None
+    };
+    let have_dup3 = if std::env::var("CARGO_CFG_UNIX").is_ok() {
+        match cconfig_lookup(pipe_config.as_ref().expect("pipe_config"), "HAVE_DUP3") {
+            ConfigValue::Bool(v) => *v,
+            other => panic!("HAVE_DUP3: {other:?}"),
+        }
+    } else {
+        false
+    };
     if target_is_unix_or_windows()
         && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc"
     {
         write_clibffi_cconfig();
     }
-    if target_is_unix_or_windows() {
+    let (have_pipe2, have_fadvise, have_fallocate, have_d_type) = if target_is_unix_or_windows() {
         write_rdynload_cconfig();
-        write_rposix_cconfig();
-    }
+        write_rposix_cconfig(&pipe_config)
+    } else {
+        (false, false, false, false)
+    };
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
     }
+    majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
+        pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
+        ..Default::default()
+    });
+    println!("cargo::metadata=HAVE_PIPE2={}", have_pipe2 as u8);
+    println!("cargo::metadata=HAVE_FADVISE={}", have_fadvise as u8);
+    println!("cargo::metadata=HAVE_FALLOCATE={}", have_fallocate as u8);
+    println!("cargo::metadata=HAVE_D_TYPE={}", have_d_type as u8);
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -104,6 +125,30 @@ const RPOSIX_HAVE_NAMES: [&str; 4] = [
     "HAVE_D_TYPE",
     "HAVE_FALLOCATE",
     "HAVE_FADVISE",
+];
+
+/// `rposix.py` `constants`.
+const RPOSIX_PIPE_CONSTANTS: [&str; 7] = [
+    "LOAD_LIBRARY_SEARCH_DEFAULT_DIRS",
+    "LOAD_LIBRARY_SEARCH_APPLICATION_DIR",
+    "LOAD_LIBRARY_SEARCH_SYSTEM32",
+    "LOAD_LIBRARY_SEARCH_USER_DIRS",
+    "LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
+    "COPYFILE_DATA",
+    "O_CLOEXEC",
+];
+
+/// `rposix.py` `dirent_config` `DT_*` (`ConstantInteger`).
+const RPOSIX_DIRENT_DT_NAMES: [&str; 4] = ["DT_UNKNOWN", "DT_REG", "DT_DIR", "DT_LNK"];
+
+/// `rposix.py` `advise_config` `POSIX_FADV_*`.
+const RPOSIX_POSIX_FADV_NAMES: [&str; 6] = [
+    "POSIX_FADV_WILLNEED",
+    "POSIX_FADV_NORMAL",
+    "POSIX_FADV_SEQUENTIAL",
+    "POSIX_FADV_RANDOM",
+    "POSIX_FADV_NOREUSE",
+    "POSIX_FADV_DONTNEED",
 ];
 
 /// `rdynload.py` `CConfig` / `configure(CConfig)`. The probe ECI is
@@ -172,12 +217,10 @@ fn rposix_ptyh(target_os: &str) -> &'static str {
     }
 }
 
-/// `rposix.py` `CConfig` / `configure(CConfig)` / `globals().update(config)`.
-/// The probe ECI is `rposix.eci`.
-fn write_rposix_cconfig() {
+/// `rposix.py` `eci`.
+fn rposix_eci() -> ExternalCompilationInfo {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
-    let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
     let (includes, libraries) = if windows {
         (
             vec![
@@ -217,6 +260,46 @@ fn write_rposix_cconfig() {
         }
         (includes, vec!["util".into()])
     };
+    ExternalCompilationInfo {
+        includes,
+        libraries,
+        ..Default::default()
+    }
+}
+
+/// `rposix.py` `pipe_config`.
+fn rposix_pipe_config() -> Vec<(String, ConfigValue)> {
+    let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
+    let mut entries = Vec::new();
+    for name in RPOSIX_PIPE_CONSTANTS {
+        entries.push((
+            name.to_string(),
+            CConfigEntry::DefinedConstantInteger(name.into()),
+        ));
+    }
+    let single_entries = if windows {
+        vec![]
+    } else {
+        vec![
+            ("HAVE_PIPE2".into(), CConfigSingleEntry::Has("pipe2".into())),
+            ("HAVE_DUP3".into(), CConfigSingleEntry::Has("dup3".into())),
+        ]
+    };
+    let cconfig = CConfig {
+        compilation_info: rposix_eci(),
+        entries,
+        single_entries,
+    };
+    configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// `rposix.py` `CConfig` / `configure(CConfig)` / `globals().update(config)`.
+/// The probe ECI is `rposix.eci`.
+fn write_rposix_cconfig(
+    pipe_config: &Option<Vec<(String, ConfigValue)>>,
+) -> (bool, bool, bool, bool) {
+    let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
+    let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
 
     let mut entries = Vec::new();
     for name in RPOSIX_DEFINED_CONSTANTS {
@@ -281,11 +364,7 @@ fn write_rposix_cconfig() {
     }
 
     let cconfig = CConfig {
-        compilation_info: ExternalCompilationInfo {
-            includes,
-            libraries,
-            ..Default::default()
-        },
+        compilation_info: rposix_eci(),
         entries,
         single_entries: vec![
             (
@@ -370,10 +449,12 @@ fn write_rposix_cconfig() {
         cconfig_lookup(&results, "SETPGRP_HAVE_ARG"),
     );
 
-    match cconfig_lookup(&results, "HAVE_UTIMES") {
-        ConfigValue::Bool(true) => println!("cargo:rustc-cfg=rposix_have_utimes"),
-        ConfigValue::Bool(false) => {}
+    let have_utimes = match cconfig_lookup(&results, "HAVE_UTIMES") {
+        ConfigValue::Bool(v) => *v,
         other => panic!("HAVE_UTIMES: {other:?}"),
+    };
+    if have_utimes {
+        println!("cargo:rustc-cfg=rposix_have_utimes");
     }
     match cconfig_lookup(&results, "GETPGRP_HAVE_ARG") {
         ConfigValue::Bool(true) => println!("cargo:rustc-cfg=rposix_getpgrp_have_arg"),
@@ -386,9 +467,187 @@ fn write_rposix_cconfig() {
         other => panic!("SETPGRP_HAVE_ARG: {other:?}"),
     }
 
+    let have_d_type = if unix {
+        match cconfig_lookup(&results, "HAVE_D_TYPE") {
+            ConfigValue::Bool(v) => *v,
+            other => panic!("HAVE_D_TYPE: {other:?}"),
+        }
+    } else {
+        false
+    };
+    if unix {
+        let mut dirent_fields = vec![
+            (
+                "d_name".into(),
+                FieldType::fixed_array(FieldType::char(), 1),
+            ),
+            ("d_ino".into(), FieldType::signed_word()),
+        ];
+        if have_d_type {
+            dirent_fields.push(("d_type".into(), FieldType::int()));
+        }
+        let mut dirent_entries = vec![(
+            "DIRENT".into(),
+            CConfigEntry::struct_type("struct dirent", dirent_fields, None),
+        )];
+        if have_d_type {
+            for name in RPOSIX_DIRENT_DT_NAMES {
+                dirent_entries.push((
+                    name.to_string(),
+                    CConfigEntry::ConstantInteger((*name).into()),
+                ));
+            }
+        }
+        let dirent_config = CConfig {
+            compilation_info: rposix_eci(),
+            entries: dirent_entries,
+            single_entries: vec![],
+        };
+        let dirent_results = configure(&dirent_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rposix.py dirent_config\n");
+        text.push_str(
+            &struct_layout("DIRENT", cconfig_lookup(&dirent_results, "DIRENT"))
+                .rust_struct_source("DIRENT", &[]),
+        );
+        if have_d_type {
+            for name in RPOSIX_DIRENT_DT_NAMES {
+                emit_i32(&mut text, name, cconfig_lookup(&dirent_results, name));
+            }
+            println!("cargo:rustc-cfg=rposix_have_d_type");
+        }
+    }
+
+    if have_utimes {
+        let times_config = CConfig {
+            compilation_info: rposix_eci(),
+            entries: vec![(
+                "TIMEVAL".into(),
+                CConfigEntry::struct_type(
+                    "struct timeval",
+                    vec![
+                        ("tv_sec".into(), FieldType::signed_word()),
+                        ("tv_usec".into(), FieldType::signed_word()),
+                    ],
+                    None,
+                ),
+            )],
+            single_entries: vec![],
+        };
+        let times_results = configure(&times_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rposix.py times_config\n");
+        text.push_str(
+            &struct_layout("TIMEVAL", cconfig_lookup(&times_results, "TIMEVAL"))
+                .rust_struct_source("TIMEVAL", &[]),
+        );
+    }
+
+    if unix {
+        let uts_config = CConfig {
+            compilation_info: ExternalCompilationInfo {
+                includes: vec!["sys/utsname.h".into()],
+                ..Default::default()
+            },
+            entries: vec![(
+                "UTSNAME".into(),
+                CConfigEntry::struct_type(
+                    "struct utsname",
+                    vec![
+                        (
+                            "sysname".into(),
+                            FieldType::fixed_array(FieldType::char(), 1),
+                        ),
+                        (
+                            "nodename".into(),
+                            FieldType::fixed_array(FieldType::char(), 1),
+                        ),
+                        (
+                            "release".into(),
+                            FieldType::fixed_array(FieldType::char(), 1),
+                        ),
+                        (
+                            "version".into(),
+                            FieldType::fixed_array(FieldType::char(), 1),
+                        ),
+                        (
+                            "machine".into(),
+                            FieldType::fixed_array(FieldType::char(), 1),
+                        ),
+                    ],
+                    None,
+                ),
+            )],
+            single_entries: vec![],
+        };
+        let uts_results = configure(&uts_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rposix.py uts_config\n");
+        text.push_str(
+            &struct_layout("UTSNAME", cconfig_lookup(&uts_results, "UTSNAME"))
+                .rust_struct_source("UTSNAME", &[]),
+        );
+    }
+
+    let have_fadvise = match cconfig_lookup(&results, "HAVE_FADVISE") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_FADVISE: {other:?}"),
+    };
+    let have_fallocate = match cconfig_lookup(&results, "HAVE_FALLOCATE") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_FALLOCATE: {other:?}"),
+    };
+    if have_fadvise && unix {
+        let mut advise_entries = Vec::new();
+        for name in RPOSIX_POSIX_FADV_NAMES {
+            advise_entries.push((
+                name.to_string(),
+                CConfigEntry::DefinedConstantInteger(name.into()),
+            ));
+        }
+        let advise_config = CConfig {
+            compilation_info: rposix_eci(),
+            entries: advise_entries,
+            single_entries: vec![],
+        };
+        let advise_results = configure(&advise_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rposix.py advise_config\n");
+        for name in RPOSIX_POSIX_FADV_NAMES {
+            emit_option_i32(&mut text, name, cconfig_lookup(&advise_results, name));
+        }
+    }
+
+    let pipe = pipe_config.as_ref().expect("pipe_config");
+    text.push_str("// rposix.py pipe_config\n");
+    let have_pipe2 = if windows {
+        text.push_str("pub const HAVE_PIPE2: bool = false;\n");
+        text.push_str("pub const HAVE_DUP3: bool = false;\n");
+        false
+    } else {
+        emit_bool(&mut text, "HAVE_PIPE2", cconfig_lookup(pipe, "HAVE_PIPE2"));
+        emit_bool(&mut text, "HAVE_DUP3", cconfig_lookup(pipe, "HAVE_DUP3"));
+        match cconfig_lookup(pipe, "HAVE_PIPE2") {
+            ConfigValue::Bool(v) => *v,
+            other => panic!("HAVE_PIPE2: {other:?}"),
+        }
+    };
+    for name in RPOSIX_PIPE_CONSTANTS {
+        emit_option_i32(&mut text, name, cconfig_lookup(pipe, name));
+    }
+
+    let have_fadvise = unix && have_fadvise;
+    let have_fallocate = unix && have_fallocate;
+    if have_pipe2 {
+        println!("cargo:rustc-cfg=rposix_have_pipe2");
+    }
+    if have_fadvise {
+        println!("cargo:rustc-cfg=rposix_have_fadvise");
+    }
+    if have_fallocate {
+        println!("cargo:rustc-cfg=rposix_have_fallocate");
+    }
+
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rposix_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    (have_pipe2, have_fadvise, have_fallocate, have_d_type)
 }
 
 fn cconfig_lookup<'a>(results: &'a [(String, ConfigValue)], name: &str) -> &'a ConfigValue {
@@ -664,6 +923,18 @@ fn emit_option_i32(text: &mut String, name: &str, value: &ConfigValue) {
     ));
 }
 
+fn emit_i32(text: &mut String, name: &str, value: &ConfigValue) {
+    match value {
+        ConfigValue::Int(n) => {
+            if *n < i32::MIN as i128 || *n > i32::MAX as i128 {
+                panic!("{name}: {n}");
+            }
+            text.push_str(&format!("pub const {name}: i32 = {n};\n"));
+        }
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
 fn emit_bool(text: &mut String, name: &str, value: &ConfigValue) {
     match value {
         ConfigValue::Bool(b) => text.push_str(&format!("pub const {name}: bool = {b};\n")),
@@ -794,26 +1065,4 @@ fn write_clibffi_cconfig() {
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("clibffi_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-}
-
-/// `rposix.py` `HAVE_DUP3 = rffi_platform.Has('dup3')`. `Has` builds a program
-/// that names `dup3`; it fails when the headers do not declare it or the C
-/// library does not provide it.
-fn have_dup3() -> bool {
-    if std::env::var("CARGO_CFG_UNIX").is_err() {
-        return false;
-    }
-    let cconfig = CConfig {
-        compilation_info: ExternalCompilationInfo {
-            includes: vec!["unistd.h".into(), "fcntl.h".into()],
-            ..Default::default()
-        },
-        entries: vec![],
-        single_entries: vec![("HAVE_DUP3".into(), CConfigSingleEntry::Has("dup3".into()))],
-    };
-    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
-    match results.as_slice() {
-        [(_, ConfigValue::Bool(have))] => *have,
-        _ => panic!("{results:?}"),
-    }
 }

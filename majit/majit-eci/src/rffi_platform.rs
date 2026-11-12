@@ -208,8 +208,10 @@ impl StructLayout {
     /// Spell the `rffi.CStruct` that `Struct.build_result` returns as a
     /// `#[repr(C)]` Rust struct. `nested` maps a nested struct's
     /// `StructLayout.name` to its Rust name.
+    /// `rffi.CStruct` `hints['c_name']`, read back by the macro-wrapper collector.
     pub fn rust_struct_source(&self, rust_name: &str, nested: &[(&str, &str)]) -> String {
         let mut out = String::new();
+        out.push_str(&format!("#[doc = \"c_name: {}\"]\n", self.c_name));
         out.push_str("#[repr(C)]\n");
         out.push_str("#[derive(Clone, Copy)]\n");
         out.push_str(&format!("pub struct {rust_name} {{\n"));
@@ -2183,6 +2185,7 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             let src = layout.rust_struct_source("TIMEVAL", &[]);
+            assert!(src.contains("#[doc = \"c_name: struct timeval\"]"), "{src}");
             assert!(src.contains("pub c_tv_sec:"), "{src}");
             assert!(
                 src.contains(&format!(

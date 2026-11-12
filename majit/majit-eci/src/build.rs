@@ -274,6 +274,13 @@ struct CollectedUse {
     leading_colon: bool,
 }
 
+struct CollectedStruct {
+    module_path: Vec<String>,
+    name: String,
+    /// `rffi.CStruct` `hints['c_name']` from `#[doc = "c_name: …"]`.
+    c_name: Option<String>,
+}
+
 enum Target {
     Local(Vec<String>, String),
     Extern(Vec<String>),
@@ -291,7 +298,7 @@ struct CrateItems {
     llexternals: Vec<CollectedLlexternal>,
     uses: Vec<CollectedUse>,
     modules: Vec<Vec<String>>,
-    structs: Vec<(Vec<String>, String)>,
+    structs: Vec<CollectedStruct>,
 }
 
 /// `rffi.py generate_macro_wrapper`: merge each `macro` llexternal's C
@@ -334,12 +341,15 @@ fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationI
                                 .find(|a| a.module_path == m && a.name == n)
                             {
                                 Some(crate::cdecl::Resolved::Alias(alias.ty.clone(), m))
-                            } else if collected
+                            } else if let Some(st) = collected
                                 .structs
                                 .iter()
-                                .any(|(tm, tn)| *tm == m && *tn == n)
+                                .find(|s| s.module_path == m && s.name == n)
                             {
-                                Some(crate::cdecl::Resolved::LocalStruct(n))
+                                Some(crate::cdecl::Resolved::LocalStruct {
+                                    name: n,
+                                    c_name: st.c_name.clone(),
+                                })
                             } else {
                                 None
                             }
@@ -785,7 +795,7 @@ fn defines_name(collected: &CrateItems, module: &[String], name: &str) -> bool {
         || collected
             .structs
             .iter()
-            .any(|(m, n)| m.as_slice() == module && n == name)
+            .any(|s| s.module_path.as_slice() == module && s.name == name)
 }
 
 fn find_binding_use(
@@ -1215,8 +1225,11 @@ fn walk_items(
                 });
             }
             Item::Struct(item) => {
-                out.structs
-                    .push((mod_path.to_vec(), unraw_ident(&item.ident)));
+                out.structs.push(CollectedStruct {
+                    module_path: mod_path.to_vec(),
+                    name: unraw_ident(&item.ident),
+                    c_name: struct_c_name(&item.attrs),
+                });
             }
             Item::Use(item) => {
                 flatten_use(
@@ -1262,6 +1275,13 @@ fn walk_items(
                             });
                         }
                     }
+                    Some("include") => {
+                        if let Some(included) = out_dir_include_path(&mac.mac)
+                            && included.exists()
+                        {
+                            walk_included_file(&included, submodule_dir, mod_path, out);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1290,6 +1310,102 @@ fn walk_items(
             _ => {}
         }
     }
+}
+
+/// rustc `include!(concat!(env!("OUT_DIR"), "<literal>"))` — paste generated
+/// items into this module the way rustc `include!` does.
+fn out_dir_include_path(mac: &syn::Macro) -> Option<PathBuf> {
+    let last = mac.path.segments.last()?;
+    if last.ident != "include" {
+        return None;
+    }
+    let expr: Expr = syn::parse2(mac.tokens.clone()).ok()?;
+    let Expr::Macro(concat_expr) = expr else {
+        return None;
+    };
+    if concat_expr.mac.path.segments.last()?.ident != "concat" {
+        return None;
+    }
+    let args = Punctuated::<Expr, Token![,]>::parse_terminated
+        .parse2(concat_expr.mac.tokens.clone())
+        .ok()?;
+    if args.len() != 2 {
+        return None;
+    }
+    let Expr::Macro(env_expr) = &args[0] else {
+        return None;
+    };
+    if env_expr.mac.path.segments.last()?.ident != "env" {
+        return None;
+    }
+    let env_lit: Lit = syn::parse2(env_expr.mac.tokens.clone()).ok()?;
+    let Lit::Str(env_key) = env_lit else {
+        return None;
+    };
+    if env_key.value() != "OUT_DIR" {
+        return None;
+    }
+    let Expr::Lit(lit) = &args[1] else {
+        return None;
+    };
+    let Lit::Str(s) = &lit.lit else {
+        return None;
+    };
+    let literal = s.value();
+    let out_dir = std::env::var("OUT_DIR").ok()?;
+    let mut path = PathBuf::from(out_dir);
+    let rel = literal.trim_start_matches('/');
+    if rel.is_empty() {
+        return None;
+    }
+    path.push(rel);
+    Some(path)
+}
+
+fn walk_included_file(
+    file_path: &Path,
+    submodule_dir: &Path,
+    mod_path: &[String],
+    out: &mut CrateItems,
+) {
+    println!("cargo:rerun-if-changed={}", file_path.display());
+    let src = std::fs::read_to_string(file_path).unwrap_or_else(|err| {
+        panic!("{}: {err}", file_path.display());
+    });
+    let file = syn::parse_file(&src).unwrap_or_else(|err| {
+        panic!("{}: {err}", file_path.display());
+    });
+    if !attrs_cfgs_hold(&file.attrs, file_path) {
+        return;
+    }
+    walk_items(&file.items, file_path, submodule_dir, mod_path, out);
+}
+
+/// `rffi.CStruct` `hints['c_name']` from `#[doc = "c_name: …"]`.
+fn struct_c_name(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        let Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        if !nv.path.is_ident("doc") {
+            continue;
+        }
+        let Expr::Lit(expr_lit) = &nv.value else {
+            continue;
+        };
+        let Lit::Str(s) = &expr_lit.lit else {
+            continue;
+        };
+        let trimmed = s.value();
+        let trimmed = trimmed.trim();
+        if let Some(rest) = trimmed.strip_prefix("c_name:") {
+            let c_name = rest.trim();
+            if !c_name.is_empty() {
+                return Some(c_name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// rustc spells a keyword module `r#struct`; the file is still `struct.rs`.

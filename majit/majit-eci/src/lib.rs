@@ -642,7 +642,10 @@ mod tests {
             "int @"
         );
         let resolve_foo = |_: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
-            Some(cdecl::Resolved::LocalStruct("Foo".into()))
+            Some(cdecl::Resolved::LocalStruct {
+                name: "Foo".into(),
+                c_name: None,
+            })
         };
         assert_eq!(
             cdecl::gettype(&syn::parse_str("Foo").unwrap(), none, &resolve_foo).unwrap(),
@@ -696,7 +699,10 @@ mod tests {
                     syn::parse_str("[i32; 4]").unwrap(),
                     vec![],
                 )),
-                "Foo" => Some(cdecl::Resolved::LocalStruct("Foo".into())),
+                "Foo" => Some(cdecl::Resolved::LocalStruct {
+                    name: "Foo".into(),
+                    c_name: None,
+                }),
                 _ => None,
             }
         };
@@ -728,6 +734,34 @@ mod tests {
         assert_eq!(
             cdecl::gettype(&syn::parse_str("*mut Foo").unwrap(), none, &resolve_a_foo).unwrap(),
             "struct Foo *@"
+        );
+        let resolve_dirent = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            if path.segments.len() == 1 && path.segments[0].ident == "DIRENT" {
+                Some(cdecl::Resolved::LocalStruct {
+                    name: "DIRENT".into(),
+                    c_name: Some("struct dirent".into()),
+                })
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*mut DIRENT").unwrap(),
+                none,
+                &resolve_dirent
+            )
+            .unwrap(),
+            "struct dirent *@"
+        );
+        assert_eq!(
+            cdecl::functype_result(
+                &syn::parse_str("*mut DIRENT").unwrap(),
+                none,
+                &resolve_dirent
+            )
+            .unwrap(),
+            "struct dirent *@"
         );
         assert_eq!(
             cdecl::functype_result(&syn::parse_str("()").unwrap(), none, &resolve_a_foo).unwrap(),
