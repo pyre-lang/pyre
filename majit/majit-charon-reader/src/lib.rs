@@ -111,16 +111,19 @@ pub struct Llbc {
     /// First name segment of every `FunDecl` that carries an unstructured
     /// body, sorted and deduplicated. Resolved once from the artefact.
     body_crate_roots: std::sync::OnceLock<Vec<String>>,
-    /// Function paths, from this artefact or any it links against, whose
-    /// body can leave shadow-stack slots published past its return or read
-    /// slots below the depth it was entered at.  A caller that calls one
-    /// cannot have its own root bracket scalar-replaced.  Sorted.
+    /// Function identities, from this artefact or any it links against,
+    /// whose body can leave shadow-stack slots published past its return
+    /// or read slots below the depth it was entered at.  A caller that
+    /// calls one cannot have its own root bracket scalar-replaced.
+    /// Sorted.  Keys are the cross-artefact FunDecl identity, not
+    /// `ItemMeta::name_path` (`GraphAnalyzer._analyzed_calls` keys by
+    /// graph).
     stack_sensitive_fns: parking_lot::RwLock<Vec<String>>,
     /// Set once the set above is complete for this artefact.
     stack_sensitive_ready: std::sync::atomic::AtomicBool,
-    /// Function paths whose own body opens and closes a `RootScope`.
+    /// Function identities whose own body opens and closes a `RootScope`.
     /// They rewind whatever they published, so a caller may treat the
-    /// call as depth-neutral even when the path is also in
+    /// call as depth-neutral even when the identity is also in
     /// `stack_sensitive_fns`.  Sorted.  Harvested in link order like
     /// the sensitive set, so a later crate sees earlier crates' answers.
     stack_depth_neutral_fns: parking_lot::RwLock<Vec<String>>,
@@ -128,22 +131,22 @@ pub struct Llbc {
     /// jitdrivers' `rewrite_jit_merge_point` turns into a portal-runner
     /// stub. Empty until the translator publishes the set. Sorted.
     rewritten_origportal_fns: parking_lot::RwLock<Vec<String>>,
-    /// Function paths whose body can return with slots still published
+    /// Function identities whose body can return with slots still published
     /// above its entry depth, or at a depth the walk could not bound.
     /// A subset of `stack_sensitive_fns`.  Sorted.  Harvested in link
     /// order like the sensitive set.
     stack_leaves_above_fns: parking_lot::RwLock<Vec<String>>,
-    /// Function paths whose body can read or write a slot below its
+    /// Function identities whose body can read or write a slot below its
     /// entry depth, or can end at a depth the walk could not bound.
-    /// A subset of `stack_sensitive_fns`; a path may also be in
+    /// A subset of `stack_sensitive_fns`; an identity may also be in
     /// `stack_leaves_above_fns`.  Sorted.  Harvested in link order like
     /// the sensitive set.
     stack_observes_fns: parking_lot::RwLock<Vec<String>>,
     /// Functions that read or write a slot whose index is one of their
-    /// own parameters.  Sorted by path.  The `Vec<u8>` is 0-based
+    /// own parameters.  Sorted by identity.  The `Vec<u8>` is 0-based
     /// positions in the callee's argument list.
     stack_param_slots_fns: parking_lot::RwLock<Vec<(String, Vec<u8>)>>,
-    /// Function paths whose every reachable `Return` yields an own
+    /// Function identities whose every reachable `Return` yields an own
     /// shadow-stack index (a lower bound relative to that body's entry
     /// depth).  Sorted.  Harvested in link order like the sensitive set.
     stack_returns_index_fns: parking_lot::RwLock<Vec<String>>,
@@ -615,11 +618,11 @@ impl Llbc {
             .is_ok()
     }
 
-    /// Record function paths whose shadow-stack effect a caller cannot see
+    /// Record function identities whose shadow-stack effect a caller cannot see
     /// past.  See the `stack_sensitive_fns` field.
-    pub fn register_stack_sensitive_fns(&self, paths: impl IntoIterator<Item = String>) {
+    pub fn register_stack_sensitive_fns(&self, identities: impl IntoIterator<Item = String>) {
         let mut known = self.stack_sensitive_fns.write();
-        known.extend(paths);
+        known.extend(identities);
         known.sort();
         known.dedup();
     }
@@ -638,29 +641,29 @@ impl Llbc {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Whether `path` was registered through
+    /// Whether `identity` was registered through
     /// [`register_stack_sensitive_fns`](Self::register_stack_sensitive_fns).
-    pub fn is_stack_sensitive_fn(&self, path: &str) -> bool {
+    pub fn is_stack_sensitive_fn(&self, identity: &str) -> bool {
         self.stack_sensitive_fns
             .read()
-            .binary_search_by(|known| known.as_str().cmp(path))
+            .binary_search_by(|known| known.as_str().cmp(identity))
             .is_ok()
     }
 
-    /// Record function paths whose body opens and closes a `RootScope`.
-    pub fn register_stack_depth_neutral_fns(&self, paths: impl IntoIterator<Item = String>) {
+    /// Record function identities whose body opens and closes a `RootScope`.
+    pub fn register_stack_depth_neutral_fns(&self, identities: impl IntoIterator<Item = String>) {
         let mut known = self.stack_depth_neutral_fns.write();
-        known.extend(paths);
+        known.extend(identities);
         known.sort();
         known.dedup();
     }
 
-    /// Whether `path` was registered through
+    /// Whether `identity` was registered through
     /// [`register_stack_depth_neutral_fns`](Self::register_stack_depth_neutral_fns).
-    pub fn is_stack_depth_neutral_fn(&self, path: &str) -> bool {
+    pub fn is_stack_depth_neutral_fn(&self, identity: &str) -> bool {
         self.stack_depth_neutral_fns
             .read()
-            .binary_search_by(|known| known.as_str().cmp(path))
+            .binary_search_by(|known| known.as_str().cmp(identity))
             .is_ok()
     }
 
@@ -682,37 +685,37 @@ impl Llbc {
             .is_ok()
     }
 
-    /// Record function paths that leave slots published above entry.
-    pub fn register_stack_leaves_above_fns(&self, paths: impl IntoIterator<Item = String>) {
+    /// Record function identities that leave slots published above entry.
+    pub fn register_stack_leaves_above_fns(&self, identities: impl IntoIterator<Item = String>) {
         let mut known = self.stack_leaves_above_fns.write();
-        known.extend(paths);
+        known.extend(identities);
         known.sort();
         known.dedup();
     }
 
-    /// Whether `path` was registered through
+    /// Whether `identity` was registered through
     /// [`register_stack_leaves_above_fns`](Self::register_stack_leaves_above_fns).
-    pub fn is_stack_leaves_above_fn(&self, path: &str) -> bool {
+    pub fn is_stack_leaves_above_fn(&self, identity: &str) -> bool {
         self.stack_leaves_above_fns
             .read()
-            .binary_search_by(|known| known.as_str().cmp(path))
+            .binary_search_by(|known| known.as_str().cmp(identity))
             .is_ok()
     }
 
-    /// Record function paths that can touch a slot below their entry.
-    pub fn register_stack_observes_fns(&self, paths: impl IntoIterator<Item = String>) {
+    /// Record function identities that can touch a slot below their entry.
+    pub fn register_stack_observes_fns(&self, identities: impl IntoIterator<Item = String>) {
         let mut known = self.stack_observes_fns.write();
-        known.extend(paths);
+        known.extend(identities);
         known.sort();
         known.dedup();
     }
 
-    /// Whether `path` was registered through
+    /// Whether `identity` was registered through
     /// [`register_stack_observes_fns`](Self::register_stack_observes_fns).
-    pub fn is_stack_observes_fn(&self, path: &str) -> bool {
+    pub fn is_stack_observes_fn(&self, identity: &str) -> bool {
         self.stack_observes_fns
             .read()
-            .binary_search_by(|known| known.as_str().cmp(path))
+            .binary_search_by(|known| known.as_str().cmp(identity))
             .is_ok()
     }
 
@@ -725,9 +728,9 @@ impl Llbc {
         known.extend(rows);
         known.sort_by(|a, b| a.0.cmp(&b.0));
         let mut merged: Vec<(String, Vec<u8>)> = Vec::new();
-        for (path, slots) in known.drain(..) {
+        for (identity, slots) in known.drain(..) {
             if let Some(last) = merged.last_mut()
-                && last.0 == path
+                && last.0 == identity
             {
                 last.1.extend(slots);
                 last.1.sort_unstable();
@@ -737,35 +740,35 @@ impl Llbc {
             let mut slots = slots;
             slots.sort_unstable();
             slots.dedup();
-            merged.push((path, slots));
+            merged.push((identity, slots));
         }
         *known = merged;
     }
 
-    /// Parameter positions `path` uses as shadow-stack indices, if any.
-    pub fn stack_param_slots(&self, path: &str) -> Option<Vec<u8>> {
+    /// Parameter positions `identity` uses as shadow-stack indices, if any.
+    pub fn stack_param_slots(&self, identity: &str) -> Option<Vec<u8>> {
         let known = self.stack_param_slots_fns.read();
         let i = known
-            .binary_search_by(|(known, _)| known.as_str().cmp(path))
+            .binary_search_by(|(known, _)| known.as_str().cmp(identity))
             .ok()?;
         Some(known[i].1.clone())
     }
 
-    /// Record function paths whose every reachable return is an own
+    /// Record function identities whose every reachable return is an own
     /// shadow-stack index relative to entry.
-    pub fn register_stack_returns_index_fns(&self, paths: impl IntoIterator<Item = String>) {
+    pub fn register_stack_returns_index_fns(&self, identities: impl IntoIterator<Item = String>) {
         let mut known = self.stack_returns_index_fns.write();
-        known.extend(paths);
+        known.extend(identities);
         known.sort();
         known.dedup();
     }
 
-    /// Whether `path` was registered through
+    /// Whether `identity` was registered through
     /// [`register_stack_returns_index_fns`](Self::register_stack_returns_index_fns).
-    pub fn is_stack_returns_index_fn(&self, path: &str) -> bool {
+    pub fn is_stack_returns_index_fn(&self, identity: &str) -> bool {
         self.stack_returns_index_fns
             .read()
-            .binary_search_by(|known| known.as_str().cmp(path))
+            .binary_search_by(|known| known.as_str().cmp(identity))
             .is_ok()
     }
 

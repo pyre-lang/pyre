@@ -4475,7 +4475,8 @@ pub fn mark_foreign_scope_owners(llbc: &Llbc, identities: &[String]) {
 /// `{name}|{inputs}|{output}|{span}|{type args}|{const args}`.
 ///
 /// Region ids and trait-ref ids are crate-local and are not part of the
-/// string. An inherent or trait impl's `Self` is that ADT's `name_path`.
+/// string: each `Impl` segment is rendered from that segment's own payload
+/// (`render_trait_impl` / `spec_type_name` / the ADT `name_path`).
 pub fn scope_owner_identity(llbc: &Llbc, fd: &FunDecl) -> String {
     let name = scope_owner_rendered_name(llbc, fd);
     let inputs = fd
@@ -4492,7 +4493,6 @@ pub fn scope_owner_identity(llbc: &Llbc, fd: &FunDecl) -> String {
 }
 
 pub(in crate::front::mir) fn scope_owner_rendered_name(llbc: &Llbc, fd: &FunDecl) -> String {
-    let owner = impl_owner_path(llbc, fd);
     let mut out = String::new();
     for seg in fd.item_meta.template_name() {
         if !out.is_empty() {
@@ -4503,30 +4503,52 @@ pub(in crate::front::mir) fn scope_owner_rendered_name(llbc: &Llbc, fd: &FunDecl
                 ident: (name, disambiguator),
             } => {
                 out.push_str(name);
-                if name == "closure" && *disambiguator > 0 {
+                if *disambiguator > 0 {
                     out.push('#');
                     out.push_str(&disambiguator.to_string());
                 }
             }
             other => {
-                if other.is_impl() {
-                    match owner.as_deref() {
-                        Some(path) => out.push_str(path),
-                        None => out.push_str("<Impl>"),
-                    }
-                    continue;
-                }
-                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(other) {
-                    out.push_str(&label);
-                    continue;
-                }
-                out.push('<');
-                out.push_str(other.first_key_label());
-                out.push('>');
+                out.push_str(&scope_owner_other_seg(llbc, other));
             }
         }
     }
     out
+}
+
+fn scope_owner_other_seg(llbc: &Llbc, seg: &NameSeg) -> String {
+    if seg.is_impl() {
+        return scope_owner_impl_seg(llbc, seg);
+    }
+    if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(seg) {
+        return label;
+    }
+    format!("<{}>", seg.first_key_label())
+}
+
+/// One `Impl` name segment, from that segment's payload. Nested ancestor
+/// impls keep their own Self / trait; the method's impl is not reused.
+fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
+    if let Some(id) = seg.impl_trait_id() {
+        let name = crate::front::clause_spec::render_trait_impl(llbc, id)
+            .unwrap_or_else(|| "?".to_string());
+        return format!("<impl {name}>");
+    }
+    if let Some(ty) = seg.impl_ty_skip_binder() {
+        return format!(
+            "<impl {}>",
+            crate::front::clause_spec::spec_type_name(ty, llbc, 0, false)
+        );
+    }
+    if let Some(adt_def_id) = resolve_impl_owner_adt_def_id_free(llbc, seg)
+        && let Some(td) = llbc.type_by_id(adt_def_id)
+    {
+        let owner = td.item_meta.name_path();
+        if !owner.is_empty() {
+            return format!("<impl {owner}>");
+        }
+    }
+    "<Impl>".to_string()
 }
 
 pub(in crate::front::mir) fn identity_span(llbc: &Llbc, fd: &FunDecl) -> String {

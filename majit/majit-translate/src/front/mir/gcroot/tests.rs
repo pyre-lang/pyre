@@ -4020,6 +4020,242 @@ fn identity_adt_includes_const_generics() {
     );
 }
 
+fn identity_fun_named(def_id: u64, name: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": identity_item_meta(name),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [],
+            "output": {"Tuple": []}
+        },
+        "body": null
+    })
+}
+
+fn identity_llbc_with_traits(
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    trait_decls: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": types,
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+fn identity_trait_decl(def_id: u64, path: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": identity_item_meta(serde_json::json!(
+            path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>()
+        )),
+        "methods": []
+    })
+}
+
+/// Nonzero Ident disambiguators are part of the FunDecl name, not a
+/// `"closure"` special case.
+#[test]
+fn scope_owner_rendered_name_prints_nonzero_ident_disambiguator() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![],
+        vec![
+            identity_fun_named(
+                0,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["OWNER", 0]}
+                ]),
+            ),
+            identity_fun_named(
+                1,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["OWNER", 1]}
+                ]),
+            ),
+        ],
+    );
+    let a = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(0).expect("fun"));
+    let b = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(1).expect("fun"));
+    assert_eq!(a, "fixture::OWNER");
+    assert_eq!(b, "fixture::OWNER#1");
+    assert_ne!(
+        super::scope_owner_identity(&llbc, llbc.fn_by_id(0).expect("fun")),
+        super::scope_owner_identity(&llbc, llbc.fn_by_id(1).expect("fun"))
+    );
+}
+
+/// Two trait impls on the same Self keep the trait from that segment's
+/// own payload (`render_trait_impl`), not the method's last Impl.
+#[test]
+fn scope_owner_rendered_name_splits_trait_impls_on_same_self() {
+    let foo_adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }
+    });
+    let foo = identity_struct_decl(
+        0,
+        identity_plain_name("fixture", "types", "Foo"),
+        "mark",
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}}),
+    );
+    let display = identity_trait_decl(0, &["core", "fmt", "Display"]);
+    let debug = identity_trait_decl(1, &["core", "fmt", "Debug"]);
+    let impl_display = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [foo_adt.clone()]}}
+    });
+    let impl_debug = serde_json::json!({
+        "impl_trait": {"id": 1, "generics": {"types": [foo_adt]}}
+    });
+    let llbc = identity_llbc_with_traits(
+        vec![foo],
+        vec![
+            identity_fun_named(
+                0,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["types", 0]},
+                    {"Impl": {"Trait": 0}},
+                    {"Ident": ["fmt", 0]}
+                ]),
+            ),
+            identity_fun_named(
+                1,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["types", 0]},
+                    {"Impl": {"Trait": 1}},
+                    {"Ident": ["fmt", 0]}
+                ]),
+            ),
+        ],
+        vec![display, debug],
+        vec![impl_display, impl_debug],
+    );
+    let a = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(0).expect("fun"));
+    let b = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(1).expect("fun"));
+    assert_eq!(
+        a,
+        "fixture::types::<impl core::fmt::Display<fixture::types::Foo>>::fmt"
+    );
+    assert_eq!(
+        b,
+        "fixture::types::<impl core::fmt::Debug<fixture::types::Foo>>::fmt"
+    );
+}
+
+/// Inherent impl segments spell Self from that payload (`spec_type_name`).
+#[test]
+fn scope_owner_rendered_name_uses_impl_payload_self() {
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![],
+        vec![
+            identity_fun_named(
+                0,
+                serde_json::json!([
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["num", 0]},
+                    {"Impl": {"Ty": {"skip_binder": usize_ty}}},
+                    {"Ident": ["saturating_add", 0]}
+                ]),
+            ),
+            identity_fun_named(
+                1,
+                serde_json::json!([
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["num", 0]},
+                    {"Impl": {"Ty": {"skip_binder": i64_ty}}},
+                    {"Ident": ["saturating_add", 0]}
+                ]),
+            ),
+        ],
+    );
+    let a = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(0).expect("fun"));
+    let b = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(1).expect("fun"));
+    assert_eq!(a, "core::num::<impl usize>::saturating_add");
+    assert_eq!(b, "core::num::<impl i64>::saturating_add");
+}
+
+/// Nested ancestor Impl segments keep their own payload; the method's
+/// impl is not reused for every `<Impl>` slot.
+#[test]
+fn scope_owner_rendered_name_keeps_nested_ancestor_impl_payloads() {
+    let foo_adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }
+    });
+    let foo = identity_struct_decl(
+        0,
+        identity_plain_name("fixture", "types", "Foo"),
+        "mark",
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}}),
+    );
+    let display = identity_trait_decl(0, &["core", "fmt", "Display"]);
+    let debug = identity_trait_decl(1, &["core", "fmt", "Debug"]);
+    let impl_display = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [foo_adt.clone()]}}
+    });
+    let impl_debug = serde_json::json!({
+        "impl_trait": {"id": 1, "generics": {"types": [foo_adt.clone()]}}
+    });
+    let inherent = serde_json::json!({"Impl": {"Ty": {"skip_binder": foo_adt}}});
+    let llbc = identity_llbc_with_traits(
+        vec![foo],
+        vec![
+            identity_fun_named(
+                0,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Impl": {"Trait": 0}},
+                    inherent.clone(),
+                    {"Ident": ["method", 0]}
+                ]),
+            ),
+            identity_fun_named(
+                1,
+                serde_json::json!([
+                    {"Ident": ["fixture", 0]},
+                    {"Impl": {"Trait": 1}},
+                    inherent,
+                    {"Ident": ["method", 0]}
+                ]),
+            ),
+        ],
+        vec![display, debug],
+        vec![impl_display, impl_debug],
+    );
+    let a = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(0).expect("fun"));
+    let b = super::scope_owner_rendered_name(&llbc, llbc.fn_by_id(1).expect("fun"));
+    assert_eq!(
+        a,
+        "fixture::<impl core::fmt::Display<fixture::types::Foo>>::<impl fixture::types::Foo>::method"
+    );
+    assert_eq!(
+        b,
+        "fixture::<impl core::fmt::Debug<fixture::types::Foo>>::<impl fixture::types::Foo>::method"
+    );
+}
+
 /// A `monomorphize:false` field `Generic<T>` is keyed by the template
 /// path; the use-site TypeDeclRef still carries the arguments.
 #[test]

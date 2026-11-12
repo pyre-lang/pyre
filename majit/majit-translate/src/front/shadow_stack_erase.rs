@@ -44,7 +44,8 @@
 //! `on_unwind` cleanup chain either, and one chain is shared by calls made at
 //! different depths.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
@@ -112,7 +113,8 @@ fn classify_call(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
-    let path = callee_path(call, llbc)?;
+    let fd = callee_fun_decl(call, llbc)?;
+    let path = fd.item_meta.name_path();
     let segments: Vec<&str> = path.split("::").collect();
     let leaf = *segments.last()?;
     if let Some(class) = classify_frame_anchor(leaf, &segments, call, llbc) {
@@ -298,15 +300,21 @@ fn classify_frame_anchor(
 
 /// Open depth named by a Guard, its Alias, or the depth word itself
 /// (`frame_anchor_release` / `frame_anchor_live` take the usize).
-fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Option<usize> {
+/// Second element is the Guard skew; an Index depth-word has skew 0.
+fn special_open_guard(specials: &HashMap<usize, Special>, local: usize) -> Option<(usize, usize)> {
     match specials.get(&local) {
-        Some(Special::Guard(d) | Special::Index(d)) => Some(*d),
+        Some(Special::Guard { depth, skew }) => Some((*depth, *skew)),
+        Some(Special::Index { k, .. }) => Some((*k, 0)),
         Some(Special::Alias(g)) => match specials.get(g) {
-            Some(Special::Guard(d)) => Some(*d),
+            Some(Special::Guard { depth, skew }) => Some((*depth, *skew)),
             _ => None,
         },
         _ => None,
     }
+}
+
+fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Option<usize> {
+    special_open_guard(specials, local).map(|(d, _)| d)
 }
 
 /// `from_raw` / `live` / `drop` / `frame_anchor_{push,live,release}` own
@@ -357,14 +365,17 @@ fn is_frame_anchor_ty(ty: &TyRef, llbc: &Llbc) -> bool {
 /// What a special local stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Special {
-    /// A `RootScope` guard opened at this depth.
-    Guard(usize),
+    /// A `RootScope` guard opened at this depth, with the join skew
+    /// (`hi - lo`) recorded at Open so a Close/Drop restores both.
+    Guard { depth: usize, skew: usize },
     /// A borrow of a guard.
     Alias(usize),
-    /// A slot index: the entry depth plus this offset.
-    Index(usize),
+    /// A slot index. `relative` is a `Leaf::Len` (or arithmetic on one):
+    /// the offset tracks the analysed depth. Absolute indices are a
+    /// guard base, a constant, or arithmetic on those.
+    Index { k: usize, relative: bool },
     /// A checked-add pair whose `.0` is this offset.
-    IndexPair(usize),
+    IndexPair { k: usize, relative: bool },
     /// `pin_roots` dest of an incoming `&[PyObjectRef]`
     /// (`pin_roots_incoming_slice`). Not a scalar slot: `Leaf::Len` and
     /// merge depth ignore it. `get(base + k)` is that list at `k`.
@@ -394,19 +405,95 @@ fn mem_drop_scope_local(
     }
 }
 
+fn mem_drop_guard(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    specials: &HashMap<usize, Special>,
+) -> Option<(usize, usize)> {
+    let local = mem_drop_scope_local(call, llbc)?;
+    match specials.get(&local) {
+        Some(Special::Guard { depth, skew }) => Some((*depth, *skew)),
+        Some(Special::Alias(g)) => match specials.get(g) {
+            Some(Special::Guard { depth, skew }) => Some((*depth, *skew)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn mem_drop_guard_depth(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
     specials: &HashMap<usize, Special>,
 ) -> Option<usize> {
-    let local = mem_drop_scope_local(call, llbc)?;
-    match specials.get(&local) {
-        Some(Special::Guard(d)) => Some(*d),
-        Some(Special::Alias(g)) => match specials.get(g) {
-            Some(Special::Guard(d)) => Some(*d),
+    mem_drop_guard(call, llbc, specials).map(|(d, _)| d)
+}
+
+impl Special {
+    fn as_index(self) -> Option<(usize, bool)> {
+        match self {
+            Special::Index { k, relative } | Special::IndexPair { k, relative } => {
+                Some((k, relative))
+            }
             _ => None,
-        },
-        _ => None,
+        }
+    }
+
+    fn index(k: usize, relative: bool, checked: bool) -> Self {
+        if checked {
+            Special::IndexPair { k, relative }
+        } else {
+            Special::Index { k, relative }
+        }
+    }
+}
+
+/// Compatible rebind of one local: same `Index`/`IndexPair` `k` (AND of
+/// `relative`) or same `Guard` depth (max of `skew`). Anything else is
+/// `special-rebound`.
+fn merge_special(previous: Special, new: Special) -> Result<Special, Refusal> {
+    match (previous, new) {
+        (
+            Special::Index {
+                k: k1,
+                relative: r1,
+            },
+            Special::Index {
+                k: k2,
+                relative: r2,
+            },
+        ) if k1 == k2 => Ok(Special::Index {
+            k: k1,
+            relative: r1 && r2,
+        }),
+        (
+            Special::IndexPair {
+                k: k1,
+                relative: r1,
+            },
+            Special::IndexPair {
+                k: k2,
+                relative: r2,
+            },
+        ) if k1 == k2 => Ok(Special::IndexPair {
+            k: k1,
+            relative: r1 && r2,
+        }),
+        (
+            Special::Guard {
+                depth: d1,
+                skew: s1,
+            },
+            Special::Guard {
+                depth: d2,
+                skew: s2,
+            },
+        ) if d1 == d2 => Ok(Special::Guard {
+            depth: d1,
+            skew: s1.max(s2),
+        }),
+        (a, b) if a == b => Ok(a),
+        _ => Err("special-rebound"),
     }
 }
 
@@ -636,7 +723,9 @@ fn assert_is_erased_index_overflow(
     };
     matches!(
         pair.and_then(|(pair, field)| (field == 1).then_some(specials.get(&pair))),
-        Some(Some(Special::IndexPair(_) | Special::SliceIndexPair { .. }))
+        Some(Some(
+            Special::IndexPair { .. } | Special::SliceIndexPair { .. }
+        ))
     )
 }
 
@@ -653,7 +742,7 @@ fn bounds_check_len_and_index(check_kind: &Value) -> Option<(&Value, &Value)> {
 /// Compile-time slot offset named by an operand JSON node.
 fn json_index_offset(v: &Value, specials: &HashMap<usize, Special>) -> Option<usize> {
     match specials_in_json(v, specials).as_slice() {
-        [Special::Index(k)] | [Special::IndexPair(k)] => Some(*k),
+        [Special::Index { k, .. }] | [Special::IndexPair { k, .. }] => Some(*k),
         [Special::SliceBase { .. }] => Some(0),
         [Special::SliceIndex { k, .. } | Special::SliceIndexPair { k, .. }] => Some(*k),
         _ => None,
@@ -677,7 +766,7 @@ fn json_slot_array_len(
         return Some(*n);
     }
     match specials_in_json(v, specials).as_slice() {
-        [Special::Index(d)] | [Special::IndexPair(d)] => Some(*d),
+        [Special::Index { k: d, .. }] | [Special::IndexPair { k: d, .. }] => Some(*d),
         _ => None,
     }
 }
@@ -1009,8 +1098,10 @@ fn const_slot_trace_local(
 
 /// What a rewritten getter call answers.
 enum GetterAnswer {
-    /// `|| shadow_stack_get(captured)` of a scalar slot.
-    Scalar(usize),
+    /// `|| shadow_stack_get(captured)` of a scalar slot. `relative` is
+    /// inherited from the captured [`Special::Index`] (a Len vs a base
+    /// or constant).
+    Scalar { k: usize, relative: bool },
     /// `|| shadow_stack_get(captured + k)` of an incoming slice
     /// (`pin_roots_incoming_slice`).
     Slice { slice_local: usize, k: usize },
@@ -1040,8 +1131,8 @@ fn try_slot_getter_call(
     for (local, spec) in specials {
         if matches!(
             spec,
-            Special::Index(_)
-                | Special::IndexPair(_)
+            Special::Index { .. }
+                | Special::IndexPair { .. }
                 | Special::SliceBase { .. }
                 | Special::SliceIndex { .. }
                 | Special::SliceIndexPair { .. }
@@ -1085,8 +1176,11 @@ fn try_slot_getter_call(
         .ok()?
         .checked_add(usize::try_from(addend.addend).ok()?)?;
     let answer = match specials.get(&index_local) {
-        Some(Special::Index(k) | Special::IndexPair(k)) => {
-            GetterAnswer::Scalar(k.checked_add(extra)?)
+        Some(Special::Index { k, relative } | Special::IndexPair { k, relative }) => {
+            GetterAnswer::Scalar {
+                k: k.checked_add(extra)?,
+                relative: *relative,
+            }
         }
         Some(Special::SliceBase { slice_local }) => GetterAnswer::Slice {
             slice_local: *slice_local,
@@ -1110,6 +1204,1058 @@ fn try_slot_getter_call(
         return None;
     }
     Some((answer, carriers))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    Probe,
+    Emit,
+}
+
+/// One walk of the erase CFG. `Probe` pushes the per-block entry lattice
+/// (`depth_in` / `lo_in` / `open_in`) to a fixpoint and does not write
+/// the rewrite `Plan`. `Emit` walks each reachable block once at those
+/// entry values and fills the plan.
+///
+/// `gctransform/framework.py` computes livevars per block from the
+/// finished graph before `push_roots` inserts the stores; the analysis
+/// never rewrites while it is still iterating.
+struct EraseWalk<'a> {
+    mode: WalkMode,
+    body: &'a Unstructured,
+    llbc: &'a Llbc,
+    classified: &'a HashMap<usize, (Leaf, bool)>,
+    forward_blocks: &'a [bool],
+    succs: &'a [Vec<u64>],
+    n_blocks: usize,
+    n_locals: usize,
+    def_counts: &'a [u32],
+    stmt_assigned: &'a HashMap<usize, usize>,
+    call_dests: &'a bit_set::BitSet,
+    depth_in: &'a mut Vec<Option<usize>>,
+    lo_in: &'a mut Vec<Option<usize>>,
+    open_in: &'a mut Vec<Option<usize>>,
+    frozen_depth: &'a [Option<usize>],
+    frozen_lo: &'a [Option<usize>],
+    queue: &'a mut VecDeque<usize>,
+    visited: &'a mut [bool],
+    specials: &'a mut HashMap<usize, Special>,
+    plan: Option<&'a mut Plan>,
+    const_locals: &'a mut HashMap<usize, usize>,
+    array_lens: &'a mut HashMap<usize, usize>,
+    getter_cache: &'a mut HashMap<u64, Option<SlotGetter>>,
+    getter_bbs: &'a mut bit_set::BitSet,
+    capture_temps: &'a mut bit_set::BitSet,
+}
+
+impl<'a> EraseWalk<'a> {
+    fn emit(&self) -> bool {
+        self.mode == WalkMode::Emit
+    }
+
+    fn slot_local(&self, k: usize) -> usize {
+        self.n_locals + k
+    }
+
+    fn single_def(&self, dest: usize) -> bool {
+        self.def_counts.get(dest).copied() == Some(1)
+    }
+
+    /// Bind one local to a special. Same `Index`/`IndexPair` `k` or same
+    /// `Guard` depth is a compatible rebind via [`merge_special`]. Absolute
+    /// wins (`relative: a && b`) so an absolute Get still sees the join
+    /// floor; a larger skew is the lower floor. Probe overwrites an
+    /// incompatible pair because it re-walks blocks at a new lattice
+    /// (Open then binds a new `Guard` depth); Emit walks once and refuses.
+    fn bind(&mut self, local: usize, special: Special) -> Result<(), Refusal> {
+        match self.specials.get(&local).copied() {
+            None => {
+                self.specials.insert(local, special);
+                Ok(())
+            }
+            Some(previous) => match merge_special(previous, special) {
+                Ok(merged) => {
+                    self.specials.insert(local, merged);
+                    Ok(())
+                }
+                Err(_) if !self.emit() => {
+                    self.specials.insert(local, special);
+                    Ok(())
+                }
+                Err(reason) => Err(reason),
+            },
+        }
+    }
+
+    fn check_slot_read(
+        &self,
+        k: usize,
+        relative: bool,
+        depth: usize,
+        lo: usize,
+        set: bool,
+    ) -> Result<(), Refusal> {
+        if !self.emit() {
+            return Ok(());
+        }
+        if relative || lo == depth {
+            if k >= depth {
+                return Err(if set {
+                    "set-above-depth"
+                } else {
+                    "get-above-depth"
+                });
+            }
+        } else if k >= lo {
+            return Err("absolute-get-above-join-floor");
+        }
+        Ok(())
+    }
+
+    fn reach(
+        &mut self,
+        from: usize,
+        target: u64,
+        depth: usize,
+        lo: usize,
+        open: usize,
+    ) -> Result<(), Refusal> {
+        let target = target as usize;
+        if target >= self.n_blocks {
+            return Ok(());
+        }
+        match self.mode {
+            WalkMode::Emit => {
+                // Probe joins every successor, including Drop/Close, so
+                // the frozen lattice is the fixpoint. Incoming must sit
+                // inside it; a miss is a two-phase bug mapped to
+                // `depth-disagrees-at-merge` in release.
+                let frozen_hi = self.frozen_depth[target];
+                let frozen_lo = self.frozen_lo[target];
+                debug_assert!(
+                    frozen_hi.is_some_and(|h| depth <= h),
+                    "emit incoming depth exceeds phase-1 lattice"
+                );
+                debug_assert!(
+                    frozen_lo.is_some_and(|l| lo >= l),
+                    "emit incoming lo is below phase-1 lattice"
+                );
+                if !frozen_hi.is_some_and(|h| depth <= h) || !frozen_lo.is_some_and(|l| lo >= l) {
+                    return Err("depth-disagrees-at-merge");
+                }
+                if !self.visited[target] {
+                    self.queue.push_back(target);
+                }
+                Ok(())
+            }
+            WalkMode::Probe => {
+                // Scalar depth only: an incoming slice is not a slot
+                // (`pin_roots_incoming_slice`). A Drop of the guard rewinds to
+                // the open depth, so a slice-only early return may join a
+                // `pin_root` arm there (`__majit_wrap_dict_descr_keys`).
+                // Join the Drop/Close entry too: skipping it leaves the
+                // first-visit lattice, and Emit then walks the rewind at
+                // that depth with the final Guard specials.
+                match (self.depth_in[target], self.lo_in[target]) {
+                    (Some(d), Some(l)) if d == depth && l == lo => Ok(()),
+                    (None, _) => {
+                        self.depth_in[target] = Some(depth);
+                        self.lo_in[target] = Some(lo);
+                        self.open_in[target] = Some(open);
+                        self.queue.push_back(target);
+                        Ok(())
+                    }
+                    (Some(d), Some(l)) => {
+                        // Incoming depths disagree at a CFG join, including a
+                        // Drop/Close: that block postdominates itself, so the
+                        // join is accepted and `slot_count` takes max.
+                        // `stack_walk` `Depth::join` takes a min lower bound for
+                        // neutrality; this walk takes max for `slot_count`.
+                        // `gctransform/shadowstack.py`
+                        // `ShadowStackFrameworkGCTransformer.push_roots` /
+                        // `gctransform/framework.py` `get_livevars_for_roots` is
+                        // one livevar set around the collecting op, not a
+                        // per-arm stack pointer. Extra-pin Gets stay on the
+                        // writing arm (SSA slot locals). A back edge that grows
+                        // depth is pins accumulating around a loop: refuse
+                        // rather than let the lattice climb.
+                        // `gctransform/framework.py` computes livevars per block
+                        // from the finished graph before `push_roots` inserts the
+                        // stores; the analysis never rewrites while it is still
+                        // iterating.
+                        if d != depth && dominates(self.succs, self.n_blocks, target, from) {
+                            return Err("depth-disagrees-at-merge");
+                        }
+                        if d != depth
+                            && !join_postdominated_by_this_guard_rewind(
+                                self.body,
+                                self.llbc,
+                                self.classified,
+                                self.specials,
+                                self.succs,
+                                self.n_blocks,
+                                target,
+                            )
+                        {
+                            return Err("depth-disagrees-at-merge");
+                        }
+                        let joined_hi = d.max(depth);
+                        let joined_lo = l.min(lo);
+                        if joined_hi != d || joined_lo != l {
+                            self.depth_in[target] = Some(joined_hi);
+                            self.lo_in[target] = Some(joined_lo);
+                            if depth == joined_hi {
+                                self.open_in[target] = Some(open);
+                            }
+                            self.visited[target] = false;
+                            self.queue.push_back(target);
+                        }
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    fn guard_open(&self, g: usize) -> Result<(usize, usize), Refusal> {
+        match self.specials.get(&g) {
+            Some(Special::Guard { depth, skew }) => Ok((*depth, *skew)),
+            _ => Err("guard-not-opened"),
+        }
+    }
+
+    fn slot_index_of(
+        &self,
+        call: &majit_charon_reader::ullbc::CallPayload,
+        i: usize,
+        llbc: &Llbc,
+    ) -> Result<(usize, bool), Refusal> {
+        if let Some((k, relative)) = call
+            .args
+            .get(i)
+            .and_then(operand_local)
+            .and_then(|l| self.specials.get(&l))
+            .and_then(|s| s.as_index())
+        {
+            return Ok((k, relative));
+        }
+        if let Some(k) = call.args.get(i).and_then(|op| const_usize(op, llbc)) {
+            return Ok((k, false));
+        }
+        Err("index-not-static")
+    }
+
+    fn record_removed(&mut self, bb: usize, si: usize) {
+        if let Some(plan) = self.plan.as_mut() {
+            plan.removed.entry(bb).or_default().push(si);
+        }
+    }
+
+    fn record_term(&mut self, bb: usize, target: u64, stmts: Vec<Value>) {
+        if let Some(plan) = self.plan.as_mut() {
+            plan.terms.insert(bb, TermRewrite { target, stmts });
+        }
+    }
+
+    fn insert_after(&mut self, key: (usize, usize), inserted: Vec<Value>) {
+        if let Some(plan) = self.plan.as_mut() {
+            plan.inserted_after.entry(key).or_default().extend(inserted);
+        }
+    }
+
+    fn bump_slot_count(&mut self, depth: usize) {
+        if let Some(plan) = self.plan.as_mut() {
+            plan.slot_count = plan.slot_count.max(depth);
+        }
+    }
+
+    fn ensure_slot_ty(&mut self, ty: Value) {
+        if let Some(plan) = self.plan.as_mut() {
+            plan.slot_ty.get_or_insert(ty);
+        }
+    }
+
+    fn record_slot_ty(&mut self, depth: usize, ty: &Value) -> Result<(), Refusal> {
+        if let Some(plan) = self.plan.as_mut() {
+            record_slot_ty(plan, depth, ty)?;
+        }
+        Ok(())
+    }
+
+    fn slot_ty_at(&self, k: usize) -> Option<Value> {
+        self.plan
+            .as_ref()
+            .and_then(|p| p.slot_tys.get(&k).cloned().or_else(|| p.slot_ty.clone()))
+    }
+}
+
+/// A pin raises `hi`. It raises `lo` only while the stack is aligned
+/// (`lo == hi`): after a disagreeing join the floor is the slots every
+/// arm holds, and later pins land at different source indices on the
+/// short arm, so the `[lo, hi)` band stays absolute-unsafe.
+fn pin_depth(depth: &mut usize, lo: &mut usize, n: usize) {
+    if *lo == *depth {
+        *lo = lo.saturating_add(n);
+    }
+    *depth = depth.saturating_add(n);
+}
+
+fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
+    let body = cx.body;
+    let llbc = cx.llbc;
+    let n_blocks = cx.n_blocks;
+    let classified = cx.classified;
+    let mut rounds = 0usize;
+    while let Some(bb) = cx.queue.pop_front() {
+        rounds += 1;
+        // Lattice is finite: hi rises only at disagreeing forward joins
+        // and back-edge growth refuses; lo falls toward 0.
+        debug_assert!(
+            rounds
+                <= n_blocks
+                    .saturating_mul(n_blocks.saturating_add(8))
+                    .saturating_add(64),
+            "erase depth lattice should terminate"
+        );
+        if cx.visited[bb] {
+            continue;
+        }
+        cx.visited[bb] = true;
+        let (mut depth, mut lo, mut open) = match cx.mode {
+            WalkMode::Emit => (
+                cx.frozen_depth[bb].expect("emit block is phase-1 reachable"),
+                cx.frozen_lo[bb].expect("emit block is phase-1 reachable"),
+                cx.open_in[bb].expect("queued blocks have an open count"),
+            ),
+            WalkMode::Probe => (
+                cx.depth_in[bb].expect("queued blocks have a depth"),
+                cx.lo_in[bb].expect("queued blocks have a lo"),
+                cx.open_in[bb].expect("queued blocks have an open count"),
+            ),
+        };
+        let block = &body.body[bb];
+        // Statements: the index, pair and alias definitions.
+        for (si, stmt) in block.statements.iter().enumerate() {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let Some(dest) = place_local(place) else {
+                continue;
+            };
+            match rvalue {
+                Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
+                    if cx.single_def(dest) {
+                        cx.array_lens.insert(dest, operands.len());
+                    }
+                }
+                Rvalue::Len(src) => {
+                    let base = place_local(src).or_else(|| deref_of_local(src));
+                    if cx.single_def(dest)
+                        && let Some(n) = base.and_then(|l| cx.array_lens.get(&l).copied())
+                    {
+                        cx.const_locals.insert(dest, n);
+                    }
+                }
+                Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                    let base = place_local(src).or_else(|| deref_of_local(src));
+                    if cx.single_def(dest)
+                        && let Some(n) = base.and_then(|l| cx.array_lens.get(&l).copied())
+                    {
+                        cx.array_lens.insert(dest, n);
+                    }
+                }
+                // Cast / UnaryOp may change the value (narrowing, negation,
+                // bit-not). `constfold.fold_op_list` evaluates them; this
+                // pass does not, so the fact is dropped.
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                    if cx.single_def(dest)
+                        && let Some((pair, 1)) = tuple_field_of_local(src)
+                        && let Some(n) = cx.array_lens.get(&pair).copied()
+                    {
+                        cx.const_locals.insert(dest, n);
+                    }
+                }
+                _ => {}
+            }
+            let special = match rvalue {
+                Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                    let guard = place_local(src)
+                        .and_then(|l| match cx.specials.get(&l) {
+                            Some(Special::Guard { .. }) => Some(l),
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            deref_of_local(src).and_then(|l| match cx.specials.get(&l) {
+                                Some(Special::Alias(g)) => Some(*g),
+                                _ => None,
+                            })
+                        });
+                    guard.map(Special::Alias)
+                }
+                Rvalue::Use(op, _) => match op {
+                    Operand::Copy(src) | Operand::Move(src) => {
+                        if let Some(l) = place_local(src) {
+                            if cx.single_def(dest) {
+                                if let Some(n) = cx.const_locals.get(&l).copied() {
+                                    cx.const_locals.insert(dest, n);
+                                }
+                                if let Some(n) = cx.array_lens.get(&l).copied() {
+                                    cx.array_lens.insert(dest, n);
+                                }
+                            }
+                            match cx.specials.get(&l).copied() {
+                                Some(Special::Index { k, relative }) => {
+                                    Some(Special::Index { k, relative })
+                                }
+                                Some(Special::Alias(g)) => Some(Special::Alias(g)),
+                                Some(Special::Guard { depth, skew }) => {
+                                    Some(Special::Guard { depth, skew })
+                                }
+                                Some(Special::SliceBase { slice_local }) => {
+                                    Some(Special::SliceBase { slice_local })
+                                }
+                                Some(Special::SliceIndex { slice_local, k }) => {
+                                    Some(Special::SliceIndex { slice_local, k })
+                                }
+                                Some(Special::SliceIndexPair { slice_local, k }) => {
+                                    Some(Special::SliceIndexPair { slice_local, k })
+                                }
+                                _ => None,
+                            }
+                        } else if let Some((base, field)) = tuple_field_of_local(src) {
+                            match (field, cx.specials.get(&base).copied()) {
+                                (0, Some(Special::IndexPair { k, relative })) => {
+                                    Some(Special::Index { k, relative })
+                                }
+                                (0, Some(Special::SliceIndexPair { slice_local, k })) => {
+                                    Some(Special::SliceIndex { slice_local, k })
+                                }
+                                (0, Some(Special::Guard { depth, .. })) => Some(Special::Index {
+                                    k: depth,
+                                    relative: false,
+                                }),
+                                (0, Some(Special::Index { k, relative })) => {
+                                    Some(Special::Index { k, relative })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Operand::Const(_) => {
+                        if cx.single_def(dest)
+                            && let Some(n) = const_usize(op, llbc)
+                        {
+                            cx.const_locals.insert(dest, n);
+                        }
+                        None
+                    }
+                },
+                Rvalue::BinaryOp(op, lhs, rhs) => match binop_is_index_arith(op) {
+                    Some(arith) => {
+                        let spec_of = |o: &Operand| {
+                            operand_local(o).and_then(|l| cx.specials.get(&l).copied())
+                        };
+                        let slice_add = |spec: Option<Special>, other: &Operand, checked: bool| {
+                            let c = const_usize(other, llbc)?;
+                            match spec {
+                                Some(Special::SliceBase { slice_local }) => Some(if checked {
+                                    Special::SliceIndexPair { slice_local, k: c }
+                                } else {
+                                    Special::SliceIndex { slice_local, k: c }
+                                }),
+                                Some(Special::SliceIndex { slice_local, k }) => {
+                                    let k = k.checked_add(c)?;
+                                    Some(if checked {
+                                        Special::SliceIndexPair { slice_local, k }
+                                    } else {
+                                        Special::SliceIndex { slice_local, k }
+                                    })
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(special) = match arith {
+                            IndexArith::Add { checked } => slice_add(spec_of(lhs), rhs, checked)
+                                .or_else(|| slice_add(spec_of(rhs), lhs, checked)),
+                            IndexArith::Sub { .. } => None,
+                        } {
+                            Some(special)
+                        } else {
+                            let index_of = |o: &Operand| match spec_of(o) {
+                                Some(
+                                    Special::Index { k, relative }
+                                    | Special::IndexPair { k, relative },
+                                ) => Some((k, relative)),
+                                _ => None,
+                            };
+                            // `len + k` and `len - k` are compile-time offsets
+                            // from the depth at the Len/Base. `zip_two_tuple_next`
+                            // names a just-pinned slot as `shadow_stack_len() - 1`.
+                            let offset = match (arith, index_of(lhs), index_of(rhs)) {
+                                (IndexArith::Add { checked }, Some((k, relative)), None) => {
+                                    const_usize(rhs, llbc).map(|c| (k + c, checked, relative))
+                                }
+                                (IndexArith::Add { checked }, None, Some((k, relative))) => {
+                                    const_usize(lhs, llbc).map(|c| (k + c, checked, relative))
+                                }
+                                (IndexArith::Sub { checked }, Some((k, relative)), None) => {
+                                    const_usize(rhs, llbc).and_then(|c| {
+                                        k.checked_sub(c).map(|n| (n, checked, relative))
+                                    })
+                                }
+                                _ => None,
+                            };
+                            offset
+                                .map(|(k, checked, relative)| Special::index(k, relative, checked))
+                        }
+                    }
+                    None => None,
+                },
+                Rvalue::Aggregate(_, operands)
+                    if is_frame_anchor_ty(&place.ty, llbc)
+                        || is_frame_anchor_local(body, llbc, dest) =>
+                {
+                    operands.first().and_then(operand_local).and_then(|l| {
+                        match cx.specials.get(&l).copied() {
+                            Some(Special::Guard { depth, skew }) => {
+                                Some(Special::Guard { depth, skew })
+                            }
+                            Some(Special::Index { k, .. }) => {
+                                Some(Special::Guard { depth: k, skew: 0 })
+                            }
+                            Some(Special::Alias(g)) => match cx.specials.get(&g).copied() {
+                                Some(Special::Guard { depth, skew }) => {
+                                    Some(Special::Guard { depth, skew })
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    })
+                }
+                _ => None,
+            };
+            if let Some(special) = special {
+                cx.bind(dest, special)?;
+                cx.record_removed(bb, si);
+            }
+        }
+        let term_json = block.terminator.kind_value();
+        match block.term_ref(llbc) {
+            Ok(TermKind::Call { call, target, .. }) => {
+                let Some(&(leaf, method)) = classified.get(&bb) else {
+                    if let Some((d, skew)) = mem_drop_guard(call, llbc, &cx.specials) {
+                        if d > depth {
+                            return Err("close-above-depth");
+                        }
+                        depth = d;
+                        lo = d - skew;
+                        open = open.saturating_sub(1);
+                        cx.record_term(bb, *target, Vec::new());
+                        cx.reach(bb, *target, depth, lo, open)?;
+                        continue;
+                    }
+                    // A closure whose body is `shadow_stack_get` of a captured
+                    // index (or `captured + const`) is a Get of that slot.
+                    // `RootBracketPlan.capture_temps` already answers this at
+                    // lowering; the codewriter must not see the bracket
+                    // (`gctransform` `push_roots` runs after `make_jitcodes`).
+                    if let Some((answer, carriers)) = try_slot_getter_call(
+                        body,
+                        llbc,
+                        call,
+                        &cx.specials,
+                        &cx.stmt_assigned,
+                        cx.call_dests,
+                        cx.forward_blocks,
+                        cx.getter_cache,
+                    ) {
+                        let dest_json = &term_json["Call"]["dest"];
+                        let stmts = match answer {
+                            GetterAnswer::Scalar { k, relative } => {
+                                cx.check_slot_read(k, relative, depth, lo, false)?;
+                                if !cx.emit() {
+                                    cx.reach(bb, *target, depth, lo, open)?;
+                                    continue;
+                                }
+                                let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
+                                vec![assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
+                                )]
+                            }
+                            GetterAnswer::Slice { slice_local, k } => {
+                                if cx.emit() && open == 0 {
+                                    return Err("get-above-depth");
+                                }
+                                if !cx.emit() {
+                                    cx.reach(bb, *target, depth, lo, open)?;
+                                    continue;
+                                }
+                                vec![assign_json(
+                                    dest_json.clone(),
+                                    slice_elem_use(body, slice_local, dest_json, k)?,
+                                )]
+                            }
+                        };
+                        cx.record_term(bb, *target, stmts);
+                        cx.getter_bbs.insert(bb);
+                        for local in carriers {
+                            cx.capture_temps.insert(local);
+                        }
+                        cx.reach(bb, *target, depth, lo, open)?;
+                        continue;
+                    }
+                    // Observes at Known(0) reads the caller's slots.
+                    // Inside our Open the callee reads our pins, which
+                    // become slot locals (`eval_slice_index` / `getindex_w`).
+                    let effect =
+                        resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+                    if effect.observes && depth == 0 {
+                        if crate::decline::enabled() {
+                            eprintln!(
+                                "[erase] observes-at-entry {} as {}",
+                                callee_path(call, llbc).as_deref().unwrap_or(""),
+                                effect.as_str()
+                            );
+                        }
+                        return Err("calls-stack-sensitive-fn");
+                    }
+                    cx.reach(bb, *target, depth, lo, open)?;
+                    continue;
+                };
+                let args_json = &term_json["Call"]["call"]["args"];
+                let dest_json = &term_json["Call"]["dest"];
+                let dest = place_local(&call.dest);
+                let arg0 = usize::from(method);
+                let guard = if method {
+                    let receiver = call.args.first().and_then(operand_local);
+                    match receiver.and_then(|l| cx.specials.get(&l).map(|s| (l, s))) {
+                        Some((_, Special::Alias(g))) => Some(*g),
+                        Some((l, Special::Guard { .. })) => Some(l),
+                        _ => return Err("receiver-not-a-guard-borrow"),
+                    }
+                } else {
+                    None
+                };
+                let mut stmts = Vec::new();
+                match leaf {
+                    Leaf::Open => {
+                        let dest = dest.ok_or("guard-dest-projected")?;
+                        cx.bind(
+                            dest,
+                            Special::Guard {
+                                depth,
+                                skew: depth - lo,
+                            },
+                        )?;
+                        open += 1;
+                    }
+                    Leaf::GuardNew => {
+                        let dest = dest.ok_or("guard-dest-projected")?;
+                        cx.bind(
+                            dest,
+                            Special::Guard {
+                                depth,
+                                skew: depth - lo,
+                            },
+                        )?;
+                        let obj = args_json.get(0).ok_or("pin-value-untyped")?;
+                        let ty = operand_json_ty(obj).ok_or("pin-value-untyped")?;
+                        cx.ensure_slot_ty(ty.clone());
+                        cx.record_slot_ty(depth, &ty)?;
+                        if cx.emit() {
+                            stmts.push(assign_json(
+                                local_place_json(cx.slot_local(depth), &ty),
+                                json!({ "Use": [copy_operand_json(obj), "Yes"] }),
+                            ));
+                        }
+                        let extra = match call.args.get(1).and_then(operand_local) {
+                            Some(slice) => {
+                                let (agg_si, operands) =
+                                    resolve_published_array(block, Some(slice))
+                                        .ok_or("publish-array-unresolved")?;
+                                let mut inserted = Vec::new();
+                                for (i, element) in operands.iter().enumerate() {
+                                    let ty = operand_json_ty(element)
+                                        .ok_or("publish-element-untyped")?;
+                                    cx.ensure_slot_ty(ty.clone());
+                                    cx.record_slot_ty(depth + 1 + i, &ty)?;
+                                    inserted.push(assign_json(
+                                        local_place_json(cx.slot_local(depth + 1 + i), &ty),
+                                        json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                    ));
+                                }
+                                cx.insert_after((bb, agg_si), inserted);
+                                operands.len()
+                            }
+                            None => 0,
+                        };
+                        pin_depth(&mut depth, &mut lo, 1 + extra);
+                        cx.bump_slot_count(depth);
+                    }
+                    Leaf::AnchorOpen => {
+                        let dest = dest.ok_or("guard-dest-projected")?;
+                        let value = args_json.get(0).ok_or("pin-value-untyped")?;
+                        let ty = value
+                            .as_object()
+                            .and_then(|m| m.values().next())
+                            .and_then(|p| p.get("ty"))
+                            .cloned()
+                            .ok_or("pin-value-untyped")?;
+                        cx.ensure_slot_ty(ty.clone());
+                        cx.record_slot_ty(depth, &ty)?;
+                        if cx.emit() {
+                            let copied = copy_operand_json(value);
+                            stmts.push(assign_json(
+                                local_place_json(cx.slot_local(depth), &ty),
+                                json!({ "Use": [copied, "Yes"] }),
+                            ));
+                        }
+                        cx.bind(
+                            dest,
+                            Special::Guard {
+                                depth,
+                                skew: depth - lo,
+                            },
+                        )?;
+                        pin_depth(&mut depth, &mut lo, 1);
+                        open += 1;
+                        cx.bump_slot_count(depth);
+                    }
+                    Leaf::Close => {
+                        let (d, skew) = if let Some(g) = guard {
+                            cx.guard_open(g)?
+                        } else {
+                            call.args
+                                .first()
+                                .and_then(operand_local)
+                                .and_then(|l| special_open_guard(&cx.specials, l))
+                                .ok_or("close-without-guard")?
+                        };
+                        if d > depth {
+                            return Err("close-above-depth");
+                        }
+                        depth = d;
+                        lo = d - skew;
+                        open = open.saturating_sub(1);
+                    }
+                    Leaf::Base => {
+                        let (d, _) = cx.guard_open(guard.ok_or("base-without-guard")?)?;
+                        cx.bind(
+                            dest.ok_or("index-dest-projected")?,
+                            Special::Index {
+                                k: d,
+                                relative: false,
+                            },
+                        )?;
+                    }
+                    Leaf::Len => {
+                        cx.bind(
+                            dest.ok_or("index-dest-projected")?,
+                            Special::Index {
+                                k: depth,
+                                relative: true,
+                            },
+                        )?;
+                    }
+                    Leaf::Pin => {
+                        let value = &args_json[arg0];
+                        let ty = value
+                            .as_object()
+                            .and_then(|m| m.values().next())
+                            .and_then(|p| p.get("ty"))
+                            .cloned()
+                            .ok_or("pin-value-untyped")?;
+                        cx.ensure_slot_ty(ty.clone());
+                        cx.record_slot_ty(depth, &ty)?;
+                        if cx.emit() {
+                            let copied = copy_operand_json(value);
+                            stmts.push(assign_json(
+                                local_place_json(cx.slot_local(depth), &ty),
+                                json!({ "Use": [copied, "Yes"] }),
+                            ));
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [copied, "Yes"] }),
+                            ));
+                        }
+                        pin_depth(&mut depth, &mut lo, 1);
+                        cx.bump_slot_count(depth);
+                    }
+                    Leaf::Publish => {
+                        let slice = call.args.get(arg0).and_then(operand_local);
+                        // Same-block array first; then an aggregate in a
+                        // dominating predecessor (`pin_roots_slice_values`
+                        // shape); then an incoming `&[PyObjectRef]`
+                        // (`pin_roots_incoming_slice`). `gctransform`
+                        // `push_roots` runs after `make_jitcodes`.
+                        if let Some((agg_bb, agg_si, operands)) =
+                            resolve_published_array(block, slice)
+                                .map(|(si, ops)| (bb, si, ops))
+                                .or_else(|| {
+                                    resolve_published_array_in_body(
+                                        body,
+                                        slice,
+                                        &cx.stmt_assigned,
+                                        cx.forward_blocks,
+                                    )
+                                })
+                        {
+                            let mut inserted = Vec::new();
+                            for (i, element) in operands.iter().enumerate() {
+                                let ty = element
+                                    .as_object()
+                                    .and_then(|m| m.values().next())
+                                    .and_then(|p| p.get("ty"))
+                                    .cloned()
+                                    .ok_or("publish-element-untyped")?;
+                                cx.ensure_slot_ty(ty.clone());
+                                cx.record_slot_ty(depth + i, &ty)?;
+                                inserted.push(assign_json(
+                                    local_place_json(cx.slot_local(depth + i), &ty),
+                                    json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                ));
+                            }
+                            cx.insert_after((agg_bb, agg_si), inserted);
+                            if let Some(dest) = dest {
+                                cx.bind(
+                                    dest,
+                                    Special::Index {
+                                        k: depth,
+                                        relative: false,
+                                    },
+                                )?;
+                            }
+                            pin_depth(&mut depth, &mut lo, operands.len());
+                            cx.bump_slot_count(depth);
+                        } else if let Some((slice_local, _)) = slice.and_then(|s| {
+                            super::pin_roots_incoming_slice(
+                                body,
+                                s,
+                                &cx.stmt_assigned,
+                                cx.forward_blocks,
+                            )
+                        }) {
+                            if let Some(dest) = dest {
+                                cx.bind(dest, Special::SliceBase { slice_local })?;
+                            }
+                        } else {
+                            return Err("publish-array-unresolved");
+                        }
+                    }
+                    Leaf::Normalize => {}
+                    Leaf::NormalizeMoved => {
+                        if cx.emit() {
+                            let ty = dest_json["ty"].clone();
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Const": [{ "Bool": false }, ty] }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::Get => {
+                        let index_local = call.args.get(arg0).and_then(operand_local);
+                        let const_k = call.args.get(arg0).and_then(|op| const_usize(op, llbc));
+                        match index_local.and_then(|l| cx.specials.get(&l).copied()) {
+                            Some(
+                                Special::Index { k, relative } | Special::IndexPair { k, relative },
+                            ) => {
+                                cx.check_slot_read(k, relative, depth, lo, false)?;
+                                if cx.emit() {
+                                    let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
+                                    stmts.push(assign_json(
+                                        dest_json.clone(),
+                                        json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
+                                    ));
+                                }
+                            }
+                            Some(Special::SliceBase { slice_local }) => {
+                                if cx.emit() && open == 0 {
+                                    return Err("get-above-depth");
+                                }
+                                if cx.emit() {
+                                    stmts.push(assign_json(
+                                        dest_json.clone(),
+                                        slice_elem_use(body, slice_local, dest_json, 0)?,
+                                    ));
+                                }
+                            }
+                            Some(
+                                Special::SliceIndex { slice_local, k }
+                                | Special::SliceIndexPair { slice_local, k },
+                            ) => {
+                                if cx.emit() && open == 0 {
+                                    return Err("get-above-depth");
+                                }
+                                if cx.emit() {
+                                    stmts.push(assign_json(
+                                        dest_json.clone(),
+                                        slice_elem_use(body, slice_local, dest_json, k)?,
+                                    ));
+                                }
+                            }
+                            _ if const_k.is_some() => {
+                                let k = const_k.unwrap();
+                                cx.check_slot_read(k, false, depth, lo, false)?;
+                                if cx.emit() {
+                                    let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
+                                    stmts.push(assign_json(
+                                        dest_json.clone(),
+                                        json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
+                                    ));
+                                }
+                            }
+                            _ => return Err("index-not-static"),
+                        }
+                    }
+                    Leaf::GuardRoot => {
+                        let (d, _) = cx.guard_open(guard.ok_or("receiver-not-a-guard-borrow")?)?;
+                        let k = call
+                            .args
+                            .get(1)
+                            .and_then(|op| {
+                                const_usize(op, llbc).or_else(|| {
+                                    operand_local(op).and_then(|l| cx.const_locals.get(&l).copied())
+                                })
+                            })
+                            .ok_or("index-not-static")?;
+                        let slot = d.checked_add(k).ok_or("get-above-depth")?;
+                        cx.check_slot_read(slot, false, depth, lo, false)?;
+                        if cx.emit() {
+                            let ty = cx.slot_ty_at(slot).ok_or("get-before-any-pin")?;
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Read": local_place_json(cx.slot_local(slot), &ty) }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::Set => {
+                        let (k, relative) = cx.slot_index_of(call, arg0, llbc)?;
+                        cx.check_slot_read(k, relative, depth, lo, true)?;
+                        if cx.emit() {
+                            let ty = cx.slot_ty_at(k).ok_or("set-before-any-pin")?;
+                            stmts.push(assign_json(
+                                local_place_json(cx.slot_local(k), &ty),
+                                json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::ReloadTop => {
+                        if depth == 0 {
+                            return Err("reload-empty-stack");
+                        }
+                        if cx.emit() {
+                            let ty = cx.slot_ty_at(depth - 1).ok_or("reload-before-any-pin")?;
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Read": local_place_json(cx.slot_local(depth - 1), &ty) }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::AnchorGet => {
+                        let k = if method {
+                            cx.guard_open(guard.ok_or("get-without-guard")?)?.0
+                        } else {
+                            call.args
+                                .first()
+                                .and_then(operand_local)
+                                .and_then(|l| special_open_depth(&cx.specials, l))
+                                .ok_or("index-not-static")?
+                        };
+                        cx.check_slot_read(k, false, depth, lo, false)?;
+                        if cx.emit() {
+                            let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::Unmodeled
+                    | Leaf::CopyRange
+                    | Leaf::ItemsOpen
+                    | Leaf::ItemsPush
+                    | Leaf::ItemsNop
+                    | Leaf::ItemsGet
+                    | Leaf::ItemsClose => unreachable!("refused above"),
+                }
+                cx.record_term(bb, *target, stmts);
+                cx.reach(bb, *target, depth, lo, open)?;
+            }
+            Ok(TermKind::Drop { place, target, .. }) => {
+                let dropped = place_local(place);
+                if let Some(Special::Guard { depth: d, skew }) =
+                    dropped.and_then(|l| cx.specials.get(&l)).copied()
+                {
+                    // A drop flag the artefact does not carry can leave the
+                    // guard unopened on this path; the depth says so.
+                    if d > depth {
+                        return Err("close-above-depth");
+                    }
+                    depth = d;
+                    lo = d - skew;
+                    open = open.saturating_sub(1);
+                    cx.record_term(bb, *target, Vec::new());
+                    cx.reach(bb, *target, depth, lo, open)?;
+                } else if dropped.is_some_and(|l| {
+                    is_root_scope_local(body, llbc, l) || is_frame_anchor_local(body, llbc, l)
+                }) {
+                    return Err("drop-of-unopened-guard");
+                } else {
+                    cx.reach(bb, *target, depth, lo, open)?;
+                }
+            }
+            Ok(TermKind::Assert { assert, target, .. }) => {
+                if assert_is_slot_index_bounds_check(assert, &cx.specials, &cx.const_locals, llbc) {
+                    cx.record_term(bb, *target, Vec::new());
+                }
+                cx.reach(bb, *target, depth, lo, open)?;
+            }
+            Ok(TermKind::Goto { target }) => cx.reach(bb, *target, depth, lo, open)?,
+            Ok(TermKind::Switch { targets, .. }) => match targets {
+                majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
+                    cx.reach(bb, *a, depth, lo, open)?;
+                    cx.reach(bb, *b, depth, lo, open)?;
+                }
+                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
+                    for (_, t) in arms {
+                        cx.reach(bb, *t, depth, lo, open)?;
+                    }
+                    cx.reach(bb, *default, depth, lo, open)?;
+                }
+            },
+            Ok(TermKind::Return) => {
+                if depth != 0 {
+                    // 10.04 `Drop` of the guard lives in an `is_cleanup`
+                    // block. `FunDecl::unstructured` keeps those blocks, so
+                    // `UnwindResume` is among them and a later
+                    // `UnwindTerminate` can be last. Return is then the
+                    // normal closer.
+                    if !body
+                        .body
+                        .iter()
+                        .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
+                    {
+                        return Err("returns-with-published-slots");
+                    }
+                }
+            }
+            Ok(
+                TermKind::UnwindResume
+                | TermKind::UnwindTerminate
+                | TermKind::Abort(_)
+                | TermKind::Panic { .. }
+                | TermKind::UndefinedBehavior,
+            ) => {}
+            _ => return Err("unknown-terminator"),
+        }
+    }
+
+    Ok(())
 }
 
 /// Build the rewrite, or say why this body keeps its bracket.
@@ -1145,17 +2291,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && let Some(path) = callee_path(call, llbc)
-            && callee_effect_of(llbc, &path).refuses_erase()
         {
-            if crate::decline::enabled() {
-                eprintln!(
-                    "[erase] refuses_erase {} as {}",
-                    path,
-                    callee_effect_of(llbc, &path).as_str()
-                );
+            let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+            if effect.refuses_erase() {
+                if crate::decline::enabled() {
+                    eprintln!(
+                        "[erase] refuses_erase {} as {}",
+                        callee_path(call, llbc).as_deref().unwrap_or(""),
+                        effect.as_str()
+                    );
+                }
+                return Err("calls-stack-sensitive-fn");
             }
-            return Err("calls-stack-sensitive-fn");
         }
     }
     if classified
@@ -1165,27 +2312,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         return Err("unmodeled-stack-op");
     }
 
-    let mut plan = Plan {
-        specials: HashMap::new(),
-        removed: HashMap::new(),
-        inserted_after: HashMap::new(),
-        terms: HashMap::new(),
-        slot_count: 0,
-        slot_ty: None,
-        slot_tys: HashMap::new(),
-        unreachable: Vec::new(),
-    };
-    let bind =
-        |specials: &mut HashMap<usize, Special>, local: usize, special: Special| match specials
-            .insert(local, special)
-        {
-            Some(previous) if previous != special => Err("special-rebound"),
-            _ => Ok(()),
-        };
-    let slot_local = |k: usize| n_locals + k;
-
     let def_counts = local_def_counts(body, llbc, &forward_blocks);
-    let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut stmt_assigned: HashMap<usize, usize> = HashMap::new();
     let mut call_dests = bit_set::BitSet::new();
     for (bb, block) in body.body.iter().enumerate() {
@@ -1208,879 +2335,107 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
     let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
-    let mut getter_bbs = bit_set::BitSet::new();
-    let mut capture_temps = bit_set::BitSet::new();
+    if n_blocks == 0 {
+        return Ok(None);
+    }
+    let succs: Vec<Vec<u64>> = (0..n_blocks)
+        .map(|bb| erase_forward_successors(body, llbc, bb))
+        .collect();
     let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
+    let mut lo_in: Vec<Option<usize>> = vec![None; n_blocks];
     // Guards currently open. Incoming-slice Gets are allowed only while
     // this is non-zero: Open does not change scalar depth, so Close of a
     // slice-only bracket is still depth 0.
     let mut open_in: Vec<Option<usize>> = vec![None; n_blocks];
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    if n_blocks == 0 {
-        return Ok(None);
-    }
     depth_in[0] = Some(0);
+    lo_in[0] = Some(0);
     open_in[0] = Some(0);
-    queue.push_back(0);
-    let mut visited = vec![false; n_blocks];
-    let reach = |depth_in: &mut Vec<Option<usize>>,
-                 open_in: &mut Vec<Option<usize>>,
-                 queue: &mut VecDeque<usize>,
-                 specials: &HashMap<usize, Special>,
-                 target: u64,
-                 depth: usize,
-                 open: usize|
-     -> Result<(), Refusal> {
-        let target = target as usize;
-        if target >= n_blocks {
-            return Ok(());
-        }
-        // Scalar depth only: an incoming slice is not a slot
-        // (`pin_roots_incoming_slice`). A Drop of the guard rewinds to
-        // the open depth, so a slice-only early return may join a
-        // `pin_root` arm there (`__majit_wrap_dict_descr_keys`).
-        let rewinds = block_rewinds_scope(body, llbc, &classified, specials, target);
-        match depth_in[target] {
-            Some(d) if d != depth && !rewinds => Err("depth-disagrees-at-merge"),
-            Some(_) => Ok(()),
-            None => {
-                depth_in[target] = Some(depth);
-                open_in[target] = Some(open);
-                queue.push_back(target);
-                Ok(())
-            }
-        }
-    };
 
-    while let Some(bb) = queue.pop_front() {
-        if visited[bb] {
-            continue;
-        }
-        visited[bb] = true;
-        let mut depth = depth_in[bb].expect("queued blocks have a depth");
-        let mut open = open_in[bb].expect("queued blocks have an open count");
-        let block = &body.body[bb];
-        // Statements: the index, pair and alias definitions.
-        for (si, stmt) in block.statements.iter().enumerate() {
-            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
-                continue;
-            };
-            let Some(dest) = place_local(place) else {
-                continue;
-            };
-            match rvalue {
-                Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
-                    if single_def(dest) {
-                        array_lens.insert(dest, operands.len());
-                    }
-                }
-                Rvalue::Len(src) => {
-                    let base = place_local(src).or_else(|| deref_of_local(src));
-                    if single_def(dest)
-                        && let Some(n) = base.and_then(|l| array_lens.get(&l).copied())
-                    {
-                        const_locals.insert(dest, n);
-                    }
-                }
-                Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
-                    let base = place_local(src).or_else(|| deref_of_local(src));
-                    if single_def(dest)
-                        && let Some(n) = base.and_then(|l| array_lens.get(&l).copied())
-                    {
-                        array_lens.insert(dest, n);
-                    }
-                }
-                // Cast / UnaryOp may change the value (narrowing, negation,
-                // bit-not). `constfold.fold_op_list` evaluates them; this
-                // pass does not, so the fact is dropped.
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
-                    if single_def(dest)
-                        && let Some((pair, 1)) = tuple_field_of_local(src)
-                        && let Some(n) = array_lens.get(&pair).copied()
-                    {
-                        const_locals.insert(dest, n);
-                    }
-                }
-                _ => {}
-            }
-            let special = match rvalue {
-                Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
-                    let guard = place_local(src)
-                        .and_then(|l| match plan.specials.get(&l) {
-                            Some(Special::Guard(_)) => Some(l),
-                            _ => None,
-                        })
-                        .or_else(|| {
-                            deref_of_local(src).and_then(|l| match plan.specials.get(&l) {
-                                Some(Special::Alias(g)) => Some(*g),
-                                _ => None,
-                            })
-                        });
-                    guard.map(Special::Alias)
-                }
-                Rvalue::Use(op, _) => match op {
-                    Operand::Copy(src) | Operand::Move(src) => {
-                        if let Some(l) = place_local(src) {
-                            if single_def(dest) {
-                                if let Some(n) = const_locals.get(&l).copied() {
-                                    const_locals.insert(dest, n);
-                                }
-                                if let Some(n) = array_lens.get(&l).copied() {
-                                    array_lens.insert(dest, n);
-                                }
-                            }
-                            match plan.specials.get(&l) {
-                                Some(Special::Index(k)) => Some(Special::Index(*k)),
-                                Some(Special::Alias(g)) => Some(Special::Alias(*g)),
-                                Some(Special::Guard(d)) => Some(Special::Guard(*d)),
-                                Some(Special::SliceBase { slice_local }) => {
-                                    Some(Special::SliceBase {
-                                        slice_local: *slice_local,
-                                    })
-                                }
-                                Some(Special::SliceIndex { slice_local, k }) => {
-                                    Some(Special::SliceIndex {
-                                        slice_local: *slice_local,
-                                        k: *k,
-                                    })
-                                }
-                                Some(Special::SliceIndexPair { slice_local, k }) => {
-                                    Some(Special::SliceIndexPair {
-                                        slice_local: *slice_local,
-                                        k: *k,
-                                    })
-                                }
-                                _ => None,
-                            }
-                        } else if let Some((base, field)) = tuple_field_of_local(src) {
-                            match (field, plan.specials.get(&base)) {
-                                (0, Some(Special::IndexPair(k))) => Some(Special::Index(*k)),
-                                (0, Some(Special::SliceIndexPair { slice_local, k })) => {
-                                    Some(Special::SliceIndex {
-                                        slice_local: *slice_local,
-                                        k: *k,
-                                    })
-                                }
-                                (0, Some(Special::Guard(d))) => Some(Special::Index(*d)),
-                                (0, Some(Special::Index(k))) => Some(Special::Index(*k)),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    Operand::Const(_) => {
-                        if single_def(dest)
-                            && let Some(n) = const_usize(op, llbc)
-                        {
-                            const_locals.insert(dest, n);
-                        }
-                        None
-                    }
-                },
-                Rvalue::BinaryOp(op, lhs, rhs) => match binop_is_index_arith(op) {
-                    Some(arith) => {
-                        let spec_of = |o: &Operand| {
-                            operand_local(o).and_then(|l| plan.specials.get(&l).copied())
-                        };
-                        let slice_add = |spec: Option<Special>, other: &Operand, checked: bool| {
-                            let c = const_usize(other, llbc)?;
-                            match spec {
-                                Some(Special::SliceBase { slice_local }) => Some(if checked {
-                                    Special::SliceIndexPair { slice_local, k: c }
-                                } else {
-                                    Special::SliceIndex { slice_local, k: c }
-                                }),
-                                Some(Special::SliceIndex { slice_local, k }) => {
-                                    let k = k.checked_add(c)?;
-                                    Some(if checked {
-                                        Special::SliceIndexPair { slice_local, k }
-                                    } else {
-                                        Special::SliceIndex { slice_local, k }
-                                    })
-                                }
-                                _ => None,
-                            }
-                        };
-                        if let Some(special) = match arith {
-                            IndexArith::Add { checked } => slice_add(spec_of(lhs), rhs, checked)
-                                .or_else(|| slice_add(spec_of(rhs), lhs, checked)),
-                            IndexArith::Sub { .. } => None,
-                        } {
-                            Some(special)
-                        } else {
-                            let index_of = |o: &Operand| match spec_of(o) {
-                                Some(Special::Index(k)) => Some(k),
-                                _ => None,
-                            };
-                            // `len + k` and `len - k` are compile-time offsets
-                            // from the depth at the Len/Base. `zip_two_tuple_next`
-                            // names a just-pinned slot as `shadow_stack_len() - 1`.
-                            let offset = match (arith, index_of(lhs), index_of(rhs)) {
-                                (IndexArith::Add { checked }, Some(k), None) => {
-                                    const_usize(rhs, llbc).map(|c| (k + c, checked))
-                                }
-                                (IndexArith::Add { checked }, None, Some(k)) => {
-                                    const_usize(lhs, llbc).map(|c| (k + c, checked))
-                                }
-                                (IndexArith::Sub { checked }, Some(k), None) => {
-                                    const_usize(rhs, llbc)
-                                        .and_then(|c| k.checked_sub(c).map(|n| (n, checked)))
-                                }
-                                _ => None,
-                            };
-                            offset.map(|(k, checked)| {
-                                if checked {
-                                    Special::IndexPair(k)
-                                } else {
-                                    Special::Index(k)
-                                }
-                            })
-                        }
-                    }
-                    None => None,
-                },
-                Rvalue::Aggregate(_, operands)
-                    if is_frame_anchor_ty(&place.ty, llbc)
-                        || is_frame_anchor_local(body, llbc, dest) =>
-                {
-                    operands.first().and_then(operand_local).and_then(|l| {
-                        match plan.specials.get(&l) {
-                            Some(Special::Guard(d) | Special::Index(d)) => Some(Special::Guard(*d)),
-                            Some(Special::Alias(g)) => match plan.specials.get(g) {
-                                Some(Special::Guard(d)) => Some(Special::Guard(*d)),
-                                _ => None,
-                            },
-                            _ => None,
-                        }
-                    })
-                }
-                _ => None,
-            };
-            if let Some(special) = special {
-                bind(&mut plan.specials, dest, special)?;
-                plan.removed.entry(bb).or_default().push(si);
-            }
-        }
-        let term_json = block.terminator.kind_value();
-        match block.term_ref(llbc) {
-            Ok(TermKind::Call { call, target, .. }) => {
-                let Some(&(leaf, method)) = classified.get(&bb) else {
-                    if let Some(d) = mem_drop_guard_depth(call, llbc, &plan.specials) {
-                        if d > depth {
-                            return Err("close-above-depth");
-                        }
-                        depth = d;
-                        open = open.saturating_sub(1);
-                        plan.terms.insert(
-                            bb,
-                            TermRewrite {
-                                target: *target,
-                                stmts: Vec::new(),
-                            },
-                        );
-                        reach(
-                            &mut depth_in,
-                            &mut open_in,
-                            &mut queue,
-                            &plan.specials,
-                            *target,
-                            depth,
-                            open,
-                        )?;
-                        continue;
-                    }
-                    // A closure whose body is `shadow_stack_get` of a captured
-                    // index (or `captured + const`) is a Get of that slot.
-                    // `RootBracketPlan.capture_temps` already answers this at
-                    // lowering; the codewriter must not see the bracket
-                    // (`gctransform` `push_roots` runs after `make_jitcodes`).
-                    if let Some((answer, carriers)) = try_slot_getter_call(
-                        body,
-                        llbc,
-                        call,
-                        &plan.specials,
-                        &stmt_assigned,
-                        &call_dests,
-                        &forward_blocks,
-                        &mut getter_cache,
-                    ) {
-                        let dest_json = &term_json["Call"]["dest"];
-                        let stmts = match answer {
-                            GetterAnswer::Scalar(k) => {
-                                if k >= depth {
-                                    return Err("get-above-depth");
-                                }
-                                let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
-                                vec![assign_json(
-                                    dest_json.clone(),
-                                    json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
-                                )]
-                            }
-                            GetterAnswer::Slice { slice_local, k } => {
-                                if open == 0 {
-                                    return Err("get-above-depth");
-                                }
-                                vec![assign_json(
-                                    dest_json.clone(),
-                                    slice_elem_use(body, slice_local, dest_json, k)?,
-                                )]
-                            }
-                        };
-                        plan.terms.insert(
-                            bb,
-                            TermRewrite {
-                                target: *target,
-                                stmts,
-                            },
-                        );
-                        getter_bbs.insert(bb);
-                        for local in carriers {
-                            capture_temps.insert(local);
-                        }
-                        reach(
-                            &mut depth_in,
-                            &mut open_in,
-                            &mut queue,
-                            &plan.specials,
-                            *target,
-                            depth,
-                            open,
-                        )?;
-                        continue;
-                    }
-                    // Observes at Known(0) reads the caller's slots.
-                    // Inside our Open the callee reads our pins, which
-                    // become slot locals (`eval_slice_index` / `getindex_w`).
-                    if let Some(path) = callee_path(call, llbc)
-                        && callee_effect_of(llbc, &path).observes
-                        && depth == 0
-                    {
-                        if crate::decline::enabled() {
-                            eprintln!(
-                                "[erase] observes-at-entry {} as {}",
-                                path,
-                                callee_effect_of(llbc, &path).as_str()
-                            );
-                        }
-                        return Err("calls-stack-sensitive-fn");
-                    }
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *target,
-                        depth,
-                        open,
-                    )?;
-                    continue;
-                };
-                let args_json = &term_json["Call"]["call"]["args"];
-                let dest_json = &term_json["Call"]["dest"];
-                let dest = place_local(&call.dest);
-                let arg0 = usize::from(method);
-                let guard = if method {
-                    let receiver = call.args.first().and_then(operand_local);
-                    match receiver.and_then(|l| plan.specials.get(&l).map(|s| (l, s))) {
-                        Some((_, Special::Alias(g))) => Some(*g),
-                        Some((l, Special::Guard(_))) => Some(l),
-                        _ => return Err("receiver-not-a-guard-borrow"),
-                    }
-                } else {
-                    None
-                };
-                let guard_depth = |g: usize| match plan.specials.get(&g) {
-                    Some(Special::Guard(d)) => Ok(*d),
-                    _ => Err("guard-not-opened"),
-                };
-                let index_arg = |i: usize| -> Result<usize, Refusal> {
-                    match call
-                        .args
-                        .get(i)
-                        .and_then(operand_local)
-                        .and_then(|l| plan.specials.get(&l))
-                    {
-                        Some(Special::Index(k)) => Ok(*k),
-                        _ => Err("index-not-static"),
-                    }
-                };
-                let mut stmts = Vec::new();
-                match leaf {
-                    Leaf::Open => {
-                        let dest = dest.ok_or("guard-dest-projected")?;
-                        bind(&mut plan.specials, dest, Special::Guard(depth))?;
-                        open += 1;
-                    }
-                    Leaf::GuardNew => {
-                        let dest = dest.ok_or("guard-dest-projected")?;
-                        bind(&mut plan.specials, dest, Special::Guard(depth))?;
-                        let obj = args_json.get(0).ok_or("pin-value-untyped")?;
-                        let ty = operand_json_ty(obj).ok_or("pin-value-untyped")?;
-                        plan.slot_ty.get_or_insert(ty.clone());
-                        record_slot_ty(&mut plan, depth, &ty)?;
-                        stmts.push(assign_json(
-                            local_place_json(slot_local(depth), &ty),
-                            json!({ "Use": [copy_operand_json(obj), "Yes"] }),
-                        ));
-                        let extra = match call.args.get(1).and_then(operand_local) {
-                            Some(slice) => {
-                                let (agg_si, operands) =
-                                    resolve_published_array(block, Some(slice))
-                                        .ok_or("publish-array-unresolved")?;
-                                let mut inserted = Vec::new();
-                                for (i, element) in operands.iter().enumerate() {
-                                    let ty = operand_json_ty(element)
-                                        .ok_or("publish-element-untyped")?;
-                                    plan.slot_ty.get_or_insert(ty.clone());
-                                    record_slot_ty(&mut plan, depth + 1 + i, &ty)?;
-                                    inserted.push(assign_json(
-                                        local_place_json(slot_local(depth + 1 + i), &ty),
-                                        json!({ "Use": [copy_operand_json(element), "Yes"] }),
-                                    ));
-                                }
-                                plan.inserted_after
-                                    .entry((bb, agg_si))
-                                    .or_default()
-                                    .extend(inserted);
-                                operands.len()
-                            }
-                            None => 0,
-                        };
-                        depth += 1 + extra;
-                        plan.slot_count = plan.slot_count.max(depth);
-                    }
-                    Leaf::AnchorOpen => {
-                        let dest = dest.ok_or("guard-dest-projected")?;
-                        let value = args_json.get(0).ok_or("pin-value-untyped")?;
-                        let ty = value
-                            .as_object()
-                            .and_then(|m| m.values().next())
-                            .and_then(|p| p.get("ty"))
-                            .cloned()
-                            .ok_or("pin-value-untyped")?;
-                        plan.slot_ty.get_or_insert(ty.clone());
-                        record_slot_ty(&mut plan, depth, &ty)?;
-                        let copied = copy_operand_json(value);
-                        stmts.push(assign_json(
-                            local_place_json(slot_local(depth), &ty),
-                            json!({ "Use": [copied, "Yes"] }),
-                        ));
-                        bind(&mut plan.specials, dest, Special::Guard(depth))?;
-                        depth += 1;
-                        open += 1;
-                        plan.slot_count = plan.slot_count.max(depth);
-                    }
-                    Leaf::Close => {
-                        let d = if let Some(g) = guard {
-                            guard_depth(g)?
-                        } else {
-                            call.args
-                                .first()
-                                .and_then(operand_local)
-                                .and_then(|l| special_open_depth(&plan.specials, l))
-                                .ok_or("close-without-guard")?
-                        };
-                        if d > depth {
-                            return Err("close-above-depth");
-                        }
-                        depth = d;
-                        open = open.saturating_sub(1);
-                    }
-                    Leaf::Base => {
-                        let d = guard_depth(guard.ok_or("base-without-guard")?)?;
-                        bind(
-                            &mut plan.specials,
-                            dest.ok_or("index-dest-projected")?,
-                            Special::Index(d),
-                        )?;
-                    }
-                    Leaf::Len => {
-                        bind(
-                            &mut plan.specials,
-                            dest.ok_or("index-dest-projected")?,
-                            Special::Index(depth),
-                        )?;
-                    }
-                    Leaf::Pin => {
-                        let value = &args_json[arg0];
-                        let ty = value
-                            .as_object()
-                            .and_then(|m| m.values().next())
-                            .and_then(|p| p.get("ty"))
-                            .cloned()
-                            .ok_or("pin-value-untyped")?;
-                        plan.slot_ty.get_or_insert(ty.clone());
-                        record_slot_ty(&mut plan, depth, &ty)?;
-                        let copied = copy_operand_json(value);
-                        stmts.push(assign_json(
-                            local_place_json(slot_local(depth), &ty),
-                            json!({ "Use": [copied, "Yes"] }),
-                        ));
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [copied, "Yes"] }),
-                        ));
-                        depth += 1;
-                        plan.slot_count = plan.slot_count.max(depth);
-                    }
-                    Leaf::Publish => {
-                        let slice = call.args.get(arg0).and_then(operand_local);
-                        // Same-block array first; then an aggregate in a
-                        // dominating predecessor (`pin_roots_slice_values`
-                        // shape); then an incoming `&[PyObjectRef]`
-                        // (`pin_roots_incoming_slice`). `gctransform`
-                        // `push_roots` runs after `make_jitcodes`.
-                        if let Some((agg_bb, agg_si, operands)) =
-                            resolve_published_array(block, slice)
-                                .map(|(si, ops)| (bb, si, ops))
-                                .or_else(|| {
-                                    resolve_published_array_in_body(
-                                        body,
-                                        slice,
-                                        &stmt_assigned,
-                                        &forward_blocks,
-                                    )
-                                })
-                        {
-                            let mut inserted = Vec::new();
-                            for (i, element) in operands.iter().enumerate() {
-                                let ty = element
-                                    .as_object()
-                                    .and_then(|m| m.values().next())
-                                    .and_then(|p| p.get("ty"))
-                                    .cloned()
-                                    .ok_or("publish-element-untyped")?;
-                                plan.slot_ty.get_or_insert(ty.clone());
-                                record_slot_ty(&mut plan, depth + i, &ty)?;
-                                inserted.push(assign_json(
-                                    local_place_json(slot_local(depth + i), &ty),
-                                    json!({ "Use": [copy_operand_json(element), "Yes"] }),
-                                ));
-                            }
-                            plan.inserted_after
-                                .entry((agg_bb, agg_si))
-                                .or_default()
-                                .extend(inserted);
-                            if let Some(dest) = dest {
-                                bind(&mut plan.specials, dest, Special::Index(depth))?;
-                            }
-                            depth += operands.len();
-                            plan.slot_count = plan.slot_count.max(depth);
-                        } else if let Some((slice_local, _)) = slice.and_then(|s| {
-                            super::pin_roots_incoming_slice(
-                                body,
-                                s,
-                                &stmt_assigned,
-                                &forward_blocks,
-                            )
-                        }) {
-                            if let Some(dest) = dest {
-                                bind(&mut plan.specials, dest, Special::SliceBase { slice_local })?;
-                            }
-                        } else {
-                            return Err("publish-array-unresolved");
-                        }
-                    }
-                    Leaf::Normalize => {}
-                    Leaf::NormalizeMoved => {
-                        let ty = dest_json["ty"].clone();
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [{ "Const": [{ "Bool": false }, ty] }, "Yes"] }),
-                        ));
-                    }
-                    Leaf::Get => {
-                        let index_local = call.args.get(arg0).and_then(operand_local);
-                        match index_local.and_then(|l| plan.specials.get(&l).copied()) {
-                            Some(Special::Index(k)) => {
-                                if k >= depth {
-                                    return Err("get-above-depth");
-                                }
-                                let ty = plan
-                                    .slot_tys
-                                    .get(&k)
-                                    .cloned()
-                                    .or_else(|| plan.slot_ty.clone())
-                                    .ok_or("get-before-any-pin")?;
-                                stmts.push(assign_json(
-                                    dest_json.clone(),
-                                    json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
-                                ));
-                            }
-                            Some(Special::SliceBase { slice_local }) => {
-                                if open == 0 {
-                                    return Err("get-above-depth");
-                                }
-                                stmts.push(assign_json(
-                                    dest_json.clone(),
-                                    slice_elem_use(body, slice_local, dest_json, 0)?,
-                                ));
-                            }
-                            Some(
-                                Special::SliceIndex { slice_local, k }
-                                | Special::SliceIndexPair { slice_local, k },
-                            ) => {
-                                if open == 0 {
-                                    return Err("get-above-depth");
-                                }
-                                stmts.push(assign_json(
-                                    dest_json.clone(),
-                                    slice_elem_use(body, slice_local, dest_json, k)?,
-                                ));
-                            }
-                            _ => return Err("index-not-static"),
-                        }
-                    }
-                    Leaf::GuardRoot => {
-                        let d = guard_depth(guard.ok_or("receiver-not-a-guard-borrow")?)?;
-                        let k = call
-                            .args
-                            .get(1)
-                            .and_then(|op| {
-                                const_usize(op, llbc).or_else(|| {
-                                    operand_local(op).and_then(|l| const_locals.get(&l).copied())
-                                })
-                            })
-                            .ok_or("index-not-static")?;
-                        let slot = d.checked_add(k).ok_or("get-above-depth")?;
-                        if slot >= depth {
-                            return Err("get-above-depth");
-                        }
-                        let ty = plan
-                            .slot_tys
-                            .get(&slot)
-                            .cloned()
-                            .or_else(|| plan.slot_ty.clone())
-                            .ok_or("get-before-any-pin")?;
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [{ "Read": local_place_json(slot_local(slot), &ty) }, "Yes"] }),
-                        ));
-                    }
-                    Leaf::AnchorGet => {
-                        let k = if method {
-                            guard_depth(guard.ok_or("get-without-guard")?)?
-                        } else {
-                            call.args
-                                .first()
-                                .and_then(operand_local)
-                                .and_then(|l| special_open_depth(&plan.specials, l))
-                                .ok_or("index-not-static")?
-                        };
-                        if k >= depth {
-                            return Err("get-above-depth");
-                        }
-                        let ty = plan
-                            .slot_tys
-                            .get(&k)
-                            .cloned()
-                            .or_else(|| plan.slot_ty.clone())
-                            .ok_or("get-before-any-pin")?;
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [{ "Read": local_place_json(slot_local(k), &ty) }, "Yes"] }),
-                        ));
-                    }
-                    Leaf::Set => {
-                        let k = index_arg(arg0)?;
-                        if k >= depth {
-                            return Err("set-above-depth");
-                        }
-                        let ty = plan
-                            .slot_tys
-                            .get(&k)
-                            .cloned()
-                            .or_else(|| plan.slot_ty.clone())
-                            .ok_or("set-before-any-pin")?;
-                        stmts.push(assign_json(
-                            local_place_json(slot_local(k), &ty),
-                            json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
-                        ));
-                    }
-                    Leaf::ReloadTop => {
-                        if depth == 0 {
-                            return Err("reload-empty-stack");
-                        }
-                        let ty = plan
-                            .slot_tys
-                            .get(&(depth - 1))
-                            .cloned()
-                            .or_else(|| plan.slot_ty.clone())
-                            .ok_or("reload-before-any-pin")?;
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [{ "Read": local_place_json(slot_local(depth - 1), &ty) }, "Yes"] }),
-                        ));
-                    }
-                    Leaf::Unmodeled
-                    | Leaf::CopyRange
-                    | Leaf::ItemsOpen
-                    | Leaf::ItemsPush
-                    | Leaf::ItemsNop
-                    | Leaf::ItemsGet
-                    | Leaf::ItemsClose => unreachable!("refused above"),
-                }
-                plan.terms.insert(
-                    bb,
-                    TermRewrite {
-                        target: *target,
-                        stmts,
-                    },
-                );
-                reach(
-                    &mut depth_in,
-                    &mut open_in,
-                    &mut queue,
-                    &plan.specials,
-                    *target,
-                    depth,
-                    open,
-                )?;
-            }
-            Ok(TermKind::Drop { place, target, .. }) => {
-                let dropped = place_local(place);
-                if let Some(Special::Guard(d)) = dropped.and_then(|l| plan.specials.get(&l)) {
-                    // A drop flag the artefact does not carry can leave the
-                    // guard unopened on this path; the depth says so.
-                    if *d > depth {
-                        return Err("close-above-depth");
-                    }
-                    depth = *d;
-                    open = open.saturating_sub(1);
-                    plan.terms.insert(
-                        bb,
-                        TermRewrite {
-                            target: *target,
-                            stmts: Vec::new(),
-                        },
-                    );
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *target,
-                        depth,
-                        open,
-                    )?;
-                } else if dropped.is_some_and(|l| {
-                    is_root_scope_local(body, llbc, l) || is_frame_anchor_local(body, llbc, l)
-                }) {
-                    return Err("drop-of-unopened-guard");
-                } else {
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *target,
-                        depth,
-                        open,
-                    )?;
-                }
-            }
-            Ok(TermKind::Assert { assert, target, .. }) => {
-                if assert_is_slot_index_bounds_check(assert, &plan.specials, &const_locals, llbc) {
-                    plan.terms.insert(
-                        bb,
-                        TermRewrite {
-                            target: *target,
-                            stmts: Vec::new(),
-                        },
-                    );
-                }
-                reach(
-                    &mut depth_in,
-                    &mut open_in,
-                    &mut queue,
-                    &plan.specials,
-                    *target,
-                    depth,
-                    open,
-                )?;
-            }
-            Ok(TermKind::Goto { target }) => reach(
-                &mut depth_in,
-                &mut open_in,
-                &mut queue,
-                &plan.specials,
-                *target,
-                depth,
-                open,
-            )?,
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *a,
-                        depth,
-                        open,
-                    )?;
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *b,
-                        depth,
-                        open,
-                    )?;
-                }
-                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
-                    for (_, t) in arms {
-                        reach(
-                            &mut depth_in,
-                            &mut open_in,
-                            &mut queue,
-                            &plan.specials,
-                            *t,
-                            depth,
-                            open,
-                        )?;
-                    }
-                    reach(
-                        &mut depth_in,
-                        &mut open_in,
-                        &mut queue,
-                        &plan.specials,
-                        *default,
-                        depth,
-                        open,
-                    )?;
-                }
-            },
-            Ok(TermKind::Return) => {
-                if depth != 0 {
-                    // 10.04 `Drop` of the guard lives in an `is_cleanup`
-                    // block. `FunDecl::unstructured` keeps those blocks, so
-                    // `UnwindResume` is among them and a later
-                    // `UnwindTerminate` can be last. Return is then the
-                    // normal closer.
-                    if body
-                        .body
-                        .iter()
-                        .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
-                    {
-                        depth = 0;
-                    } else {
-                        return Err("returns-with-published-slots");
-                    }
-                }
-            }
-            Ok(
-                TermKind::UnwindResume
-                | TermKind::UnwindTerminate
-                | TermKind::Abort(_)
-                | TermKind::Panic { .. }
-                | TermKind::UndefinedBehavior,
-            ) => {}
-            _ => return Err("unknown-terminator"),
-        }
+    let mut probe_specials = HashMap::new();
+    let mut queue: VecDeque<usize> = VecDeque::from([0]);
+    let mut visited = vec![false; n_blocks];
+    let mut dummy_getter_bbs = bit_set::BitSet::new();
+    let mut dummy_capture = bit_set::BitSet::new();
+    {
+        let mut cx = EraseWalk {
+            mode: WalkMode::Probe,
+            body,
+            llbc,
+            classified: &classified,
+            forward_blocks: &forward_blocks,
+            succs: &succs,
+            n_blocks,
+            n_locals,
+            def_counts: &def_counts,
+            stmt_assigned: &stmt_assigned,
+            call_dests: &call_dests,
+            depth_in: &mut depth_in,
+            lo_in: &mut lo_in,
+            open_in: &mut open_in,
+            frozen_depth: &[],
+            frozen_lo: &[],
+            queue: &mut queue,
+            visited: &mut visited,
+            specials: &mut probe_specials,
+            plan: None,
+            const_locals: &mut const_locals,
+            array_lens: &mut array_lens,
+            getter_cache: &mut getter_cache,
+            getter_bbs: &mut dummy_getter_bbs,
+            capture_temps: &mut dummy_capture,
+        };
+        run_erase_walk(&mut cx)?;
     }
+
+    let frozen_depth = depth_in.clone();
+    let frozen_lo = lo_in.clone();
+    visited.fill(false);
+    queue.clear();
+    queue.push_back(0);
+    let mut plan = Plan {
+        specials: HashMap::new(),
+        removed: HashMap::new(),
+        inserted_after: HashMap::new(),
+        terms: HashMap::new(),
+        slot_count: 0,
+        slot_ty: None,
+        slot_tys: HashMap::new(),
+        unreachable: Vec::new(),
+    };
+    let mut emit_specials = HashMap::new();
+    let mut getter_bbs = bit_set::BitSet::new();
+    let mut capture_temps = bit_set::BitSet::new();
+    {
+        let mut cx = EraseWalk {
+            mode: WalkMode::Emit,
+            body,
+            llbc,
+            classified: &classified,
+            forward_blocks: &forward_blocks,
+            succs: &succs,
+            n_blocks,
+            n_locals,
+            def_counts: &def_counts,
+            stmt_assigned: &stmt_assigned,
+            call_dests: &call_dests,
+            depth_in: &mut depth_in,
+            lo_in: &mut lo_in,
+            open_in: &mut open_in,
+            frozen_depth: &frozen_depth,
+            frozen_lo: &frozen_lo,
+            queue: &mut queue,
+            visited: &mut visited,
+            specials: &mut emit_specials,
+            plan: Some(&mut plan),
+            const_locals: &mut const_locals,
+            array_lens: &mut array_lens,
+            getter_cache: &mut getter_cache,
+            getter_bbs: &mut getter_bbs,
+            capture_temps: &mut capture_temps,
+        };
+        run_erase_walk(&mut cx)?;
+    }
+    plan.specials = emit_specials;
 
     // Local 0 is the return place. An Index bound there is a helper that
     // answers a slot (`pin_self`: pin, then `shadow_stack_len() - 1`).
@@ -2097,7 +2452,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // (`shadowstack.py ShadowStackFrameworkGCTransformer.push_roots`).
     if matches!(
         plan.specials.get(&0),
-        Some(Special::Index(_) | Special::IndexPair(_) | Special::Guard(_))
+        Some(Special::Index { .. } | Special::IndexPair { .. } | Special::Guard { .. })
     ) {
         return Err("returns-slot-index");
     }
@@ -2242,11 +2597,138 @@ fn block_rewinds_scope(
         Some(TermKind::Drop { place, .. }) => {
             matches!(
                 place_local(place).and_then(|l| specials.get(&l)),
-                Some(Special::Guard(_))
+                Some(Special::Guard { .. })
             ) || place_local(place).is_some_and(|l| is_root_scope_local(body, llbc, l))
         }
+        Some(TermKind::Call { call, .. }) => mem_drop_guard_depth(call, llbc, specials).is_some(),
         _ => false,
     }
+}
+
+/// Forward successors the erase walk follows: `on_unwind` is not a
+/// successor (`analyze` does not walk cleanup).
+fn erase_forward_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<u64> {
+    let Some(block) = body.body.get(bb) else {
+        return Vec::new();
+    };
+    match block.term_ref(llbc) {
+        Ok(TermKind::Call { target, .. })
+        | Ok(TermKind::Drop { target, .. })
+        | Ok(TermKind::Assert { target, .. })
+        | Ok(TermKind::Goto { target }) => vec![*target],
+        Ok(TermKind::Switch { targets, .. }) => match targets {
+            majit_charon_reader::ullbc::SwitchTargets::If(a, b) => vec![*a, *b],
+            majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
+                let mut s: Vec<u64> = arms.iter().map(|(_, t)| *t).collect();
+                s.push(*default);
+                s
+            }
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn is_erase_exit(body: &Unstructured, llbc: &Llbc, bb: usize) -> bool {
+    matches!(
+        body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()),
+        Some(
+            TermKind::Return
+                | TermKind::UnwindResume
+                | TermKind::UnwindTerminate
+                | TermKind::Abort(_)
+                | TermKind::Panic { .. }
+                | TermKind::UndefinedBehavior
+        )
+    )
+}
+
+/// A path that returns to the caller with this body's Open still live.
+/// UB / abort / panic / unwind-terminate are sinks: they do not hand a
+/// livevar set back, so they do not need a rewind for the join to be
+/// sound (`get_livevars_for_roots` is around collecting ops on returning
+/// paths).
+fn is_erase_returning_exit(body: &Unstructured, llbc: &Llbc, bb: usize) -> bool {
+    matches!(
+        body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()),
+        Some(TermKind::Return | TermKind::UnwindResume)
+    )
+}
+
+fn reachable_avoiding(
+    succs: &[Vec<u64>],
+    n: usize,
+    start: usize,
+    goal: usize,
+    avoid: usize,
+) -> bool {
+    if start == avoid {
+        return false;
+    }
+    if start == goal {
+        return true;
+    }
+    let mut seen = vec![false; n];
+    let mut queue = VecDeque::new();
+    queue.push_back(start);
+    seen[start] = true;
+    while let Some(bb) = queue.pop_front() {
+        for &s in succs.get(bb).into_iter().flatten() {
+            let s = s as usize;
+            if s >= n || s == avoid || seen[s] {
+                continue;
+            }
+            if s == goal {
+                return true;
+            }
+            seen[s] = true;
+            queue.push_back(s);
+        }
+    }
+    false
+}
+
+fn dominates(succs: &[Vec<u64>], n: usize, dominator: usize, node: usize) -> bool {
+    dominator == node || !reachable_avoiding(succs, n, 0, node, dominator)
+}
+
+/// The set of Close/Drop of this body's open guard postdominates `join`
+/// on the erase CFG: every *returning* path from `join` goes through some
+/// rewind. rustc copies the Drop onto each return, so no single rewind
+/// block postdominates; the set does. UB / abort / panic sinks (shared
+/// unreachable defaults) do not need a rewind.
+fn join_postdominated_by_this_guard_rewind(
+    body: &Unstructured,
+    llbc: &Llbc,
+    classified: &HashMap<usize, (Leaf, bool)>,
+    specials: &HashMap<usize, Special>,
+    succs: &[Vec<u64>],
+    n: usize,
+    join: usize,
+) -> bool {
+    let mut seen = vec![false; n];
+    let mut queue = VecDeque::new();
+    queue.push_back(join);
+    seen[join] = true;
+    while let Some(bb) = queue.pop_front() {
+        if block_rewinds_scope(body, llbc, classified, specials, bb) {
+            continue;
+        }
+        if is_erase_returning_exit(body, llbc, bb) {
+            return false;
+        }
+        if is_erase_exit(body, llbc, bb) {
+            continue;
+        }
+        for &s in succs.get(bb).into_iter().flatten() {
+            let s = s as usize;
+            if s >= n || seen[s] {
+                continue;
+            }
+            seen[s] = true;
+            queue.push_back(s);
+        }
+    }
+    true
 }
 
 /// `(*slice)[k]` as a `Use` rvalue. Lowering's `pair_getitem` /
@@ -2579,26 +3061,61 @@ pub(super) fn erase_or_keep(fd: &FunDecl, body: Unstructured, llbc: &Llbc) -> Un
 /// Census-path only: every local body's walk under the registered
 /// effects must equal the registered effect. A registered Observes
 /// whose own walk is clean (`why=-`) is the sticky-fixpoint bug.
+/// `callee_effect_of` must not answer `None` when the field tables
+/// hold a non-`None` product (depth-neutral overlay vs tables).
 fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
-    let effect = |path: &str| callee_effect_of(llbc, path);
+    let collect_all = std::env::var_os("PYRE_SS_COLLECT_ALL").is_some();
+    let effect = |identity: &str| callee_effect_of(llbc, identity);
+    let mut mismatches = 0usize;
+    let mut overlay_hides = 0usize;
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        let name = fd.item_meta.name_path();
-        let registered = effect(&name);
+        let identity = super::scope_owner_identity(llbc, fd);
+        let registered = effect(&identity);
         let walked = stack_walk(&body, llbc, &effect).effect();
-        if registered != walked {
-            panic!(
-                "stack-effect invariant: {name} registered {} rewalk {} why={}",
-                registered.as_str(),
-                walked.as_str(),
-                stack_walk(&body, llbc, &effect)
-                    .why
-                    .as_deref()
-                    .unwrap_or("-")
+        let assembled = assembled_effect_from_tables(llbc, &identity);
+        if !assembled.is_none() && registered.is_none() {
+            overlay_hides += 1;
+            let name = fd.item_meta.name_path();
+            let msg = format!(
+                "stack-effect overlay: {name} identity={identity} tables {} callee_effect_of None",
+                assembled.describe()
             );
+            if collect_all {
+                eprintln!("[table-overlay-disagree] {msg}");
+            } else {
+                panic!("{msg}");
+            }
         }
+        if registered != walked {
+            mismatches += 1;
+            let name = fd.item_meta.name_path();
+            let why = stack_walk(&body, llbc, &effect)
+                .why
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+            let msg = format!(
+                "stack-effect invariant: {name} identity={identity} registered {} rewalk {} why={why}",
+                registered.describe(),
+                walked.describe(),
+            );
+            if collect_all {
+                eprintln!("[mismatch] {msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+    if collect_all {
+        eprintln!(
+            "[mismatch-summary] crate={} mismatches={} overlay_hides={}",
+            llbc.crate_name(),
+            mismatches,
+            overlay_hides
+        );
     }
 }
 
@@ -2621,7 +3138,7 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
         };
         let name = fd.item_meta.name_path();
         if detail {
-            let walk = stack_walk(&body, llbc, &|path| callee_effect_of(llbc, path));
+            let walk = stack_walk(&body, llbc, &|identity| callee_effect_of(llbc, identity));
             let callee = first_non_none_callee(&body, llbc);
             eprintln!(
                 "[census-detail] {name}:{bucket} why={} callee={} effect={}",
@@ -2629,8 +3146,8 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
                 callee.as_ref().map(|(p, _)| p.as_str()).unwrap_or("-"),
                 callee
                     .as_ref()
-                    .map(|(_, effect)| effect.as_str())
-                    .unwrap_or("-"),
+                    .map(|(_, effect)| effect.describe())
+                    .unwrap_or_else(|| "-".to_string()),
             );
         }
         out.entry(bucket).or_default().push(name);
@@ -2771,6 +3288,64 @@ impl CalleeEffect {
         !self.observes && !self.leaves_above && self.param_slots.is_empty() && !self.returns_index
     }
 
+    /// `GraphAnalyzer.bottom_result`: most optimistic answer.
+    /// `returns_index` is a must-property (`true ≼ false`), so bottom
+    /// still claims it. `RaiseAnalyzer.bottom_result` is `False`
+    /// (cannot raise) for the same reason: unseen / in-progress graphs
+    /// are optimistic until `Dependency.merge_with_result` / `leave_with`.
+    fn bottom() -> Self {
+        Self {
+            observes: false,
+            leaves_above: false,
+            param_slots: Vec::new(),
+            returns_index: true,
+        }
+    }
+
+    /// Pointwise join: `observes` / `leaves_above` OR, `param_slots`
+    /// union (sorted, dedup), `returns_index` AND.
+    /// `BoolGraphAnalyzer.join_two_results` is OR; the must-field uses
+    /// the dual. `WriteAnalyzer.join_two_results` is set union.
+    fn join_two_results(&self, other: &Self) -> Self {
+        let mut param_slots = self.param_slots.clone();
+        for &p in &other.param_slots {
+            if !param_slots.contains(&p) {
+                param_slots.push(p);
+            }
+        }
+        param_slots.sort_unstable();
+        Self {
+            observes: self.observes || other.observes,
+            leaves_above: self.leaves_above || other.leaves_above,
+            param_slots,
+            returns_index: self.returns_index && other.returns_index,
+        }
+    }
+
+    /// Product order: `self ≼ other` iff other is at least as severe
+    /// on every field (`false ≼ true` OR-fields, `⊆` on `param_slots`,
+    /// `true ≼ false` on `returns_index`).
+    fn leq(&self, other: &Self) -> bool {
+        (!self.observes || other.observes)
+            && (!self.leaves_above || other.leaves_above)
+            && self
+                .param_slots
+                .iter()
+                .all(|p| other.param_slots.contains(p))
+            && (!other.returns_index || self.returns_index)
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{}(observes={} leaves_above={} param_slots={:?} returns_index={})",
+            self.as_str(),
+            self.observes,
+            self.leaves_above,
+            self.param_slots,
+            self.returns_index
+        )
+    }
+
     fn as_str(&self) -> &'static str {
         if self.observes && self.leaves_above {
             "ObservesLeaves"
@@ -2795,31 +3370,39 @@ fn resolved_callee_is_origportal_alias(llbc: &Llbc, path: &str) -> bool {
     llbc.is_rewritten_origportal_fn(&crate::front::mir::strip_crate_prefix(path))
 }
 
-/// Registered effect of `path`: `None` if not sensitive or proven
+/// Origportal is a property of the FunDecl, matched by the configured
+/// jitdriver path (`rewritten_origportal_fns`).
+fn is_origportal_alias_fd(llbc: &Llbc, fd: &FunDecl) -> bool {
+    resolved_callee_is_origportal_alias(llbc, &fd.item_meta.name_path())
+}
+
+/// Registered effect of `identity`: `None` if not sensitive or proven
 /// neutral; otherwise the union of the sets it was registered in. A
-/// sensitive path in none of them comes from an artefact that did not
-/// classify it, and is taken at its worst.
-fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
-    if llbc.is_stack_depth_neutral_fn(path) {
+/// sensitive identity in none of them comes from an artefact that did
+/// not classify it, and is taken at its worst. `identity` is
+/// [`super::scope_owner_identity`], matching
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` keyed by
+/// graph, never by `ItemMeta::name_path`. Origportal aliases are
+/// answered as none by [`resolved_callee_effect`] / [`is_origportal_alias_fd`],
+/// not here: identities are not config paths.
+fn assembled_effect_from_tables(llbc: &Llbc, identity: &str) -> CalleeEffect {
+    CalleeEffect {
+        observes: llbc.is_stack_observes_fn(identity),
+        leaves_above: llbc.is_stack_leaves_above_fn(identity),
+        param_slots: llbc.stack_param_slots(identity).unwrap_or_default(),
+        returns_index: llbc.is_stack_returns_index_fn(identity),
+    }
+}
+
+fn callee_effect_of(llbc: &Llbc, identity: &str) -> CalleeEffect {
+    let assembled = assembled_effect_from_tables(llbc, identity);
+    if llbc.is_stack_depth_neutral_fn(identity) {
         return CalleeEffect::none();
     }
-    if resolved_callee_is_origportal_alias(llbc, path) {
-        return CalleeEffect::none();
-    }
-    let param_slots = llbc.stack_param_slots(path).unwrap_or_default();
-    let leaves = llbc.is_stack_leaves_above_fn(path);
-    let returns_index = llbc.is_stack_returns_index_fn(path);
-    let observes = llbc.is_stack_observes_fn(path);
-    let effect = CalleeEffect {
-        observes,
-        leaves_above: leaves,
-        param_slots,
-        returns_index,
-    };
-    if effect.is_none() && llbc.is_stack_sensitive_fn(path) {
+    if assembled.is_none() && llbc.is_stack_sensitive_fn(identity) {
         return CalleeEffect::worst();
     }
-    effect
+    assembled
 }
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
@@ -2830,24 +3413,56 @@ fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, Ca
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && let Some(path) = callee_path(call, llbc)
+            && let Some(identity) = callee_identity(call, llbc)
         {
-            let effect = callee_effect_of(llbc, &path);
+            let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
             if !effect.is_none() {
-                return Some((path, effect));
+                return Some((identity, effect));
             }
         }
     }
     None
 }
 
-/// The callee path a call terminator names, for a statically resolved callee.
-fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+fn callee_fun_decl<'a>(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &'a Llbc,
+) -> Option<&'a FunDecl> {
     let majit_charon_reader::ullbc::CallFunc::Regular(reg) = &call.func else {
         return None;
     };
     let id = super::regular_call_fun_decl_id(&reg.kind)?;
-    llbc.fn_by_id(id).map(|fd| fd.item_meta.name_path())
+    llbc.fn_by_id(id)
+}
+
+/// The callee's `ItemMeta::name_path()`, for a statically resolved callee.
+/// Name consumers (`mem_drop_scope_local`, observes-at-entry logging)
+/// use this. Stack-effect tables key by [`callee_identity`].
+fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+    callee_fun_decl(call, llbc).map(|fd| fd.item_meta.name_path())
+}
+
+/// [`super::scope_owner_identity`] of the resolved callee FunDecl.
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` key by graph;
+/// this is that graph's existing identity string.
+fn callee_identity(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> Option<String> {
+    callee_fun_decl(call, llbc).map(|fd| super::scope_owner_identity(llbc, fd))
+}
+
+/// Shared Call → effect resolution. An origportal-alias callee is none
+/// before identity-keyed tables or `effect` are consulted.
+fn resolved_callee_effect(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    effect: &dyn Fn(&str) -> CalleeEffect,
+) -> CalleeEffect {
+    let Some(fd) = callee_fun_decl(call, llbc) else {
+        return CalleeEffect::none();
+    };
+    if is_origportal_alias_fd(llbc, fd) {
+        return CalleeEffect::none();
+    }
+    effect(&super::scope_owner_identity(llbc, fd))
 }
 
 /// Result of the per-path shadow-stack walk.
@@ -2876,33 +3491,28 @@ impl StackWalk {
     fn effect(&self) -> CalleeEffect {
         // An exit the walk could not bound may sit below entry (the
         // caller's slots are gone) or above it (slots are left), so it
-        // sets both.
+        // sets both. The four fields are a product: Observes does not
+        // clear `param_slots` / `returns_index`.
         let observes = self.reads_below || self.unknown_exit;
         CalleeEffect {
             observes,
             leaves_above: self.leaves_above || self.unknown_exit,
-            param_slots: if observes {
-                Vec::new()
-            } else {
-                self.param_slots.clone()
-            },
-            returns_index: self.returns_index && !observes,
+            param_slots: self.param_slots.clone(),
+            returns_index: self.returns_index,
         }
     }
 }
 
-/// Depth-neutral: every reachable path restores the entry depth, the body
-/// never reads a caller-owned slot, Observes callees are refused only at
-/// entry depth (inside our Open they see our pins; Close rewinds),
-/// LeavesAbove is allowed, no parameter-indexed slot access, no returned
-/// own-index summary, and a `RootScope` opens on some reachable path.
+/// Depth-neutral: the walk's product is `None` and a `RootScope` opens
+/// on some reachable path (`effect().is_none() && saw_open`).
+#[cfg(test)]
 fn body_is_depth_neutral(
     body: &Unstructured,
     llbc: &Llbc,
     effect: &dyn Fn(&str) -> CalleeEffect,
 ) -> bool {
     let walk = stack_walk(body, llbc, effect);
-    walk.why.is_none() && walk.saw_open && walk.param_slots.is_empty() && !walk.returns_index
+    walk.effect().is_none() && walk.saw_open
 }
 
 fn clear_tracked(
@@ -3389,64 +3999,54 @@ fn stack_walk(
                                 depth = d;
                             }
                         }
-                        let callee = path
-                            .as_deref()
-                            .map(effect)
-                            .unwrap_or_else(CalleeEffect::none);
-                        if callee.observes {
-                            // Unproven stack-sensitive callee. At
-                            // Known(0) every live slot is the caller's,
-                            // so the body is not neutral. Inside our
-                            // own Open (`eval_slice_index` pin then
-                            // `getindex_w`) only the depth is unknown:
-                            // Close rewinds our guard, and
-                            // `is_stack_depth_neutral_fn` still holds
-                            // so BINARY_SLICE can erase its bracket.
-                            if !depth.above_entry() {
-                                reads_below = true;
-                                why = format!(
-                                    "unproven-stack-sensitive {}",
-                                    path.as_deref().unwrap_or("")
-                                );
-                            }
-                            // A reader that may also leave slots, or end
-                            // below its entry, leaves no bound at all.
-                            depth = if callee.leaves_above {
+                        let callee = resolved_callee_effect(call, llbc, effect);
+                        // Four fields independently (`GraphAnalyzer` product
+                        // transfer). Observes does not gate param-slots or
+                        // `returns_index`. At Known(0) every live slot is
+                        // the caller's, so Observes is not neutral. Inside
+                        // our own Open (`eval_slice_index` pin then
+                        // `getindex_w`) Observes does not set `reads_below`:
+                        // Close rewinds our guard.
+                        if callee.observes && !depth.above_entry() {
+                            reads_below = true;
+                            why = format!(
+                                "unproven-stack-sensitive {}",
+                                path.as_deref().unwrap_or("")
+                            );
+                        }
+                        let depth_at_call = depth;
+                        if callee.leaves_above {
+                            // ObservesLeaves may be an unbounded exit
+                            // (below or above); LeavesAbove alone is a
+                            // publish of unknown length at this depth.
+                            depth = if callee.observes {
                                 Depth::Unknown
                             } else {
-                                depth
+                                depth.after_unknown_push()
                             };
-                        } else {
-                            // pin() returns shadow_stack_len() captured at
-                            // callee entry, an own index >= entry; the
-                            // caller dest is the depth at the call.
-                            let depth_at_call = depth;
-                            if callee.leaves_above {
-                                depth = depth.after_unknown_push();
-                            }
-                            for &p in &callee.param_slots {
-                                if !call
-                                    .args
-                                    .get(p as usize)
-                                    .and_then(operand_local)
-                                    .is_some_and(|l| {
-                                        accept_index(l, &indices, &params, &mut param_slots)
-                                    })
-                                {
-                                    reads_below = true;
-                                    why = format!("index-not-own bb{bb}");
-                                    break;
-                                }
-                            }
-                            if callee.returns_index
-                                && let Some(dest) = place_local(&call.dest)
-                                && depth_at_call.lower_bound().is_some()
+                        }
+                        for &p in &callee.param_slots {
+                            if !call
+                                .args
+                                .get(p as usize)
+                                .and_then(operand_local)
+                                .is_some_and(|l| {
+                                    accept_index(l, &indices, &params, &mut param_slots)
+                                })
                             {
-                                // pin() returns the entry Len; a struct
-                                // whose field is an own index is the same
-                                // bound at the call-site depth.
-                                indices.insert(dest, depth_at_call);
+                                reads_below = true;
+                                why = format!("index-not-own bb{bb}");
+                                break;
                             }
+                        }
+                        if callee.returns_index
+                            && let Some(dest) = place_local(&call.dest)
+                            && depth_at_call.lower_bound().is_some()
+                        {
+                            // pin() returns the entry Len; a struct
+                            // whose field is an own index is the same
+                            // bound at the call-site depth.
+                            indices.insert(dest, depth_at_call);
                         }
                     }
                 }
@@ -3522,10 +4122,6 @@ fn stack_walk(
     } else {
         None
     };
-    // A reader's parameter-indexed accesses add nothing to "reads below".
-    if reads_below {
-        param_slots.clear();
-    }
     param_slots.sort_unstable();
     param_slots.dedup();
     StackWalk {
@@ -3624,7 +4220,8 @@ fn resolve_published_array_len(
 /// The functions of `llbc` whose shadow-stack effect a caller cannot see
 /// past.  Callees from artefacts linked earlier are answered by what they
 /// registered on `llbc` ([`Llbc::is_stack_sensitive_fn`],
-/// [`Llbc::is_stack_leaves_above_fn`]).
+/// [`Llbc::is_stack_leaves_above_fn`]), keyed by
+/// [`super::scope_owner_identity`].
 pub fn discover_stack_sensitive_fns(llbc: &Llbc) -> Vec<String> {
     discover_stack_fn_effects(llbc).0
 }
@@ -3648,8 +4245,9 @@ pub fn discover_stack_returns_index_fns(llbc: &Llbc) -> Vec<String> {
     discover_stack_fn_effects(llbc).3
 }
 
-/// Sensitive, leaves-above, param-slots, returns-index and observes
-/// sets from one fixpoint, so harvest does not recompute the body walks.
+/// Sensitive, leaves-above, param-slots, returns-index, observes, and
+/// depth-neutral sets from one fixpoint, so harvest does not recompute
+/// the body walks.
 pub fn discover_stack_fn_effects(
     llbc: &Llbc,
 ) -> (
@@ -3658,19 +4256,43 @@ pub fn discover_stack_fn_effects(
     Vec<(String, Vec<u8>)>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 ) {
     discover_stack_effects(llbc)
 }
 
+fn local_callee_answer(
+    llbc: &Llbc,
+    identity: &str,
+    local: &HashSet<&str>,
+    class: &HashMap<String, CalleeEffect>,
+) -> CalleeEffect {
+    if local.contains(identity) {
+        class
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(CalleeEffect::bottom)
+    } else {
+        callee_effect_of(llbc, identity)
+    }
+}
+
 /// Least consistent assignment of per-body [`stack_walk`] over this artefact.
 ///
-/// Seed every local body against all-`None` (own-body effects only). Then
-/// Gauss-Seidel: recompute a body from scratch against the live classes
-/// (previous crates through [`callee_effect_of`]). Jacobi rounds oscillate
-/// on a caller that Observes only because a `returns_index` callee is not
-/// yet in the previous map; processing Observes first lets that caller
-/// drop once the callee's summary is live. A revisit cap freezes still-
-/// changing bodies as Observes.
+/// `GraphAnalyzer.analyze` / `analyze_direct_call`: every local body
+/// starts at [`CalleeEffect::bottom`] (`GraphAnalyzer.bottom_result`).
+/// A body's answer is `join_two_results(previous, walk)`
+/// (`Dependency.merge_with_result`). On a change, requeue that body's
+/// callers (`DependencyTracker`). FIFO worklist; no visit cap; no
+/// `CalleeEffect::worst()` freeze. Cross-artefact callees keep
+/// [`callee_effect_of`]. Termination follows from finite height
+/// (`param_slots` bounded by arity). Depth-neutral is the same
+/// assignment: `effect().is_none() && saw_open`.
+///
+/// `class`, `identities[i]`, and `callers` are keyed by
+/// [`super::scope_owner_identity`], matching
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` which key
+/// by graph object. `ItemMeta::name_path` is a label, not an identity.
 fn discover_stack_effects(
     llbc: &Llbc,
 ) -> (
@@ -3679,29 +4301,28 @@ fn discover_stack_effects(
     Vec<(String, Vec<u8>)>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 ) {
+    let started = Instant::now();
     let fds: Vec<&FunDecl> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .collect();
-    let names: Vec<String> = fds.iter().map(|fd| fd.item_meta.name_path()).collect();
-    let local: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let identities: Vec<String> = fds
+        .iter()
+        .map(|fd| super::scope_owner_identity(llbc, fd))
+        .collect();
+    let local: HashSet<&str> = identities.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
+    // Concrete assignment, including resolved None. Missing is only the
+    // pre-init state; lookup must not revive `bottom` (`returns_index`)
+    // for a body already joined to None.
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
-    let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
+    for identity in &identities {
+        class.insert(identity.clone(), CalleeEffect::bottom());
+    }
+    let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect, bool)>> =
         vec![None; fds.len()];
-    let none_effect = |path: &str| {
-        if resolved_callee_is_origportal_alias(llbc, path) {
-            CalleeEffect::none()
-        } else if local.contains(path) {
-            CalleeEffect::none()
-        } else {
-            callee_effect_of(llbc, path)
-        }
-    };
-    let mut queued = vec![false; fds.len()];
-    let mut observes_ids: Vec<usize> = Vec::new();
-    let mut other_ids: Vec<usize> = Vec::new();
     for (i, fd) in fds.iter().enumerate() {
         let Some(body) = fd.unstructured_shared() else {
             continue;
@@ -3712,117 +4333,101 @@ fn discover_stack_effects(
                 continue;
             }
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
-                && let Some(path) = callee_path(call, llbc)
+                && let Some(identity) = callee_identity(call, llbc)
             {
-                callers.entry(path).or_default().push(i);
+                callers.entry(identity).or_default().push(i);
             }
         }
-        let new = if resolved_callee_is_origportal_alias(llbc, &names[i]) {
-            CalleeEffect::none()
-        } else {
-            let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                let answer = none_effect(path);
-                if local.contains(path) {
-                    queried
-                        .borrow_mut()
-                        .push((path.to_string(), answer.clone()));
-                }
-                answer
-            };
-            let new = stack_walk(&body, llbc, &effect).effect();
-            last_walk[i] = Some((queried.into_inner(), new.clone()));
-            new
-        };
-        if new.observes {
-            observes_ids.push(i);
-        } else {
-            other_ids.push(i);
-        }
-        if !new.is_none() {
-            class.insert(names[i].clone(), new);
-        }
     }
+    let mut queued = vec![false; fds.len()];
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for i in observes_ids.into_iter().chain(other_ids) {
+    for i in 0..fds.len() {
         queued[i] = true;
         queue.push_back(i);
     }
-    let mut visits = vec![0u8; fds.len()];
-    const VISIT_CAP: u8 = 8;
+    let mut pops = 0usize;
+    let mut walks = 0usize;
+    let mut skips = 0usize;
+    let mut max_visits = 0u32;
+    let mut visits = vec![0u32; fds.len()];
     while let Some(i) = queue.pop_front() {
         queued[i] = false;
-        if visits[i] >= VISIT_CAP {
-            let old = class
-                .get(&names[i])
-                .cloned()
-                .unwrap_or_else(CalleeEffect::none);
-            class.insert(names[i].clone(), CalleeEffect::worst());
-            if old != CalleeEffect::worst() {
-                for &caller in callers.get(&names[i]).into_iter().flatten() {
-                    if queued[caller] {
-                        continue;
-                    }
-                    queued[caller] = true;
-                    queue.push_back(caller);
-                }
-            }
-            continue;
-        }
+        pops += 1;
         visits[i] = visits[i].saturating_add(1);
-        let new = if let Some((queried, prev)) = &last_walk[i]
-            && queried.iter().all(|(path, answer)| {
-                class.get(path).cloned().unwrap_or_else(CalleeEffect::none) == *answer
+        if visits[i] > max_visits {
+            max_visits = visits[i];
+        }
+        let walk_effect = if let Some((queried, prev, _)) = &last_walk[i]
+            && queried.iter().all(|(identity, answer)| {
+                local_callee_answer(llbc, identity, &local, &class) == *answer
             }) {
+            skips += 1;
             prev.clone()
-        } else if resolved_callee_is_origportal_alias(llbc, &names[i]) {
+        } else if is_origportal_alias_fd(llbc, fds[i]) {
             CalleeEffect::none()
         } else {
             let Some(body) = fds[i].unstructured_shared() else {
+                let none = CalleeEffect::none();
+                let old = class
+                    .get(&identities[i])
+                    .cloned()
+                    .unwrap_or_else(CalleeEffect::bottom);
+                let joined = old.join_two_results(&none);
+                debug_assert!(
+                    old.leq(&joined),
+                    "stack-effect answer decreased: {} -> {}",
+                    old.describe(),
+                    joined.describe()
+                );
+                if joined != old {
+                    class.insert(identities[i].clone(), joined);
+                    for &caller in callers.get(&identities[i]).into_iter().flatten() {
+                        if queued[caller] {
+                            continue;
+                        }
+                        queued[caller] = true;
+                        queue.push_back(caller);
+                    }
+                }
                 continue;
             };
+            walks += 1;
             let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                if resolved_callee_is_origportal_alias(llbc, path) {
-                    CalleeEffect::none()
-                } else if local.contains(path) {
-                    let answer = class.get(path).cloned().unwrap_or_else(CalleeEffect::none);
+            let effect = |identity: &str| {
+                let answer = local_callee_answer(llbc, identity, &local, &class);
+                if local.contains(identity) {
                     queried
                         .borrow_mut()
-                        .push((path.to_string(), answer.clone()));
-                    answer
-                } else {
-                    callee_effect_of(llbc, path)
+                        .push((identity.to_string(), answer.clone()));
                 }
+                answer
             };
-            let new = stack_walk(&body, llbc, &effect).effect();
-            last_walk[i] = Some((queried.into_inner(), new.clone()));
-            new
+            let walk = stack_walk(&body, llbc, &effect);
+            let walk_effect = walk.effect();
+            last_walk[i] = Some((queried.into_inner(), walk_effect.clone(), walk.saw_open));
+            walk_effect
         };
         let old = class
-            .get(&names[i])
+            .get(&identities[i])
             .cloned()
-            .unwrap_or_else(CalleeEffect::none);
-        if new == old {
+            .unwrap_or_else(CalleeEffect::bottom);
+        let joined = old.join_two_results(&walk_effect);
+        debug_assert!(
+            old.leq(&joined),
+            "stack-effect answer decreased: {} -> {}",
+            old.describe(),
+            joined.describe()
+        );
+        if joined == old {
             continue;
         }
-        if new.is_none() {
-            class.remove(&names[i]);
-        } else {
-            class.insert(names[i].clone(), new.clone());
-        }
-        for &caller in callers.get(&names[i]).into_iter().flatten() {
+        class.insert(identities[i].clone(), joined);
+        for &caller in callers.get(&identities[i]).into_iter().flatten() {
             if queued[caller] {
                 continue;
             }
             queued[caller] = true;
-            if new.observes {
-                queue.push_back(caller);
-            } else {
-                // Callee dropped Observes or gained a summary: re-walk
-                // Observes callers first so they can drop.
-                queue.push_front(caller);
-            }
+            queue.push_back(caller);
         }
     }
     let mut sensitive: Vec<String> = Vec::new();
@@ -3830,22 +4435,34 @@ fn discover_stack_effects(
     let mut param_slots: Vec<(String, Vec<u8>)> = Vec::new();
     let mut returns_index: Vec<String> = Vec::new();
     let mut observes: Vec<String> = Vec::new();
-    for (name, effect) in class {
+    let mut neutrals: Vec<String> = Vec::new();
+    for (i, identity) in identities.iter().enumerate() {
+        let effect = class
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(CalleeEffect::none);
+        let saw_open = last_walk[i]
+            .as_ref()
+            .map(|(_, _, open)| *open)
+            .unwrap_or(false);
         if effect.is_none() {
+            if saw_open {
+                neutrals.push(identity.clone());
+            }
             continue;
         }
-        sensitive.push(name.clone());
+        sensitive.push(identity.clone());
         if effect.leaves_above {
-            leaves.push(name.clone());
+            leaves.push(identity.clone());
         }
         if effect.observes {
-            observes.push(name.clone());
+            observes.push(identity.clone());
         }
         if !effect.param_slots.is_empty() {
-            param_slots.push((name.clone(), effect.param_slots));
+            param_slots.push((identity.clone(), effect.param_slots));
         }
         if effect.returns_index {
-            returns_index.push(name);
+            returns_index.push(identity.clone());
         }
     }
     sensitive.sort();
@@ -3853,64 +4470,31 @@ fn discover_stack_effects(
     leaves.sort();
     param_slots.sort_by(|a, b| a.0.cmp(&b.0));
     returns_index.sort();
-    (sensitive, leaves, param_slots, returns_index, observes)
+    neutrals.sort();
+    if std::env::var_os("PYRE_SS_STATS").is_some() {
+        eprintln!(
+            "[discover-stats] crate={} pops={pops} walks={walks} skips={skips} max_visits={max_visits} neutrals={} ms={} bodies={}",
+            llbc.crate_name(),
+            neutrals.len(),
+            started.elapsed().as_millis(),
+            fds.len()
+        );
+    }
+    (
+        sensitive,
+        leaves,
+        param_slots,
+        returns_index,
+        observes,
+        neutrals,
+    )
 }
 
-/// Local bodies proven depth-neutral: every path restores the entry
-/// depth, no caller-owned slot is read, Observes callees are refused,
-/// and LeavesAbove callees are allowed (fixpoint, pessimistic start).
-/// Harvested in link order like [`discover_stack_sensitive_fns`].
-/// A body whose last failed check queried no newly proven path is not re-checked.
+/// Local bodies proven depth-neutral under the same assignment
+/// [`discover_stack_effects`] publishes: `effect().is_none() && saw_open`.
+/// Keys are [`super::scope_owner_identity`] (`GraphAnalyzer` keys by graph).
 pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
-    let fds: Vec<&FunDecl> = llbc
-        .iter_local_fns()
-        .filter(|fd| fd.body.is_some())
-        .collect();
-    // Proven name -> how many names were proven up to and including it.
-    let mut proven: HashMap<String, usize> = HashMap::new();
-    // Per body: the proven count at its last failed check and the callee paths that check
-    // queried. Only a newly proven queried path can change the answer.
-    let mut last_check: Vec<Option<(usize, Vec<String>)>> = vec![None; fds.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (i, fd) in fds.iter().enumerate() {
-            let name = fd.item_meta.name_path();
-            if proven.contains_key(&name) {
-                continue;
-            }
-            if let Some((at, queried)) = &last_check[i]
-                && queried
-                    .iter()
-                    .all(|path| proven.get(path).is_none_or(|&n| n <= *at))
-            {
-                continue;
-            }
-            let Some(body) = fd.unstructured_shared() else {
-                last_check[i] = Some((proven.len(), Vec::new()));
-                continue;
-            };
-            let queried = std::cell::RefCell::new(Vec::new());
-            let effect = |path: &str| {
-                queried.borrow_mut().push(path.to_string());
-                if resolved_callee_is_origportal_alias(llbc, path) || proven.contains_key(path) {
-                    CalleeEffect::none()
-                } else {
-                    callee_effect_of(llbc, path)
-                }
-            };
-            if body_is_depth_neutral(&body, llbc, &effect) {
-                let n = proven.len() + 1;
-                proven.insert(name, n);
-                changed = true;
-            } else {
-                last_check[i] = Some((proven.len(), queried.into_inner()));
-            }
-        }
-    }
-    let mut out: Vec<String> = proven.into_keys().collect();
-    out.sort();
-    out
+    discover_stack_effects(llbc).5
 }
 
 /// Classify `llbc`'s own functions and mark its set complete, for a caller
@@ -3920,13 +4504,13 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     if llbc.stack_sensitive_fns_complete() {
         return;
     }
-    let (found, leaves, params, ret_idx, observes) = discover_stack_effects(llbc);
+    let (found, leaves, params, ret_idx, observes, neutrals) = discover_stack_effects(llbc);
     llbc.register_stack_sensitive_fns(found);
     llbc.register_stack_observes_fns(observes);
     llbc.register_stack_leaves_above_fns(leaves);
     llbc.register_stack_param_slots_fns(params);
     llbc.register_stack_returns_index_fns(ret_idx);
-    llbc.register_stack_depth_neutral_fns(discover_depth_neutral_fns(llbc));
+    llbc.register_stack_depth_neutral_fns(neutrals);
     llbc.mark_stack_sensitive_fns_complete();
 }
 
@@ -4296,11 +4880,7 @@ mod tests {
     }
 
     fn bb(kind: Value) -> Value {
-        json!({
-            "statements": [],
-            "terminator": {"span": span(), "kind": kind},
-            "kind": "Regular"
-        })
+        bb_stmts(vec![], kind)
     }
 
     fn bb_cleanup(kind: Value) -> Value {
@@ -4453,30 +5033,35 @@ mod tests {
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let id = |suffix: &str| stack_fn_identity(&llbc, suffix);
         llbc.register_stack_sensitive_fns([
-            "other::unproven_callee".into(),
-            "other::leaves_above_callee".into(),
-            "other::reload_slot".into(),
-            "other::pin_helper".into(),
-            "other::storage_helper".into(),
-            "other::observes_and_leaves".into(),
+            id("unproven_callee"),
+            id("leaves_above_callee"),
+            id("reload_slot"),
+            id("pin_helper"),
+            id("storage_helper"),
+            id("observes_and_leaves"),
         ]);
-        llbc.register_stack_observes_fns([
-            "other::unproven_callee".into(),
-            "other::observes_and_leaves".into(),
-        ]);
+        llbc.register_stack_observes_fns([id("unproven_callee"), id("observes_and_leaves")]);
         llbc.register_stack_leaves_above_fns([
-            "other::leaves_above_callee".into(),
-            "other::pin_helper".into(),
-            "other::observes_and_leaves".into(),
+            id("leaves_above_callee"),
+            id("pin_helper"),
+            id("observes_and_leaves"),
         ]);
-        llbc.register_stack_param_slots_fns([("other::reload_slot".into(), vec![0])]);
-        llbc.register_stack_returns_index_fns([
-            "other::pin_helper".into(),
-            "other::storage_helper".into(),
-        ]);
+        llbc.register_stack_param_slots_fns([(id("reload_slot"), vec![0])]);
+        llbc.register_stack_returns_index_fns([id("pin_helper"), id("storage_helper")]);
         llbc.mark_stack_sensitive_fns_complete();
         llbc
+    }
+
+    fn stack_fn_identity(llbc: &Llbc, suffix: &str) -> String {
+        llbc.iter_fun_decls()
+            .find(|fd| {
+                let path = fd.item_meta.name_path();
+                path == suffix || path.ends_with(&format!("::{suffix}"))
+            })
+            .map(|fd| super::super::scope_owner_identity(llbc, fd))
+            .unwrap_or_else(|| panic!("missing FunDecl ending with {suffix}"))
     }
 
     fn bb_stmts(statements: Vec<Value>, kind: Value) -> Value {
@@ -4954,8 +5539,9 @@ mod tests {
     #[test]
     fn depth_neutral_refuses_unproven_stack_sensitive_callee() {
         let llbc = stack_ops_llbc_with_callee();
-        let observes = |path: &str| {
-            if path.ends_with("unproven_callee") {
+        let unproven = stack_fn_identity(&llbc, "unproven_callee");
+        let observes = |identity: &str| {
+            if identity == unproven {
                 CalleeEffect::observes()
             } else {
                 CalleeEffect::none()
@@ -5003,7 +5589,7 @@ mod tests {
     #[test]
     fn open_pin_callee_close_observes_vs_leaves_above() {
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         let observes_inside = body_of(
             4,
             vec![
@@ -5105,7 +5691,7 @@ mod tests {
     #[test]
     fn param_slots_callee_own_index_is_neutral_untracked_is_observes() {
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         let callee = body_of_args(
             1,
             3,
@@ -5262,6 +5848,208 @@ mod tests {
         );
     }
 
+    fn effect_params(slots: Vec<u8>) -> CalleeEffect {
+        CalleeEffect {
+            observes: false,
+            leaves_above: false,
+            param_slots: slots,
+            returns_index: false,
+        }
+    }
+
+    #[test]
+    fn callee_effect_join_leq_laws() {
+        let bottom = CalleeEffect::bottom();
+        let none = CalleeEffect::none();
+        let observes = CalleeEffect::observes();
+        let leaves = CalleeEffect::leaves_above();
+        let params = effect_params(vec![0, 2]);
+        let worst = CalleeEffect::worst();
+        for x in [&bottom, &none, &observes, &leaves, &params, &worst] {
+            assert!(x.leq(x), "leq reflexive {}", x.describe());
+            assert_eq!(
+                x.join_two_results(x),
+                *x,
+                "join idempotent {}",
+                x.describe()
+            );
+            assert!(bottom.leq(x), "bottom ≼ {}", x.describe());
+        }
+        assert!(none.leq(&observes));
+        assert!(none.leq(&leaves));
+        assert!(none.leq(&params));
+        assert!(observes.leq(&worst));
+        assert!(leaves.leq(&worst));
+        let joined = params.join_two_results(&observes);
+        assert_eq!(observes.join_two_results(&params), joined);
+        assert!(params.leq(&joined));
+        assert!(observes.leq(&joined));
+        assert!(joined.observes);
+        assert_eq!(joined.param_slots, vec![0, 2]);
+        assert!(!joined.returns_index);
+        assert!(!joined.leaves_above);
+        let a = effect_params(vec![0]);
+        let b = effect_params(vec![1]);
+        let u = a.join_two_results(&b);
+        assert_eq!(u.param_slots, vec![0, 1]);
+        assert!(a.leq(&u) && b.leq(&u));
+        let must = CalleeEffect::bottom().join_two_results(&none);
+        assert!(!must.returns_index, "true ≼ false, join is AND");
+    }
+
+    #[test]
+    fn join_param_slots_with_observes_keeps_both() {
+        let joined = effect_params(vec![0]).join_two_results(&CalleeEffect::observes());
+        assert!(joined.observes && joined.param_slots == vec![0]);
+        assert!(!joined.leaves_above && !joined.returns_index);
+    }
+
+    fn unstructured_fun_body(n_locals: u64, blocks: Vec<Value>) -> Value {
+        json!({
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": (0..n_locals).map(local_decl).collect::<Vec<_>>()
+                },
+                "body": blocks
+            }
+        })
+    }
+
+    #[test]
+    fn recursive_pair_converges_without_visit_cap() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["other", "rec_a"],
+                        unstructured_fun_body(
+                            2,
+                            vec![bb(call_fun(2, vec![], 1, 1)), bb(json!("Return"))],
+                        ),
+                    ),
+                    opaque_fun(
+                        2,
+                        &["other", "rec_b"],
+                        unstructured_fun_body(
+                            2,
+                            vec![bb(call_fun(1, vec![], 1, 1)), bb(json!("Return"))],
+                        ),
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let (sens, leaves, params, ret, obs, neutrals) = discover_stack_effects(&llbc);
+        assert!(sens.is_empty(), "sens={sens:?}");
+        assert!(leaves.is_empty(), "leaves={leaves:?}");
+        assert!(params.is_empty(), "params={params:?}");
+        assert!(ret.is_empty(), "ret={ret:?}");
+        assert!(obs.is_empty(), "obs={obs:?}");
+        assert!(neutrals.is_empty(), "neutrals={neutrals:?}");
+    }
+
+    #[test]
+    fn returns_index_cycle_stays_true() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_object", "gc_roots", "shadow_stack_len"],
+                        json!("Opaque"),
+                    ),
+                    opaque_fun(
+                        2,
+                        &["other", "ret_a"],
+                        unstructured_fun_body(
+                            3,
+                            vec![
+                                bb(call_fun(1, vec![], 0, 1)),
+                                bb(call_fun(3, vec![], 2, 2)),
+                                bb(json!("Return")),
+                            ],
+                        ),
+                    ),
+                    opaque_fun(
+                        3,
+                        &["other", "ret_b"],
+                        unstructured_fun_body(
+                            3,
+                            vec![
+                                bb(call_fun(1, vec![], 0, 1)),
+                                bb(call_fun(2, vec![], 2, 2)),
+                                bb(json!("Return")),
+                            ],
+                        ),
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        let (sens, _leaves, _params, ret, obs, _) = discover_stack_effects(&llbc);
+        assert!(
+            ret.iter().any(|id| id.contains("ret_a")) && ret.iter().any(|id| id.contains("ret_b")),
+            "cycle must keep returns_index: ret={ret:?} sens={sens:?} obs={obs:?}"
+        );
+        assert!(obs.is_empty(), "obs={obs:?}");
+    }
+
+    #[test]
+    fn observes_param_slots_untracked_inside_open_is_observes() {
+        let llbc = stack_ops_llbc_with_callee();
+        let id = stack_fn_identity(&llbc, "unproven_callee");
+        llbc.register_stack_param_slots_fns([(id, vec![0])]);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
+        let untracked = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(5, vec![json!({"Read": place(0)})], 3, 3)),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        let walk = stack_walk(&untracked, &llbc, &effect);
+        assert!(
+            walk.effect().observes,
+            "Observes+ParamSlots callee with an untracked index inside Open is Observes: {:?}",
+            walk.effect()
+        );
+        let own = body_of(
+            5,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb(call_fun(5, vec![json!({"Read": place(3)})], 4, 4)),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            body_is_depth_neutral(&own, &llbc, &effect),
+            "own index to Observes+ParamSlots inside Open is depth-neutral"
+        );
+        match analyze(&own, &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
+        }
+    }
+
     #[test]
     fn option_wrap_of_own_index_stays_own() {
         let llbc = stack_ops_llbc();
@@ -5390,7 +6178,7 @@ mod tests {
             walk.effect()
         );
         let llbc = stack_ops_llbc_with_callee();
-        let effect = |path: &str| callee_effect_of(&llbc, path);
+        let effect = |identity: &str| callee_effect_of(&llbc, identity);
         // Caller treats the dest as an own-index carrier and passes it
         // to a ParamSlots callee.
         let caller = body_of(
@@ -5507,7 +6295,13 @@ mod tests {
 
     #[test]
     fn bounds_check_against_unrelated_length_is_refused() {
-        let specials = HashMap::from([(5usize, Special::Index(0))]);
+        let specials = HashMap::from([(
+            5usize,
+            Special::Index {
+                k: 0,
+                relative: false,
+            },
+        )]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
             "cond": {"Read": place(5)},
             "expected": true,
@@ -5530,7 +6324,22 @@ mod tests {
 
     #[test]
     fn bounds_check_of_erased_slot_index_against_slot_len_is_accepted() {
-        let specials = HashMap::from([(5usize, Special::Index(0)), (6usize, Special::Index(3))]);
+        let specials = HashMap::from([
+            (
+                5usize,
+                Special::Index {
+                    k: 0,
+                    relative: false,
+                },
+            ),
+            (
+                6usize,
+                Special::Index {
+                    k: 3,
+                    relative: true,
+                },
+            ),
+        ]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
             "cond": {"Read": place(5)},
             "expected": true,
@@ -5980,9 +6789,339 @@ mod tests {
         }
     }
 
-    /// `w_module_dict_setitem_str_internal` used to refuse
-    /// `calls-stack-sensitive-fn` on `DictOperationGuard::new` (`ReturnsIndex`)
-    /// and leave the module-strategy `with_roots!` as residual `push_roots`.
+    /// Extra `pin_root` on one arm joining a non-Drop continuation, then
+    /// Drop of this body's guard. A join postdominated by that Drop lets
+    /// `slot_count` take max over arms.
+    #[test]
+    fn analyze_erases_extra_pin_join_at_non_drop_then_drop() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(json!({"Goto": {"target": 7}})),
+                bb(drop_local(1, 8)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(plan)) => {
+                assert_eq!(plan.slot_count, 2, "max over arms, extra pin is slot 1");
+            }
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// Pins that accumulate around a loop join with no postdominating Drop
+    /// still refuse: the lattice would climb, and there is no rewind of
+    /// this body's open guard on every path to an exit.
+    #[test]
+    fn analyze_refuses_extra_pin_loop_join_without_drop() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 2)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("depth-disagrees-at-merge") => {}
+            Ok(Some(_)) => panic!("expected depth-disagrees-at-merge, got accepted"),
+            Ok(None) => panic!("expected depth-disagrees-at-merge, got no bracket"),
+            Err(reason) => panic!("expected depth-disagrees-at-merge, got {reason}"),
+        }
+    }
+
+    /// Get of the extra pin is rewritten on the writing arm only (SSA
+    /// slot locals). The join does not grow a Get of slot 1.
+    #[test]
+    fn analyze_erases_extra_pin_get_stays_on_writing_arm() {
+        let llbc = stack_ops_llbc();
+        let n_locals: u64 = 7;
+        let body = body_of(
+            n_locals,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 8}})),
+                bb(call_fun(3, vec![], 4, 5)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 6)),
+                bb(call_fun(2, vec![copy_local(4)], 6, 7)),
+                bb(json!({"Goto": {"target": 8}})),
+                bb(json!({"Goto": {"target": 9}})),
+                bb(drop_local(1, 10)),
+                bb(json!("Return")),
+            ],
+        );
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert_eq!(plan.slot_count, 2, "max over arms");
+        let slot1 = local_place_json(n_locals as usize + 1, &ty());
+        let rewrite_get = plan.terms.get(&6).expect("Get of extra pin rewritten");
+        assert_eq!(
+            rewrite_get.stmts,
+            vec![json!({"Assign": [
+                place(6),
+                {"Use": [{"Read": slot1}, "Yes"]}
+            ]})],
+            "Get of the extra pin is Read of slot 1 on the writing arm"
+        );
+        assert!(
+            plan.terms.get(&3).is_none(),
+            "the no-extra-pin arm has no Get of slot 1"
+        );
+        assert!(
+            plan.terms.get(&8).is_none(),
+            "the join does not Get the extra pin"
+        );
+    }
+
+    /// Two-phase walk: the short arm reaches the join first. After the join
+    /// a Len, a pin, and a Get of that Len in a block also reached from the
+    /// extra-pin arm already at `hi`. Emit walks at the Probe fixpoint: the
+    /// Get copies the pin after the join (`slot == hi`).
+    #[test]
+    fn analyze_rewrites_len_after_disagreeing_join_at_final_depth() {
+        let llbc = stack_ops_llbc();
+        let n_locals: u64 = 7;
+        let body = body_of(
+            n_locals,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(3)},
+                    "targets": {"If": [6, 8]}
+                }})),
+                bb(call_fun(3, vec![], 4, 7)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 8)),
+                bb(call_fun(2, vec![copy_local(4)], 6, 9)),
+                bb(drop_local(1, 10)),
+                bb(json!("Return")),
+            ],
+        );
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert_eq!(plan.slot_count, 3, "obj + extra pin + pin after join");
+        let hi = 2usize;
+        let slot_hi = local_place_json(n_locals as usize + hi, &ty());
+        let rewrite_get = plan.terms.get(&8).expect("Get of Len index rewritten");
+        assert_eq!(
+            rewrite_get.stmts,
+            vec![json!({"Assign": [
+                place(6),
+                {"Use": [{"Read": slot_hi}, "Yes"]}
+            ]})],
+            "Get of the Len index copies the pin after the join (slot hi)"
+        );
+    }
+
+    /// After a disagreeing join, `guard.get(1)` is an absolute index in
+    /// the `[lo, hi)` band and refuses `absolute-get-above-join-floor`.
+    #[test]
+    fn analyze_refuses_absolute_get_in_join_band() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 7)),
+                bb(call_fun(2, vec![usize_lit(1)], 5, 8)),
+                bb(drop_local(1, 9)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("absolute-get-above-join-floor") => {}
+            Ok(Some(_)) => panic!("expected absolute-get-above-join-floor, got accepted"),
+            Ok(None) => panic!("expected absolute-get-above-join-floor, got no bracket"),
+            Err(reason) => panic!("expected absolute-get-above-join-floor, got {reason}"),
+        }
+    }
+
+    /// Same CFG as [`analyze_refuses_absolute_get_in_join_band`], slot 0
+    /// sits below `lo`.
+    #[test]
+    fn analyze_accepts_absolute_get_below_join_floor() {
+        let llbc = stack_ops_llbc();
+        let n_locals: u64 = 6;
+        let body = body_of(
+            n_locals,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 7)),
+                bb(call_fun(2, vec![usize_lit(0)], 5, 8)),
+                bb(drop_local(1, 9)),
+                bb(json!("Return")),
+            ],
+        );
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        let slot0 = local_place_json(n_locals as usize, &ty());
+        let rewrite_get = plan.terms.get(&7).expect("Get of slot 0 rewritten");
+        assert_eq!(
+            rewrite_get.stmts,
+            vec![json!({"Assign": [
+                place(5),
+                {"Use": [{"Read": slot0}, "Yes"]}
+            ]})],
+            "absolute get below the join floor copies slot 0"
+        );
+    }
+
+    /// `ll_set_nonnull`: one arm binds the shared index local as a
+    /// `pin_roots` dest (`relative: false`), the other as a `Len`
+    /// (`relative: true`) then `pin_root`. Same `k` is a compatible
+    /// rebind; absolute wins and the Get sits below the join floor.
+    #[test]
+    fn analyze_erases_pin_roots_and_len_bound_to_the_same_index_local() {
+        let llbc = stack_ops_llbc();
+        let array = json!({"Aggregate": [
+            {"Array": [ty(), {"Deduplicated": 1}, null]},
+            [{"Move": place(0)}]
+        ]});
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(0)},
+                    "targets": {"If": [2, 3]}
+                }})),
+                bb_stmts(
+                    vec![assign_local(3, array)],
+                    call_fun(8, vec![json!({"Move": place(3)})], 2, 4),
+                ),
+                bb(call_fun(3, vec![], 2, 7)),
+                bb(call_fun(2, vec![copy_local(2)], 4, 5)),
+                bb(drop_local(1, 6)),
+                bb(json!("Return")),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 4)),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// Two arms bind the same index local to different `k`. That is
+    /// `special-rebound`: a join Get would read one slot on both arms.
+    #[test]
+    fn analyze_refuses_dual_def_with_different_slot_index() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(0)},
+                    "targets": {"If": [2, 3]}
+                }})),
+                bb(call_fun(3, vec![], 2, 4)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 7)),
+                bb(call_fun(2, vec![copy_local(2)], 4, 5)),
+                bb(drop_local(1, 6)),
+                bb(json!("Return")),
+                bb(call_fun(3, vec![], 2, 4)),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("special-rebound") => {}
+            Ok(Some(_)) => panic!("expected special-rebound, got accepted"),
+            Ok(None) => panic!("expected special-rebound, got no bracket"),
+            Err(reason) => panic!("expected special-rebound, got {reason}"),
+        }
+    }
+
+    /// `build_instance`: extra-pin join, then an inner Open/Drop. Probe
+    /// first visits the inner Drop at the short-arm depth; the high arm
+    /// reaches it later. Joining the rewind entry lets Emit walk it at
+    /// the fixpoint with the final Guard specials.
+    #[test]
+    fn analyze_erases_inner_rewind_after_extra_pin_join() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 5}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 5)),
+                bb(call_fun(1, vec![], 3, 6)),
+                bb(drop_local(3, 7)),
+                bb(drop_local(1, 8)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(plan)) => {
+                assert_eq!(plan.slot_count, 2, "max over extra-pin arms");
+            }
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// `w_module_dict_setitem_str_internal` erases: `DictOperationGuard::new`
+    /// is `ReturnsIndex`, so the module-strategy `with_roots!` is not residual
+    /// `push_roots`.
     #[test]
     fn w_module_dict_setitem_str_internal_bracket_is_scalar_replaced() {
         let path = concat!(
