@@ -3269,6 +3269,12 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// Decoded marker-const strings. The payload is a property of the artefact.
     global_marker_strs:
         std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<str>>>>,
+    /// `(impl_key, trait_leaf)` pairs of `DynImplVtableDesc` statics
+    /// (`register_dyn_impl_vtable!`). An Unsize vtable ConstFnAddr is
+    /// emitted only when this set contains the pair (`rclass.py`
+    /// `getvtable` / `OBJECT.typeptr`).
+    pub(in crate::front::mir) registered_dyn_impl_vtables:
+        std::sync::OnceLock<Vec<(String, String)>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -10554,7 +10560,7 @@ pub(in crate::front::mir) fn node_is_dyn_trait(node: &serde_json::Value, llbc: &
 
 /// Trait decl id of a fat `&dyn Trait` / `Box<dyn Trait>` type, if the
 /// `DynTrait` body names one. Used to look up `impl Trait for Src` when
-/// an `Unsize` forms the vtable word (`new_with_vtable`).
+/// an `Unsize` forms the vtable word (`rclass.py` `getvtable`).
 pub(in crate::front::mir) fn tyref_dyn_trait_decl_id(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
     let node = tyref_node(ty, llbc)?;
     let inner = if let Some(pointee) = type_node_box_pointee(node, llbc) {

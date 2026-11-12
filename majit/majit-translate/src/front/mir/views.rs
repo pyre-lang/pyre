@@ -2215,7 +2215,7 @@ impl<'a> Lowering<'a> {
 
     /// `{data, vtable}` of an rvalue whose dest type is fat `&dyn Trait`.
     /// `Unsize` of a thin instance pointer is the source pointer plus the
-    /// `impl Trait for Src` vtable constant (`new_with_vtable`).
+    /// `impl Trait for Src` vtable constant (`rclass.py` `getvtable`).
     pub(in crate::front::mir) fn dyn_fat_rvalue_parts(
         &mut self,
         mir_bb: usize,
@@ -2272,10 +2272,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Vtable word of `impl Trait for Src`: a `ConstFnAddr` of
-    /// `{impl_key}::{trait_leaf}` when that crate-local impl is in LLBC.
-    /// `runtime_fnaddr_by_path` resolves it to `dyn_impl_vtables`
-    /// (`new_with_vtable` / `OBJECT.typeptr`). An unregistered Unsize
-    /// declines rather than emitting a zero word.
+    /// `{impl_key}::{trait_leaf}` when that crate-local impl is in LLBC
+    /// and the pair is a `DynImplVtableDesc` registration. `runtime_fnaddr_by_path`
+    /// resolves it to `dyn_impl_vtables` (`rclass.py` `getvtable` /
+    /// `OBJECT.typeptr`). An unregistered Unsize declines rather than
+    /// emitting a zero word.
     fn emit_dyn_unsize_vtable(
         &mut self,
         mir_bb: usize,
@@ -5598,9 +5599,10 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
 }
 
 /// `{impl_key}::{trait_leaf}` of a crate-local `impl Trait for Src`
-/// recorded in LLBC. Same key `dyn_impl_vtable_addr_for_path` resolves
-/// at runtime (`new_with_vtable` / `OBJECT.typeptr`). Core `FnMut`
-/// shims are not local and stay one-word.
+/// recorded in LLBC and registered as a `DynImplVtableDesc` static. Same key
+/// `dyn_impl_vtable_addr_for_path` resolves at runtime (`rclass.py`
+/// `getvtable` / `OBJECT.typeptr`). A local impl without that static,
+/// and core `FnMut` shims, stay one-word.
 pub(in crate::front::mir) fn dyn_unsize_vtable_const_path(
     src: &Place,
     dest_ty: &TyRef,
@@ -5633,10 +5635,128 @@ pub(in crate::front::mir) fn dyn_unsize_vtable_const_path(
         };
         if same_nominal_adt(llbc, src_id, impl_src_id) {
             let impl_key = llbc.type_by_id(src_id)?.item_meta.name_path();
+            if !dyn_impl_vtable_pair_is_registered(llbc, &impl_key, trait_leaf) {
+                return None;
+            }
             return Some(format!("{impl_key}::{trait_leaf}"));
         }
     }
     None
+}
+
+fn dyn_impl_vtable_pair_is_registered(llbc: &Llbc, impl_key: &str, trait_leaf: &str) -> bool {
+    registered_dyn_impl_vtable_pairs(llbc)
+        .iter()
+        .any(|(key, leaf)| leaf == trait_leaf && dyn_impl_registered_key_matches(impl_key, key))
+}
+
+fn dyn_impl_registered_key_matches(impl_path: &str, impl_key: &str) -> bool {
+    impl_path == impl_key
+        || impl_path.ends_with(&format!("::{impl_key}"))
+        || impl_key.ends_with(&format!("::{impl_path}"))
+}
+
+fn registered_dyn_impl_vtable_pairs(llbc: &Llbc) -> &[(String, String)] {
+    llbc_derived(llbc)
+        .registered_dyn_impl_vtables
+        .get_or_init(|| harvest_registered_dyn_impl_vtables(llbc))
+}
+
+/// `(impl_key, trait_leaf)` of each static whose declared type is
+/// `pyre_object::lltype::DynImplVtableDesc` (`register_dyn_impl_vtable!`).
+/// The static ident is caller-chosen; selection is the ADT name path
+/// (`Llbc::global_ty_adt_def_id`). Reads the init body through
+/// [`crate::front::llbc_hints::marker_init_fun_id`], the same path other
+/// global initializers use.
+fn harvest_registered_dyn_impl_vtables(llbc: &Llbc) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for gd in llbc.iter_global_decls() {
+        if !global_ty_is_dyn_impl_vtable_desc(llbc, gd) {
+            continue;
+        }
+        if let Some(pair) = dyn_impl_vtable_desc_strings(llbc, gd) {
+            out.push(pair);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn global_ty_is_dyn_impl_vtable_desc(
+    llbc: &Llbc,
+    gd: &majit_charon_reader::ullbc::GlobalDecl,
+) -> bool {
+    llbc.global_ty_adt_def_id(gd)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(&td.item_meta.name_path()))
+}
+
+fn dyn_impl_vtable_desc_adt_path(path: &str) -> bool {
+    path == "pyre_object::lltype::DynImplVtableDesc"
+}
+
+fn dyn_impl_vtable_desc_strings(
+    llbc: &Llbc,
+    gd: &majit_charon_reader::ullbc::GlobalDecl,
+) -> Option<(String, String)> {
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let n = body.locals.locals.len();
+    let mut local_strs = vec![None; n];
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = &place.kind else {
+                continue;
+            };
+            let dest = *dest as usize;
+            if dest >= n {
+                continue;
+            }
+            if let Rvalue::Use(Operand::Const(expr), _) = rvalue {
+                local_strs[dest] = llbc
+                    .const_expr_literal(expr)
+                    .and_then(|lit| lit.get("Str")?.as_str().map(str::to_string));
+            }
+        }
+    }
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind_ref()
+            else {
+                continue;
+            };
+            let Some(impl_key) = operands
+                .first()
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
+                continue;
+            };
+            let Some(trait_leaf) = operands
+                .get(1)
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
+                continue;
+            };
+            return Some((impl_key, trait_leaf));
+        }
+    }
+    None
+}
+
+fn operand_str_literal(llbc: &Llbc, op: &Operand, local_strs: &[Option<String>]) -> Option<String> {
+    match op {
+        Operand::Const(expr) => llbc
+            .const_expr_literal(expr)
+            .and_then(|lit| lit.get("Str")?.as_str().map(str::to_string)),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(i) => local_strs.get(*i as usize).cloned().flatten(),
+            _ => None,
+        },
+    }
 }
 
 pub(in crate::front::mir) fn dyn_unsize_src_trait_names(

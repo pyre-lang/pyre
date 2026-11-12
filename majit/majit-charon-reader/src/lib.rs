@@ -866,6 +866,17 @@ impl Llbc {
             .map(|i| self.dedup_adt[i].1)
     }
 
+    /// ADT `def_id` of a global's declared type, if that type is an ADT.
+    /// [`GlobalTy::Adt`] is the inline id; [`GlobalTy::Dedup`] is resolved
+    /// through [`Self::dedup_to_adt_def_id`]. Integer widths return `None`.
+    pub fn global_ty_adt_def_id(&self, gd: &GlobalDecl) -> Option<u64> {
+        match gd.ty.as_ref()? {
+            GlobalTy::Adt(id) => Some(*id),
+            GlobalTy::Dedup(id) => self.dedup_to_adt_def_id(*id),
+            GlobalTy::Signed(_) | GlobalTy::Unsigned(_) => None,
+        }
+    }
+
     /// Resolve a Charon `Deduplicated: <id>` reference to its
     /// underlying inline body (a `serde_json::Value` of the same
     /// shape Charon emits inline for a `Value: [id, body]`).

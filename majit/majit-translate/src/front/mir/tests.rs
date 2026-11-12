@@ -7247,8 +7247,14 @@ fn dyn_predicate_trait0() -> serde_json::Value {
 
 /// `Unsize` of `&Concrete` to `&dyn Storage`, optionally stored in
 /// `Holder.slot` or followed by `PtrMetadata`. `with_impl` records
-/// `impl Storage for Concrete`.
-fn unsize_into_dyn_fat_llbc(with_impl: bool, store_field: bool, read_metadata: bool) -> Llbc {
+/// `impl Storage for Concrete`. `registered` adds a `DynImplVtableDesc`
+/// static `register_dyn_impl_vtable!` would emit.
+fn unsize_into_dyn_fat_llbc(
+    with_impl: bool,
+    registered: bool,
+    store_field: bool,
+    read_metadata: bool,
+) -> Llbc {
     let span = serde_json::json!({"data": {
         "file_id": 0,
         "beg": {"line": 1, "col": 0},
@@ -7296,6 +7302,17 @@ fn unsize_into_dyn_fat_llbc(with_impl: bool, store_field: bool, read_metadata: b
             "ty": fat_ty,
             "attr_info": field_attr
         }]}
+    });
+    let dyn_impl_vtable_desc = serde_json::json!({
+        "def_id": 2,
+        "item_meta": meta(&["pyre_object", "lltype", "DynImplVtableDesc"]),
+        "kind": {"Struct": [
+            {"name": "impl_key", "ty": {"Literal": "Str"}, "attr_info": field_attr},
+            {"name": "trait_leaf", "ty": {"Literal": "Str"}, "attr_info": field_attr}
+        ]}
+    });
+    let desc_adt = serde_json::json!({
+        "Adt": {"id": 2, "builtin": null, "generics": empty_generics}
     });
     let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
     let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
@@ -7397,14 +7414,61 @@ fn unsize_into_dyn_fat_llbc(with_impl: bool, store_field: bool, read_metadata: b
     } else {
         serde_json::json!([])
     };
+    let mut fun_decls = vec![caller];
+    let mut global_decls = Vec::new();
+    if with_impl && registered {
+        fun_decls.push(serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "RegisteredVtable"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": desc_adt},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local(0, &desc_adt)]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 0}), &desc_adt),
+                            {"Aggregate": [
+                                "Tuple",
+                                [
+                                    {"Const": [{"Str": "fixture::Concrete"}, {"Literal": "Str"}]},
+                                    {"Const": [{"Str": "Storage"}, {"Literal": "Str"}]}
+                                ]
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        }));
+        global_decls.push(serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "RegisteredVtable"]),
+            "global_kind": {"Static": {
+                "is_mut": false,
+                "is_safe": true,
+                "is_thread_local": false
+            }},
+            "ty": desc_adt,
+            "value": {"Value": [0, [
+                {"Call": [
+                    {"kind": {"Fun": 1}, "generics": empty_generics},
+                    []
+                ]},
+                desc_adt
+            ]]}
+        }));
+    }
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [concrete, holder],
-            "fun_decls": [caller],
-            "global_decls": [],
+            "type_decls": [concrete, holder, dyn_impl_vtable_desc],
+            "fun_decls": fun_decls,
+            "global_decls": global_decls,
             "trait_decls": [{
                 "def_id": 0,
                 "item_meta": meta(&["fixture", "Storage"]),
@@ -7418,12 +7482,12 @@ fn unsize_into_dyn_fat_llbc(with_impl: bool, store_field: bool, read_metadata: b
 
 /// `Unsize` of a thin instance pointer into a dyn-fat field stores
 /// `{data, vtable}` as `FatData` + `FatMeta`, and the vtable word is a
-/// trait-qualified `ConstFnAddr` (`new_with_vtable` / `OBJECT.typeptr`).
+/// trait-qualified `ConstFnAddr` (`rclass.py` `getvtable` / `OBJECT.typeptr`).
 #[test]
 fn unsize_of_thin_instance_into_dyn_fat_field_emits_fatdata_fatmeta() {
     use crate::model::{OpKind, ValueType, VecFieldPart};
 
-    let llbc = unsize_into_dyn_fat_llbc(true, true, false);
+    let llbc = unsize_into_dyn_fat_llbc(true, true, true, false);
     let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
         .expect("lower unsize_into_dyn_fat_field");
     let ops = graph_ops(&graph);
@@ -7471,7 +7535,7 @@ fn unsize_of_thin_instance_into_dyn_fat_field_emits_fatdata_fatmeta() {
 /// storing a zero vtable word.
 #[test]
 fn unsize_of_unregistered_into_dyn_fat_field_is_unsupported() {
-    let llbc = unsize_into_dyn_fat_llbc(false, true, false);
+    let llbc = unsize_into_dyn_fat_llbc(false, false, true, false);
     let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
         .expect_err("unregistered Unsize into a dyn-fat field must decline");
     let msg = err.to_string();
@@ -7490,7 +7554,7 @@ fn unsize_of_unregistered_into_dyn_fat_field_is_unsupported() {
 fn unsize_of_unregistered_into_dyn_fat_local_stays_one_word() {
     use crate::model::{OpKind, VecFieldPart};
 
-    let llbc = unsize_into_dyn_fat_llbc(false, false, false);
+    let llbc = unsize_into_dyn_fat_llbc(false, false, false, false);
     let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local")
         .expect("unregistered Unsize into a local stays one word");
     let ops = graph_ops(&graph);
@@ -7510,11 +7574,54 @@ fn unsize_of_unregistered_into_dyn_fat_local_stays_one_word() {
     );
 }
 
+/// A crate-local impl without a `DynImplVtableDesc` static is unregistered:
+/// storing it into a dyn-fat field declines (`rclass.py` `getvtable`).
+#[test]
+fn unsize_of_impl_without_registration_into_dyn_fat_field_is_unsupported() {
+    let llbc = unsize_into_dyn_fat_llbc(true, false, true, false);
+    let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
+        .expect_err("Unsize of an unregistered impl into a dyn-fat field must decline");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, super::LowerError::Unsupported(_)),
+        "Unsize of an unregistered impl into a dyn-fat field must be Unsupported; {msg}"
+    );
+    assert!(
+        msg.contains("Concrete") && msg.contains("Storage"),
+        "Unsupported must name the source type and trait; {msg}"
+    );
+}
+
+/// A crate-local impl without a `DynImplVtableDesc` static stays one word.
+#[test]
+fn unsize_of_impl_without_registration_into_dyn_fat_local_stays_one_word() {
+    use crate::model::{OpKind, VecFieldPart};
+
+    let llbc = unsize_into_dyn_fat_llbc(true, false, false, false);
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local")
+        .expect("Unsize of an unregistered impl into a local stays one word");
+    let ops = graph_ops(&graph);
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.vec_part == Some(VecFieldPart::FatData)
+                    || field.vec_part == Some(VecFieldPart::FatMeta)
+        )),
+        "unregistered impl Unsize local must not form a fat pair; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { .. })),
+        "unregistered impl Unsize local must not emit a vtable ConstFnAddr; ops={ops:?}"
+    );
+}
+
 /// `PtrMetadata` of an unregistered Unsize dest needs the vtable word
 /// and declines rather than reading a zero (`ClassRepr.getclsfield`).
 #[test]
 fn unsize_of_unregistered_ptr_metadata_is_unsupported() {
-    let llbc = unsize_into_dyn_fat_llbc(false, false, true);
+    let llbc = unsize_into_dyn_fat_llbc(false, false, false, true);
     let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_meta")
         .expect_err("PtrMetadata of an unregistered Unsize must decline");
     let msg = err.to_string();

@@ -2239,7 +2239,7 @@ pub fn dyn_impl_vtables() -> &'static [DynImplVtable] {
 ///
 /// The assembler records this as `ConstIRelocKind::FnAddr` the way
 /// `assembler.py emit_const` records a funcptr; `runtime_fnaddr_by_path`
-/// resolves it to the rustc vtable word (`new_with_vtable` /
+/// resolves it to the rustc vtable word (`rclass.py` `getvtable` /
 /// `OBJECT.typeptr`).
 pub fn dyn_impl_vtable_const_path(impl_key: &str, trait_leaf: &str) -> String {
     format!("{impl_key}::{trait_leaf}")
@@ -2255,7 +2255,22 @@ pub fn dyn_impl_vtable_addr_for_path(path: &str) -> Option<i64> {
     })
 }
 
-fn dyn_impl_key_matches(impl_path: &str, impl_key: &str) -> bool {
+/// Whether `path` is a [`dyn_impl_vtable_const_path`] key: `{impl_key}::{trait_leaf}`
+/// whose `trait_leaf` is published by [`dyn_impl_vtables`].
+pub fn is_dyn_impl_vtable_const_path(path: &str) -> bool {
+    let Some((_, trait_leaf)) = path.rsplit_once("::") else {
+        return false;
+    };
+    dyn_impl_vtables()
+        .iter()
+        .any(|entry| entry.trait_leaf == trait_leaf)
+}
+
+/// Whether `impl_path` names the same impl as `impl_key`.
+///
+/// Charon's owner path and the registered `impl_key` (`module_path!()::Ty`)
+/// may differ by a crate or module prefix.
+pub fn dyn_impl_key_matches(impl_path: &str, impl_key: &str) -> bool {
     impl_path == impl_key
         || impl_path.ends_with(&format!("::{impl_key}"))
         || impl_key.ends_with(&format!("::{impl_path}"))
@@ -7810,8 +7825,8 @@ mod tests {
         dict_entries_probe_hashed_word, dict_entries_probe_object_word,
         dyn_impl_vtable_addr_for_path, dyn_impl_vtable_const_path, dyn_impl_vtables,
         finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
-        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
-        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        is_dyn_impl_vtable_const_path, is_exact_type_word, is_list_write_barrier,
+        is_plain_int1_word, is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
         jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
         ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
         ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
@@ -9505,6 +9520,10 @@ mod tests {
             dyn_impl_vtable_addr_for_path(&path),
             Some(entry.vtable as i64)
         );
+        assert!(is_dyn_impl_vtable_const_path(&path));
+        assert!(!is_dyn_impl_vtable_const_path(
+            "pyre_interpreter::call::take_last_exec_ctx"
+        ));
     }
 
     #[test]

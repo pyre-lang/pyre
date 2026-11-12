@@ -753,9 +753,9 @@ fn raw_object_first_key_is(raw: &str, key: &str) -> bool {
 
 /// Static or const item referenced via [`PlaceKind::Global`].
 ///
-/// Keeps `global_kind`, the integer width of `ty` (or its dedup id), and
-/// `value` projected to an init-fun id or a const-expr the literal
-/// readers accept. serde skips `generics`, `size`, `align`,
+/// Keeps `global_kind`, the projected `ty` (integer width, dedup id, or
+/// ADT def id), and `value` projected to an init-fun id or a const-expr
+/// the literal readers accept. serde skips `generics`, `size`, `align`,
 /// `ptr_metadata`, `src`.
 #[derive(Debug, Deserialize)]
 #[serde(from = "GlobalDeclFields")]
@@ -779,11 +779,13 @@ pub enum GlobalKind {
     Other,
 }
 
-/// Primitive integer width of a global's `ty`, or a dedup id resolved
-/// at the MIN/MAX associated-const site.
+/// Primitive integer width of a global's `ty`, a dedup id, or an ADT
+/// def id. Dedup ids are resolved at the MIN/MAX associated-const site
+/// and by [`crate::Llbc::global_ty_adt_def_id`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GlobalTy {
     Dedup(u64),
+    Adt(u64),
     Signed(String),
     Unsigned(String),
 }
@@ -820,7 +822,7 @@ impl From<GlobalDeclFields> for GlobalDecl {
                 .global_kind
                 .map(project_global_kind)
                 .unwrap_or(GlobalKind::Other),
-            ty: fields.ty.and_then(project_global_ty),
+            ty: fields.ty.as_ref().and_then(project_global_ty),
             value: fields.value.and_then(project_global_value),
         }
     }
@@ -845,7 +847,7 @@ fn project_global_kind(kind: Value) -> GlobalKind {
     }
 }
 
-fn project_global_ty(ty: Value) -> Option<GlobalTy> {
+fn project_global_ty(ty: &Value) -> Option<GlobalTy> {
     if let Some(id) = ty.get("Deduplicated").and_then(Value::as_u64) {
         return Some(GlobalTy::Dedup(id));
     }
@@ -853,7 +855,14 @@ fn project_global_ty(ty: Value) -> Option<GlobalTy> {
         .get("Value")
         .and_then(Value::as_array)
         .and_then(|pair| pair.get(1))
-        .unwrap_or(&ty);
+        .unwrap_or(ty);
+    if let Some(id) = body
+        .get("Adt")
+        .and_then(|adt| adt.get("id"))
+        .and_then(Value::as_u64)
+    {
+        return Some(GlobalTy::Adt(id));
+    }
     integer_width_ty(body)
 }
 
@@ -5047,6 +5056,21 @@ mod tests {
             static_gd.const_expr(),
             Some(&serde_json::json!({"Deduplicated": 8}))
         );
+
+        let adt = parse(serde_json::json!({
+            "def_id": 2,
+            "item_meta": {
+                "name": [{"Ident": ["DynImplVtableDesc", 0]}],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"inline": null, "rename": null, "public": true}
+            },
+            "global_kind": {"Static": {"mut": false}},
+            "ty": {"Adt": {"id": 7, "builtin": null}},
+            "value": {"Value": [0, [{"Call": [{"kind": {"Fun": 1}}]}, null]]}
+        }));
+        assert_eq!(adt.ty, Some(GlobalTy::Adt(7)));
+        assert_eq!(adt.init_fun_id(), Some(1));
     }
 
     #[test]

@@ -359,7 +359,7 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
             };
             let (owner_path, identity_trait) = ict_split_impl_identity(impl_path);
             for impl_entry in impls {
-                if !ict_impl_path_matches(owner_path, impl_entry.impl_key) {
+                if !pyre_interpreter::dyn_impl_key_matches(owner_path, impl_entry.impl_key) {
                     continue;
                 }
                 if let Some(t) = identity_trait {
@@ -394,12 +394,6 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
         }
         by_fnaddr
     });
-
-fn ict_impl_path_matches(impl_path: &str, impl_key: &str) -> bool {
-    impl_path == impl_key
-        || impl_path.ends_with(&format!("::{impl_key}"))
-        || impl_key.ends_with(&format!("::{impl_path}"))
-}
 
 fn ict_split_impl_identity(impl_path: &str) -> (&str, Option<&str>) {
     if !impl_path.ends_with('>') {
