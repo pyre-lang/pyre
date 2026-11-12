@@ -10,15 +10,14 @@ description = "JIT compiler integration for pyre interpreter"
 default = ["dynasm", "prepass", "pyre-module"]
 # The binary links `pyre-module`; the prepass then translates its modules too.
 pyre-module = ["pyre-jit-trace/pyre-module"]
-jit = []  # meta feature: enabled by cranelift or dynasm
 # `pyre-jit-trace`'s translation prepass. Forwarded rather than inherited
 # through that dependency's defaults so an LLBC extraction pass of this crate
 # (`--no-default-features --features dynasm`) can leave it off; every other
 # build wants it, and a dependant that turns this crate's defaults off must
 # name it (`pyre-wasm` does).
 prepass = ["pyre-jit-trace/prepass"]
-cranelift = ["jit", "majit-backend-cranelift", "majit-metainterp/cranelift", "pyre-jit-trace/cranelift"]
-dynasm = ["jit", "majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-trace/dynasm"]
+cranelift = ["majit-backend-cranelift", "majit-metainterp/cranelift", "pyre-jit-trace/cranelift"]
+dynasm = ["majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-trace/dynasm"]
 # Build opt-in majit audit instrumentation. Individual audits remain selected
 # at runtime by their environment gates.
 jit-audits = ["majit-metainterp/jit-audits", "majit-ir/jit-audits"]
