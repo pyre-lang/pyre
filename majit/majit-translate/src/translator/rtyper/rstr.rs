@@ -48,10 +48,11 @@ use crate::translator::rtyper::lltypesystem::rbytearray::{
     BYTEARRAYPTR, build_ll_str2bytearray_helper_graph,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
-    build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
-    build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
-    build_ll_join_chars_helper_graph_for, build_ll_join_chars_isvirtual_helper_graph,
+    ConstUnicodeCacheKey, STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph,
+    build_ll_count_char_helper_graph, build_ll_endswith_char_helper_graph,
+    build_ll_endswith_helper_graph, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
+    build_ll_int_helper_graph, build_ll_join_chars_helper_graph_for,
+    build_ll_join_chars_isvirtual_helper_graph,
     build_ll_join_chars_look_inside_iff_helper_graph_for,
     build_ll_join_chars_trampoline_helper_graph_for, build_ll_join_helper_graph,
     build_ll_join_strs_helper_graph_for, build_ll_join_strs_look_inside_iff_helper_graph_for,
@@ -624,25 +625,28 @@ impl Repr for UnicodeRepr {
     /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`) for
     /// `UnicodeRepr` (`basetype = basestring`, `base = UniChar`,
     /// `CACHE = CONST_UNICODE_CACHE`, `malloc = mallocunicode`).
-    /// `None` is a typed null. A `str` or `unicode` constant is the
-    /// cached prebuilt container: each character is stored as
-    /// `UniChar` (`cast_primitive(UniChar, value[i])`; a byte
-    /// character is `unichr(ord(ch))`) and `ll_strhash` fills `hash`.
+    /// `None` is a typed null. A `str` or `unicode` constant is keyed
+    /// by the host basestring (`CONST_UNICODE_CACHE`): an ASCII `str`
+    /// compares equal to the `unicode` it decodes to (`'a' == u'a'`),
+    /// and a non-ASCII `str` does not (`'\xff' != u'\xff'`). Each
+    /// character is stored as `UniChar`
+    /// (`cast_primitive(UniChar, value[i])`; a byte character is
+    /// `unichr(ord(ch))`) and `ll_strhash` fills `hash`.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
-        let text = match value {
+        let key = match value {
             ConstValue::None => {
                 return Ok(Constant::with_concretetype(
                     ConstValue::LLPtr(Box::new(null_unicode_ptr())),
                     self.lltype.clone(),
                 ));
             }
-            ConstValue::UniStr(s) => s.clone(),
-            ConstValue::ByteStr(bytes) => bytes.iter().copied().map(char::from).collect(),
+            ConstValue::UniStr(s) => ConstUnicodeCacheKey::from_unicode(s),
+            ConstValue::ByteStr(bytes) => ConstUnicodeCacheKey::from_bytes(bytes),
             other => {
                 return Err(TyperError::message(format!("not a str: {other:?}")));
             }
         };
-        let p = const_unicode_cache_llunicode(&text).map_err(TyperError::message)?;
+        let p = const_unicode_cache_llunicode(&key).map_err(TyperError::message)?;
         Ok(Constant::with_concretetype(
             ConstValue::LLPtr(Box::new(p)),
             self.lltype.clone(),
@@ -4426,8 +4430,10 @@ mod tests {
     }
 
     /// `BaseLLStringRepr.convert_const` for `UnicodeRepr`: `None` is a
-    /// typed null, and a `str` / `unicode` constant is one cached
-    /// `Ptr(UNICODE)` (`CONST_UNICODE_CACHE`) with `ll_strhash` filled.
+    /// typed null. `CONST_UNICODE_CACHE` is keyed by the host
+    /// basestring: `'a'` and `u'a'` share one container, `'\xff'` and
+    /// `u'\xff'` do not. Both of the latter carry the same `UniChar`
+    /// payload and the same precomputed hash.
     #[test]
     fn unicode_repr_convert_const_caches_basestring() {
         use crate::translator::rtyper::lltypesystem::rstr::{
@@ -4457,11 +4463,38 @@ mod tests {
             prebuilt_unicode_bytes_and_hash(latin_ptr).expect("latin-1 unicode payload");
         assert_eq!(bytes, "\u{ff}".as_bytes());
         assert_eq!(hash, ll_unicodehash_value(&['\u{ff}']));
-        let same = r.convert_const(&ConstValue::uni_str("\u{ff}")).unwrap();
-        let ConstValue::LLPtr(same_ptr) = &same.value else {
+        let uni_ff = r.convert_const(&ConstValue::uni_str("\u{ff}")).unwrap();
+        let ConstValue::LLPtr(uni_ff_ptr) = &uni_ff.value else {
             panic!("U+00FF unicode const is an LLPtr");
         };
-        assert_eq!(latin_ptr.as_ref(), same_ptr.as_ref());
+        let (uni_bytes, uni_hash) =
+            prebuilt_unicode_bytes_and_hash(uni_ff_ptr).expect("U+00FF unicode payload");
+        assert_eq!(bytes, uni_bytes);
+        assert_eq!(hash, uni_hash);
+        assert_ne!(
+            latin_ptr.as_ref(),
+            uni_ff_ptr.as_ref(),
+            r"'\xff' and u'\xff' are distinct CONST_UNICODE_CACHE keys"
+        );
+        let latin_again = r.convert_const(&ConstValue::byte_str([0xff])).unwrap();
+        let ConstValue::LLPtr(latin_again_ptr) = &latin_again.value else {
+            panic!("second latin-1 byte string is an LLPtr");
+        };
+        assert_eq!(latin_ptr.as_ref(), latin_again_ptr.as_ref());
+
+        let ascii_bytes = r.convert_const(&ConstValue::byte_str(b"a")).unwrap();
+        let ascii_uni = r.convert_const(&ConstValue::uni_str("a")).unwrap();
+        let ConstValue::LLPtr(ascii_bytes_ptr) = &ascii_bytes.value else {
+            panic!("ASCII byte string is an LLPtr, got {:?}", ascii_bytes.value);
+        };
+        let ConstValue::LLPtr(ascii_uni_ptr) = &ascii_uni.value else {
+            panic!("ASCII unicode const is an LLPtr");
+        };
+        assert_eq!(
+            ascii_bytes_ptr.as_ref(),
+            ascii_uni_ptr.as_ref(),
+            "'a' and u'a' share one CONST_UNICODE_CACHE container"
+        );
 
         let none = r.convert_const(&ConstValue::None).unwrap();
         let ConstValue::LLPtr(none_ptr) = &none.value else {

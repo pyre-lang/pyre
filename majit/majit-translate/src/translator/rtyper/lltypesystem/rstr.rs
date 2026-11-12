@@ -42,6 +42,8 @@
 
 #![allow(non_upper_case_globals)]
 
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 #[cfg(test)]
@@ -55,7 +57,8 @@ use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GCREF, GcKind, LowLevelType,
-    LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, functionptr_for_graph_with_type, malloc,
+    LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, WeakContainer,
+    functionptr_for_graph_with_type, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{
@@ -142,9 +145,8 @@ pub fn new_malloc() -> Result<(), TyperError> {
 /// container for a host string constant — `mallocstr(len(s))` plus a
 /// per-index `chars[i] = s[i]` fill.  `hash` keeps malloc's `Signed`
 /// default `0` (upstream computes it lazily through `ll_strhash`).
-/// The container is immortal: prebuilt string constants live for the
-/// whole translation, exactly like upstream's `CONST_STR_CACHE`
-/// entries.
+/// This helper does not intern; [`const_str_cache_llstr`] is
+/// `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`).
 pub(crate) fn llstr(s: &[u8]) -> Result<_ptr, String> {
     let LowLevelType::ForwardReference(fwd) = STR.clone() else {
         return Err("STR must be a ForwardReference".to_string());
@@ -247,25 +249,137 @@ pub(crate) fn ll_unicodehash_value(chars: &[char]) -> i64 {
     ))
 }
 
+/// Host basestring key of `CONST_UNICODE_CACHE`
+/// (`BaseLLStringRepr.convert_const`). The key is the host basestring
+/// value. A `unicode` is [`ConstUnicodeCacheKey::Unicode`]. A `str`
+/// whose bytes are all ASCII is stored as `Unicode` too, because
+/// `'a' == u'a'` (one hash). A non-ASCII `str` stays
+/// [`ConstUnicodeCacheKey::Bytes`] and does not compare equal to any
+/// `unicode` (`'\xff' != u'\xff'`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ConstUnicodeCacheKey {
+    Unicode(String),
+    Bytes(Vec<u8>),
+}
+
+impl ConstUnicodeCacheKey {
+    /// Host `unicode` value, kept as given.
+    pub(crate) fn from_unicode(text: &str) -> Self {
+        ConstUnicodeCacheKey::Unicode(text.to_string())
+    }
+
+    /// Host `str` value. ASCII bytes decode to the equal `unicode` key
+    /// (`'a' == u'a'`). Any other byte string stays a distinct key.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.is_ascii() {
+            let text = std::str::from_utf8(bytes).expect("ASCII bytes are UTF-8");
+            ConstUnicodeCacheKey::Unicode(text.to_string())
+        } else {
+            ConstUnicodeCacheKey::Bytes(bytes.to_vec())
+        }
+    }
+}
+
+/// `WeakValueDictionary` value for `CONST_STR_CACHE` /
+/// `CONST_UNICODE_CACHE`. The weak value stands for the `_ptr` object
+/// that `WeakValueDictionary` holds, so a hit keeps its identity.
+/// `weak` is the container; `ptr_type`, `solid`, and `identity` are the
+/// `Ptr` type, `solid` flag, and `_identity`
+/// [`_ptr::new_with_solid_identity`] needs to rebuild that same `_ptr`
+/// (`_TYPE`, `_solid`, `_identity`, container). `_ptr` `PartialEq`
+/// compares containers; `ConstValue::LLPtr` hashes `_identity`.
+struct CachedConstPtr {
+    weak: WeakContainer,
+    ptr_type: Ptr,
+    solid: bool,
+    identity: u64,
+}
+
+impl CachedConstPtr {
+    fn from_ptr(p: &_ptr) -> Result<Self, String> {
+        let obj = p
+            ._obj0_value()
+            .map_err(|_| "delayed pointer has no container to cache".to_string())?
+            .ok_or_else(|| "null pointer has no container to cache".to_string())?;
+        let weak = WeakContainer::downgrade(&obj)
+            .ok_or_else(|| "string constant container has no weak form".to_string())?;
+        Ok(CachedConstPtr {
+            weak,
+            ptr_type: p._TYPE.clone(),
+            solid: p._solid,
+            identity: p._identity,
+        })
+    }
+
+    /// Live upgrade rebuilds the cached `_ptr`, including its
+    /// `_identity`. `None` is a dead entry (`WeakValueDictionary`
+    /// `KeyError`).
+    fn upgrade(&self) -> Option<_ptr> {
+        let obj = self.weak.upgrade()?;
+        Some(_ptr::new_with_solid_identity(
+            self.ptr_type.clone(),
+            Ok(Some(obj)),
+            self.solid,
+            self.identity,
+        ))
+    }
+
+    #[cfg(test)]
+    fn is_live(&self) -> bool {
+        self.weak.upgrade().is_some()
+    }
+}
+
+/// Hit with a live upgrade returns the rebuilt `_ptr`. A missing key
+/// and a dead entry are both `KeyError`: allocate, then `insert`
+/// (replacing the dead entry). No separate pruning pass.
+fn weak_cache_get_or_insert<K, Q, F>(
+    cache: &mut HashMap<K, CachedConstPtr>,
+    query: &Q,
+    make_key: impl FnOnce() -> K,
+    alloc: F,
+) -> Result<_ptr, String>
+where
+    K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+    Q: Eq + std::hash::Hash + ?Sized,
+    F: FnOnce() -> Result<_ptr, String>,
+{
+    let hit = cache.get(query).and_then(CachedConstPtr::upgrade);
+    if let Some(p) = hit {
+        return Ok(p);
+    }
+    let p = alloc()?;
+    cache.insert(make_key(), CachedConstPtr::from_ptr(&p)?);
+    Ok(p)
+}
+
 thread_local! {
-    /// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py` /
-    /// `StringRepr.CACHE`, `lltypesystem/rstr.py`): one host string →
-    /// one prebuilt container identity, so repeated `convert_const` calls
-    /// on the same literal return the same `_ptr` (prebuilt-constant
-    /// `is`-identity upstream relies on).  Thread-lifetime strong
-    /// cache; upstream's weak semantics only matter for memory, not
-    /// identity.  Upstream is module-global because one translation owns
-    /// the process; translation sessions here are single-threaded, so
-    /// thread_local confines the cache to one session at a time (the
+    /// `CONST_STR_CACHE = WeakValueDictionary()` (`StringRepr.CACHE`,
+    /// `BaseLLStringRepr.convert_const`): one host string → one
+    /// prebuilt container, so repeated `convert_const` calls on the
+    /// same literal return equal `_ptr`s while the container is still
+    /// referenced. The stored value is weak. Once nothing else
+    /// references the container the entry is dead, and the next lookup
+    /// is a `KeyError`: a fresh container is allocated and replaces
+    /// that entry.
+    ///
+    /// Upstream is module-global because one translation owns the
+    /// process; translation sessions here are single-threaded, so
+    /// `thread_local` confines the cache to one session at a time (the
     /// same convention as `classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`) —
-    /// cached `_ptr`s carry a mutable `hash` slot written back by
-    /// `build_ll_strhash_internal_helper_graph`, which must not be shared
-    /// across concurrently-running sessions.  Sequential sessions on one
-    /// thread DO share entries, which is sound: the value is determined
-    /// by the key bytes alone ([`llstr`] container + [`ll_strhash_value`]
-    /// fill), and the only mutation is that idempotent hash fill.
-    static CONST_STR_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, _ptr>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// cached containers carry a mutable `hash` slot written back by
+    /// `build_ll_strhash_internal_helper_graph`, which must not be
+    /// shared across concurrently-running sessions. Sequential sessions
+    /// on one thread DO share entries, which is sound: the value is
+    /// determined by the key bytes alone ([`llstr`] container +
+    /// [`ll_strhash_value`] fill), and the only mutation is that
+    /// idempotent hash fill.
+    static CONST_STR_CACHE: RefCell<HashMap<Vec<u8>, CachedConstPtr>> =
+        RefCell::new(HashMap::new());
+
+    /// `@specialize.memo()` `emptystrfun`: the strong `_ptr` from
+    /// `string_repr.convert_const("")` (`CONST_STR_CACHE`).
+    static EMPTYSTRFUN: OnceCell<_ptr> = OnceCell::new();
 }
 
 /// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
@@ -273,16 +387,19 @@ thread_local! {
 pub(crate) fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
     CONST_STR_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(p) = cache.get(s) {
-            return Ok(p.clone());
-        }
-        let mut p = llstr(s)?;
-        // `p.hash = 0; self.ll.ll_strhash(p)` (rstr.py):
-        // precompute the hash before caching the container, so every
-        // prebuilt string constant ships with its hash slot filled.
-        p.setattr("hash", LowLevelValue::Signed(ll_strhash_value(s)))?;
-        cache.insert(s.to_vec(), p.clone());
-        Ok(p)
+        weak_cache_get_or_insert(
+            &mut cache,
+            s,
+            || s.to_vec(),
+            || {
+                let mut p = llstr(s)?;
+                // `p.hash = 0; self.ll.ll_strhash(p)` (`BaseLLStringRepr.convert_const`):
+                // precompute the hash before caching the container, so every
+                // prebuilt string constant ships with its hash slot filled.
+                p.setattr("hash", LowLevelValue::Signed(ll_strhash_value(s)))?;
+                Ok(p)
+            },
+        )
     })
 }
 
@@ -336,7 +453,7 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     Some((bytes, hash))
 }
 
-/// Inverse of [`alloc_array_unicode`]: read back the UTF-8 payload and
+/// Inverse of `alloc_array_unicode`: read back the UTF-8 payload and
 /// `hash`-slot value of a prebuilt `Ptr(UNICODE)` container.  Mirror of
 /// [`prebuilt_str_bytes_and_hash`] with `chars` as `UniChar` instead of
 /// `Char`; the codewriter routes the pair through `emit_str_const_r`
@@ -444,19 +561,49 @@ pub static UNICODEPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 });
 
 thread_local! {
-    /// RPython `CONST_UNICODE_CACHE = WeakValueDictionary()`.
-    pub static CONST_UNICODE_CACHE: std::cell::RefCell<std::collections::HashMap<String, _ptr>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// `CONST_UNICODE_CACHE = WeakValueDictionary()`
+    /// (`UnicodeRepr.CACHE`, `BaseLLStringRepr.convert_const`). Keyed
+    /// by the host basestring ([`ConstUnicodeCacheKey`]). The value is
+    /// weak, same as `CONST_STR_CACHE`: a dead entry is a `KeyError`
+    /// and the next lookup replaces it. `thread_local` for the same
+    /// reason as `CONST_STR_CACHE`: the hash slot is written once and
+    /// must not be shared across concurrent translation sessions.
+    static CONST_UNICODE_CACHE: RefCell<HashMap<ConstUnicodeCacheKey, CachedConstPtr>> =
+        RefCell::new(HashMap::new());
+
+    /// `@specialize.memo()` `emptyunicodefun`: the strong `_ptr` from
+    /// `unicode_repr.convert_const(u'')` (`CONST_UNICODE_CACHE`).
+    static EMPTYUNICODEFUN: OnceCell<_ptr> = OnceCell::new();
 }
 
-/// RPython `emptyunicodefun()`.
+/// `@specialize.memo()` `emptyunicodefun` (`lltypesystem/rstr.py`):
+/// `unicode_repr.convert_const(u'')`. One container per thread, computed
+/// through `CONST_UNICODE_CACHE` with the empty `Unicode` key. The
+/// memo holds that `_ptr` strongly; the cache entry stays weak.
 pub fn emptyunicodefun() -> Result<_ptr, String> {
-    alloc_array_unicode("")
+    EMPTYUNICODEFUN.with(|cell| {
+        if let Some(p) = cell.get() {
+            return Ok(p.clone());
+        }
+        let p = const_unicode_cache_llunicode(&ConstUnicodeCacheKey::from_unicode(""))?;
+        cell.set(p.clone()).expect("emptyunicodefun memo is unset");
+        Ok(p)
+    })
 }
 
-/// RPython `emptystrfun()`.
+/// `@specialize.memo()` `emptystrfun` (`lltypesystem/rstr.py`):
+/// `string_repr.convert_const("")`. One container per thread, computed
+/// through `CONST_STR_CACHE`. The memo holds that `_ptr` strongly; the
+/// cache entry stays weak.
 pub fn emptystrfun() -> Result<_ptr, String> {
-    const_str_cache_llstr(b"")
+    EMPTYSTRFUN.with(|cell| {
+        if let Some(p) = cell.get() {
+            return Ok(p.clone());
+        }
+        let p = const_str_cache_llstr(b"")?;
+        cell.set(p.clone()).expect("emptystrfun memo is unset");
+        Ok(p)
+    })
 }
 
 /// RPython `alloc_array_name(name)` (rclass.py):
@@ -474,19 +621,26 @@ pub(crate) fn alloc_array_name(name: &str) -> Result<_ptr, String> {
     const_str_cache_llstr(name.as_bytes())
 }
 
-/// Host `mallocunicode` for a constant: an immortal `Ptr(UNICODE)`
-/// whose `chars` are the code points of `value` and whose `hash` is
-/// the malloc zero. [`const_unicode_cache_llunicode`] is the
+/// Host `mallocunicode` for a constant: a `Ptr(UNICODE)` whose `chars`
+/// are the code points of `value` and whose `hash` is the malloc zero.
+/// [`const_unicode_cache_llunicode`] is the
 /// `BaseLLStringRepr.convert_const` cache and `ll_strhash` fill.
+/// Tests use this uncached allocator; production constants go through
+/// the cache.
+#[cfg(test)]
 fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
+    let chars: Vec<char> = value.chars().collect();
+    alloc_array_unicode_chars(&chars)
+}
+
+fn alloc_array_unicode_chars(chars_in: &[char]) -> Result<_ptr, String> {
     let unicode_body = match UNICODE.clone() {
         LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
             "alloc_array_unicode: UNICODE ForwardReference is not resolved".to_string()
         })?,
         other => other,
     };
-    let codepoint_count = value.chars().count();
-    let mut ptr = malloc(unicode_body, Some(codepoint_count), MallocFlavor::Gc, true)?;
+    let mut ptr = malloc(unicode_body, Some(chars_in.len()), MallocFlavor::Gc, true)?;
     ptr.setattr("hash", LowLevelValue::Signed(0))?;
     let Some(obj) = ptr._obj0_value().map_err(|_| {
         "alloc_array_unicode: delayed UNICODE pointer cannot be initialised".to_string()
@@ -503,30 +657,41 @@ fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
     let LowLevelValue::Array(chars) = chars_value else {
         return Err("alloc_array_unicode: UNICODE struct chars field is not an Array".to_string());
     };
-    for (i, ch) in value.chars().enumerate() {
+    for (i, ch) in chars_in.iter().copied().enumerate() {
         chars.setitem(i, LowLevelValue::UniChar(ch));
     }
     Ok(ptr)
 }
 
+/// Code points written into `chars` for a `CONST_UNICODE_CACHE` key.
+/// A `unicode` character is stored as itself. A byte is
+/// `cast_primitive(UniChar, ch)` (the same ordinal).
+fn unicode_cache_chars(key: &ConstUnicodeCacheKey) -> Vec<char> {
+    match key {
+        ConstUnicodeCacheKey::Unicode(text) => text.chars().collect(),
+        ConstUnicodeCacheKey::Bytes(bytes) => bytes.iter().copied().map(char::from).collect(),
+    }
+}
+
 /// `BaseLLStringRepr.convert_const` cache half for `UnicodeRepr`
-/// (`CACHE = CONST_UNICODE_CACHE`, `lltypesystem/rstr.py`). One host
-/// string maps to one prebuilt `Ptr(UNICODE)`. `hash` is
-/// `LLHelpers.ll_strhash` (`_ll_strhash` / `_hash_string` on the code
-/// points). The `thread_local` cache is the same session split as
-/// `CONST_STR_CACHE`: the hash slot is written once and must not be
-/// shared across concurrent translation sessions.
-pub(crate) fn const_unicode_cache_llunicode(text: &str) -> Result<_ptr, String> {
+/// (`CACHE = CONST_UNICODE_CACHE`). The key is the host basestring
+/// ([`ConstUnicodeCacheKey`]). `hash` is `LLHelpers.ll_strhash`
+/// (`ll_unicodehash_value` on the code points). A dead weak value is a
+/// miss and is replaced.
+pub(crate) fn const_unicode_cache_llunicode(key: &ConstUnicodeCacheKey) -> Result<_ptr, String> {
     CONST_UNICODE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(p) = cache.get(text) {
-            return Ok(p.clone());
-        }
-        let mut p = alloc_array_unicode(text)?;
-        let chars: Vec<char> = text.chars().collect();
-        p.setattr("hash", LowLevelValue::Signed(ll_unicodehash_value(&chars)))?;
-        cache.insert(text.to_string(), p.clone());
-        Ok(p)
+        weak_cache_get_or_insert(
+            &mut cache,
+            key,
+            || key.clone(),
+            || {
+                let chars = unicode_cache_chars(key);
+                let mut p = alloc_array_unicode_chars(&chars)?;
+                p.setattr("hash", LowLevelValue::Signed(ll_unicodehash_value(&chars)))?;
+                Ok(p)
+            },
+        )
     })
 }
 
@@ -14615,8 +14780,9 @@ mod tests {
     /// zero `alloc_array_unicode` leaves behind.
     #[test]
     fn const_unicode_cache_llunicode_reuses_container_and_precomputes_hash() {
-        let p1 = const_unicode_cache_llunicode("α").expect("first lookup");
-        let p2 = const_unicode_cache_llunicode("α").expect("second lookup");
+        let key = ConstUnicodeCacheKey::from_unicode("α");
+        let p1 = const_unicode_cache_llunicode(&key).expect("first lookup");
+        let p2 = const_unicode_cache_llunicode(&key).expect("second lookup");
         assert_eq!(p1, p2, "same literal must reuse the cached container");
         let (bytes, hash) = prebuilt_unicode_bytes_and_hash(&p1).expect("unicode payload");
         assert_eq!(bytes, "α".as_bytes());
@@ -14624,7 +14790,8 @@ mod tests {
         assert_ne!(hash, 0);
         let fresh = alloc_array_unicode("α").expect("uncached malloc");
         assert_ne!(p1, fresh, "alloc_array_unicode must not consult the cache");
-        let empty = const_unicode_cache_llunicode("").expect("empty");
+        let empty =
+            const_unicode_cache_llunicode(&ConstUnicodeCacheKey::from_unicode("")).expect("empty");
         assert_eq!(
             prebuilt_unicode_bytes_and_hash(&empty),
             Some((Vec::new(), ll_unicodehash_value(&[])))
@@ -14650,6 +14817,136 @@ mod tests {
         // An uncached `llstr` of the same bytes mints a fresh container.
         let fresh = llstr(b"cache-identity-probe").expect("uncached llstr");
         assert_ne!(p1, fresh, "llstr must not consult the cache");
+    }
+
+    /// `WeakValueDictionary` (`CONST_STR_CACHE`): a live entry rebuilds
+    /// an equal `_ptr`. After every strong reference is dropped the
+    /// entry is still present and dead (`KeyError`); the next lookup
+    /// replaces it.
+    #[test]
+    fn const_str_cache_dead_entry_is_a_miss() {
+        let key = b"weak-cache-probe-n31";
+        {
+            let p1 = const_str_cache_llstr(key).expect("first lookup");
+            let p2 = const_str_cache_llstr(key).expect("second lookup");
+            assert_eq!(p1, p2);
+            assert!(const_str_cache_entry_is_live(key));
+        }
+        assert!(const_str_cache_entry_is_present(key));
+        assert!(
+            !const_str_cache_entry_is_live(key),
+            "dropped container must leave a dead CONST_STR_CACHE entry"
+        );
+        let p3 = const_str_cache_llstr(key).expect("lookup after collect");
+        assert!(const_str_cache_entry_is_live(key));
+        let (bytes, hash) = prebuilt_str_bytes_and_hash(&p3).expect("payload");
+        assert_eq!(bytes, key);
+        assert_eq!(hash, ll_strhash_value(key));
+    }
+
+    /// `WeakValueDictionary` (`CONST_UNICODE_CACHE`), same dead-entry
+    /// rule as `CONST_STR_CACHE`.
+    #[test]
+    fn const_unicode_cache_dead_entry_is_a_miss() {
+        let key = ConstUnicodeCacheKey::from_unicode("weak-cache-probe-n31");
+        {
+            let p1 = const_unicode_cache_llunicode(&key).expect("first lookup");
+            let p2 = const_unicode_cache_llunicode(&key).expect("second lookup");
+            assert_eq!(p1, p2);
+            assert!(const_unicode_cache_entry_is_live(&key));
+        }
+        assert!(const_unicode_cache_entry_is_present(&key));
+        assert!(
+            !const_unicode_cache_entry_is_live(&key),
+            "dropped container must leave a dead CONST_UNICODE_CACHE entry"
+        );
+        let p3 = const_unicode_cache_llunicode(&key).expect("lookup after collect");
+        assert!(const_unicode_cache_entry_is_live(&key));
+        let (bytes, hash) = prebuilt_unicode_bytes_and_hash(&p3).expect("payload");
+        assert_eq!(bytes, "weak-cache-probe-n31".as_bytes());
+        assert_eq!(hash, ll_unicodehash_value(&unicode_cache_chars(&key)));
+    }
+
+    /// `@specialize.memo()` `emptystrfun` / `emptyunicodefun`: two calls
+    /// return one container, the hash is the precomputed empty-string
+    /// hash, and that container is the cache entry while the memo holds
+    /// it.
+    #[test]
+    fn emptystrfun_and_emptyunicodefun_memoize_one_container() {
+        let s1 = emptystrfun().expect("emptystrfun");
+        let s2 = emptystrfun().expect("emptystrfun again");
+        assert_eq!(s1, s2);
+        assert_eq!(s1, const_str_cache_llstr(b"").expect("empty str cache"));
+        assert_eq!(prebuilt_str_bytes_and_hash(&s1), Some((Vec::new(), -1)));
+        assert_eq!(ll_strhash_value(b""), -1);
+
+        let u1 = emptyunicodefun().expect("emptyunicodefun");
+        let u2 = emptyunicodefun().expect("emptyunicodefun again");
+        assert_eq!(u1, u2);
+        let empty_key = ConstUnicodeCacheKey::from_unicode("");
+        assert_eq!(
+            u1,
+            const_unicode_cache_llunicode(&empty_key).expect("empty unicode cache")
+        );
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&u1), Some((Vec::new(), -1)));
+        assert_eq!(ll_unicodehash_value(&[]), -1);
+    }
+
+    /// A live `WeakValueDictionary` hit (`BaseLLStringRepr.convert_const`)
+    /// returns the cached `_ptr`: same container (`==`) and the same
+    /// `_identity` (`_hashable_identity`). `ConstValue::LLPtr` hashes that
+    /// identity, so the two constants hash equal.
+    #[test]
+    fn weak_const_cache_hit_keeps_cached_ptr_identity() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn llptr_hash(p: &_ptr) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            ConstValue::LLPtr(Box::new(p.clone())).hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let str_key = b"weak-cache-ptr-identity-n31b";
+        let p1 = const_str_cache_llstr(str_key).expect("str first");
+        let p2 = const_str_cache_llstr(str_key).expect("str second");
+        assert_eq!(p1, p2);
+        assert_eq!(p1._hashable_identity(), p2._hashable_identity());
+        assert_eq!(llptr_hash(&p1), llptr_hash(&p2));
+
+        let uni_key = ConstUnicodeCacheKey::from_unicode("weak-cache-ptr-identity-n31b");
+        let u1 = const_unicode_cache_llunicode(&uni_key).expect("unicode first");
+        let u2 = const_unicode_cache_llunicode(&uni_key).expect("unicode second");
+        assert_eq!(u1, u2);
+        assert_eq!(u1._hashable_identity(), u2._hashable_identity());
+        assert_eq!(llptr_hash(&u1), llptr_hash(&u2));
+
+        let s1 = emptystrfun().expect("emptystrfun");
+        let s2 = emptystrfun().expect("emptystrfun again");
+        assert_eq!(s1, s2);
+        assert_eq!(s1._hashable_identity(), s2._hashable_identity());
+
+        let e1 = emptyunicodefun().expect("emptyunicodefun");
+        let e2 = emptyunicodefun().expect("emptyunicodefun again");
+        assert_eq!(e1, e2);
+        assert_eq!(e1._hashable_identity(), e2._hashable_identity());
+    }
+
+    fn const_str_cache_entry_is_live(key: &[u8]) -> bool {
+        CONST_STR_CACHE.with(|cache| cache.borrow().get(key).is_some_and(CachedConstPtr::is_live))
+    }
+
+    fn const_str_cache_entry_is_present(key: &[u8]) -> bool {
+        CONST_STR_CACHE.with(|cache| cache.borrow().contains_key(key))
+    }
+
+    fn const_unicode_cache_entry_is_live(key: &ConstUnicodeCacheKey) -> bool {
+        CONST_UNICODE_CACHE
+            .with(|cache| cache.borrow().get(key).is_some_and(CachedConstPtr::is_live))
+    }
+
+    fn const_unicode_cache_entry_is_present(key: &ConstUnicodeCacheKey) -> bool {
+        CONST_UNICODE_CACHE.with(|cache| cache.borrow().contains_key(key))
     }
 
     /// [`prebuilt_str_bytes_and_hash`] is the inverse of

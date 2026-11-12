@@ -1530,7 +1530,9 @@ pub enum WeakContainer {
 
 impl WeakContainer {
     /// `weakref.ref(parent)` — downgrade a strong container handle.
-    fn downgrade(obj: &_ptr_obj) -> Option<WeakContainer> {
+    /// `CONST_STR_CACHE` / `CONST_UNICODE_CACHE` store this weak value
+    /// (`WeakValueDictionary`, `BaseLLStringRepr.convert_const`).
+    pub(crate) fn downgrade(obj: &_ptr_obj) -> Option<WeakContainer> {
         match obj {
             _ptr_obj::Struct(s) => Some(WeakContainer::Struct(Arc::downgrade(&s.0))),
             _ptr_obj::Array(a) => Some(WeakContainer::Array(Arc::downgrade(&a.0))),
@@ -1540,7 +1542,8 @@ impl WeakContainer {
     }
 
     /// Upgrade back to the strong container, or `None` if collected.
-    fn upgrade(&self) -> Option<_ptr_obj> {
+    /// A `None` upgrade is `WeakValueDictionary`'s `KeyError`.
+    pub(crate) fn upgrade(&self) -> Option<_ptr_obj> {
         match self {
             WeakContainer::Struct(w) => w.upgrade().map(|c| _ptr_obj::Struct(_struct(c))),
             WeakContainer::Array(w) => w.upgrade().map(|c| _ptr_obj::Array(_array(c))),
@@ -3205,6 +3208,26 @@ impl _ptr {
                 p._solid = _solid;
             }
         }
+        p
+    }
+
+    /// Rebuild a `_ptr` that is the object `WeakValueDictionary` stored.
+    ///
+    /// The weak value stands for the `_ptr` object that
+    /// `WeakValueDictionary` holds, so a hit keeps its identity.
+    /// [`Self::new_with_solid`] follows `_ptr.__init__` and mints a fresh
+    /// `_identity`; this constructor then writes the recorded one back.
+    /// `ConstValue::LLPtr` hashes `_hashable_identity` and
+    /// `PTR_BECOME_TARGETS` is keyed by it, so the rebuilt pointer is a
+    /// clone of the cached `_ptr` (`_identity`, `_TYPE`, `_solid`, container).
+    pub(crate) fn new_with_solid_identity(
+        _TYPE: Ptr,
+        _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
+        _solid: bool,
+        _identity: u64,
+    ) -> Self {
+        let mut p = Self::new_with_solid(_TYPE, _obj0, _solid);
+        p._identity = _identity;
         p
     }
 
