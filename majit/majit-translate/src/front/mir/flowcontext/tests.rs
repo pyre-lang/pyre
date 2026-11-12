@@ -5714,6 +5714,9 @@ fn str_family_class_roots_reject_lookalikes() {
     }
     assert!(super::is_str_family_class_root("string::String"));
     assert!(super::is_str_family_class_root("str"));
+    assert!(super::is_str_family_class_root("path::PathBuf"));
+    assert!(super::is_str_family_class_root("ffi::OsString"));
+    assert!(!super::is_str_family_class_root("other::PathBuf"));
     assert!(!super::is_str_family_class_root("other::Utf8Str"));
     assert!(!super::is_str_family_class_root("other::Wtf8Buf"));
     assert!(!super::is_str_family_class_root("other::BytesBlock"));

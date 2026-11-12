@@ -1,14 +1,14 @@
 use super::{
     adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
     charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
-    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
-    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
-    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
+    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
+    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_immutable_fields,
+    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
+    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
+    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
+    tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
+    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -82,6 +82,63 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(!is_str_family_class_root("other::BytesKey"));
     assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
+}
+
+#[test]
+fn os_path_family_roots_are_str_family_and_reject_lookalikes() {
+    for root in [
+        "PathBuf",
+        "path::PathBuf",
+        "std::path::PathBuf",
+        "Path",
+        "path::Path",
+        "OsString",
+        "ffi::OsString",
+        "std::ffi::OsString",
+        "ffi::os_str::OsString",
+        "OsStr",
+        "ffi::OsStr",
+    ] {
+        assert!(
+            is_os_path_family_root(root),
+            "{root} is a std path/ffi spelling"
+        );
+        assert!(
+            is_str_family_class_root(root),
+            "{root} projects as the rpath.py s_Str0 string family"
+        );
+    }
+    assert!(!is_os_path_family_root("other::PathBuf"));
+    assert!(!is_os_path_family_root("other::OsString"));
+    assert!(!is_str_family_class_root("other::PathBuf"));
+    assert!(!is_str_family_class_root("other::OsString"));
+    assert!(!is_os_path_family_root("String"));
+    assert!(!is_os_path_family_root("string::String"));
+}
+
+#[test]
+fn oparg_newtype_spelling_is_the_compiler_core_wrapper() {
+    for spelling in [
+        "ConstIdx",
+        "LoadAttr",
+        "OpArg",
+        "bytecode::oparg::ConstIdx",
+        "bytecode::oparg::LoadAttr",
+        "oparg::ConstIdx",
+        "rustpython_compiler_core::bytecode::oparg::ConstIdx",
+        "rustpython_compiler_core::bytecode::oparg::LoadAttr",
+        "&ConstIdx",
+        "&mut LoadAttr",
+    ] {
+        assert!(
+            is_oparg_newtype_spelling(spelling),
+            "{spelling} is a newtype_oparg! wrapper"
+        );
+    }
+    assert!(!is_oparg_newtype_spelling("other::ConstIdx"));
+    assert!(!is_oparg_newtype_spelling("other::LoadAttr"));
+    assert!(!is_oparg_newtype_spelling("String"));
+    assert!(!is_oparg_newtype_spelling("u32"));
 }
 
 #[test]
@@ -281,6 +338,10 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     let intern_none = |s: &str| is_niche_option_gc_payload_spelling(s, None);
     assert!(intern_none("option::Option<string::String>"));
     assert!(intern_none("Option<*mut unicodeobject::Utf8Str>"));
+    assert!(intern_none("Option<path::PathBuf>"));
+    assert!(intern_none("option::Option<PathBuf>"));
+    assert!(intern_none("Option<ffi::OsString>"));
+    assert!(!intern_none("Option<other::PathBuf>"));
     assert!(!intern_none("Option<pyobject::PyObject>"));
     assert!(!intern_none("Option<W_BufferedReader>"));
     assert!(!intern_none("pyobject::PyObject"));
@@ -11498,6 +11559,9 @@ fn option_of_string_value_llbc() -> Llbc {
             code_struct(1, &["rustpython_wtf8", "Wtf8"]),
             code_struct(2, &["alloc", "string", "String"]),
             code_struct(3, &["rustpython_wtf8", "Wtf8Buf"]),
+            code_struct(4, &["std", "path", "PathBuf"]),
+            code_struct(5, &["std", "ffi", "OsString"]),
+            code_struct(6, &["other", "PathBuf"]),
         ],
         vec![],
     )
@@ -11861,6 +11925,10 @@ fn option_of_string_is_ref_paint_and_niche() {
             "Option<String> None is a null Ref"
         );
         assert!(
+            !lowering.enum_payload_is_nullable_instance_ptr(&option_string),
+            "Option<String> is SomeString (`rstr.py`), not a W_ROOT GC instance"
+        );
+        assert!(
             lowering.tyref_is_niche_option_ptr(&option_ref_string),
             "Option<&String> is the rust-heap-string niche"
         );
@@ -11891,6 +11959,75 @@ fn option_of_string_is_ref_paint_and_niche() {
             "&Option<String> param class root is the payload String's class root"
         );
     });
+}
+
+/// `rpath.py` `_posix_rnormpath` annotates `PathBuf` as `s_Str0`. The
+/// Option is the same rust-heap-string niche as `Option<String>`: `Some`
+/// is the path string, `None` is a null Ref, and there is no
+/// `__discriminant` aggregate. A lookalike `other::PathBuf` stays tagged.
+#[test]
+fn option_of_pathbuf_is_ref_paint_and_niche() {
+    use crate::model::ValueType;
+    let llbc = option_of_string_value_llbc();
+    let option_pathbuf = TyRef::Other(option_adt_node(0, adt_node(4)));
+    let pathbuf = TyRef::Other(adt_node(4));
+    let option_os_string = TyRef::Other(option_adt_node(0, adt_node(5)));
+    let option_lookalike = TyRef::Other(option_adt_node(0, adt_node(6)));
+    let option_paint = super::tyref_to_value_type(&option_pathbuf, &llbc);
+    let pathbuf_paint = super::tyref_to_value_type(&pathbuf, &llbc);
+    assert!(
+        !matches!(option_paint, ValueType::Str),
+        "Option<PathBuf> is not a nullable SomeString paint"
+    );
+    assert!(
+        matches!(pathbuf_paint, ValueType::Ref(_)),
+        "PathBuf itself stays Ref like a rust-heap String"
+    );
+    assert_eq!(
+        option_paint, pathbuf_paint,
+        "Option<PathBuf> value paint is the payload PathBuf's Ref"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        assert!(
+            lowering.tyref_is_niche_option_ptr(&option_pathbuf),
+            "Option<PathBuf> is the rpath.py s_Str0 string niche"
+        );
+        assert!(
+            matches!(
+                lowering.option_niche_null_cast(&option_pathbuf),
+                Some((_, ValueType::Ref(_)))
+            ),
+            "Option<PathBuf> None is a null Ref"
+        );
+        assert!(
+            !lowering.enum_payload_is_nullable_instance_ptr(&option_pathbuf),
+            "Option<PathBuf> is SomeString (`rstr.py` / `rpath.py` s_Str0), not a W_ROOT GC instance"
+        );
+        assert!(
+            lowering.tyref_is_niche_option_ptr(&option_os_string),
+            "Option<OsString> is the rpath.py s_Str0 string niche"
+        );
+        assert!(
+            !lowering.enum_payload_is_nullable_instance_ptr(&option_os_string),
+            "Option<OsString> is SomeString, not a W_ROOT GC instance"
+        );
+        assert!(
+            !lowering.tyref_is_niche_option_ptr(&option_lookalike),
+            "Option<other::PathBuf> stays a tagged aggregate"
+        );
+    });
+    let empty_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty_raw: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let stamp = super::tyref_niche_option_gc_payload_spelling(
+        &option_pathbuf,
+        &llbc,
+        &empty_ids,
+        &empty_raw,
+    );
+    assert!(
+        stamp.as_deref().is_some_and(|s| s.contains("PathBuf")),
+        "Option<PathBuf> intern stamp is Option<PathBuf>, got {stamp:?}"
+    );
 }
 
 /// `<Option<String> as PartialEq>::eq` operands are `&Option<String>`.

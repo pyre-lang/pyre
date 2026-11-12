@@ -4015,6 +4015,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Vec<")
         && !ty.starts_with("Option<")
         && !is_rust_heap_string_root(ty)
+        && !is_os_path_family_root(ty)
     {
         format!("&{ty}")
     } else {
@@ -4063,6 +4064,10 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
         s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
+        // `rpath.py` `_posix_rnormpath` `s_Str0`: the same owned-header
+        // `Ref` paint as rust-heap `String` so `ll_strconcat` does not
+        // consume `{cap, ptr, len}`.
+        s if is_os_path_family_root(s) => ValueType::Ref(Some(s.into())),
         s if is_rstr_str_family_spelling(s) => ValueType::Str,
         _ => {
             if majit_ir::descr::is_shared_u8_slice_spelling(type_name)
@@ -7558,14 +7563,14 @@ pub(crate) use self::lltype::{
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
+    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr,
+    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
+    strip_crate_prefix, struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

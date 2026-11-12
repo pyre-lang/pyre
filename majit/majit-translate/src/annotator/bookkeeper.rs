@@ -5486,6 +5486,14 @@ impl Bookkeeper {
                 )
                 .unwrap_or_else(|| panic!("scalar_lltype({stripped})"));
             }
+            // `newtype_oparg!` wrappers are `#[repr(transparent)] struct
+            // Name(u32)` (`OpArg`, `ConstIdx`, `LoadAttr`, …). Interning
+            // the name as a Ptr struct made `Result<ConstIdx, Never>::Ok`
+            // `__pos_0` fail to union with the Integer `Into<ConstIdx>`
+            // result (`core::convert` `TryFrom` blanket `Ok(U::into(value))`).
+            _ if crate::front::mir::is_oparg_newtype_spelling(stripped) => {
+                return super::model::s_uint();
+            }
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
             "bool" => return super::model::s_bool(),
@@ -7656,6 +7664,9 @@ fn fn_ptr_arg_lltype(
         "str" | "String" | "Wtf8" | "Wtf8Buf" => {
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
         }
+        other if crate::front::mir::is_os_path_family_root(other) => {
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
+        }
         "StringBuilder" => {
             crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDERPTR.clone()
         }
@@ -7700,6 +7711,7 @@ fn fn_ptr_result_lltype(
         "f32" => ValueType::SingleFloat,
         "f64" => ValueType::Float,
         "str" | "String" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
+        other if crate::front::mir::is_os_path_family_root(other) => ValueType::Str,
         "StringBuilder" => ValueType::StringBuilder,
         other if is_fn_type_spelling(other) => ValueType::Int,
         _ => ValueType::Ref(None),
@@ -9048,6 +9060,7 @@ mod tests {
     #[test]
     fn fn_ptr_result_lltype_follows_callee_return_valuetype() {
         use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         use crate::translator::rtyper::rclass::OBJECTPTR;
 
         let math = fn_ptr_somevalue_for_spelling("fn(f64) -> Result<f64, MathError>")
@@ -9131,6 +9144,41 @@ mod tests {
                 .result,
             OBJECTPTR.clone(),
             "the carrier predicate does not treat a sum as the carrier"
+        );
+
+        for spelling in [
+            "fn() -> PathBuf",
+            "fn() -> path::PathBuf",
+            "fn() -> std::path::PathBuf",
+            "fn() -> OsString",
+            "fn() -> std::ffi::OsString",
+        ] {
+            let s = fn_ptr_somevalue_for_spelling(spelling)
+                .unwrap_or_else(|| panic!("{spelling}: fn-pointer spelling"));
+            let SomeValue::Ptr(p) = &s else {
+                panic!("{spelling}: must seed SomePtr, got {s:?}");
+            };
+            assert_eq!(
+                p.ll_ptrtype.TO,
+                PtrTarget::Func(FuncType {
+                    args: vec![],
+                    result: STRPTR.clone(),
+                }),
+                "{spelling}: FUNC.RESULT is STRPTR (`rpath.py` s_Str0 / `rstr.py` one string type)"
+            );
+        }
+        let arg = fn_ptr_somevalue_for_spelling("fn(path::PathBuf) -> ()")
+            .expect("PathBuf arg spelling is a fn pointer");
+        let SomeValue::Ptr(p_arg) = &arg else {
+            panic!("PathBuf arg must seed SomePtr, got {arg:?}");
+        };
+        assert_eq!(
+            p_arg.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![STRPTR.clone()],
+                result: LowLevelType::Void,
+            }),
+            "PathBuf arg is STRPTR (`rpath.py` s_Str0)"
         );
     }
 
@@ -9266,6 +9314,55 @@ mod tests {
             bk.project_struct_field_type("other::LowlevelStringHeader"),
             crate::annotator::model::s_str0(),
             "an unrelated LowlevelStringHeader declaration is not rstr STR"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_os_path_family_is_s_str0() {
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("path::PathBuf"),
+            crate::annotator::model::s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("ffi::OsString"),
+            crate::annotator::model::s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("PathBuf"),
+            crate::annotator::model::s_str0()
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::PathBuf"),
+            crate::annotator::model::s_str0(),
+            "an unrelated PathBuf declaration is not rpath.py s_Str0"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::OsString"),
+            crate::annotator::model::s_str0(),
+            "an unrelated OsString declaration is not rpath.py s_Str0"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_oparg_newtype_is_s_uint() {
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("bytecode::oparg::ConstIdx"),
+            crate::annotator::model::s_uint()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("LoadAttr"),
+            crate::annotator::model::s_uint()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("ConstIdx"),
+            crate::annotator::model::s_uint()
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::ConstIdx"),
+            crate::annotator::model::s_uint(),
+            "an unrelated ConstIdx declaration is not a newtype_oparg! wrapper"
         );
     }
 

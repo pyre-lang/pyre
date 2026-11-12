@@ -2282,6 +2282,23 @@ impl<'a> Lowering<'a> {
         self.callee_template_is(reg, "core::convert::<Impl>::into")
     }
 
+    /// The callee is `From::from`: a `CallKind::Trait` on
+    /// `core::convert::From`, or a FunDecl whose leaf is `from`.
+    /// Combined with a string/path-family source and dest this is the
+    /// annotation identity the blanket `Into::into` body (`U::from(self)`)
+    /// lowers to when the selected `From` impl is Opaque.
+    pub(in crate::front::mir) fn callee_is_from_from(&self, reg: &RegularCall) -> bool {
+        match &reg.kind {
+            CallKind::Trait(v) => trait_payload_path_and_method(v, self.llbc)
+                .is_some_and(|(path, method)| path == "core::convert::From" && method == "from"),
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("from")),
+            _ => false,
+        }
+    }
+
     /// The callee's declaration is named `path`, read off its template name
     /// so a monomorphized instance matches like the generic item.
     pub(in crate::front::mir) fn callee_template_is(&self, reg: &RegularCall, path: &str) -> bool {
@@ -2353,23 +2370,42 @@ impl<'a> Lowering<'a> {
     ///
     /// A monomorphized caller names the selected impl instead: the
     /// blanket `core::convert::<Impl>::into` instance, which is the same
-    /// conversion.
+    /// conversion.  That body is `U::from(self)`; when the selected
+    /// `From` is Opaque (`From<&str> for String`, `From<String> for
+    /// PathBuf`) the inner call residualizes as `["From", "from"]` and
+    /// takes the same alias when source and dest are both string- or
+    /// os-path-family (`rpath.py` `s_Str0`). `From<Vec<u8>> for OsString`
+    /// keeps the Call.
     pub(in crate::front::mir) fn trait_into_string_alias(
         &self,
         reg: &RegularCall,
         segments: &[String],
         args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let spelled_trait =
+        let spelled_into =
             matches!(segments, [trait_seg, leaf] if trait_seg == "Into" && leaf == "into");
-        if !spelled_trait && !self.callee_is_blanket_into(reg) {
+        let spelled_from =
+            matches!(segments, [trait_seg, leaf] if trait_seg == "From" && leaf == "from");
+        let from_call = spelled_from || self.callee_is_from_from(reg);
+        let into_call = spelled_into || self.callee_is_blanket_into(reg);
+        if !from_call && !into_call {
             return None;
         }
         let [arg] = args else {
             return None;
         };
-        tyref_is_string_family(dest_ty, self.llbc).then(|| arg.clone())
+        if !tyref_is_string_or_os_path_family(dest_ty, self.llbc) {
+            return None;
+        }
+        if from_call || tyref_is_os_path_family(dest_ty, self.llbc) {
+            let src = first_arg_ty?;
+            if !tyref_is_string_or_os_path_family(src, self.llbc) {
+                return None;
+            }
+        }
+        Some(arg.clone())
     }
 
     /// Resolve the WTF-8 string wrappers `Wtf8::new(&str) -> &Wtf8` and

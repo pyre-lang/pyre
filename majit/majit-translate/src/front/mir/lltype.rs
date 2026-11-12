@@ -3200,8 +3200,11 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // A Rust-heap `String` is a `{cap, ptr, len}` header, not rstr `STR`
     // (`{hash, chars}`). Painting it `ValueType::Str` makes `ll_str` identity
     // and `pair(StringRepr, StringRepr).rtype_add` → `ll_strconcat` consume
-    // that header as a GC string.
-    if tyref_is_rust_heap_string(ty, llbc) {
+    // that header as a GC string. `PathBuf` / `OsString` intern as `s_Str0`
+    // (`rpath.py` `_posix_rnormpath`) and take the same `Ref` paint so the
+    // owned header is not concatenated; `valuetype_to_someshell` shells the
+    // str-family class root as `SomeString`.
+    if tyref_is_rust_heap_string(ty, llbc) || tyref_is_os_path_family(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }
     if tyref_is_u8_window(ty, llbc) {
@@ -5349,7 +5352,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // `Ref` so `ll_strconcat` does not consume a `{cap, ptr, len}`
     // header. `valuetype_to_someshell` shells that Ref as `SomeString`
     // with `no_nul=False` (`annotator/model.py` `SomeString`).
-    if tyref_is_rust_heap_string(ty, llbc) {
+    // `PathBuf` / `OsString` is the same intern (`rpath.py`
+    // `_posix_rnormpath` `s_Str0`) and the same `Ref` paint.
+    if tyref_is_rust_heap_string(ty, llbc) || tyref_is_os_path_family(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }
     if tyref_is_u8_window(ty, llbc) {
@@ -5652,6 +5657,34 @@ pub(crate) fn is_str_family_class_root(root: &str) -> bool {
         || STR_FAMILY_DECLARED_PATHS.contains(&root)
         || is_rust_heap_string_root(root)
         || root == "str"
+        || is_os_path_family_root(root)
+}
+
+/// Class-root / TypeDecl spelling of std `Path` / `PathBuf` / `OsStr` /
+/// `OsString`.
+///
+/// `rpath.py` `_posix_rnormpath` annotates path values as `s_Str0`; the
+/// translator has one string type (`rstr.py`), so these project as
+/// `SomeString`. A lookalike (`other::PathBuf`) is not this family: after
+/// stripping `std` / `alloc` / `core`, the first remaining module must be
+/// a std path/ffi owner, or the spelling is the bare leaf.
+pub(crate) fn is_os_path_family_root(root: &str) -> bool {
+    let leaf = root.rsplit("::").next().unwrap_or(root);
+    if !matches!(leaf, "PathBuf" | "Path" | "OsString" | "OsStr") {
+        return false;
+    }
+    if root == leaf {
+        return true;
+    }
+    let stripped = root
+        .strip_prefix("std::")
+        .or_else(|| root.strip_prefix("alloc::"))
+        .or_else(|| root.strip_prefix("core::"))
+        .unwrap_or(root);
+    matches!(
+        stripped.split("::").next().unwrap_or(""),
+        "path" | "ffi" | "sys" | "sys_common" | "os_str"
+    )
 }
 
 /// A `*const T` / `*mut T` whose pointee is [`is_str_family_class_root`].
@@ -5965,7 +5998,10 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
         }
     }
     let option_of = format!("Option<{inner}>");
-    let str_family = tyref_is_string_family(&payload, llbc)
+    // `rpath.py` `_posix_rnormpath` annotates path values as `s_Str0`;
+    // intern of `Option<PathBuf>` is `SomeString.noneify`, the same
+    // stamp as `Option<String>`.
+    let str_family = tyref_is_string_or_os_path_family(&payload, llbc)
         || tyref_is_option_of_string_value(option_ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(&payload, llbc)
         || tyref_raw_ptr_to_str_family_spelling(&payload, llbc).is_some();
@@ -6193,6 +6229,25 @@ pub(in crate::front::mir) fn wtf8_string_identity_segments(segments: &[String]) 
 /// consume a `{cap, ptr, len}` header.
 pub(in crate::front::mir) fn tyref_is_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_string_value(ty, llbc) || tyref_is_rust_heap_string(ty, llbc)
+}
+
+/// `Path` / `PathBuf` / `OsStr` / `OsString` behind the usual wrappers.
+///
+/// Kept out of [`tyref_is_string_family`] so `PathBuf::deref` → `&Path`
+/// is not the string-family identity alias; `From` / `Into` between this
+/// family and a string-family value is identity at annotation
+/// (`rpath.py` `s_Str0`).
+pub(in crate::front::mir) fn tyref_is_os_path_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|p| is_os_path_family_root(&p))
+}
+
+/// String-family or os-path-family: the annotation identity `From` /
+/// `Into` uses, and the `Option` payload that intern's as a nullable
+/// string (`rstr.py` one string type; `rpath.py` `_posix_rnormpath`
+/// `s_Str0`). Kept as a union of the two family predicates so
+/// `PathBuf::deref` stays out of [`tyref_is_string_family`].
+pub(in crate::front::mir) fn tyref_is_string_or_os_path_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_string_family(ty, llbc) || tyref_is_os_path_family(ty, llbc)
 }
 
 /// Whether a `TyRef` resolves (behind the usual wrappers) to `rstring.py`'s
@@ -8137,6 +8192,50 @@ pub(in crate::front::mir) fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
     )
 }
 
+/// Field-type spelling of a `newtype_oparg!` transparent `u32` wrapper.
+///
+/// [`tyref_is_oparg`] is the `TyRef` form. The annotator's
+/// `project_struct_field_type` sees the AST string
+/// (`bytecode::oparg::ConstIdx`) and must return `s_uint()` so
+/// `Result<ConstIdx, Infallible>::Ok.__pos_0` unions with the Integer
+/// `Into<ConstIdx>` result (`core::convert` `TryFrom` blanket
+/// `Ok(U::into(value))`). A lookalike (`other::ConstIdx`) keeps the
+/// named-struct intern.
+pub(crate) fn is_oparg_newtype_spelling(ty: &str) -> bool {
+    let t = ty
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    let t = t
+        .strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+        .unwrap_or(t)
+        .trim();
+    let leaf = if let Some(rest) = t.strip_prefix("rustpython_compiler_core::bytecode::oparg::") {
+        rest
+    } else if let Some(rest) = t.strip_prefix("bytecode::oparg::") {
+        rest
+    } else if let Some(rest) = t.strip_prefix("oparg::") {
+        rest
+    } else if !t.contains("::") {
+        t
+    } else {
+        return false;
+    };
+    matches!(
+        leaf,
+        "OpArg"
+            | "ConstIdx"
+            | "VarNum"
+            | "VarNums"
+            | "LoadAttr"
+            | "LoadSuperAttr"
+            | "Label"
+            | "ResumeContext"
+    )
+}
+
 /// The ADT def_id of an (already wrapper-stripped) type node, or
 /// `None` for non-ADT nodes.
 pub(in crate::front::mir) fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
@@ -9355,12 +9454,16 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
 }
 
 /// Paint of a niche `Option<P>` whose payload is a rust-heap `String`,
-/// a nullable list, or a storage-raw struct borrow.
+/// an os-path (`PathBuf` / `OsString`), a nullable list, or a
+/// storage-raw struct borrow.
 ///
 /// The niche is one pointer word: `Some` is the payload, `None` is null.
 /// `annotator/model.py` `SomeInstance(can_be_None=True)` / `SomePtr`
 /// nullable uses the payload's paint, so this Option intern's as that
 /// `Ref` made nullable rather than as the `Option<String>` enum class.
+/// `PathBuf` is the same `Ref` paint as rust-heap `String` so
+/// `ll_strconcat` does not consume a three-word header; intern of the
+/// class root is still `s_Str0` (`rpath.py` `_posix_rnormpath`).
 /// A storage-raw struct borrow is the int-bank `SomePtr` (`history.py`
 /// `getkind` of `Ptr(TO)` when `TO._gckind == raw`).
 pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
@@ -9372,7 +9475,7 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
         return None;
     }
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
-    if tyref_is_rust_heap_string(&payload, llbc) {
+    if tyref_is_rust_heap_string(&payload, llbc) || tyref_is_os_path_family(&payload, llbc) {
         return Some(ValueType::Ref(tyref_class_root_with(
             &payload, llbc, tombstoned,
         )));
@@ -9598,8 +9701,14 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     // the null `STR` pointer (`StringRepr.convert_const(None)`), `Some`
     // is the string itself. `Option<&Wtf8>` and `Option<Wtf8Buf>` are the same
     // set. A rust-heap `String` is not this set; it is niched by the
-    // [`tyref_is_string_family`] arm below.
-    if tyref_is_option_of_string_value(ty, llbc) {
+    // [`tyref_is_string_family`] arm below. `PathBuf` / `OsString` /
+    // `Path` / `OsStr` are `rpath.py` `s_Str0` (`_posix_rnormpath`);
+    // their `Option` is that same nullable string, not a tagged
+    // `__discriminant` aggregate.
+    if tyref_is_option_of_string_value(ty, llbc)
+        || crate::front::result_exc::tyref_option_payload(ty, llbc)
+            .is_some_and(|payload| tyref_is_os_path_family(&payload, llbc))
+    {
         return true;
     }
     // Shared `&[PyObjectRef]` / Charon's `Option<[PyObject]>` spelling
@@ -9796,7 +9905,9 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
     // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
     // there is no `__discriminant` / `__pos_0` field.
-    if tyref_is_string_family(&TyRef::Other(payload.clone()), llbc) {
+    // `Option<PathBuf>` is that same projection (`rpath.py`
+    // `_posix_rnormpath` `s_Str0`).
+    if tyref_is_string_or_os_path_family(&TyRef::Other(payload.clone()), llbc) {
         return true;
     }
     let Some(def_id) = adt_node_def_id(payload) else {

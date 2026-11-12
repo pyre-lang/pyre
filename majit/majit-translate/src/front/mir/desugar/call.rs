@@ -1364,6 +1364,11 @@ impl<'a> Lowering<'a> {
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
+                        || self.from_string_path_identity(
+                            &reg,
+                            first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                            &call.dest.ty,
+                        )
                         || self.is_noop_ptr_cast(&reg)
                         || self.is_raw_ptr_as_ref(&reg)
                         || self.is_reflexive_into_iter(&reg)
@@ -6556,7 +6561,15 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         )
                     })
-                    .or_else(|| self.trait_into_string_alias(&reg, &segments, &args, &call.dest.ty))
+                    .or_else(|| {
+                        self.trait_into_string_alias(
+                            &reg,
+                            &segments,
+                            &args,
+                            first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                            &call.dest.ty,
+                        )
+                    })
                     .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
                     .or_else(|| {
                         self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
