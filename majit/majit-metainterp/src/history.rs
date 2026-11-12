@@ -9,6 +9,7 @@ use majit_backend::JitCellToken;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 /// `[funcbox] + argboxes` for residual-call recording. Eight OpRefs stay
@@ -115,6 +116,15 @@ pub struct TargetToken {
     attrs: Mutex<TargetTokenAttrs>,
 }
 
+/// MiniMark write barrier on a TargetToken traced-field store: every store
+/// bumps the epoch; each MetaInterp's minor root walk scans its token graphs
+/// when the epoch moved since its last walk (`old_objects_pointing_to_young`).
+static TARGET_TOKEN_STORE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn target_token_store_epoch() -> u64 {
+    TARGET_TOKEN_STORE_EPOCH.load(Ordering::Acquire)
+}
+
 // `VirtualState` / `ShortPreamble` hold `Rc` operands. The token is only
 // touched by the single JIT compile/execute thread, like the `Rc`-carrying
 // resume payload on `ResumeGuardDescr`.
@@ -163,6 +173,7 @@ impl TargetToken {
     /// Mirror MiniMark's write barrier after replacing a traced field.
     pub(crate) fn mark_minor_scan_pending(&self) {
         self.attrs.lock().minor_scan_pending = true;
+        TARGET_TOKEN_STORE_EPOCH.fetch_add(1, Ordering::Release);
     }
 
     /// `compile.py compile_simple_loop` / `compile_loop` /

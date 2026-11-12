@@ -2291,6 +2291,8 @@ pub struct MetaInterp<M: Clone> {
     /// `ResumeGuardDescr.rd_consts` pools enter MiniMark's remembered set
     /// through `remember_const_pool` instead.
     compiled_graph_minor_scan_pending: bool,
+    /// Last process-global `target_token_store_epoch` this walker consumed.
+    seen_target_token_store_epoch: u64,
     /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
     /// six Vec capacities on the pooled interpreter; exits that never enter
@@ -3800,8 +3802,14 @@ impl<M: Clone> MetaInterp<M> {
         // not traverse the complete old object graph to inspect each owner's
         // dirty flag. `compiled_graph_minor_scan_pending` is the off-GC owner
         // bit for TargetToken graphs, armed at every compilation boundary.
-        let scan_compiled_graph =
-            !is_minor || std::mem::take(&mut self.compiled_graph_minor_scan_pending);
+        // A TargetToken traced-field store also arms the walk: it bumps the
+        // process-global store epoch, and this MetaInterp scans when the
+        // epoch moved since its last walk.
+        let epoch = crate::history::target_token_store_epoch();
+        let token_store_seen = epoch != self.seen_target_token_store_epoch;
+        self.seen_target_token_store_epoch = epoch;
+        let scan_compiled_graph = !is_minor
+            || std::mem::take(&mut self.compiled_graph_minor_scan_pending) | token_store_seen;
         if scan_compiled_graph {
             let tokens = self.live_jitcell_tokens();
             if !is_minor {
@@ -4630,6 +4638,7 @@ impl<M: Clone> MetaInterp<M> {
             backend: Box::new(BackendImpl::new()),
             next_global_opref: 0,
             compiled_graph_minor_scan_pending: true,
+            seen_target_token_store_epoch: 0,
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             blackhole_terminal_scratch: None,
             tracing: None,
@@ -31812,6 +31821,38 @@ mod tests {
             seen,
             vec![0x8f_0000_5000],
             "in-flight UnrollOptimizer.target_tokens are roots before the cell holds the token"
+        );
+    }
+
+    /// A TargetToken traced-field store arms the next minor walk even when
+    /// the MetaInterp owner bit was already consumed
+    /// (`old_objects_pointing_to_young`).
+    #[test]
+    fn walk_rd_consts_refs_visits_token_store_after_owner_bit_consumed() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let tt = crate::history::TargetToken::new_loop(16);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x8e_0000_6000)));
+        tt.attrs().short_preamble = Some(sp);
+
+        let token = std::sync::Arc::new(JitCellToken::new(16));
+        token.set_target_tokens(vec![tt.as_jump_target_descr()]);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.memory_manager.keep_loop_alive(&token);
+        meta.compiled_graph_minor_scan_pending = false;
+        tt.mark_minor_scan_pending();
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x8e_0000_6000],
+            "a token store after the owner bit was consumed is still a minor root"
         );
     }
 

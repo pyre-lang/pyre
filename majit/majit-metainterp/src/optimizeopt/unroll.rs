@@ -3845,6 +3845,10 @@ impl OptUnroll {
             attrs.virtual_state = Some(virtual_state);
             attrs.short_preamble = Some(short_preamble);
         }
+        // `history.TargetToken.virtual_state` / `short_preamble` are traced
+        // GC fields upstream, so this replacement invokes the MiniMark write
+        // barrier.
+        target_token.mark_minor_scan_pending();
         let short_preamble_producer = short_preamble_builder.map(|builder| {
             crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(
                 target_token.as_jump_target_descr(),
