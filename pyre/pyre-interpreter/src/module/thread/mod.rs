@@ -1036,18 +1036,6 @@ mod lock_class {
             Ok(obj)
         }
 
-        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
-        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
-        #[majit_macros::dont_look_inside]
-        fn acquire_timed(&self, microseconds: i64) -> i64 {
-            // A potentially blocking native lock wait leaves the collector's
-            // RUNNING census.  This does not serialize Python execution.  The
-            // guard ends with the primitive, so the signal handlers the caller
-            // runs on `RPY_LOCK_INTR` execute back inside the census.
-            let _blocked = before_external_block();
-            self.lock.acquire_timed(microseconds, true)
-        }
-
         /// `os_lock.py descr_lock_acquire`.
         fn acquire(
             &self,
@@ -1068,6 +1056,23 @@ mod lock_class {
 
         fn locked(&self) -> bool {
             self.lock.is_locked()
+        }
+
+        // Obsolete synonyms (`os_lock.py Lock.typedef`).
+        fn acquire_lock(
+            &self,
+            #[default(1)] blocking: i64,
+            timeout: Option<PyObjectRef>,
+        ) -> Result<bool, crate::PyError> {
+            self.acquire(blocking, timeout)
+        }
+
+        fn release_lock(&self) -> Result<(), crate::PyError> {
+            self.release()
+        }
+
+        fn locked_lock(&self) -> bool {
+            self.locked()
         }
 
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -1093,6 +1098,20 @@ mod lock_class {
             // vanished at fork.  PyPy's rthread lock reinit replaces the native
             // lock without trying to acquire or destroy the inherited one.
             self.lock.reinit();
+        }
+    }
+
+    impl W_Lock {
+        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
+        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
+        #[majit_macros::dont_look_inside]
+        fn acquire_timed(&self, microseconds: i64) -> i64 {
+            // A potentially blocking native lock wait leaves the collector's
+            // RUNNING census.  This does not serialize Python execution.  The
+            // guard ends with the primitive, so the signal handlers the caller
+            // runs on `RPY_LOCK_INTR` execute back inside the census.
+            let _blocked = before_external_block();
+            self.lock.acquire_timed(microseconds, true)
         }
     }
 }
@@ -1173,14 +1192,6 @@ mod rlock_class {
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             rlock_new(cls, args.len() > 1, false)
-        }
-
-        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
-        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
-        #[majit_macros::dont_look_inside]
-        fn acquire_timed(&self, microseconds: i64) -> i64 {
-            let _blocked = before_external_block();
-            self.lock.acquire_timed(microseconds, true)
         }
 
         /// `os_lock.py acquire_w`.
@@ -1318,6 +1329,14 @@ mod rlock_class {
     }
 
     impl W_RLock {
+        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
+        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
+        #[majit_macros::dont_look_inside]
+        fn acquire_timed(&self, microseconds: i64) -> i64 {
+            let _blocked = before_external_block();
+            self.lock.acquire_timed(microseconds, true)
+        }
+
         /// `rthread.py Lock.acquire(True)` / `RPyThreadAcquireLock` (`intr_flag=0`).
         #[majit_macros::dont_look_inside]
         fn acquire_restore_wait(&self) -> i64 {
