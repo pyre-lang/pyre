@@ -3960,7 +3960,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         );
         let expected = ctx.trace_ctx.const_ref(callable as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[r_args[0], expected], 0);
+            .record_guard(OpCode::GuardValue, &[r_args[0], expected]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
@@ -4341,7 +4341,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the snapshot (`virtualref_boxes`).
     ctx.trace_ctx
         .track_recorded_virtual_ref(callee_frame, callee_vref);
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     if let Err(err) = walker_capture_snapshot_for_last_guard(ctx, op.pc) {
         ctx.trace_ctx.finish_recorded_virtual_ref(false, false);
         return Err(err);
@@ -4392,7 +4392,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `residual_call_catch_resume` is the same request the residual
     // `call_fn` path makes: a CALL inside a `try` deopts at the call's
     // own `catch_exception`, not the fallthrough opcode.
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard_scoped(
         ctx,
         op.pc,
@@ -5095,7 +5095,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         ..Default::default()
     };
 
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     // `execute_frame`'s `finally: executioncontext.leave(...)` after
     // `do_recursive_call(assembler_call=True)` returns (`opimpl_jit_merge_point`).
     // Snapshot first so this GUARD_NOT_FORCED keeps a resume position
@@ -5143,7 +5143,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             raised: Some((exc, exc_concrete)),
         }));
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope.clone())?;
 
     if record_init_none_check {
@@ -5194,7 +5194,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 raised: Some((exc_box, exc_concrete)),
             }));
         }
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
         // Compiled leftover only: a force resumes through the tail's
         // `ref_return` instead. `write_ref_reg` updates the walk banks so
@@ -7889,7 +7889,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         );
         let expected = ctx.trace_ctx.const_ref(live_callable() as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
+            .record_guard(OpCode::GuardValue, &[callable_guard_op, expected]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
@@ -8975,7 +8975,7 @@ fn walker_guard_function_field<Sym: WalkSym>(
     );
     let expected_op = ctx.trace_ctx.const_ref(expected);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[field_op, expected_op], 0);
+        .record_guard(OpCode::GuardValue, &[field_op, expected_op]);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     ctx.trace_ctx
         .heap_cache_mut()
@@ -10427,7 +10427,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     pinned_obj(callable_guard_value_pin, callable_guard_value) as usize as i64
                 );
             ctx.trace_ctx
-                .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
+                .record_guard(OpCode::GuardValue, &[callable_guard_op, expected]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         // Pinning the operand pins none of the callee's fields, and this inline
@@ -10657,7 +10657,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .trace_ctx
                 .const_ref(pinned_obj(&defaults_tuple_pin, defaults.tuple) as i64);
             ctx.trace_ctx
-                .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
+                .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
 
@@ -14011,7 +14011,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         let str_type = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
         let str_type_const = ctx.trace_ctx.const_int(str_type);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[result, str_type_const], 0);
+            .record_guard(OpCode::GuardClass, &[result, str_type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(result);
     }
@@ -17014,7 +17014,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
                     op.next_pc,
                 )));
             }
-            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             ctx.frame_state.borrow_mut().vstack_last_ref = result_op;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
@@ -17106,7 +17106,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
         let type_const = ctx.trace_ctx.const_int(iter_layout);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     ctx.trace_ctx.heap_cache_mut().class_now_known(iter_op);
@@ -17715,7 +17715,7 @@ fn descend_generatorentry<Sym: WalkSym>(
             .trace_ctx
             .const_int(unsafe { (*iter_obj).ob_type } as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         let pycode_descr = crate::descr::gc_cached_field_descr(
             "generator::GeneratorIterator",
@@ -17738,7 +17738,7 @@ fn descend_generatorentry<Sym: WalkSym>(
         );
         let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const], 0);
+            .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
@@ -17833,7 +17833,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     }
     ctx.live_after_jit_pc = op.next_pc;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     // `direct_assembler_call` keeps the assembler target alive between
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
@@ -17858,7 +17858,7 @@ fn descend_generatorentry<Sym: WalkSym>(
             op.next_pc,
         )));
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -18350,7 +18350,7 @@ pub(crate) fn record_send_ex_frame_nonnull_guard<Sym: WalkSym>(
         return Ok(());
     }
     ctx.trace_ctx
-        .record_guard(OpCode::GuardNonnull, &[frame_box], 0);
+        .record_guard(OpCode::GuardNonnull, &[frame_box]);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
@@ -18395,7 +18395,7 @@ pub(crate) fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     } else {
         OpCode::GuardFalse
     };
-    ctx.trace_ctx.record_guard(opcode, &[finished_bits], 0);
+    ctx.trace_ctx.record_guard(opcode, &[finished_bits]);
 
     super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut caller_parent);
     super::resume_snapshot::refresh_paused_parent_blackhole(&mut caller_parent);
@@ -18732,7 +18732,7 @@ fn walk_generator_resume<Sym: WalkSym>(
             .trace_ctx
             .const_int(unsafe { (*iter_obj).ob_type } as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         // `send_ex` reads the immutable `self.pycode` that
         // `generatorentry_driver.jit_merge_point` takes as its green.
@@ -18761,7 +18761,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         );
         let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const], 0);
+            .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
@@ -18813,7 +18813,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     if !last_instr_box.is_constant() {
         let expected = ctx.trace_ctx.const_int(shape.last_instr as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[last_instr_box, expected], 0);
+            .record_guard(OpCode::GuardValue, &[last_instr_box, expected]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
@@ -21590,7 +21590,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     }
     if emit_guard_not_forced {
         ctx.trace_ctx
-            .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
+            .record_guard(majit_ir::OpCode::GuardNotForced, &[]);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     // `pyjitpl.py handle_possible_exception`: a standing last_exc_value
@@ -21614,7 +21614,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     }
     if can_raise {
         ctx.trace_ctx
-            .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+            .record_guard(majit_ir::OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     Ok(InlineCallOutcome::residual(DispatchOutcome::SubReturn {

@@ -267,7 +267,7 @@ impl<'frame, 'static_a: 'frame, Sym: crate::state::WalkSym> WalkerFrameOps
         // (`pyjitpl.py MetaInterp.generate_guard`).
         self.trace_ctx
             .fill_virtualizable_boxes_to_declared_layout(None);
-        self.trace_ctx.record_guard(opcode, args, 0);
+        self.trace_ctx.record_guard(opcode, args);
         // `walker_capture_snapshot_for_last_guard` returns a typed abort
         // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the
         // full-body walk routes through `DispatchError`. The `()` trait

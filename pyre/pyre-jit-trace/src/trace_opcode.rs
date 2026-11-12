@@ -2636,7 +2636,7 @@ impl MIFrame {
         // no inline fail_args; `capture_resumedata` + `_number_boxes`
         // populate them from the snapshot chain. Types come from the
         // live boxes at `store_final_boxes` (`compile.py`).
-        ctx.record_guard(opcode, args, 0);
+        ctx.record_guard(opcode, args);
 
         // pyjitpl.py: self.capture_resumedata(resumepc, after_residual_call)
         self.capture_resumedata(

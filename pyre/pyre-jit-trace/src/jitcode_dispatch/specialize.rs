@@ -6115,7 +6115,7 @@ pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     } else {
         OpCode::GuardFalse
     };
-    ctx.trace_ctx.record_guard(guard, &[truth], 0);
+    ctx.trace_ctx.record_guard(guard, &[truth]);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     Ok(Some(walker_const_bool(ctx, observed)))
 }
@@ -13700,7 +13700,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                 forced_op,
                 majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
             );
-            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             // `VirtualRefFinish(vref, virtual)` immediately before the call is
             // the optimizer proof that `forced_op == virtual_op`.  Preserve
@@ -13894,9 +13894,9 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', cur_op)?;
     ctx.live_after_jit_pc = op.next_pc;
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some(DispatchOutcome::Continue))
 }
@@ -14274,7 +14274,7 @@ fn walker_guard_fold_callable<Sym: WalkSym>(
     }
     let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        .record_guard(OpCode::GuardValue, &[callable_op, expected]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx
         .heap_cache_mut()
@@ -14374,7 +14374,7 @@ fn walker_guard_fold_int<Sym: WalkSym>(
     }
     let expected = ctx.trace_ctx.const_int(value);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[op, expected], 0);
+        .record_guard(OpCode::GuardValue, &[op, expected]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     Ok(())
@@ -14476,7 +14476,7 @@ fn walker_guard_fold_class<Sym: WalkSym>(
     if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[obj, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
@@ -14526,7 +14526,7 @@ fn walker_guard_fold_class_if_unknown<Sym: WalkSym>(
     }
     let type_const = ctx.trace_ctx.const_int(type_addr);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        .record_guard(OpCode::GuardClass, &[obj, type_const]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     Ok(())
@@ -14678,7 +14678,7 @@ fn walker_guard_bound_method<Sym: WalkSym>(
     );
     let expected = ctx.trace_ctx.const_ref(inner_func as i64);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[func_ref, expected], 0);
+        .record_guard(OpCode::GuardValue, &[func_ref, expected]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx
         .heap_cache_mut()
@@ -16065,7 +16065,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[callable_op, type_const]);
         if !list_append_capture_guard(
             ctx,
             op.pc,
@@ -16085,7 +16085,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
+        .record_guard(OpCode::GuardValue, &[func_ref, func_const]);
     if !list_append_capture_guard(
         ctx,
         op.pc,

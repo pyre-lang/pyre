@@ -143,7 +143,7 @@
 //!       universally, needing the dynamic calldescr builder pyre lacks,
 //!       so it falls through to `direct_call_release_gil` /
 //!       `direct_call_may_force`.
-//!    e. Guard recording uses `ctx.trace_ctx.record_guard(..., 0)`
+//!    e. Guard recording uses `ctx.trace_ctx.record_guard(...)`
 //!       followed by `walker_capture_snapshot_for_last_guard`
 //!       (`jitcode_dispatch.rs:walker_capture_snapshot_for_last_guard`)
 //!       — the walker-side port of `capture_resumedata(
@@ -3214,7 +3214,7 @@ fn create_segmented_trace<Sym: WalkSym>(
     // (`jtransform.py handle_jit_marker__jit_merge_point` op2).
     ctx.trace_ctx
         .fill_virtualizable_boxes_to_declared_layout(None);
-    ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[]);
     let snapshot = if synthesized_python_opcode_boundary {
         walker_capture_segmented_python_opcode_guard(ctx, mp_opcode_pc)
     } else {
@@ -5050,9 +5050,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             ctx.trace_ctx
                 .heapcache_invalidate_caches_varargs(call_opcode, Some(&ei), &allboxes);
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }
@@ -5069,7 +5069,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     if recorded != OpRef::NONE {
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     // `direct_assembler_call` returns the target driver's virtualizable red
     // box; `do_residual_call` records `KEEPALIVE` on it after
@@ -5104,7 +5104,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             op.next_pc,
         )));
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -5346,7 +5346,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
         ctx.live_after_jit_pc = op.next_pc;
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     if raised {
         walker_record_guard_exception(ctx, op.pc)?;
@@ -5356,7 +5356,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
         let exc_concrete = ctx.last_exc_value_concrete();
         return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -7462,7 +7462,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
         if !valuebox.is_constant() {
             let expected = ctx.trace_ctx.const_int(search_value);
             ctx.trace_ctx
-                .record_guard(OpCode::GuardValue, &[valuebox, expected], 0);
+                .record_guard(OpCode::GuardValue, &[valuebox, expected]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             vable_ops::walker_replace_box(ctx, valuebox, expected);
         }
@@ -7495,7 +7495,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
                 ctx.trace_ctx
                     .set_opref_concrete(eqbox, majit_ir::Value::Int((v == key) as i64));
             }
-            ctx.trace_ctx.record_guard(OpCode::GuardFalse, &[eqbox], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardFalse, &[eqbox]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
     }
@@ -7641,7 +7641,7 @@ pub(crate) fn pin_nonconst_standing_exception_class<Sym: WalkSym>(
     };
     let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
     ctx.trace_ctx
-        .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+        .record_guard(OpCode::GuardClass, &[exc, cls_const]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx.heap_cache_mut().class_now_known(exc);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
@@ -7792,7 +7792,7 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     // pypy/objspace/std/celldict.py `elidable_promote('0,1,2')` promotes
     // `w_dict`; mirror that by pinning the runtime frame's w_globals identity.
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[w_globals_op, expected], 0);
+        .record_guard(OpCode::GuardValue, &[w_globals_op, expected]);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     vable_ops::walker_replace_box(ctx, w_globals_op, expected);
     Ok(true)
@@ -11184,7 +11184,7 @@ pub(crate) fn walker_record_guard_exception_scoped<Sym: WalkSym>(
     let exc_obj = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
-            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
             walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
             return Ok(());
         }
@@ -11212,7 +11212,7 @@ pub(crate) fn walker_record_guard_exception_scoped<Sym: WalkSym>(
     let exc_pin = residual_call::owner_root_if_gc(exc_obj as usize);
     let guard_op = ctx
         .trace_ctx
-        .record_guard(OpCode::GuardException, &[exc_type_const], 0);
+        .record_guard(OpCode::GuardException, &[exc_type_const]);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
     let exc_obj = exc_pin
         .as_ref()
@@ -11452,7 +11452,7 @@ fn direct_libffi_call<Sym: WalkSym>(
     if dst_bank != 'v' {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, recorded)?;
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     if ei.check_can_raise(false) {
         if resid_raised {
@@ -11466,7 +11466,7 @@ fn direct_libffi_call<Sym: WalkSym>(
                 exc_concrete,
             }));
         }
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     Ok(LibffiCallOutcome::Recorded)
@@ -11741,7 +11741,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // observed by the executor's vable token bracket above, surfacing as
     // `VableEscapedDuringResidualCall` (aborting the walk) before reaching
     // this guard.
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     // pyjitpl.py handle_possible_exception — emits GUARD_EXCEPTION
     // when the recording-time helper raised (then finishframe_exception:
@@ -11758,7 +11758,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
             let exc_concrete = ctx.last_exc_value_concrete();
             return Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }));
         }
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     Ok(None)
@@ -12509,7 +12509,7 @@ fn walker_unbox_long<Sym: WalkSym>(
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(long_type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[obj, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
@@ -12562,7 +12562,7 @@ fn walker_unbox_float<Sym: WalkSym>(
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(float_type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[obj, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
@@ -12727,7 +12727,7 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx
         .fill_virtualizable_boxes_to_declared_layout(None);
-    ctx.trace_ctx.record_guard(opcode, args, 0);
+    ctx.trace_ctx.record_guard(opcode, args);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
@@ -12858,7 +12858,7 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx
         .fill_virtualizable_boxes_to_declared_layout(None);
-    ctx.trace_ctx.record_guard(opcode, args, 0);
+    ctx.trace_ctx.record_guard(opcode, args);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
@@ -13026,7 +13026,7 @@ fn walker_guard_class<Sym: WalkSym>(
         }
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[obj, type_const]);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
@@ -14617,7 +14617,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // `goto_if_not` whose Python operand stack is also live (the
         // nested FOR_ITER iterators in `searches()`).  Capture below
         // reads those banks.
-        ctx.trace_ctx.record_guard(guard_opcode, guard_operands, 0);
+        ctx.trace_ctx.record_guard(guard_opcode, guard_operands);
         // `pyjitpl.py` `opimpl_goto_if_not` / `generate_guard(resumepc=orgpc)`.
         // Capture at the jump's `-live-` BEFORE (`ctx.live_before_jit_pc`)
         // so the snapshot boxes are the live set before `goto_if_not`
@@ -14768,7 +14768,7 @@ fn int_ovf_jump<Sym: WalkSym>(
     if resbox.is_constant() {
         branch_without_guard(op, ctx, taken_pc, result_write)
     } else {
-        ctx.trace_ctx.record_guard(guard_opcode, &[], 0);
+        ctx.trace_ctx.record_guard(guard_opcode, &[]);
         // `handle_possible_overflow_error` resumes at `orgpc`: unlike
         // `goto_if_not`, blackhole must re-execute the arithmetic opcode so
         // the no-overflow path writes its result register.
@@ -14992,7 +14992,7 @@ fn reached_loop_header<Sym: WalkSym>(
     // coordinate is the JitCode pc the walk is standing on. `next_instr` is
     // the Python green and names a different `-live-` marker.
     ctx.trace_ctx
-        .record_guard(OpCode::GuardFutureCondition, &[], 0);
+        .record_guard(OpCode::GuardFutureCondition, &[]);
     if ctx.is_authoritative_executor {
         walker_capture_snapshot_for_last_guard(ctx, snapshot_jit_pc)?;
     }
@@ -17898,7 +17898,7 @@ fn handle<Sym: WalkSym>(
                         };
                         let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
                         ctx.trace_ctx
-                            .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+                            .record_guard(OpCode::GuardClass, &[exc, cls_const]);
                         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
                         ctx.trace_ctx.heap_cache_mut().class_now_known(exc);
                     }

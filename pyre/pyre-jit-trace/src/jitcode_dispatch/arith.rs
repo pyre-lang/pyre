@@ -623,8 +623,7 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
 ///     at `value` to `expected`,
 ///     matching `dispatch_switch_id:1198-1202`.
 ///
-/// The `0` in `record_guard(..., 0)` is only `record_guard`'s `num_live`
-/// argument; a full production resume snapshot is attached on the next line
+/// A full production resume snapshot is attached on the next line
 /// via `walker_capture_snapshot_for_last_guard`.
 #[derive(Clone, Copy)]
 pub(crate) enum GuardValueBank {
@@ -687,7 +686,7 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
         _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
     };
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[value, expected], 0);
+        .record_guard(OpCode::GuardValue, &[value, expected]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     super::vable_ops::walker_replace_box(ctx, value, expected);
     Ok((DispatchOutcome::Continue, op.next_pc))

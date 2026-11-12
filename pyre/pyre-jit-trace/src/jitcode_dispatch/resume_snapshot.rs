@@ -3994,7 +3994,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
-    ctx.trace_ctx.record_guard(opcode, args, 0);
+    ctx.trace_ctx.record_guard(opcode, args);
     if opcode == OpCode::GuardClass
         && let Some(subject) = subject
     {

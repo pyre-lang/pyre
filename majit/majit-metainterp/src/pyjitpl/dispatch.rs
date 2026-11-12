@@ -2095,7 +2095,7 @@ where
         // list (or type list) to decide whether the frame snapshot exists.
         // `resume.py ResumeDataVirtualAdder.finish` derives the final failargs
         // from that snapshot after optimization.
-        let guard_op = ctx.record_guard_with_value(opcode, args, 0, value);
+        let guard_op = ctx.record_guard_with_value(opcode, args, value);
         self.publish_last_guard_resume_snapshot(
             ctx,
             sym,
@@ -6401,7 +6401,7 @@ pub fn implement_guard_value_on_frames(
         );
     }
     let promoted_box = ctx.const_int(runtime_value);
-    ctx.record_guard(OpCode::GuardValue, &[box_, promoted_box], 0);
+    ctx.record_guard(OpCode::GuardValue, &[box_, promoted_box]);
     let top_idx = frames.frames.len() - 1;
     let saved_top_pc = frames.frames[top_idx].pc;
     frames.frames[top_idx].pc = resume_pc;

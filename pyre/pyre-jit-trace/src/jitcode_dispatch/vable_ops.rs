@@ -1514,7 +1514,7 @@ pub(crate) fn walker_implement_guard_value<Sym: WalkSym>(
         _ => ctx.trace_ctx.const_int(runtime_value),
     };
     ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[box_, expected], 0);
+        .record_guard(OpCode::GuardValue, &[box_, expected]);
     // Full-body walks install `snapshot_sym` so `generate_guard` can
     // capture the live framestack. Unit fixtures leave it null; skip
     // the capture rather than abort the op.
