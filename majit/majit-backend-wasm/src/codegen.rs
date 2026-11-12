@@ -3580,12 +3580,46 @@ fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
     )
 }
 
+/// `CallDescr.create_call_stub` casts `func` to `lltype.Ptr(FUNC)` of the
+/// calldescr (`rffi.cast`). The word view is I64 for `'i'`/`'r'`, F64 for
+/// `'f'`, F32 for `'S'`. A table slot may be the wasm32-narrow twin
+/// (I32 pointer / usize, F32 float).
+fn valtype_word_convertible(expected: ValType, real: ValType) -> bool {
+    match expected {
+        ValType::I64 => matches!(real, ValType::I32 | ValType::I64),
+        ValType::F64 => matches!(real, ValType::F32 | ValType::F64),
+        other => other == real,
+    }
+}
+
+fn typed_sig_convertible(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+    if expected.0.len() != real.0.len() {
+        return false;
+    }
+    expected
+        .0
+        .iter()
+        .zip(real.0.iter())
+        .all(|(want, got)| valtype_word_convertible(*want, *got))
+        && match (expected.1, real.1) {
+            (None, None) => true,
+            (Some(want), Some(got)) => valtype_word_convertible(want, got),
+            _ => false,
+        }
+}
+
 /// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
-/// `get_result_size`. The descr is the call type. A constant callee whose
-/// table type differs keeps `jit_call`. An unknown table type keeps
-/// `jit_call` only when the host reflects table types (`host-import` on
-/// wasm32); everywhere else the descr FUNC is the type, the same call the
-/// native backends emit.
+/// `get_result_size`. The descr is the call type.
+///
+/// `CallDescr.create_call_stub` does `rffi.cast(lltype.Ptr(FUNC), func)`
+/// from that same FUNC, and `emit_raw_call` CALLs it. Wasm `call_indirect`
+/// type-checks the table slot, so a constant callee whose real table FUNC
+/// equals the descr, or is element-wise convertible from it, emits
+/// `call_indirect` of the real type and converts each argument (i64 word
+/// to i32 pointer, f64 to f32). An unknown table type keeps `jit_call`
+/// only when the host reflects table types (`host-import` on wasm32);
+/// everywhere else the descr FUNC is the type, the same call the native
+/// backends emit.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     func_arg: usize,
@@ -3602,15 +3636,17 @@ fn residual_callee_direct_emit_sig_at(
             let real_typed = wasm_sig_to_typed(&real);
             if real_typed == *expected {
                 Some(expected.clone())
+            } else if typed_sig_convertible(expected, &real_typed) {
+                Some(real_typed)
             } else {
                 // Native tests inject table types; the guest is where a
-                // missing `residual_word_addr` is a programming error.
+                // non-convertible table type is a programming error.
                 #[cfg(target_arch = "wasm32")]
-                debug_assert_eq!(
-                    real_typed, *expected,
-                    "residual callee table type differs from the calldescr FUNC; \
-                     publish the target through residual_word_addr \
-                     (descr.py create_call_stub, callbuilder.py emit_raw_call)"
+                debug_assert!(
+                    false,
+                    "residual callee table type {real_typed:?} is not convertible from the \
+                     calldescr FUNC {expected:?} (descr.py create_call_stub, \
+                     callbuilder.py emit_raw_call)"
                 );
                 None
             }
@@ -3685,7 +3721,8 @@ fn conditional_call_true_void_arity(op: &Op) -> Option<usize> {
 
 /// Descr-derived signature of a `COND_CALL` when the uniform word families
 /// do not already cover it. The callee sits at arg 1. A table type that
-/// differs from the descr is not emitted here.
+/// is element-wise convertible from the descr (i32 pointer, f32 float)
+/// is the emit type here; a non-convertible mismatch keeps the trampoline.
 fn conditional_call_typed_sig(op: &Op) -> Option<TypedResidualSig> {
     if !matches!(
         op.opcode,
@@ -4024,9 +4061,10 @@ fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
 /// and write barriers are direct when the call descr and the callee's table
-/// type agree. A `COND_CALL` whose descr does not establish that signature
-/// declines. A mismatch, a host import, and string allocation retain the
-/// trampoline for ordinary calls.
+/// type agree, or when the table type is element-wise convertible from the
+/// descr (`residual_call_typed_sig`). A `COND_CALL` whose descr does not
+/// establish that signature declines. A non-convertible mismatch, a host
+/// import, and string allocation retain the trampoline for ordinary calls.
 fn has_trampoline_calls(inputargs: &[InputArgRc], ops: &[Op], emit_ca: bool) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     ops.iter().any(|op| match op.opcode {

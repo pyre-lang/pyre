@@ -10583,10 +10583,10 @@ fn cond_call_n_emits_predicate_and_direct_call() {
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
-/// A COND_CALL whose table type is i32 does not match the descr word.
-/// The direct `call_indirect` type is the descr's; this callee stays on `jit_call`.
+/// A COND_CALL whose table type is i32 is convertible from the descr word.
+/// `conditional_call_typed_sig` emits `call_indirect` of the real type.
 #[test]
-fn cond_call_n_i32_arg_keeps_trampoline() {
+fn cond_call_n_i32_arg_is_called_in_module() {
     use majit_ir::descr::SimpleCallDescr;
     use std::sync::Arc;
 
@@ -10619,25 +10619,33 @@ fn cond_call_n_i32_arg_keeps_trampoline() {
         ];
         let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
-        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-        assert!(indirect_calls.is_empty());
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (vec![wasmparser::ValType::I32], vec![])
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(op, wasmparser::Operator::I32WrapI64)),
+            1
+        );
     });
 }
 
-/// An i32 table result is not the descr word (`i64` / ref). Widening stays
-/// in the host hook; the trace does not `call_indirect` that callee.
+/// An i32 table result is convertible from the descr word. The emit widens
+/// with `i64.extend_i32_s` for a signed narrow Int and `_u` for Ref / unsigned.
 #[test]
-fn cond_call_value_i32_result_keeps_trampoline() {
+fn cond_call_value_i32_result_is_called_in_module() {
     use majit_ir::descr::SimpleCallDescr;
     use std::sync::Arc;
 
     let encoded =
         majit_backend_wasm::encode_func_sig(&[], Some(majit_backend_wasm::FuncSigVal::I32));
-    for (opcode, result_signed) in [
-        (OpCode::CondCallValueI, true),
-        (OpCode::CondCallValueI, false),
-        (OpCode::CondCallValueR, false),
+    for (opcode, result_signed, extend_s) in [
+        (OpCode::CondCallValueI, true, true),
+        (OpCode::CondCallValueI, false, false),
+        (OpCode::CondCallValueR, false, false),
     ] {
         with_table_sig(0x100, Some(encoded), || {
             let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
@@ -10666,9 +10674,26 @@ fn cond_call_value_i32_result_keeps_trampoline() {
             let ops = vec![call, Op::new(OpCode::Finish, &[rb(result)])];
             let (bytes, _) = build_module_default(&inputargs, &ops);
             validate_wasm(&bytes);
-            assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+            assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
             let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-            assert!(indirect_calls.is_empty());
+            assert_eq!(indirect_calls.len(), 1);
+            assert_eq!(
+                function_type(&bytes, indirect_calls[0].0 as usize),
+                (vec![], vec![wasmparser::ValType::I32])
+            );
+            let signed = count_ops(&bytes, |op| {
+                matches!(op, wasmparser::Operator::I64ExtendI32S)
+            });
+            let unsigned = count_ops(&bytes, |op| {
+                matches!(op, wasmparser::Operator::I64ExtendI32U)
+            });
+            if extend_s {
+                assert_eq!(signed, 1);
+                assert_eq!(unsigned, 0);
+            } else {
+                assert_eq!(signed, 0);
+                assert_eq!(unsigned, 1);
+            }
         });
     }
 }
@@ -12647,11 +12672,11 @@ fn with_table_sig(addr: i64, encoded: Option<i64>, body: impl FnOnce()) {
     body();
 }
 
-/// `descr.py` `create_call_stub`: the callee's FUNC is the calldescr's.
-/// An i32-narrowed table type is a missing `word_publish` /
-/// `residual_word_addr` on that target, not a second wasm ABI. Encoding 0
-/// (no table type) is the legitimate `jit_call_host` case: multi-value /
-/// sret, or an import outside the guest table.
+/// `CallDescr.create_call_stub` / `emit_raw_call` call through the descr
+/// FUNC. Wasm `call_indirect` uses the table slot's real FUNC, so an
+/// i32-narrowed twin is a different type and the emitter wraps each
+/// argument. Encoding 0 (no table type) is the `jit_call_host` case:
+/// multi-value / sret, or an import outside the guest table.
 #[test]
 fn i32_table_type_is_not_the_calldescr_word() {
     use majit_backend_wasm::{FuncSigVal, WasmSig};
@@ -12741,9 +12766,47 @@ fn test_oracle_i64_call_lowers_in_module_without_vouch() {
 }
 
 #[test]
-fn test_oracle_i32_call_keeps_trampoline() {
+fn i32_table_callee_is_called_in_module_with_wrap_and_extend() {
     let encoded = majit_backend_wasm::encode_func_sig(
         &[
+            majit_backend_wasm::FuncSigVal::I32,
+            majit_backend_wasm::FuncSigVal::I32,
+        ],
+        Some(majit_backend_wasm::FuncSigVal::I32),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let (inputargs, ops) = call_i_two_ints();
+        let (bytes, _) = build_module_default(&inputargs, &ops);
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        let (params, results) = function_type(&bytes, indirect_calls[0].0 as usize);
+        assert_eq!(
+            params,
+            vec![wasmparser::ValType::I32, wasmparser::ValType::I32]
+        );
+        assert_eq!(results, vec![wasmparser::ValType::I32]);
+        // Two live call arguments. The constant table index folds to i32.const.
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(op, wasmparser::Operator::I32WrapI64)),
+            2
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::I64ExtendI32U
+            )),
+            1
+        );
+    });
+}
+
+#[test]
+fn arity_mismatch_table_type_keeps_trampoline() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[
+            majit_backend_wasm::FuncSigVal::I32,
             majit_backend_wasm::FuncSigVal::I32,
             majit_backend_wasm::FuncSigVal::I32,
         ],
@@ -12875,7 +12938,7 @@ fn test_oracle_singlefloat_arg_passes_f32_bits() {
 }
 
 #[test]
-fn test_oracle_f32_float_keeps_trampoline() {
+fn f32_table_float_callee_is_called_in_module_with_demote_and_promote() {
     let encoded = majit_backend_wasm::encode_func_sig(
         &[majit_backend_wasm::FuncSigVal::F32],
         Some(majit_backend_wasm::FuncSigVal::F32),
@@ -12898,9 +12961,30 @@ fn test_oracle_f32_float_keeps_trampoline() {
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))])];
         let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
-        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-        assert!(indirect_calls.is_empty());
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (
+                vec![wasmparser::ValType::F32],
+                vec![wasmparser::ValType::F32]
+            )
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::F32DemoteF64
+            )),
+            1
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::F64PromoteF32
+            )),
+            1
+        );
     });
 }
 
