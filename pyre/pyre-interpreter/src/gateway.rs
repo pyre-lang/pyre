@@ -2020,6 +2020,25 @@ pub fn make_builtin_function_with_arity_and_text_signature(
     function
 }
 
+/// `GatewayCache.build`: `fn.w_text_signature = space.newtext(text_sig)` when
+/// `_generate_text_signature` produced one.  The registrars of
+/// `#[pyre_function]` module functions pass its `<name>_pyre_text_sig()`.
+pub fn function_set_text_signature(
+    function: PyObjectRef,
+    text_signature: Option<&'static str>,
+) -> PyObjectRef {
+    let Some(text_signature) = text_signature else {
+        return function;
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(function);
+    let w_text_signature = pyre_object::w_str_new(text_signature);
+    let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+    unsafe { crate::function::fset_func_text_signature(function, w_text_signature) };
+    function
+}
+
 /// Like `make_builtin_function` but tagged as `BuiltinFunction`
 /// (the `builtin_function` type) rather than `FunctionWithFixedCode`.
 /// Used for builtin `__new__` carriers so `type(int.__new__)` is the

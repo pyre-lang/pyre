@@ -481,11 +481,14 @@ macro_rules! py_module {
                             $name,
                             ::paste::paste! { [<$ifn_name _pyre_apply_kwonly_defaults>] }(
                                 $crate::gateway::function_set_null_positional_defaults(
-                                    $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                                        stringify!($ifn_name),
-                                        $ifn_name,
-                                        ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                                        ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                                    $crate::gateway::function_set_text_signature(
+                                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                                            stringify!($ifn_name),
+                                            $ifn_name,
+                                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                                        ),
+                                        ::paste::paste! { [<$ifn_name _pyre_text_sig>]() },
                                     ),
                                     ::paste::paste! { [<$ifn_name _pyre_ndef>]() },
                                 ),

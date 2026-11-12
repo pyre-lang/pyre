@@ -937,6 +937,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         hc!("IPV6_CHECKSUM", IPV6_CHECKSUM, ws::IPV6_CHECKSUM);
         hc!("IPV6_DONTFRAG", IPV6_DONTFRAG, ws::IPV6_DONTFRAG);
         hc!("IPV6_HOPLIMIT", IPV6_HOPLIMIT, ws::IPV6_HOPLIMIT);
+        // ws2ipdef.h; `rustpython_host_env::socket` does not re-export it.
+        cst!(
+            "IPV6_HDRINCL",
+            windows_sys::Win32::Networking::WinSock::IPV6_HDRINCL
+        );
         hc!("IPV6_HOPOPTS", IPV6_HOPOPTS, ws::IPV6_HOPOPTS);
         hc!("IPV6_JOIN_GROUP", IPV6_JOIN_GROUP, ws::IPV6_JOIN_GROUP);
         hc!("IPV6_LEAVE_GROUP", IPV6_LEAVE_GROUP, ws::IPV6_LEAVE_GROUP);
@@ -2881,7 +2886,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
     static SOCKET_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
         pyre_object::gc_roots::RootedOnceRef::new();
     SOCKET_TYPE_OBJ.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type("socket", init_socket_type);
+        let tp = pyre_interpreter::typedef::make_builtin_type("_socket.socket", init_socket_type);
         // PyPy's `W_Socket.typedef` is a builtin immutable type. 3.14
         // exposes the same immutable public type while constructing it from a
         // module heap spec, so retain HEAPTYPE and set IMMUTABLETYPE as well.

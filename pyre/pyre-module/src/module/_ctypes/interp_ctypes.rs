@@ -851,7 +851,7 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     let mut w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
     let mut comerror = pyre_object::with_roots!(ns, w_exception => pyre_interpreter::builtins::make_exc_type_with_init(
-        "COMError",
+        "_ctypes.COMError",
         Some("Raised when a COM method call failed."),
         pyre_interpreter::builtins::exc_exception_new,
         Some(comerror_init),

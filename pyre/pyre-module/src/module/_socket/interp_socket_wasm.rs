@@ -22,7 +22,7 @@ fn socket_type() -> PyObjectRef {
     static SOCKET_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
         pyre_object::gc_roots::RootedOnceRef::new();
     SOCKET_TYPE_OBJ.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type("socket", init_socket_type);
+        let tp = pyre_interpreter::typedef::make_builtin_type("_socket.socket", init_socket_type);
         pyre_interpreter::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp

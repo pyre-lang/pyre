@@ -22516,12 +22516,22 @@ fn hash_secret_from_seed(mut seed: u32) -> [u8; 16] {
 /// it is not interpreter-thread-local state.
 static HASH_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
 
+/// Set when `PYTHONHASHSEED=0` turned hash randomization off.
+static HASH_SEED_ZERO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `sys.flags.hash_randomization`: `config->use_hash_seed == 0 ||
+/// config->hash_seed != 0`, so only `PYTHONHASHSEED=0` reports it off.
+pub fn hash_randomization_flag() -> bool {
+    !HASH_SEED_ZERO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How a `PYTHONHASHSEED` value that names no seed is reported.
 pub const HASH_SEED_ERROR: &str =
     "PYTHONHASHSEED must be \"random\" or an integer in range [0; 4294967295]";
 
 /// Fix the process-global hash secret from `PYTHONHASHSEED`, leaving it unset
 /// for `"random"` or an absent value so the first digest samples a random one.
+/// `read_env` false (`-E`, `-R`) takes the random secret without reading it.
 ///
 /// The variable is read through the host seam, so under sandbox the value comes
 /// from the controller's environment rather than the child's cleared one.  A
@@ -22530,11 +22540,15 @@ pub const HASH_SEED_ERROR: &str =
 ///
 /// A digest taken before this runs pins a random secret and the variable is
 /// ignored from then on, so the launcher calls it before anything hashes.
-pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
-    let value = match crate::host_seam::getenv(b"PYTHONHASHSEED") {
-        Ok(value) => value.unwrap_or_default(),
-        // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
-        Err(_) => return Err("MemoryError"),
+pub fn init_hash_secret_from_env(read_env: bool) -> Result<(), &'static str> {
+    let value = if read_env {
+        match crate::host_seam::getenv(b"PYTHONHASHSEED") {
+            Ok(value) => value.unwrap_or_default(),
+            // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
+            Err(_) => return Err("MemoryError"),
+        }
+    } else {
+        Vec::new()
     };
     if value.is_empty() || value.as_slice() == b"random" {
         // Force the getrandom backend (and its optional `/dev/urandom`
@@ -22551,6 +22565,7 @@ pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
     // `_build_key_from_seed` gives seed 0 the all-zero key rather than running
     // the expansion over it.
     let secret = if seed == 0 {
+        HASH_SEED_ZERO.store(true, std::sync::atomic::Ordering::Relaxed);
         [0; 16]
     } else {
         hash_secret_from_seed(seed)

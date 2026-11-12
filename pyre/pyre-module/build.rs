@@ -234,6 +234,65 @@ fn main() {
     if curses_probe_enabled() {
         configure_minimal_curses();
     }
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        configure_crt_assembly_version();
+    }
+}
+
+/// `msvcrtmodule.c` builds `CRT_ASSEMBLY_VERSION` from crtversion.h's
+/// `_VC_CRT_{MAJOR,MINOR,BUILD,RBUILD}_VERSION`, and leaves the name out when
+/// any of them is undefined. The probe runs only where the build compiles for
+/// the host it runs on; elsewhere the name is left out the same way.
+fn configure_crt_assembly_version() {
+    const PARTS: [&str; 4] = [
+        "_VC_CRT_MAJOR_VERSION",
+        "_VC_CRT_MINOR_VERSION",
+        "_VC_CRT_BUILD_VERSION",
+        "_VC_CRT_RBUILD_VERSION",
+    ];
+    let host = std::env::var("HOST").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let version = if host == target && target.ends_with("-msvc") {
+        let cconfig = majit_eci::rffi_platform::CConfig {
+            compilation_info: majit_eci::ExternalCompilationInfo {
+                includes: vec!["crtversion.h".into()],
+                ..Default::default()
+            },
+            entries: PARTS
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        majit_eci::rffi_platform::CConfigEntry::DefinedConstantInteger(
+                            (*name).to_string(),
+                        ),
+                    )
+                })
+                .collect(),
+            single_entries: vec![],
+        };
+        majit_eci::rffi_platform::configure(&cconfig, false)
+            .ok()
+            .and_then(|results| {
+                let parts: Option<Vec<String>> = PARTS
+                    .iter()
+                    .map(|name| match results.iter().find(|(n, _)| n == name) {
+                        Some((_, majit_eci::rffi_platform::ConfigValue::Int(v))) => {
+                            Some(v.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                parts.map(|parts| parts.join("."))
+            })
+    } else {
+        None
+    };
+    fs::write(
+        out_dir().join("msvcrt_crt_assembly_version.rs"),
+        format!("{version:?}"),
+    )
+    .expect("write msvcrt_crt_assembly_version.rs");
 }
 
 /// `fficurses.py guess_eci` runs on the host that will execute the

@@ -300,6 +300,11 @@ fn parse_args(
             Short('s') => flags.no_user_site = true,
             Short('S') => flags.no_site = true,
             Short('P') => flags.safe_path = true,
+            // [3.15-spec] app_main.py `'R': (ignore_option, None)` drops it;
+            // `config_parse_cmdline` sets `use_hash_seed = 0`, so
+            // `-R` with PYTHONHASHSEED=0 still randomizes. Evidence:
+            // `test_cmd_line.test_hash_randomization`.
+            Short('R') => flags.hash_randomization = true,
             Short('V') | Long("version") => {
                 println!("{binary_name} 0.0.1");
                 std::process::exit(0);
@@ -931,14 +936,6 @@ fn post_run_diagnostics() {
 }
 
 fn real_main(binary_name: &str) {
-    // Ahead of everything else: the hash secret is fixed by the first digest
-    // taken in the process, so `PYTHONHASHSEED` has to be resolved before any
-    // Python object exists. `-E` does not reach it — the seed is settled before
-    // command-line flags are, so an ignored environment still supplies it.
-    if let Err(detail) = pyre_interpreter::builtins::init_hash_secret_from_env() {
-        eprintln!("{detail}");
-        std::process::exit(1);
-    }
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
     // alarms.  Hosts that stay on the original thread already receive them
@@ -1014,6 +1011,16 @@ fn real_main(binary_name: &str) {
     // Applied after the option parse, which is where the variables it
     // overrides have already been folded in.
     importing::apply_pth_config(&mut flags);
+    // The hash secret is fixed by the first digest taken in the process, so
+    // `PYTHONHASHSEED` is resolved here, after the options that decide whether
+    // it is read and before any Python object exists. `config_init_hash_seed`
+    // reads it only when neither `-E` nor `-R` turned it off.
+    if let Err(detail) = pyre_interpreter::builtins::init_hash_secret_from_env(
+        !flags.ignore_environment && !flags.hash_randomization,
+    ) {
+        eprintln!("{detail}");
+        std::process::exit(1);
+    }
     let LaunchFlags {
         interactive,
         quiet,

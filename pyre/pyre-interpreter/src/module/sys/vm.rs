@@ -2302,7 +2302,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fields.push(w_int_new(crate::importing::verbose_flag()));
         fields.push(w_int_new(crate::importing::bytes_warning_flag()));
         fields.push(w_int_new(i64::from(crate::importing::quiet_flag())));
-        fields.push(w_int_new(0)); // hash_randomization
+        fields.push(w_int_new(i64::from(crate::builtins::hash_randomization_flag())));
         fields.push(w_int_new(i64::from(crate::importing::isolated_flag())));
         fields.push(w_bool_from(crate::importing::dev_mode_flag()));
         fields.push(w_int_new(crate::importing::utf8_mode_flag()));

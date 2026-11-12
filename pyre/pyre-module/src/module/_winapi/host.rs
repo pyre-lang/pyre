@@ -154,6 +154,18 @@ pub fn GetACP() -> i64 {
     host_winapi::get_acp() as i64
 }
 
+/// `_winapi.GetOEMCP()` — the system's OEM code page.
+#[pyre_interpreter::pyre_function]
+pub fn GetOEMCP() -> i64 {
+    unsafe { windows_sys::Win32::Globalization::GetOEMCP() as i64 }
+}
+
+/// `_winapi.GetTickCount64()` — milliseconds since the system started.
+#[pyre_interpreter::pyre_function]
+pub fn GetTickCount64() -> i64 {
+    rustpython_host_env::time::tick_count64() as i64
+}
+
 /// `_winapi.GetVersion()` — the packed version word `GetVersion` reports.
 #[pyre_interpreter::pyre_function]
 pub fn GetVersion() -> i64 {
@@ -968,11 +980,14 @@ macro_rules! install {
                     "_winapi",
                     ::paste::paste! { [<$kw _pyre_apply_kwonly_defaults>] }(
                         pyre_interpreter::gateway::function_set_null_positional_defaults(
-                            pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                                stringify!($kw),
-                                $kw,
-                                ::paste::paste! { [<$kw _pyre_arity>]() },
-                                ::paste::paste! { [<$kw _pyre_sig>]() },
+                            pyre_interpreter::gateway::function_set_text_signature(
+                                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                                    stringify!($kw),
+                                    $kw,
+                                    ::paste::paste! { [<$kw _pyre_arity>]() },
+                                    ::paste::paste! { [<$kw _pyre_sig>]() },
+                                ),
+                                ::paste::paste! { [<$kw _pyre_text_sig>]() },
                             ),
                             ::paste::paste! { [<$kw _pyre_ndef>]() },
                         ),
@@ -988,11 +1003,14 @@ macro_rules! install {
                     "_winapi",
                     ::paste::paste! { [<$pos _pyre_apply_kwonly_defaults>] }(
                         pyre_interpreter::gateway::function_set_null_positional_defaults(
-                            pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                                stringify!($pos),
-                                $pos,
-                                ::paste::paste! { [<$pos _pyre_arity>]() },
-                                ::std::option::Option::None,
+                            pyre_interpreter::gateway::function_set_text_signature(
+                                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                                    stringify!($pos),
+                                    $pos,
+                                    ::paste::paste! { [<$pos _pyre_arity>]() },
+                                    ::std::option::Option::None,
+                                ),
+                                ::paste::paste! { [<$pos _pyre_text_sig>]() },
                             ),
                             ::paste::paste! { [<$pos _pyre_ndef>]() },
                         ),
@@ -1055,6 +1073,8 @@ pub fn install(ns: PyObjectRef) {
             DeregisterEventSource,
             ExitProcess,
             GetACP,
+            GetOEMCP,
+            GetTickCount64,
             GetVersion,
             MapViewOfFile,
             OpenFileMapping,

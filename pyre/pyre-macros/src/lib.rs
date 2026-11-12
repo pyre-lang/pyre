@@ -240,14 +240,22 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut posonly_marked = false;
     let mut kwonly_marked = false;
     let mut raw_slice = false;
+    // `_generate_text_signature` inputs, gathered beside the builder.
+    let mut text_params = Vec::<TextSigParam>::new();
+    let mut text_posonlyargcount = 0;
+    let mut text_sig_possible = !has_varargs;
     for arg in user_sig.inputs.iter() {
         let FnArg::Typed(pt) = arg else { continue };
         let name_lit = match &*pt.pat {
             Pat::Ident(pi) => python_param_keyword(&pi.ident.to_string()),
-            _ => continue,
+            _ => {
+                text_sig_possible = false;
+                continue;
+            }
         };
         if pt.attrs.iter().any(|a| a.path().is_ident("kwargs")) {
             sig_stmts.push(quote! { __b.kwargname = ::std::option::Option::Some(#name_lit); });
+            text_sig_possible = false;
             continue;
         }
         // Only a `&[PyObjectRef]` slice is the raw whole-args passthrough
@@ -267,11 +275,13 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if !posonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("posonly")) {
             sig_stmts.push(quote! { __b.marker_posonly(); });
             posonly_marked = true;
+            text_posonlyargcount = text_params.len();
         }
         if !kwonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("kwonly")) {
             sig_stmts.push(quote! { __b.marker_kwonly(); });
             kwonly_marked = true;
         }
+        text_params.push(TextSigParam::new(name_lit.clone(), pt, kwonly_marked)?);
         sig_stmts.push(quote! { __b.append(#name_lit); });
     }
     let sig_body = if raw_slice {
@@ -287,6 +297,26 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #[allow(non_snake_case)]
         #vis fn #sig_fn_name() -> ::std::option::Option<::pyre_interpreter::Signature> {
             #sig_body
+        }
+    };
+
+    // Companion `<name>_pyre_text_sig()` — the module function's
+    // `__text_signature__` (`GatewayCache.build` stores what
+    // `_generate_text_signature` returns), `None` where it returns `None`.
+    let text_sig_fn_name = format_ident!("{}_pyre_text_sig", user_name);
+    let text_sig = if text_sig_possible && !raw_slice {
+        generate_text_signature("$module", &text_params, text_posonlyargcount)
+    } else {
+        None
+    };
+    let text_sig_body = match text_sig {
+        Some(text) => quote! { ::std::option::Option::Some(#text) },
+        None => quote! { ::std::option::Option::None },
+    };
+    let text_sig_fn = quote! {
+        #[allow(non_snake_case, dead_code)]
+        #vis fn #text_sig_fn_name() -> ::std::option::Option<&'static str> {
+            #text_sig_body
         }
     };
 
@@ -363,6 +393,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #inner_fn
         #wrapper
         #sig_fn
+        #text_sig_fn
         #arity_fn
         #ndef_fn
         #apply_kwonly_fn
@@ -1141,6 +1172,213 @@ fn option_inner(ty: &Type) -> Option<&Type> {
         return None;
     };
     Some(t)
+}
+
+/// A parameter's default as `_generate_text_signature` renders it.
+enum TextSigDefault {
+    Required,
+    /// The default's `repr`.
+    Text(String),
+    /// A default whose `repr` cannot be read off the Rust expression.
+    Unrepresentable,
+}
+
+/// One Python-visible parameter for [`generate_text_signature`].
+struct TextSigParam {
+    name: String,
+    default: TextSigDefault,
+    kwonly: bool,
+}
+
+impl TextSigParam {
+    /// `#[default(expr)]` renders through [`text_default`]. An `Option<T>`
+    /// without one is a default the body supplies (`rotate(self, n=1)`,
+    /// `unpack_from(..., offset=0)`); an explicit `None` still goes through
+    /// the unwrapper, so neither its value nor `None` can be written here.
+    fn new(name: String, pt: &PatType, kwonly: bool) -> syn::Result<Self> {
+        let default = match arg_default(pt)? {
+            Some(tokens) => match syn::parse2::<syn::Expr>(tokens)
+                .ok()
+                .and_then(|e| text_default(&e))
+            {
+                Some(text) => TextSigDefault::Text(text),
+                None => TextSigDefault::Unrepresentable,
+            },
+            None if option_inner(&pt.ty).is_some() => TextSigDefault::Unrepresentable,
+            None => TextSigDefault::Required,
+        };
+        Ok(Self {
+            name,
+            default,
+            kwonly,
+        })
+    }
+}
+
+/// gateway.py `_generate_text_signature`.  Upstream runs it at translation
+/// time (`@not_rpython`); this runs at macro expansion, its counterpart.
+/// `first` is `$module` for a module function or `$self` for an instance
+/// method, `posonlyargcount` counts the leading positional-only parameters
+/// after it.  A default with no readable `repr`, or a required positional
+/// after a defaulted one (not a parseable signature), yields `None`, as
+/// `*args` / `**kwargs` do upstream (the callers check those).
+fn generate_text_signature(
+    first: &str,
+    params: &[TextSigParam],
+    posonlyargcount: usize,
+) -> Option<String> {
+    fn render(param: &TextSigParam) -> Option<String> {
+        match &param.default {
+            TextSigDefault::Required => Some(param.name.clone()),
+            TextSigDefault::Text(text) => Some(format!("{}={text}", param.name)),
+            TextSigDefault::Unrepresentable => None,
+        }
+    }
+    let pos_argnames: Vec<&TextSigParam> = params.iter().filter(|p| !p.kwonly).collect();
+    let kw_argnames: Vec<&TextSigParam> = params.iter().filter(|p| p.kwonly).collect();
+    let mut parts = vec![first.to_string()];
+    let mut posonly_slash_added = false;
+    let mut seen_default = false;
+    for (i, param) in pos_argnames.iter().enumerate() {
+        if posonlyargcount > 0 && i == posonlyargcount && !posonly_slash_added {
+            parts.push("/".to_string());
+            posonly_slash_added = true;
+        }
+        match param.default {
+            TextSigDefault::Required if seen_default => return None,
+            TextSigDefault::Required => {}
+            _ => seen_default = true,
+        }
+        parts.push(render(param)?);
+    }
+    if (kw_argnames.is_empty() && !posonly_slash_added)
+        || (posonlyargcount > 0 && !posonly_slash_added)
+    {
+        parts.push("/".to_string());
+    }
+    if !kw_argnames.is_empty() {
+        parts.push("*".to_string());
+        for param in kw_argnames {
+            parts.push(render(param)?);
+        }
+    }
+    Some(format!("({})", parts.join(", ")))
+}
+
+/// The Python `repr` of a `#[default(...)]` expression, when the expression
+/// spells one exactly: a literal, a negated number, `None`, or a
+/// `w_none()` / `w_bool_from` / `w_int_new` / `w_float_new` / `w_str_new`
+/// around a literal.  Anything else (a named constant, a computed value) has
+/// no `repr` readable here.
+fn text_default(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Lit(lit) => text_default_lit(&lit.lit),
+        syn::Expr::Group(g) => text_default(&g.expr),
+        syn::Expr::Paren(p) => text_default(&p.expr),
+        syn::Expr::Cast(c) => text_default(&c.expr),
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+            let syn::Expr::Lit(lit) = &*u.expr else {
+                return None;
+            };
+            match &lit.lit {
+                syn::Lit::Int(_) | syn::Lit::Float(_) => {
+                    Some(format!("-{}", text_default_lit(&lit.lit)?))
+                }
+                _ => None,
+            }
+        }
+        syn::Expr::Path(p) if p.path.is_ident("None") => Some("None".to_string()),
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(func) = &*call.func else {
+                return None;
+            };
+            let name = func.path.segments.last()?.ident.to_string();
+            let args: Vec<&syn::Expr> = call.args.iter().collect();
+            match (name.as_str(), args.as_slice()) {
+                ("w_none", []) => Some("None".to_string()),
+                ("Some", [inner]) => text_default(inner),
+                ("w_bool_from" | "w_int_new" | "w_float_new" | "w_str_new", [inner]) => {
+                    text_default(inner)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn text_default_lit(lit: &syn::Lit) -> Option<String> {
+    match lit {
+        syn::Lit::Int(i) => Some(i.base10_digits().to_string()),
+        syn::Lit::Float(f) => {
+            let digits = f.base10_digits();
+            if digits.contains(['.', 'e', 'E']) {
+                Some(digits.to_string())
+            } else {
+                Some(format!("{digits}.0"))
+            }
+        }
+        syn::Lit::Bool(b) => Some(if b.value { "True" } else { "False" }.to_string()),
+        syn::Lit::Str(s) => Some(python_str_repr(&s.value())),
+        syn::Lit::ByteStr(b) => Some(python_bytes_repr(&b.value())),
+        _ => None,
+    }
+}
+
+/// `unicode_repr`: single quotes unless the text holds a `'` and no `"`.
+fn python_str_repr(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::from(quote);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// `bytes_repr`: the same quoting, with every byte outside printable ASCII
+/// as `\xNN`.
+fn python_bytes_repr(bytes: &[u8]) -> String {
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::from("b");
+    out.push(quote as char);
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push(quote as char);
+    out
 }
 
 fn wrap_return(
@@ -2707,9 +2945,12 @@ fn expand_pyre_methods(
         let mut sig_stmts = Vec::<proc_macro2::TokenStream>::new();
         let mut has_varargs = false;
         let mut kwonly_tail = false;
-        let mut kwonly_start = None;
         let mut kwonly_marked = false;
         let mut kwonly_default_pairs = Vec::<(String, proc_macro2::TokenStream)>::new();
+        // `_generate_text_signature` inputs; a `**kwargs` slot or a
+        // destructured parameter leaves the method without one.
+        let mut text_params = Vec::<TextSigParam>::new();
+        let mut text_sig_possible = true;
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -2725,10 +2966,6 @@ fn expand_pyre_methods(
             let is_kwargs = pt.attrs.iter().any(|a| a.path().is_ident("kwargs"));
             if is_kwonly {
                 kwonly_tail = true;
-                // The first kwonly offset splits the rendered signature text.
-                if kwonly_start.is_none() {
-                    kwonly_start = Some(offset);
-                }
             }
             let pname = param_name(offset, pt);
             // A bare `&[PyObjectRef]` (raw whole-args passthrough) suppresses
@@ -2746,6 +2983,11 @@ fn expand_pyre_methods(
                 }
             }
             param_names.push(pname.clone());
+            if is_kwargs || !matches!(&*pt.pat, Pat::Ident(_)) {
+                text_sig_possible = false;
+            } else if !is_varargs_param(&pt.ty) {
+                text_params.push(TextSigParam::new(pname.clone(), pt, kwonly_tail)?);
+            }
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             let default_expr = arg_default(pt)?;
             if is_kwonly && let Some(default_expr) = default_expr.clone() {
@@ -3063,20 +3305,17 @@ fn expand_pyre_methods(
         // (`interp2app._getdefaults`). `self` is not a defaulted slot.
         let method_ndef = trailing_optional_positional_count(&param_required, &param_positional);
 
-        // gateway.py `_generate_text_signature`: a regular
-        // interp2app instance method whose arguments are all required and
-        // non-variadic has a lossless generated signature. Defaults need
-        // their Python repr, so those continue to require an explicit
-        // declaration rather than guessing from Rust tokens.
-        let raw_fn = if matches!(kind, MethodKind::Instance)
-            && !has_varargs
-            && kwonly_start.is_none()
-            && param_required.iter().all(|required| *required)
-        {
-            let mut parts = vec!["$self".to_string()];
-            parts.extend(param_names.iter().cloned());
-            parts.push("/".to_string());
-            let text_signature = format!("({})", parts.join(", "));
+        // gateway.py `_generate_text_signature` for an instance method
+        // (`$self`). A default is rendered only where `text_default` reads
+        // its `repr` off the tokens; any other default, a `*args` slice or a
+        // `**kwargs` slot leaves the method without a signature.
+        let text_signature =
+            if matches!(kind, MethodKind::Instance) && !has_varargs && text_sig_possible {
+                generate_text_signature("$self", &text_params, 0)
+            } else {
+                None
+            };
+        let raw_fn = if let Some(text_signature) = text_signature {
             quote! {
                 ::pyre_interpreter::gateway::function_set_null_positional_defaults(
                     ::pyre_interpreter::gateway::make_builtin_function_with_text_signature_and_sig(
