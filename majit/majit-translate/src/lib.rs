@@ -2805,6 +2805,9 @@ fn analyze_pipeline_from_module_paths(
             addr,
         );
     });
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        call_control.attach_helper_fnaddr_abi(desc.get() as i64, desc.abi);
+    });
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and
     // random_effects_on_gcobjs on external function objects.
@@ -3566,6 +3569,9 @@ fn make_jitcodes(
     prof.mark("  lower_registered_indirect_calls");
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
     prof.mark("  drain_pending_graphs");
+    if std::env::var_os("MAJIT_FNADDR_ABI_DEBUG").is_some_and(|v| v == "1") {
+        call_control.dump_fnaddr_abi_mismatches();
+    }
 
     // `BuiltinCode.func` is a SomePBC function-pointer field.  The ordinary
     // translated indirect-call op contributes this family through

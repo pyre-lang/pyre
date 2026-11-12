@@ -6694,6 +6694,9 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 
 /// Fold the macro-published trampoline slice into the hand-listed table.
 ///
+/// Hand-listed `(path, i64)` rows carry no macro ABI; the translator stores
+/// an empty `abi` for them and skips the trampoline-vs-calldescr check.
+///
 /// An occupied slot takes the trampoline from `emit_helper_call_target_fn`,
 /// unless the hand-listed address is in `abi_unsound_arguments`. That
 /// trampoline is the descr-word entry (`descr.py` `CallDescr.create_call_stub`):

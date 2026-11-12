@@ -1299,6 +1299,89 @@ fn helper_abi_words(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comm
         .sum()
 }
 
+/// Word-class string of the trampoline [`emit_helper_call_target_fn`] emits.
+///
+/// One char per trampoline argument word (`f` when that word is an `f64`
+/// parameter, `w` otherwise; a pair-slice that becomes two words is `ww`),
+/// then `>`, then the result (`v` / `w` / `f`). `lltype.FuncType` has no
+/// exception component — `wrap_result_exc_call` still returns a plain
+/// word or float.
+fn trampoline_abi_string(func: &ItemFn, word_enums: &[Path]) -> String {
+    let mut abi = String::new();
+    for arg in &func.sig.inputs {
+        match arg {
+            FnArg::Receiver(_) => abi.push('w'),
+            FnArg::Typed(pat_type) if pair_slice_param(&pat_type.ty).is_some() => {
+                abi.push_str("ww");
+            }
+            FnArg::Typed(pat_type)
+                if !is_word_enum_arg(&pat_type.ty, word_enums)
+                    && helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float =>
+            {
+                abi.push('f');
+            }
+            FnArg::Typed(_) => abi.push('w'),
+        }
+    }
+    abi.push('>');
+    let result_payload = result_exc_payload(&func.sig.output);
+    let return_kind = if let Some(ok_ty) = result_payload {
+        helper_call_kind_for_type(ok_ty)
+    } else {
+        helper_call_kind_for_return(&func.sig.output)
+    };
+    match return_kind {
+        HelperCallKind::Void => abi.push('v'),
+        HelperCallKind::Float => abi.push('f'),
+        HelperCallKind::Int | HelperCallKind::Ref | HelperCallKind::Unsupported => abi.push('w'),
+    }
+    abi
+}
+
+/// ABI string of an `llexternal` funcptr, from its declared C types.
+fn trampoline_abi_from_types(args: &[Type], result: &Type) -> String {
+    let mut abi = String::new();
+    for ty in args {
+        if pair_slice_param(ty).is_some() {
+            abi.push_str("ww");
+        } else if matches!(
+            primitive_type_ident(ty)
+                .map(|ident| ident.to_string())
+                .as_deref(),
+            Some("f64") | Some("f32")
+        ) {
+            abi.push('f');
+        } else {
+            abi.push('w');
+        }
+    }
+    abi.push('>');
+    let dummy_output = ReturnType::Type(Default::default(), Box::new(result.clone()));
+    let result_payload = result_exc_payload(&dummy_output);
+    let return_kind = if let Some(ok_ty) = result_payload {
+        helper_call_kind_for_type(ok_ty)
+    } else {
+        helper_call_kind_for_type(result)
+    };
+    match return_kind {
+        HelperCallKind::Void => abi.push('v'),
+        HelperCallKind::Float => abi.push('f'),
+        HelperCallKind::Int | HelperCallKind::Ref | HelperCallKind::Unsupported => {
+            if matches!(
+                primitive_type_ident(result)
+                    .map(|ident| ident.to_string())
+                    .as_deref(),
+                Some("f32")
+            ) {
+                abi.push('f');
+            } else {
+                abi.push('w');
+            }
+        }
+    }
+    abi
+}
+
 fn result_ok_and_err(ty: &Type) -> Option<(&Type, &Type)> {
     let Type::Path(type_path) = ty else {
         return None;
@@ -1536,6 +1619,7 @@ fn emit_helper_fnaddr_registration(
     path_name: &Ident,
     trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
+    abi: &str,
 ) -> proc_macro2::TokenStream {
     let static_name = format_ident!("__MAJIT_HELPER_FNADDR_{path_name}");
     let row = quote! {
@@ -1543,6 +1627,7 @@ fn emit_helper_fnaddr_registration(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
             #trampoline_ptr,
             #arity,
+            #abi,
         )
     };
     quote! {
@@ -1560,10 +1645,11 @@ fn emit_helper_fnaddr_registrations(
     path_names: &[&Ident],
     trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
+    abi: &str,
 ) -> proc_macro2::TokenStream {
     let rows = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ptr, arity));
+        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ptr, arity, abi));
     quote! { #(#rows)* }
 }
 
@@ -1571,6 +1657,7 @@ fn emit_helper_fnaddr_ctor(
     path_name: &Ident,
     trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
+    abi: &str,
 ) -> proc_macro2::TokenStream {
     let ctor_name = format_ident!("__majit_register_helper_fnaddr_{path_name}");
     let register = quote! {
@@ -1578,6 +1665,7 @@ fn emit_helper_fnaddr_ctor(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
             #trampoline_ptr,
             #arity,
+            #abi,
         );
     };
     quote! {
@@ -1593,10 +1681,11 @@ fn emit_helper_fnaddr_ctors(
     path_names: &[&Ident],
     trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
+    abi: &str,
 ) -> proc_macro2::TokenStream {
     let ctors = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ptr, arity));
+        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ptr, arity, abi));
     quote! { #(#ctors)* }
 }
 
@@ -1665,6 +1754,7 @@ fn emit_impl_helper_fnaddr_register_fn(
     import_ret: &proc_macro2::TokenStream,
     arity: u8,
     span: proc_macro2::Span,
+    abi: &str,
 ) -> proc_macro2::TokenStream {
     let export_name = impl_fnaddr_export_name(trampoline_ident, span);
     let trampoline_export = impl_trampoline_export_name(trampoline_ident, span);
@@ -1675,6 +1765,7 @@ fn emit_impl_helper_fnaddr_register_fn(
                 ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
                 addr,
                 #arity,
+                #abi,
                 ::core::any::type_name::<Self>(),
             );
         }
@@ -1858,8 +1949,8 @@ pub fn prebuilt_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #loaded as i64 }
         };
         let getter_ptr = trampoline_fn_ptr(&getter, false);
-        let registration = emit_helper_fnaddr_registration(name, &getter_ptr, 0);
-        let ctor = emit_helper_fnaddr_ctor(name, &getter_ptr, 0);
+        let registration = emit_helper_fnaddr_registration(name, &getter_ptr, 0, ">w");
+        let ctor = emit_helper_fnaddr_ctor(name, &getter_ptr, 0, ">w");
         return quote! {
             #item
             #[doc(hidden)]
@@ -2073,10 +2164,11 @@ fn emit_helper_call_target_fn(
         fnaddr_call_expr = fnaddr_wrapped;
     }
     let arity = helper_abi_words(&func.sig.inputs);
+    let trampoline_abi = trampoline_abi_string(func, word_enums);
     let trace_ptr = trampoline_fn_ptr(&trace_target_name, in_impl);
     let method_span = func.sig.ident.span();
     let shim_registration = if register_fnaddr && !has_float_arg && !in_impl {
-        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_ptr, arity)
+        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_ptr, arity, &trampoline_abi)
     } else if register_fnaddr && !has_float_arg && in_impl {
         emit_impl_helper_fnaddr_ctor(&trace_target_name, method_span)
     } else {
@@ -2175,7 +2267,12 @@ fn emit_helper_call_target_fn(
         let registration = if in_impl {
             emit_impl_helper_fnaddr_ctor(&fnaddr_name, method_span)
         } else {
-            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_ptr, arity)
+            emit_helper_fnaddr_registrations(
+                &fnaddr_path_names,
+                &fnaddr_ptr,
+                arity,
+                &trampoline_abi,
+            )
         };
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
@@ -2226,14 +2323,14 @@ fn emit_helper_call_target_fn(
         let sibling = if in_impl {
             quote! {}
         } else {
-            emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_ptr, arity)
+            emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_ptr, arity, &trampoline_abi)
         };
         quote! {
             #float_abi
             #sibling
         }
     } else if register_fnaddr && !in_impl {
-        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_ptr, arity)
+        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_ptr, arity, &trampoline_abi)
     } else {
         quote! {}
     };
@@ -2304,6 +2401,7 @@ fn emit_helper_call_target_fn(
             &import_ret,
             arity,
             method_span,
+            &trampoline_abi,
         );
         let wasm_ctor = emit_impl_helper_fnaddr_wasm_ctor(published_ident, method_span);
         quote! {
@@ -5776,6 +5874,22 @@ mod tests {
             rpython_attribute_markers("jit_may_force"),
             Some(&[("_MAJIT_MAY_FORCE_", true), ("_jit_look_inside_", false),][..])
         );
+    }
+
+    #[test]
+    fn trampoline_abi_string_encodes_generated_words() {
+        let func = parse_fn("fn f(o: PyObjectRef, x: f64) -> PyResult { loop {} }");
+        assert_eq!(trampoline_abi_string(&func, &[]), "wf>w");
+        let pair = parse_fn("fn f(xs: &[*mut u8]) -> i64 { 0 }");
+        assert_eq!(trampoline_abi_string(&pair, &[]), "ww>w");
+        let void = parse_fn("fn f() {}");
+        assert_eq!(trampoline_abi_string(&void, &[]), ">v");
+        let fl = parse_fn("fn f() -> f64 { 0.0 }");
+        assert_eq!(trampoline_abi_string(&fl, &[]), ">f");
+        let res = parse_fn("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }");
+        assert_eq!(trampoline_abi_string(&res, &[]), "w>w");
+        let rstr = parse_fn("fn f(s: &str) -> i64 { 0 }");
+        assert_eq!(trampoline_abi_string(&rstr, &[]), "w>w");
     }
 
     #[test]

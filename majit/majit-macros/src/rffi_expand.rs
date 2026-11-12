@@ -990,6 +990,7 @@ impl LlexternalInput {
         ctor_name: &Ident,
     ) -> TokenStream {
         let arity = u8::try_from(self.args.len()).unwrap_or(u8::MAX);
+        let abi = crate::trampoline_abi_from_types(&self.args, &self.result);
         quote! {
             #[cfg(not(target_arch = "wasm32"))]
             #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
@@ -1000,6 +1001,7 @@ impl LlexternalInput {
                     ::core::concat!(::core::module_path!(), "::", stringify!(#path_func)),
                     #target_func as *const (),
                     #arity,
+                    #abi,
                 );
             #[cfg(target_arch = "wasm32")]
             #[::ctor::ctor(unsafe)]
@@ -1008,6 +1010,7 @@ impl LlexternalInput {
                     ::core::concat!(::core::module_path!(), "::", stringify!(#path_func)),
                     #target_func as *const (),
                     #arity,
+                    #abi,
                 );
             }
         }

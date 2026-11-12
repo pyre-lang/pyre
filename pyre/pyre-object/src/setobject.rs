@@ -2322,6 +2322,7 @@ static W_SET_LOCK_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
         "pyre_object::setobject::w_set_lock",
         w_set_lock_jit_abi as *const (),
         1,
+        "w>w",
     );
 
 #[cfg(target_arch = "wasm32")]
@@ -2331,6 +2332,7 @@ fn register_w_set_lock_jit_abi() {
         "pyre_object::setobject::w_set_lock",
         w_set_lock_jit_abi as *const (),
         1,
+        "w>w",
     );
 }
 

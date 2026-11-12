@@ -94,6 +94,7 @@ static __MAJIT_HELPER_FNADDR__search_normal: majit_ir::helper_fnaddr::HelperFnAd
         ::core::concat!(::core::module_path!(), "::", stringify!(_search_normal)),
         _search_normal_unicode as *const (),
         5,
+        "wwwww>w",
     );
 
 #[cfg(target_arch = "wasm32")]
@@ -103,6 +104,7 @@ fn __majit_register_helper_fnaddr__search_normal() {
         ::core::concat!(::core::module_path!(), "::", stringify!(_search_normal)),
         _search_normal_unicode as *const (),
         5,
+        "wwwww>w",
     );
 }
 

@@ -1330,6 +1330,7 @@ mod helper_fnaddr_registry {
         majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
             if desc.path.ends_with("::residual_word_result") {
                 assert_eq!(desc.arity, 2);
+                assert_eq!(desc.abi, "ww>w");
                 found = true;
             }
         });

@@ -482,6 +482,7 @@ static __MAJIT_HELPER_FNADDR__get_raw_address_buf_from_string:
     ),
     _get_raw_address_buf_from_string as *const (),
     1,
+    "w>w",
 );
 
 #[cfg(target_arch = "wasm32")]
@@ -495,6 +496,7 @@ fn __majit_register_helper_fnaddr__get_raw_address_buf_from_string() {
         ),
         _get_raw_address_buf_from_string as *const (),
         1,
+        "w>w",
     );
 }
 

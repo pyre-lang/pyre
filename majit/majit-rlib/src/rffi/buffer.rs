@@ -1098,6 +1098,15 @@ fn raw_malloc_varsize_core(
     ptr as usize as i64
 }
 
+const fn raw_varsize_abi(arity: u8) -> &'static str {
+    match arity {
+        1 => "w>w",
+        3 => "www>w",
+        4 => "wwww>w",
+        _ => "",
+    }
+}
+
 macro_rules! publish_raw_varsize {
     ($static:ident, $name:ident, $arity:literal) => {
         #[cfg(not(target_arch = "wasm32"))]
@@ -1109,6 +1118,7 @@ macro_rules! publish_raw_varsize {
                 concat!("majit_rlib::rffi::", stringify!($name)),
                 $name as *const (),
                 $arity,
+                raw_varsize_abi($arity),
             );
     };
 }
@@ -1386,7 +1396,7 @@ publish_raw_varsize!(
 #[ctor::ctor(unsafe)]
 fn __majit_register_helper_fnaddr_ll_raw_malloc_varsize() {
     fn add(path: &'static str, addr: *const (), arity: u8) {
-        majit_ir::helper_fnaddr::register(path, addr, arity);
+        majit_ir::helper_fnaddr::register(path, addr, arity, raw_varsize_abi(arity));
     }
     add(
         "majit_rlib::rffi::ll_raw_malloc_varsize",
@@ -1464,7 +1474,7 @@ fn __majit_register_helper_fnaddr_ll_raw_malloc_varsize() {
 #[ctor::ctor(unsafe)]
 fn __majit_register_helper_fnaddr_ll_raw_malloc_fixedsize() {
     fn add(path: &'static str, addr: *const (), arity: u8) {
-        majit_ir::helper_fnaddr::register(path, addr, arity);
+        majit_ir::helper_fnaddr::register(path, addr, arity, raw_varsize_abi(arity));
     }
     add(
         "majit_rlib::rffi::ll_raw_malloc_fixedsize",

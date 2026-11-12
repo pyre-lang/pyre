@@ -2,9 +2,9 @@
 //!
 //! `#[dont_look_inside]` / `#[elidable]` (and the rest of that family) emit
 //! an `extern "C"` trampoline next to the annotated function. This slice
-//! publishes `(path, address, arity)` for each trampoline whose ABI matches
-//! what the codewriter records, so a residual callee has a real address
-//! without a hand-maintained list.
+//! publishes `(path, address, arity, abi)` for each trampoline whose ABI
+//! matches what the codewriter records, so a residual callee has a real
+//! address without a hand-maintained list.
 //!
 //! The address is captured in the defining crate (`fn as *const ()` in that
 //! crate's static or constructor). Taking `fn as usize` in another crate can
@@ -37,6 +37,13 @@ pub struct HelperFnAddr {
     addr: *const (),
     /// Argument count in source order, matching the trampoline.
     pub arity: u8,
+    /// Word-class string of the trampoline the macros emitted.
+    ///
+    /// One char per argument word (`f` for an `f64`/`f32` parameter, `w`
+    /// otherwise; a pair-slice that becomes two words is `ww`), then `>`,
+    /// then the result (`v` / `w` / `f`). Empty for a hand-listed row that
+    /// carries no macro ABI.
+    pub abi: &'static str,
     /// `Some(type_name::<Self>())` for an inherent `&self` trampoline, the
     /// string itself captured in the defining impl. Free functions leave
     /// this `None`. `#[jit_module]` records the same triple as
@@ -52,11 +59,12 @@ unsafe impl Send for HelperFnAddr {}
 impl HelperFnAddr {
     /// Build a registry row. Called from a `const` static initializer in the
     /// defining crate, where `fn as *const ()` is a valid initializer.
-    pub const fn new(path: &'static str, addr: *const (), arity: u8) -> Self {
+    pub const fn new(path: &'static str, addr: *const (), arity: u8, abi: &'static str) -> Self {
         Self {
             path,
             addr,
             arity,
+            abi,
             impl_type_name: None,
         }
     }
@@ -72,12 +80,14 @@ impl HelperFnAddr {
         path: &'static str,
         addr: *const (),
         arity: u8,
+        abi: &'static str,
         impl_type_name: &'static str,
     ) -> Self {
         Self {
             path,
             addr,
             arity,
+            abi,
             impl_type_name: Some(impl_type_name),
         }
     }
@@ -160,11 +170,11 @@ pub static WASM_HELPER_FNADDRS: std::sync::Mutex<Vec<HelperFnAddr>> =
 /// Called only from the constructor the macros emit. An entry appended after
 /// the address table has been read is not published.
 #[cfg(target_arch = "wasm32")]
-pub fn register(path: &'static str, addr: *const (), arity: u8) {
+pub fn register(path: &'static str, addr: *const (), arity: u8, abi: &'static str) {
     WASM_HELPER_FNADDRS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(HelperFnAddr::new(path, addr, arity));
+        .push(HelperFnAddr::new(path, addr, arity, abi));
 }
 
 /// Native constructor-populated rows for inherent `&self` trampolines.
@@ -185,9 +195,10 @@ pub fn register_impl_method(
     path: &'static str,
     addr: *const (),
     arity: u8,
+    abi: &'static str,
     impl_type_name: &'static str,
 ) {
-    let row = HelperFnAddr::new_impl_method(path, addr, arity, impl_type_name);
+    let row = HelperFnAddr::new_impl_method(path, addr, arity, abi, impl_type_name);
     #[cfg(target_arch = "wasm32")]
     WASM_HELPER_FNADDRS
         .lock()
@@ -648,6 +659,7 @@ mod impl_fnaddr_binding_tests {
             "host_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             std::ptr::null(),
             4,
+            "",
             "host_object::celldict::ModuleDictStrategy",
         );
         assert!(desc.is_impl_method());
@@ -667,9 +679,18 @@ mod impl_fnaddr_binding_tests {
             "host_object::celldict::next_version_tag_serial",
             std::ptr::null(),
             0,
+            "",
         );
         assert!(!desc.is_impl_method());
         assert_eq!(desc.impl_fnaddr_binding(), None);
+        assert_eq!(desc.abi, "");
+    }
+
+    #[test]
+    fn new_stores_trampoline_abi() {
+        let desc = HelperFnAddr::new("host::leaf", std::ptr::null(), 2, "wf>w");
+        assert_eq!(desc.abi, "wf>w");
+        assert_eq!(desc.arity, 2);
     }
 
     #[test]
@@ -678,6 +699,7 @@ mod impl_fnaddr_binding_tests {
             "host_object::other::bar",
             std::ptr::null(),
             1,
+            "",
             "host_object::a::Foo",
         );
         assert_eq!(
@@ -692,6 +714,7 @@ mod impl_fnaddr_binding_tests {
             "host_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             std::ptr::null(),
             4,
+            "",
             "host_object::celldict::ModuleDictStrategy",
         );
         let paths = desc.impl_method_fnaddr_paths();
@@ -710,6 +733,7 @@ mod impl_fnaddr_binding_tests {
             "host_object::other::bar",
             std::ptr::null(),
             1,
+            "",
             "host_object::a::Foo",
         );
         assert_eq!(

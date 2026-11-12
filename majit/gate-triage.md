@@ -25,6 +25,7 @@ cover the condition they diagnose.
 | `MAJIT_DTRACE_CONST_FROM` | value | Filters constant-propagation diagnostics by source value; remove with those diagnostics. |
 | `MAJIT_DTRACE_CONST_TO` | value | Filters constant-propagation diagnostics by destination value; remove with those diagnostics. |
 | `MAJIT_DYNASM_EXEC_DIAG` | OFF | Reports dynasm trace execution; remove when trace entry is covered by ordinary telemetry. |
+| `MAJIT_FNADDR_ABI_DEBUG` | OFF | Prints helper trampoline ABI strings that differ from the calldescr when a fnaddr is bound; remove when a mismatch fails the build. |
 | `MAJIT_FNPTR_INDIRECT` | OFF | Enables indirect function-pointer lowering; retain while that lowering remains a build configuration. |
 | `MAJIT_GC_FREELIST_DIAG` | OFF | Reports GC freelist allocation and reuse; remove when freelist accounting has sufficient invariant tests. |
 | `MAJIT_HELPER_FNADDR_SKIP` | OFF | Counts each `#[dont_look_inside]` / `#[elidable]`-family function that got no residual trampoline, by reason (`generic`, `fat-pointer arg`, `Result return`, `method receiver`, `other`); remove when every annotated residual is either published or covered by an ordinary skip test. |

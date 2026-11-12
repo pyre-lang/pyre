@@ -85,6 +85,7 @@ static W_LIST_LOCK_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
         "pyre_object::listobject::w_list_lock",
         w_list_lock_jit_abi as *const (),
         1,
+        "w>w",
     );
 
 #[cfg(target_arch = "wasm32")]
@@ -94,6 +95,7 @@ fn register_w_list_lock_jit_abi() {
         "pyre_object::listobject::w_list_lock",
         w_list_lock_jit_abi as *const (),
         1,
+        "w>w",
     );
 }
 

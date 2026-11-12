@@ -4347,14 +4347,19 @@ pub struct CallControl {
     /// fnaddr, calldescr)`. majit's source-only codewriter cannot derive
     /// that address from a parsed `CallPath`, so hosts may pre-bind the
     /// concrete trace-call surface here. Unbound paths still fall back to
-    /// the stable symbolic address shim.
-    function_fnaddrs: HashMap<CallPath, i64>,
+    /// the stable symbolic address shim. The row's trampoline ABI rides
+    /// beside the address so a binding can refuse a mismatch.
+    function_fnaddrs: HashMap<CallPath, BoundFnAddr>,
     /// Original `jit_trace_fnaddrs` key for each [`Self::function_fnaddrs`]
     /// `CallPath`. `register_macro_helper_trace_fnaddr` strips `r#` and
     /// the crate root when building aliases; the reloc descriptor stores
     /// this key so the runtime exact-matches the published spelling
     /// (`assembler.py emit_const` carrying the symbolic object).
     fnaddr_registry_keys: HashMap<CallPath, String>,
+    /// Registry-path ABI mismatches recorded while binding a concrete
+    /// fnaddr. Printed when `MAJIT_FNADDR_ABI_DEBUG=1` at the end of
+    /// `make_jitcodes`.
+    fnaddr_abi_mismatches: std::cell::RefCell<Vec<(String, String, String)>>,
 
     /// Memoised [`Self::builtin_wrapper_indirect_graphs`] family.
     ///
@@ -5281,6 +5286,7 @@ impl CallControl {
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
             fnaddr_registry_keys: HashMap::new(),
+            fnaddr_abi_mismatches: std::cell::RefCell::new(Vec::new()),
             builtin_wrapper_family: std::cell::OnceCell::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
             need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
@@ -7396,7 +7402,13 @@ impl CallControl {
     }
 
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
-        self.function_fnaddrs.insert(path, fnaddr);
+        let abi = self
+            .function_fnaddrs
+            .get(&path)
+            .map(|bound| bound.abi)
+            .unwrap_or("");
+        self.function_fnaddrs
+            .insert(path, BoundFnAddr { addr: fnaddr, abi });
     }
 
     /// Copy a bound trace-call address from `src` onto `dest`.
@@ -7407,13 +7419,27 @@ impl CallControl {
     /// `HELPER_FNADDRS`; the kind leaf is. The reloc key stays the
     /// published spelling.
     pub fn alias_function_fnaddr(&mut self, dest: CallPath, src: &CallPath) {
-        let Some(&addr) = self.function_fnaddrs.get(src) else {
+        let Some(bound) = self.function_fnaddrs.get(src).copied() else {
             return;
         };
         let key = self.fnaddr_registry_keys.get(src).cloned();
-        self.function_fnaddrs.insert(dest.clone(), addr);
+        self.function_fnaddrs.insert(dest.clone(), bound);
         if let Some(key) = key {
             self.fnaddr_registry_keys.insert(dest, key);
+        }
+    }
+
+    /// Stamp the trampoline ABI onto every bound path whose address is
+    /// this helper. Hand-listed `(path, i64)` rows never appear in
+    /// `HELPER_FNADDRS`, so they keep the empty ABI and skip the check.
+    pub fn attach_helper_fnaddr_abi(&mut self, addr: i64, abi: &'static str) {
+        if abi.is_empty() {
+            return;
+        }
+        for bound in self.function_fnaddrs.values_mut() {
+            if bound.addr == addr {
+                bound.abi = abi;
+            }
         }
     }
 
@@ -7548,7 +7574,7 @@ impl CallControl {
     /// [`Self::register_macro_helper_trace_fnaddr`] (or another impl row).
     fn address_for_registry_key(&self, registry_key: &str) -> Option<i64> {
         self.fnaddr_registry_keys.iter().find_map(|(bound, key)| {
-            (*key == registry_key).then(|| self.function_fnaddrs.get(bound).copied())?
+            (*key == registry_key).then(|| self.function_fnaddrs.get(bound).map(|row| row.addr))?
         })
     }
 
@@ -9779,7 +9805,7 @@ impl CallControl {
         // symbolic the C backend's linker resolves by name. Record the
         // same `{ path, symbolic }` pair `fnaddr_binding_for_target`
         // writes onto a `constants_i` FnAddr descriptor.
-        let (resolved_path, fnaddr, symbolic) = match self.resolved_function_fnaddr(fnaddr_path) {
+        let (resolved_path, fnaddr, symbolic) = match self.concrete_fnaddr_binding(fnaddr_path) {
             Some((resolved, addr)) => (resolved, addr, false),
             None => (
                 fnaddr_path.clone(),
@@ -10843,7 +10869,7 @@ impl CallControl {
             addr,
             symbolic,
         };
-        let from_table = |path: CallPath| match self.resolved_function_fnaddr(&path) {
+        let from_table = |path: CallPath| match self.concrete_fnaddr_binding(&path) {
             Some((resolved, addr)) => binding(resolved, addr, false),
             None => {
                 let addr = symbolic_fnaddr_for_path(&path);
@@ -10912,7 +10938,10 @@ impl CallControl {
             }
             for candidate in candidates {
                 let qualified = CallPath::for_impl_method(candidate, name.as_str());
-                if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
+                if let Some(bound) = self.function_fnaddrs.get(&qualified).copied()
+                    && let Some(addr) =
+                        self.concrete_fnaddr_if_abi_ok(&qualified, bound.addr, bound.abi)
+                {
                     return binding(qualified, addr, false);
                 }
             }
@@ -10962,18 +10991,120 @@ impl CallControl {
     /// canonical seed name follows that key rather than a second runtime
     /// table entry.
     fn resolved_function_fnaddr(&self, path: &CallPath) -> Option<(CallPath, i64)> {
-        if let Some(addr) = self.function_fnaddrs.get(path).copied() {
-            return Some((path.clone(), addr));
+        if let Some(bound) = self.function_fnaddrs.get(path).copied() {
+            return Some((path.clone(), bound.addr));
         }
         for alias in self.function_graphs.alias_paths(path) {
             if alias == *path {
                 continue;
             }
-            if let Some(addr) = self.function_fnaddrs.get(&alias).copied() {
-                return Some((alias, addr));
+            if let Some(bound) = self.function_fnaddrs.get(&alias).copied() {
+                return Some((alias, bound.addr));
             }
         }
         None
+    }
+
+    fn resolved_bound_fnaddr(&self, path: &CallPath) -> Option<(CallPath, BoundFnAddr)> {
+        if let Some(bound) = self.function_fnaddrs.get(path).copied() {
+            return Some((path.clone(), bound));
+        }
+        for alias in self.function_graphs.alias_paths(path) {
+            if alias == *path {
+                continue;
+            }
+            if let Some(bound) = self.function_fnaddrs.get(&alias).copied() {
+                return Some((alias, bound));
+            }
+        }
+        None
+    }
+
+    /// Registry hit whose trampoline ABI matches the calldescr, or `None`
+    /// (symbolic fallback) on a miss or a mismatch.
+    ///
+    /// RPython `getfunctionptr(graph)` builds `FUNCTYPE` from the graph's
+    /// own args/result, so `getcalldescr(op)` and the pointer cannot
+    /// disagree. pyre compiles the trampoline separately, so the binding
+    /// checks it. Exceptions are not part of `FUNCTYPE` (`exc_data`
+    /// channel / `cpu.grab_exc_value`), so the ABI string is arguments
+    /// and result class only.
+    fn concrete_fnaddr_binding(&self, path: &CallPath) -> Option<(CallPath, i64)> {
+        let (resolved, bound) = self.resolved_bound_fnaddr(path)?;
+        let addr = self.concrete_fnaddr_if_abi_ok(&resolved, bound.addr, bound.abi)?;
+        Some((resolved, addr))
+    }
+
+    fn concrete_fnaddr_if_abi_ok(
+        &self,
+        path: &CallPath,
+        addr: i64,
+        abi: &'static str,
+    ) -> Option<i64> {
+        if abi.is_empty() {
+            return Some(addr);
+        }
+        let Some(calldescr_abi) = self.calldescr_abi_for_path(path) else {
+            return Some(addr);
+        };
+        if calldescr_abi == abi {
+            return Some(addr);
+        }
+        self.record_fnaddr_abi_mismatch(path, abi, &calldescr_abi);
+        None
+    }
+
+    fn calldescr_abi_for_path(&self, path: &CallPath) -> Option<String> {
+        let args = self.declared_non_void_arg_classes(path)?;
+        let result = self
+            .declared_result_argclass(path)
+            .or_else(|| self.declared_return_kind(path))?;
+        let mut s = String::new();
+        for c in args.chars() {
+            match c {
+                'i' | 'r' | 'S' => s.push('w'),
+                'f' | 'L' => s.push('f'),
+                'v' => {}
+                _ => s.push('w'),
+            }
+        }
+        s.push('>');
+        match result {
+            'i' | 'r' | 'S' => s.push('w'),
+            'f' | 'L' => s.push('f'),
+            'v' => s.push('v'),
+            _ => s.push('w'),
+        }
+        Some(s)
+    }
+
+    fn record_fnaddr_abi_mismatch(&self, path: &CallPath, row_abi: &str, calldescr_abi: &str) {
+        let key = self
+            .fnaddr_registry_keys
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.canonical_key());
+        let row = (key, row_abi.to_string(), calldescr_abi.to_string());
+        let mut list = self.fnaddr_abi_mismatches.borrow_mut();
+        if !list.contains(&row) {
+            list.push(row);
+        }
+    }
+
+    /// Print ABI mismatches recorded while binding fnaddrs.
+    ///
+    /// `make_jitcodes` calls this when `MAJIT_FNADDR_ABI_DEBUG=1`.
+    pub fn dump_fnaddr_abi_mismatches(&self) {
+        let rows = self.fnaddr_abi_mismatches.borrow();
+        eprintln!("[MAJIT_FNADDR_ABI] {} mismatches:", rows.len());
+        for (path, row_abi, calldescr_abi) in rows.iter() {
+            eprintln!("[MAJIT_FNADDR_ABI] {path} row={row_abi} calldescr={calldescr_abi}");
+        }
+    }
+
+    #[cfg(test)]
+    fn fnaddr_abi_mismatch_rows(&self) -> Vec<(String, String, String)> {
+        self.fnaddr_abi_mismatches.borrow().clone()
     }
 
     /// `support.py:771-774` cache read.
@@ -11214,7 +11345,8 @@ impl CallControl {
     fn compute_builtin_wrapper_indirect_graphs(&self) -> Vec<CallPath> {
         let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
             std::collections::BTreeMap::new();
-        for (path, &fnaddr) in &self.function_fnaddrs {
+        for (path, bound) in &self.function_fnaddrs {
+            let fnaddr = bound.addr;
             let Some(leaf) = path.last_segment() else {
                 crate::decline::record(
                     WRAPPER_FAMILY_GATE,
@@ -11437,7 +11569,7 @@ impl CallControl {
                 && self
                     .function_fnaddrs
                     .get(&p)
-                    .is_some_and(|&fnaddr| fnaddr != 0)
+                    .is_some_and(|bound| bound.addr != 0)
         })
     }
 
@@ -11630,7 +11762,7 @@ impl CallControl {
                 && self
                     .function_fnaddrs
                     .get(&p)
-                    .is_some_and(|&fnaddr| fnaddr != 0)
+                    .is_some_and(|bound| bound.addr != 0)
         })
     }
 
@@ -11791,15 +11923,15 @@ impl CallControl {
         }
         if segments.len() > 1 {
             let stripped = CallPath::from_segments(segments[1..].iter().copied());
-            if let Some(&addr) = self.function_fnaddrs.get(&stripped) {
-                return Some(addr);
+            if let Some(bound) = self.function_fnaddrs.get(&stripped) {
+                return Some(bound.addr);
             }
             let mut crate_alias = Vec::with_capacity(segments.len());
             crate_alias.push("crate");
             crate_alias.extend(segments[1..].iter().copied());
             let aliased = CallPath::from_segments(crate_alias);
-            if let Some(&addr) = self.function_fnaddrs.get(&aliased) {
-                return Some(addr);
+            if let Some(bound) = self.function_fnaddrs.get(&aliased) {
+                return Some(bound.addr);
             }
         }
         None
@@ -13421,6 +13553,17 @@ pub struct FnAddrBinding {
     pub addr: i64,
     pub path: String,
     pub symbolic: bool,
+}
+
+/// Concrete helper address plus the trampoline ABI published beside it.
+///
+/// RPython `getfunctionptr(graph)` builds `FUNCTYPE` from the graph's own
+/// args/result, so `getcalldescr(op)` and the pointer cannot disagree.
+/// pyre compiles the trampoline separately, so the binding checks it.
+#[derive(Clone, Copy, Debug)]
+struct BoundFnAddr {
+    addr: i64,
+    abi: &'static str,
 }
 
 impl Default for CallControl {
@@ -24884,6 +25027,86 @@ mod tests {
                 symbolic: false,
             })
         );
+    }
+
+    #[test]
+    fn matching_fnaddr_abi_binds() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["helpers", "leaf"]);
+        cc.register_function_graph(
+            path.clone(),
+            FunctionGraph::new("leaf").with_return_type("i64"),
+        );
+        cc.register_function_fnaddr(path.clone(), 0xfeed);
+        cc.attach_helper_fnaddr_abi(0xfeed, ">w");
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(jitcode.fnaddr, 0xfeed);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: path.canonical_key(),
+                symbolic: false,
+            })
+        );
+        assert!(cc.fnaddr_abi_mismatch_rows().is_empty());
+    }
+
+    #[test]
+    fn mismatching_fnaddr_abi_falls_back_to_symbolic() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["helpers", "leaf"]);
+        cc.register_function_graph(
+            path.clone(),
+            FunctionGraph::new("leaf").with_return_type("i64"),
+        );
+        cc.register_function_fnaddr(path.clone(), 0xfeed);
+        cc.attach_helper_fnaddr_abi(0xfeed, ">f");
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(jitcode.fnaddr, symbolic_fnaddr_for_path(&path));
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: path.canonical_key(),
+                symbolic: true,
+            })
+        );
+        assert_eq!(
+            cc.fnaddr_abi_mismatch_rows(),
+            vec![(path.canonical_key(), ">f".into(), ">w".into())]
+        );
+    }
+
+    #[test]
+    fn empty_fnaddr_abi_skips_check_even_when_calldescr_exists() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["helpers", "leaf"]);
+        cc.register_function_graph(
+            path.clone(),
+            FunctionGraph::new("leaf").with_return_type("i64"),
+        );
+        cc.register_function_fnaddr(path.clone(), 0xfeed);
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(jitcode.fnaddr, 0xfeed);
+        assert!(cc.fnaddr_abi_mismatch_rows().is_empty());
+    }
+
+    #[test]
+    fn result_exc_calldescr_abi_is_plain_word() {
+        let mut cc = CallControl::new();
+        cc.set_error_carrier(crate::OwnedErrorCarrierSpec {
+            carrier_path: "Carrier".into(),
+            ..Default::default()
+        });
+        let path = CallPath::from_segments(["helpers", "leaf"]);
+        cc.register_function_graph(
+            path.clone(),
+            FunctionGraph::new("leaf").with_return_type("Result<i64, Carrier>"),
+        );
+        cc.register_function_fnaddr(path.clone(), 0xfeed);
+        cc.attach_helper_fnaddr_abi(0xfeed, ">w");
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(jitcode.fnaddr, 0xfeed);
+        assert!(cc.fnaddr_abi_mismatch_rows().is_empty());
     }
 
     #[test]
