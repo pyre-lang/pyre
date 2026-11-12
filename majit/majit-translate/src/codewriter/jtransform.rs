@@ -10977,6 +10977,19 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // `framework.py pop_roots` reloads are inserted by the gctransformer
+        // after the codewriter; in a jitcode the root stays in its register.
+        if crate::front::result_exc::is_gc_erasure_root_identity(&op.kind)
+            && let CallTarget::FunctionPath { segments, .. } = target
+            && matches!(
+                segments.last().map(String::as_str),
+                Some("reload_top_root" | "reload_top_root_at")
+            )
+            && let Some(root) = args.first()
+        {
+            let src = resolve_alias(root, &self.aliases);
+            return RewriteResult::Identity(src);
+        }
         // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
         // args[0]).  The same identity applies to the Rust spelling of
         // that op: `cast_int_to_ptr(cast_ptr_to_int(p))`.
@@ -33292,14 +33305,11 @@ mod tests {
         }
     }
 
-    /// Both root-stack operations keep their call.  `pin_root` publishes a
-    /// slot that bound `shadow_stack_get` residuals read back positionally,
-    /// and `reload_top_root` re-reads the slot after a collection may have
-    /// moved the object; a trace that keeps the pre-move word instead has no
-    /// other forwarding for it.
+    /// `pin_root` publishes a slot that bound `shadow_stack_get` residuals
+    /// read back positionally; the call stays.
     #[test]
     fn gc_root_pin_and_reload_keep_their_calls() {
-        for leaf in ["pin_root", "reload_top_root"] {
+        for leaf in ["pin_root"] {
             let config = GraphTransformConfig::default();
             let mut transformer = Transformer::new(&config);
             let mut graph = FunctionGraph::new(format!("gc_roots_{leaf}"));
@@ -33349,6 +33359,64 @@ mod tests {
                 "{leaf} must survive as the same call, not a replacement"
             );
         }
+    }
+
+    /// `framework.py pop_roots` reloads are inserted by the gctransformer
+    /// after the codewriter; in a jitcode the root stays in its register.
+    #[test]
+    fn reload_top_root_at_elides_to_first_argument_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("reload_top_root_at");
+        let entry = graph.startblock;
+        let root = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let slot = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["gc_roots", "reload_top_root_at"]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![root.clone(), slot.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[root.clone(), slot.clone()],
+            &result_ty,
+            "reload_top_root_at",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, root),
+            _ => panic!("expected Identity alias to the root"),
+        }
+
+        graph.blocks[entry.0].operations.push(op);
+        graph.set_return(entry, Some(result_var));
+        let exceptblock = graph.exceptblock;
+        transformer.optimize_block(&mut graph, entry.0, "reload_top_root_at", exceptblock);
+        let surviving = &graph.blocks[entry.0].operations;
+        assert!(
+            surviving.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Call { .. }
+                    | OpKind::CallResidual { .. }
+                    | OpKind::CallMayForce { .. }
+                    | OpKind::CallElidable { .. }
+                    | OpKind::InlineCall { .. }
+            )),
+            "reload_top_root_at must not survive as a residual or inline call"
+        );
+        assert_eq!(
+            graph.blocks[entry.0].exits[0].args[0].as_variable(),
+            Some(&root),
+            "result must be the root's register"
+        );
     }
 
     /// `rpython/rtyper/rbuiltin.py`: `rtype_intmask` returns its
