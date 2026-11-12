@@ -1077,7 +1077,7 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
                 escape_rust_string(&row.name)
             );
             defs.push_str(&format!(
-                "#[cfg(not(target_arch = \"wasm32\"))]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n}}\n"
+                "#[cfg(not(target_arch = \"wasm32\"))]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n}}\n"
             ));
         }
         let destructor_field = if emit_destructor {
