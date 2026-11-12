@@ -1489,13 +1489,21 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: IterOpcodeHandler + NamespaceOpcodeHandler,
     {
+        // `space.iter` / `GET_YIELD_FROM_ITER` collect. framework.py
+        // `gct_direct_call` / shadowstack.py `pop_roots` rewrite `self`
+        // before the index-or-NULL push (`pyopcode.py GET_ITER`).
+        // Pass `self` into the looked-inside helpers: `live_handler` as
+        // the handler argument is `FrameAnchor.live()` (`dont_look_inside`)
+        // and Skips `opcode_get_iter`. The helpers root the frame for
+        // their own push; this anchor covers the index-or-NULL push after.
+        let anchor = self.anchor();
         if mode != 0 {
             self.get_yield_from_iter()?;
         } else {
             opcode_get_iter(self)?;
         }
-        // GET_ITER then pushes the iterator's index-or-NULL slot.
-        self.push_null()
+        let null = unsafe { &mut *Self::live_handler(&anchor) }.null_value()?;
+        Self::push_anchored(&anchor, null)
     }
 
     fn for_iter(&mut self, target: usize) -> Result<(), PyError>

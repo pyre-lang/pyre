@@ -234,6 +234,17 @@ fn recursion_state_get(home: RecursionHome) -> (usize, *mut PyFrame) {
     }
 }
 
+/// Write only `py_recursion_depth` back to `home`, leaving the claim as is.
+#[inline]
+fn recursion_depth_set(home: RecursionHome, depth: usize) {
+    if home.is_null() {
+        let (_, accounted) = detached_recursion_state_get();
+        detached_recursion_state_set(depth, accounted);
+    } else {
+        unsafe { (*home).py_recursion_depth = depth };
+    }
+}
+
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
 ///
 /// Twin of [`recursion_state_get`]: the depth is an integer field store;
@@ -305,8 +316,12 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     if std::ptr::eq(accounted, key) {
         return RecursionDepthGuard::arm(home, key, saved_depth);
     }
+    // Root the displaced claim before the store: the write barrier in
+    // `recursion_state_set` sits between the read and the guard
+    // (`shadowstack.py` `push_roots` / `pop_roots`).
+    let guard = RecursionDepthGuard::arm(home, accounted, saved_depth);
     recursion_state_set(home, saved_depth + 1, key);
-    RecursionDepthGuard::arm(home, accounted, saved_depth)
+    guard
 }
 
 /// Spend one unit of the recursion budget on a dispatch level that pushes no
@@ -321,7 +336,9 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
 pub fn enter_native_dispatch() -> RecursionDepthGuard {
     let home = recursion_home();
     let (saved_depth, accounted) = recursion_state_get(home);
-    recursion_state_set(home, saved_depth + 1, accounted);
+    // The claim is carried through unchanged, so only the depth is written;
+    // no write barrier sits between the read and the guard.
+    recursion_depth_set(home, saved_depth + 1);
     RecursionDepthGuard::arm(home, accounted, saved_depth)
 }
 
