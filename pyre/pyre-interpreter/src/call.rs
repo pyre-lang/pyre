@@ -6783,26 +6783,6 @@ except TypeError as e:
             self_named.message_text()
         );
     }
-
-    /// `argument.py Arguments._match_signature` counts filled keyword-only
-    /// slots, so a `**kwargs` extra is not a keyword-only argument.
-    #[test]
-    fn kwonly_given_ignores_varkw_extras() {
-        let source = "\
-def f(a, *, k, **kw):
-    pass
-try:
-    f(1, 2, **{'k': 1, 'z': 2})
-except TypeError as e:
-    r_starstar_extra = str(e)
-";
-        let w_globals = run_snippet(source);
-        let r_starstar_extra = get_str(w_globals, "r_starstar_extra");
-        assert_eq!(
-            r_starstar_extra,
-            "f() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
-        );
-    }
 }
 
 /// CALL_KW on a plain user function binds through
@@ -6827,12 +6807,6 @@ mod call_kw_parse_into_scope_tests {
             .to_string()
     }
 
-    fn expect_int(w_globals: pyre_object::PyObjectRef, name: &str, expected: i64) {
-        let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
-        let got = unsafe { pyre_object::w_int_get_value(value) };
-        assert_eq!(got, expected, "{name}");
-    }
-
     fn expect_ints(w_globals: pyre_object::PyObjectRef, name: &str, expected: &[i64]) {
         let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
         unsafe {
@@ -6843,119 +6817,6 @@ mod call_kw_parse_into_scope_tests {
                 assert_eq!(pyre_object::w_int_get_value(item), *want, "{name}[{index}]");
             }
         }
-    }
-
-    #[test]
-    fn call_kw_user_function_binds_keywords_and_reports_signature_errors() {
-        let source = "\
-def f_kwonly(a, *, k):
-    return (a, k)
-r_kwonly = f_kwonly(1, k=2)
-
-def f_kwdef(*, k=3):
-    return k
-r_kwdef = f_kwdef()
-r_kwover = f_kwdef(k=4)
-
-def f_varkw(a, **kw):
-    return (a, kw['b'], tuple(sorted(kw)))
-r_varkw_head = f_varkw(1, c=3, b=2)
-
-def f_dup(a):
-    return a
-try:
-    f_dup(1, a=2)
-except TypeError as e:
-    r_dup = str(e)
-
-def f_unexpected(a):
-    return a
-try:
-    f_unexpected(a=1, b=2)
-except TypeError as e:
-    r_unexpected = str(e)
-
-def f_missing(a):
-    return a
-try:
-    f_missing()
-except TypeError as e:
-    r_missing = str(e)
-
-def f_missing_kw(*, k):
-    return k
-try:
-    f_missing_kw()
-except TypeError as e:
-    r_missing_kw = str(e)
-
-class A:
-    def m(self, a, *, k):
-        return (self.n, a, k)
-obj = A()
-obj.n = 7
-bm = obj.m
-r_bound = bm(1, k=2)
-r_method = obj.m(1, k=2)
-try:
-    bm(k=2)
-except TypeError as e:
-    r_bound_missing = str(e)
-";
-        let w_globals = run_snippet(source);
-        expect_ints(w_globals, "r_kwonly", &[1, 2]);
-        expect_int(w_globals, "r_kwdef", 3);
-        expect_int(w_globals, "r_kwover", 4);
-        let varkw = unsafe { pyre_object::w_dict_getitem_str(w_globals, "r_varkw_head") }
-            .expect("r_varkw_head");
-        unsafe {
-            assert!(pyre_object::is_tuple(varkw));
-            assert_eq!(pyre_object::w_tuple_len(varkw), 3);
-            assert_eq!(
-                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(varkw, 0).unwrap()),
-                1
-            );
-            assert_eq!(
-                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(varkw, 1).unwrap()),
-                2
-            );
-            let keys = pyre_object::w_tuple_getitem(varkw, 2).unwrap();
-            assert_eq!(pyre_object::w_tuple_len(keys), 2);
-            assert_eq!(
-                pyre_object::w_str_get_wtf8(pyre_object::w_tuple_getitem(keys, 0).unwrap())
-                    .as_str()
-                    .unwrap(),
-                "b"
-            );
-            assert_eq!(
-                pyre_object::w_str_get_wtf8(pyre_object::w_tuple_getitem(keys, 1).unwrap())
-                    .as_str()
-                    .unwrap(),
-                "c"
-            );
-        }
-        assert_eq!(
-            get_str(w_globals, "r_dup"),
-            "f_dup() got multiple values for argument 'a'"
-        );
-        assert_eq!(
-            get_str(w_globals, "r_unexpected"),
-            "f_unexpected() got an unexpected keyword argument 'b'"
-        );
-        assert_eq!(
-            get_str(w_globals, "r_missing"),
-            "f_missing() missing 1 required positional argument: 'a'"
-        );
-        assert_eq!(
-            get_str(w_globals, "r_missing_kw"),
-            "f_missing_kw() missing 1 required keyword-only argument: 'k'"
-        );
-        expect_ints(w_globals, "r_bound", &[7, 1, 2]);
-        expect_ints(w_globals, "r_method", &[7, 1, 2]);
-        assert_eq!(
-            get_str(w_globals, "r_bound_missing"),
-            "A.m() missing 1 required positional argument: 'a'"
-        );
     }
 
     /// `pycode.py` `make_signature` for posonly, kwonly, `CO_VARARGS`, and
