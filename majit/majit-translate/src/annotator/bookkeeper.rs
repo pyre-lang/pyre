@@ -1407,7 +1407,7 @@ pub(crate) fn scalar_lltype(
     scalar_lltype_for(spelling, crate::layout::target_signed_size())
 }
 
-fn scalar_lltype_for(
+pub(crate) fn scalar_lltype_for(
     spelling: &str,
     signed_size: usize,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
@@ -1431,6 +1431,19 @@ fn scalar_lltype_for(
         "()" => LowLevelType::Void,
         _ => return None,
     })
+}
+
+/// `lltype_to_annotation` of [`scalar_lltype_for`]. `SignedLongLong` is
+/// `SomeInteger(knowntype=r_longlong)`; `Signed` is `knowntype=int`.
+pub(crate) fn integer_annotation_for_spelling(
+    spelling: &str,
+    signed_size: usize,
+) -> Option<crate::annotator::model::SomeValue> {
+    let ll = scalar_lltype_for(spelling, signed_size)?;
+    if !ll.is_number() {
+        return None;
+    }
+    Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ll))
 }
 
 fn is_string_spelling(spelling: &str) -> bool {
@@ -5464,11 +5477,14 @@ impl Bookkeeper {
             return gcref_ptr_annotation();
         }
         match stripped {
-            "i8" | "i16" | "i32" | "i64" | "isize" => {
-                return super::model::s_int();
-            }
-            "u8" | "u16" | "u32" | "u64" | "usize" => {
-                return super::model::s_uint();
+            // `lltype_to_annotation(scalar_lltype(spelling))`. `i64` is
+            // `SignedLongLong` (`r_longlong`) when `Signed` is 4 bytes.
+            "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+                return integer_annotation_for_spelling(
+                    stripped,
+                    crate::layout::target_signed_size(),
+                )
+                .unwrap_or_else(|| panic!("scalar_lltype({stripped})"));
             }
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
@@ -8288,6 +8304,50 @@ mod tests {
         assert_eq!(
             scalar_lltype_for("u64", 4),
             Some(LowLevelType::UnsignedLongLong)
+        );
+    }
+
+    #[test]
+    fn integer_annotation_for_spelling_carries_longlong_when_signed_is_four() {
+        use crate::annotator::model::{KnownType, SomeValue};
+        let SomeValue::Integer(i64_narrow) =
+            integer_annotation_for_spelling("i64", 4).expect("i64")
+        else {
+            panic!("i64 is SomeInteger");
+        };
+        assert_eq!(i64_narrow.base.knowntype, KnownType::LongLong);
+        assert!(!i64_narrow.unsigned);
+        assert_eq!(
+            integer_annotation_for_spelling("i64", 8).expect("i64"),
+            crate::annotator::model::s_int()
+        );
+        assert_eq!(
+            integer_annotation_for_spelling("isize", 4).expect("isize"),
+            crate::annotator::model::s_int()
+        );
+        let SomeValue::Integer(u64_narrow) =
+            integer_annotation_for_spelling("u64", 4).expect("u64")
+        else {
+            panic!("u64 is SomeInteger");
+        };
+        assert_eq!(u64_narrow.base.knowntype, KnownType::ULongLong);
+        let book = bk();
+        let signed_size = crate::layout::target_signed_size();
+        assert_eq!(
+            book.project_struct_field_type("i64"),
+            integer_annotation_for_spelling("i64", signed_size).expect("i64")
+        );
+        assert_eq!(
+            book.project_struct_field_type("u64"),
+            integer_annotation_for_spelling("u64", signed_size).expect("u64")
+        );
+        assert_eq!(
+            book.project_struct_field_type("isize"),
+            crate::annotator::model::s_int()
+        );
+        assert_eq!(
+            book.project_struct_field_type("usize"),
+            crate::annotator::model::s_uint()
         );
     }
 

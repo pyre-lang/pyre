@@ -51,7 +51,9 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
     build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
-    build_ll_join_chars_isvirtual_helper_graph, build_ll_join_helper_graph,
+    build_ll_join_chars_helper_graph_for, build_ll_join_chars_isvirtual_helper_graph,
+    build_ll_join_chars_look_inside_iff_helper_graph_for,
+    build_ll_join_chars_trampoline_helper_graph_for, build_ll_join_helper_graph,
     build_ll_join_strs_helper_graph_for, build_ll_join_strs_look_inside_iff_helper_graph_for,
     build_ll_join_strs_trampoline_helper_graph_for, build_ll_replace_chr_chr_helper_graph,
     build_ll_rfind_char_helper_graph, build_ll_startswith_char_helper_graph,
@@ -63,7 +65,8 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_stringslice_helper_graph, build_ll_stritem_checked_helper_graph,
     build_ll_stritem_helper_graph, build_ll_stritem_nonneg_checked_helper_graph,
     build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
-    build_ll_unichr2str_helper_graph, const_str_cache_llstr, null_str_ptr, temp_ptr_lltype,
+    build_ll_unichr2str_helper_graph, const_str_cache_llstr, const_unicode_cache_llunicode,
+    null_str_ptr, null_unicode_ptr, temp_ptr_lltype,
 };
 use crate::translator::rtyper::rlist::{
     ListLengthItems, build_ll_alloc_and_set_isconstant_helper_graph,
@@ -618,6 +621,34 @@ impl Repr for UnicodeRepr {
         super::pairtype::ReprClassId::UnicodeRepr
     }
 
+    /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`) for
+    /// `UnicodeRepr` (`basetype = basestring`, `base = UniChar`,
+    /// `CACHE = CONST_UNICODE_CACHE`, `malloc = mallocunicode`).
+    /// `None` is a typed null. A `str` or `unicode` constant is the
+    /// cached prebuilt container: each character is stored as
+    /// `UniChar` (`cast_primitive(UniChar, value[i])`; a byte
+    /// character is `unichr(ord(ch))`) and `ll_strhash` fills `hash`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        let text = match value {
+            ConstValue::None => {
+                return Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null_unicode_ptr())),
+                    self.lltype.clone(),
+                ));
+            }
+            ConstValue::UniStr(s) => s.clone(),
+            ConstValue::ByteStr(bytes) => bytes.iter().copied().map(char::from).collect(),
+            other => {
+                return Err(TyperError::message(format!("not a str: {other:?}")));
+            }
+        };
+        let p = const_unicode_cache_llunicode(&text).map_err(TyperError::message)?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(p)),
+            self.lltype.clone(),
+        ))
+    }
+
     /// RPython `AbstractUnicodeRepr.rtype_len` inherits the
     /// `AbstractStringRepr.rtype_len` body (`rstr.py`); the
     /// only delta is the helper-graph identity (`ll_unilen`) and the
@@ -763,9 +794,10 @@ impl Repr for UnicodeRepr {
                 "cast_unichar_to_int",
                 StringIsxxxPredicate::InRange(97, 122),
             ),
-            // AbstractUnicodeRepr overrides these to raise TyperError
-            // instead of inheriting AbstractStringRepr's byte-string
-            // casefold helpers (rstr.py:452-457).
+            // `AbstractUnicodeRepr.rtype_method_upper` /
+            // `rtype_method_lower` (`rstr.py`) raise TyperError instead of
+            // inheriting `AbstractStringRepr.rtype_method_upper` /
+            // `rtype_method_lower`.
             "upper" => Err(TyperError::message("Cannot do toupper on unicode string")),
             "lower" => Err(TyperError::message("Cannot do tolower on unicode string")),
             "replace" => rtype_abstract_string_method_replace(
@@ -775,6 +807,8 @@ impl Repr for UnicodeRepr {
                 UNICODEPTR.clone(),
                 LowLevelType::UniChar,
             ),
+            // `AbstractUnicodeRepr` inherits `AbstractStringRepr.rtype_method_join`.
+            "join" => rtype_method_join(hop),
             _ => Err(TyperError::message(format!(
                 "missing UnicodeRepr.rtype_method_{method_name}"
             ))),
@@ -966,10 +1000,26 @@ fn lowlevel_str2unicode_function(rtyper: &RPythonTyper) -> Result<LowLevelFuncti
 /// `BaseListRepr` argument. `lltypesystem/rstr.py` `_list_length_items`
 /// is `ll_length` / `ll_items` (resized) or `ll_fixed_length` /
 /// `ll_fixed_items` (fixed). An empty constant separator calls
-/// `ll_join_strs`; any other separator calls `LLHelpers.ll_join`.
-/// `ll_join_chars` is not minted here.
+/// `ll_join_strs` when `external_item_repr` is the receiver, or
+/// `ll_join_chars` when `item_repr` is `char_repr` / `unichar_repr`.
+/// Any other separator calls `LLHelpers.ll_join`.
+///
+/// `ll_join_chars` takes a Void `RES` (`self.lowleveltype`). That
+/// constant is specialised into the helper result (`Ptr(STR)` or
+/// `Ptr(UNICODE)`). `ll_join_strs` drops Void `TYP` the same way:
+/// `TYP.TO == STR` selects `mallocstr` / `copy_string_contents`, and
+/// the other arm selects `mallocunicode` / `copy_unicode_contents`.
+/// `ll_join` specialises `typeOf(s)` (`s.malloc` / `s.copy_contents` /
+/// `s.empty()`).
 fn rtype_method_join(hop: &HighLevelOp) -> RTypeResult {
     hop.exception_cannot_occur()?;
+    let r_str = hop
+        .args_r
+        .borrow()
+        .first()
+        .cloned()
+        .flatten()
+        .ok_or_else(|| TyperError::message("string.join: args_r[0] missing"))?;
     let s_result = hop.s_result.borrow().clone();
     if s_result.as_ref().is_some_and(|s| s.is_constant()) {
         let value = s_result
@@ -977,8 +1027,7 @@ fn rtype_method_join(hop: &HighLevelOp) -> RTypeResult {
             .and_then(SomeValue::const_)
             .cloned()
             .ok_or_else(|| TyperError::message("string.join: constant s_result has no const"))?;
-        let srepr = string_repr();
-        let c = HighLevelOp::inputconst(srepr.as_ref(), &value)?;
+        let c = HighLevelOp::inputconst(r_str.as_ref(), &value)?;
         return Ok(Some(Hlvalue::Constant(c)));
     }
     let r_lst = hop
@@ -1000,34 +1049,43 @@ fn rtype_method_join(hop: &HighLevelOp) -> RTypeResult {
                 .and_then(ConstValue::as_text)
                 .is_some_and(|text| text.is_empty())
     });
-    let srepr: Arc<dyn Repr> = string_repr();
     let vlist = hop.inputargs(vec![
-        ConvertedTo::Repr(srepr.as_ref()),
+        ConvertedTo::Repr(r_str.as_ref()),
         ConvertedTo::Repr(r_lst.as_ref()),
     ])?;
     let v_str = vlist[0].clone();
     let v_lst = vlist[1].clone();
     let (v_length, v_items) = list_length_items(hop, v_lst, &view)?;
     if empty_sep {
-        if repr_data_eq(view.external_item_repr.as_ref(), srepr.as_ref()) {
-            let helper = ll_join_strs_helper_for(hop.rtyper.as_ref(), view.items_ll.clone())?;
+        if repr_data_eq(view.external_item_repr.as_ref(), r_str.as_ref()) {
+            let helper = ll_join_strs_helper_for(
+                hop.rtyper.as_ref(),
+                view.items_ll.clone(),
+                r_str.lowleveltype().clone(),
+            )?;
             return hop.gendirectcall(&helper, vec![v_length, v_items]);
-        }
-        if repr_data_eq(view.item_repr.as_ref(), char_repr().as_ref())
+        } else if repr_data_eq(view.item_repr.as_ref(), char_repr().as_ref())
             || repr_data_eq(view.item_repr.as_ref(), unichar_repr().as_ref())
         {
+            let helper = ll_join_chars_helper(
+                hop.rtyper.as_ref(),
+                view.items_ll.clone(),
+                r_str.lowleveltype().clone(),
+            )?;
+            return hop.gendirectcall(&helper, vec![v_length, v_items]);
+        } else {
             return Err(TyperError::message(format!(
-                "'\'.join() of char list requires ll_join_chars: {}",
+                "'\'.join() of non-string list: {}",
                 r_lst.repr_string()
             )));
         }
-        return Err(TyperError::message(format!(
-            "'\'.join() of non-string list: {}",
-            r_lst.repr_string()
-        )));
     }
-    if repr_data_eq(view.external_item_repr.as_ref(), srepr.as_ref()) {
-        let helper = ll_join_helper(hop.rtyper.as_ref(), view.items_ll.clone())?;
+    if repr_data_eq(view.external_item_repr.as_ref(), r_str.as_ref()) {
+        let helper = ll_join_helper(
+            hop.rtyper.as_ref(),
+            view.items_ll.clone(),
+            r_str.lowleveltype().clone(),
+        )?;
         hop.gendirectcall(&helper, vec![v_str, v_length, v_items])
     } else {
         Err(TyperError::message(format!(
@@ -1125,58 +1183,89 @@ fn list_length_items(
 
 /// `LLHelpers.ll_join` (`lltypesystem/rstr.py`). A bare static method:
 /// no `@jit.look_inside_iff` and no `@signature`. `items_ptr` is the
-/// list's `ll_items` result (`Ptr(GcArray(GCREF))` for a list of str).
+/// list's `ll_items` result (`Ptr(GcArray(GCREF))` for a list of str
+/// or unicode). `str_ptr` is `typeOf(s)`: `Ptr(STR)` uses `mallocstr`
+/// / `copy_string_contents` / `emptystrfun`, `Ptr(UNICODE)` uses
+/// `mallocunicode` / `copy_unicode_contents` / `emptyunicodefun`.
+/// The `(name, args, result)` cache keeps the two apart: `args[0]`
+/// and `result` are `str_ptr`, and a list of either string kind shares
+/// the same `GcArray(GCREF)` items pointer.
 fn ll_join_helper(
     rtyper: &RPythonTyper,
     items_ptr: LowLevelType,
+    str_ptr: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
     let items_for_builder = items_ptr.clone();
+    let str_for_builder = str_ptr.clone();
     rtyper.lowlevel_helper_function_with_builder(
         "ll_join".to_string(),
-        vec![STRPTR.clone(), LowLevelType::Signed, items_ptr],
-        STRPTR.clone(),
-        move |_rtyper, _args, _result| build_ll_join_helper_graph("ll_join", items_for_builder),
+        vec![str_ptr.clone(), LowLevelType::Signed, items_ptr],
+        str_ptr,
+        move |_rtyper, _args, _result| {
+            build_ll_join_helper_graph("ll_join", items_for_builder, str_for_builder)
+        },
     )
 }
 
 /// Mint `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) through
 /// `look_inside_iff` (`rlib/jit.py`) with `loop_unrolling_heuristic`
-/// (`cutoff=2`): original loop, `dont_look_inside` trampoline,
-/// `isconstant` / `isvirtual` predicates, and the wrapper named
-/// `ll_join_strs`. Returns the wrapper. The items pointer is `TEMP`
-/// (`do_stringformat`); a list of str passes its own items pointer to
-/// [`ll_join_strs_helper_for`] because `@jit.look_inside_iff` is on the
-/// function and each specialization keeps it.
+/// (`cutoff=2`). `look_inside_iff` keeps the body's `__name__`
+/// (`ll_join_strs`, `unroll_safe` + `specialize:call_location`), names
+/// the `dont_look_inside` trampoline `ll_join_strs_trampoline`, and
+/// names the wrapper `ll_join_strs_look_inside_iff`. Returns the wrapper:
+/// `rtype_method_join` `gendirectcall`s the decorated object. The items
+/// pointer is `TEMP` (`do_stringformat`); a list of str passes its own
+/// items pointer to [`ll_join_strs_helper_for`] because
+/// `@jit.look_inside_iff` is on the function and each specialization
+/// keeps it. `do_stringformat` passes `TEMP` (`GcArray(Ptr(STR))`),
+/// so its `str_ptr` is `Ptr(STR)`.
 pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
-    ll_join_strs_helper_for(rtyper, temp_ptr_lltype())
+    ll_join_strs_helper_for(rtyper, temp_ptr_lltype(), STRPTR.clone())
 }
 
+/// `str_ptr` is the specialised Void `TYP` (`LLHelpers.ll_join_strs`).
+/// `Ptr(STR)` selects `mallocstr` / `copy_string_contents`;
+/// `Ptr(UNICODE)` selects `mallocunicode` / `copy_unicode_contents`.
+/// Result of every minted graph is `str_ptr`, so the
+/// `(name, args, result)` cache does not share a `GcArray(GCREF)` list
+/// of str with a list of unicode (`specialize:call_location` plus the
+/// Void `TYP` constant split the same way upstream).
 fn ll_join_strs_helper_for(
     rtyper: &RPythonTyper,
     items_ptr: LowLevelType,
+    str_ptr: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
+    // `look_inside_iff` (`rlib/jit.py`): body keeps `func.__name__`,
+    // trampoline is `func.__name__ + "_trampoline"`, wrapper `f` is
+    // `func.__name__ + "_look_inside_iff"`.
+    let body_name = "ll_join_strs";
+    let trampoline_name = "ll_join_strs_trampoline";
+    let wrapper_name = "ll_join_strs_look_inside_iff";
     let orig_args = vec![LowLevelType::Signed, items_ptr.clone()];
     let items_for_orig = items_ptr.clone();
+    let str_for_orig = str_ptr.clone();
     let orig = rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_strs__orig".to_string(),
+        body_name.to_string(),
         orig_args.clone(),
-        STRPTR.clone(),
+        str_ptr.clone(),
         move |_r, _a, _res| {
-            build_ll_join_strs_helper_graph_for("ll_join_strs__orig", items_for_orig)
+            build_ll_join_strs_helper_graph_for(body_name, items_for_orig, str_for_orig)
         },
     )?;
     let trampoline = {
         let orig_fn = functionptr_const(rtyper, &orig)?;
         let items_for_trampoline = items_ptr.clone();
+        let str_for_trampoline = str_ptr.clone();
         rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_strs_trampoline".to_string(),
+            trampoline_name.to_string(),
             orig_args.clone(),
-            STRPTR.clone(),
+            str_ptr.clone(),
             move |_r, _a, _res| {
                 build_ll_join_strs_trampoline_helper_graph_for(
-                    "ll_join_strs_trampoline",
+                    trampoline_name,
                     orig_fn,
                     items_for_trampoline,
+                    str_for_trampoline,
                 )
             },
         )?
@@ -1211,18 +1300,119 @@ fn ll_join_strs_helper_for(
     let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
     let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
     let items_for_wrapper = items_ptr;
+    let str_for_wrapper = str_ptr.clone();
     rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_strs".to_string(),
+        wrapper_name.to_string(),
         orig_args,
-        STRPTR.clone(),
+        str_ptr,
         move |_r, _a, _res| {
             build_ll_join_strs_look_inside_iff_helper_graph_for(
-                "ll_join_strs",
+                wrapper_name,
                 orig_fn,
                 trampoline_fn,
                 isconstant_fn,
                 isvirtual_fn,
                 items_for_wrapper,
+                str_for_wrapper,
+            )
+        },
+    )
+}
+
+/// Mint `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`) through
+/// `look_inside_iff` (`rlib/jit.py`) with
+/// `isconstant(length) and isvirtual(chars)`. `look_inside_iff` keeps
+/// the body's `__name__` (`ll_join_chars`, `unroll_safe` +
+/// `specialize:call_location`), names the `dont_look_inside` trampoline
+/// `ll_join_chars_trampoline`, and names the wrapper
+/// `ll_join_chars_look_inside_iff`. Returns the wrapper;
+/// `rtype_method_join` `gendirectcall`s that decorated object.
+/// `result_ptr` is the specialised Void `RES`
+/// (`StringRepr.lowleveltype` or `UnicodeRepr.lowleveltype`).
+fn ll_join_chars_helper(
+    rtyper: &RPythonTyper,
+    items_ptr: LowLevelType,
+    result_ptr: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    // `look_inside_iff` (`rlib/jit.py`): body keeps `func.__name__`,
+    // trampoline is `func.__name__ + "_trampoline"`, wrapper `f` is
+    // `func.__name__ + "_look_inside_iff"`.
+    let body_name = "ll_join_chars";
+    let trampoline_name = "ll_join_chars_trampoline";
+    let wrapper_name = "ll_join_chars_look_inside_iff";
+    let orig_args = vec![LowLevelType::Signed, items_ptr.clone()];
+    let items_for_orig = items_ptr.clone();
+    let result_for_orig = result_ptr.clone();
+    let orig = rtyper.lowlevel_helper_function_with_builder(
+        body_name.to_string(),
+        orig_args.clone(),
+        result_ptr.clone(),
+        move |_r, _a, _res| {
+            build_ll_join_chars_helper_graph_for(body_name, items_for_orig, result_for_orig)
+        },
+    )?;
+    let trampoline = {
+        let orig_fn = functionptr_const(rtyper, &orig)?;
+        let items_for_trampoline = items_ptr.clone();
+        let result_for_trampoline = result_ptr.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            trampoline_name.to_string(),
+            orig_args.clone(),
+            result_ptr.clone(),
+            move |_r, _a, _res| {
+                build_ll_join_chars_trampoline_helper_graph_for(
+                    trampoline_name,
+                    orig_fn,
+                    items_for_trampoline,
+                    result_for_trampoline,
+                )
+            },
+        )?
+    };
+    // `rlib/jit.py isconstant`. Shared with alloc_and_set / ll_join_strs:
+    // the `(name, args, result)` cache hits on the second mint.
+    let isconstant = rtyper.lowlevel_helper_function_with_builder(
+        "_ll_alloc_and_set_isconstant".to_string(),
+        vec![LowLevelType::Signed],
+        LowLevelType::Bool,
+        |rtyper, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
+        },
+    )?;
+    let isvirtual = {
+        let items_for_virtual = items_ptr.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_join_chars_isvirtual".to_string(),
+            vec![items_ptr.clone()],
+            LowLevelType::Bool,
+            move |rtyper, _a, _res| {
+                build_ll_join_chars_isvirtual_helper_graph(
+                    rtyper,
+                    "ll_join_chars_isvirtual",
+                    items_for_virtual,
+                )
+            },
+        )?
+    };
+    let orig_fn = functionptr_const(rtyper, &orig)?;
+    let trampoline_fn = functionptr_const(rtyper, &trampoline)?;
+    let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
+    let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
+    let items_for_wrapper = items_ptr;
+    let result_for_wrapper = result_ptr.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        wrapper_name.to_string(),
+        orig_args,
+        result_ptr,
+        move |_r, _a, _res| {
+            build_ll_join_chars_look_inside_iff_helper_graph_for(
+                wrapper_name,
+                orig_fn,
+                trampoline_fn,
+                isconstant_fn,
+                isvirtual_fn,
+                items_for_wrapper,
+                result_for_wrapper,
             )
         },
     )
@@ -4235,6 +4425,55 @@ mod tests {
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::UniChar));
     }
 
+    /// `BaseLLStringRepr.convert_const` for `UnicodeRepr`: `None` is a
+    /// typed null, and a `str` / `unicode` constant is one cached
+    /// `Ptr(UNICODE)` (`CONST_UNICODE_CACHE`) with `ll_strhash` filled.
+    #[test]
+    fn unicode_repr_convert_const_caches_basestring() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            ll_unicodehash_value, prebuilt_unicode_bytes_and_hash,
+        };
+        let r = unicode_repr();
+        let first = r.convert_const(&ConstValue::uni_str("")).unwrap();
+        let second = r.convert_const(&ConstValue::uni_str("")).unwrap();
+        let ConstValue::LLPtr(first_ptr) = &first.value else {
+            panic!("empty unicode const is an LLPtr, got {:?}", first.value);
+        };
+        let ConstValue::LLPtr(second_ptr) = &second.value else {
+            panic!("second empty unicode const is an LLPtr");
+        };
+        assert_eq!(first_ptr.as_ref(), second_ptr.as_ref());
+        assert_eq!(first.concretetype.as_ref(), Some(r.lowleveltype()));
+        assert_eq!(
+            prebuilt_unicode_bytes_and_hash(first_ptr),
+            Some((Vec::new(), ll_unicodehash_value(&[])))
+        );
+
+        let latin = r.convert_const(&ConstValue::byte_str([0xff])).unwrap();
+        let ConstValue::LLPtr(latin_ptr) = &latin.value else {
+            panic!("latin-1 byte string is an LLPtr, got {:?}", latin.value);
+        };
+        let (bytes, hash) =
+            prebuilt_unicode_bytes_and_hash(latin_ptr).expect("latin-1 unicode payload");
+        assert_eq!(bytes, "\u{ff}".as_bytes());
+        assert_eq!(hash, ll_unicodehash_value(&['\u{ff}']));
+        let same = r.convert_const(&ConstValue::uni_str("\u{ff}")).unwrap();
+        let ConstValue::LLPtr(same_ptr) = &same.value else {
+            panic!("U+00FF unicode const is an LLPtr");
+        };
+        assert_eq!(latin_ptr.as_ref(), same_ptr.as_ref());
+
+        let none = r.convert_const(&ConstValue::None).unwrap();
+        let ConstValue::LLPtr(none_ptr) = &none.value else {
+            panic!("None is a null LLPtr, got {:?}", none.value);
+        };
+        assert!(!none_ptr.nonzero());
+        assert_eq!(none.concretetype.as_ref(), Some(r.lowleveltype()));
+
+        let err = r.convert_const(&ConstValue::Int(1)).unwrap_err();
+        assert!(err.to_string().contains("not a str"), "{err}");
+    }
+
     /// Non-ASCII bytes raise `UnicodeDecodeError` under Python2's
     /// default codec — pyre rejects the `ByteStr` outright.
     #[test]
@@ -5076,8 +5315,8 @@ mod tests {
             );
             if empty_sep {
                 assert!(
-                    names[2].contains("ll_join_strs"),
-                    "expected ll_join_strs in {}",
+                    names[2].contains("ll_join_strs_look_inside_iff"),
+                    "expected ll_join_strs_look_inside_iff in {}",
                     names[2]
                 );
                 assert_eq!(ops.ops[2].args.len(), 3);
@@ -5092,9 +5331,9 @@ mod tests {
         }
     }
 
-    /// Constant `s_result` returns before the list check. A non-list,
-    /// a char/unichar list, and a non-string list each name the branch
-    /// `rtype_method_join` refuses.
+    /// Constant `s_result` returns before the list check. A non-list
+    /// and a non-string list each name the branch `rtype_method_join`
+    /// refuses. Char and unichar lists call `ll_join_chars`.
     #[test]
     fn string_repr_rtype_method_join_constant_result_and_rejected_item_kinds() {
         use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
@@ -5139,19 +5378,6 @@ mod tests {
         assert!(ops._called_exception_is_here_or_cannot_occur);
         drop(ops);
 
-        for item in [
-            char_repr() as Arc<dyn Repr>,
-            unichar_repr() as Arc<dyn Repr>,
-        ] {
-            let list = list_of(&rtyper, item, true);
-            let (err, llops) = run_method_join(&rtyper, "", true, list, None);
-            let err = err.expect_err("char list");
-            let text = err.to_string();
-            assert!(text.contains("ll_join_chars"), "{text}");
-            assert!(text.contains("''.join()"), "{text}");
-            assert_eq!(llops.borrow().ops.len(), 2, "{text}");
-        }
-
         let signed_list = list_of(&rtyper, signed_repr() as Arc<dyn Repr>, true);
         let (err, llops) = run_method_join(&rtyper, "", true, signed_list.clone(), None);
         let text = err.expect_err("empty non-string").to_string();
@@ -5160,6 +5386,653 @@ mod tests {
 
         let (err, llops) = run_method_join(&rtyper, ", ", false, signed_list, None);
         let text = err.expect_err("sep non-string").to_string();
+        assert!(text.contains("sep.join() of non-string list"), "{text}");
+        assert_eq!(llops.borrow().ops.len(), 2, "{text}");
+    }
+
+    fn const_some_unicode(text: &str) -> crate::annotator::model::SomeValue {
+        use crate::annotator::model::SomeUnicodeString;
+        let mut value = SomeUnicodeString::new(false, false);
+        value.inner.base.const_box = Some(Constant::new(ConstValue::uni_str(text)));
+        SomeValue::UnicodeString(value)
+    }
+
+    fn run_receiver_join(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        receiver: Arc<dyn Repr>,
+        result_ll: LowLevelType,
+        sep: crate::annotator::model::SomeValue,
+        list_repr: Arc<dyn Repr>,
+    ) -> (
+        Result<Option<Hlvalue>, TyperError>,
+        std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
+    ) {
+        use crate::annotator::model::SomeString;
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let v_str = Variable::new();
+        v_str.set_concretetype(Some(receiver.lowleveltype().clone()));
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_repr.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(result_ll));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_str), Hlvalue::Variable(v_lst)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([sep, SomeValue::String(SomeString::new(false, false))]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(receiver.clone()), Some(list_repr)]);
+        let result = receiver.rtype_method("join", &hop);
+        (result, llops)
+    }
+
+    fn bool_exit(
+        block: &crate::flowspace::model::BlockRef,
+        is_true: bool,
+    ) -> crate::flowspace::model::BlockRef {
+        let borrowed = block.borrow();
+        for exit in &borrowed.exits {
+            let exit = exit.borrow();
+            if matches!(
+                &exit.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(is_true)
+            ) {
+                return exit.target.clone().expect("bool exit target");
+            }
+        }
+        panic!("missing bool exit {is_true}");
+    }
+
+    fn callee_name(op: &SpaceOperation) -> String {
+        use crate::translator::rtyper::lltypesystem::rstr::funcobj_from_funcptr_constant;
+        funcobj_from_funcptr_constant(&op.args[0])
+            .expect("direct_call funcptr")
+            ._name
+    }
+
+    /// `''.join(list_of_char)` (`AbstractStringRepr.rtype_method_join`)
+    /// direct-calls the `look_inside_iff` wrapper
+    /// `ll_join_chars_look_inside_iff` with `(length, items)` and result
+    /// `Ptr(STR)`. The body keeps `__name__` `ll_join_chars`
+    /// (`LLHelpers.ll_join_chars`): `mallocstr`, then
+    /// `result.chars[i] = cast_primitive(Char, chars[i])`.
+    fn assert_ll_join_chars_call(
+        op: &SpaceOperation,
+        length: &Hlvalue,
+        items: &Hlvalue,
+        result_ll: &LowLevelType,
+        item_ll: &LowLevelType,
+        casts: &[&str],
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            chars_array_ptr_lltype_from_strptr, direct_call_funcobjs,
+            funcobj_from_funcptr_constant, struct_lltype_from_strptr,
+        };
+        assert_eq!(op.opname, "direct_call");
+        assert_eq!(op.args.len(), 3, "func, length, items");
+        assert_eq!(&op.args[1], length);
+        assert_eq!(&op.args[2], items);
+        let Hlvalue::Variable(result) = &op.result else {
+            panic!("ll_join_chars result is a Variable");
+        };
+        assert_eq!(result.concretetype().as_ref(), Some(result_ll));
+        let Hlvalue::Variable(length_var) = length else {
+            panic!("length is a Variable");
+        };
+        assert_eq!(
+            length_var.concretetype().as_ref(),
+            Some(&LowLevelType::Signed)
+        );
+        let func = funcobj_from_funcptr_constant(&op.args[0]).expect("ll_join_chars funcptr");
+        assert_eq!(func._name, "ll_join_chars_look_inside_iff");
+        let Hlvalue::Variable(items_var) = items else {
+            panic!("items is a Variable");
+        };
+        let items_ll = items_var.concretetype().expect("items concretetype");
+        assert_eq!(func.TYPE.args, vec![LowLevelType::Signed, items_ll]);
+        assert_eq!(&func.TYPE.result, result_ll);
+
+        let wrapper_ref = func.graph_ref().expect("ll_join_chars graph");
+        let wrapper = wrapper_ref.borrow();
+        let wrapper_func = wrapper.func.as_ref().expect("wrapper func");
+        assert_eq!(wrapper_func.annspecialcase, None);
+        assert!(!wrapper_func._jit_unroll_safe_);
+        let start = wrapper.startblock.borrow();
+        assert!(
+            matches!(
+                &start.exitswitch,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID)
+            ),
+            "we_are_jitted SpecTag exitswitch"
+        );
+        assert!(matches!(
+            start.exits[0].borrow().exitcase,
+            Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+        ));
+        assert!(matches!(
+            start.exits[1].borrow().exitcase,
+            Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)
+        ));
+        let jitted = start.exits[0].borrow().target.clone().expect("jitted");
+        let not_jitted = start.exits[1].borrow().target.clone().expect("not jitted");
+        drop(start);
+        assert_eq!(
+            callee_name(&jitted.borrow().operations[0]),
+            "_ll_alloc_and_set_isconstant"
+        );
+        assert_eq!(
+            callee_name(&not_jitted.borrow().operations[0]),
+            "ll_join_chars"
+        );
+        let isvirtual = bool_exit(&jitted, true);
+        let const_false = bool_exit(&jitted, false);
+        assert_eq!(
+            callee_name(&isvirtual.borrow().operations[0]),
+            "ll_join_chars_isvirtual"
+        );
+        assert_eq!(
+            callee_name(&const_false.borrow().operations[0]),
+            "ll_join_chars_trampoline"
+        );
+        assert_eq!(
+            callee_name(&bool_exit(&isvirtual, true).borrow().operations[0]),
+            "ll_join_chars"
+        );
+        assert_eq!(
+            callee_name(&bool_exit(&isvirtual, false).borrow().operations[0]),
+            "ll_join_chars_trampoline"
+        );
+        let wrapper_ops: Vec<String> = wrapper
+            .iterblocks()
+            .iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            !wrapper_ops.iter().any(|name| name == "int_le"),
+            "ll_join_chars predicate has no length cutoff: {wrapper_ops:?}"
+        );
+        let callee_names: Vec<String> = direct_call_funcobjs(&wrapper)
+            .iter()
+            .map(|func| func._name.clone())
+            .collect();
+        for name in [
+            "ll_join_chars",
+            "ll_join_chars_trampoline",
+            "_ll_alloc_and_set_isconstant",
+            "ll_join_chars_isvirtual",
+        ] {
+            assert!(
+                callee_names.iter().any(|got| got == name),
+                "wrapper calls {name}, got {callee_names:?}"
+            );
+        }
+        let orig = direct_call_funcobjs(&wrapper)
+            .into_iter()
+            .find(|func| func._name == "ll_join_chars")
+            .expect("orig");
+        let trampoline = direct_call_funcobjs(&wrapper)
+            .into_iter()
+            .find(|func| func._name == "ll_join_chars_trampoline")
+            .expect("trampoline");
+        drop(wrapper);
+
+        let orig_ref = orig.graph_ref().expect("orig graph");
+        let orig_graph = orig_ref.borrow();
+        crate::flowspace::model::checkgraph(&orig_graph);
+        let orig_func = orig_graph.func.as_ref().expect("orig func");
+        assert!(orig_func._jit_unroll_safe_);
+        assert_eq!(
+            orig_func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let chars_ptr = chars_array_ptr_lltype_from_strptr(result_ll).expect("chars ptr");
+        let LowLevelType::Ptr(chars_ptr) = chars_ptr else {
+            panic!("chars ptr");
+        };
+        let PtrTarget::Array(chars_array) = &chars_ptr.TO else {
+            panic!("chars array");
+        };
+        let target = chars_array.OF.clone();
+        let expected_struct = struct_lltype_from_strptr(result_ll).expect("struct");
+        let mut saw_malloc = false;
+        let mut saw_hash = false;
+        let mut saw_chars = false;
+        let mut saw_int_lt = false;
+        let mut saw_int_add = false;
+        let mut get_result = None;
+        let mut set_value = None;
+        let mut cast_ops = Vec::new();
+        for block in orig_graph.iterblocks() {
+            for op in &block.borrow().operations {
+                match op.opname.as_str() {
+                    "malloc_varsize" => {
+                        let Hlvalue::Constant(c) = &op.args[0] else {
+                            panic!("malloc_varsize type argument");
+                        };
+                        let ConstValue::LowLevelType(ty) = &c.value else {
+                            panic!("malloc_varsize type is LowLevelType, got {:?}", c.value);
+                        };
+                        assert_eq!(ty.as_ref(), &expected_struct);
+                        saw_malloc = true;
+                    }
+                    "setfield" => {
+                        let Hlvalue::Constant(field) = &op.args[1] else {
+                            panic!("setfield name");
+                        };
+                        assert_eq!(field.value, ConstValue::byte_str("hash"));
+                        saw_hash = true;
+                    }
+                    "getsubstruct" => {
+                        let Hlvalue::Constant(field) = &op.args[1] else {
+                            panic!("getsubstruct name");
+                        };
+                        assert_eq!(field.value, ConstValue::byte_str("chars"));
+                        saw_chars = true;
+                    }
+                    "getarrayitem" => {
+                        get_result = Some(op.result.clone());
+                        let Hlvalue::Variable(raw) = &op.result else {
+                            panic!("getarrayitem result");
+                        };
+                        assert_eq!(raw.concretetype().as_ref(), Some(item_ll));
+                    }
+                    "setarrayitem" => {
+                        set_value = Some(op.args[2].clone());
+                        let Hlvalue::Variable(stored) = &op.args[2] else {
+                            panic!("setarrayitem value");
+                        };
+                        assert_eq!(stored.concretetype().as_ref(), Some(&target));
+                    }
+                    "int_lt" => saw_int_lt = true,
+                    "int_add" => saw_int_add = true,
+                    other if other.starts_with("cast_") => cast_ops.push(other.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_malloc, "ll_join_chars mallocs the result string");
+        assert!(saw_hash && saw_chars, "mallocstr sets hash and reads chars");
+        assert!(saw_int_lt && saw_int_add, "while i < length");
+        let get_result = get_result.expect("getarrayitem");
+        let set_value = set_value.expect("setarrayitem");
+        assert_eq!(cast_ops, casts);
+        if casts.is_empty() {
+            assert_eq!(set_value, get_result, "identity gen_cast stores chars[i]");
+        }
+        drop(orig_graph);
+
+        let tramp_ref = trampoline.graph_ref().expect("trampoline graph");
+        let tramp_graph = tramp_ref.borrow();
+        let tramp_func = tramp_graph.func.as_ref().expect("trampoline func");
+        assert_eq!(tramp_func._jit_look_inside_, Some(false));
+        assert_eq!(
+            tramp_func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let tramp_calls: Vec<String> = direct_call_funcobjs(&tramp_graph)
+            .iter()
+            .map(|func| func._name.clone())
+            .collect();
+        assert_eq!(tramp_calls, vec!["ll_join_chars".to_string()]);
+    }
+
+    /// `''.join` of a char or unichar list (`rtype_method_join`).
+    #[test]
+    fn string_repr_rtype_method_join_char_list_calls_ll_join_chars() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let cases = [
+            (
+                true,
+                char_repr() as Arc<dyn Repr>,
+                LowLevelType::Char,
+                &[][..],
+            ),
+            (
+                false,
+                char_repr() as Arc<dyn Repr>,
+                LowLevelType::Char,
+                &[][..],
+            ),
+            (
+                true,
+                unichar_repr() as Arc<dyn Repr>,
+                LowLevelType::UniChar,
+                &["cast_unichar_to_int", "cast_int_to_char"][..],
+            ),
+        ];
+        for (fixed, item, item_ll, casts) in cases {
+            let list = list_of(&rtyper, item, fixed);
+            let (result, llops) = run_method_join(&rtyper, "", true, list, None);
+            result.unwrap_or_else(|err| panic!("char join fixed={fixed}: {err}"));
+            let ops = llops.borrow();
+            assert!(ops._called_exception_is_here_or_cannot_occur);
+            assert_eq!(ops.ops.len(), 3, "length, items, ll_join_chars");
+            let length_name = if fixed {
+                "ll_fixed_length"
+            } else {
+                "ll_length"
+            };
+            let items_name = if fixed { "ll_fixed_items" } else { "ll_items" };
+            assert!(direct_call_name(&ops.ops[0]).contains(length_name));
+            assert!(direct_call_name(&ops.ops[1]).contains(items_name));
+            assert_ll_join_chars_call(
+                &ops.ops[2],
+                &ops.ops[0].result,
+                &ops.ops[1].result,
+                &STRPTR,
+                &item_ll,
+                casts,
+            );
+        }
+
+        let chars = list_of(&rtyper, char_repr() as Arc<dyn Repr>, true);
+        let (err, llops) = run_method_join(&rtyper, ",", false, chars, None);
+        let text = err.expect_err("sep.join of chars").to_string();
+        assert!(text.contains("sep.join() of non-string list"), "{text}");
+        assert_eq!(llops.borrow().ops.len(), 2, "{text}");
+    }
+
+    /// `u''.join` of a char or unichar list. `RES` is `Ptr(UNICODE)`
+    /// (`mallocunicode`, target `UniChar`).
+    #[test]
+    fn unicode_repr_rtype_method_join_char_list_calls_ll_join_chars() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let receiver: Arc<dyn Repr> = unicode_repr();
+        let cases = [
+            (
+                unichar_repr() as Arc<dyn Repr>,
+                LowLevelType::UniChar,
+                &[][..],
+            ),
+            (
+                char_repr() as Arc<dyn Repr>,
+                LowLevelType::Char,
+                &["cast_char_to_int", "cast_int_to_unichar"][..],
+            ),
+        ];
+        for (item, item_ll, casts) in cases {
+            let list = list_of(&rtyper, item, true);
+            let (result, llops) = run_receiver_join(
+                &rtyper,
+                receiver.clone(),
+                UNICODEPTR.clone(),
+                const_some_unicode(""),
+                list,
+            );
+            result.unwrap_or_else(|err| panic!("unicode char join: {err}"));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 3);
+            assert_ll_join_chars_call(
+                &ops.ops[2],
+                &ops.ops[0].result,
+                &ops.ops[1].result,
+                &UNICODEPTR,
+                &item_ll,
+                casts,
+            );
+        }
+    }
+
+    /// Walk a `''.join` / `sep.join` `direct_call` into the helper that
+    /// mallocs the result (`LLHelpers.ll_join_strs` body, or
+    /// `LLHelpers.ll_join` itself). `call_name` is the object
+    /// `rtype_method_join` calls; `body_name` is the graph whose
+    /// `malloc_varsize` must be `malloc_struct` and whose copies are
+    /// `copy_op` (`copy_string_contents` / `copy_unicode_contents`).
+    fn assert_string_list_join(
+        op: &SpaceOperation,
+        call_name: &str,
+        body_name: &str,
+        result_ll: &LowLevelType,
+        malloc_struct: &str,
+        copy_op: &str,
+        copy_count: usize,
+        check_empty: bool,
+    ) {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            direct_call_funcobjs, funcobj_from_funcptr_constant, prebuilt_str_bytes_and_hash,
+            prebuilt_unicode_bytes_and_hash, struct_lltype_from_strptr,
+        };
+        assert_eq!(op.opname, "direct_call");
+        let func = funcobj_from_funcptr_constant(&op.args[0]).expect("join funcptr");
+        assert_eq!(func._name, call_name);
+        assert_eq!(&func.TYPE.result, result_ll);
+        let expected_argc = if call_name == "ll_join" { 4 } else { 3 };
+        assert_eq!(op.args.len(), expected_argc, "{call_name} argc");
+        let Hlvalue::Variable(result) = &op.result else {
+            panic!("{call_name} result is a Variable");
+        };
+        assert_eq!(result.concretetype().as_ref(), Some(result_ll));
+
+        let body = if call_name == body_name {
+            func
+        } else {
+            let wrapper_ref = func.graph_ref().expect("wrapper graph");
+            let wrapper = wrapper_ref.borrow();
+            let callees = direct_call_funcobjs(&wrapper);
+            let names: Vec<String> = callees.iter().map(|callee| callee._name.clone()).collect();
+            for name in [
+                "ll_join_strs",
+                "ll_join_strs_trampoline",
+                "_ll_alloc_and_set_isconstant",
+                "ll_join_strs_isvirtual",
+            ] {
+                assert!(
+                    names.iter().any(|got| got == name),
+                    "wrapper calls {name}, got {names:?}"
+                );
+            }
+            callees
+                .into_iter()
+                .find(|callee| callee._name == body_name)
+                .unwrap_or_else(|| panic!("wrapper calls {body_name}, got {names:?}"))
+        };
+        assert_eq!(body._name, body_name);
+        assert_eq!(&body.TYPE.result, result_ll);
+        let expected_struct = struct_lltype_from_strptr(result_ll).expect("result struct");
+        let body_ref = body.graph_ref().expect("body graph");
+        let body_graph = body_ref.borrow();
+        let mut malloc_ty = None;
+        let mut copies = 0usize;
+        let mut other_copy = false;
+        for block in body_graph.iterblocks() {
+            for body_op in &block.borrow().operations {
+                match body_op.opname.as_str() {
+                    "malloc_varsize" => {
+                        let Hlvalue::Constant(c) = &body_op.args[0] else {
+                            panic!("malloc_varsize type argument");
+                        };
+                        let ConstValue::LowLevelType(ty) = &c.value else {
+                            panic!("malloc_varsize type is LowLevelType, got {:?}", c.value);
+                        };
+                        malloc_ty = Some(ty.clone());
+                    }
+                    name if name == copy_op => copies += 1,
+                    "copystrcontent" | "copyunicodecontent" => other_copy = true,
+                    _ => {}
+                }
+            }
+        }
+        let malloc_ty = malloc_ty.expect("body malloc_varsize");
+        assert_eq!(malloc_ty.as_ref(), &expected_struct);
+        let LowLevelType::Struct(st) = malloc_ty.as_ref() else {
+            panic!("malloc_varsize type is a Struct, got {malloc_ty:?}");
+        };
+        assert_eq!(st._name, malloc_struct);
+        assert_eq!(copies, copy_count, "{body_name} {copy_op}");
+        assert!(
+            !other_copy,
+            "{body_name} must not mix copystrcontent and copyunicodecontent"
+        );
+
+        if check_empty {
+            let start = body_graph.startblock.borrow();
+            let true_link = start.exits[0].borrow();
+            let Some(Hlvalue::Constant(empty)) = true_link.args[0].as_ref() else {
+                panic!(
+                    "zero-length join returns s.empty(), got {:?}",
+                    true_link.args
+                );
+            };
+            let ConstValue::LLPtr(ptr) = &empty.value else {
+                panic!("s.empty() is an LLPtr, got {:?}", empty.value);
+            };
+            if malloc_struct == "rpy_unicode" {
+                let (bytes, _) = prebuilt_unicode_bytes_and_hash(ptr).expect("emptyunicodefun");
+                assert_eq!(bytes, b"");
+                assert!(prebuilt_str_bytes_and_hash(ptr).is_none());
+            } else {
+                let (bytes, _) = prebuilt_str_bytes_and_hash(ptr).expect("emptystrfun");
+                assert_eq!(bytes, b"");
+            }
+        }
+    }
+
+    /// `u''.join(list_of_unicode)` direct-calls
+    /// `ll_join_strs_look_inside_iff` (`LLHelpers.ll_join_strs` through
+    /// `look_inside_iff`) and the body mallocs `UNICODE`.
+    /// `u','.join(list_of_unicode)` direct-calls `LLHelpers.ll_join`
+    /// with result `Ptr(UNICODE)`. A list of str on the same rtyper
+    /// still mallocs `STR`: both item arrays are `GcArray(GCREF)`, and
+    /// the helper cache splits on the result (`specialize:call_location`
+    /// plus Void `TYP` / `typeOf(s)`).
+    #[test]
+    fn unicode_repr_rtype_method_join_string_list_calls_ll_join() {
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rlist::list_of_str_lltype;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let receiver: Arc<dyn Repr> = unicode_repr();
+        let list = list_of(&rtyper, unicode_repr() as Arc<dyn Repr>, true);
+
+        let (result, llops) = run_receiver_join(
+            &rtyper,
+            receiver.clone(),
+            UNICODEPTR.clone(),
+            const_some_unicode(""),
+            list.clone(),
+        );
+        result.unwrap_or_else(|err| panic!("unicode ''.join: {err}"));
+        let ops = llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 3, "length, items, ll_join_strs");
+        assert!(direct_call_name(&ops.ops[0]).contains("ll_fixed_length"));
+        assert!(direct_call_name(&ops.ops[1]).contains("ll_fixed_items"));
+        let Hlvalue::Variable(items_var) = &ops.ops[1].result else {
+            panic!("ll_fixed_items result is a Variable");
+        };
+        assert_eq!(
+            items_var.concretetype().as_ref(),
+            Some(&list_of_str_lltype()),
+            "list of unicode stores GcArray(GCREF), same as list of str"
+        );
+        assert_string_list_join(
+            &ops.ops[2],
+            "ll_join_strs_look_inside_iff",
+            "ll_join_strs",
+            &UNICODEPTR,
+            "rpy_unicode",
+            "copyunicodecontent",
+            1,
+            false,
+        );
+        drop(ops);
+
+        // Minted after the unicode helper, so a shared `GcArray(GCREF)`
+        // cache key would hand back the UNICODE graph.
+        let strings = list_of(&rtyper, string_repr() as Arc<dyn Repr>, true);
+        let (result, llops) = run_method_join(&rtyper, "", true, strings, None);
+        result.unwrap_or_else(|err| panic!("str ''.join after unicode: {err}"));
+        let ops = llops.borrow();
+        assert_string_list_join(
+            &ops.ops[2],
+            "ll_join_strs_look_inside_iff",
+            "ll_join_strs",
+            &STRPTR,
+            "rpy_string",
+            "copystrcontent",
+            1,
+            false,
+        );
+        drop(ops);
+
+        let (result, llops) = run_receiver_join(
+            &rtyper,
+            receiver.clone(),
+            UNICODEPTR.clone(),
+            const_some_unicode(","),
+            list,
+        );
+        result.unwrap_or_else(|err| panic!("unicode sep.join: {err}"));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 3, "length, items, ll_join");
+        assert_string_list_join(
+            &ops.ops[2],
+            "ll_join",
+            "ll_join",
+            &UNICODEPTR,
+            "rpy_unicode",
+            "copyunicodecontent",
+            3,
+            true,
+        );
+        drop(ops);
+
+        let signed_list = list_of(&rtyper, signed_repr() as Arc<dyn Repr>, true);
+        let (err, llops) = run_receiver_join(
+            &rtyper,
+            receiver.clone(),
+            UNICODEPTR.clone(),
+            const_some_unicode(""),
+            signed_list.clone(),
+        );
+        let text = err.expect_err("unicode empty non-string").to_string();
+        assert!(text.contains("''.join() of non-string list"), "{text}");
+        assert_eq!(llops.borrow().ops.len(), 2, "{text}");
+
+        let (err, llops) = run_receiver_join(
+            &rtyper,
+            receiver,
+            UNICODEPTR.clone(),
+            const_some_unicode(","),
+            signed_list,
+        );
+        let text = err.expect_err("unicode sep non-string").to_string();
         assert!(text.contains("sep.join() of non-string list"), "{text}");
         assert_eq!(llops.borrow().ops.len(), 2, "{text}");
     }

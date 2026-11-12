@@ -580,7 +580,9 @@ impl pyre_object::lltype::GcType for PyErrorObject {
 /// payload in bytes. `gc_ptr_offsets` are the payload GC-pointer fields
 /// at those bytes. The object root's `w_class` edge is not repeated.
 /// `destructor` frees that class's raw-owned attribute boxes. `None`
-/// means the class owns none.
+/// means the class owns none. `alloc_with_del` is `support.py`
+/// `build_ll_0_alloc_with_del` for that STRUCT when the destructor is
+/// present, and `None` when the class owns no raw-owned attr.
 ///
 /// The generated table lives in `pyre-jit-trace`. This struct is the
 /// element type the subclass-range census can name.
@@ -591,6 +593,7 @@ pub struct MintedExceptionClass {
     pub size: usize,
     pub gc_ptr_offsets: &'static [usize],
     pub destructor: Option<majit_gc::trace::DestructorFn>,
+    pub alloc_with_del: Option<unsafe extern "C" fn() -> i64>,
 }
 
 /// Link-time registry of the minted exception-class table.

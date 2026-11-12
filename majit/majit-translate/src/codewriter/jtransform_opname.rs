@@ -75,7 +75,7 @@ use crate::flowspace::model::{
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
 };
-use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
+use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
 use crate::translator::rtyper::lltypesystem::rstr::{STR, UNICODE};
 
@@ -1592,6 +1592,16 @@ pub(crate) fn materialize_constant(
         let kind = match c.concretetype.as_ref() {
             Some(LowLevelType::Signed) => match &c.value {
                 ConstValue::Int(n) => OpKind::ConstInt(*n),
+                // `rstr.py` `new_malloc`: `int_is_true(Constant(malloc_zero_filled, Signed))`.
+                // `constfold` leaves the `CDefinedIntSymbolic` alone;
+                // `rewrite_op_int_is_true` folds it once this carrier
+                // reaches `transform_graph`.
+                ConstValue::SpecTag(tag) if *tag == MALLOC_ZERO_FILLED_TAG_ID => {
+                    OpKind::ConstSymbolic {
+                        tag: *tag,
+                        ty: ValueType::Int,
+                    }
+                }
                 _ => fail(),
             },
             Some(LowLevelType::SignedLongLong) => match &c.value {
@@ -1920,8 +1930,9 @@ mod tests {
     };
     use crate::translator::rtyper::lltypesystem::rffi::{CArray, CArrayPtr};
     use crate::translator::rtyper::lltypesystem::rstr::{
-        STRPTR, build_ll_search_helper_graph, chars_array_ptr_lltype_from_strptr,
-        direct_call_funcobjs, graph_ref_for_funcptr_id, struct_lltype_from_strptr,
+        STRPTR, build_ll_mallocstr_helper_graph, build_ll_search_helper_graph,
+        chars_array_ptr_lltype_from_strptr, direct_call_funcobjs, graph_ref_for_funcptr_id,
+        struct_lltype_from_strptr,
     };
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
     use crate::translator::rtyper::rtyper::{
@@ -3543,6 +3554,143 @@ mod tests {
 
         let model = lower_graph(&graph);
         assert!(model.func.elidable);
+    }
+
+    /// `mallocstr` (`rstr.py` `new_malloc`) guards `hash = 0` on
+    /// `int_is_true(Constant(malloc_zero_filled, Signed))`.
+    /// `lower_graph` keeps that `int_is_true`, the `ConstSymbolic`
+    /// operand, and the branch. `transform_graph` runs
+    /// `rewrite_op_int_is_true` then `fold_constant_exitswitch`, so the
+    /// store, the symbolic, and the residual branch are gone.
+    #[test]
+    fn lower_graph_folds_mallocstr_hash_store_away() {
+        use crate::codewriter::jtransform::{GraphTransformConfig, transform_graph};
+
+        let helper =
+            build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone()).expect("mallocstr helper");
+        let model = lower_graph(&helper.graph.borrow());
+        assert_mallocstr_lowered_keeps_int_is_true_branch(&model);
+        let transformed = transform_graph(&model, &GraphTransformConfig::default());
+        assert_mallocstr_fold_dropped_hash_store(&transformed.graph);
+    }
+
+    fn assert_mallocstr_lowered_keeps_int_is_true_branch(model: &crate::model::FunctionGraph) {
+        use crate::translator::backendopt::constfold::MALLOC_ZERO_FILLED_TAG_ID;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut symbolic = None;
+        let mut truth = None;
+        let mut saw_hash = false;
+        let mut saw_branch = false;
+        let mut saw_newstr = false;
+        for block in &model.blocks {
+            if let Some(ExitSwitch::Value(switch)) = &block.exitswitch {
+                assert_eq!(
+                    block.exits.len(),
+                    2,
+                    "malloc_zero_filled branch has two links"
+                );
+                let cases: Vec<_> = block
+                    .exits
+                    .iter()
+                    .map(|link| link.exitcase.clone())
+                    .collect();
+                assert!(
+                    cases.contains(&Some(ExitCase::Bool(true)))
+                        && cases.contains(&Some(ExitCase::Bool(false))),
+                    "true link joins, false link stores hash"
+                );
+                assert!(
+                    truth.is_none(),
+                    "mallocstr has one malloc_zero_filled branch"
+                );
+                truth = Some(switch.clone());
+                saw_branch = true;
+            }
+            for op in &block.operations {
+                if let OpKind::ConstSymbolic {
+                    tag,
+                    ty: ValueType::Int,
+                } = &op.kind
+                    && *tag == MALLOC_ZERO_FILLED_TAG_ID
+                {
+                    let result = op.result.clone().expect("ConstSymbolic result");
+                    assert_eq!(result.concretetype(), Some(LowLevelType::Signed));
+                    symbolic = Some(result);
+                }
+                if matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "hash"
+                ) {
+                    saw_hash = true;
+                }
+                if matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "newstr"
+                ) {
+                    saw_newstr = true;
+                }
+            }
+        }
+        let symbolic = symbolic.expect("lower_graph carries malloc_zero_filled as ConstSymbolic");
+        let truth = truth.expect("lower_graph keeps the malloc_zero_filled branch");
+        let truth_op = model
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find(|op| op.result.as_ref() == Some(&truth))
+            .expect("int_is_true defines the exitswitch");
+        assert!(
+            matches!(
+                &truth_op.kind,
+                OpKind::UnaryOp { op, operand, result_ty }
+                    if op == "int_is_true"
+                        && operand == &symbolic
+                        && *result_ty == ValueType::Int
+            ),
+            "int_is_true reads the Signed ConstSymbolic"
+        );
+        assert_eq!(truth.concretetype(), Some(LowLevelType::Bool));
+        assert!(saw_newstr, "malloc_varsize of STR lowers to newstr");
+        assert!(
+            saw_hash,
+            "lower_graph keeps the hash store on the false arm"
+        );
+        assert!(saw_branch);
+    }
+
+    fn assert_mallocstr_fold_dropped_hash_store(model: &crate::model::FunctionGraph) {
+        let mut saw_newstr = false;
+        for block in &model.blocks {
+            assert!(
+                block.exitswitch.is_none(),
+                "folded mallocstr keeps no symbolic exitswitch"
+            );
+            assert!(
+                block.exits.len() <= 1,
+                "folded mallocstr keeps no residual branch"
+            );
+            for op in &block.operations {
+                assert!(
+                    !matches!(op.kind, OpKind::ConstSymbolic { .. }),
+                    "folded mallocstr keeps no ConstSymbolic"
+                );
+                assert!(
+                    !matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "hash"
+                    ),
+                    "folded mallocstr does not setfield hash"
+                );
+                if matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "newstr"
+                ) {
+                    saw_newstr = true;
+                }
+            }
+        }
+        assert!(saw_newstr, "malloc_varsize of STR lowers to newstr");
     }
 
     fn gcarray_signed() -> LowLevelType {

@@ -4899,17 +4899,15 @@ fn check_result(int: (usize, usize), reference: (usize, usize), float: (usize, u
 }
 
 /// `LLHelpers._ll_strhash` / `ll_hash_string` over UNICODE `chars`
-/// (`rstr.py UnicodeRepr.convert_const`, `objectmodel.py _hash_string`).
-/// Empty is `-1`; a real hash of `0` becomes `29872897`.
+/// (`rstr.py` `UnicodeRepr.convert_const`, `objectmodel.py` `_hash_string`).
+/// Empty is `-1`; a real hash of `0` becomes `29872897`. Same `intmask`
+/// width as [`crate::translator::rtyper::lltypesystem::rstr::ll_unicodehash_value`].
 fn ll_strhash_unichars(chars: &[u32]) -> i64 {
-    let Some(&first) = chars.first() else {
-        return -1;
-    };
-    let mut x = (first as i64) << 7;
-    for &c in chars {
-        x = 1000003i64.wrapping_mul(x) ^ c as i64;
-    }
-    x ^= chars.len() as i64;
+    let x = crate::translator::rtyper::lltypesystem::rstr::hash_string(
+        chars.len(),
+        |i| chars[i],
+        crate::layout::target_signed_size(),
+    );
     if x == 0 { 29872897 } else { x }
 }
 
@@ -5963,6 +5961,23 @@ fn minted_exception_instance_layout(
         super_align = class_align;
     }
     (super_size, specs, drops, gc_ptr_offsets)
+}
+
+/// Whether a minted class layout owns a raw-owned attribute.
+///
+/// `render_minted_exception_classes_rs` emits `MINTED_EXC_*_destructor`
+/// from that same list, including an ancestor attr repeated on a subclass
+/// instance. `jtransform.py` `Transformer.rewrite_op_malloc` reads it as
+/// `getRuntimeTypeInfo(STRUCT)` / `destructor_funcptr`. A STRUCT that is
+/// not a minted host has none. The walk is [`minted_exception_instance_layout`],
+/// the one [`attach_minted_exception_raw_owned_drops`] runs after jitcodes.
+pub(crate) fn minted_exception_has_destructor(cc: &CallControl, owner: &str) -> bool {
+    let Some(key) = minted_exception_size_owner(cc, owner, 0) else {
+        return false;
+    };
+    let chain = minted_exception_chain_for_key(cc, &key);
+    let (_size, _specs, drops, _gc_ptr_offsets) = minted_exception_instance_layout(cc, &chain);
+    !drops.is_empty()
 }
 
 /// Fill `size`, `gc_ptr_offsets`, and `raw_owned` from one instance layout.

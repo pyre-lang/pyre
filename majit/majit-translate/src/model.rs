@@ -1159,9 +1159,18 @@ pub enum OpKind {
     /// <ty>)` for the rtyper / `constfold::replace_we_are_jitted`
     /// (→ `false`) genc path, and `jtransform` folds it to
     /// `ConstBool(true)` keyed on the `SpecTag` identity (parity with
-    /// `jtransform.py Transformer.rewrite_op_int_is_true value is _we_are_jitted`).  No
-    /// `ConstSymbolic` survives `jtransform`, so the backend never
-    /// materialises one.
+    /// `jtransform.py Transformer.rewrite_op_int_is_true value is _we_are_jitted`).
+    /// `objectmodel.malloc_zero_filled`
+    /// ([`crate::translator::backendopt::constfold::MALLOC_ZERO_FILLED_TAG_ID`])
+    /// uses the same carrier at `Signed` (`ValueType::Int`), as the
+    /// operand of `int_is_true` (`rstr.py` `new_malloc`).
+    /// `rewrite_op_int_is_true`
+    /// (`value is objectmodel.malloc_zero_filled`) replaces that unary
+    /// with `ConstBool(true)`. The unread `ConstSymbolic` is then dead
+    /// (`prune_dead_phis`; `is_pure_op` treats `ConstSymbolic` as a pure
+    /// `Constant`). `_we_are_jitted` still folds the `ConstSymbolic` op
+    /// itself to `ConstBool(true)`. No `ConstSymbolic` survives
+    /// `jtransform`, so the backend never materialises one.
     ConstSymbolic {
         tag: u64,
         ty: ValueType,

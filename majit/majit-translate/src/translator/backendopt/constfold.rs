@@ -1118,6 +1118,32 @@ pub fn replace_symbolic(graph: &FunctionGraph, symbolic: &ConstValue, value: Con
 /// sites" behaviour, but driven by identity rather than string match.
 pub const WE_ARE_JITTED_TAG_ID: u64 = u64::MAX - 0x57E_A1E_71D;
 
+/// Stable, process-unique `SpecTag` id reserved for
+/// `rpython.rlib.objectmodel.malloc_zero_filled`
+/// (`CDefinedIntSymbolic('MALLOC_ZERO_FILLED', default=0)`).
+/// Picked at the far end of the `u64` space, distinct from
+/// [`WE_ARE_JITTED_TAG_ID`], so no `SpecTag` allocated by
+/// `unroll.py` (which counts up from 0) can collide.
+///
+/// Annotated `SomeInteger`, lltype `Signed`. In a translated program
+/// `we_are_translated()` is True, so `new_malloc`'s `r.hash = 0`
+/// (`rstr.py` `mallocstr`) is guarded only by `not malloc_zero_filled`.
+/// The flow graph is
+/// `v = int_is_true(Constant(malloc_zero_filled, Signed))` then
+/// `exitswitch v`. `FlowContext.not_` swaps the link exitcases.
+/// `constfold` leaves a `CDefinedIntSymbolic` alone.
+/// `materialize_constant` carries the Signed SpecTag as
+/// `OpKind::ConstSymbolic` (`ValueType::Int`).
+/// `Transformer.rewrite_op_int_is_true` replaces that `int_is_true` with
+/// `Constant(True, lltype.Bool)` when
+/// `op.args[0].value is objectmodel.malloc_zero_filled`.
+/// `fold_constant_exitswitch` then keeps the true link.
+/// The unread `ConstSymbolic` is dead (`prune_dead_phis`; `is_pure_op`
+/// treats `ConstSymbolic` as a pure `Constant`). llinterp evaluates the
+/// tag at Signed as default 0, so `int_is_true` is false and the false
+/// link stores `hash = 0`.
+pub const MALLOC_ZERO_FILLED_TAG_ID: u64 = u64::MAX - 0x5A11_0C_F11D;
+
 /// RPython `replace_we_are_jitted(graph)` at `constfold.py`.
 ///
 /// Upstream:

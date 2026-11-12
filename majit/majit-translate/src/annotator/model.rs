@@ -6128,6 +6128,25 @@ mod tests {
     }
 
     #[test]
+    fn unionof_int_and_longlong_keeps_longlong() {
+        // `pairtype(SomeInteger, SomeInteger).union` (`binaryop.py`):
+        // `knowntype = compute_restype(int1.knowntype, int2.knowntype)`.
+        // `compute_restype` keeps `r_longlong` when the other side is `int`.
+        let int = SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::Int));
+        let longlong =
+            SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::LongLong));
+        for (lhs, rhs) in [(&int, &longlong), (&longlong, &int)] {
+            let SomeValue::Integer(merged) = unionof([lhs, rhs]).expect("int ∪ r_longlong")
+            else {
+                panic!("expected SomeInteger");
+            };
+            assert_eq!(merged.base.knowntype, KnownType::LongLong);
+            assert!(!merged.unsigned);
+            assert!(!merged.nonneg);
+        }
+    }
+
+    #[test]
     fn unionof_empty_is_impossible() {
         let empty: [&SomeValue; 0] = [];
         let u = unionof(empty).unwrap();

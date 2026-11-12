@@ -974,81 +974,136 @@ fn push_minted_exception_row(
     hosts.push(host.clone());
 }
 
-/// Rust source for `$OUT_DIR/minted_exception_classes.rs`.
+/// `NameManager` `global_prefix` (`gensupp.py` `NameManager.__init__`).
+/// A first claim of an intern key is this prefix plus the key after
+/// `C_IDENTIFIER`.
+const MINTED_EXC_PREFIX: &str = "MINTED_EXC_";
+
+/// `NameManager.uniquename` `lenmax` (`gensupp.py`). Upstream's default
+/// is 50. The render-test keys (`synth::E::B`, `Arg::TooManyMethod`)
+/// and a `_destructor` companion are shorter than that. A longer key is
+/// cut by `basename[:lenmax]` before `C_IDENTIFIER`.
+/// `NameManager._ensure_unique` still separates two keys that share the
+/// truncated basename.
+const MINTED_EXC_NAME_LENMAX: usize = 50;
+
+/// Rust source for the minted exception class table.
 ///
-/// Included inside the module that defines `MintedExceptionClass`, so
-/// the table uses that short name. An empty `rows` is an empty table.
-/// Two keys that sanitize to one ident panic here, in the build script.
+/// Included in the module that defines `MintedExceptionClass`, so the
+/// table uses that short name. An empty `rows` is an empty table.
+/// One `NameManager` (`gensupp.py`) claims each static, each
+/// `_destructor` companion, and each `_alloc_with_del` /
+/// `_alloc_fnaddr` companion, walking `rows` in order. `global_prefix`
+/// is `MINTED_EXC_` and `number_sep` is `_`. `C_IDENTIFIER` folds every
+/// non-identifier byte to `_` inside `NameManager.uniquename`.
+/// Each claim omits `with_number`, as `SourceGenerator.uniquecname`
+/// and `_LocalScope.uniquename` do. `NameManager.uniquename` then
+/// sets `with_number = basename in ('v', 'w_')`. When that holds and
+/// the last character is not a digit, `fmt = '%s%d'`, so basename
+/// `v` is claimed as `v0`. Any other basename already in `seennames`
+/// — a sanitized collision or an earlier companion — comes back with
+/// the `_N` suffix from `NameManager._ensure_unique`. Claim order is the
+/// bare ident, then `_destructor`, then `_alloc_with_del`, then
+/// `_alloc_fnaddr`, so a later row whose basename is an earlier
+/// `_destructor` still takes that companion's `_1` suffix.
+///
+/// Every emitted `static` and `fn` name is `MINTED_EXC_` plus a
+/// `NameManager.uniquename` claim. The including module defines no
+/// `MINTED_EXC_`-prefixed item, so the table and the module's names
+/// sit outside the claimed namespace.
+///
+/// A non-empty `raw_owned` list also emits `support.py`
+/// `build_ll_0_alloc_with_del`: a zero-argument `extern "C"` wrapper
+/// closed over the row index and the row `PyType`, registered on
+/// `HELPER_FNADDRS` under `build_ll_0_alloc_with_del::{intern key}`.
 pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> String {
     if rows.is_empty() {
         return "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n".to_string();
     }
-    let mut idents = Vec::with_capacity(rows.len());
-    let mut out = String::new();
-    for row in rows {
-        let ident = minted_exception_class_ident(&row.name);
-        if ident == "MINTED_EXCEPTION_CLASSES" || idents.iter().any(|existing| existing == &ident) {
-            panic!(
-                "minted exception class ident collision: {ident} from `{}`",
-                row.name
-            );
-        }
-        idents.push(ident);
-    }
-    for (row, ident) in rows.iter().zip(&idents) {
-        let destructor = format!("{ident}_destructor");
-        if destructor == "MINTED_EXCEPTION_CLASSES"
-            || idents.iter().any(|existing| existing == &destructor)
-        {
-            panic!(
-                "minted exception class ident collision: {destructor} from `{}`",
-                row.name
-            );
-        }
-        out.push_str(&format!(
+    let mut names = crate::translator::gensupp::NameManager::new(MINTED_EXC_PREFIX, "_");
+    let mut defs = String::new();
+    let mut table =
+        String::from("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
+    for (index, row) in rows.iter().enumerate() {
+        // `NameManager.uniquename` (`gensupp.py`) with the default
+        // `with_number=None` (`basename in ('v', 'w_')`). Companions are
+        // claimed for every row, emitted or not, so a later ident
+        // cannot take `{bare}_destructor` or `{bare}_alloc_with_del`.
+        let (bare, ident) = names.uniquename_bare(&row.name, None, MINTED_EXC_NAME_LENMAX);
+        let destructor_name =
+            names.uniquename(&format!("{bare}_destructor"), None, MINTED_EXC_NAME_LENMAX);
+        let alloc_name = names.uniquename(
+            &format!("{bare}_alloc_with_del"),
+            None,
+            MINTED_EXC_NAME_LENMAX,
+        );
+        let alloc_fnaddr_name = names.uniquename(
+            &format!("{bare}_alloc_fnaddr"),
+            None,
+            MINTED_EXC_NAME_LENMAX,
+        );
+        defs.push_str(&format!(
             "static {ident}: pyre_object::PyType = pyre_object::pyobject::new_pytype(\"{}\");\n",
             escape_rust_string(&row.name)
         ));
-        if row.raw_owned.is_empty() {
-            continue;
-        }
-        out.push_str(&format!(
-            "unsafe fn {destructor}(obj_addr: usize) {{\n    unsafe {{\n"
-        ));
-        for raw in &row.raw_owned {
-            if raw.type_path.is_empty() {
-                panic!(
-                    "minted exception class `{}` raw-owned attr has an empty type path",
-                    row.name
-                );
+        let emit_destructor = !row.raw_owned.is_empty();
+        if emit_destructor {
+            defs.push_str(&format!(
+                "unsafe fn {destructor_name}(obj_addr: usize) {{\n    unsafe {{\n"
+            ));
+            for raw in &row.raw_owned {
+                if raw.type_path.is_empty() {
+                    panic!(
+                        "minted exception class `{}` raw-owned attr has an empty type path",
+                        row.name
+                    );
+                }
+                defs.push_str(&format!(
+                    "        drop_raw_owned_attr::<{}>(obj_addr, {});\n",
+                    raw.type_path, raw.offset
+                ));
             }
-            out.push_str(&format!(
-                "        drop_raw_owned_attr::<{}>(obj_addr, {});\n",
-                raw.type_path, raw.offset
+            defs.push_str("    }\n}\n");
+            // `support.py` `build_ll_0_alloc_with_del(RESULT, vtable)`:
+            // zero arguments; RESULT and the vtable are closed over.
+            // `HELPER_FNADDRS` publishes the path `handle_residual_call`
+            // records on `ConstFnAddr`. wasm32 has no `linkme` slice
+            // (`helper_fnaddr.rs` `register`).
+            defs.push_str(&format!(
+                "unsafe extern \"C\" fn {alloc_name}() -> i64 {{\n    alloc_with_del_for_index({index}, &{ident} as *const _ as usize)\n}}\n"
+            ));
+            let fnaddr_path = format!(
+                "build_ll_0_alloc_with_del::{}",
+                escape_rust_string(&row.name)
+            );
+            defs.push_str(&format!(
+                "#[cfg(not(target_arch = \"wasm32\"))]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0);\n}}\n"
             ));
         }
-        out.push_str("    }\n}\n");
-    }
-    out.push_str("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
-    for (row, ident) in rows.iter().zip(&idents) {
+        let destructor_field = if emit_destructor {
+            format!("Some({destructor_name})")
+        } else {
+            "None".to_string()
+        };
+        let alloc_field = if emit_destructor {
+            format!("Some({alloc_name})")
+        } else {
+            "None".to_string()
+        };
         let parent = match row.parent {
             None => "None".to_string(),
             Some(parent) => format!("Some({parent})"),
         };
-        let destructor = if row.raw_owned.is_empty() {
-            "None".to_string()
-        } else {
-            format!("Some({ident}_destructor)")
-        };
         let offsets = render_gc_ptr_offsets(&row.gc_ptr_offsets);
-        out.push_str(&format!(
-            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor} }},\n",
+        table.push_str(&format!(
+            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, size: {size}, gc_ptr_offsets: {offsets}, destructor: {destructor_field}, alloc_with_del: {alloc_field} }},\n",
             escape_rust_string(&row.name),
             size = row.size,
         ));
     }
-    out.push_str("];\n");
-    out
+    defs.push_str(&table);
+    defs.push_str("];\n");
+    defs
 }
 
 /// `&[]` or `&[16, 32]`. The slice is a static promotion inside the
@@ -1063,21 +1118,6 @@ fn render_gc_ptr_offsets(offsets: &[usize]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{body}]")
-}
-
-/// `MINTED_EXC_` plus the intern key, with every non-alphanumeric byte
-/// replaced by `_`. Deterministic. The caller panics when two keys share
-/// the result.
-pub fn minted_exception_class_ident(name: &str) -> String {
-    let mut ident = String::from("MINTED_EXC_");
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            ident.push(ch);
-        } else {
-            ident.push('_');
-        }
-    }
-    ident
 }
 
 fn escape_rust_string(text: &str) -> String {
@@ -2598,6 +2638,166 @@ mod tests {
         extend_program_exception_class_hints(
             &mut acc,
             harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&second)),
+        );
+    }
+
+    fn minted_emit(name: &str, raw_owned: bool) -> super::MintedExceptionClassEmit {
+        super::MintedExceptionClassEmit {
+            name: name.to_string(),
+            parent: None,
+            size: 0,
+            gc_ptr_offsets: Vec::new(),
+            raw_owned: if raw_owned {
+                vec![super::MintedRawOwnedDrop {
+                    offset: 8,
+                    type_path: "fixture::Signature".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// `pkg::E::A` and `pkg::E__A` both sanitize to `pkg__E__A`.
+    /// `NameManager.uniquename` keeps the first claim and gives the
+    /// second the `_1` suffix from `NameManager._ensure_unique`.
+    #[test]
+    fn minted_exception_sanitized_collision_uses_uniquename_suffix() {
+        let rows = vec![
+            minted_emit("pkg::E::A", true),
+            minted_emit("pkg::E__A", true),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert_eq!(src, super::render_minted_exception_classes_rs(&rows));
+        let first = src
+            .find("static MINTED_EXC_pkg__E__A:")
+            .expect("first ident");
+        let second = src
+            .find("static MINTED_EXC_pkg__E__A_1:")
+            .expect("second ident");
+        assert!(first < second, "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A,"), "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A_1,"), "{src}");
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_1_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("destructor: Some(MINTED_EXC_pkg__E__A_destructor)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("destructor: Some(MINTED_EXC_pkg__E__A_1_destructor)"),
+            "{src}"
+        );
+    }
+
+    /// A later intern key that sanitizes to an earlier row's
+    /// `_destructor` companion gets its own `_1` suffix.
+    #[test]
+    fn minted_exception_destructor_claim_disambiguates_later_ident() {
+        let rows = vec![
+            minted_emit("pkg::E::A", true),
+            minted_emit("pkg::E::A_destructor", false),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert!(
+            src.contains("unsafe fn MINTED_EXC_pkg__E__A_destructor("),
+            "{src}"
+        );
+        assert!(
+            src.contains("static MINTED_EXC_pkg__E__A_destructor_1:"),
+            "{src}"
+        );
+        assert!(src.contains("pytype: &MINTED_EXC_pkg__E__A,"), "{src}");
+        assert!(
+            src.contains("pytype: &MINTED_EXC_pkg__E__A_destructor_1,"),
+            "{src}"
+        );
+        assert!(
+            !src.contains("static MINTED_EXC_pkg__E__A_destructor:"),
+            "{src}"
+        );
+    }
+
+    /// `NameManager.uniquename` with omitted `with_number` (`gensupp.py`)
+    /// sets `with_number = basename in ('v', 'w_')` after `C_IDENTIFIER`.
+    /// A key that sanitizes to `v` is claimed as `v0` (`fmt = '%s%d'`).
+    /// `NameManager.global_prefix` then prepends `MINTED_EXC_`.
+    #[test]
+    fn minted_exception_v_key_takes_default_with_number() {
+        let rows = vec![minted_emit("v", false)];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        assert!(src.contains("static MINTED_EXC_v0:"), "{src}");
+        assert!(src.contains("pytype: &MINTED_EXC_v0,"), "{src}");
+        assert!(!src.contains("static MINTED_EXC_v:"), "{src}");
+        assert!(!src.contains("MINTED_EXC_v_0"), "{src}");
+    }
+
+    /// Item name on a rendered `static` or `fn` line.
+    fn rendered_item_ident(line: &str) -> Option<&str> {
+        let rest = [
+            "pub unsafe extern \"C\" fn ",
+            "unsafe extern \"C\" fn ",
+            "pub unsafe fn ",
+            "pub static ",
+            "pub fn ",
+            "unsafe fn ",
+            "static ",
+            "fn ",
+        ]
+        .into_iter()
+        .find_map(|prefix| line.strip_prefix(prefix))?;
+        let end = rest.find(|ch: char| ch == ':' || ch == '(')?;
+        Some(&rest[..end])
+    }
+
+    /// `MINTED_EXCEPTION_CLASSES`, `MintedExceptionClass`, and
+    /// `EPTION_CLASSES` still emit only `MINTED_EXC_` `static` and `fn`
+    /// idents. `MINTED_EXCEPTION_CLASSES` is defined once, as the table.
+    #[test]
+    fn minted_exception_row_idents_keep_the_prefix() {
+        let rows = vec![
+            minted_emit("MINTED_EXCEPTION_CLASSES", true),
+            minted_emit("MintedExceptionClass", true),
+            minted_emit("EPTION_CLASSES", true),
+        ];
+        let src = super::render_minted_exception_classes_rs(&rows);
+        let mut statics = 0usize;
+        let mut fns = 0usize;
+        for line in src.lines() {
+            let Some(ident) = rendered_item_ident(line) else {
+                continue;
+            };
+            if line.starts_with("static ") {
+                statics += 1;
+            } else if line.starts_with("unsafe extern \"C\" fn ")
+                || line.starts_with("unsafe fn ")
+                || line.starts_with("fn ")
+            {
+                fns += 1;
+            } else {
+                continue;
+            }
+            assert!(ident.starts_with("MINTED_EXC_"), "{ident}\n{src}");
+        }
+        // Each raw-owned row emits a pytype static and a `HELPER_FNADDRS`
+        // static, plus a destructor, an `alloc_with_del` extern, and a
+        // wasm32 ctor.
+        assert_eq!(statics, rows.len() * 2, "{src}");
+        assert_eq!(fns, rows.len() * 3, "{src}");
+        let definitions: Vec<&str> = src
+            .lines()
+            .filter(|line| rendered_item_ident(line) == Some("MINTED_EXCEPTION_CLASSES"))
+            .collect();
+        assert_eq!(
+            definitions,
+            ["pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &["],
+            "{src}"
         );
     }
 }

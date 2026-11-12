@@ -4617,20 +4617,70 @@ fn exception_class_annotation_is_list_of_str(
         && matches!(item.s_value, crate::annotator::model::SomeValue::String(_))
 }
 
-/// Storage spelling of a generalized annotation. Signed `SomeInteger` is
-/// `lltype.Signed` (`isize`); unsigned is `lltype.Unsigned` (`usize`).
+/// Byte size of `lltype` at `signed_size`. `Signed` / `Unsigned` use
+/// that size (`primitive_byte_size_for`), not the pointer word.
+fn exception_class_integer_byte_size(
+    lltype: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    signed_size: usize,
+) -> Option<usize> {
+    let signed = i64::try_from(signed_size).ok()?;
+    let word = i64::try_from(crate::layout::target_word_size()).ok()?;
+    let bytes = crate::translator::rtyper::lltypesystem::llmemory::primitive_byte_size_for(
+        lltype, word, signed,
+    )
+    .ok()?;
+    usize::try_from(bytes).ok()
+}
+
+/// `(spelling, ValueType, collapsed lltype)` of a `SomeInteger`.
+///
+/// `SomeInteger.rtyper_makerepr` is `build_number(None, knowntype)`.
+/// `array_of_lltype_identity_for` is that lltype after `r_longlong is
+/// r_int` when `Signed` is 8 bytes. The spelling is the uncollapsed
+/// name when `scalar_lltype_for` still projects it onto the collapsed
+/// type (`r_longlong` stays `i64`), otherwise `lltype_item_spelling`.
+fn exception_class_integer_storage(
+    annotation: &crate::annotator::model::SomeValue,
+    signed_size: usize,
+) -> Option<(
+    String,
+    ValueType,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    use crate::annotator::model::SomeValue;
+    let SomeValue::Integer(int) = annotation else {
+        return None;
+    };
+    let built =
+        crate::translator::rtyper::lltypesystem::lltype::build_number(None, int.base.knowntype)
+            .ok()?;
+    let lltype = crate::codewriter::call::array_of_lltype_identity_for(&built, signed_size);
+    let uncollapsed = crate::codewriter::call::lltype_item_spelling(&built)?;
+    let spelling = if crate::annotator::bookkeeper::scalar_lltype_for(&uncollapsed, signed_size)
+        .as_ref()
+        == Some(&lltype)
+    {
+        uncollapsed
+    } else {
+        crate::codewriter::call::lltype_item_spelling(&lltype)?
+    };
+    let value_type = crate::codewriter::annotation_state::somevalue_to_valuetype(annotation);
+    Some((spelling, value_type, lltype))
+}
+
+/// Storage spelling of a generalized annotation.
+///
+/// A `SomeInteger` follows [`exception_class_integer_storage`]
+/// (`build_number` of the knowntype). `int` is `isize`, `r_uint` is
+/// `usize`, `r_longlong` is `i64`, `r_ulonglong` is `u64`.
 fn exception_class_annotation_repr(
     annotation: &crate::annotator::model::SomeValue,
+    signed_size: usize,
 ) -> Option<(String, ValueType)> {
     use crate::annotator::model::SomeValue;
     match annotation {
-        SomeValue::Integer(int) => {
-            if int.unsigned {
-                Some(("usize".to_string(), ValueType::Unsigned))
-            } else {
-                Some(("isize".to_string(), ValueType::Int))
-            }
-        }
+        SomeValue::Integer(_) => exception_class_integer_storage(annotation, signed_size)
+            .map(|(spelling, value_type, _)| (spelling, value_type)),
         SomeValue::Bool(_) => Some(("bool".to_string(), ValueType::Bool)),
         SomeValue::Float(_) => Some(("f64".to_string(), ValueType::Float)),
         SomeValue::SingleFloat(_) => Some(("f32".to_string(), ValueType::SingleFloat)),
@@ -4825,6 +4875,7 @@ fn exception_class_generalized_owner_row(
     owner_variant: &str,
     decls: &[ExceptionClassAttrDecl],
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    signed_size: usize,
 ) -> (crate::front::semantic::FieldRow, (String, ValueType)) {
     let ordered = exception_class_order_owner(owner_variant, decls);
     if ordered.is_empty() || ordered[0].variant_name != owner_variant {
@@ -4893,16 +4944,57 @@ fn exception_class_generalized_owner_row(
             }
         }
         ExceptionClassAttrKind::Ordinary => {
-            // `i64` and `isize` share `get_type_flag` on a 64-bit target
-            // and `unionof` does not widen, so the owner's row is already
-            // that signed integer. A wider union takes the declaration
-            // whose flag is the annotation's (`lltype.Signed` / `Unsigned`),
-            // or that canonical spelling when none matches.
+            // Same `get_type_flag` and an unwidened `unionof`
+            // (`compute_restype` of equal knowntypes) keep the owner's
+            // row. A wider integer takes the declaration whose
+            // `scalar_lltype_for` and `get_type_flag` size are
+            // `build_number` of the unioned knowntype
+            // (`array_of_lltype_identity_for`), or that spelling when
+            // none matches.
             let widened = ordered.iter().any(|decl| decl.s_value != acc);
             if exception_class_flags_agree(&ordered, raw_alloc_flavor_structs) && !widened {
                 return exception_class_publish_owner(owner, field_name);
             }
-            let Some((canon_ty, canon_vt)) = exception_class_annotation_repr(&acc) else {
+            if let Some((canon_ty, canon_vt, lltype)) =
+                exception_class_integer_storage(&acc, signed_size)
+            {
+                if let Some(size) = exception_class_integer_byte_size(&lltype, signed_size) {
+                    let projects = |row_ty: &str, attr_ty: &ValueType| {
+                        let (_, _, flag_size) = crate::codewriter::call::get_type_flag(
+                            row_ty,
+                            raw_alloc_flavor_structs,
+                        );
+                        attr_ty == &canon_vt
+                            && crate::annotator::bookkeeper::scalar_lltype_for(row_ty, signed_size)
+                                .as_ref()
+                                == Some(&lltype)
+                            && flag_size == size
+                    };
+                    if projects(&owner.row_ty, &owner.attr_ty) {
+                        return exception_class_publish_owner(owner, field_name);
+                    }
+                    if let Some(decl) = ordered
+                        .iter()
+                        .find(|decl| projects(&decl.row_ty, &decl.attr_ty))
+                    {
+                        return (
+                            exception_class_owner_field_row(
+                                owner,
+                                field_name,
+                                decl.row_ty.clone(),
+                                None,
+                            ),
+                            (field_name.to_string(), decl.attr_ty.clone()),
+                        );
+                    }
+                }
+                return (
+                    exception_class_owner_field_row(owner, field_name, canon_ty, None),
+                    (field_name.to_string(), canon_vt),
+                );
+            }
+            let Some((canon_ty, canon_vt)) = exception_class_annotation_repr(&acc, signed_size)
+            else {
                 exception_class_attr_types_panic(class_name, field_name, &ordered);
             };
             let target =
@@ -5057,6 +5149,7 @@ fn register_exception_class_variant_fields(
                 owner,
                 &group.decls,
                 raw_alloc_flavor_structs,
+                crate::layout::target_signed_size(),
             );
             rows.push(row);
             attrs.push(attr);

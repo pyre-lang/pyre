@@ -33,7 +33,7 @@ use crate::rlib::rarithmetic::{
     RIntPayload, RIntValue, rint_new, rint_value, signed_int_overflow_message,
 };
 use crate::tool::ansi_print::AnsiLogger;
-use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
+use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
@@ -334,6 +334,11 @@ fn const_to_llvalue(c: &Constant) -> LLValue {
             Some(LowLevelType::Bool) => LLValue::Bool(false),
             _ => LLValue::Int(0),
         },
+        // `malloc_zero_filled` is `CDefinedIntSymbolic('MALLOC_ZERO_FILLED', default=0)`.
+        // `new_malloc` passes it to `int_is_true` at Signed. Default 0
+        // makes `int_is_true` false, so the llinterp takes the false
+        // link and stores `hash = 0`.
+        ConstValue::SpecTag(tag) if *tag == MALLOC_ZERO_FILLED_TAG_ID => LLValue::Int(0),
         other => llvalue_from_constvalue(other),
     }
 }
@@ -2872,7 +2877,12 @@ fn exact_int_of_const(case: &ConstValue) -> Option<ExactInt> {
 }
 
 /// `intmask` (signed) / `unsigned_int.__new__` (unsigned) down to `LONG_BIT`.
-fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
+///
+/// `word` is `layout::target_signed_size` (`rffi.sizeof(lltype.Signed)`).
+/// Word 8 keeps the low 64 bits; any other word sign-extends (signed) or
+/// zero-extends (unsigned) the low 32 bits, matching `rarithmetic.intmask`
+/// when `LONG_BIT` is 32.
+pub(crate) fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
     if word == 8 {
         if signed {
             low128 as i64
@@ -7027,6 +7037,88 @@ mod tests {
             super::const_to_llvalue(&Constant::new(ConstValue::UInt128(u128::MAX))),
             LLValue::UInt128(u128::MAX)
         );
+    }
+
+    /// `malloc_zero_filled` is `CDefinedIntSymbolic('MALLOC_ZERO_FILLED', default=0)`.
+    /// At Signed that default is 0, so `int_is_true` is false and the
+    /// false link stores `hash = 0`.
+    #[test]
+    fn const_to_llvalue_maps_malloc_zero_filled_to_default_zero() {
+        let signed_c = Constant::with_concretetype(
+            ConstValue::SpecTag(MALLOC_ZERO_FILLED_TAG_ID),
+            LowLevelType::Signed,
+        );
+        assert_eq!(super::const_to_llvalue(&signed_c), LLValue::Int(0));
+    }
+
+    #[test]
+    fn eval_mallocstr_helper_stores_hash_zero() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            STRPTR, build_ll_mallocstr_helper_graph,
+        };
+
+        let helper = build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+            .expect("build_ll_mallocstr_helper_graph");
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                helper.graph.clone() as Rc<dyn Any>,
+                vec![Rc::new(4_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect("mallocstr helper");
+        let LowLevelValue::Ptr(ptr) = &*out.downcast::<LowLevelValue>().expect("Ptr return") else {
+            panic!("expected a STR pointer return");
+        };
+        match ptr.getattr("hash").expect("hash field") {
+            LowLevelValue::Signed(0) => {}
+            other => panic!("mallocstr hash must be 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_ll_join_chars_helper_stores_hash_zero() {
+        use crate::translator::rtyper::lltypesystem::lltype::MallocFlavor;
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            STRPTR, build_ll_join_chars_helper_graph_for,
+        };
+
+        let items_ll = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Char)),
+        }));
+        let helper =
+            build_ll_join_chars_helper_graph_for("ll_join_chars", items_ll, STRPTR.clone())
+                .expect("ll_join_chars");
+        let mut chars = malloc(
+            LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char))),
+            Some(3),
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("chars");
+        for (index, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            chars
+                .setitem(index, LowLevelValue::Char(ch))
+                .expect("fill chars");
+        }
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                helper.graph.clone() as Rc<dyn Any>,
+                vec![
+                    Rc::new(3_i64) as Rc<dyn Any>,
+                    Rc::new(LowLevelValue::Ptr(Box::new(chars))) as Rc<dyn Any>,
+                ],
+                false,
+            )
+            .expect("ll_join_chars helper");
+        let LowLevelValue::Ptr(ptr) = &*out.downcast::<LowLevelValue>().expect("Ptr return") else {
+            panic!("expected a STR pointer return");
+        };
+        match ptr.getattr("hash").expect("hash field") {
+            LowLevelValue::Signed(0) => {}
+            other => panic!("ll_join_chars hash must be 0, got {other:?}"),
+        }
     }
 
     fn number_class_of(ty: &LowLevelType) -> crate::annotator::model::RIntClass {

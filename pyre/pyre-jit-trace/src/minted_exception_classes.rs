@@ -43,6 +43,26 @@ fn register_generated_minted_exception_class_table() {
     pyre_interpreter::error::register_minted_exception_class_table(MINTED_EXCEPTION_CLASSES);
 }
 
+/// `support.py` `build_ll_0_alloc_with_del` for one minted row.
+///
+/// `index` selects the STRUCT. The tid is the one
+/// [`register_minted_exception_classes`] assigns that row. `vtable` is
+/// the row's `PyType`. Header stores go through
+/// `majit_backend::alloc_with_del` / `write_new_with_vtable_header`
+/// (`llmodel.py` `bh_new_with_vtable`), with the product's
+/// `OB_TYPE_OFFSET` and `W_CLASS_OFFSET`.
+fn alloc_with_del_for_index(index: usize, vtable: usize) -> i64 {
+    let row = &MINTED_EXCEPTION_CLASSES[index];
+    let tid = pyre_interpreter::pyopcode::minted_exception_first_gc_type_id() + index as u32;
+    majit_backend::alloc_with_del(
+        tid,
+        row.size,
+        vtable,
+        Some(pyre_object::pyobject::OB_TYPE_OFFSET),
+        Some(pyre_object::pyobject::W_CLASS_OFFSET),
+    )
+}
+
 /// Register `rows` in parent-before-child order.
 ///
 /// Each row is `TypeInfo::object_subclass_with_gc_ptrs` of the layout
@@ -68,6 +88,10 @@ pub fn register_minted_exception_classes(
     rows: &[MintedExceptionClass],
     host_exc_tid: u32,
 ) -> Vec<u32> {
+    // Generated `build_ll_0_alloc_with_del` wrappers call
+    // `alloc_with_del_for_index`. The extraction placeholder emits no
+    // wrapper, so the registration path names the helper too.
+    let _ = alloc_with_del_for_index as fn(usize, usize) -> i64;
     let mut tids = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let parent_tid = match row.parent {
@@ -152,13 +176,13 @@ mod tests {
         let b_at = src.find("static MINTED_EXC_synth__E__B:").expect("B ident");
         assert!(base_at < a_at && a_at < b_at);
         assert!(src.contains(
-            "MintedExceptionClass { name: \"synth::E\", pytype: &MINTED_EXC_synth__E, parent: None, size: 0, gc_ptr_offsets: &[], destructor: None }"
+            "MintedExceptionClass { name: \"synth::E\", pytype: &MINTED_EXC_synth__E, parent: None, size: 0, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }"
         ));
         assert!(src.contains(
-            "MintedExceptionClass { name: \"synth::E::A\", pytype: &MINTED_EXC_synth__E__A, parent: Some(0), size: 0, gc_ptr_offsets: &[], destructor: None }"
+            "MintedExceptionClass { name: \"synth::E::A\", pytype: &MINTED_EXC_synth__E__A, parent: Some(0), size: 0, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }"
         ));
         assert!(src.contains(
-            "MintedExceptionClass { name: \"synth::E::B\", pytype: &MINTED_EXC_synth__E__B, parent: Some(1), size: 0, gc_ptr_offsets: &[], destructor: None }"
+            "MintedExceptionClass { name: \"synth::E::B\", pytype: &MINTED_EXC_synth__E__B, parent: Some(1), size: 0, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }"
         ));
         assert!(src.contains("pyre_object::pyobject::new_pytype(\"synth::E\")"));
         assert!(src.contains("pyre_object::pyobject::new_pytype(\"synth::E::A\")"));
@@ -201,6 +225,7 @@ mod tests {
                 size: object_size,
                 gc_ptr_offsets: &[],
                 destructor: None,
+                alloc_with_del: None,
             },
             MintedExceptionClass {
                 name: "test::E::A",
@@ -209,6 +234,7 @@ mod tests {
                 size: object_size,
                 gc_ptr_offsets: &[],
                 destructor: None,
+                alloc_with_del: None,
             },
             MintedExceptionClass {
                 name: "test::E::B",
@@ -217,6 +243,7 @@ mod tests {
                 size: object_size,
                 gc_ptr_offsets: &[],
                 destructor: None,
+                alloc_with_del: None,
             },
         ];
         let mut gc = MiniMarkGC::new();
@@ -285,19 +312,32 @@ mod tests {
         assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooMany_destructor"));
         assert!(src.contains("drop_raw_owned_attr::<fixture::Signature>(obj_addr, 8)"));
         assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
+        assert!(src.contains("unsafe extern \"C\" fn MINTED_EXC_Arg__TooMany_alloc_with_del"));
         assert!(src.contains(
-            "MintedExceptionClass { name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: 0, gc_ptr_offsets: &[], destructor: None }"
+            "alloc_with_del_for_index(1, &MINTED_EXC_Arg__TooMany as *const _ as usize)"
+        ));
+        assert!(src.contains("build_ll_0_alloc_with_del::Arg::TooMany"));
+        assert!(src.contains("#[linkme(crate = ::majit_ir::linkme)]"));
+        assert!(src.contains("alloc_with_del: Some(MINTED_EXC_Arg__TooMany_alloc_with_del)"));
+        assert!(src.contains(
+            "MintedExceptionClass { name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: 0, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }"
         ));
         assert!(
             !src.contains("fn MINTED_EXC_Arg_destructor"),
             "a class with no raw-owned attr has no destructor; src={src}"
         );
+        assert!(
+            !src.contains("fn MINTED_EXC_Arg_alloc_with_del"),
+            "a class with no raw-owned attr has no alloc_with_del; src={src}"
+        );
     }
 
     static MINTED_RAW_DESTRUCTOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(not(target_arch = "wasm32"))]
     static MINTED_RAW_DESTRUCTOR_RUNS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe fn minted_raw_counting_destructor(_obj_addr: usize) {
         MINTED_RAW_DESTRUCTOR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -422,8 +462,52 @@ mod tests {
         }
     }
 
+    /// Re-run one collecting test in its own process.
+    ///
+    /// `MiniMarkGC::do_collect_nursery` takes the process-global STW when
+    /// `gc_sync::stw_required` reports another registered mutator. A parallel
+    /// lib test that then acquires the GIL trips `rejoin_running_after_gil`.
+    /// The child is `--exact --test-threads=1`. `PYRE_MINTED_GC_CHILD` names
+    /// the test: the matching invocation runs `body`, and the parent asserts
+    /// the child passed that one test. wasm32 has no process spawn.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_in_child(test_name: &str, body: fn()) {
+        if std::env::var("PYRE_MINTED_GC_CHILD").is_ok_and(|name| name == test_name) {
+            body();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let module = module_path!();
+        let module = module
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module);
+        let filter = format!("{module}::{test_name}");
+        let output = std::process::Command::new(&exe)
+            .args([&filter, "--exact", "--test-threads=1"])
+            .env("PYRE_MINTED_GC_CHILD", test_name)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {exe:?}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(&filter) && stdout.contains("1 passed"),
+            "{test_name} child failed: status={} filter={filter}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn minted_class_destructor_runs_once_on_collection() {
+        run_in_child(
+            "minted_class_destructor_runs_once_on_collection",
+            minted_class_destructor_runs_once_on_collection_body,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn minted_class_destructor_runs_once_on_collection_body() {
         use majit_ir::descr::SizeDescr;
 
         let _guard = MINTED_RAW_DESTRUCTOR_LOCK
@@ -451,6 +535,114 @@ mod tests {
         assert_eq!(unsafe { (*header).type_id() }, minted.tid);
         let _plain = gc.alloc_with_type(0, object_size);
         gc.do_collect_nursery();
+        assert_eq!(
+            MINTED_RAW_DESTRUCTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// `support.py` `build_ll_0_alloc_with_del` allocates through
+    /// `MiniMarkGC::alloc_with_type`, so `finish_nursery_object` runs
+    /// `register_young_object_if_needed`. A minor collection then runs the
+    /// destructor once. The header stores are `write_new_with_vtable_header`:
+    /// `ob_type` is the minted `PyType`, and `w_class` is that type's
+    /// `instantiate` pointer.
+    ///
+    /// The helper calls `gc_op`, which borrows the process-global collector.
+    /// Installing that collector, or the `w_class` resolver, in this process
+    /// races lib tests that assert the singleton is still unset. The parent
+    /// only spawns a one-test child (`run_in_child`).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn alloc_with_del_registers_young_destructor_once() {
+        run_in_child(
+            "alloc_with_del_registers_young_destructor_once",
+            alloc_with_del_child_body,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn alloc_with_del_child_body() {
+        static CLASS_WORD: pyre_object::PyObject = pyre_object::PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        };
+
+        let _guard = MINTED_RAW_DESTRUCTOR_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        MINTED_RAW_DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let index = MINTED_EXCEPTION_CLASSES
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.alloc_with_del.is_some() && row.size > 0)
+            .min_by_key(|(_, row)| row.size)
+            .map(|(index, _)| index)
+            .expect("generated minted table has no alloc_with_del row");
+        let row = &MINTED_EXCEPTION_CLASSES[index];
+        let tid = pyre_interpreter::pyopcode::minted_exception_first_gc_type_id() + index as u32;
+        let word = std::mem::size_of::<usize>();
+        assert!(row.size >= pyre_object::pyobject::W_CLASS_OFFSET + word);
+        assert!(row.size >= pyre_object::pyobject::OB_TYPE_OFFSET + word);
+        let vtable = row.pytype as *const pyre_object::PyType as usize;
+        let class_word = &CLASS_WORD as *const pyre_object::PyObject as usize;
+
+        majit_gc::rgil::acquire_maybe_in_new_thread();
+        if !majit_gc::gc_sync::is_initialized() {
+            majit_gc::gc_sync::store_singleton(Box::new(MiniMarkGC::new()));
+        }
+        pyre_object::pyobject::set_instantiate(row.pytype, class_word as pyre_object::PyObjectRef);
+        let _ = majit_ir::descr::set_w_class_obj_resolver(crate::descr::w_class_obj_for_vtable);
+        assert_eq!(
+            majit_ir::descr::resolve_w_class_obj(vtable),
+            Some(class_word as i64),
+            "w_class resolver did not return the minted instantiate pointer"
+        );
+
+        majit_gc::gc_sync::gc_op(|gc| {
+            let object_size = std::mem::size_of::<pyre_object::PyObject>();
+            if gc.types.len() > tid as usize {
+                let info = gc.types.get(tid);
+                assert!(
+                    info.old_style_finalizer.is_none(),
+                    "minted tid {tid} already has an old-style finalizer; set_destructor cannot attach the counting destructor"
+                );
+                gc.types.set_destructor(tid, minted_raw_counting_destructor);
+                return;
+            }
+            while gc.types.len() < tid as usize {
+                let id = gc.register_type(majit_gc::trace::TypeInfo::object(object_size));
+                assert!(id < tid);
+            }
+            let registered = gc.register_type(
+                majit_gc::trace::TypeInfo::object(row.size)
+                    .with_destructor_fn(minted_raw_counting_destructor),
+            );
+            assert_eq!(registered, tid);
+            assert!(gc.types.get(registered).destructor.is_some());
+        });
+
+        let alloc = row.alloc_with_del.expect("alloc_with_del");
+        let addr = unsafe { alloc() };
+        assert_ne!(addr, 0, "build_ll_0_alloc_with_del returned NULL");
+        let addr = addr as usize;
+        let ob_type = unsafe { *((addr + pyre_object::pyobject::OB_TYPE_OFFSET) as *const usize) };
+        let w_class = unsafe { *((addr + pyre_object::pyobject::W_CLASS_OFFSET) as *const usize) };
+        assert_eq!(ob_type, vtable);
+        assert_eq!(w_class, class_word);
+
+        majit_gc::gc_sync::gc_op(|gc| {
+            assert!(gc.is_in_nursery(addr), "alloc_with_del left the nursery");
+            let header = unsafe { majit_gc::header::header_of(addr) };
+            assert_eq!(unsafe { (*header).type_id() }, tid);
+            gc.do_collect_nursery();
+        });
+        assert_eq!(
+            MINTED_RAW_DESTRUCTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
         assert_eq!(
             MINTED_RAW_DESTRUCTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -553,6 +745,7 @@ mod tests {
             size: inst_size,
             gc_ptr_offsets: row_offsets,
             destructor: None,
+            alloc_with_del: None,
         }];
         let mut gc = MiniMarkGC::new();
         let object_tid = gc.register_type(majit_gc::trace::TypeInfo::object(std::mem::size_of::<
@@ -571,14 +764,19 @@ mod tests {
 
     /// A nursery instance keeps its scalar bytes across a minor collection,
     /// and a young object stored in a registered GC-pointer field is
-    /// updated to the moved address.
-    ///
-    /// `do_collect_nursery` takes the process-global STW when any other
-    /// mutator is registered. A second collector in this process stores
-    /// `STW_DEPTH` over the first, so this shares the destructor test's
-    /// lock and only one minted collection owns that word.
+    /// updated to the moved address. The collection runs in a one-test
+    /// child ([`run_in_child`]).
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn minted_instance_young_pointer_and_scalar_survive_minor_collection() {
+        run_in_child(
+            "minted_instance_young_pointer_and_scalar_survive_minor_collection",
+            minted_instance_young_pointer_and_scalar_survive_minor_collection_body,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn minted_instance_young_pointer_and_scalar_survive_minor_collection_body() {
         let _guard = MINTED_RAW_DESTRUCTOR_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -594,6 +792,7 @@ mod tests {
             size: inst_size,
             gc_ptr_offsets: offsets,
             destructor: None,
+            alloc_with_del: None,
         }];
         let mut gc = MiniMarkGC::new();
         let object_tid = gc.register_type(majit_gc::trace::TypeInfo::object(std::mem::size_of::<
@@ -653,9 +852,19 @@ mod tests {
     /// nursery bump. The parent is the object root that traces
     /// `w_class`, so a minor collection visits the word. A scalar that
     /// the descr does not list stays poison, which a whole-object
-    /// memclear would have wiped.
+    /// memclear would have wiped. The collections run in a one-test child
+    /// ([`run_in_child`]).
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn minted_instance_clears_header_class_word_on_a_dirty_nursery() {
+        run_in_child(
+            "minted_instance_clears_header_class_word_on_a_dirty_nursery",
+            minted_instance_clears_header_class_word_on_a_dirty_nursery_body,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn minted_instance_clears_header_class_word_on_a_dirty_nursery_body() {
         use majit_ir::descr::{FieldDescr, SizeDescr};
 
         let _guard = MINTED_RAW_DESTRUCTOR_LOCK
@@ -695,6 +904,7 @@ mod tests {
             size: inst_size,
             gc_ptr_offsets: payload,
             destructor: None,
+            alloc_with_del: None,
         }];
         let tids = register_minted_exception_classes(&mut gc, &rows, host_tid);
         let registered = gc.types.get(tids[0]).gc_ptr_offsets.clone();
@@ -762,6 +972,7 @@ mod tests {
         gc.roots.clear();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn field_spec(
         index: u32,
         key: &str,

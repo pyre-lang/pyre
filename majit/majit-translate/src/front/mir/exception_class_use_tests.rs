@@ -2304,6 +2304,123 @@ fn exception_class_inherited_i64_isize_merges_on_owner() {
     assert_eq!(owners, vec!["synth::E::A"]);
 }
 
+fn ordinary_integer_decl(
+    variant: &str,
+    row_ty: &str,
+    signed_size: usize,
+) -> super::super::ExceptionClassAttrDecl {
+    let s_value =
+        crate::annotator::bookkeeper::integer_annotation_for_spelling(row_ty, signed_size)
+            .unwrap_or_else(|| panic!("{row_ty} at signed size {signed_size}"));
+    super::super::ExceptionClassAttrDecl {
+        variant_name: variant.to_string(),
+        field_index: 0,
+        is_positional: false,
+        is_atomic: false,
+        declared: row_ty.to_string(),
+        row_ty: row_ty.to_string(),
+        attr_ty: ValueType::Int,
+        raw_owned: None,
+        s_value,
+        one_word: true,
+        kind: super::super::ExceptionClassAttrKind::Ordinary,
+    }
+}
+
+/// Ancestor `x: i64`, subclass `x: isize`, with `Signed` 4 bytes.
+/// `compute_restype` keeps `r_longlong`; the owner row stays `i64`
+/// (`SignedLongLong`, 8 bytes). The owner declared as `isize` widens
+/// to that same row.
+#[test]
+fn exception_class_inherited_i64_isize_keeps_i64_when_signed_is_four_bytes() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let raw = std::collections::HashSet::new();
+    let owner_i64 = vec![
+        ordinary_integer_decl("A", "i64", 4),
+        ordinary_integer_decl("B", "isize", 4),
+    ];
+    let (row, attr) = super::super::exception_class_generalized_owner_row(
+        "synth::E::A",
+        "x",
+        "A",
+        &owner_i64,
+        &raw,
+        4,
+    );
+    assert_eq!(row.name, "x");
+    assert_eq!(row.ty, "i64");
+    assert!(row.raw_owned.is_none());
+    assert_eq!(attr, ("x".to_string(), ValueType::Int));
+    assert_eq!(
+        crate::annotator::bookkeeper::scalar_lltype_for("i64", 4),
+        Some(LowLevelType::SignedLongLong)
+    );
+
+    let owner_isize = vec![
+        ordinary_integer_decl("A", "isize", 4),
+        ordinary_integer_decl("B", "i64", 4),
+    ];
+    let (row, attr) = super::super::exception_class_generalized_owner_row(
+        "synth::E::A",
+        "x",
+        "A",
+        &owner_isize,
+        &raw,
+        4,
+    );
+    assert_eq!(row.ty, "i64");
+    assert_eq!(attr, ("x".to_string(), ValueType::Int));
+    assert_eq!(
+        crate::annotator::bookkeeper::scalar_lltype_for(&row.ty, 4),
+        Some(LowLevelType::SignedLongLong)
+    );
+}
+
+/// `int` → `isize`, `r_uint` → `usize`, `r_longlong` → `i64`,
+/// `r_ulonglong` → `u64`. `i64` is `Signed` when `Signed` is 8 bytes
+/// and `SignedLongLong` when it is 4.
+#[test]
+fn exception_class_annotation_repr_follows_integer_knowntype() {
+    use crate::annotator::model::{KnownType, SomeInteger, SomeValue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let repr = |knowntype, signed_size| {
+        let ann = SomeValue::Integer(SomeInteger::new_with_knowntype(false, knowntype));
+        super::super::exception_class_annotation_repr(&ann, signed_size).expect("integer repr")
+    };
+    assert_eq!(
+        repr(KnownType::Int, 4),
+        ("isize".to_string(), ValueType::Int)
+    );
+    assert_eq!(
+        repr(KnownType::Ruint, 4),
+        ("usize".to_string(), ValueType::Unsigned)
+    );
+    assert_eq!(
+        repr(KnownType::LongLong, 4),
+        ("i64".to_string(), ValueType::Int)
+    );
+    assert_eq!(
+        repr(KnownType::LongLong, 8),
+        ("i64".to_string(), ValueType::Int)
+    );
+    assert_eq!(
+        repr(KnownType::ULongLong, 4),
+        ("u64".to_string(), ValueType::Unsigned)
+    );
+    assert_eq!(
+        repr(KnownType::ULongLong, 8),
+        ("u64".to_string(), ValueType::Unsigned)
+    );
+    assert_eq!(
+        crate::annotator::bookkeeper::scalar_lltype_for("i64", 8),
+        Some(LowLevelType::Signed)
+    );
+    assert_eq!(
+        crate::annotator::bookkeeper::scalar_lltype_for("i64", 4),
+        Some(LowLevelType::SignedLongLong)
+    );
+}
+
 #[test]
 #[should_panic(expected = "exception class synth::E::A.x: field type i64 ∪ String")]
 fn exception_class_inherited_field_type_mismatch_panics() {
@@ -3471,8 +3588,16 @@ fn exception_class_raw_owned_destructor_includes_inherited_attr() {
     assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooManyMethod_destructor"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
     assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooManyMethod_destructor)"));
+    assert!(src.contains("unsafe extern \"C\" fn MINTED_EXC_Arg__TooMany_alloc_with_del"));
+    assert!(src.contains("unsafe extern \"C\" fn MINTED_EXC_Arg__TooManyMethod_alloc_with_del"));
+    assert!(src.contains("build_ll_0_alloc_with_del::Arg::TooMany"));
+    assert!(src.contains("build_ll_0_alloc_with_del::Arg::TooManyMethod"));
+    assert!(
+        !src.contains("fn MINTED_EXC_Arg_alloc_with_del"),
+        "the base owns no raw attr; src={src}"
+    );
     assert!(src.contains(&format!(
-        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None }}",
+        "MintedExceptionClass {{ name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, size: {}, gc_ptr_offsets: &[], destructor: None, alloc_with_del: None }}",
         base.size
     )));
     assert!(
