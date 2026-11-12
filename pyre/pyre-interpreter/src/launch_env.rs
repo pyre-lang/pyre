@@ -61,6 +61,9 @@ pub struct LaunchFlags {
     pub debug: i64,
     pub bytes_warning: i64,
     pub dont_write_bytecode: bool,
+    /// `-R`: `config_parse_cmdline` sets `use_hash_seed = 0`, so the hash
+    /// secret is random whatever PYTHONHASHSEED says.
+    pub hash_randomization: bool,
     /// `-X pycache_prefix[=PATH]`, three-state until [`finalize`] resolves it.
     /// `None` is an option the command line did not name, and is the only
     /// state PYTHONPYCACHEPREFIX still applies to; after finalize a `Some`
