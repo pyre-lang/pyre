@@ -2646,8 +2646,8 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 ///
 /// `startpoints` (`jitcode.py:40`) is the assembler's own record of where
 /// instructions begin, and the authority the blackhole already uses for this
-/// question — `blackhole.py dispatch_loop` asserts its position against it,
-/// and `find_catch_before_resume_live` scans it for op boundaries. Assembled
+/// question — `blackhole.py dispatch_loop` asserts its position against it.
+/// Assembled
 /// jitcodes always populate it; a hand-built one leaves it `None`
 /// (`jitcode.py setup(..., startpoints=None)`), so fall back to walking the
 /// fallthrough layout. `decoded_ops` starts at 0 and stops at the first byte it
@@ -5869,6 +5869,12 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
                 | "module_spec_get_initializing"
                 | "bootstrap_handle_fromlist"
                 | "default_importlib_import_word"
+                // `dont_look_inside` write barrier: `list_write_barrier` then
+                // the stored word. The graph is top so the opcode is may-force,
+                // but the helper does not re-enter Python (`GUARD_NOT_FORCED`
+                // cannot fail for a callback). `ll_append` residual-calls it
+                // between `_ll_resize_ge` and `ll_setitem_fast`.
+                | "prepare_list_ref_store"
         )
     })
 }

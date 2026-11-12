@@ -3655,16 +3655,16 @@ pub(crate) fn catch_predecessor_is_reachable(
 }
 
 /// Pc of the `catch_exception` `handle_exception_in_frame` would read after
-/// skipping leading `live`s from `resume_pc`.
+/// skipping one `live` from `resume_pc`.
 pub(crate) fn landing_catch_pc(code: &[u8], resume_pc: usize) -> Option<usize> {
     let mut landing = resume_pc;
-    while let Some(op) = decode_op_at(code, landing) {
-        if op.opname != "live" {
-            return (op.opname == "catch_exception").then_some(landing);
+    if let Some(op) = decode_op_at(code, landing) {
+        if op.opname == "live" {
+            landing = op.next_pc;
         }
-        landing = op.next_pc;
     }
-    None
+    let op = decode_op_at(code, landing)?;
+    (op.opname == "catch_exception").then_some(landing)
 }
 
 pub(crate) fn catch_at_landing_pc(code: &[u8], resume_pc: usize, catch_pc: usize) -> bool {

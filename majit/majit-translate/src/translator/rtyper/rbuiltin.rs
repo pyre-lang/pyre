@@ -546,6 +546,16 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "malloc_raw",
             rtype_malloc_raw,
         ),
+        // `rgc.py` `ll_arraycopy`. Harvest-skip plus this typer mint
+        // one `ll_arraycopy` helper per ARRAY (`@specialize.ll()`);
+        // `mark_oopspec(["ll_arraycopy"])` rewrites it to OS_ARRAYCOPY.
+        // An erased (`PyObjectRef`) ARRAY residualizes the native
+        // `jit_ll_arraycopy` instead.
+        (
+            crate::runtime_names::modules::OBJECT_ARRAY,
+            "jit_ll_arraycopy",
+            rtype_jit_ll_arraycopy,
+        ),
         // `majit_gc::header` varsize helpers (`malloc_varsize` +
         // `init_gc_object_immortal`). Residual `direct_call`, like
         // `malloc_raw`: no vtable to fuse into `NewWithVtable`.
@@ -4758,6 +4768,199 @@ fn dst_as_store_address(
     }
 }
 
+/// `rgc.py` `ll_arraycopy` (`object_array::jit_ll_arraycopy`).
+///
+/// Harvest-skip plus HOST_ENV keep one ARRAY per caller (`@specialize.ll()`).
+/// When source or dest is an ARRAY, the rtyper mints the same `ll_arraycopy`
+/// helper `rlist.py` extend/getslice mint
+/// (`build_ll_arraycopy_general_helper_graph`); `CallControl.mark_oopspec`
+/// on `["ll_arraycopy"]` rewrites it to `OS_ARRAYCOPY`
+/// (`jtransform.py` `do_fixed_list_ll_arraycopy`), matching
+/// `rtype_ll_arraymove_intrinsic`. `_canraise` is False (`call.py`).
+/// Indices are Signed (`@enforceargs(None, None, int, int, int)`).
+///
+/// Both endpoints name the same ARRAY: specialize. Differing ARRAYs or
+/// one ARRAY and one erased endpoint are a TyperError (`rgc.py`
+/// `ll_arraycopy` asserts `TP == typeOf(dest).TO`). Both erased: residual
+/// `direct_call` of the native `jit_ll_arraycopy`. The native body reads
+/// the layout at run time.
+fn rtype_jit_ll_arraycopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    if hop.nb_args() != 5 {
+        return Err(TyperError::message(format!(
+            "jit_ll_arraycopy: expected 5 arguments, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_source = arg_repr(hop, 0)?;
+    let r_dest = arg_repr(hop, 1)?;
+    let src_array = arraycopy_array_of(r_source.as_ref());
+    let dest_array = arraycopy_array_of(r_dest.as_ref());
+    let (item_lltype, items_ptr) = match (src_array, dest_array) {
+        (Some((src_item, src_ptr)), Some((_, dest_ptr))) => {
+            if src_ptr != dest_ptr {
+                return Err(TyperError::message(format!(
+                    "jit_ll_arraycopy: source and dest name different ARRAYs: {src_ptr:?} vs {dest_ptr:?}"
+                )));
+            }
+            (src_item, src_ptr)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(TyperError::message(format!(
+                "jit_ll_arraycopy: source and dest name different ARRAYs: one endpoint is an ARRAY, the other is erased ({:?} vs {:?})",
+                r_source.lowleveltype(),
+                r_dest.lowleveltype()
+            )));
+        }
+        (None, None) => {
+            return rtype_jit_ll_arraycopy_erased(hop, r_source.as_ref(), r_dest.as_ref());
+        }
+    };
+    // rgc.py copy_item / CopyStructEntry: struct OF copies via getinteriorfield/setinteriorfield.
+    if matches!(item_lltype, LowLevelType::Struct(_)) {
+        return Err(TyperError::message(format!(
+            "jit_ll_arraycopy: struct-element ARRAY {items_ptr:?} needs rgc.copy_item's struct branch (getinteriorfield/setinteriorfield), which is not lowered"
+        )));
+    }
+    rtype_jit_ll_arraycopy_specialized(
+        hop,
+        r_source.as_ref(),
+        r_dest.as_ref(),
+        item_lltype,
+        items_ptr,
+    )
+}
+
+fn rtype_jit_ll_arraycopy_specialized(
+    hop: &HighLevelOp,
+    r_source: &dyn Repr,
+    r_dest: &dyn Repr,
+    item_lltype: LowLevelType,
+    items_ptr: LowLevelType,
+) -> RTypeResult {
+    use crate::translator::rtyper::rlist::build_ll_arraycopy_general_helper_graph;
+
+    let vlist_args = hop.inputargs(vec![
+        ConvertedTo::Repr(r_source),
+        ConvertedTo::Repr(r_dest),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_arraycopy".to_string(),
+        vec![
+            items_ptr.clone(),
+            items_ptr.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Void,
+        move |_rtyper, _args, _result| {
+            build_ll_arraycopy_general_helper_graph("ll_arraycopy", item_lltype, items_ptr)
+        },
+    )?;
+    hop.exception_cannot_occur()?;
+    hop.gendirectcall(
+        &helper,
+        vec![
+            vlist_args[0].clone(),
+            vlist_args[1].clone(),
+            vlist_args[2].clone(),
+            vlist_args[3].clone(),
+            vlist_args[4].clone(),
+        ],
+    )
+}
+
+/// Both endpoints are the erased `PyObjectRef` Instance with the same
+/// lowleveltype; anything else is a TyperError. Residualize the native
+/// `jit_ll_arraycopy`, whose body reads the items-block layout at run
+/// time.
+fn rtype_jit_ll_arraycopy_erased(
+    hop: &HighLevelOp,
+    r_source: &dyn Repr,
+    r_dest: &dyn Repr,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        self, FuncType, functionptr_with_external_name,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    {
+        let args_s = hop.args_s.borrow();
+        for (which, idx) in [("source", 0usize), ("dest", 1usize)] {
+            let s = args_s.get(idx).ok_or_else(|| {
+                TyperError::message(format!(
+                    "jit_ll_arraycopy: erased {which} is not a PyObjectRef Instance, got None"
+                ))
+            })?;
+            if !matches!(s, SomeValue::Instance(_)) {
+                return Err(TyperError::message(format!(
+                    "jit_ll_arraycopy: erased {which} is not a PyObjectRef Instance, got {s:?}"
+                )));
+            }
+        }
+    }
+    if r_source.lowleveltype() != r_dest.lowleveltype() {
+        return Err(TyperError::message(format!(
+            "jit_ll_arraycopy: source and dest name different ARRAYs: erased endpoints {:?} vs {:?}",
+            r_source.lowleveltype(),
+            r_dest.lowleveltype()
+        )));
+    }
+    let funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![
+                r_source.lowleveltype().clone(),
+                r_dest.lowleveltype().clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+            result: LowLevelType::Void,
+        },
+        "jit_ll_arraycopy",
+        Some("jit_ll_arraycopy".to_string()),
+    );
+    let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+    hop.exception_cannot_occur()?;
+    let v_func = HighLevelOp::inputconst(&funcptr_lltype, &ConstValue::LLPtr(Box::new(funcptr)))?;
+    let mut vlist = vec![Hlvalue::Constant(v_func)];
+    vlist.extend(hop.inputargs(vec![
+        ConvertedTo::Repr(r_source),
+        ConvertedTo::Repr(r_dest),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?);
+    let _ = hop.genop("direct_call", vlist, GenopResult::Void);
+    let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(void_const)))
+}
+
+/// `rgc.py` `ll_arraycopy`: `TP = typeOf(source).TO`. An Instance
+/// (`PyObjectRef` items block) has no ARRAY, so the rtyper residualizes
+/// the native `jit_ll_arraycopy` instead of specializing.
+fn arraycopy_array_of(r: &dyn Repr) -> Option<(LowLevelType, LowLevelType)> {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    use crate::translator::rtyper::rlist::FixedSizeListRepr;
+
+    let any = r as &dyn std::any::Any;
+    if let Some(fixed) = any.downcast_ref::<FixedSizeListRepr>() {
+        return Some((fixed.item_lowleveltype(), r.lowleveltype().clone()));
+    }
+    let ll = r.lowleveltype();
+    let LowLevelType::Ptr(ptr) = ll else {
+        return None;
+    };
+    match &ptr.TO {
+        PtrTarget::Array(arr) => Some((arr.OF.clone(), ll.clone())),
+        PtrTarget::FixedSizeArray(arr) => Some((arr.OF.clone(), ll.clone())),
+        _ => None,
+    }
+}
+
 /// `cast_ptr_to_adr` when the operand is a `Ptr` (`raddress.py`
 /// `pairtype(PtrRepr, AddressRepr).convert_from_to`). An `Address` is
 /// already the llop's operand type (`rtype_raw_memcopy`).
@@ -7322,6 +7525,401 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.malloc`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_jit_ll_arraycopy() {
+        let host = HOST_ENV
+            .import_module(crate::runtime_names::modules::OBJECT_ARRAY)
+            .and_then(|m| m.module_get("jit_ll_arraycopy"))
+            .expect("HOST_ENV missing pyre_object.object_array.jit_ll_arraycopy");
+        let stripped = HOST_ENV
+            .import_module(crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED)
+            .and_then(|m| m.module_get("jit_ll_arraycopy"))
+            .expect("HOST_ENV missing object_array.jit_ll_arraycopy");
+        assert_eq!(
+            host, stripped,
+            "crate-stripped alias is the same HostObject"
+        );
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `object_array.jit_ll_arraycopy`"
+        );
+    }
+
+    #[test]
+    fn jit_ll_arraycopy_s_none_simple_call_emits_direct_call() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let host = HOST_ENV
+            .import_module(crate::runtime_names::modules::OBJECT_ARRAY)
+            .and_then(|m| m.module_get("jit_ll_arraycopy"))
+            .expect("HOST_ENV missing pyre_object.object_array.jit_ll_arraycopy");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("jit_ll_arraycopy hop setup");
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("s_None simple_call must agree with the void copy");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "direct_call"),
+            "direct_call missing from {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    /// Erased (non-ARRAY) source/dest rtypes to a residual `direct_call` of
+    /// the external `jit_ll_arraycopy`, not a minted `ll_arraycopy` graph.
+    #[test]
+    fn jit_ll_arraycopy_erased_reprs_emit_external_direct_call() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::extfunc::is_external;
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let host = HOST_ENV
+            .import_module(crate::runtime_names::modules::OBJECT_ARRAY)
+            .and_then(|m| m.module_get("jit_ll_arraycopy"))
+            .expect("HOST_ENV missing pyre_object.object_array.jit_ll_arraycopy");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("jit_ll_arraycopy hop setup");
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("erased simple_call must rtype");
+        let ops = &llops.borrow().ops;
+        assert!(
+            ops.iter().all(|op| op.opname != "cast_pointer"),
+            "erased ARRAY must not cast to a minted items ptr: {ops:?}"
+        );
+        let call = ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .unwrap_or_else(|| panic!("direct_call missing from {ops:?}"));
+        let Hlvalue::Constant(c) = &call.args[0] else {
+            panic!("direct_call callee is not a constant: {:?}", call.args[0]);
+        };
+        assert!(
+            is_external(&c.value),
+            "erased ARRAY must residualize an external funcptr, got {:?}",
+            c.value
+        );
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("direct_call callee is not an LLPtr: {:?}", c.value);
+        };
+        match ptr._obj0_value() {
+            Ok(Some(_ptr_obj::Func(func))) => {
+                assert_eq!(
+                    func._name, "jit_ll_arraycopy",
+                    "erased ARRAY must call the native residual, not a minted ll_arraycopy"
+                );
+                assert!(
+                    func.graph.is_none(),
+                    "erased ARRAY must not mint an ll_arraycopy graph"
+                );
+            }
+            other => panic!("direct_call callee is not a Func: {other:?}"),
+        }
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    struct JitLlArraycopyHop {
+        _ann: Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        rtyper: Rc<RPythonTyper>,
+        hop: HighLevelOp,
+        llops: Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
+    }
+
+    fn gc_array_ptr(of: LowLevelType) -> crate::translator::rtyper::lltypesystem::lltype::Ptr {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
+        Ptr {
+            TO: PtrTarget::Array(Array::gc(of)),
+        }
+    }
+
+    fn jit_ll_arraycopy_hop(src_ann: SomeValue, dst_ann: SomeValue) -> JitLlArraycopyHop {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module(crate::runtime_names::modules::OBJECT_ARRAY)
+            .and_then(|m| m.module_get("jit_ll_arraycopy"))
+            .expect("HOST_ENV missing pyre_object.object_array.jit_ll_arraycopy");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let src = Variable::named("src");
+        src.annotation.replace(Some(Rc::new(src_ann)));
+        let dst = Variable::named("dst");
+        dst.annotation.replace(Some(Rc::new(dst_ann)));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("jit_ll_arraycopy hop setup");
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        JitLlArraycopyHop {
+            _ann: ann,
+            rtyper,
+            hop,
+            llops,
+        }
+    }
+
+    /// `rgc.py` `copy_item` / `CopyStructEntry`: a struct-element ARRAY
+    /// cannot take the specialized scalar getarrayitem/setarrayitem path.
+    #[test]
+    fn jit_ll_arraycopy_struct_element_array_is_error() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+
+        let item = LowLevelType::Struct(Box::new(Struct::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(item.clone()))),
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(item))),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("struct-element ARRAY must not specialize");
+        assert!(err.to_string().contains("struct-element ARRAY"), "{err}");
+    }
+
+    /// `rgc.py` `ll_arraycopy` `TP == typeOf(dest).TO`: two ARRAY endpoints
+    /// with different items_ptr lowleveltypes are a TyperError.
+    #[test]
+    fn jit_ll_arraycopy_mismatched_arrays_is_error() {
+        use crate::annotator::model::SomePtr;
+
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(LowLevelType::Signed))),
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(LowLevelType::Float))),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("mismatched ARRAYs must not specialize");
+        assert!(
+            err.to_string()
+                .contains("source and dest name different ARRAYs"),
+            "{err}"
+        );
+    }
+
+    /// `rgc.py` `ll_arraycopy` `TP == typeOf(dest).TO`.
+    #[test]
+    fn jit_ll_arraycopy_one_erased_endpoint_is_error() {
+        use crate::annotator::model::{SomeInstance, SomePtr};
+
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(LowLevelType::Signed))),
+            SomeValue::Instance(SomeInstance::new(None, false, Default::default())),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("one ARRAY and one erased endpoint must not specialize");
+        assert!(
+            err.to_string()
+                .contains("source and dest name different ARRAYs"),
+            "{err}"
+        );
+        assert!(
+            !fx.llops
+                .borrow()
+                .ops
+                .iter()
+                .any(|op| op.opname == "cast_pointer"),
+            "mixed ARRAY/erased must not emit cast_pointer: {:?}",
+            fx.llops.borrow().ops
+        );
+    }
+
+    /// Both erased endpoints that are not a `PyObjectRef` Instance cannot
+    /// residualize `jit_ll_arraycopy`.
+    #[test]
+    fn jit_ll_arraycopy_erased_non_instance_is_error() {
+        use crate::annotator::model::SomeInteger;
+
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Integer(SomeInteger::new(true, true)),
+            SomeValue::Integer(SomeInteger::new(true, true)),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("erased non-Instance endpoints must not residualize");
+        assert!(
+            err.to_string().contains("is not a PyObjectRef Instance"),
+            "{err}"
+        );
+    }
+
+    /// A non-ARRAY struct pointer is not an items block (`rgc.py`
+    /// `ll_arraycopy` indexes `TP.OF`).
+    #[test]
+    fn jit_ll_arraycopy_erased_struct_ptr_is_error() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+        let struct_ptr = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        let fx = jit_ll_arraycopy_hop(struct_ptr.clone(), struct_ptr);
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("erased struct-ptr endpoints must not residualize");
+        assert!(
+            err.to_string().contains("is not a PyObjectRef Instance"),
+            "{err}"
         );
     }
 

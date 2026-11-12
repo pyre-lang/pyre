@@ -13186,53 +13186,43 @@ impl<'a> Transformer<'a> {
             // `single_write_descr_array` from writeanalyze of
             // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
             // The residual helper has no graph, so name dest's ARRAY
-            // (`copy_args[1]`) with `newlist_clear_shape`. Resized and a
-            // non-GC Fallback leave `extradescrs` unset so
+            // (`copy_args[1]`) with `newlist_clear_shape`. Fallback and
+            // Resized leave `extradescrs` unset so
             // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
-            let array_descrs = self.callcontrol.as_deref().and_then(|cc| {
-                match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
-                    NewlistClearShape::Fixed {
-                        item_ty,
-                        array_type_id,
-                        array,
-                    } => Some(vec![cc.arraydescrof_for_op(
-                        &item_ty,
-                        &array_type_id,
-                        &array,
-                        value_type_to_ir_type(&item_ty),
-                        Some(0),
-                    )]),
-                    NewlistClearShape::Fallback => {
-                        // A kind-collapsed GC object pointer used as a
-                        // list item array is `GcArray(OBJECTPTR)`, the
-                        // same ARRAY the `newlist_clear` Fallback names;
-                        // typed int/float arrays classify as `Fixed`
-                        // above.
-                        match copy_args[1]
-                            .concretetype()
-                            .and_then(|ct| crate::model::try_getkind(&ct, true, true, true).ok())
-                        {
-                            Some(crate::codewriter::type_state::ConcreteType::GcRef) => {
-                                Some(vec![cc.arraydescrof_for_type(
-                                    &ValueType::Ref(None),
-                                    &Some(
-                                        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
-                                    ),
-                                    majit_ir::value::Type::Ref,
-                                    Some(0),
-                                )])
-                            }
-                            _ => None,
-                        }
+            // A kind-collapsed `GcRef` is an erased ARRAY (`PyObjectRef`
+            // items block): naming `GcArray(OBJECTPTR)` would copy
+            // int/float items as GC pointers. The native
+            // `jit_ll_arraycopy` reads the layout at run time.
+            let array_descrs =
+                self.callcontrol.as_deref().and_then(|cc| {
+                    match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
+                        NewlistClearShape::Fixed {
+                            item_ty,
+                            array_type_id,
+                            array,
+                        } => Some(vec![cc.arraydescrof_for_op(
+                            &item_ty,
+                            &array_type_id,
+                            &array,
+                            value_type_to_ir_type(&item_ty),
+                            Some(0),
+                        )]),
+                        NewlistClearShape::Fallback | NewlistClearShape::Resized { .. } => None,
                     }
-                    NewlistClearShape::Resized { .. } => None,
-                }
-            });
+                });
             // rgc.py `ll_arraycopy` `_canraise` is False (`call.py`).
             // The Rust body still has `assert!` on negative starts, which
             // the graph analyser reports as CanRaise; a transparent
             // helper walk then declines the residual as CallMayForceR.
             // Pass CannotRaise so OS_ARRAYCOPY records as CallN.
+            // An erased dest has no ARRAY: omit the oopspec so this
+            // residual does not intern OS_ARRAYCOPY with a missing write
+            // descr (top write, native `jit_ll_arraycopy`).
+            let oopspec = if array_descrs.is_some() {
+                OopSpecIndex::Arraycopy
+            } else {
+                OopSpecIndex::None
+            };
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -13240,7 +13230,7 @@ impl<'a> Transformer<'a> {
                 &copy_args,
                 &ValueType::Void,
                 graph_name,
-                OopSpecIndex::Arraycopy,
+                oopspec,
                 Some(majit_ir::descr::ExtraEffect::CannotRaise),
                 array_descrs,
             );
@@ -39689,20 +39679,66 @@ mod tests {
 
     /// Dest `OBJECTPTR` (`Ptr(GcStruct object {typeptr})`) is a
     /// kind-collapsed GC object pointer. `newlist_clear_shape` returns
-    /// Fallback; the arraycopy arm names `GcArray(OBJECTPTR)`, the same
-    /// ARRAY the `newlist_clear` Fallback names.
+    /// Fallback; the arraycopy arm leaves the write descr unset so the
+    /// residual has top write. Naming `GcArray(OBJECTPTR)` would copy
+    /// an erased int/float items block as GC pointers.
     #[test]
-    fn list_ll_arraycopy_gcptr_dest_names_the_gcref_array() {
+    fn list_ll_arraycopy_erased_dest_has_no_objectptr_write_descr() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
 
-        let descr = list_ll_arraycopy_write_descr_for_dest(OBJECTPTR.clone());
-        let ad = descr
-            .as_array_descr()
-            .expect("write descr must be an array descr");
-        assert_eq!(ad.item_type(), majit_ir::value::Type::Ref);
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let args = vec![
+            variable_with_lltype("source", OBJECTPTR.clone()),
+            variable_with_lltype("dest", OBJECTPTR.clone()),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+            .expect("list.ll_arraycopy must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        let residual = ops.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+            _ => None,
+        });
+        let Some(descriptor) = residual else {
+            panic!("expected a CallResidual, got {ops:?}");
+        };
+        assert!(
+            descriptor.extra_info.single_write_descr_array.is_none(),
+            "erased ARRAY must not name GcArray(OBJECTPTR), got {:?}",
+            descriptor.extra_info.single_write_descr_array
+        );
         assert_eq!(
-            ad.cache_key(),
-            majit_ir::descr::path_hash(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::None,
+            "erased ARRAY must be a plain residual, not OS_ARRAYCOPY"
+        );
+        let callinfo = &transformer
+            .callcontrol
+            .as_deref()
+            .unwrap()
+            .callinfocollection;
+        assert!(
+            !callinfo.has_oopspec(OopSpecIndex::Arraycopy),
+            "erased ARRAY must not intern an Arraycopy callinfo row"
         );
     }
 

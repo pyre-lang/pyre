@@ -11,8 +11,7 @@ use crate::object_array::{
     FloatItemsBlock, ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc,
     alloc_typed_items_block, alloc_typed_items_block_nursery, dealloc_list_items_block,
     gc_float_array_gc_type_id, gc_int_array_gc_type_id, items_block_capacity,
-    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, ll_new_int_items,
-    typed_items_block_items_base,
+    items_block_items_base, items_block_set_ref, ll_new_int_items, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -406,8 +405,10 @@ impl W_ListObject {
         unsafe { std::slice::from_raw_parts(items_block_items_base(self.items), len) }
     }
 
+    /// Blackhole `bhimpl_inline_call_*` native-calls `jitcode.fnaddr`
+    /// (`call.py getfunctionptr`); `jit_fnaddr.rs` publishes this method.
     #[inline]
-    fn live_len(&self) -> usize {
+    pub fn live_len(&self) -> usize {
         match self.strategy {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
@@ -1680,7 +1681,11 @@ unsafe fn install_range_state(obj: PyObjectRef, strategy: ListStrategy, values: 
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
 /// expected to perform the actual append immediately afterward.
-unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRef) -> PyObjectRef {
+/// `pub` because the blackhole calls it by address (`call.py getfunctionptr`).
+pub unsafe fn switch_to_correct_strategy(
+    list: &mut W_ListObject,
+    w_item: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::publish_roots(&[list as *mut W_ListObject as PyObjectRef, w_item]);
@@ -2968,9 +2973,9 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
         let mut j = 0i64;
         let total_i = total as i64;
         while j < total_i {
-            jit_ll_arraycopy(
-                crate::gc_roots::shadow_stack_get(src_items_slot),
-                crate::gc_roots::shadow_stack_get(dest_items_slot),
+            crate::object_array::ll_arraycopy_items_block(
+                crate::gc_roots::shadow_stack_get(src_items_slot) as *mut ItemsBlock,
+                crate::gc_roots::shadow_stack_get(dest_items_slot) as *mut ItemsBlock,
                 0,
                 j,
                 n_i,
@@ -3081,9 +3086,9 @@ unsafe fn write_object_pointers(dest_slot: usize, src_slot: usize, dest_index: u
         (*(crate::gc_roots::shadow_stack_get(dest_slot) as *const W_ListObject)).items
             as PyObjectRef,
     );
-    jit_ll_arraycopy(
-        crate::gc_roots::shadow_stack_get(src_items_slot),
-        crate::gc_roots::shadow_stack_get(dest_items_slot),
+    crate::object_array::ll_arraycopy_items_block(
+        crate::gc_roots::shadow_stack_get(src_items_slot) as *mut ItemsBlock,
+        crate::gc_roots::shadow_stack_get(dest_items_slot) as *mut ItemsBlock,
         0,
         dest_index as i64,
         wrote as i64,
@@ -3592,7 +3597,7 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
         crate::object_array::ll_arraycopy_float_items_block(
             old as *mut FloatItemsBlock,
-            newitems as *mut FloatItemsBlock,
+            newitems,
             0,
             0,
             p as i64,
@@ -3607,7 +3612,7 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     // uses, immediately before it; `drop_guarded_gc_write_barriers` drops
     // it when that GC-ref setfield follows.
     crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
-    ll_list_float_set_items(list, newitems);
+    ll_list_float_set_items(list, newitems as *mut TypedItemsBlock);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
     if !majit_rlib::jit::we_are_jitted() {
@@ -4561,14 +4566,15 @@ unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
 }
 
 /// [`int_ll_newlist`] for FloatListStrategy storage (`GcArray(Float)`).
+/// The result type is `GcArray(Float)` so `do_fixed_newlist` picks the float array descr.
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+unsafe fn float_ll_newlist(count: i64) -> *mut FloatItemsBlock {
     let count = count as usize;
     if count == 0 {
         return std::ptr::null_mut();
     }
-    typed_ll_newlist(count, gc_float_array_gc_type_id())
+    typed_ll_newlist(count, gc_float_array_gc_type_id()) as *mut FloatItemsBlock
 }
 
 /// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the
@@ -4626,7 +4632,7 @@ unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObj
 /// No oopspec — the JIT inlines this body. Word ABI `(obj, start, n)` so a
 /// declined sub-walk can residualize through `jitcode.fnaddr`. A `&[i64]`
 /// is two words (`jit_fnaddr.rs` `ResidualSlot`) and is never an argument;
-/// the copy addresses the typed blocks through `jit_ll_arraycopy`.
+/// the copy addresses the typed blocks through `ll_arraycopy_int_items_block`.
 ///
 /// Native path opens a RootScope so the source/dest pins pop on return.
 /// `rlist.py ll_listslice_startstop` has no bracket (gctransform inserts
@@ -4649,9 +4655,15 @@ pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize
     if n > 0 {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.
-        let src = ll_list_int_items(&*(obj as *const W_ListObject)) as PyObjectRef;
+        let src = ll_list_int_items(&*(obj as *const W_ListObject));
         let dest_now = crate::gc_roots::shadow_stack_get(dest_slot);
-        crate::object_array::jit_ll_arraycopy(src, dest_now, start as i64, 0, n as i64);
+        crate::object_array::ll_arraycopy_int_items_block(
+            src,
+            dest_now as *mut TypedItemsBlock,
+            start as i64,
+            0,
+            n as i64,
+        );
     }
     let dest_now = if dest.is_null() {
         std::ptr::null_mut()

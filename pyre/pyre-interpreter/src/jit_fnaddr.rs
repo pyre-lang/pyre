@@ -159,6 +159,82 @@ extern "C" fn w_list_pop_end_inner_word(obj: i64) -> i64 {
         as usize as i64
 }
 
+/// Word-ABI adapters for transparent list helpers whose jitcode shells
+/// `bhimpl_inline_call_*` native-calls (`call.py getfunctionptr`). A raw
+/// `usize`/`bool`/`PyObjectRef` item is i32 on wasm32; residual descrs
+/// are i64 words (`prepare_list_ref_store` `call_indirect` note).
+extern "C" fn w_list_live_len_word(list: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::w_list_live_len_word");
+    unsafe { (*(list as usize as *const pyre_object::W_ListObject)).live_len() as i64 }
+}
+
+extern "C" fn is_plain_int1_word(item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::is_plain_int1_word");
+    unsafe {
+        pyre_object::listobject::is_plain_int1(item as usize as pyre_object::PyObjectRef) as i64
+    }
+}
+
+extern "C" fn is_exact_type_word(obj: i64, tp: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::is_exact_type_word");
+    unsafe {
+        pyre_object::pyobject::is_exact_type(
+            obj as usize as pyre_object::PyObjectRef,
+            &*(tp as usize as *const pyre_object::PyType),
+        ) as i64
+    }
+}
+
+extern "C" fn switch_to_correct_strategy_word(list: i64, w_item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::switch_to_correct_strategy_word");
+    unsafe {
+        pyre_object::listobject::switch_to_correct_strategy(
+            &mut *(list as usize as *mut pyre_object::W_ListObject),
+            w_item as usize as pyre_object::PyObjectRef,
+        ) as usize as i64
+    }
+}
+
+extern "C" fn ll_list_int_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_int_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_int_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
+extern "C" fn ll_list_float_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_float_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_float_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
+extern "C" fn ll_list_ascii_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_ascii_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_ascii_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
+extern "C" fn ll_list_obj_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_obj_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_obj_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
 /// One-word residual ABI for `w_dict_lookup_int_strategy`. A miss is NULL.
 /// `Option<PyObjectRef>` is two words with no pointer niche, so the Rust
 /// item would return the `Some` discriminant; `llmodel.py bh_call_r` reads
@@ -4551,6 +4627,78 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_append",
         pyre_object::listobject::w_list_append,
     );
+    // Transparent list helpers the fold inline-calls. `call.py
+    // getfunctionptr(graph)` is `JitCode.fnaddr`; an unpublished shell
+    // keeps `symbolic_fnaddr_for_path` and `bhimpl_inline_call_*` joins
+    // the callee's whole-body abort. Bind a word-ABI adapter whenever
+    // the Rust item is not i64 (`prepare_list_ref_store` `call_indirect`
+    // note): `usize`/`bool`/`&mut`/`&PyType` are i32 or a reference on
+    // wasm32, while residual descrs are i64 words.
+    upa2!(
+        &mut entries,
+        "pyre_object::listobject::w_list_append_inner",
+        "pyre_object::w_list_append_inner",
+        pyre_object::listobject::w_list_append_inner,
+    );
+    upa2!(
+        &mut entries,
+        "pyre_object::listobject::w_list_append_preallocated",
+        "pyre_object::w_list_append_preallocated",
+        pyre_object::listobject::w_list_append_preallocated,
+    );
+    p0!(
+        &mut entries,
+        "pyre_object::gil_ready::gil_ready_word",
+        pyre_object::gil_ready::gil_ready_word,
+    );
+    cpa1!(
+        &mut entries,
+        "listobject::W_ListObject::live_len",
+        "pyre_object::listobject::W_ListObject::live_len",
+        w_list_live_len_word,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_object::listobject::is_plain_int1",
+        "pyre_object::is_plain_int1",
+        is_plain_int1_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::pyobject::is_exact_type",
+        "pyre_object::is_exact_type",
+        is_exact_type_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::switch_to_correct_strategy",
+        "pyre_object::switch_to_correct_strategy",
+        switch_to_correct_strategy_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_int_resize_ge",
+        "pyre_object::ll_list_int_resize_ge",
+        ll_list_int_resize_ge_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_float_resize_ge",
+        "pyre_object::ll_list_float_resize_ge",
+        ll_list_float_resize_ge_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_ascii_resize_ge",
+        "pyre_object::ll_list_ascii_resize_ge",
+        ll_list_ascii_resize_ge_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_obj_resize_ge",
+        "pyre_object::ll_list_obj_resize_ge",
+        ll_list_obj_resize_ge_word,
+    );
     // The fold descends the Option-returning Rust body. Residual/blackhole
     // calls use the one-word bridges: `Option<PyObjectRef>` has no pointer
     // niche, so the raw function would return the Some discriminant.
@@ -4886,7 +5034,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `rgc.ll_arraycopy` / `list.ll_arraycopy` keeps PyPy's five-argument
     // residual ABI. `_handle_list_call` retargets the oopspec residual to
-    // `["jit_ll_arraycopy"]`.
+    // `["jit_ll_arraycopy"]`. An erased (`PyObjectRef`) ARRAY residual
+    // `direct_call`s this same name (`functionptr_with_external_name`).
     cpa5!(
         &mut entries,
         "pyre_object::object_array::jit_ll_arraycopy",
@@ -7637,16 +7786,19 @@ mod tests {
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
         finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
-        is_list_write_barrier, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
+        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
+        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
+        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
+        ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
         pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word, unicode_dict_getitem_str_hashed_word,
-        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
-        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
-        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
+        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
+        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
+        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
+        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
         w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
@@ -8217,6 +8369,71 @@ mod tests {
         assert_ne!(
             bindings["pyre_object::listobject::w_list_pop_end"], raw_end,
             "must not publish the Option-returning Rust item"
+        );
+    }
+
+    #[test]
+    fn transparent_list_helper_fnaddrs_are_word_abi() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let live_len = w_list_live_len_word as *const () as usize as i64;
+        let plain_int = is_plain_int1_word as *const () as usize as i64;
+        let exact_type = is_exact_type_word as *const () as usize as i64;
+        let switch = switch_to_correct_strategy_word as *const () as usize as i64;
+        let int_resize = ll_list_int_resize_ge_word as *const () as usize as i64;
+        let float_resize = ll_list_float_resize_ge_word as *const () as usize as i64;
+        let ascii_resize = ll_list_ascii_resize_ge_word as *const () as usize as i64;
+        let obj_resize = ll_list_obj_resize_ge_word as *const () as usize as i64;
+        let gil = pyre_object::gil_ready::gil_ready_word as *const () as usize as i64;
+        let append_inner =
+            pyre_object::listobject::w_list_append_inner as *const () as usize as i64;
+        let append_pre =
+            pyre_object::listobject::w_list_append_preallocated as *const () as usize as i64;
+        for (path, expected) in [
+            ("listobject::W_ListObject::live_len", live_len),
+            ("pyre_object::listobject::W_ListObject::live_len", live_len),
+            ("pyre_object::listobject::is_plain_int1", plain_int),
+            ("pyre_object::is_plain_int1", plain_int),
+            ("pyre_object::pyobject::is_exact_type", exact_type),
+            ("pyre_object::is_exact_type", exact_type),
+            (
+                "pyre_object::listobject::switch_to_correct_strategy",
+                switch,
+            ),
+            ("pyre_object::switch_to_correct_strategy", switch),
+            ("pyre_object::listobject::ll_list_int_resize_ge", int_resize),
+            ("pyre_object::ll_list_int_resize_ge", int_resize),
+            (
+                "pyre_object::listobject::ll_list_float_resize_ge",
+                float_resize,
+            ),
+            ("pyre_object::ll_list_float_resize_ge", float_resize),
+            (
+                "pyre_object::listobject::ll_list_ascii_resize_ge",
+                ascii_resize,
+            ),
+            ("pyre_object::ll_list_ascii_resize_ge", ascii_resize),
+            ("pyre_object::listobject::ll_list_obj_resize_ge", obj_resize),
+            ("pyre_object::ll_list_obj_resize_ge", obj_resize),
+            ("pyre_object::gil_ready::gil_ready_word", gil),
+            ("pyre_object::listobject::w_list_append_inner", append_inner),
+            ("pyre_object::w_list_append_inner", append_inner),
+            (
+                "pyre_object::listobject::w_list_append_preallocated",
+                append_pre,
+            ),
+            ("pyre_object::w_list_append_preallocated", append_pre),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+        assert_ne!(
+            bindings["listobject::W_ListObject::live_len"],
+            pyre_object::W_ListObject::live_len as *const () as usize as i64,
+            "must not publish the usize-returning method"
+        );
+        assert_ne!(
+            bindings["pyre_object::listobject::is_plain_int1"],
+            pyre_object::listobject::is_plain_int1 as *const () as usize as i64,
+            "must not publish the bool-returning item"
         );
     }
 

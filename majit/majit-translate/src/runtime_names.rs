@@ -171,6 +171,14 @@ pub(crate) mod modules {
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
+    /// `rgc.py` `ll_arraycopy` residual (`object_array::jit_ll_arraycopy`).
+    /// `@specialize.ll()` wrappers keep one ARRAY per graph; this shared
+    /// oopspec body is not a look-inside graph.
+    pub(crate) const OBJECT_ARRAY: &str = "pyre_object.object_array";
+    pub(crate) const JIT_LL_ARRAYCOPY: &str = "pyre_object.object_array.jit_ll_arraycopy";
+    /// Crate-stripped Layer-3b prefix after `canonical_dedup_key` drops
+    /// the local `pyre_object` root. Same HostObject Arc as [`OBJECT_ARRAY`].
+    pub(crate) const OBJECT_ARRAY_STRIPPED: &str = "object_array";
     /// `majit_gc::header` varsize helpers (`init_gc_object_immortal` /
     /// `malloc_varsize` analogue). Concrete, so they need the same HOST_ENV
     /// residual as `malloc_typed` rather than a look-inside graph.

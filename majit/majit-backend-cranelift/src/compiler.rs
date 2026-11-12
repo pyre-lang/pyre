@@ -7522,6 +7522,7 @@ fn emit_indirect_call_from_parts(
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
+    can_collect: bool,
     call_conv: cranelift_codegen::isa::CallConv,
     ptr_type: cranelift_codegen::ir::Type,
     jf_ptr: CValue,
@@ -7553,7 +7554,10 @@ fn emit_indirect_call_from_parts(
     // RPython callbuilder.py parity:
     //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
     //   emit_no_collect(): bare CALL only
-    let can_collect = call_descr.get_extra_info().check_can_collect();
+    // Callers compute `can_collect`: ordinary CALL_* pass
+    // `call_descr.get_extra_info().check_can_collect()`; COND_CALL
+    // always passes true (`regalloc.py` `consider_cond_call` takes
+    // `get_gcmap` unconditionally).
     let call = emit_call_with_gc_roots(
         module,
         builder,
@@ -7629,13 +7633,16 @@ fn cond_call_slowpath_nargs(call_descr: &dyn CallDescr) -> Option<usize> {
 /// force stack homes on values live across the never-taken cond_call.
 /// After the stub returns, read the reloaded jitframe from the pinned
 /// register (`set_pinned_reg` in the stub) and reload GC refs.
+///
+/// `regalloc.py` `consider_cond_call` always takes `get_gcmap()`, and
+/// `cond_call` always `push_gcmap(store=True)`: the taken path publishes the
+/// site's gcmap and reloads the refs regardless of EffectInfo.can_collect.
 fn emit_cond_call_slowpath_call(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     func_ref: OpRef,
     arg_refs: &[OpRef],
-    call_descr: &dyn CallDescr,
     ptr_type: cranelift_codegen::ir::Type,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
@@ -7659,20 +7666,17 @@ fn emit_cond_call_slowpath_call(
         stub_args.push(coerce_ty(builder, raw, cl_types::I64));
     }
 
-    let can_collect = call_descr.get_extra_info().check_can_collect();
-    if can_collect {
-        spill_ref_roots(
-            builder,
-            opref_vars,
-            jf_ptr,
-            ref_root_slots,
-            defined_ref_vars,
-            stale_ref_vars,
-            demoted_failarg_slots,
-            ref_root_base_ofs,
-        );
-        emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
-    }
+    spill_ref_roots(
+        builder,
+        opref_vars,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+    );
+    emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
 
     let mut stub_sig = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
     stub_sig.params.push(AbiParam::new(ptr_type));
@@ -7687,17 +7691,15 @@ fn emit_cond_call_slowpath_call(
     let _call = builder.ins().call(fref, &stub_args);
 
     let new_jf = builder.ins().get_pinned_reg(ptr_type);
-    if can_collect {
-        reload_ref_roots(
-            builder,
-            opref_vars,
-            new_jf,
-            ref_root_slots,
-            defined_ref_vars,
-            demoted_failarg_slots,
-            ref_root_base_ofs,
-        );
-    }
+    reload_ref_roots(
+        builder,
+        opref_vars,
+        new_jf,
+        ref_root_slots,
+        defined_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+    );
     new_jf
 }
 
@@ -15629,6 +15631,7 @@ impl CraneliftBackend {
                             .map(|a| a.to_opref())
                             .collect::<Vec<_>>(),
                         call_descr,
+                        call_descr.get_extra_info().check_can_collect(),
                         call_conv,
                         ptr_type,
                         jf_ptr,
@@ -16261,6 +16264,7 @@ impl CraneliftBackend {
                             .map(|a| a.to_opref())
                             .collect::<Vec<_>>(),
                         call_descr,
+                        call_descr.get_extra_info().check_can_collect(),
                         call_conv,
                         ptr_type,
                         call_jf,
@@ -16524,7 +16528,6 @@ impl CraneliftBackend {
                                 &opref_var_map,
                                 func_ref,
                                 &arg_refs,
-                                call_descr,
                                 ptr_type,
                                 call_jf,
                                 &live_ref_root_raw,
@@ -16536,6 +16539,8 @@ impl CraneliftBackend {
                                 stub_addr,
                             );
                         } else {
+                            // `consider_cond_call` publishes `get_gcmap()` on
+                            // the taken path regardless of EffectInfo.
                             let _ = emit_indirect_call_from_parts(
                                 module,
                                 &mut builder,
@@ -16543,6 +16548,7 @@ impl CraneliftBackend {
                                 func_ref,
                                 &arg_refs,
                                 call_descr,
+                                true,
                                 call_conv,
                                 ptr_type,
                                 call_jf,
@@ -16630,6 +16636,11 @@ impl CraneliftBackend {
                         && let Some(call_descr) = descr.as_call_descr()
                     {
                         let call_jf = builder.ins().get_pinned_reg(ptr_type);
+                        // `consider_cond_call` `get_gcmap([resloc])` excludes
+                        // the result register: the miss path overwrites it
+                        // with the helper word. `defined_ref_vars` does not
+                        // contain this op's result until after the match, so
+                        // `live_ref_root_raw` / `reload_ref_roots` skip it.
                         if let Some(result) = emit_indirect_call_from_parts(
                             module,
                             &mut builder,
@@ -16640,6 +16651,7 @@ impl CraneliftBackend {
                                 .map(|a| a.to_opref())
                                 .collect::<Vec<_>>(),
                             call_descr,
+                            true,
                             call_conv,
                             ptr_type,
                             call_jf,
@@ -23469,6 +23481,22 @@ mod tests {
             extra_info: EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
                 oopspecindex: majit_ir::OopSpecIndex::None,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn make_call_descr_cannot_collect(
+        arg_types: Vec<Type>,
+        result_type: Type,
+    ) -> majit_ir::DescrRef {
+        Arc::new(TestCallDescr {
+            arg_types,
+            result_type,
+            extra_info: EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: majit_ir::OopSpecIndex::None,
+                can_collect: false,
                 ..Default::default()
             },
         })
@@ -34848,6 +34876,60 @@ mod tests {
         // Vestigial runtime_id arg, see comment on the previous test.
 
         let token = JitCellToken::new(1507);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved_root = backend.get_ref_value(&frame, 0);
+
+        assert!(!moved_root.is_null());
+        assert_ne!(moved_root, root);
+        assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xFACEB00C);
+    }
+
+    /// `consider_cond_call` publishes `get_gcmap()` on the taken path even
+    /// when the callee's EffectInfo says it cannot collect. A helper that
+    /// does collect (the list-resize slow path) would otherwise leave live
+    /// nursery refs unforwarded in JitFrame slots.
+    #[test]
+    fn test_cond_call_n_publishes_gcmap_when_effectinfo_cannot_collect() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe {
+            *(root.0 as *mut u64) = 0xFACEB00C;
+        }
+
+        let mut backend = backend_with_gc(gc);
+
+        let descr = make_call_descr_cannot_collect(vec![Type::Int], Type::Void);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CondCallN,
+                &[
+                    OpRef::const_int(1),
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(15107);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);

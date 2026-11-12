@@ -4254,7 +4254,7 @@ pub fn translate_op(
                         {
                             // ExtRegistry residual (`rlib/jit.py`
                             // `ConditionalCallEntry`, `copy_nonoverlapping`,
-                            // `malloc_raw`, …). A leftover `FunctionEntry` must
+                            // `malloc_raw`, `rgc.py` `ll_arraycopy`, …). A leftover `FunctionEntry` must
                             // not beat Layer-3b: `FunctionDesc.pycall` would
                             // walk the harvested body. `allocate` ctor stubs
                             // are declined and have no HOST_ENV callable, so

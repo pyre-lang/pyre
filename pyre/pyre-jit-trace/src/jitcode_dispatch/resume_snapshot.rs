@@ -1763,11 +1763,11 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
     let Some(operand_slots) = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end) else {
         return Err(AssembleFail::NoShape);
     };
-    let (sentinel_slots, proof_slot) = match operand_slots {
+    let (sentinel_slots, proof_slot): ([Option<usize>; 2], Option<usize>) = match operand_slots {
         CallerOperandSlots::Call {
             null_or_self,
             callable,
-        } => ([Some(null_or_self), None], callable),
+        } => ([Some(null_or_self), None], Some(callable)),
         // `self_or_null` and `kwargs_or_null` are the checked null sentinels.
         // A resolved receiver or mapping already in `overrides` stays; only a
         // slot no source named is filled with null.
@@ -1775,8 +1775,11 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
             self_or_null,
             kwargs,
             callable,
-        } => ([Some(self_or_null), Some(kwargs)], callable),
-        CallerOperandSlots::Operands { deepest } => ([None, None], deepest),
+        } => ([Some(self_or_null), Some(kwargs)], Some(callable)),
+        CallerOperandSlots::Operands { deepest } => ([None, None], Some(deepest)),
+        // `LOAD_GLOBAL` / `LOAD_NAME` consume nothing, so there is no
+        // operand slot to prove.
+        CallerOperandSlots::Empty => ([None, None], None),
     };
     for sentinel_slot in sentinel_slots.into_iter().flatten() {
         if sentinel_slot >= nlocals
@@ -1793,17 +1796,19 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
     // Ref(0) is valid only for the synthesized null_or_self sentinel.  A null
     // proof value means the sparse vstack/color reconstruction is incomplete;
     // decline instead of publishing an invalid operand region.
-    let proof_value = overrides
-        .iter()
-        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
-    // A missing callable stays unresolved. `outer_active_boxes` is ordered by
-    // liveness color, so its first non-null entry is not the CALL's callable.
-    if !matches!(proof_value, Some(value) if !value.is_null()) {
-        return Err(AssembleFail::Proof(ProofGap {
-            depth,
-            stack_end,
-            proof_slot,
-        }));
+    if let Some(proof_slot) = proof_slot {
+        let proof_value = overrides
+            .iter()
+            .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
+        // A missing callable stays unresolved. `outer_active_boxes` is ordered by
+        // liveness color, so its first non-null entry is not the CALL's callable.
+        if !matches!(proof_value, Some(value) if !value.is_null()) {
+            return Err(AssembleFail::Proof(ProofGap {
+                depth,
+                stack_end,
+                proof_slot,
+            }));
+        }
     }
     // Report-only: a slot left absent here is what makes the outer-call flush
     // decline, and the consumer can only say "not capturable". Name each source
@@ -1832,7 +1837,7 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
                 "[call-overrides-absent] slot={slot} nlocals={nlocals} depth={depth} \
                  vstack_box={vstack_box:?} vstack_concrete={vstack_concrete:?} \
                  pcdep_color={pcdep_color:?} shadow={shadow:?} \
-                 proof_slot={proof_slot}"
+                 proof_slot={proof_slot:?}"
             );
         }
     }
@@ -1855,6 +1860,9 @@ enum CallerOperandSlots {
     /// A shape with no slot to synthesize: the deepest of the operands it
     /// consumes is the proof slot.
     Operands { deepest: usize },
+    /// `opcode_load_global` / `opcode_load_name` pop nothing. The operand
+    /// region is empty, so reconstruction has no proof slot.
+    Empty,
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
@@ -1890,6 +1898,9 @@ enum CallerOperandSlots {
 /// entry stack is `[callable, self_or_null, starargs, kwargs_or_null]`
 /// (`call_function_ex`), and with no arm `CallStack::NoOperandShape` left
 /// `add(*args)` a residual `bh_call_function_ex_fn`.
+/// LIST_EXTEND and the other container-building opcodes call their
+/// `*_value` helper with the receiver peeked in place, so the operand
+/// block is only the popped value(s).
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1926,6 +1937,21 @@ fn caller_operand_slots<Sym: WalkSym>(
             null_or_self,
             callable: null_or_self.checked_sub(1)?,
         });
+    }
+    // `opcode_load_global` / `opcode_load_name` pop nothing and push the
+    // looked-up name (`load_global_checked_value`); LOAD_GLOBAL with the
+    // low bit set also pushes a NULL sentinel. The helper's namespace
+    // argument is the frame, not a value-stack operand.
+    // `execute_jump_backward` pops nothing either: `jump_backward` (`pyopcode.py`
+    // `jump_absolute`) reads only the frame and the action ticker.
+    if matches!(
+        instruction,
+        pyre_interpreter::Instruction::LoadGlobal { .. }
+            | pyre_interpreter::Instruction::LoadName { .. }
+            | pyre_interpreter::Instruction::JumpBackward { .. }
+            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { .. }
+    ) {
+        return Some(CallerOperandSlots::Empty);
     }
     if matches!(instruction, pyre_interpreter::Instruction::CallFunctionEx) {
         // Entry order, bottom to top: callable, self_or_null, starargs,
@@ -1975,6 +2001,48 @@ fn caller_operand_slots<Sym: WalkSym>(
         // inlines each bound's `__index__` from this residual; with no arm
         // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
         pyre_interpreter::Instruction::BinarySlice => 3,
+        // `[list, iterable]`. `list_extend` pops the iterable; the list is
+        // peeked in place (`list_extend_value`).
+        pyre_interpreter::Instruction::ListExtend { .. } => 1,
+        // `[collection, value]`. `opcode_list_append` / `set_add` /
+        // `set_update` / `dict_update` / `dict_merge` each pop the value;
+        // the receiver is peeked in place.
+        pyre_interpreter::Instruction::ListAppend { .. }
+        | pyre_interpreter::Instruction::SetAdd { .. }
+        | pyre_interpreter::Instruction::SetUpdate { .. }
+        | pyre_interpreter::Instruction::DictUpdate { .. }
+        | pyre_interpreter::Instruction::DictMerge { .. } => 1,
+        // `[dict, key, value]`. `map_add` pops value then key; the dict is
+        // peeked in place (`map_add_value`).
+        pyre_interpreter::Instruction::MapAdd { .. } => 2,
+        // `[a, b]`. `is_op` pops b then a.
+        pyre_interpreter::Instruction::IsOp { .. } => 2,
+        // `[obj, index]`. `delete_subscript` pops index then obj.
+        pyre_interpreter::Instruction::DeleteSubscr => 2,
+        // `[value]`. `opcode_unary_negative` / `unary_not` / `unary_invert`
+        // each pop that one value.
+        pyre_interpreter::Instruction::UnaryNegative
+        | pyre_interpreter::Instruction::UnaryNot
+        | pyre_interpreter::Instruction::UnaryInvert => 1,
+        // `[value]`. `format_simple` pops the value (`eval.rs`).
+        pyre_interpreter::Instruction::FormatSimple => 1,
+        // `[value]`. `call_intrinsic_1` pops one (`pyopcode.rs`).
+        pyre_interpreter::Instruction::CallIntrinsic1 { .. } => 1,
+        // `[a, b]`. `call_intrinsic_2` pops two (`prep_reraise_star`);
+        // `set_function_typeparams` pops the type params and peeks the
+        // function, so entry depth still holds both.
+        pyre_interpreter::Instruction::CallIntrinsic2 { .. } => 2,
+        // `[item0 .. item_{n-1}]`. `build_set` peeks each then
+        // `dropvalues(count)` (`eval.rs`).
+        pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
+        // `[value]`. `opcode_store_name` / `opcode_store_global`
+        // (`pyopcode.rs`) pop the value then call `store_name_value` /
+        // `store_global_value`.
+        pyre_interpreter::Instruction::StoreName { .. }
+        | pyre_interpreter::Instruction::StoreGlobal { .. } => 1,
+        // `[k0, v0 .. k_{n-1}, v_{n-1}]`. `opcode_build_map`
+        // (`shared_opcode.rs`) `pop_n(size * 2)`.
+        pyre_interpreter::Instruction::BuildMap { count } => 2 * count.get(op_arg) as usize,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(
@@ -1990,6 +2058,10 @@ fn caller_operand_slots<Sym: WalkSym>(
             return None;
         }
     };
+    // BUILD_SET/BUILD_MAP with count 0 pop nothing; no operand slot to prove.
+    if operand_count == 0 {
+        return Some(CallerOperandSlots::Empty);
+    }
     Some(CallerOperandSlots::Operands {
         deepest: stack_end.checked_sub(operand_count)?,
     })
@@ -3278,10 +3350,12 @@ impl HelperLevel {
 /// helper. That holds only when every helper level below is numbered too and
 /// the helper's return is the call's result. An inlined Python caller that
 /// cannot pause past the call (or whose return is not the call's result)
-/// resumes at the CALL entry instead; an `Err` there declines the descent. A helper under
-/// a numbered helper that cannot be numbered is pushed as
-/// [`HelperResume::Unresumable`] so its guards are refused rather than
-/// numbered at the enclosing helper's position.
+/// resumes at the CALL entry instead; an `Err` there declines the descent. At
+/// the portal, a helper whose return is the call's result and whose caller
+/// cannot pause past the call declines the descent. A helper under a numbered
+/// helper that cannot be numbered is pushed as [`HelperResume::Unresumable`]
+/// so its guards are refused rather than numbered at the enclosing helper's
+/// position.
 pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -3299,24 +3373,29 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
             HelperChain::NoHelper | HelperChain::Collapsed | HelperChain::Unresumable => None,
         });
     }
-    if !ret.resumes_at_call_entry()
-        && let Ok(caller) = compute_inline_caller_frame(ctx, call_jit_pc)
-    {
-        let call_entry = if ctx.fbw_mode.inline_subwalk {
-            compute_inline_helper_call_entry_frame(ctx, call_jit_pc)
-                .map_or(HelperCallEntry::Unavailable, HelperCallEntry::Frame)
-        } else {
-            HelperCallEntry::CallerBoundary
-        };
-        return Ok(Some(HelperLevel::section(
-            with_call_result_slot(caller),
-            call_entry,
-        )));
+    if !ret.resumes_at_call_entry() {
+        match compute_inline_caller_frame(ctx, call_jit_pc) {
+            Ok(caller) => {
+                let call_entry = if ctx.fbw_mode.inline_subwalk {
+                    compute_inline_helper_call_entry_frame(ctx, call_jit_pc)
+                        .map_or(HelperCallEntry::Unavailable, HelperCallEntry::Frame)
+                } else {
+                    HelperCallEntry::CallerBoundary
+                };
+                return Ok(Some(HelperLevel::section(
+                    with_call_result_slot(caller),
+                    call_entry,
+                )));
+            }
+            Err(e) if !ctx.fbw_mode.inline_subwalk => return Err(e),
+            Err(_) => {}
+        }
     }
     if !ctx.fbw_mode.inline_subwalk {
-        // The root portal resumes at its CALL boundary (`entry_py_pc`).
-        // `pyjitpl.py capture_resumedata` numbers only the frames already
-        // on `metainterp.framestack`. A residual helper does not push one;
+        // A helper whose return is not the call's result resumes the root
+        // portal at its CALL boundary (`entry_py_pc`). `pyjitpl.py
+        // capture_resumedata` numbers only the frames already on
+        // `metainterp.framestack`. A residual helper does not push one;
         // a looked-inside helper that paused its caller is the Section
         // returned above (`compute_inline_caller_frame`).
         return Ok(None);
@@ -3390,20 +3469,16 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
 /// Resume of a guard at `op_pc` inside a numbered helper chain:
 /// `parent_frames` plus the innermost helper section at the guard.
 ///
-/// The blackhole runs every helper section from its resume pc to its return,
-/// and `reject_unresolved_call` bails at a residual call it cannot resolve;
-/// a helper section has no Python coordinate the interpreter could continue
-/// from. When a section can reach one
-/// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
-/// entered the outermost helper level instead ([`HelperCallEntry`]), which
-/// re-runs that call. That is refused once a heap-writing residual (live
-/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
-/// live-heap effect (a list pop or append, a store) has executed since the
-/// level was entered, since the re-run would apply it twice; the refusal is
-/// the one an unlowered helper gets, so the descent is cut back to a residual
-/// call when it applied nothing and the trace aborts otherwise. A residual
-/// the executed-effect odometer counts only for its void result (an
-/// allocation, `make_pyerror`) keeps the CALL-entry resume.
+/// `capture_resumedata` numbers every `MIFrame` (`resume.py`
+/// `ResumeDataLoopMemo.number`). The blackhole runs each helper section
+/// from its resume pc to its return, and `reject_unresolved_call` bails
+/// at a residual it cannot resolve. CALL-entry collapse
+/// ([`HelperCallEntry`]) re-runs the call: it is used when a section has
+/// no resume marker, or when a marked section can reach such a residual
+/// ([`helper_resume_reaches_blocker`]). Collapse is refused once a
+/// heap-writing residual or a journaled live-heap effect has executed
+/// since the level was entered, and so is a blocker section then (the
+/// guard is refused).
 fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3417,11 +3492,6 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         after_residual_call,
         scope,
     )?);
-    let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
-        frame.resume_marker_jit_pc.is_some_and(|pc| {
-            !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
-        })
-    };
     // `capture_resumedata` numbers every frame on `framestack`. A Python
     // inline level below the helper levels that holds no paused-caller image
     // (a straight-line callee) has no section here, so numbering would skip
@@ -3451,53 +3521,119 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     if after_residual_call {
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
-    let runnable = python_chain_complete && {
+    // Helper-section markers only — not the portal parent's. A helper
+    // whose resume can reach a blackhole blocker collapses to CALL-entry
+    // unless a heap write already ran, in which case the guard is refused.
+    let helper_level_count = {
         let session = ctx.session.borrow();
-        // The trailing helper levels own the last sections: level `j`'s is
-        // the paused parent level `j + 1` holds, and the innermost level's
-        // is the one pushed above.
+        session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .count()
+    };
+    let split = parent_frames.len().saturating_sub(helper_level_count);
+    let (sections_have_markers, any_blocker) = {
+        let session = ctx.session.borrow();
         let levels: Vec<&InlineFrame> = session
             .framestack
             .iter()
             .rev()
             .take_while(|frame| frame.is_helper_level())
             .collect();
-        let split = parent_frames.len().saturating_sub(levels.len());
-        let (outer, sections) = parent_frames.split_at(split);
-        outer.iter().all(|frame| {
-            !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32)
-                || runs_from(frame, None)
-        }) && sections
-            .iter()
-            .zip(levels.iter().rev())
-            .all(|(frame, level)| runs_from(frame, level.helper_entry_array_len))
+        let mut sections_have_markers = true;
+        let mut any_blocker = false;
+        // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
+        for frame in &parent_frames[..split] {
+            if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
+                continue;
+            }
+            match frame.resume_marker_jit_pc {
+                Some(pc) => {
+                    if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
+                        any_blocker = true;
+                    }
+                }
+                None => {
+                    sections_have_markers = false;
+                    any_blocker = true;
+                }
+            }
+        }
+        for (frame, level) in parent_frames[split..].iter().zip(levels.iter().rev()) {
+            match frame.resume_marker_jit_pc {
+                Some(pc) => {
+                    if helper_resume_reaches_blocker(
+                        frame.jitcode_index as usize,
+                        pc,
+                        level.helper_entry_array_len,
+                    ) {
+                        any_blocker = true;
+                    }
+                }
+                None => {
+                    sections_have_markers = false;
+                    any_blocker = true;
+                }
+            }
+        }
+        (sections_have_markers, any_blocker)
     };
-    if runnable {
-        return Ok(NumberedHelperGuard::Frames(parent_frames));
-    }
     let refused = DispatchError::OrthodoxSubWalkTraceUnsupported {
         pc: op_pc,
         symbolic: 0,
     };
-    let session = ctx.session.borrow();
-    let helper_levels = session
-        .framestack
-        .iter()
-        .rev()
-        .take_while(|frame| frame.is_helper_level())
-        .count();
-    let outer_index = session.framestack.len() - helper_levels;
-    let Some(outer) = session.framestack.get(outer_index) else {
-        return Err(refused);
+    let (heap_moved, journal_delta, outer_index) = {
+        let session = ctx.session.borrow();
+        let helper_levels = session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .count();
+        let outer_index = session.framestack.len() - helper_levels;
+        let Some(outer) = session.framestack.get(outer_index) else {
+            return Err(refused);
+        };
+        let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
+        let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
+        (heap_moved, journal_delta, outer_index)
     };
-    let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
-    let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
+    if python_chain_complete && sections_have_markers && !any_blocker {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[numbered-helper-guard] frames op_pc={op_pc} blocker={any_blocker}");
+        }
+        return Ok(NumberedHelperGuard::Frames(parent_frames));
+    }
     if heap_moved || journal_delta != 0 {
+        if fbw_debug_abort_enabled() {
+            for (i, frame) in parent_frames.iter().enumerate() {
+                let blocker = frame.resume_marker_jit_pc.map(|pc| {
+                    helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None)
+                });
+                eprintln!(
+                    "[numbered-helper-guard] refuse op_pc={op_pc} parent[{i}] jc={} \
+                     resume={:?} blocker={blocker:?} heap_moved={heap_moved} journal_delta={journal_delta}",
+                    frame.jitcode_index, frame.resume_marker_jit_pc
+                );
+            }
+        }
         return Err(refused);
+    }
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[numbered-helper-guard] collapse op_pc={op_pc} markers={sections_have_markers} \
+             blocker={any_blocker} python_chain={python_chain_complete}"
+        );
     }
     if !python_chain_complete {
         return Ok(NumberedHelperGuard::CallerBoundary);
     }
+    let session = ctx.session.borrow();
+    let Some(outer) = session.framestack.get(outer_index) else {
+        return Err(refused);
+    };
     match &outer.helper_call_entry {
         HelperCallEntry::Unavailable => Err(refused),
         HelperCallEntry::CallerBoundary => Ok(NumberedHelperGuard::CallerBoundary),

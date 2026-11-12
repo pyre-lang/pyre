@@ -2948,8 +2948,8 @@ impl HomeLiveness {
 ///   `push_gcmap_for_call_release_gil` is unconditional; `emit`'s own
 ///   docstring reads "not for CALL_RELEASE_GIL". The bit describes the callee,
 ///   while another thread may collect for the span the GIL is released.
-/// - `COND_CALL_VALUE` — `x86/regalloc.py consider_cond_call` builds the gcmap with
-///   `get_gcmap()` and reads no effect info at all.
+/// - `COND_CALL` / `COND_CALL_VALUE` — `x86/regalloc.py consider_cond_call` builds the gcmap with
+///   `get_gcmap()` (`get_gcmap([resloc])` for `COND_CALL_VALUE_*`) and reads no effect info at all.
 ///
 /// A call carrying no call descr also keeps its reloads: this narrows a
 /// conservative answer where the effect info is there to narrow it, and never
@@ -2960,6 +2960,7 @@ fn call_can_collect(op: &Op) -> bool {
         OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilN
             | OpCode::CallReleaseGilF
+            | OpCode::CondCallN
             | OpCode::CondCallValueI
             | OpCode::CondCallValueR
     ) {

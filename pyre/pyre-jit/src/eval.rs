@@ -8355,8 +8355,11 @@ fn drive_portal_metatrace(
             Some(LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)))
         }
         JitException::ExitFrameWithExceptionRef(value) => {
-            // The generated portal/blackhole has already unwound this frame's
-            // exception handlers. Return its exception to the Python caller.
+            // `BlackholeInterpreter.handle_exception_in_frame` already
+            // searched this portal jitcode for adjacent `catch_exception`
+            // (`codewriter.rs` `catch_for_pc` from the Python exception
+            // table). A hit jumped to the except landing; this leftover is
+            // uncaught in this frame (`warmspot.py handle_jitexception`).
             Some(LoopResult::Done(Err(unsafe {
                 pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
             })))
@@ -11399,11 +11402,13 @@ fn screen_exit_frame_delivery(frame: *mut PyFrame, err: &mut pyre_interpreter::P
 /// frame.  The eval loop's own `maybe_compile_and_run` site handles the warm
 /// path inline via `continue` instead of recursing here.
 ///
-/// This is not optional bookkeeping: pyre's Python-level handler search is
-/// interpreter machinery, so neither a compiled trace's exception exit nor the
-/// blackhole's `handle_exception_in_frame` (which only knows the jitcode
-/// `catch_exception` a residual helper's own RPython `try` emits) has consulted
-/// it.  Skipping it exits a frame without running its `finally`.
+/// This is not optional bookkeeping for a compiled-run / bridge leftover:
+/// `handle_exception_in_frame` only sees an adjacent jitcode `catch_exception`
+/// (`catch_for_pc` for a portal Python try, or a residual helper's own RPython
+/// `try`). A `FINISH` / `BridgeRaised` exit has already left that scan, so
+/// `handle_exception` still owes this frame's table (`pyopcode.py
+/// handle_operation_error`). Skipping it exits without running a `finally`
+/// the jitcode catch did not take.
 fn deliver_exit_frame_exception(
     frame: &mut PyFrame,
     mut err: pyre_interpreter::PyError,
@@ -12865,6 +12870,12 @@ fn dispatch_handle_fail(
                 // result for the portal's `result_type=Ref`, or propagate
                 // the ExitFrameWithExceptionRef exception rather than
                 // swallowing it.  Spelled once, in `take_pyresult`.
+                //
+                // Portal Python try/except is already jitcode `catch_exception`
+                // (`catch_for_pc`); `handle_exception_in_frame` ran that scan
+                // before this leftover. Keep `Done` so `handle_exception` is
+                // not offered a second time. Compiled FINISH / BridgeRaised
+                // still use `HandleFailDispatch::ExitFrameWithException`.
                 _ => {
                     let Some(r) = bh_result.take_pyresult() else {
                         return HandleFailDispatch::Fallthrough;
@@ -13640,6 +13651,7 @@ fn compile_and_run_once(
     let mut snapshot_error = None;
     let mut snapshot_saved_last_instr = None;
     let mut published_abort_image = false;
+    let first_segment = std::cell::Cell::new(true);
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
     let outcome = driver.jit_merge_point_keyed(
@@ -13728,6 +13740,7 @@ fn compile_and_run_once(
                     concrete_frame,
                     live_frame_addr,
                     true,
+                    first_segment.replace(false),
                 );
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
                 // A published abort image has not driven yet
@@ -13880,12 +13893,11 @@ fn compile_and_run_once(
                 // warmspot.py:998-1005 — the walk (or the blackhole that
                 // finished it) left the frame with this exception, so the
                 // interpreter owes it the frame's exception table before
-                // propagating: pyre's Python-level handler search is
-                // interpreter machinery, not jitcode, and the blackhole's
-                // `handle_exception_in_frame` scan only knows the jitcode
-                // `catch_exception` a residual helper's own RPython try
-                // emits.  Without this a `try`/`finally` whose body escaped
-                // through the blackhole exits without running its `finally`.
+                // propagating. `handle_exception_in_frame` only sees adjacent
+                // jitcode `catch_exception` (`catch_for_pc` / helper RPython
+                // `try`); a walk `Raise` has already left that scan.
+                // Without this a `try`/`finally` whose body escaped through
+                // the blackhole exits without running its `finally`.
                 let mut err = finish_concrete_raise_error(cv);
                 // This frame's traceback node is already on the chain: the
                 // walk's own uncaught-raise arm records it

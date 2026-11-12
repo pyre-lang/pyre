@@ -6580,31 +6580,15 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
     }
 }
 
-/// Mirror of `blackhole.rs BlackholeInterpreter::handle_exception_in_frame`
-/// for the walker: locate the `catch_exception/L` that owns an exception-guard
-/// resume position, forward case first, then the backward scan.
-///
-/// Forward case (blackhole.py): the `catch_exception` sits directly after
-/// the resume `-live-` — explicit `raise` sites, and residual ops whose resume
-/// coordinate is their own post-call `-live-` (a mid-Python-op residual such as
-/// a binary-op helper resumes at its OWN op's `-live-`, with its catch
-/// following it).  Backward case: the after-residual-call layout where the
-/// catch sits BEHIND the resume `-live-` (`find_catch_before_resume_live`).
-/// Returns the handler target (three-byte LE label), or `None` when the raising op
-/// sits outside any in-frame try (propagate).
+/// `blackhole.py handle_exception_in_frame` / `pyjitpl.py finishframe_exception`
+/// for the walker: skip one `-live-` and inspect the next op. Adjacent
+/// `catch_exception/L` is this operation's handler; anything else
+/// propagates. The resume coordinate is the raising op's trailing `-live-`
+/// (`after_residual_guard_marker` / `trailing_live_marker`).
+/// Returns the handler target (three-byte LE label), or `None` when the
+/// raising op sits outside any in-frame try.
 pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> Option<usize> {
-    let mut position = resume_live_pos;
-    if let Some(op) = decode_op_at(code, position) {
-        if op.key == "live/" {
-            position = op.next_pc;
-        }
-        if let Some(op) = decode_op_at(code, position) {
-            if op.key == "catch_exception/L" {
-                return Some(majit_jitcode::jitcode::read_label_at(code, position + 1));
-            }
-        }
-    }
-    find_catch_before_resume_live(code, resume_live_pos)
+    try_catch_exception_at(code, resume_live_pos)
 }
 
 /// `catch_exception` target of a helper jitcode section at `jitcode_pc`.
@@ -6637,73 +6621,6 @@ fn walker_ll_issubclass(typeptr: i64, bounding_class: i64) -> bool {
     } else {
         typeptr == bounding_class
     }
-}
-
-/// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
-/// for the walker.  An after-residual-call exception guard resumes at the
-/// no-exception fallthrough `-live-` (the next opcode after the call); the
-/// `catch_exception/L` that belongs to the just-executed raising op sits BEHIND
-/// that resume `-live-`.  The caught can-raise op's expansion is `[op, -live-,
-/// catch_exception, -live-(block entry), vable stores…]` (the guessexception
-/// split closes the block at the op's trailing `-live-`, so the successor block
-/// opens with its own `-live-` before the moved stores).  Scan op boundaries
-/// backward from `resume_live_pos`, newest first, hopping over exactly one
-/// `-live-` (the successor's block-entry marker); accept the `catch_exception`
-/// only when it sits immediately before it — any other op there is the raising
-/// op itself (uncaught), and a second `-live-` means the raising op sits
-/// outside any in-frame try.
-/// Returns the handler target (three-byte LE label after `catch_exception/L`), or
-/// `None` when the raising op sits outside any in-frame try (propagate).
-/// The `catch_exception/L` target of the can-raise op whose OWN trailing
-/// `-live-` sits at `resume_live_pos`.
-///
-/// A caught can-raise op expands to `[op, -live-, catch_exception,
-/// -live-(block entry), vable stores…]`.  [`find_catch_before_resume_live`]
-/// keys off the SUCCESSOR block-entry `-live-` and reads backward from it; a
-/// caller holding the op's own trailing `-live-` instead is one op short of
-/// that coordinate, so the same scan walks straight past the catch. Read
-/// forward for those callers: when `resume_live_pos` is a `-live-` whose very
-/// next op is a `catch_exception`, that catch is the one guarding the op.
-pub(crate) fn catch_target_after_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
-    let live = decode_op_at(code, resume_live_pos)?;
-    if live.key != "live/" {
-        return None;
-    }
-    let catch = decode_op_at(code, live.next_pc)?;
-    if catch.key != "catch_exception/L" {
-        return None;
-    }
-    let _ = *code.get(catch.pc + majit_jitcode::jitcode::LABEL_OPERAND_SIZE)?;
-    Some(majit_jitcode::jitcode::read_label_at(code, catch.pc + 1))
-}
-
-pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
-    let mut pcs: Vec<usize> = crate::jitcode_runtime::decoded_ops(code)
-        .map(|op| op.pc)
-        .filter(|&pc| pc < resume_live_pos)
-        .collect();
-    pcs.sort_unstable_by(|a, b| b.cmp(a));
-    let mut crossed_block_entry_live = false;
-    for pc in pcs {
-        let op = decode_op_at(code, pc)?;
-        if op.key == "catch_exception/L" {
-            return Some(majit_jitcode::jitcode::read_label_at(code, pc + 1));
-        }
-        if op.key == "live/" {
-            if crossed_block_entry_live {
-                // Second `-live-`: the raising op has no catch.
-                return None;
-            }
-            crossed_block_entry_live = true;
-            continue;
-        }
-        if crossed_block_entry_live {
-            // The op immediately before the block-entry `-live-` is not a
-            // `catch_exception` — it is the raising op itself (uncaught).
-            return None;
-        }
-    }
-    None
 }
 
 /// Byte offset of the three-byte label operand inside an op's operand block,
@@ -7649,28 +7566,27 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
 ///
-/// Bridge exception seeding follows `pyjitpl.py`: every trace runs on a
-/// fresh `MetaInterp`, whose `last_exc_value` is null until an op of the
-/// trace raises. Only `prepare_resume_from_failure` installs one before the
-/// first op, and only for a `ResumeGuardExcDescr` /
-/// `ResumeGuardCopiedExcDescr` source guard, from that failure's
-/// `cpu.grab_exc_value(deadframe)`. A root trace and a non-exception-guard
-/// bridge are therefore not seeded: neither a residual helper's leftover in
-/// `BH_LAST_EXC_VALUE` nor the exception an enclosing `except` block is
-/// handling (`ExecutionContext.sys_exc_value`) is this trace's exception.
-fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
+/// `prepare_resume_from_failure` (`pyjitpl.py`): a fresh `MetaInterp` has
+/// `last_exc_value` null until an op of the trace raises. Only an exception
+/// guard (`ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr`) installs one
+/// before the first op, from `cpu.grab_exc_value(deadframe)`.
+///
+/// Called once at the start of a bridge trace. Later walks of the same
+/// trace leave the value on the walker `last_exc_value` until `finishframe`
+/// (`finishframe_clear_last_exc`) or a handler consumes it. Residuals write
+/// `BH_LAST_EXC_VALUE`; the grab itself stays in `GUARD_EXC_VALUE` for the
+/// park (`GuardExcRoot`).
+pub(crate) fn seed_standing_exception_for_walk<Sym: WalkSym>(
+    sym: &mut Sym,
+    trace_ctx: &mut TraceCtx,
+) {
     if !(trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard()) {
         return;
     }
 
-    // `call_jit.rs` publishes the grab in `BH_LAST_EXC_VALUE` before bridge
-    // tracing starts and zeroes it when the guard carried no exception. The
-    // sym persists across walks, so the publish overwrites whatever a
-    // previous walk left on it. The multi-frame carrier walk seeds the same
-    // cell in `drive_bridge_carrier_walk`.
-    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-    if bh_exc != 0 {
-        let exc = bh_exc as pyre_object::PyObjectRef;
+    let grab = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
+    if grab != 0 {
+        let exc = grab as pyre_object::PyObjectRef;
         if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
             let exc_box = trace_ctx.const_ref(exc as i64);
             sym.set_current_exc_value(exc);
@@ -7681,18 +7597,11 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
             return;
         }
     }
-
-    // The carrier already copied this failure's grab onto the sym. A
-    // residual between that copy and this seed clears the cell, so an empty
-    // cell is not "the deadframe published nothing".
-    if trace_ctx.bridge_grab_seeded() && !sym.last_exc_value().is_null() {
-        return;
-    }
-    // Null grab (`prepare_resume_from_failure`): `clear_exception()` on the
-    // fresh MetaInterp. Keeping a preseeded sym here would walk the
-    // exception-flavor continuation for a no-exception failure: a loop whose
-    // exception guard was recorded through a raising iteration then compiles
-    // the HANDLER as its no-exception bridge, and every non-raising
+    // Null grab: `clear_exception()` on the fresh MetaInterp.
+    // Keeping a preseeded sym here would walk the exception-flavor
+    // continuation for a no-exception failure: a loop whose exception
+    // guard was recorded through a raising iteration then compiles the
+    // HANDLER as its no-exception bridge, and every non-raising
     // iteration runs the handler body.
     sym.set_current_exc_value(pyre_object::PY_NULL);
     sym.set_current_exc_box(OpRef::NONE);

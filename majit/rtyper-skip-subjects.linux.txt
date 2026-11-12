@@ -263,9 +263,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::text_w
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::truncatedint_w
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::try_instance_getattr_hook
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::tuple_descr_getslice
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::tuple_getslice_step1_block
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::tuple_ll_listslice_startstop
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::tuple_slice_startstop
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_attr_stored
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_attr_stored_is_cell
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_del_annotations

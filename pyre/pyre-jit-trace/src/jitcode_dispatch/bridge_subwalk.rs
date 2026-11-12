@@ -201,13 +201,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // so recovering there would record the getfield after the guard that
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
-    // Seed the standing exception before the execution-context residual.
-    // `emit_current_execution_context` runs `execute_residual_call`, which
-    // clears `BH_LAST_EXC_VALUE` before dispatch.  That cell is the grab
-    // `trace_and_compile_from_bridge` just published; clearing it first makes
-    // an exception-guard bridge look exception-free and record the
-    // no-exception fallthrough (`Finish` of the NULL call result).
-    seed_standing_exception_for_walk(sym, trace_ctx);
+    // `prepare_resume_from_failure` already copied the grab onto the walker
+    // `last_exc_value` (`seed_standing_exception_for_walk` in `trace_bytecode`).
+    // A later walk of the same trace must not re-seed: `finishframe` nulls
+    // that field, and `emit_current_execution_context` may clear
+    // `BH_LAST_EXC_VALUE`.
     seed_execution_context_for_walk(sym, trace_ctx);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py)
@@ -358,20 +356,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 
     // Exception-edge bridge routing: an exception-guard
     // bridge with a standing exception resumes at the no-exception fallthrough
-    // `-live-`, NOT the `except` handler.  Mirror the blackhole
-    // `handle_exception_in_frame` backward case: route the walk entry to the
-    // in-frame catch target so the handler body (`except KeyError: return -1`)
-    // is recorded as the bridge instead of the NULL raised-call fallthrough.
-    // `call_jit.rs trace_and_compile_from_bridge` only lets a bridge walk begin
-    // with this precondition holding when it has already ROUTED the exc-edge
-    // (published the standing exception into `BH_LAST_EXC_VALUE`).  So whenever
-    // the precondition holds the walk MUST resume at an `except` handler —
-    // falling through to the no-exception continuation would record the return
-    // of the NULL raised-call result (`Finish(NULL)` → "call failed").
+    // `-live-`, NOT the `except` handler. Skip one `-live-` and enter the
+    // adjacent `catch_exception` (`handle_exception_in_frame` /
+    // `finishframe_exception`). `prepare_resume_from_failure` left the grab
+    // on walker `last_exc_value`; a later `finishframe` nulls it.
+    // `finishframe_exception` delivers the newest raise; the bridge grab
+    // only applies when no frame raised since.
+    let carrier_raise_seed = session.borrow_mut().carrier_raise_seed.take();
     let exc_edge_precondition = trace_ctx.is_bridge_trace
         && trace_ctx.bridge_source_is_exception_guard()
-        && !sym.last_exc_box().is_none()
-        && !sym.last_exc_value().is_null();
+        && !sym.last_exc_value().is_null()
+        && carrier_raise_seed.is_none();
     // `finishframe_exception` (`pyjitpl.py`) reads the frame's
     // `catch_exception` and jumps to the handler with no further condition on
     // where the handler leads.  A handler that RETURNS out of the frame instead
@@ -505,10 +500,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // last_exc_value` is already the standing exception box, so the handler's
         // `last_exc_value/>r` reads it.  On the normal path, seed the mirror at
         // the first-walked pc as before.
-        // Carrier-boundary raise seed (`finishframe_exception`): a depth-2
-        // inlined callee's sub-walk raised and the root frame's handler covers
-        // the CALL (set by `drive_bridge_carrier_walk`).  Consumed once here.
-        let carrier_raise_seed = session.borrow_mut().carrier_raise_seed.take();
         // `finishframe_exception` already moved the top frame. A pc that
         // differs from the failing guard's resume pc is the handler;
         // otherwise keep the exception-table catch the unprepared path uses.
@@ -524,7 +515,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // pc applied to the outer body is not an instruction boundary.
         let prepared_handler = walked_jitcode_index
             .and_then(|index| prepared_handler_in(wc.trace_ctx, jitcode_code, index, position));
-        let handler_entry = prepared_handler.or(exc_edge_catch_target);
+        let handler_entry = if carrier_raise_seed.is_some() {
+            None
+        } else {
+            prepared_handler.or(exc_edge_catch_target)
+        };
         // Set by the carrier seed's no-handler arm: the root frame lets the
         // exception through, so the trace ends at bridge entry and the walk is
         // skipped entirely.
@@ -617,9 +612,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // the new TOS (mirrors the mid-walk SubRaise catch routing).
             vstack_enter_exception_handler(&mut wc, catch_target, value_op);
             // The exception is now caught by this frame's handler; drain the
-            // standing residual-call exception flag so a later trace attempt's
-            // `seed_standing_exception_for_walk` does not re-pick this
-            // already-caught exception (mirrors `blackhole.rs route_to_catch`).
+            // residual-call cell (`blackhole.rs route_to_catch`).
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             catch_target
         } else if let Some(mut seed) = carrier_raise_seed {
@@ -2310,129 +2303,118 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 exc_concrete,
                 catch_target,
             }) => {
-                // `prepare_resume_from_failure` / `handle_possible_exception`
-                // (`pyjitpl.py`): a null grab records `GUARD_NO_EXCEPTION`
-                // and continues at the resume pc. Enter the handler only
-                // when this bridge's resume carries `cpu.grab_exc_value`.
-                let grabbed = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0
-                    && !exc_concrete.is_null();
-                if !grabbed {
-                    entry
+                // `prepare_resume_from_failure` copied a non-null grab onto
+                // walker `last_exc_value`; a null grab never produces
+                // `Restored` and continues at the resume pc (`GUARD_NO_EXCEPTION`).
+                //
+                // The root frame's exception-edge arm, recorded on this frame:
+                // SAVE_EXC_CLASS / SAVE_EXCEPTION / RESTORE_EXCEPTION, then
+                // GUARD_EXCEPTION against the class read at pointer width
+                // (`_store_exception` keeps the typeptr at offset 0).  The
+                // guard's resume data is this frame at `entry` with every
+                // shallower carrier frame paused above it, carried verbatim
+                // because `entry` is already the post-call coordinate.
+                //
+                // `prepare_resume_from_failure` (`pyjitpl.py`) already recorded
+                // that RESTORE + `handle_possible_exception` GUARD_EXCEPTION
+                // when `bridge_exception_resume_prepared` is set.  A second
+                // GUARD_EXCEPTION runs after `_store_and_reset_exception`
+                // cleared the pending cell, so it fails on every match, and
+                // the failure resumes the call.  The handler reads the
+                // SAVE_EXCEPTION box from the earlier recording instead.
+                let exception_resume_prepared = sub_wc.trace_ctx.bridge_exception_resume_prepared();
+                let value_op = if exception_resume_prepared {
+                    sub_wc
+                        .trace_ctx
+                        .bridge_saved_exc_op()
+                        .unwrap_or(OpRef::NONE)
                 } else {
-                    // The root frame's exception-edge arm, recorded on this frame:
-                    // SAVE_EXC_CLASS / SAVE_EXCEPTION / RESTORE_EXCEPTION, then
-                    // GUARD_EXCEPTION against the class read at pointer width
-                    // (`_store_exception` keeps the typeptr at offset 0).  The
-                    // guard's resume data is this frame at `entry` with every
-                    // shallower carrier frame paused above it, carried verbatim
-                    // because `entry` is already the post-call coordinate.
-                    //
-                    // `prepare_resume_from_failure` (`pyjitpl.py`) already recorded
-                    // that RESTORE + `handle_possible_exception` GUARD_EXCEPTION
-                    // when `bridge_exception_resume_prepared` is set.  A second
-                    // GUARD_EXCEPTION runs after `_store_and_reset_exception`
-                    // cleared the pending cell, so it fails on every match, and
-                    // the failure resumes the call.  The handler reads the
-                    // SAVE_EXCEPTION box from the earlier recording instead.
-                    let exception_resume_prepared =
-                        sub_wc.trace_ctx.bridge_exception_resume_prepared();
-                    let value_op = if exception_resume_prepared {
-                        sub_wc
-                            .trace_ctx
-                            .bridge_saved_exc_op()
-                            .unwrap_or(OpRef::NONE)
-                    } else {
-                        let class_op = sub_wc.trace_ctx.save_exc_class();
-                        let value_op = sub_wc.trace_ctx.save_exception();
-                        sub_wc.trace_ctx.restore_exception(class_op, value_op);
-                        sub_wc.trace_ctx.set_opref_concrete(
-                            value_op,
-                            majit_ir::Value::Ref(majit_ir::GcRef(exc_concrete as usize)),
-                        );
-                        let exc_class = unsafe { *(exc_concrete as *const usize) as i64 };
-                        let exc_class_const = sub_wc.trace_ctx.const_int(exc_class);
-                        sub_wc.trace_ctx.record_guard(
-                            OpCode::GuardException,
-                            &[exc_class_const],
-                            0,
-                        );
-                        value_op
-                    };
-                    if !exception_resume_prepared {
-                        if let Err(error) = walker_capture_snapshot_for_last_guard_impl(
+                    let class_op = sub_wc.trace_ctx.save_exc_class();
+                    let value_op = sub_wc.trace_ctx.save_exception();
+                    sub_wc.trace_ctx.restore_exception(class_op, value_op);
+                    sub_wc.trace_ctx.set_opref_concrete(
+                        value_op,
+                        majit_ir::Value::Ref(majit_ir::GcRef(exc_concrete as usize)),
+                    );
+                    let exc_class = unsafe { *(exc_concrete as *const usize) as i64 };
+                    let exc_class_const = sub_wc.trace_ctx.const_int(exc_class);
+                    sub_wc
+                        .trace_ctx
+                        .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+                    value_op
+                };
+                if !exception_resume_prepared {
+                    if let Err(error) = walker_capture_snapshot_for_last_guard_impl(
+                        &mut sub_wc,
+                        entry,
+                        false,
+                        GuardCaptureScope {
+                            carried_resume_jit_pc: Some(entry),
+                            ..Default::default()
+                        },
+                    ) {
+                        drop(bank_guard);
+                        return Some(Err(error));
+                    }
+                }
+                // `execute_ll_raised`: the handler reads the SAVE_EXCEPTION
+                // box, and GUARD_EXCEPTION made its class a constant.
+                let mut exc_box = ConcreteValue::Ref(exc_concrete);
+                sub_wc.set_last_exc_value(value_op, exc_box);
+                sub_wc.fbw_mode.class_of_last_exc_is_const = true;
+                // Handler consumed the standing exception (`route_to_catch`).
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                match catch_target {
+                    Some(catch_target) => {
+                        if let Err(error) = record_bridge_handler_entry_traceback(
                             &mut sub_wc,
+                            value_op,
+                            exc_box,
                             entry,
-                            false,
-                            GuardCaptureScope {
-                                carried_resume_jit_pc: Some(entry),
-                                ..Default::default()
-                            },
                         ) {
                             drop(bank_guard);
                             return Some(Err(error));
                         }
+                        vstack_enter_exception_handler(&mut sub_wc, catch_target, value_op);
+                        catch_target
                     }
-                    // `execute_ll_raised`: the handler reads the SAVE_EXCEPTION
-                    // box, and GUARD_EXCEPTION made its class a constant.
-                    let mut exc_box = ConcreteValue::Ref(exc_concrete);
-                    sub_wc.set_last_exc_value(value_op, exc_box);
-                    sub_wc.fbw_mode.class_of_last_exc_is_const = true;
-                    // Consumed here, so the root walk's
-                    // `seed_standing_exception_for_walk` takes the null arm
-                    // instead of routing the same exception a second time.
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                    match catch_target {
-                        Some(catch_target) => {
-                            if let Err(error) = record_bridge_handler_entry_traceback(
+                    None => {
+                        // No `catch_exception` here: the frame is popped with
+                        // its own traceback node, as the walk's sub-frame
+                        // raise arm does, and the exception goes to the
+                        // shallower carrier frames.
+                        if !recording_raise_keeps_existing_traceback(&mut sub_wc, entry) {
+                            let node = match record_prepend_application_traceback(
                                 &mut sub_wc,
                                 value_op,
                                 exc_box,
                                 entry,
                             ) {
-                                drop(bank_guard);
-                                return Some(Err(error));
-                            }
-                            vstack_enter_exception_handler(&mut sub_wc, catch_target, value_op);
-                            catch_target
-                        }
-                        None => {
-                            // No `catch_exception` here: the frame is popped with
-                            // its own traceback node, as the walk's sub-frame
-                            // raise arm does, and the exception goes to the
-                            // shallower carrier frames.
-                            if !recording_raise_keeps_existing_traceback(&mut sub_wc, entry) {
-                                let node = match record_prepend_application_traceback(
-                                    &mut sub_wc,
-                                    value_op,
-                                    exc_box,
-                                    entry,
-                                ) {
-                                    Ok(node) => node,
-                                    Err(error) => {
-                                        drop(bank_guard);
-                                        return Some(Err(error));
-                                    }
-                                };
-                                let emit_runtime = node.is_none();
-                                record_inline_application_traceback(
-                                    &mut sub_wc,
-                                    value_op,
-                                    &mut exc_box,
-                                    entry,
-                                    true,
-                                    emit_runtime,
-                                    node,
-                                );
-                            }
-                            drop(bank_guard);
-                            return Some(Ok((
-                                DispatchOutcome::SubRaise {
-                                    exc: value_op,
-                                    exc_concrete: exc_box,
-                                },
+                                Ok(node) => node,
+                                Err(error) => {
+                                    drop(bank_guard);
+                                    return Some(Err(error));
+                                }
+                            };
+                            let emit_runtime = node.is_none();
+                            record_inline_application_traceback(
+                                &mut sub_wc,
+                                value_op,
+                                &mut exc_box,
                                 entry,
-                            )));
+                                true,
+                                emit_runtime,
+                                node,
+                            );
                         }
+                        drop(bank_guard);
+                        return Some(Ok((
+                            DispatchOutcome::SubRaise {
+                                exc: value_op,
+                                exc_concrete: exc_box,
+                            },
+                            entry,
+                        )));
                     }
                 }
             }

@@ -2585,9 +2585,20 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if is_std_alloc_raw(canonical_strip) {
         return Some(SKIP_STD_ALLOC_RAW);
     }
+    // `rgc.py` `ll_arraycopy` is `@specialize.ll()` plus an oopspec
+    // residual, not one look-inside graph. Layer-1 `call_registry.lookup`
+    // would beat `host_env_callable` and `mergeinputargs` would union
+    // List and Instance(PyObject) into slot=0. Declining the registry
+    // entry lets the callsite reach the HOST_ENV builtin.
+    if crate::flowspace::model::is_jit_ll_arraycopy_path(canonical_strip) {
+        return Some(SKIP_JIT_LL_ARRAYCOPY);
+    }
 
     None
 }
+
+/// [`registration_decline`] reason for `rgc.py` `ll_arraycopy` residual.
+const SKIP_JIT_LL_ARRAYCOPY: &str = "skip-jit-ll-arraycopy";
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
@@ -4366,15 +4377,17 @@ pub(crate) fn register_unsafe_fn_stubs(
     for (segments, signature, return_token, return_lltype, return_class_root) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
-        // here, before they ever become a `SemanticFunction`. Declining
-        // that path lets Layer-1 `call_registry.lookup` miss, so the
-        // callsite reaches `host_env_callable`.
+        // and the `rgc.py` `ll_arraycopy` residual here, before they
+        // ever become a `SemanticFunction`. Declining that path lets
+        // Layer-1 `call_registry.lookup` miss, so the callsite reaches
+        // `host_env_callable`.
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
         if let Some(reason) = registration_decline(&path.segments)
             .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING
                 || reason == SKIP_STD_ALLOC_RAW
-                || reason == SKIP_PTR_WRITE)
+                || reason == SKIP_PTR_WRITE
+                || reason == SKIP_JIT_LL_ARRAYCOPY)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
@@ -9383,6 +9396,71 @@ mod tests {
                 "unsafe stub still registered for {segments:?}"
             );
         }
+    }
+
+    #[test]
+    fn jit_ll_arraycopy_is_declined_and_host_env_wins() {
+        for segments in [
+            vec![
+                crate::runtime_names::crates::OBJECT.to_string(),
+                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
+                "jit_ll_arraycopy".into(),
+            ],
+            vec![
+                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
+                "jit_ll_arraycopy".into(),
+            ],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_JIT_LL_ARRAYCOPY),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["jit_ll_arraycopy".into()]),
+            None,
+            "bare leaf jit_ll_arraycopy is not the rgc residual"
+        );
+        assert_eq!(
+            registration_decline(&["helpers".into(), "jit_ll_arraycopy".into()]),
+            None,
+            "helpers::jit_ll_arraycopy is not the rgc residual"
+        );
+        assert_eq!(
+            registration_decline(&[
+                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
+                "ll_arraycopy_int_items_block".into()
+            ]),
+            None
+        );
+
+        let host = crate::flowspace::model::host_env_callable(
+            &[
+                crate::runtime_names::crates::OBJECT,
+                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED,
+                "jit_ll_arraycopy",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        )
+        .expect("pyre_object.object_array.jit_ll_arraycopy resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        let stripped = crate::flowspace::model::host_env_callable(
+            &[
+                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED,
+                "jit_ll_arraycopy",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        )
+        .expect("object_array.jit_ll_arraycopy resolves in HOST_ENV");
+        assert_eq!(
+            host, stripped,
+            "crate-stripped alias is the same HostObject"
+        );
     }
 
     #[test]

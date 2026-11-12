@@ -1190,6 +1190,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
+    prepare_resume_from_failure: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox, bool) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -1291,6 +1292,15 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    // `prepare_resume_from_failure` (`pyjitpl.py`): one-time copy of
+    // `cpu.grab_exc_value(deadframe)` onto walker `last_exc_value`. Runs
+    // on the first segment only (`prepare_resume_from_failure` precedes
+    // `interpret()`; later merge-point segments keep the walker's
+    // `last_exc_value`). Both the live-frame walk and the carrier walk
+    // start after this call.
+    if prepare_resume_from_failure {
+        crate::jitcode_dispatch::seed_standing_exception_for_walk(sym, ctx);
+    }
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
             unsafe { (*sym.jitcode()).index as i32 },
@@ -1763,21 +1773,11 @@ fn publish_root_post_call_depth<Sym: WalkSym>(
 }
 
 /// The paused frame's `except` handler jitcode pc covering its CALL, for the
-/// carrier-boundary `finishframe_exception`.  The resume pc is the CALL's
-/// post-call `-live-`, with the enclosing `catch_exception/L` sitting behind
-/// it.  The handler is accepted on the catch alone, as
-/// `pyjitpl.py finishframe_exception` does; where it leads is `finishframe`'s
-/// business.
+/// carrier-boundary `finishframe_exception`. The resume pc is the CALL's
+/// trailing `-live-`; skip that one live and read the adjacent
+/// `catch_exception` (`pyjitpl.py finishframe_exception`).
 fn carrier_catch_target(code: &[u8], pc: usize, frame: &str) -> Option<usize> {
-    // The paused caller's resume pc is the CALL's post-call `-live-`; the
-    // `catch_exception/L` for the enclosing try sits BEHIND it (between the
-    // CALL's post-call `-live-` and the next op), so scan backward — the same
-    // lookup the single-frame exception-edge router uses.
-    // `pc` is the CALL's OWN trailing `-live-`, one op short of the
-    // block-entry `-live-` the backward scan keys off, so read forward first
-    // and keep the backward scan for callers already at that coordinate.
-    let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, pc)
-        .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, pc));
+    let candidate = crate::jitcode_dispatch::find_catch_for_exc_resume(code, pc);
     if crate::jitcode_dispatch::p2_diag_enabled() {
         eprintln!("[p2-raise] frame={frame} pc={pc} catch_before={candidate:?}");
     }
@@ -1937,12 +1937,10 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
     // innermost frame. A helper jitcode is that frame; `Restored` enters its
     // `catch_exception` or surfaces `SubRaise` when it has none so the
     // caller section can catch (`drive_carrier_finishframe_exception`).
-    let grabbed = ctx.bridge_grab_seeded()
-        || majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0;
+    // `prepare_resume_from_failure` already copied the grab onto the
+    // walker `last_exc_value`; a null grab leaves it null.
     let handler_entry = (ctx.is_bridge_trace
         && ctx.bridge_source_is_exception_guard()
-        && grabbed
-        && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null())
     .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
         exc_concrete: sym.last_exc_value(),
@@ -1986,24 +1984,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
     let ctx = live_trace_ctx(meta);
-    // `_prepare_exception_resumption` (`pyjitpl.py`): the grab
-    // `trace_and_compile_from_bridge` published is the standing exception
-    // this drain's innermost sub-walk reads as `sym.last_exc_value`.  The
-    // live-frame walk seeds through `seed_standing_exception_for_walk`;
-    // this path never calls that function.
-    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-    if bh_exc != 0 {
-        let exc = bh_exc as pyre_object::PyObjectRef;
-        if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
-            let exc_box = ctx.const_ref(exc as i64);
-            sym.set_current_exc_value(exc);
-            sym.set_current_exc_box(exc_box);
-            sym.set_last_exc_value(exc);
-            sym.set_last_exc_box(exc_box);
-            sym.set_class_of_last_exc_is_const(true);
-            ctx.set_bridge_grab_seeded(true);
-        }
-    }
+    // `prepare_resume_from_failure` already copied the grab onto
+    // `sym.last_exc_value` in `trace_bytecode`.
     let entry_depth = ctx.virtualref_boxes_len();
     let pre_virtualref_boxes = ctx.snapshot_virtualref_boxes();
     let pre_pos = ctx.get_trace_position();
@@ -2183,13 +2165,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // (`pyjitpl.py`): a null `cpu.grab_exc_value(deadframe)` records
         // `GUARD_NO_EXCEPTION` and continues at the resume pc. `Restored` is
         // the ChangeFrame into the catching frame, which only happens when
-        // that grab was non-null.
-        let grabbed = ctx.bridge_grab_seeded()
-            || majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0;
+        // walker `last_exc_value` is non-null after that one-time seed.
         let handler_entry = (ctx.is_bridge_trace
             && ctx.bridge_source_is_exception_guard()
-            && grabbed
-            && !sym.last_exc_box().is_none()
             && !sym.last_exc_value().is_null())
         .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
             exc_concrete: sym.last_exc_value(),
@@ -2293,7 +2271,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // `SubReturn`s both go through `drive_middles_finishframe`, which
     // clears. Keep the same clear here so a later drain abort still sees
     // a consumed grab (`seed_standing_exception_for_walk`).
-    if subwalk_result.is_some() && ctx.bridge_source_is_exception_guard() {
+    if subwalk_result.is_some() {
         finishframe_clear_last_exc(&session, sym);
     }
     if let Some(result) = subwalk_result {

@@ -888,11 +888,6 @@ pub struct TraceCtx {
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
     /// that only receive `TraceCtx`.
     pub(crate) bridge_source_is_exception_guard: bool,
-    /// The carrier walk copied this failure's grabbed exception onto the
-    /// sym. A later residual clears `BH_LAST_EXC_VALUE`, so the root
-    /// frame's seed must not treat that empty cell as "no exception" and
-    /// wipe the sym.
-    pub(crate) bridge_grab_seeded: bool,
     /// `prepare_resume_from_failure` already recorded `RESTORE_EXCEPTION`
     /// and `handle_possible_exception`. The walker must not emit that
     /// sequence again. The walk of the framestack-top jitcode starts at
@@ -2546,7 +2541,6 @@ impl TraceCtx {
             bridge_virtual_ops: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
-            bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
             trace_continuation_suspended: std::cell::Cell::new(false),
         }
@@ -2649,7 +2643,6 @@ impl TraceCtx {
             bridge_virtual_ops: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
-            bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
             trace_continuation_suspended: std::cell::Cell::new(false),
         }
@@ -2860,21 +2853,11 @@ impl TraceCtx {
     /// (`ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr` analog).
     pub fn set_bridge_source_is_exception_guard(&mut self, is_exception_guard: bool) {
         self.bridge_source_is_exception_guard = is_exception_guard;
-        // A reused `TraceCtx` must not keep the previous bridge's grab.
-        self.bridge_grab_seeded = false;
     }
 
     /// True only for bridge traces sourced from an exception guard descr.
     pub fn bridge_source_is_exception_guard(&self) -> bool {
         self.bridge_source_is_exception_guard
-    }
-
-    pub fn set_bridge_grab_seeded(&mut self, seeded: bool) {
-        self.bridge_grab_seeded = seeded;
-    }
-
-    pub fn bridge_grab_seeded(&self) -> bool {
-        self.bridge_grab_seeded
     }
 
     /// `prepare_resume_from_failure` already recorded the exception

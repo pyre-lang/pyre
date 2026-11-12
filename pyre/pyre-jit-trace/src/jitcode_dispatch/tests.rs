@@ -1716,6 +1716,102 @@ fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
     assert!(!summary.body_not_walked);
 }
 
+/// `catch_exception L` guards the immediately preceding call
+/// (`handle_exception_in_frame`). A resume past that catch has already
+/// left the protected op behind, so a blocker sitting only in the handler
+/// is not reachable.
+#[test]
+fn a_handler_protecting_an_earlier_call_is_not_a_later_resume_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let mut code = residual_call_with_funcbox(1);
+    let handler = code.len() + 4 + 1;
+    code.extend(catch_exception(handler));
+    code.extend(void_return());
+    assert_eq!(code.len(), handler, "the handler follows the fallthrough");
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+
+    let after_catch = handler - 1;
+    let at_catch = 6;
+    let resume_after = super::inline_call::summarize_body_blockers_resume(
+        after_catch,
+        &code,
+        1,
+        &[real, symbolic],
+        |_| None,
+    );
+    assert_eq!(resume_after.blocker_effect_free, None);
+    assert_eq!(resume_after.blocker_after_effect, None);
+    assert!(!resume_after.body_not_walked);
+
+    let resume_at_catch = super::inline_call::summarize_body_blockers_resume(
+        at_catch,
+        &code,
+        1,
+        &[real, symbolic],
+        |_| None,
+    );
+    assert_eq!(resume_at_catch.blocker_after_effect, Some(symbolic));
+}
+
+/// Resume after a residual call lands on the trailing `live/` before
+/// `catch_exception` (`helper_residual_guard_lands_on_catch`). That
+/// handler is still reachable.
+#[test]
+fn a_resume_on_the_trailing_live_reaches_the_catch_handler() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let mut code = residual_call_with_funcbox(1);
+    let live_pc = code.len();
+    code.extend(live());
+    let handler = code.len() + 4 + 1;
+    code.extend(catch_exception(handler));
+    code.extend(void_return());
+    assert_eq!(code.len(), handler);
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+
+    let resume = super::inline_call::summarize_body_blockers_resume(
+        live_pc,
+        &code,
+        1,
+        &[real, symbolic],
+        |_| None,
+    );
+    assert_eq!(resume.blocker_after_effect, Some(symbolic));
+}
+
+/// An `abort` only in a handler that protects an earlier call is not a
+/// resume blocker past that catch; it is one when resume is at the catch.
+#[test]
+fn a_handler_abort_is_not_a_later_resume_blocker() {
+    let mut code = residual_call_with_funcbox(1);
+    let handler = code.len() + 4 + 1;
+    code.extend(catch_exception(handler));
+    code.extend(void_return());
+    assert_eq!(code.len(), handler);
+    code.extend(abort_op());
+    code.extend(void_return());
+
+    let after_catch = handler - 1;
+    let resume_after = super::inline_call::summarize_body_blockers_resume(
+        after_catch,
+        &code,
+        1,
+        &[0x1234_5678],
+        |_| None,
+    );
+    assert!(!resume_after.has_reachable_abort || resume_after.blocker_effect_free.is_none());
+    assert_eq!(resume_after.blocker_effect_free, None);
+    assert_eq!(resume_after.blocker_after_effect, None);
+
+    let resume_at_catch =
+        super::inline_call::summarize_body_blockers_resume(6, &code, 1, &[0x1234_5678], |_| None);
+    assert!(resume_at_catch.has_reachable_abort);
+    assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
+}
+
 /// An `inline_call` whose descr does not resolve to a JitCode is the same
 /// condition one level down: a callee the scan holds nothing about.  Falling
 /// through would read it as executing no effect and holding no blocker — the
@@ -7709,7 +7805,10 @@ fn with_hint_walk_context<R>(
 /// `pyjitpl.py capture_resumedata` numbers only the `MIFrame`s already on
 /// `metainterp.framestack`; a residual call does not push one. Numbering a
 /// call-entry section here made FBW walk the helper during the Python loop
-/// body and drop FOR_ITER items (`reversed_disabled`).
+/// body and drop FOR_ITER items (`reversed_disabled`). A `CallResult` helper
+/// whose caller cannot pause past the call declines the descent: resuming at
+/// the CALL boundary would re-run effects the helper already applied, so it
+/// stays a residual call.
 #[test]
 fn portal_helper_call_result_does_not_number_a_call_entry_section() {
     use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
@@ -7795,12 +7894,15 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
                 entry_trace_index: 0,
                 live: None,
             });
-            let level = helper_subwalk_level(wc, 0, HelperReturn::CallResult)
-                .expect("portal helper CallResult is Ok");
-            assert!(
-                level.is_none(),
-                "capture_resumedata numbers only framestack MIFrames; a portal helper stays at the CALL"
-            );
+            match helper_subwalk_level(wc, 0, HelperReturn::CallResult) {
+                Err(e) => assert!(
+                    matches!(e, InlineCallerFrameDecline::Unavailable),
+                    "portal CallResult decline is the compute_inline_caller_frame error, got {e:?}"
+                ),
+                Ok(Some(_)) | Ok(None) => panic!(
+                    "a portal CallResult helper whose caller cannot pause past the call declines the descent rather than numbering a section or resuming at the CALL boundary"
+                ),
+            }
         },
     );
 }

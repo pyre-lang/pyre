@@ -17072,7 +17072,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
     let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::Converted)
-        .map_err(|_| DispatchError::callee_inline_unsupported(op.pc))?;
+        .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op.pc })?;
     // Nested in an active `SubWalkDriver` (list.__init__ descending
     // `proxy_list_append`), the yield would cut this prefix and restore a
     // heap cache that still names it. The append body reads those boxes.
@@ -17214,12 +17214,19 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, popped, dst,
     ) {
         Ok(()) => Ok(Some(())),
-        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(
+            error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+            | DispatchError::GuardResumeCoordinateUnavailable { .. }),
+        ) => {
             if abort_blackhole_latched() {
                 return Err(error);
             }
             if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
+                eprintln!(
+                    "[decline-why] LIST-POP-SUBWALK pc={} error={}",
+                    error.stop_pc(),
+                    error.variant_name()
+                );
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -17363,7 +17370,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
     let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::CallResult)
-        .map_err(|_| DispatchError::callee_inline_unsupported(op.pc))?;
+        .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op.pc })?;
     let (walk_outcome, walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,

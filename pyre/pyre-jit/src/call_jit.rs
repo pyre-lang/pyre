@@ -4898,9 +4898,10 @@ fn trace_and_compile_from_bridge_body(
     };
     pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(&discarded_levels);
     if route_exc_edge && guard_exc != 0 {
-        // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
-        // walker's `seed_standing_exception_for_walk` threads it into
-        // `sym.last_exc_box`, which the handler's `last_exc_value/>r` reads.
+        // Residual-call cell starts as this failure's grab
+        // (`cpu.grab_exc_value`). Walker `last_exc_value` is seeded once
+        // from `GUARD_EXC_VALUE` (`prepare_resume_from_failure`); residuals
+        // write this cell during the trace.
         // Re-read `GUARD_EXC_VALUE`: `guard_exc` is the pre-move copy, and
         // resume rebuild above allocates.
         let guard_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
@@ -4908,13 +4909,8 @@ fn trace_and_compile_from_bridge_body(
     } else if !pending_exc {
         // No standing exception at this bridge's source guard (e.g. a
         // GUARD_NOT_FORCED that fails every iteration because the may-force
-        // residual forced the frame).  A prior residual-call raise may have
-        // left a stale non-null value in `BH_LAST_EXC_VALUE`; the walker's
-        // exc-edge routing seeds `sym.last_exc_value` from it and would route
-        // this exception-free bridge into the `except` handler (recording the
-        // `v = -1` handler body as the bridge body → the handler path runs
-        // every iteration).  Clear it so the walk resumes on the real
-        // no-exception continuation.
+        // residual forced the frame). A prior residual-call raise may have
+        // left a stale non-null value in `BH_LAST_EXC_VALUE`.
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
     let exception_resume_prepared = {
@@ -5059,6 +5055,7 @@ fn trace_and_compile_from_bridge_body(
         driver.set_bridge_entered_at_guard_resume(true);
     }
     let mut snapshot_error = None;
+    let first_segment = std::cell::Cell::new(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -5100,6 +5097,7 @@ fn trace_and_compile_from_bridge_body(
                     trace_frame,
                     live_frame_addr,
                     false,
+                    first_segment.replace(false),
                 );
                 // pyjitpl.py raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed

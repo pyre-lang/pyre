@@ -2994,7 +2994,7 @@ unsafe fn tuple_getslice_step1_block(
 /// `rlist.py ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`.
 ///
 /// `wrappeditems` is a raw items-block pointer, not a Rust slice of the GC
-/// array, so the copy is `jit_ll_arraycopy` into the fresh block.
+/// array, so the copy is `ll_arraycopy_items_block` into the fresh block.
 #[inline(never)]
 unsafe fn tuple_ll_listslice_startstop(
     obj: PyObjectRef,
@@ -3013,9 +3013,9 @@ unsafe fn tuple_ll_listslice_startstop(
     if n > 0 {
         let src = (*(obj_now as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
         let dest_now = pyre_object::gc_roots::shadow_stack_get(dest_slot);
-        pyre_object::object_array::jit_ll_arraycopy(
-            src as PyObjectRef,
-            dest_now,
+        pyre_object::object_array::ll_arraycopy_items_block(
+            src,
+            dest_now as *mut pyre_object::object_array::ItemsBlock,
             start,
             0,
             slicelength,

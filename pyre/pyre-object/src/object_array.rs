@@ -334,13 +334,19 @@ pub extern "C" fn jit_ll_arraymove(
 }
 
 /// `rgc.ll_arraycopy(source, dest, source_start, dest_start, length)` —
-/// runtime target for the `list.ll_arraycopy` oopspec (OS_ARRAYCOPY / 1).
+/// runtime target for the `list.ll_arraycopy` oopspec (OS_ARRAYCOPY / 1)
+/// and for an erased (`PyObjectRef`) ARRAY residual.
 ///
 /// rgc.py `ll_arraycopy`: `copy_item` when `length <= 1`; otherwise
 /// `writebarrier_before_copy` when the item contains GC pointers, then
 /// `raw_memcopy`. `false` from the barrier is the per-item `copy_item`
-/// slow path. `rgc.py ll_arraycopy`'s `@jit.oopspec`: a call from an
-/// interpreter body is the `OS_ARRAYCOPY` residual, never a look-inside.
+/// slow path. A known ARRAY mints `ll_arraycopy` and `jtransform.py`
+/// `do_fixed_list_ll_arraycopy` rewrites that helper to OS_ARRAYCOPY.
+/// An erased items block has no ARRAY to specialize; the rtyper emits a
+/// residual `direct_call` of this body, which reads both layouts from
+/// `gc_varsize_layout`. No `@jit.oopspec` here: harvested
+/// `list.ll_arraycopy` on this name would make `guess_call_kind` return
+/// Builtin and name dest as `GcArray(OBJECTPTR)`.
 /// `dont_look_inside_cannot_raise` matches `_canraise` False on that
 /// helper (`call.py`): the `assert!` on negative starts is a native
 /// contract, not a Python exception. Without it the residual is
@@ -349,7 +355,6 @@ pub extern "C" fn jit_ll_arraymove(
 /// type owns a graph (`annlowlevel.py` `lowlevelspecialize`).
 #[majit_macros::specialize_ll]
 #[majit_macros::dont_look_inside_cannot_raise]
-#[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub extern "C" fn jit_ll_arraycopy(
     source: crate::PyObjectRef,
     dest: crate::PyObjectRef,

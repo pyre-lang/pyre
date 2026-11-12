@@ -9810,6 +9810,111 @@ fn cond_call_value_tests_its_value_and_calls_arg_one() {
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
+/// `consider_cond_call` publishes `get_gcmap()` on the taken path even
+/// when the callee's EffectInfo says it cannot collect. A helper that
+/// does collect (the list-resize slow path) would otherwise leave live
+/// nursery refs unforwarded in JitFrame slots. A plain CALL_N with the
+/// same EffectInfo still skips the reload.
+#[test]
+fn cond_call_n_reloads_when_effectinfo_cannot_collect() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let mut extra = EffectInfo::const_new(
+        majit_ir::ExtraEffect::CanRaise,
+        majit_ir::OopSpecIndex::None,
+    );
+    extra.can_collect = false;
+    assert!(!extra.check_can_collect());
+
+    let make_descr = || {
+        Arc::new(SimpleCallDescr::new(
+            0,
+            vec![Type::Ref],
+            Type::Void,
+            false,
+            8,
+            extra.clone(),
+        ))
+    };
+
+    let build = |opcode: OpCode, args: &[OpRef]| {
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+        ];
+        let call = make_op(opcode, args, OpRef::NONE);
+        call.setdescr(make_descr());
+        let ops = vec![
+            call,
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]),
+        ];
+        let frame = codegen::FrameGeometry::compact(
+            codegen::frame_value_slots(&inputargs, &ops),
+            codegen::count_ref_homes(&inputargs, &ops),
+            0,
+        );
+        let (bytes, _) = build_module_with_frame(
+            &inputargs,
+            &ops,
+            Some(0),
+            &codegen::GuardGcTypeInfo::default(),
+            frame,
+        );
+        validate_wasm(&bytes);
+        let mut seq: Vec<String> = Vec::new();
+        count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+        (seq, frame, codegen::count_ref_homes(&inputargs, &ops))
+    };
+
+    let (cond_seq, cond_frame, cond_homes) = build(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_ref(1),
+        ],
+    );
+    assert!(
+        cond_homes >= 1,
+        "a Ref live across COND_CALL owns a home even when EffectInfo cannot collect"
+    );
+    let home = format!("offset: {},", cond_frame.home_slot_base);
+    let else_at = cond_seq
+        .iter()
+        .position(|o| o == "Else")
+        .expect("the cond call puts its trampoline in an else arm");
+    let end_at = else_at
+        + cond_seq[else_at..]
+            .iter()
+            .position(|o| o == "End")
+            .expect("the else arm closes");
+    let reload_at = cond_seq
+        .iter()
+        .position(|o| o.starts_with("I64Load ") && o.contains(&home))
+        .expect("COND_CALL reloads the live Ref from its home slot");
+    assert!(
+        else_at < reload_at && reload_at < end_at,
+        "the ref-home reload is outside the calling arm: {cond_seq:#?}"
+    );
+
+    let (calln_seq, calln_frame, calln_homes) = build(
+        OpCode::CallN,
+        &[OpRef::const_int(0x100), OpRef::input_arg_ref(1)],
+    );
+    assert_eq!(
+        calln_homes, 0,
+        "CALL_N with a non-collecting EffectInfo assigns no Ref home"
+    );
+    let calln_home = format!("offset: {},", calln_frame.home_slot_base);
+    assert!(
+        !calln_seq
+            .iter()
+            .any(|o| o.starts_with("I64Load ") && o.contains(&calln_home)),
+        "CALL_N with a non-collecting EffectInfo must not reload: {calln_seq:#?}"
+    );
+}
+
 /// x86/assembler.py `genop_guard_guard_nonnull_class` guards the class compare
 /// with `CMP(ptr, 1)`; sharing the GUARD_CLASS arm let a NULL receiver be
 /// decided by a read of linear-memory address 0, which on wasm does not trap.
