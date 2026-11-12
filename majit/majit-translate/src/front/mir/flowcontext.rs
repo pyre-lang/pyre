@@ -704,7 +704,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[]);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[], &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
@@ -3264,7 +3264,12 @@ impl<'a> Lowering<'a> {
         if let PlaceKind::Local(i) = dest.kind
             && self.len_shadow[i as usize].is_some()
         {
-            return self.lower_pair_assign(mir_bb, i as usize, rvalue);
+            // Body-local `&dyn Trait` gets a length shadow so `Unsize`
+            // can bind `{data, vtable}`. A one-word producer (Call,
+            // field copy, param copy) keeps the helper ABI.
+            if !tyref_is_fat_dyn(&dest.ty, self.llbc) || self.rvalue_is_dyn_fat_pair(&rvalue) {
+                return self.lower_pair_assign(mir_bb, i as usize, rvalue);
+            }
         }
         // A raw-buffer array's literal stores into its buffer; a borrow of it
         // is its item pointer.
@@ -3543,6 +3548,12 @@ impl<'a> Lowering<'a> {
                 {
                     let ptr = self.ensure_window_ccharp(mir_bb, ptr);
                     return self.emit_window_field_write(mir_bb, *inner, elem, ptr, len);
+                }
+                if tyref_is_fat_dyn(&dest_ty, self.llbc)
+                    && let Some((ptr, meta)) =
+                        self.dyn_fat_rvalue_parts(mir_bb, &rvalue, &dest_ty)?
+                {
+                    return self.emit_dyn_fat_field_write(mir_bb, *inner, elem, ptr, meta);
                 }
                 let value = match self.field_write_inline_const(&inner, &elem, &rvalue, &dest_ty) {
                     // An int / bool / float field write keeps its constant

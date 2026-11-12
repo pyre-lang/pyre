@@ -7215,6 +7215,319 @@ fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
     );
 }
 
+/// Charon `DynPredicate` body whose first clause is trait decl 0.
+fn dyn_predicate_trait0() -> serde_json::Value {
+    serde_json::json!({
+        "binder": {
+            "params": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_clauses": [{
+                    "clause_id": 0,
+                    "origin": "Dyn",
+                    "trait_": {
+                        "regions": [],
+                        "outlives": [],
+                        "skip_binder": {
+                            "id": 0,
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    })
+}
+
+/// `Unsize` of `&Concrete` to `&dyn Storage`, optionally stored in
+/// `Holder.slot` or followed by `PtrMetadata`. `with_impl` records
+/// `impl Storage for Concrete`.
+fn unsize_into_dyn_fat_llbc(with_impl: bool, store_field: bool, read_metadata: bool) -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let concrete_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let concrete_ref = serde_json::json!({"Ref": ["static", concrete_adt, "Shared"]});
+    let fat_ty =
+        serde_json::json!({"Ref": ["static", {"DynTrait": dyn_predicate_trait0()}, "Shared"]});
+    let field_attr = serde_json::json!({
+        "attributes": [], "inline": null, "rename": null, "public": true
+    });
+    let concrete = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Concrete"]),
+        "kind": {"Struct": [{
+            "name": "tag",
+            "ty": {"Literal": "Bool"},
+            "attr_info": field_attr
+        }]}
+    });
+    let holder = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Holder"]),
+        "kind": {"Struct": [{
+            "name": "slot",
+            "ty": fat_ty,
+            "attr_info": field_attr
+        }]}
+    });
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let unsize_rvalue = |src_local: u64| {
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"Unsize": [
+                concrete_ref.clone(),
+                fat_ty.clone(),
+                "VTable"
+            ]}},
+            {"Move": place(serde_json::json!({"Local": src_local}), &concrete_ref)}
+        ]})
+    };
+    let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Mut"]});
+    let (fn_name, inputs, locals, statements) = if store_field {
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        (
+            "unsize_into_dyn_fat_field",
+            vec![holder_ref.clone(), concrete_ref.clone()],
+            vec![
+                local(0, &unit),
+                local(1, &holder_ref),
+                local(2, &concrete_ref),
+            ],
+            vec![serde_json::json!({"span": span, "kind": {"Assign": [
+                slot_place,
+                unsize_rvalue(2)
+            ]}})],
+        )
+    } else {
+        let unsize_stmt = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(serde_json::json!({"Local": 2}), &fat_ty),
+            unsize_rvalue(1)
+        ]}});
+        if read_metadata {
+            let meta_ty = serde_json::json!({"Literal": "Usize"});
+            (
+                "unsize_into_dyn_fat_local_meta",
+                vec![concrete_ref.clone()],
+                vec![
+                    local(0, &unit),
+                    local(1, &concrete_ref),
+                    local(2, &fat_ty),
+                    local(3, &meta_ty),
+                ],
+                vec![
+                    unsize_stmt,
+                    serde_json::json!({"span": span, "kind": {"Assign": [
+                        place(serde_json::json!({"Local": 3}), &meta_ty),
+                        {"Use": [{"Read": place(
+                            serde_json::json!({"Projection": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                "PtrMetadata"
+                            ]}),
+                            &meta_ty
+                        )}, "No"]}
+                    ]}}),
+                ],
+            )
+        } else {
+            (
+                "unsize_into_dyn_fat_local",
+                vec![concrete_ref.clone()],
+                vec![local(0, &unit), local(1, &concrete_ref), local(2, &fat_ty)],
+                vec![unsize_stmt],
+            )
+        }
+    };
+    let arg_count = inputs.len();
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", fn_name]),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": unit},
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": [{
+                "statements": statements,
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let trait_impls = if with_impl {
+        serde_json::json!([{
+            "impl_trait": {"id": 0, "generics": {"types": [{
+                "Value": [0, {"Adt": {"id": 0, "builtin": null, "generics": empty_generics}}]
+            }]}}
+        }])
+    } else {
+        serde_json::json!([])
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [concrete, holder],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["fixture", "Storage"]),
+                "methods": [{"skip_binder": {"name": "head"}}]
+            }],
+            "trait_impls": trait_impls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+/// `Unsize` of a thin instance pointer into a dyn-fat field stores
+/// `{data, vtable}` as `FatData` + `FatMeta`, and the vtable word is a
+/// trait-qualified `ConstFnAddr` (`new_with_vtable` / `OBJECT.typeptr`).
+#[test]
+fn unsize_of_thin_instance_into_dyn_fat_field_emits_fatdata_fatmeta() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let llbc = unsize_into_dyn_fat_llbc(true, true, false);
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
+        .expect("lower unsize_into_dyn_fat_field");
+    let ops = graph_ops(&graph);
+    let slot_writes: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "slot" => {
+                Some((field.vec_part, ty.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        slot_writes.iter().any(|(part, ty)| {
+            *part == Some(VecFieldPart::FatData) && matches!(ty, ValueType::Ref(_))
+        }),
+        "Unsize into a dyn-fat field must write FatData as Ref; writes={slot_writes:?} ops={ops:?}"
+    );
+    assert!(
+        slot_writes
+            .iter()
+            .any(|(part, ty)| *part == Some(VecFieldPart::FatMeta) && *ty == ValueType::Int),
+        "Unsize into a dyn-fat field must write FatMeta as Int; writes={slot_writes:?} ops={ops:?}"
+    );
+    assert!(
+        !slot_writes.iter().any(|(part, _)| part.is_none()),
+        "the dyn-fat store must not be a one-word identity write; writes={slot_writes:?} ops={ops:?}"
+    );
+    let vtable_paths: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstFnAddr { path, symbolic, .. } if *symbolic => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        vtable_paths
+            .iter()
+            .any(|path| path.ends_with("Concrete::Storage")),
+        "Unsize vtable ConstFnAddr must be trait-qualified {{impl_key}}::{{trait_leaf}}; paths={vtable_paths:?} ops={ops:?}"
+    );
+}
+
+/// An unregistered `Unsize` into a dyn-fat field declines rather than
+/// storing a zero vtable word.
+#[test]
+fn unsize_of_unregistered_into_dyn_fat_field_is_unsupported() {
+    let llbc = unsize_into_dyn_fat_llbc(false, true, false);
+    let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
+        .expect_err("unregistered Unsize into a dyn-fat field must decline");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, super::LowerError::Unsupported(_)),
+        "unregistered Unsize into a dyn-fat field must be Unsupported; {msg}"
+    );
+    assert!(
+        msg.contains("Concrete") && msg.contains("Storage"),
+        "Unsupported must name the source type and trait; {msg}"
+    );
+}
+
+/// An unregistered `Unsize` into a body local keeps the one-word ABI.
+#[test]
+fn unsize_of_unregistered_into_dyn_fat_local_stays_one_word() {
+    use crate::model::{OpKind, VecFieldPart};
+
+    let llbc = unsize_into_dyn_fat_llbc(false, false, false);
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local")
+        .expect("unregistered Unsize into a local stays one word");
+    let ops = graph_ops(&graph);
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.vec_part == Some(VecFieldPart::FatData)
+                    || field.vec_part == Some(VecFieldPart::FatMeta)
+        )),
+        "unregistered Unsize local must not form a fat pair; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { .. })),
+        "unregistered Unsize local must not emit a vtable ConstFnAddr; ops={ops:?}"
+    );
+}
+
+/// `PtrMetadata` of an unregistered Unsize dest needs the vtable word
+/// and declines rather than reading a zero (`ClassRepr.getclsfield`).
+#[test]
+fn unsize_of_unregistered_ptr_metadata_is_unsupported() {
+    let llbc = unsize_into_dyn_fat_llbc(false, false, true);
+    let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_meta")
+        .expect_err("PtrMetadata of an unregistered Unsize must decline");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, super::LowerError::Unsupported(_)),
+        "PtrMetadata of an unregistered Unsize must be Unsupported; {msg}"
+    );
+    assert!(
+        msg.contains("Concrete") && msg.contains("Storage"),
+        "Unsupported must name the source type and trait; {msg}"
+    );
+}
+
 /// `w_dict_getitem_str_hashed` reads `imp` on two strategy arms, merges,
 /// then reads `method_*` after a passthrough. The FatMeta metadata word
 /// must be an inputarg of the method_* block: a dominating use of the
@@ -31330,6 +31643,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            dyn_fat: false,
             raw_u8: false,
             str_value: false,
             list_of_str: false,
@@ -31381,6 +31695,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            dyn_fat: false,
             raw_u8: false,
             str_value: false,
             list_of_str: false,

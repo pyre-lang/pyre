@@ -160,7 +160,7 @@ pub(in crate::front::mir) fn struct_ctor_discovered_fields(
         }
         if let Some(existing) = fields
             .iter_mut()
-            .find(|(seen, _, _)| seen.name == field.name)
+            .find(|(seen, _, _)| struct_field_slot_eq(seen, field))
         {
             *existing = (field.clone(), value.clone(), ty.clone());
         } else {
@@ -1036,8 +1036,9 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
             OpKind::FieldRead {
                 base, field, ty, ..
             } if base == &result => {
-                if let Some((_, value, _)) =
-                    fields.iter().find(|(seen, _, _)| seen.name == field.name)
+                if let Some((_, value, _)) = fields
+                    .iter()
+                    .find(|(seen, _, _)| struct_field_slot_eq(seen, field))
                 {
                     if let (Some(dest), LinkArg::Value(src)) = (&op.result, value) {
                         // The read is the stored SSA value. A block input
@@ -1293,12 +1294,22 @@ pub(in crate::front::mir) fn upsert_struct_field(
 ) {
     if let Some(existing) = fields
         .iter_mut()
-        .find(|(seen, _, _)| seen.name == field.name)
+        .find(|(seen, _, _)| struct_field_slot_eq(seen, &field))
     {
         *existing = (field, value, ty);
     } else {
         fields.push((field, value, ty));
     }
+}
+
+/// Last-write-wins is per inlined slot. `FatData` and `FatMeta` of one
+/// attribute are two words of `two_word_fat_struct` (`rclass.py`
+/// `OBJECT.typeptr`); they must not collapse to one store.
+fn struct_field_slot_eq(
+    a: &crate::model::FieldDescriptor,
+    b: &crate::model::FieldDescriptor,
+) -> bool {
+    a.name == b.name && a.vec_part == b.vec_part
 }
 
 pub(in crate::front::mir) fn link_arg_as_alias_op(

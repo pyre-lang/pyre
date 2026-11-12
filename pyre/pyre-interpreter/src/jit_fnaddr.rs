@@ -2235,6 +2235,32 @@ pub fn dyn_impl_vtables() -> &'static [DynImplVtable] {
     })
 }
 
+/// ConstFnAddr path of `impl Trait for Src`: `{impl_key}::{trait_leaf}`.
+///
+/// The assembler records this as `ConstIRelocKind::FnAddr` the way
+/// `assembler.py emit_const` records a funcptr; `runtime_fnaddr_by_path`
+/// resolves it to the rustc vtable word (`new_with_vtable` /
+/// `OBJECT.typeptr`).
+pub fn dyn_impl_vtable_const_path(impl_key: &str, trait_leaf: &str) -> String {
+    format!("{impl_key}::{trait_leaf}")
+}
+
+/// Vtable word published for a [`dyn_impl_vtable_const_path`] key, if
+/// that `(impl_key, trait_leaf)` is in [`dyn_impl_vtables`].
+pub fn dyn_impl_vtable_addr_for_path(path: &str) -> Option<i64> {
+    let (impl_key, trait_leaf) = path.rsplit_once("::")?;
+    dyn_impl_vtables().iter().find_map(|entry| {
+        (dyn_impl_key_matches(impl_key, entry.impl_key) && entry.trait_leaf == trait_leaf)
+            .then_some(entry.vtable as i64)
+    })
+}
+
+fn dyn_impl_key_matches(impl_path: &str, impl_key: &str) -> bool {
+    impl_path == impl_key
+        || impl_path.ends_with(&format!("::{impl_key}"))
+        || impl_key.ends_with(&format!("::{impl_path}"))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -7781,7 +7807,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
-        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
+        dict_entries_probe_hashed_word, dict_entries_probe_object_word,
+        dyn_impl_vtable_addr_for_path, dyn_impl_vtable_const_path, dyn_impl_vtables,
         finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
         is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
         is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
@@ -9457,6 +9484,26 @@ mod tests {
         assert_eq!(
             bindings["pyobject::OBJECT_LAYOUT"],
             pyre_object::object_layout_static_addr() as i64
+        );
+    }
+
+    #[test]
+    fn dyn_impl_vtable_addr_for_path_matches_dyn_impl_vtables_module_dict_strategy() {
+        let tables = dyn_impl_vtables();
+        let entry = tables
+            .iter()
+            .find(|e| {
+                e.impl_key.ends_with("::ModuleDictStrategy") && e.trait_leaf == "DictStrategy"
+            })
+            .expect("ModuleDictStrategy DictStrategy vtable");
+        let path = dyn_impl_vtable_const_path(entry.impl_key, entry.trait_leaf);
+        assert!(
+            path.ends_with("ModuleDictStrategy::DictStrategy"),
+            "trait-qualified key: {path}"
+        );
+        assert_eq!(
+            dyn_impl_vtable_addr_for_path(&path),
+            Some(entry.vtable as i64)
         );
     }
 

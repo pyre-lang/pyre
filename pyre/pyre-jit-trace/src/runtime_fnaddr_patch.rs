@@ -180,16 +180,23 @@ fn insert_minted_exception_class_rows(map: &mut HashMap<&'static str, i64>) {
 }
 
 /// The runtime address published for `path` in `jit_trace_fnaddrs`, or
-/// `None` when the path is not published.  A walker fold that recognises a
-/// residual by its callee compares the call's funcbox against this.
+/// the rustc vtable word of a `dyn_impl_vtable_const_path` key, or
+/// `None` when neither table publishes the path.  A walker fold that
+/// recognises a residual by its callee compares the call's funcbox
+/// against this.
 ///
 /// Tagged reloc lookup uses this same set as the old value-based
 /// correspondence / disarm: `fnaddr_bindings.bin` serialises exactly
-/// these names, so every bound slot has a runtime address.
+/// these names, so every bound slot has a runtime address. Unsize
+/// vtable constants reuse the same `ConstIRelocKind::FnAddr` reloc
+/// (`new_with_vtable` / `OBJECT.typeptr`).
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied()
+    RUNTIME_FNADDRS
+        .get(path)
+        .copied()
+        .or_else(|| pyre_interpreter::dyn_impl_vtable_addr_for_path(path))
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -2323,6 +2330,19 @@ mod tests {
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
         );
+    }
+
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_dyn_impl_vtable_module_dict_strategy() {
+        let tables = pyre_interpreter::dyn_impl_vtables();
+        let entry = tables
+            .iter()
+            .find(|e| {
+                e.impl_key.ends_with("::ModuleDictStrategy") && e.trait_leaf == "DictStrategy"
+            })
+            .expect("ModuleDictStrategy DictStrategy vtable");
+        let path = pyre_interpreter::dyn_impl_vtable_const_path(entry.impl_key, entry.trait_leaf);
+        assert_eq!(runtime_fnaddr_by_path(&path), Some(entry.vtable as i64));
     }
 
     /// An untagged `constants_i` word that equals a build-process fnaddr

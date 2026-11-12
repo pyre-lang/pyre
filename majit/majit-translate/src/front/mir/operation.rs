@@ -6130,11 +6130,13 @@ impl<'a> Lowering<'a> {
     ) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
         // A pair slice's `PtrMetadata` is its length word. A window's is
-        // the same length word (`FatLen`).
+        // the same length word (`FatLen`). A fat `&dyn Trait` pair's is
+        // the vtable word (`FatMeta`).
         if let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind
             && atom == "PtrMetadata"
             && (self.pair_slice_kind(&inner.ty).is_some()
-                || tyref_is_u8_window(&inner.ty, self.llbc))
+                || tyref_is_u8_window(&inner.ty, self.llbc)
+                || tyref_is_fat_dyn(&inner.ty, self.llbc))
             && let Some((_, len)) = self.pair_place_parts(mir_bb, inner)?
         {
             return Ok(len);
@@ -6277,15 +6279,13 @@ impl<'a> Lowering<'a> {
             {
                 // A window's one-word consumer sees the `CCHARP` data
                 // word; the length stays in the shadow (`link_word`).
-                // Word-sized pair slices still refuse a one-word read.
+                // A fat `&dyn Trait` pair's one-word consumer sees the
+                // data word the same way. Word-sized pair slices still
+                // refuse a one-word read.
                 let local = i as usize;
-                if self
-                    .body
-                    .locals
-                    .locals
-                    .get(local)
-                    .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc))
-                {
+                if self.body.locals.locals.get(local).is_some_and(|loc| {
+                    tyref_is_u8_window(&loc.ty, self.llbc) || tyref_is_fat_dyn(&loc.ty, self.llbc)
+                }) {
                     Ok(self.local_var[local]
                         .as_ref()
                         .expect("pair local is bound")
@@ -7569,14 +7569,31 @@ impl<'a> Lowering<'a> {
                     // `FatLen` (`ListRepr.rtype_len`). `tyref_is_fat_dyn`
                     // covers `Box<dyn T>` as well as one-level `&dyn T`.
                     let is_dyn = tyref_is_fat_dyn(&inner.ty, self.llbc);
+                    if is_dyn {
+                        let names_place = inner.as_ref().clone();
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        let bb_id = self.emit_bb(mir_bb);
+                        if let Some(meta) =
+                            self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatMeta)
+                        {
+                            return Ok(meta);
+                        }
+                        if let Some((src_name, trait_name)) =
+                            unregistered_dyn_unsize_names(self.body, self.llbc, &names_place)
+                        {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: PtrMetadata vtable of {src_name} as dyn {trait_name} is not registered"
+                            )));
+                        }
+                        // Field copy of a dyn-fat slot is the metadata word
+                        // itself (`ClassRepr.getclsfield`).
+                        return Ok(base);
+                    }
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
-                    let part = if is_dyn {
-                        crate::model::VecFieldPart::FatMeta
-                    } else {
-                        crate::model::VecFieldPart::FatLen
-                    };
-                    if let Some(meta) = self.fat_component(bb_id, &base, part) {
+                    if let Some(meta) =
+                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
+                    {
                         return Ok(meta);
                     }
                     return Ok(base);
@@ -8333,6 +8350,8 @@ impl<'a> Lowering<'a> {
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),
+                    dyn_fat: declared_ty.is_some_and(|ty| tyref_is_fat_dyn(ty, self.llbc))
+                        || crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(&field_ty),
                     raw_u8: declared_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
                         || field_ty == "*mut u8"
                         || field_ty == "*const u8",

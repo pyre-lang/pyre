@@ -1610,6 +1610,7 @@ impl<'a> Lowering<'a> {
                     void: false,
                     narrow_root: None,
                     window: false,
+                    dyn_fat: false,
                     raw_u8: false,
                     str_value: false,
                     list_of_str: false,

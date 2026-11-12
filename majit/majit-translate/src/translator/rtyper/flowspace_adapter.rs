@@ -1158,13 +1158,13 @@ fn tuple_aggregate_items(
     Some(TupleAggregate { items, at })
 }
 
-/// FatData+FatLen FieldWrite pairs formed in order between adjacent
-/// halves on one `(base, field.name)` whose layout spelling is a `&[u8]`
-/// window. Rebuilt as `newtuple(data, len)` then `setattr` (`rtuple.py`
-/// `TupleRepr.newtuple`, `rclass.py` `InstanceRepr.setfield`). A
-/// `FieldRead` or ordinary write of the same field name, or any
-/// side-effecting op, drops open halves; the caller rejects a half left
-/// without its partner.
+/// FatData+FatLen/FatMeta FieldWrite pairs formed in order between
+/// adjacent halves on one `(base, field.name)` whose layout spelling is
+/// a `&[u8]` window or a fat `&dyn Trait`. Rebuilt as `newtuple(data,
+/// metadata)` then `setattr` (`rtuple.py` `TupleRepr.newtuple`,
+/// `rclass.py` `InstanceRepr.setfield`). A `FieldRead` or ordinary write
+/// of the same field name, or any side-effecting op, drops open halves;
+/// the caller rejects a half left without its partner.
 struct WindowFieldWritePair {
     at: usize,
     data_at: usize,
@@ -1238,6 +1238,7 @@ fn window_field_write_pairs(
                 match field.vec_part {
                     Some(crate::model::VecFieldPart::FatData)
                     | Some(crate::model::VecFieldPart::FatLen)
+                    | Some(crate::model::VecFieldPart::FatMeta)
                         if is_window_field(field) =>
                     {
                         let is_data =
@@ -6977,11 +6978,7 @@ fn function_graph_to_flowspace_inner(
             })
             .collect();
         let is_window_field = |field: &crate::model::FieldDescriptor| -> bool {
-            let Some(ty) = projected_owner_field_spelling(call_registry, field) else {
-                return false;
-            };
-            majit_ir::descr::is_shared_u8_slice_spelling(&ty)
-                || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
+            field_spelling_is_dyn_fat(call_registry, field)
         };
         let window_pairs = window_field_write_pairs(&legacy_block.operations, &is_window_field);
         for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
@@ -7199,12 +7196,13 @@ fn function_graph_to_flowspace_inner(
                     field.vec_part,
                     Some(crate::model::VecFieldPart::FatData)
                         | Some(crate::model::VecFieldPart::FatLen)
+                        | Some(crate::model::VecFieldPart::FatMeta)
                 )
                 && is_window_field(field)
             {
                 return Err(TyperError::message(format!(
-                    "flowspace_adapter: `&[u8]` window half-store `{}` has no partner half in its block; \
-                     a lone half cannot be stored as the `(data, len)` tuple (`rclass.py` `InstanceRepr.setfield`)",
+                    "flowspace_adapter: fat-pair half-store `{}` has no partner half in its block; \
+                     a lone half cannot be stored as the `(data, metadata)` tuple (`rclass.py` `InstanceRepr.setfield`)",
                     field.name
                 )));
             }
@@ -15407,6 +15405,116 @@ mod tests {
         assert!(matches!(
             &name.value,
             ConstValue::ByteStr(bytes) if bytes == b"__pos_0"
+        ));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_rebuilds_dyn_fat_field_writes_as_tuple_setattr() {
+        // FatData+FatMeta writes of a dyn-fat attribute become `newtuple`
+        // then `setattr`, the same shape as a `&[u8]` window
+        // (`rtuple.py` `TupleRepr.newtuple`, `rclass.py`
+        // `InstanceRepr.setfield`). FatMeta is the Unsize vtable
+        // `ConstFnAddr` of `{impl_key}::{trait_leaf}`.
+        let mut graph = LegacyGraph::new("dyn_fat_to_tuple_setattr");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new("slot", Some("Holder".into()));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("Holder".to_string())),
+                        class_root: Some("Holder".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstFnAddr {
+                        path: "fixture::Concrete::Storage".to_string(),
+                        value: 20,
+                        symbolic: true,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Ref(None),
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatMeta),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("Holder", "slot", "&'static dyn Trait"),
+        )
+        .expect("dyn-fat pair must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["newtuple", "setattr"], "got {opnames:?}");
+        assert_eq!(startblock.operations[0].args.len(), 2);
+        let layout = crate::fat_ptr_layout::probe();
+        let data_idx = layout.word_index(false) as usize;
+        let meta_idx = layout.word_index(true) as usize;
+        assert!(matches!(
+            &startblock.operations[0].args[data_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(10)
+        ));
+        assert!(matches!(
+            &startblock.operations[0].args[meta_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
+        ));
+        let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
+            panic!("setattr name");
+        };
+        assert!(matches!(
+            &name.value,
+            ConstValue::ByteStr(bytes) if bytes == b"slot"
         ));
     }
 
