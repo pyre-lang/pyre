@@ -1030,7 +1030,7 @@ fn semlock_acquire_method(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pyre_interpreter::py_class! {
-    "SemLock",
+    "_multiprocessing.SemLock",
     methods: {
         fn release(self_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             w_semlock_release(self_obj)

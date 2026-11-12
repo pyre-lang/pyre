@@ -3433,7 +3433,7 @@ mod xmlparser_class {
     use super::*;
 
     pyre_interpreter::py_class! {
-        "xmlparser",
+        "pyexpat.xmlparser",
         methods: {
             fn Parse(
                 self_obj: PyObjectRef,

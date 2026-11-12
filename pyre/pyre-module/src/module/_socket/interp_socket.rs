@@ -2886,7 +2886,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
     static SOCKET_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
         pyre_object::gc_roots::RootedOnceRef::new();
     SOCKET_TYPE_OBJ.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type("socket", init_socket_type);
+        let tp = pyre_interpreter::typedef::make_builtin_type("_socket.socket", init_socket_type);
         // PyPy's `W_Socket.typedef` is a builtin immutable type. 3.14
         // exposes the same immutable public type while constructing it from a
         // module heap spec, so retain HEAPTYPE and set IMMUTABLETYPE as well.
