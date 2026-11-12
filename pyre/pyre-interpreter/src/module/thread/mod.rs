@@ -1058,23 +1058,6 @@ mod lock_class {
             self.lock.is_locked()
         }
 
-        // Obsolete synonyms (`os_lock.py Lock.typedef`).
-        fn acquire_lock(
-            &self,
-            #[default(1)] blocking: i64,
-            timeout: Option<PyObjectRef>,
-        ) -> Result<bool, crate::PyError> {
-            self.acquire(blocking, timeout)
-        }
-
-        fn release_lock(&self) -> Result<(), crate::PyError> {
-            self.release()
-        }
-
-        fn locked_lock(&self) -> bool {
-            self.locked()
-        }
-
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
             self.acquire(1, None)?;
             Ok(self as *const Self as PyObjectRef)
@@ -3086,6 +3069,26 @@ crate::py_module! {
                 function = crate::gateway::function_set_null_positional_defaults(function, 1);
                 crate::__pyre_store!(ns, name, function);
             }
+        }
+        // `os_lock.py Lock.typedef` binds the obsolete synonyms to the same
+        // `interp2app(Lock.descr_lock_*)`, which `GatewayCache` wraps once, so
+        // `acquire_lock` is the very function object `acquire` is.
+        {
+            let lock_type = lock_class::type_object();
+            let lock_dict = unsafe { pyre_object::w_type_get_dict_ptr(lock_type) } as PyObjectRef;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let lock_dict_slot = pyre_object::gc_roots::pin_roots(&[lock_dict, ns]);
+            for (synonym, name) in [
+                ("acquire_lock", "acquire"),
+                ("release_lock", "release"),
+                ("locked_lock", "locked"),
+            ] {
+                let lock_dict = pyre_object::gc_roots::shadow_stack_get(lock_dict_slot);
+                let function = unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lock_dict, name) }
+                    .expect("Lock.typedef defines the method its synonym names");
+                crate::__pyre_put_new!(lock_dict_slot, synonym, function);
+            }
+            ns = pyre_object::gc_roots::shadow_stack_get(lock_dict_slot + 1);
         }
         // `RLock.__new__` rejects keywords as well as positionals, so it is
         // registered as a `BuiltinCodePassThroughArguments1` descriptor.
