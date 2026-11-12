@@ -9,7 +9,7 @@ use majit_charon_reader::ullbc::{Operand, PlaceKind, Rvalue, StmtKind};
 use majit_charon_reader::{GlobalDecl, Llbc};
 use serde_json::Value;
 
-fn strategy_impl_leaves(llbc: &Llbc) -> Vec<(String, String)> {
+fn strategy_impls(llbc: &Llbc) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for row in llbc.trait_impls_raw() {
         let Some(impl_trait) = row.get("impl_trait") else {
@@ -36,7 +36,7 @@ fn strategy_impl_leaves(llbc: &Llbc) -> Vec<(String, String)> {
         else {
             continue;
         };
-        let Some(leaf) = ty_adt_leaf(llbc, self_ty) else {
+        let Some(src_path) = ty_adt_name_path(llbc, self_ty) else {
             continue;
         };
         let registered_trait = if unwrapped_set {
@@ -44,24 +44,17 @@ fn strategy_impl_leaves(llbc: &Llbc) -> Vec<(String, String)> {
         } else {
             trait_leaf
         };
-        out.push((registered_trait.to_string(), leaf));
+        out.push((registered_trait.to_string(), src_path));
     }
     out
 }
 
-fn ty_adt_leaf(llbc: &Llbc, ty: &Value) -> Option<String> {
+fn ty_adt_name_path(llbc: &Llbc, ty: &Value) -> Option<String> {
     let obj = ty.as_object()?;
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
         let def_id = llbc.dedup_to_adt_def_id(id)?;
         let td = llbc.type_by_id(def_id)?;
-        return Some(
-            td.item_meta
-                .name_path()
-                .rsplit("::")
-                .next()
-                .unwrap_or("")
-                .to_string(),
-        );
+        return Some(td.item_meta.name_path());
     }
     if let Some(arr) = obj.get("Value").and_then(Value::as_array)
         && let Some(body) = arr.get(1)
@@ -71,14 +64,7 @@ fn ty_adt_leaf(llbc: &Llbc, ty: &Value) -> Option<String> {
             .and_then(Value::as_u64)
     {
         let td = llbc.type_by_id(def_id)?;
-        return Some(
-            td.item_meta
-                .name_path()
-                .rsplit("::")
-                .next()
-                .unwrap_or("")
-                .to_string(),
-        );
+        return Some(td.item_meta.name_path());
     }
     None
 }
@@ -160,17 +146,21 @@ fn registered_dyn_impls(llbc: &Llbc) -> Vec<(String, String)> {
             if !global_ty_is_dyn_impl_vtable_desc(llbc, gd) {
                 return None;
             }
-            let (impl_key, trait_leaf) = dyn_impl_desc_strings(llbc, gd)?;
-            let type_leaf = impl_key.rsplit("::").next()?.to_string();
-            Some((trait_leaf, type_leaf))
+            dyn_impl_desc_strings(llbc, gd)
         })
         .collect()
 }
 
-fn impl_is_registered(trait_leaf: &str, type_leaf: &str, registered: &[(String, String)]) -> bool {
+fn impl_is_registered(trait_leaf: &str, type_path: &str, registered: &[(String, String)]) -> bool {
     registered
         .iter()
-        .any(|(t, ty)| t == trait_leaf && ty == type_leaf)
+        .any(|(impl_key, leaf)| impl_key == type_path && leaf == trait_leaf)
+}
+
+fn type_decl_name_paths(llbc: &Llbc) -> Vec<String> {
+    llbc.iter_type_decls()
+        .map(|td| td.item_meta.name_path())
+        .collect()
 }
 
 #[test]
@@ -181,19 +171,47 @@ fn translator_seen_dict_and_set_strategy_impls_are_registered() {
     let interpreter = load_llbc_if_present(INTERPRETER_LLBC).unwrap_or_else(|| {
         panic!("{INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
     });
-    let mut impls = strategy_impl_leaves(object);
-    impls.extend(strategy_impl_leaves(interpreter));
+    let mut impls = strategy_impls(object);
+    impls.extend(strategy_impls(interpreter));
     impls.sort();
     impls.dedup();
     let mut registered = registered_dyn_impls(object);
     registered.extend(registered_dyn_impls(interpreter));
     let missing: Vec<(String, String)> = impls
         .into_iter()
-        .filter(|(trait_leaf, type_leaf)| !impl_is_registered(trait_leaf, type_leaf, &registered))
+        .filter(|(trait_leaf, type_path)| !impl_is_registered(trait_leaf, type_path, &registered))
         .collect();
     assert!(
         missing.is_empty(),
         "translator-seen DictStrategy/SetStrategy impls with no register_dyn_impl_vtable! \
          (add the macro at the impl): {missing:?}\nregistered: {registered:?}"
+    );
+}
+
+/// Each harvested `impl_key` is the Charon `name_path()` of its type
+/// (`rclass.py` `getvtable` is type-directed).
+#[test]
+fn registered_dyn_impl_keys_equal_charon_name_path_of_their_type() {
+    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
+        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+    });
+    let interpreter = load_llbc_if_present(INTERPRETER_LLBC).unwrap_or_else(|| {
+        panic!("{INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+    });
+    let mut registered = registered_dyn_impls(object);
+    registered.extend(registered_dyn_impls(interpreter));
+    registered.sort();
+    registered.dedup();
+    let mut type_paths = type_decl_name_paths(object);
+    type_paths.extend(type_decl_name_paths(interpreter));
+    type_paths.sort();
+    type_paths.dedup();
+    let mismatches: Vec<(String, String)> = registered
+        .into_iter()
+        .filter(|(impl_key, _)| !type_paths.iter().any(|p| p == impl_key))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "registered impl_key must equal Charon name_path() of its type exactly: {mismatches:?}"
     );
 }

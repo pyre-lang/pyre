@@ -3216,6 +3216,13 @@ pub enum ConstValue {
     /// `Signed`). Payload is the address `cast_adr_to_int(..., 'symbolic')`
     /// captured; `intmask` of a Symbolic returns the Symbolic.
     AddressAsInt(crate::translator::rtyper::lltypesystem::lltype::_address),
+    /// Unsize vtable word (`rclass.py` `inputconst(CLASSTYPE, getvtable())`).
+    /// `assembler.py emit_const` keys the constant object itself; the
+    /// assembler records [`crate::jitcode::ConstIRelocKind::Vtable`].
+    Vtable {
+        impl_key: String,
+        trait_leaf: String,
+    },
     /// Arbitrary host-level Python object (class, module, builtin
     /// callable, instance). General carrier that stands in for an arbitrary
     /// object stored in upstream `Constant.value` — see `HostObject`.
@@ -3559,6 +3566,16 @@ impl PartialEq for ConstValue {
                     value: w,
                 },
             ) => a == b && x == y && v == w,
+            (
+                ConstValue::Vtable {
+                    impl_key: a,
+                    trait_leaf: x,
+                },
+                ConstValue::Vtable {
+                    impl_key: b,
+                    trait_leaf: y,
+                },
+            ) => a == b && x == y,
             _ => false,
         }
     }
@@ -3611,6 +3628,10 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::Function(_) => write!(f, "{self:?}"),
             ConstValue::AddressOffset(offset) => write!(f, "{offset:?}"),
             ConstValue::InheritanceId { value, .. } => write!(f, "<inheritance-id {value}>"),
+            ConstValue::Vtable {
+                impl_key,
+                trait_leaf,
+            } => write!(f, "<vtable {impl_key}::{trait_leaf}>"),
         }
     }
 }
@@ -3704,6 +3725,13 @@ impl Hash for ConstValue {
                 cdef_id.hash(state);
                 is_max.hash(state);
                 value.hash(state);
+            }
+            ConstValue::Vtable {
+                impl_key,
+                trait_leaf,
+            } => {
+                impl_key.hash(state);
+                trait_leaf.hash(state);
             }
         }
     }
@@ -4319,6 +4347,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::AddressOffset(_) => "AddressOffset",
         ConstValue::SpecTag(_) => "SpecTag",
         ConstValue::InheritanceId { .. } => "InheritanceId",
+        ConstValue::Vtable { .. } => "Vtable",
         ConstValue::Opaque(_) => "Opaque",
         ConstValue::Repr(_) => "Repr",
         ConstValue::Desc(_) => "Desc",
@@ -4576,6 +4605,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
+            ConstValue::Vtable { .. } => Some(true),
             ConstValue::Opaque(_) | ConstValue::Repr(_) | ConstValue::Desc(_) => Some(true),
         }
     }
@@ -4676,6 +4706,7 @@ impl ConstValue {
             | ConstValue::AddressAsInt(_)
             | ConstValue::AddressOffset(_)
             | ConstValue::InheritanceId { .. }
+            | ConstValue::Vtable { .. }
             | ConstValue::SpecTag(_)
             | ConstValue::Opaque(_)
             | ConstValue::Repr(_) => None,

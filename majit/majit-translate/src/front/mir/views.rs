@@ -2239,10 +2239,10 @@ impl<'a> Lowering<'a> {
         Ok(Some((data, meta)))
     }
 
-    /// Vtable word of `impl Trait for Src`: a `ConstFnAddr` of
-    /// `{impl_key}::{trait_leaf}` when that crate-local impl is in LLBC
-    /// and the pair is a `DynImplVtableDesc` registration. `runtime_fnaddr_by_path`
-    /// resolves it to `dyn_impl_vtables` (`rclass.py` `getvtable` /
+    /// Vtable word of `impl Trait for Src`: a [`OpKind::ConstVtable`]
+    /// of the registered `(impl_key, trait_leaf)` pair. The assembler
+    /// records [`crate::jitcode::ConstIRelocKind::Vtable`]; the runtime
+    /// resolves it through `dyn_impl_vtables` (`rclass.py` `getvtable` /
     /// `OBJECT.typeptr`). An unregistered Unsize declines rather than
     /// emitting a zero word.
     fn emit_dyn_unsize_vtable(
@@ -2251,7 +2251,8 @@ impl<'a> Lowering<'a> {
         src: &Place,
         dest_ty: &TyRef,
     ) -> Result<Variable, LowerError> {
-        let Some(path) = dyn_unsize_vtable_const_path(src, dest_ty, self.llbc) else {
+        let Some((impl_key, trait_leaf)) = dyn_unsize_vtable_const_path(src, dest_ty, self.llbc)
+        else {
             let (src_name, trait_name) = dyn_unsize_src_trait_names(src, dest_ty, self.llbc);
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Unsize vtable of {src_name} as dyn {trait_name} is not registered"
@@ -2263,13 +2264,31 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(var.clone()),
-            kind: OpKind::ConstFnAddr {
-                path,
-                value: 0,
-                symbolic: true,
+            kind: OpKind::ConstVtable {
+                impl_key,
+                trait_leaf,
             },
         });
         Ok(var)
+    }
+
+    /// Field name of a dyn-fat store (`InstanceRepr.setfield`). Used
+    /// when the source is not a `{data, vtable}` pair so the decline
+    /// names the field rather than writing one word into a two-word slot.
+    pub(in crate::front::mir) fn dyn_fat_write_field_name(
+        &self,
+        inner: &Place,
+        elem: &ProjectionElem,
+    ) -> String {
+        let ProjectionElem::Tagged(v) = elem else {
+            return "field".to_string();
+        };
+        let Some(payload) = v.as_object().and_then(|m| m.get("Field")) else {
+            return "field".to_string();
+        };
+        self.resolve_adt_field(&inner.ty, payload)
+            .map(|(_, name, _, _, _)| name)
+            .unwrap_or_else(|| "field".to_string())
     }
 
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
@@ -5549,23 +5568,22 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
     view
 }
 
-/// `{impl_key}::{trait_leaf}` of a crate-local `impl Trait for Src`
-/// recorded in LLBC and registered as a `DynImplVtableDesc` static. Same key
-/// `dyn_impl_vtable_addr_for_path` resolves at runtime (`rclass.py`
-/// `getvtable` / `OBJECT.typeptr`). A local impl without that static,
-/// and core `FnMut` shims, stay one-word.
+/// Registered `(impl_key, trait_leaf)` of `impl Trait for Src` when
+/// that pair is a `DynImplVtableDesc` static whose `impl_key` equals
+/// the Charon `name_path()` of the source ADT (`rclass.py`
+/// `getvtable` / `OBJECT.typeptr`). Registration is the gate: a
+/// trait whose decl is in another crate still emits the constant
+/// when the impl is registered. An impl without that static stays
+/// one-word.
 pub(in crate::front::mir) fn dyn_unsize_vtable_const_path(
     src: &Place,
     dest_ty: &TyRef,
     llbc: &Llbc,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let pointee = ref_pointee_ty(&src.ty, llbc).unwrap_or_else(|| clone_tyref(&src.ty));
     let src_id = json_ty_adt_def_id(llbc, tyref_node(&pointee, llbc)?)?;
     let trait_id = tyref_dyn_trait_decl_id(dest_ty, llbc)?;
     let trait_decl = llbc.trait_by_id(trait_id)?;
-    if !trait_decl.item_meta.is_local {
-        return None;
-    }
     let trait_path = trait_decl.item_meta.name_path();
     let trait_leaf = trait_path
         .rsplit("::")
@@ -5585,26 +5603,24 @@ pub(in crate::front::mir) fn dyn_unsize_vtable_const_path(
             continue;
         };
         if same_nominal_adt(llbc, src_id, impl_src_id) {
-            let impl_key = llbc.type_by_id(src_id)?.item_meta.name_path();
-            if !dyn_impl_vtable_pair_is_registered(llbc, &impl_key, trait_leaf) {
-                return None;
-            }
-            return Some(format!("{impl_key}::{trait_leaf}"));
+            let src_path = llbc.type_by_id(src_id)?.item_meta.name_path();
+            let (impl_key, trait_leaf) =
+                dyn_impl_vtable_registered_pair(llbc, &src_path, trait_leaf)?;
+            return Some((impl_key, trait_leaf));
         }
     }
     None
 }
 
-fn dyn_impl_vtable_pair_is_registered(llbc: &Llbc, impl_key: &str, trait_leaf: &str) -> bool {
+fn dyn_impl_vtable_registered_pair(
+    llbc: &Llbc,
+    src_path: &str,
+    trait_leaf: &str,
+) -> Option<(String, String)> {
     registered_dyn_impl_vtable_pairs(llbc)
         .iter()
-        .any(|(key, leaf)| leaf == trait_leaf && dyn_impl_registered_key_matches(impl_key, key))
-}
-
-fn dyn_impl_registered_key_matches(impl_path: &str, impl_key: &str) -> bool {
-    impl_path == impl_key
-        || impl_path.ends_with(&format!("::{impl_key}"))
-        || impl_key.ends_with(&format!("::{impl_path}"))
+        .find(|(key, leaf)| key == src_path && leaf == trait_leaf)
+        .cloned()
 }
 
 fn registered_dyn_impl_vtable_pairs(llbc: &Llbc) -> &[(String, String)] {

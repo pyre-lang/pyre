@@ -514,6 +514,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
+        | ConstValue::Vtable { .. }
         | ConstValue::LLAddress(_)
         | ConstValue::AddressAsInt(_)
         | ConstValue::UniChar(_) => ConcreteType::Signed,
@@ -826,7 +827,9 @@ fn infer_concrete_from_op(
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> ConcreteType {
     match kind {
-        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ConcreteType::Signed,
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => {
+            ConcreteType::Signed
+        }
         // Unsigned shares the JIT integer register bank with Signed; the
         // annotation/repr distinction is carried separately.
         OpKind::ConstUInt(_) => ConcreteType::Signed,

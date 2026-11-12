@@ -471,6 +471,7 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::LLPtr(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
+        | ConstValue::Vtable { .. }
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_)
         | ConstValue::Opaque(_)

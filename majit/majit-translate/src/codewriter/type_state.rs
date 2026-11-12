@@ -166,7 +166,9 @@ pub(crate) fn authoritative_result_type_from_op(
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> Option<ConcreteType> {
     match kind {
-        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ConcreteType::Signed),
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => {
+            Some(ConcreteType::Signed)
+        }
         OpKind::ConstUInt(_) => Some(ConcreteType::Signed),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => None,
         OpKind::ConstBool(_) => Some(ConcreteType::Signed),

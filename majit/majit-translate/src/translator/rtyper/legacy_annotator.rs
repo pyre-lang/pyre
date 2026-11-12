@@ -1867,6 +1867,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
+        | ConstValue::Vtable { .. }
         | ConstValue::LLAddress(_)
         | ConstValue::AddressAsInt(_)
         | ConstValue::UniChar(_) => ValueType::Int,
@@ -1971,7 +1972,9 @@ fn malloc_new_result_type(owner: &str) -> ValueType {
 fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
-        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ValueType::Int,
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => {
+            ValueType::Int
+        }
         OpKind::ConstUInt(_) => ValueType::Unsigned,
         OpKind::ConstInt128(_) => ValueType::Int128,
         OpKind::ConstSingleFloat(_) => ValueType::SingleFloat,

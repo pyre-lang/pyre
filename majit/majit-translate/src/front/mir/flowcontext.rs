@@ -3629,11 +3629,18 @@ impl<'a> Lowering<'a> {
                     let ptr = self.ensure_window_ccharp(mir_bb, ptr);
                     return self.emit_window_field_write(mir_bb, *inner, elem, ptr, len);
                 }
-                if tyref_is_fat_dyn(&dest_ty, self.llbc)
-                    && let Some((ptr, meta)) =
-                        self.dyn_fat_rvalue_parts(mir_bb, &rvalue, &dest_ty)?
-                {
-                    return self.emit_dyn_fat_field_write(mir_bb, *inner, elem, ptr, meta);
+                if tyref_is_fat_dyn(&dest_ty, self.llbc) {
+                    return match self.dyn_fat_rvalue_parts(mir_bb, &rvalue, &dest_ty)? {
+                        Some((ptr, meta)) => {
+                            self.emit_dyn_fat_field_write(mir_bb, *inner, elem, ptr, meta)
+                        }
+                        None => {
+                            let field = self.dyn_fat_write_field_name(&inner, &elem);
+                            Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: one-word dyn-fat write into field {field}"
+                            )))
+                        }
+                    };
                 }
                 let value = match self.field_write_inline_const(&inner, &elem, &rvalue, &dest_ty) {
                     // An int / bool / float field write keeps its constant

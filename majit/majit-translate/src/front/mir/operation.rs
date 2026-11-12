@@ -5671,6 +5671,7 @@ impl<'a> Lowering<'a> {
         match op {
             OpKind::ConstInt(_)
             | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstVtable { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstInt128(_)
             | OpKind::ConstUInt128(_)
@@ -5957,7 +5958,8 @@ impl<'a> Lowering<'a> {
                     OpKind::ConstInt(_)
                     | OpKind::ConstUInt(_)
                     | OpKind::ConstBool(_)
-                    | OpKind::ConstFnAddr { .. } => return true,
+                    | OpKind::ConstFnAddr { .. }
+                    | OpKind::ConstVtable { .. } => return true,
                     _ => None,
                 };
                 if let Some(ty) = result_ty {

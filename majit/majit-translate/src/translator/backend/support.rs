@@ -240,6 +240,7 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
         (ConstValue::UniStr(s), LowLevelType::UniChar) => s.chars().count() == 1,
         (ConstValue::UniChar(_), LowLevelType::UniChar) => true,
         (ConstValue::AddressAsInt(_), LowLevelType::Signed) => true,
+        (ConstValue::Vtable { .. }, LowLevelType::Signed) => true,
         (ConstValue::LLAddress(_), LowLevelType::Address) => true,
         (ConstValue::LLPtr(ptr), LowLevelType::Ptr(declared)) => &typeOf(ptr) == declared.as_ref(),
         // Every other pair is a real mismatch (e.g. Bool concretetype
