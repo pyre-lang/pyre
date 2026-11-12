@@ -5778,7 +5778,6 @@ impl OptContext {
             "get_box_replacement_operand S9 bound_from_opref fallback: {opref:?} \
              has no producer; mint at allocation (mint_box_at / reserve_virtual_box)"
         );
-        self.s9_probe_fire(opref);
         Operand::bound_from_opref(opref)
     }
 
@@ -5890,111 +5889,6 @@ impl OptContext {
                      mint at allocation (mint_box_at / reserve_virtual_box)"
                 );
                 self.mint_box_at(opref)
-            }
-        }
-    }
-
-    /// S9 probe classifier for a `from_opref` fallback fire (see
-    /// [`OptContext::get_box_replacement`]). `&self`-only, no mutation.
-    ///
-    /// Precondition: `find_producer_op` already missed (full type-tagged
-    /// `OpRef` match across `new_operations` / `phase1_emit_ops` / `resop_refs`
-    /// / `input_ops`) and `resolve_to_operand` returned `None`; `opref` is
-    /// non-`none`, non-`Const`.
-    ///
-    /// - `b-inputarg`: an InputArg position whose `inputarg_refs` slot is unbound.
-    /// - `b-typetag`: a producer Op exists at the same RAW position under a
-    ///   different type tag (the #97 type-tag divergence signal).
-    /// - `b-rekey-*`: the OpRef is named by a carried Phase-1 registry
-    ///   (`inputargs` / `imported_label_args` via `to_opref()` / `imported_virtual_args`), so a
-    ///   producer exists in Phase 1 but is not in a `find_producer_op` store.
-    /// - `b-shortpure`: the OpRef is the `result` of a carried
-    ///   `imported_short_pure_ops` entry — a short-preamble producer survives
-    ///   but `find_producer_op` does not consult that table.
-    /// - `a-producerless`: no producer Op for this position is reachable in any
-    ///   OptContext-local registry — correct-as-is (an unforwarded box returns
-    ///   itself, `resoperation.py`).
-    fn classify_s9_fallback(&self, opref: OpRef) -> &'static str {
-        match opref {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                return "b-inputarg";
-            }
-            _ => {}
-        }
-        let raw = opref.raw();
-        let raw_hit = self
-            .new_operations
-            .iter()
-            .chain(self.phase1_emit_ops.iter())
-            .chain(self.input_ops.iter())
-            .any(|op| op.pos().get().raw() == raw);
-        if raw_hit {
-            return "b-typetag";
-        }
-        if self
-            .inputargs
-            .iter()
-            .any(|inputarg| inputarg.to_opref() == opref)
-        {
-            return "b-rekey-inputargs";
-        }
-        if let Some(label_args) = self.imported_label_args.as_ref()
-            && label_args.iter().any(|arg| arg.to_opref() == opref)
-        {
-            return "b-rekey-label";
-        }
-        if let Some((_, vargs)) = self.imported_virtual_args.as_ref()
-            && vargs.contains(&opref)
-        {
-            return "b-rekey-vargs";
-        }
-        if self
-            .imported_short_pure_ops
-            .iter()
-            .any(|sp| sp.result.to_opref() == opref)
-        {
-            return "b-shortpure";
-        }
-        "a-producerless"
-    }
-
-    /// S9 probe sink (env-gated). No-op unless `MAJIT_S9_PROBE` is set; appends
-    /// one classified line per `from_opref` fallback fire to
-    /// `/tmp/majit_s9_probe.log`. Process-global file sink because the caller is
-    /// `&self` (no context-local counter). When the flag is unset, only a
-    /// cached bool is read and the sink is never opened.
-    fn s9_probe_fire(&self, opref: OpRef) {
-        use parking_lot::Mutex;
-        use std::sync::LazyLock;
-        static ENABLED: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("MAJIT_S9_PROBE").is_some());
-        if !*ENABLED {
-            return;
-        }
-        static SINK: LazyLock<Mutex<std::fs::File>> = LazyLock::new(|| {
-            Mutex::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/majit_s9_probe.log")
-                    .expect("open /tmp/majit_s9_probe.log"),
-            )
-        });
-        let cat = self.classify_s9_fallback(opref);
-        // `MAJIT_S9_PROBE=bt` additionally captures the caller backtrace per
-        // fire, to attribute fallback fires to their `get_box_replacement`
-        // call sites.
-        static BT: LazyLock<bool> = LazyLock::new(|| {
-            std::env::var("MAJIT_S9_PROBE")
-                .map(|v| v == "bt")
-                .unwrap_or(false)
-        });
-        {
-            let mut f = SINK.lock();
-            use std::io::Write;
-            let _ = writeln!(f, "cat={} opref={:?} raw={}", cat, opref, opref.raw());
-            if *BT {
-                let _ = writeln!(f, "{}", std::backtrace::Backtrace::force_capture());
             }
         }
     }

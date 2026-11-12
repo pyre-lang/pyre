@@ -38,41 +38,6 @@ use majit_ir::{
     OopSpecIndex, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
-mod slice_x2_probe {
-    //! Instrumentation: count how often the host-loop
-    //! `execute_with_inputs` falls back to the dispatch-loop branch for
-    //! cross-loop JUMP exits.  In-code `closing_jump` work will keep
-    //! shrinking this counter until the branch can be deleted.
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    pub static EXECUTE_WITH_INPUTS_HITS: AtomicUsize = AtomicUsize::new(0);
-
-    pub fn record_execute_with_inputs_hit() {
-        EXECUTE_WITH_INPUTS_HITS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    struct ReporterGuard;
-
-    impl Drop for ReporterGuard {
-        fn drop(&mut self) {
-            if std::env::var_os("MAJIT_X2_PROBE").is_some() {
-                eprintln!(
-                    "[X2-PROBE] execute_with_inputs.external_jump={}",
-                    EXECUTE_WITH_INPUTS_HITS.load(Ordering::Relaxed),
-                );
-            }
-        }
-    }
-
-    thread_local! {
-        static REPORTER: ReporterGuard = const { ReporterGuard };
-    }
-
-    pub fn arm_reporter() {
-        REPORTER.with(|_| {});
-    }
-}
-
 /// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
 /// prefix filter accepts, so a category filter silences these sites.
 ///
@@ -2756,7 +2721,6 @@ fn handle_compiled_exit(
     let fail_descr_fd = fail_descr.as_fail_descr();
 
     if fail_descr_fd.is_external_jump() {
-        slice_x2_probe::record_execute_with_inputs_hit();
         let target_descr = fail_descr_fd.target_descr();
         let target_entry = target_descr
             .as_ref()
@@ -12942,8 +12906,6 @@ impl CraneliftBackend {
                 longevity_dump,
             );
         }
-        let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
-
         // LABEL identity → source arity (args.len()).  Captured up front
         // because Cranelift's FunctionBuilder may auto-promote `def_var`
         // chains into block params later, growing the block's runtime
@@ -13046,10 +13008,6 @@ impl CraneliftBackend {
         // `0..num_inputs` so the entry `def_var` lands on the slot the
         // ops actually reference.
         for ia in inputargs {
-            if debug_declares {
-                // Independent debug toggle — not gated by MAJIT_LOG.
-                eprintln!("[jit][declare] input var{}", ia.index);
-            }
             var_types.insert(ia.index, cl_types::I64);
             declared_vars.insert(ia.index);
         }
@@ -13073,10 +13031,6 @@ impl CraneliftBackend {
                     // through a GPR (fmov) on every iteration.
                     cranelift_type_for(&op.result_type())
                 };
-                if debug_declares {
-                    // Independent debug toggle — not gated by MAJIT_LOG.
-                    eprintln!("[jit][declare] op-result var{vi} opcode={:?}", op.opcode);
-                }
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
@@ -13094,13 +13048,6 @@ impl CraneliftBackend {
                 }
                 if !arg.is_none() && !declared_vars.contains(&arg.to_opref().raw()) {
                     declared_vars.insert(arg.to_opref().raw());
-                    if debug_declares {
-                        eprintln!(
-                            "[jit][declare] ref-arg var{} owner={:?}",
-                            arg.to_opref().raw(),
-                            op.opcode
-                        );
-                    }
                     var_types.insert(arg.to_opref().raw(), cl_type_for_opref(arg.to_opref()));
                 }
             }
@@ -13123,10 +13070,6 @@ impl CraneliftBackend {
                     continue;
                 }
                 declared_vars.insert(arg.to_opref().raw());
-                if debug_declares {
-                    // Independent debug toggle — not gated by MAJIT_LOG.
-                    eprintln!("[jit][declare] label-arg var{}", arg.to_opref().raw());
-                }
                 var_types.insert(arg.to_opref().raw(), cl_type_for_opref(arg.to_opref()));
             }
         }
@@ -17679,18 +17622,6 @@ impl CraneliftBackend {
                             op.arg(3).to_opref(),
                             "GC_STORE itemsize",
                         )?;
-                        if std::env::var_os("MAJIT_CL_GCSTORE_LOG").is_some() {
-                            let offset_dbg = lookup_const_i64(op.arg(1).to_opref());
-                            eprintln!(
-                                "[cl-gcstore] op_idx={} base={:?} offset_arg={:?} offset={:?} value_arg={:?} size={}",
-                                op_idx,
-                                op.arg(0).to_opref(),
-                                op.arg(1).to_opref(),
-                                offset_dbg,
-                                op.arg(2).to_opref(),
-                                item_size
-                            );
-                        }
                         let value_type = type_for_opref(
                             &type_index,
                             &type_overrides,
@@ -21737,12 +21668,6 @@ impl majit_backend::Backend for CraneliftBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        // Armed here rather than at the entry it reports on. The guard only
-        // has to exist by the time the thread ends, and registering a
-        // thread-local with a destructor is a call — one this thread was
-        // going to make anyway, on a path taken once per compiled loop
-        // instead of once per entry into one.
-        slice_x2_probe::arm_reporter();
         token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         #[cfg(test)]
         rebind_trace_arg_boxes(inputargs, ops);
@@ -22311,7 +22236,6 @@ impl majit_backend::Backend for CraneliftBackend {
             // `MAJIT_CL_NO_CLOSING_JUMP`); otherwise the JUMP transfers
             // entirely inside generated code.
             if fail_descr_fd.is_external_jump() {
-                slice_x2_probe::record_execute_with_inputs_hit();
                 let target_descr = fail_descr_fd.target_descr();
                 let target_entry = target_descr
                     .as_ref()

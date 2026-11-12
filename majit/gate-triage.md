@@ -37,7 +37,6 @@ cover the condition they diagnose.
 | `MAJIT_MIR_FRONTEND_DEBUG` | OFF | Prints MIR frontend lowering diagnostics; remove when unsupported shapes are fully classified. |
 | `MAJIT_MIR_FRONTEND_LLBC` | path list | Supplies the complete LLBC input set to the translator; retain as consumer configuration. |
 | `MAJIT_MIR_STRESS_LLBC` | path | Supplies the LLBC snapshot for ignored stress tests; retain while those tests are external-fixture tests. |
-| `MAJIT_NBODY_DEBUG` | OFF | Reports nested-body tracing decisions; remove when those decisions have focused coverage. |
 | `MAJIT_NO_UNROLL` | OFF | Skips the unroll optimizer for diagnosis; remove when the optimizer no longer needs a runtime comparison path. |
 | `MAJIT_PORTAL_RCA` | OFF | Reports portal-selection decisions; remove when portal selection is covered by focused tests. |
 | `MAJIT_PROBE_SUBSCR` | OFF | Reports subscription tracing and dispatch decisions; remove when the relevant opcode paths have focused coverage. |
@@ -45,7 +44,6 @@ cover the condition they diagnose.
 | `MAJIT_ROOT_BRACKET_ERASE` | ON | Keeps a root bracket out of the jitcode when its read-backs are answerable without the shadow stack; `0` or `false` restores the residual bracket, and the escape hatch retires when the erasure covers every bracket shape. |
 | `MAJIT_RTYPER_FRONTIER` | OFF | Makes the flowspace adapter resume past an unresolvable call and report the subject's whole call-wall set instead of the first; remove when the census no longer needs sole-blocker ranking. |
 | `MAJIT_RTYPER_VERBOSE` | OFF | Emits per-graph rtyper failure census rows; remove when all supported graphs translate or fail through stable classifications. |
-| `MAJIT_S9_PROBE` | OFF | Records optimizer stage-nine diagnostics; remove when that stage has focused invariant coverage. |
 | `MAJIT_SIZE_SHELL_OWNERS` | OFF | Reports owners of size-descriptor shells; remove when shell identity is enforced structurally. |
 | `MAJIT_TRACE_CALL_DIAG` | OFF | Reports calls emitted by the native backend; remove when call lowering has sufficient trace-level coverage. |
 | `MAJIT_TRACE_OPS_DIAG` | OFF | Reports operations executed by the native backend; remove when operation lowering has sufficient trace-level coverage. |
@@ -108,13 +106,6 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
-### `MAJIT_CL_GCSTORE_LOG`
-
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
-- Accessor: read inline in `do_compile()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_COVERAGE_AUDIT`
 
 - Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs`
@@ -126,13 +117,6 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs`
 - Accessor: read inline in `assemble_with_callcontrol()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
-### `MAJIT_DEBUG_DECLARES`
-
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
-- Accessor: read inline in `do_compile()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
@@ -183,13 +167,6 @@ cover the condition they diagnose.
 - Read sites: 1 — `pyre/pyre-jit/src/jit/assembler.rs`
 - Accessor: `dump_assembled_ssarepr()`
 - What it does: Print the assembled instruction stream, byte position first, for graphs whose name matches `MAJIT_DUMP_SSAREPR`. A blackhole failure reports a raw `(jitcode, position)` pair; without the stream there is no way back from that byte offset to the op that wrote it or to the register operands it reads.  The env lookup is cached because `try_assemble` runs per graph on the tracing path.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
-### `MAJIT_FAILVALS`
-
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
-- Accessor: `failvals_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_FIELD_MINT_TRACE`
@@ -298,13 +275,6 @@ cover the condition they diagnose.
 - Accessor: `guard_resume_refuse_pending_fields()`
 - What it does: Restores `guard_carries_pending_fields`, the refusal to build a guard-resume bridge for a guard whose deferred writes span more than one virtual. Off by default: upstream has no such refusal, and the double-application it once guarded against is answered by placing the decision ahead of `start_bridge_tracing` rather than by declining. Kept so the two answers stay comparable inside one binary, which a second build cannot do.
 - Retirement condition: Remove once no consumer needs the refusal restored to attribute a result.
-
-### `MAJIT_HEAPDBG`
-
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
-- Accessor: `heapdbg_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_JITFRAME_POOL`
 
@@ -448,13 +418,6 @@ cover the condition they diagnose.
 - What it does: `MAJIT_SKIP_BRIDGES=a,b,...`: decline exactly the listed bridge sequence numbers and take every other one, so a bisect can ask whether one numbered bridge corrupts on its own or whether the corruption is cumulative. `MAJIT_MAX_BRIDGES` cannot answer that, because declining number N also declines everything after it. The two share one sequence — the n-th bridge `should_bridge` otherwise reaches — and either one alone starts the count, so this gate needs no fuel limit beside it.
 - Retirement condition: Remove with `MAJIT_MAX_BRIDGES`, once a compiled bridge cannot produce a value the same guard's blackhole resume would not.
 
-### `MAJIT_SMALLIR`
-
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
-- Accessor: `smallir_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_SPDIAG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
@@ -491,13 +454,6 @@ cover the condition they diagnose.
 - Default polarity: **OFF**; unset launches the isolated child, any present value runs the fixture in that child. It is not a runtime optimization switch.
 - Retirement condition: Remove when this fixture has a dedicated test executable or another process-isolation mechanism that does not need a child marker.
 
-### `MAJIT_TLDBG`
-
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
-- Accessor: `tldbg_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_TRACE_ENTRY_CENSUS`
 
 - Read sites: 1 — `majit/majit-backend-wasm/src/lib.rs`
@@ -510,11 +466,4 @@ cover the condition they diagnose.
 - Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
 - Accessor: `majit_verify_enabled()`
 - What it does: Whether `MAJIT_VERIFY` is set, cached at first access.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
-### `MAJIT_X2_PROBE`
-
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
-- Accessor: `drop()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.

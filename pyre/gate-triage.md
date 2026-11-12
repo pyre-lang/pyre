@@ -93,14 +93,12 @@ Kept as-is; listed for completeness.
 - **Diagnostics (~35, default-OFF)** — print/log/dump/probe/assert only; tooling,
   not experiments: `PYRE_FBW_DEBUG_ABORT`, `_INLINE_DIAG`, `_MF_DIAG`,
   `_STRICT_DIAG`, `PYRE_WALK_PERFN_JITCODE`, `PYRE_DUMP_PERFN_JITCODE`,
-  `PYRE_P2_DIAG`, `PYRE_PCDEP_VALIDATE`, `MAJIT_MIR_FRAMESTATE_DEBUG`,
+  `PYRE_PCDEP_VALIDATE`, `MAJIT_MIR_FRAMESTATE_DEBUG`,
   `_FRAMESTATE_STRICT`, `MAJIT_MIR_FRONTEND_DEBUG`, `PYRE_VSTACK_DIAG`,
-  `PYRE_PROBE_AUTHORITATIVE`, `_BH_STARTUP`, `_SNAPSHOT`, `_SUBSCR`,
-  `MAJIT_S9_PROBE`, `_PIPELINE`, `PYRE_MFRAME_DIAG`,
-  `MAJIT_RTYPER_VERBOSE`, `PYRE_DIAG124C`, `_51C`,
-  `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
-  `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `MAJIT_NBODY_DEBUG`,
-  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`,
+  `MAJIT_PROFILE_PIPELINE`,
+  `MAJIT_RTYPER_VERBOSE`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
+  `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`,
+  `PYRE_DESCR_DEMAND`,
   `PYRE_CENSUS_HISTOGRAM`, `PYRE_REGEX_LENGTHS`, `PYRE_REGEX_ROWS`.
   `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
   actually resolves, so the per-index pool loader can be measured against the
@@ -273,7 +271,7 @@ effect unless the probe in §6c is enabled. The former
 `PYRE_PORTAL_METATRACE_ENTRY` knob is retired: the probe requires a split
 portal and enters at pc 0 through `initialize_state_from_start`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (67): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -283,7 +281,7 @@ configuration.
 `MAJIT_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
 `PYRE_CELL_CENSUS`, `PYRE_CHECK_INHERIT_ENV`,
 `PYRE_DESCR_SPELLING_GATE`,
-`PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
+`PYRE_DEOPT_PROBE`,
 `MAJIT_DETERMINISM_TRACE`, `MAJIT_DTRACE_CONST_BT`,
 `MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
 `PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
@@ -295,15 +293,12 @@ configuration.
 `PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
 `PYRE_GEN_CENSUS`, `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`, `PYRE_JD2_DEBUG`,
-`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
-`PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
-`PYRE_M73_MIDBODY_CARRY_AUDIT`,
+`PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
 `MAJIT_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `MAJIT_NO_UNROLL`,
 `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
 `MAJIT_PORTAL_RCA`, `PYRE_PORTAL_INTERPRET`, `PYRE_PORTAL_METATRACE`,
-`PYRE_PROBE_SNAPSHOT`,
 `MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_SS_COLLECT_ALL`, `PYRE_SS_STATS`,
@@ -404,7 +399,6 @@ under measurement.
 
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
-| `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
 | `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 | `PYRE_GC_GATE_BASE` | VALUE | names the upstream commit `scripts/check-gc-root-brackets.py` measured its numbers over, so a backlog raised by code the baseline never saw is reported rather than charged to the branch; the workflow supplies it because a CI checkout is shallow, holds no `main` ref and has its merge commit's parent list truncated away, leaving nothing in the repository able to answer; retire when the gate's job checks out enough history for `git merge-base` to name the base itself |
 | `PYRE_EXIT_FRAME_DIAG` | OFF | prints one line per `exit_frame_with_exception` delivery to a frame's own exception table, naming the site and the verdict `exit_frame_handler_needs_unwritten_stack` reached there, passes included so a refusal is a share of something; retire when the handler search moves inside the trace and the two delivery sites become one |

@@ -1393,12 +1393,6 @@ impl MIFrame {
                         sym_ec
                     }
                 } else {
-                    if is_portal_red && crate::jitcode_dispatch::p2_diag_enabled() {
-                        eprintln!(
-                            "[p2-trait-scratch] jitcode_pc={} color={} owned by frame slot; keeping bank box",
-                            jit_pc, reg_idx
-                        );
-                    }
                     // `registers_r_bank` is slot-indexed (`sym.registers_r`).
                     // `pyjitpl.py` `MIFrame.get_list_of_active_boxes` records
                     // `registers_r[index]`, the color-indexed register. An
@@ -2764,48 +2758,6 @@ impl MIFrame {
         // alongside the virtualizable boxes; the vable half here comes from
         // the trait leg's own mirror, so take only the vref half.
         let (_, vref_boxes) = ctx.build_snapshot_vable_vref_boxes();
-        // PHASE 1.4 candidate D probe: detect snapshot-time divergence
-        // between vable_boxes (heap mirror) and registers_r (machine
-        // register source). Both should be populated by store_local_value's
-        // dual-write. Any divergence here means a code path updated one
-        // shadow without the other — most likely load_local_value's lazy
-        // fallback (trace_opcode.rs) which writes registers_r
-        // but does NOT call set_virtualizable_box_at.
-        if std::env::var("PYRE_PROBE_SNAPSHOT").ok().as_deref() == Some("1") {
-            let num_static = ctx
-                .virtualizable_info()
-                .map(|info| info.num_static_extra_boxes)
-                .unwrap_or(0);
-            let nlocals = self.sym().nlocals;
-            let registers_r_src: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                pre_r[..pre_r.len().min(nlocals)].to_vec()
-            } else {
-                let s = self.sym();
-                s.registers_r.iter().take(nlocals).collect()
-            };
-            let mut diverge = 0usize;
-            for i in 0..registers_r_src.len() {
-                let reg_op = registers_r_src[i];
-                let vable_op = ctx
-                    .virtualizable_box_at(num_static + i)
-                    .unwrap_or(OpRef::NONE);
-                if !reg_op.is_none() && reg_op != vable_op {
-                    eprintln!(
-                        "[PROBE-D] vable/reg divergence top_pc={} local={} reg_opref={:?} vable_opref={:?}",
-                        top_pc, i, reg_op, vable_op
-                    );
-                    diverge += 1;
-                }
-            }
-            eprintln!(
-                "[PROBE-D] ENTER top_pc={} nlocals={} reg_len={} num_static={} diverge_count={}",
-                top_pc,
-                nlocals,
-                registers_r_src.len(),
-                num_static,
-                diverge
-            );
-        }
         majit_metainterp::recorder::Snapshot {
             resume_position: -1,
             frames,

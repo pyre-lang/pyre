@@ -322,7 +322,7 @@ fn gate_names_in<'a>(line: &'a str, prefix: &str) -> Vec<&'a str> {
 ///
 /// **Subject, not mention**: only the *first* name on a retirement line is
 /// retired by it. A row retiring `PYRE_AUTHORITATIVE` may end
-/// "`PYRE_PROBE_AUTHORITATIVE` is separate and remains live" — the whole point
+/// "`PYRE_WALKABORT_OFF` is separate and remains live" — the whole point
 /// of that clause is that the second name is not the one being retired.
 ///
 /// "retired", not "retire": §4 is a live section whose gates are the ones that

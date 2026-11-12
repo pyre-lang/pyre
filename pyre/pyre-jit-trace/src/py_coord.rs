@@ -122,26 +122,6 @@ pub fn trivia_normalized_py_pc_for_jitcode_pc(jitcode_index: i32, pc_word: i32) 
     }
 }
 
-/// `PYRE_M73_BACKXLAT_TWIN_AUDIT` asserts the codewriter-built forward py_pc
-/// twin equals the [`trivia_normalized_py_pc_for_jitcode_pc`] containing lookup
-/// at every non-negative resume word before [`resume_py_pc_for_jitcode_word`]
-/// trusts the twin. Off in production; the gated assert is the only added work.
-fn m73_backxlat_twin_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BACKXLAT_TWIN_AUDIT").is_some())
-}
-
-pub(crate) fn emptytwin_census_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_EMPTYTWIN_CENSUS").is_some())
-}
-
-pub(crate) fn note_empty_twin_fallback(site: &'static str, jitcode_index: i32, jit_pc: i32) {
-    if emptytwin_census_enabled() {
-        eprintln!("[m73-emptytwin] site={site} jitcode={jitcode_index} pc={jit_pc}");
-    }
-}
-
 /// Forward Python instruction coordinate for a carried resume JitCode word.
 ///
 /// Reads the codewriter-built `forward_py_pc` twin first. Empty-twin JitCodes
@@ -159,19 +139,7 @@ pub fn resume_py_pc_for_jitcode_word(jitcode_index: i32, pc_word: i32) -> i32 {
     match crate::state::pyjitcode_for_jitcode_index(jitcode_index)
         .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))
     {
-        Some(twin) => {
-            if m73_backxlat_twin_audit_enabled() {
-                assert_eq!(
-                    twin as i32,
-                    trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, pc_word),
-                    "PYRE_M73_BACKXLAT_TWIN_AUDIT: forward py_pc twin diverged at jitcode {jitcode_index} pc {pc_word}"
-                );
-            }
-            twin as i32
-        }
-        None => {
-            note_empty_twin_fallback("resume_word", jitcode_index, pc_word);
-            trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, pc_word)
-        }
+        Some(twin) => twin as i32,
+        None => trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, pc_word),
     }
 }

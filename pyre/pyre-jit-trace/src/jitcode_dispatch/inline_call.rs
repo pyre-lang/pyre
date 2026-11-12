@@ -507,70 +507,6 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
-#[allow(non_snake_case)]
-/// #62 call-inlining recognition probe (env-gated `PYRE_DIAG_INLINE_RECOG`,
-/// ZERO behavior change — emits only diagnostics).  A user-function `CALL`
-/// lowers to a `call_fn` residual whose `funcptr` is the generic call helper,
-/// not the callee; the actual callable is a runtime Ref arg.  This scans the
-/// Ref args' concrete values for a user Python function (`FUNCTION_TYPE`,
-/// non-builtin) and reports whether its per-`CodeObject` JitCode is installed
-/// (`jitcode_lookup`).  It confirms the runtime callable -> `CodeObject` ->
-/// JitCode recognition seam fires before any inline sub-walk wiring lands.
-pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
-    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
-    // Single-letter kind tag per arg, so the call_fn arg layout (which slot
-    // holds the callable vs the positional args) can be read off empirically
-    // without touching CodeObject internals.
-    let shape: String = arg_concretes
-        .iter()
-        .map(|cv| match cv {
-            ConcreteValue::Int(_) => 'i',
-            ConcreteValue::Float(_) => 'f',
-            ConcreteValue::Bool(_) => 'b',
-            ConcreteValue::Ref(_) => 'r',
-            ConcreteValue::Null => '_',
-        })
-        .collect();
-    for (i, cv) in arg_concretes.iter().enumerate() {
-        let ConcreteValue::Ref(obj) = *cv else {
-            continue;
-        };
-        if obj.is_null() {
-            continue;
-        }
-        unsafe {
-            if !pyre_interpreter::is_function(obj) {
-                continue;
-            }
-            // Only the pure-Python `function` type is a sub-walk candidate;
-            // builtins share `is_function` but have no per-fn JitCode.
-            if (*obj).ob_type as *const () as usize != function_type_addr {
-                continue;
-            }
-            let code = pyre_interpreter::function_get_code(obj);
-            // Exercise the slice-(3) obtain step: build (if needed) + view the
-            // callee per-fn JitCode as a SubJitCodeBody.  Reports the callee
-            // register-bank shape the sub-walk will allocate.
-            match crate::state::sub_jitcode_body_for_code(code) {
-                Some(body) => eprintln!(
-                    "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} \
-                     code={code:?} body-OK regs_r={} regs_i={} regs_f={} code_len={}",
-                    arg_concretes.len(),
-                    body.num_regs_r,
-                    body.num_regs_i,
-                    body.num_regs_f,
-                    body.code.len()
-                ),
-                None => eprintln!(
-                    "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} \
-                     code={code:?} body-NONE",
-                    arg_concretes.len()
-                ),
-            }
-        }
-    }
-}
-
 /// Whether a fresh inlined callee frame stores PY_NULL `debugdata` or a
 /// constructor `FrameDebugData` (`frame_stores_global` override).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3888,9 +3824,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .iter()
             .any(|f| f.w_code == w_code as usize);
         if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
-            if p2_diag_enabled() {
-                eprintln!("[p2-ca] decline pc={} reason=not-self-nor-mutual", op.pc);
-            }
             return Ok(None);
         }
     }
@@ -3925,12 +3858,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .iter()
             .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
         {
-            if p2_diag_enabled() {
-                eprintln!(
-                    "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
-                    op.pc
-                );
-            }
             return Ok(None);
         }
     }
@@ -4017,15 +3944,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         match driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types) {
             Some(token) => token,
             None => {
-                if p2_diag_enabled() {
-                    eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
-                }
                 return Ok(None);
             }
         };
-    if p2_diag_enabled() {
-        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
-    }
 
     // emission
     // The token is the callee this callable resolved to. A loop-carried
@@ -7851,7 +7772,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         callable_operand,
         fnaddr,
         helper_return,
-        "builtin_call",
         "builtin_wrapper_call_site",
     ) else {
         return Ok(None);
@@ -8083,7 +8003,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     callable_operand: pyre_object::PyObjectRef,
     fnaddr: usize,
     helper_return: HelperReturn,
-    twin_tag: &'static str,
     active_tag: &'static str,
 ) -> Option<BuiltinWrapperCallSite> {
     let nested_helper = ctx.fbw_mode.inline_subwalk;
@@ -8178,7 +8097,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
                 .payload
                 .forward_py_pc_for_jitcode_pc(op.pc)
                 .unwrap_or_else(|| {
-                    crate::py_coord::note_empty_twin_fallback(twin_tag, jc.index, op.pc as i32);
                     crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
                 });
             if jc.payload.code_ptr.is_null() {
@@ -12376,7 +12294,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         call_jitcode_pc,
                         call_stack_len: arg_concretes.len(),
                         callee_jitcode_index: callee_pjc.jitcode.index() as u32,
-                        abort_jitcode_pc: abort_pc,
                         callee_py_pc,
                         w_code: pyre_object::gc_roots::shadow_stack_get(inline_code_slot),
                         w_globals: unsafe {
@@ -15307,7 +15224,6 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
         callable,
         fnaddr,
         HelperReturn::Converted,
-        "builtin_getattribute",
         "builtin_getattribute_call_site",
     ) else {
         return Ok(None);

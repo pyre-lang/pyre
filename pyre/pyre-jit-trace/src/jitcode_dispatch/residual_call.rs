@@ -7117,22 +7117,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // false, and rollback would miss that concrete mutation.  The helper no-ops
     // on an empty session framestack, so top-level depth-1 behavior is unchanged.
     if !provably_side_effect_free {
-        if std::env::var_os("PYRE_LB_SITE").is_some() {
-            // The decline cause the gate prints is `None` on this arm, so name
-            // the callee here instead: once a body is traced through, the
-            // residual that fails the predicate is one of its whole helper set.
-            let name = pyre_interpreter::jit_trace_fnaddrs()
-                .iter()
-                .find(|(_, a)| *a == func_ptr as i64)
-                .map(|(n, _)| *n);
-            eprintln!(
-                "[lb-exec] pc={op_pc} helper={helper:?} extraeffect={:?} elidable={} \
-                 rtype={:?} fn={name:?}",
-                ei.extraeffect,
-                ei.check_is_elidable(),
-                call_descr.result_type(),
-            );
-        }
         fbw_abort_nested_unjournaled_residual(ctx, op_pc, None)?;
     }
     // The loop-variable binding store is the op at the in-flight FOR_ITER's
@@ -11353,14 +11337,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     ctx.clear_last_exc_value();
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (mut r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
-    // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
-    // set; full-body-walk authoritative path only).  First slice of the
-    // call-inlining feature — confirms callable->JitCode recognition before
-    // sub-walk wiring.
-    if ctx.is_authoritative_executor && std::env::var("PYRE_DIAG_INLINE_RECOG").is_ok() {
-        let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-        diagnose_inline_recognition(&arg_concretes, op.pc);
-    }
     let descr_offset = 1 + arg_width;
     let descr_index = decode_descr_index(code, op, descr_offset);
     let descr = read_descr(code, op, descr_offset, ctx)?;

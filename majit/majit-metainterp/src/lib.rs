@@ -568,11 +568,6 @@ fn callee_rca_enabled_init() -> bool {
     std::env::var_os("MAJIT_CALLEE_RCA").is_some()
 }
 
-pub fn nbody_debug_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NBODY_DEBUG").is_some())
-}
-
 /// Constness of every index arriving at `TraceCtx::get_arrayitem_vable_index`.
 /// See that function for what the counts do and do not establish — in
 /// particular, it is a shared callee and the reading cannot be attributed to a
@@ -623,16 +618,6 @@ pub fn mptrace_enabled() -> bool {
 pub fn pcseq_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_PCSEQ").is_some())
-}
-
-pub fn tldbg_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_TLDBG").is_some())
-}
-
-pub fn heapdbg_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_HEAPDBG").is_some())
 }
 
 /// Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode).
@@ -724,11 +709,6 @@ pub(crate) fn handle_portal_crn_hook(target_pc: usize, green_pc: usize) -> bool 
 pub fn log_jtet_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_LOG_JTET").is_some())
-}
-
-pub fn smallir_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_SMALLIR").is_some())
 }
 
 pub fn log_opt_enabled() -> bool {

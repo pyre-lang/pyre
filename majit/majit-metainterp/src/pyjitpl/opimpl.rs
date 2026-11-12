@@ -1128,17 +1128,6 @@ where
                 )
             }
         };
-        if !is_ref && ctx.is_bridge_trace && crate::heapdbg_enabled() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 240 {
-                eprintln!(
-                    "@@@HEAP getfield_i n={} struct_ptr={:#x} off={} loaded={}",
-                    n, struct_ptr, offset, loaded
-                );
-            }
-        }
         let kind = if is_ref {
             OpCode::GetfieldGcR
         } else {

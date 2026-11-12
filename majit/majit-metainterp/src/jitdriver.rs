@@ -744,17 +744,6 @@ fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
 }
-static FAILVALS_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[inline]
-fn failvals_enabled() -> bool {
-    crate::env_presence_flag(&FAILVALS_FLAG, failvals_enabled_init)
-}
-
-fn failvals_enabled_init() -> bool {
-    std::env::var_os("MAJIT_FAILVALS").is_some()
-}
-
 static PORTAL_RCA_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[inline]
@@ -7492,17 +7481,6 @@ impl<S: JitState> JitDriver<S> {
                 fd.fail_arg_types().len()
             );
         }
-        if failvals_enabled() {
-            let raw_values = self.meta.raw_exit_slots_from_deadframe(&deadframe, fd);
-            eprintln!(
-                "@@@FAILVALS descr=0x{:x} resume_pc={} raw_values={:?}",
-                descr_id,
-                crate::compile::guard_resume_pc(fd)
-                    .map(|p| p as i64)
-                    .unwrap_or(-1),
-                raw_values
-            );
-        }
         if crate::callee_rca_enabled() {
             let raw_values = self.meta.raw_exit_slots_from_deadframe(&deadframe, fd);
             eprintln!(
@@ -7783,19 +7761,6 @@ impl<S: JitState> JitDriver<S> {
                 "[jit] handle_fail: descr=0x{:x} values={}",
                 descr_id,
                 fd.fail_arg_types().len()
-            );
-        }
-        if failvals_enabled() {
-            let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                self.meta.raw_exit_slots_from_deadframe(frame, fd)
-            });
-            eprintln!(
-                "@@@FAILVALS descr=0x{:x} resume_pc={} raw_values={:?}",
-                descr_id,
-                crate::compile::guard_resume_pc(fd)
-                    .map(|p| p as i64)
-                    .unwrap_or(-1),
-                raw_values
             );
         }
         if crate::callee_rca_enabled() {
