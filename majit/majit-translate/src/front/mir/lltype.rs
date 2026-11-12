@@ -11142,6 +11142,10 @@ pub(in crate::front::mir) fn tyref_dyn_trait_decl_id(ty: &TyRef, llbc: &Llbc) ->
             .as_array()?
             .get(1)?
     };
+    // Charon wraps the `DynTrait` predicate in `Value` / `Deduplicated`.
+    // `node_is_dyn_trait` peels those; the principal trait lives on the
+    // peeled node (`rclass.py` `getvtable`).
+    let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
     json_dyn_trait_decl_id(inner).or_else(|| json_dyn_predicate_principal_trait_id(inner))
 }
 

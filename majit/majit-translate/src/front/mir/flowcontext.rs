@@ -3332,7 +3332,9 @@ impl<'a> Lowering<'a> {
             // Body-local `&dyn Trait` gets a length shadow so `Unsize`
             // can bind `{data, vtable}`. A one-word producer (Call,
             // field copy, param copy) keeps the helper ABI.
-            if !tyref_is_fat_dyn(&dest.ty, self.llbc) || self.rvalue_is_dyn_fat_pair(&rvalue) {
+            if !tyref_is_fat_dyn(&dest.ty, self.llbc)
+                || self.rvalue_is_dyn_fat_pair(&rvalue, &dest.ty)
+            {
                 return self.lower_pair_assign(mir_bb, i as usize, rvalue);
             }
         }

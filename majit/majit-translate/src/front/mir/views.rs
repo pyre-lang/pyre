@@ -2123,17 +2123,23 @@ impl<'a> Lowering<'a> {
 
     /// Whether `rvalue` produces the two-word `{data, vtable}` pair of a
     /// fat `&dyn Trait`: an `Unsize` of a thin instance pointer whose
-    /// `impl Trait for Src` vtable key resolves, or a copy of a local
-    /// already bound as that pair. `rclass.py` `OBJECT.typeptr`. An
+    /// `impl Trait for Src` vtable key resolves against `dest_ty`, or a
+    /// copy of a local already bound as that pair. `rclass.py`
+    /// `OBJECT.typeptr`. Charon records `Unsize(tgt, VTable(impl), extra)`;
+    /// the assignment dest names the trait, not the metadata word. An
     /// `Unsize` whose source is already a one-word dyn (a parameter),
     /// or whose vtable is unregistered, stays one word.
-    pub(in crate::front::mir) fn rvalue_is_dyn_fat_pair(&self, rvalue: &Rvalue) -> bool {
+    pub(in crate::front::mir) fn rvalue_is_dyn_fat_pair(
+        &self,
+        rvalue: &Rvalue,
+        dest_ty: &TyRef,
+    ) -> bool {
         match rvalue {
             Rvalue::UnaryOp(cast, op) if cast_kind_is_unsize(cast) => {
-                self.unsize_rvalue_is_pair(cast, op)
+                self.unsize_rvalue_is_pair(op, dest_ty)
             }
             Rvalue::Cast(cast, op, _) if cast_kind_is_unsize(cast) => {
-                self.unsize_rvalue_is_pair(cast, op)
+                self.unsize_rvalue_is_pair(op, dest_ty)
             }
             Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.operand_is_dyn_fat_pair(op),
             Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
@@ -2143,15 +2149,13 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    fn unsize_rvalue_is_pair(&self, cast: &serde_json::Value, op: &Operand) -> bool {
+    fn unsize_rvalue_is_pair(&self, op: &Operand, dest_ty: &TyRef) -> bool {
         match op {
             Operand::Copy(src) | Operand::Move(src) if tyref_is_fat_dyn(&src.ty, self.llbc) => {
                 self.place_is_dyn_fat_pair(src)
             }
             Operand::Copy(src) | Operand::Move(src) => {
-                unsize_cast_dest_ty(cast).as_ref().is_some_and(|dest_ty| {
-                    dyn_unsize_vtable_const_path(src, dest_ty, self.llbc).is_some()
-                })
+                dyn_unsize_vtable_const_path(src, dest_ty, self.llbc).is_some()
             }
             _ => false,
         }
@@ -5748,15 +5752,6 @@ pub(in crate::front::mir) fn dyn_unsize_src_trait_names(
         })
         .unwrap_or_else(|| "Trait".to_string());
     (src_name, trait_name)
-}
-
-fn unsize_cast_dest_ty(cast: &serde_json::Value) -> Option<TyRef> {
-    let payload = cast
-        .get("Cast")
-        .and_then(|c| c.get("Unsize"))
-        .or_else(|| cast.get("Unsize"))?;
-    let dest = payload.as_array()?.get(1)?;
-    Some(TyRef::Other(dest.clone()))
 }
 
 /// Body locals that hold the two-word `{data, vtable}` of an `Unsize`
