@@ -4315,10 +4315,15 @@ fn init_someptr_overrides(
                     .expect("ptr.getattr: attr unbound");
                 with_ptr_like(
                     &s,
-                    |ptr| ptr.getattr(&s_attr).expect("ptr.getattr must succeed"),
                     |ptr| {
-                        ptr.getattr(&s_attr)
-                            .expect("interiorptr.getattr must succeed")
+                        ptr.getattr(&s_attr).unwrap_or_else(|e| {
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                        })
+                    },
+                    |ptr| {
+                        ptr.getattr(&s_attr).unwrap_or_else(|e| {
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                        })
                     },
                 )
             }),
@@ -4407,12 +4412,14 @@ fn init_someptr_overrides(
                 with_ptr_like(
                     &s,
                     |ptr| {
-                        ptr.setattr(&s_attr, &s_value)
-                            .expect("ptr.setattr must succeed")
+                        ptr.setattr(&s_attr, &s_value).unwrap_or_else(|e| {
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                        })
                     },
                     |ptr| {
-                        ptr.setattr(&s_attr, &s_value)
-                            .expect("interiorptr.setattr must succeed")
+                        ptr.setattr(&s_attr, &s_value).unwrap_or_else(|e| {
+                            std::panic::panic_any(e.in_stage("compute_at_fixpoint").to_string())
+                        })
                     },
                 );
                 None

@@ -1977,11 +1977,13 @@ fn analyze_pipeline_from_module_paths(
             // `SomeInteger` with `r_uint` at its readers.
             Some("u64".into()),
             None,
+            None,
         ),
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],
             Signature::new(vec!["depth".into()], None, None),
             Some("gcref".into()),
+            None,
             None,
         ),
         (
@@ -1991,6 +1993,7 @@ fn analyze_pipeline_from_module_paths(
                 "try_pop_to".into(),
             ],
             Signature::new(vec!["depth".into()], None, None),
+            None,
             None,
             None,
         ),
@@ -2008,6 +2011,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["root".into()], None, None),
             Some("u64".into()),
             None,
+            None,
         ),
         (
             vec![
@@ -2016,6 +2020,7 @@ fn analyze_pipeline_from_module_paths(
                 "release_owner_root".into(),
             ],
             Signature::new(vec!["index".into()], None, None),
+            None,
             None,
             None,
         ),
@@ -2028,6 +2033,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["index".into()], None, None),
             Some("gcref".into()),
             None,
+            None,
         ),
         (
             vec![
@@ -2038,6 +2044,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["index".into(), "root".into()], None, None),
             None,
             None,
+            None,
         ),
         // `framework.py` keeps the GC as a prebuilt constant, so a nursery
         // request always has a route. This query is the port's stand-in and
@@ -2046,6 +2053,7 @@ fn analyze_pipeline_from_module_paths(
             vec!["majit_gc".into(), "gc_allocator_installed".into()],
             Signature::new(vec![], None, None),
             Some("bool".into()),
+            None,
             None,
         ),
         // `rffi.aroundstate.before` (`_RPyGilRelease`).  The helper lives
@@ -2059,6 +2067,7 @@ fn analyze_pipeline_from_module_paths(
             ],
             Signature::new(vec![], None, None),
             Some("ref".into()),
+            None,
             None,
         ),
         // `executioncontext.py enter` writes `f_backref` through this
@@ -2074,6 +2083,7 @@ fn analyze_pipeline_from_module_paths(
                 None,
                 None,
             ),
+            None,
             None,
             None,
         ),
@@ -2955,6 +2965,11 @@ fn analyze_pipeline_from_module_paths(
     // Inverse: `STR` → list of unsigned (`Vec<u8>`). `list(str)` yields
     // `Char`; a `Vec<u8>` item is `r_uint` (`ord` of each char).
     front::join_chars::register_ll_str2uintlist_helper(&mut call_control);
+    // `rffi.py` `charpsize2str` — look-inside window → STR copy
+    // (`rstr.py` `mallocstr` analogue plus the raw-to-string copy).
+    // Minted in the rich model because the Wtf8-from-bytes Ok window
+    // rewrite runs on the front spine before prepass.
+    front::join_chars::register_ll_charpsize2str_helper(&mut call_control);
 
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function

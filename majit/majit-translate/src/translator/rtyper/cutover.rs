@@ -79,10 +79,22 @@ use crate::translator::translator::TranslationContext;
 pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 
 /// Annotator-only residual stub: Charon `name_path` segments, signature,
-/// the pre-existing FUNC.RESULT token, and the declared result lltype
-/// when the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
-/// `llexternal` / `extfunc.py` `register_external`).
-pub(crate) type ResidualStubSpec = (Vec<String>, Signature, Option<String>, Option<LowLevelType>);
+/// the pre-existing FUNC.RESULT token, the declared result lltype when
+/// the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
+/// `llexternal` / `extfunc.py` `register_external`), and
+/// `dont_look_inside_return_class_root` of that result.
+///
+/// A skipped look-inside / bodyless callee must intern no more precisely
+/// than the declared type (`extfunc.py` `ExtFuncEntry.compute_result_annotation`
+/// / `signature.py` `annotationoftype`). A `*mut T` onto a non-GC ADT is
+/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` → `SomePtr`.
+pub(crate) type ResidualStubSpec = (
+    Vec<String>,
+    Signature,
+    Option<String>,
+    Option<LowLevelType>,
+    Option<String>,
+);
 
 /// Residual FUNC.RESULT token for an rstr `STR` result (`ValueType::Str`):
 /// ref-kind, annotated `SomeString` and lowered `Ptr(STR)`.
@@ -2541,6 +2553,15 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     {
         return Some(SKIP_PTR_COPY_NONOVERLAPPING);
     }
+    // `core::ptr::write` is an opaque foreign decl with the same unique-
+    // graph hazard: Layer-1 `call_registry.lookup` would mint one empty
+    // body whose `mergeinputargs` unions every pointee. The `write` leaf
+    // is shared (`io::Write::write`); decline only the `ptr` path, and
+    // a bare-leaf alias whose `source_identity` is this path via
+    // `registration_decline_graph_origin`.
+    if is_ptr_write(canonical_strip) {
+        return Some(SKIP_PTR_WRITE);
+    }
     // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
     // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
     // (`init_gc_object_immortal`), not graphs. Their bodies walk
@@ -2570,6 +2591,33 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
+
+/// [`registration_decline`] reason for `ptr::write`.
+const SKIP_PTR_WRITE: &str = "skip-ptr-write";
+
+/// `core::ptr::write` / `std::ptr::write` and the method form
+/// `core::ptr::mut_ptr::<Impl>::write`. The `write` leaf is not unique.
+fn is_ptr_write(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [crate_or_std, module, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && leaf == "write" =>
+        {
+            true
+        }
+        [crate_or_std, module, owner, impl_seg, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && owner == "mut_ptr"
+                && impl_seg == "<Impl>"
+                && leaf == "write" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 /// [`registration_decline`] reason for `std::alloc::alloc` / `alloc_zeroed`.
 const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
@@ -3295,7 +3343,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
     registry: &Rc<CallRegistry>,
     stubs: &[ResidualStubSpec],
 ) {
-    for (segments, _signature, _return_token, _return_lltype) in stubs {
+    for (segments, _signature, _return_token, _return_lltype, _return_class_root) in stubs {
         let key = FunctionPathKey::from_segments(segments.iter().cloned());
         if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name())
             .is_some()
@@ -3964,7 +4012,7 @@ fn declared_return_annotation(
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
         return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
     }
-    if crate::front::mir::is_niche_option_gc_payload_spelling(root) {
+    if bk.is_niche_option_gc_payload_spelling(root) {
         return Some(
             crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
                 Some(bk),
@@ -3994,6 +4042,27 @@ fn declared_return_annotation(
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
+    // `*mut T` / `*const T` onto a harvested owner is the same
+    // annotation an Input or field of that spelling already uses
+    // (`project_struct_field_type`). A classed T stays SomeInstance
+    // (`rclass.py` `getgcflavor` / `InstanceRepr`); SomePtr is an
+    // lltype container with no ClassDef (`llannotation.py`
+    // `lltype_to_annotation`). Widen Instance `can_be_None` from
+    // `return_can_be_none` only to True (`annotator/model.py`
+    // `SomeInstance.noneify`); never narrow. A residual result stays
+    // nullable so `SomeInstance.bool_behavior` does not fold the live
+    // null arm (`transform.py` `transform_dead_code`).
+    if bk.raw_ptr_declared_owner_pointee(root).is_some() {
+        let s = bk.project_struct_field_type(root);
+        return Some(if graph.return_can_be_none {
+            match &s {
+                crate::annotator::model::SomeValue::Instance(_) => s.noneify().unwrap_or(s),
+                _ => s,
+            }
+        } else {
+            s
+        });
+    }
     // A `GcStruct._arrayfld` class root is the array itself
     // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
     // a ClassDef would rtype the residual as `InstanceRepr` of `object`
@@ -4007,6 +4076,11 @@ fn declared_return_annotation(
     }
     if crate::front::semantic::is_list_family_spelling(root) {
         return Some(projected);
+    }
+    // `*mut T` / `*const T` whose T has no harvested layout is unknown.
+    // Do not intern a ClassDef of the pointer spelling.
+    if root.trim().starts_with("*mut ") || root.trim().starts_with("*const ") {
+        return None;
     }
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
@@ -4289,7 +4363,7 @@ pub(crate) fn register_unsafe_fn_stubs(
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let foreign_callables = registry_foreign_callables(registry);
-    for (segments, signature, return_token, return_lltype) in specs {
+    for (segments, signature, return_token, return_lltype, return_class_root) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
         // here, before they ever become a `SemanticFunction`. Declining
@@ -4298,7 +4372,9 @@ pub(crate) fn register_unsafe_fn_stubs(
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
         if let Some(reason) = registration_decline(&path.segments)
             .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
-            && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
+            && (reason == SKIP_PTR_COPY_NONOVERLAPPING
+                || reason == SKIP_STD_ALLOC_RAW
+                || reason == SKIP_PTR_WRITE)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
@@ -4356,6 +4432,20 @@ pub(crate) fn register_unsafe_fn_stubs(
                 store_graph
                     .as_ref()
                     .and_then(|graph| declared_return_annotation(registry, graph.as_ref()))
+            })
+            .or_else(|| {
+                // A skipped look-inside / bodyless callee has no
+                // GraphStore header for `declared_return_annotation`.
+                // The `"ref"` token alone is the classdef-less instance
+                // (`residual_return_annotation`); a declared `*mut T`
+                // uses the field projector of that spelling.
+                if declared_token != Some("ref") && declared_token != Some(GCREF_RETURN_TYPE) {
+                    return None;
+                }
+                let root = return_class_root.as_deref()?;
+                let bk = registry.bookkeeper();
+                bk.raw_ptr_declared_owner_pointee(root)?;
+                Some(bk.project_struct_field_type(root))
             })
             .or_else(|| residual_return_annotation(declared_token, Some(registry.bookkeeper())));
         if alias_existing_lookup(registry, &key) {
@@ -9136,6 +9226,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         for segments in [
             vec!["std", "alloc", "alloc_zeroed"],
@@ -9147,6 +9238,7 @@ mod tests {
                 segments.iter().map(|s| (*s).to_string()).collect(),
                 Signature::new(vec!["layout".to_string()], None, None),
                 Some("ref".to_string()),
+                None,
                 None,
             ));
         }
@@ -9246,6 +9338,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         for segments in [
             vec!["core", "ptr", "copy_nonoverlapping"],
@@ -9259,6 +9352,7 @@ mod tests {
                     None,
                     None,
                 ),
+                None,
                 None,
                 None,
             ));
@@ -9281,6 +9375,146 @@ mod tests {
             &["core", "ptr", "copy_nonoverlapping"][..],
             &["std", "ptr", "copy_nonoverlapping"][..],
             &["copy_nonoverlapping"][..],
+        ] {
+            assert!(
+                stub_registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ptr_write_is_declined_and_unregistered() {
+        for segments in [
+            vec!["core".to_string(), "ptr".into(), "write".into()],
+            vec!["std".into(), "ptr".into(), "write".into()],
+            vec![
+                "core".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "write".into(),
+            ],
+            vec![
+                "std".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "write".into(),
+            ],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_PTR_WRITE),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["write".into()]),
+            None,
+            "the write leaf is shared with other functions"
+        );
+        assert_eq!(
+            registration_decline(&["core".into(), "ptr".into(), "write_unaligned".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "ptr::write");
+        fields.note_foreign_body_callable("std", "ptr::write");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["core", "ptr", "write"],
+            vec!["std", "ptr", "write"],
+            vec!["core", "ptr", "mut_ptr", "<Impl>", "write"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            };
+            let mut graph = LegacyGraph::new("write");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "ptr", "write"][..],
+            &["std", "ptr", "write"][..],
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "write"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.write resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        let mut_ptr_host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.mut_ptr.<Impl>.write resolves in HOST_ENV");
+        assert_eq!(host, mut_ptr_host);
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let mut stub_fields = crate::front::StructFieldRegistry::default();
+        stub_fields.note_foreign_body_callable("core", "ptr::write");
+        stub_fields.note_foreign_body_callable("std", "ptr::write");
+        stub_registry.set_struct_fields(std::rc::Rc::new(stub_fields));
+        let mut specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+            None,
+            None,
+        )];
+        for segments in [
+            vec!["core", "ptr", "write"],
+            vec!["std", "ptr", "write"],
+            vec!["core", "ptr", "mut_ptr", "<Impl>", "write"],
+        ] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(vec!["dst".to_string(), "src".to_string()], None, None),
+                None,
+                None,
+                None,
+            ));
+        }
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined ptr::write specs must not be registered"
+        );
+        assert!(
+            stub_registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        for segments in [
+            &["core", "ptr", "write"][..],
+            &["std", "ptr", "write"][..],
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
         ] {
             assert!(
                 stub_registry
@@ -11260,6 +11494,7 @@ mod tests {
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
                 None,
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let qualified_entry = registry
@@ -11339,6 +11574,7 @@ mod tests {
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
                 None,
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stub_entry = registry
@@ -11392,6 +11628,7 @@ mod tests {
             vec!["other".into(), "f".into()],
             Signature::new(vec![], None, None),
             Some("ref".to_string()),
+            None,
             None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -11457,6 +11694,7 @@ mod tests {
                     sig.clone(),
                     Some("i64".to_string()),
                     None,
+                    None,
                 ),
                 (
                     vec![
@@ -11466,6 +11704,7 @@ mod tests {
                     ],
                     sig.clone(),
                     Some("i64".to_string()),
+                    None,
                     None,
                 ),
             ];
@@ -11561,6 +11800,7 @@ mod tests {
                 ],
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
+                None,
                 None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -11968,6 +12208,7 @@ mod tests {
                 None,
             ),
             Some(token),
+            None,
             None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -18586,6 +18827,7 @@ mod tests {
             Signature::new(vec!["kind".to_string()], None, None),
             Some("ref".to_string()),
             None,
+            None,
         )];
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
@@ -19364,11 +19606,40 @@ mod tests {
         graph.return_can_be_none = true;
         let nullable = declared_return_annotation(&registry, &graph)
             .expect("a nullable STR pointer result declares its annotation");
-        let SomeValue::String(ns) = nullable else {
+        let SomeValue::String(ns) = &nullable else {
             panic!("a nullable STR pointer result is SomeString, got {nullable:?}")
         };
         assert!(ns.inner.can_be_none);
         graph.return_can_be_none = false;
+        let is_none_of = |s: SomeValue| {
+            use crate::annotator::binaryop::is__default;
+            use crate::annotator::model::s_none;
+            use crate::flowspace::model::{Hlvalue, Variable};
+            use crate::flowspace::operation::{HLOperation, OpKind};
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let mut ret = Variable::named("ret");
+            let mut n = Variable::named("n");
+            ann.setbinding(&mut ret, s);
+            ann.setbinding(&mut n, s_none());
+            is__default(
+                &ann,
+                &HLOperation::new(
+                    OpKind::Is,
+                    vec![Hlvalue::Variable(ret), Hlvalue::Variable(n)],
+                ),
+            )
+        };
+        assert!(
+            is_none_of(nullable.clone()).const_().is_none(),
+            "is_(SomeString(can_be_none=true), None) must not fold (is__default)"
+        );
+        let non_null = declared_return_annotation(&registry, &graph)
+            .expect("a non-nullable STR pointer result declares its annotation");
+        assert_eq!(
+            is_none_of(non_null).const_(),
+            Some(&crate::flowspace::model::ConstValue::Bool(false)),
+            "is_(SomeString(can_be_none=false), None) folds to False (is__default)"
+        );
         let ft = declared_funcptr_type_from_legacy(&graph, None)
             .expect("a no-arg STR-returning graph has a declared fn type");
         assert_eq!(
@@ -19433,8 +19704,10 @@ mod tests {
     #[test]
     fn declared_return_annotation_niche_option_gc_payload_is_nullable() {
         use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
 
         let mut graph = LegacyGraph::new("returns_opt_instance");
         graph.return_type = Some("ref".into());
@@ -19462,6 +19735,44 @@ mod tests {
         assert!(
             s.inner.can_be_none,
             "niche Option of a GC string is SomeString(can_be_None=True)"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_undeclared_uppercase_option_is_not_gc_instance() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("returns_opt_undeclared");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<*mut SomeUndeclared>".into());
+        let declared = declared_return_annotation(&registry, &graph);
+        assert!(
+            !matches!(&declared, Some(SomeValue::Instance(inst)) if inst.can_be_none),
+            "uppercase pointee with no Gc layout must not noneify, got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_registered_gc_option_is_nullable_instance() {
+        use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["SomeUndeclared"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let mut graph = LegacyGraph::new("returns_opt_declared");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<*mut SomeUndeclared>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a niche Option of a registered-Gc pointee intern's");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("registered-Gc Option payload is SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "registered-Gc Option payload is SomeInstance(can_be_None=True)"
         );
     }
 
@@ -19573,6 +19884,337 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn declared_return_annotation_nongc_raw_ptr_class_root_follows_projector() {
+        use crate::annotator::model::SomeValue;
+
+        // Harvested Raw layout, no field rows: the projector of `*mut T`
+        // is the classdef-less nullable instance (Impossible pointee).
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let spelling = "*mut ffi_raw::NativeSession";
+        let mut graph = LegacyGraph::new("connection_session");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(spelling.into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a raw pointer onto a non-GC struct intern's the projector");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = declared else {
+            panic!("expected projector instance, got {declared:?}");
+        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
+        assert!(
+            inst.classdef.is_none(),
+            "no ClassDef-bearing rows: classdef-less instance"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_nongc_classed_raw_ptr_matches_projector() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        // Registered non-GC owner with a ClassDef-bearing projection, not
+        // a raw-word owner (`rclass.py` `getgcflavor` / `InstanceRepr`).
+        let owner = "host::FrameDebugData";
+        let word = "host::RawWord";
+        let (layouts, _ids) = crate::test_support::raw_layout_table_for(&[owner, word]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("flag".to_string(), "u8".to_string())],
+        );
+        fields.fields.insert(
+            word.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(word.to_string());
+        registry.set_struct_fields(Rc::new(fields));
+        registry.set_struct_layouts(layouts);
+
+        let bk = registry.bookkeeper();
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("classed non-GC owner has a ClassDef");
+        let spelling = format!("*mut {owner}");
+        let mut graph = LegacyGraph::new("frame_debug_data_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(spelling.clone());
+        graph.return_can_be_none = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("residual *mut classed owner declares its annotation");
+        let projected = bk.project_struct_field_type(&spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("classed non-GC *mut T is SomeInstance, got {declared:?}");
+        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
+        assert!(
+            inst.classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &classdef)),
+            "ClassDef-bearing projection, not SomePtr"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_undeclared_uppercase_raw_ptr_is_not_someptr() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("connection_session");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut SomeUndeclared".into());
+        let declared = declared_return_annotation(&registry, &graph);
+        assert!(
+            declared.is_none(),
+            "uppercase pointee with no harvested layout is unknown, got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_lowercase_declared_raw_ptr_follows_projector() {
+        use crate::annotator::model::SomeValue;
+
+        let (layouts, _ids) = crate::test_support::raw_layout_table_for(&["foo::bar_state"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let spelling = "*mut foo::bar_state";
+        let mut graph = LegacyGraph::new("bar_state_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(spelling.into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a raw pointer onto a lowercase declared struct intern's the projector");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = declared else {
+            panic!("expected projector instance, got {declared:?}");
+        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
+    }
+
+    /// A skipped look-inside / bodyless callee whose declared result is
+    /// `*mut T` onto a non-GC ADT intern's the field projector of that
+    /// spelling (`extfunc.py` `ExtFuncEntry.compute_result_annotation`).
+    /// The `"ref"` token alone is the classdef-less instance whose
+    /// `SomeInstance.bool` is const-True when `!can_be_None`.
+    #[test]
+    fn register_unsafe_fn_stubs_nongc_raw_ptr_intern_follows_projector() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        registry.set_struct_layouts(layouts);
+        let spelling = "*mut ffi_raw::NativeSession";
+        let specs = vec![(
+            vec!["nongc_raw_ptr_session".to_string()],
+            Signature::new(vec!["conn".to_string()], None, None),
+            Some("ref".to_string()),
+            None,
+            Some(spelling.into()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["nongc_raw_ptr_session"]))
+            .expect("stub registered");
+        let intern = entry
+            .function_desc
+            .borrow()
+            .residual_signature_result()
+            .expect("bodyless residual intern");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(intern, projected);
+        let SomeValue::Instance(inst) = intern else {
+            panic!("skipped *mut nongc intern is the projector, got {intern:?}");
+        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
+    }
+
+    /// Look-inside caller of a skipped callee that returns `null_mut()`
+    /// or a real `*mut T` onto a non-GC struct. Frontend `is_null` is
+    /// `eq(bool(p), False)` (`desugar/std_call.rs` `is_raw_ptr_is_null`).
+    /// Both exits are followed (`annrpython.py` `follow_link`): intern is
+    /// a nullable instance, so `SomeInstance.bool_behavior` does not fold.
+    #[test]
+    fn look_inside_is_null_of_skipped_nongc_raw_ptr_follows_both_exits() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::transform::link_not_in_links_followed;
+
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
+        let _lock = anchor_lock();
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        registry.set_struct_layouts(layouts);
+        let specs = vec![(
+            vec!["nongc_raw_ptr_session".to_string()],
+            Signature::new(vec!["conn".to_string()], None, None),
+            Some("ref".to_string()),
+            None,
+            Some("*mut ffi_raw::NativeSession".into()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+
+        let mut graph = LegacyGraph::new("look_inside_is_null_nongc_raw_ptr");
+        let conn = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Input {
+                    name: "conn".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .block_mut(graph.startblock)
+            .inputargs
+            .push(conn.clone());
+        setbinding(&conn, ValueType::Ref(None));
+        let backend = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["nongc_raw_ptr_session"]),
+                    args: crate::model::call_args(vec![conn.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let is_true = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: backend.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let false_c = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::ConstBool(false),
+                true,
+            )
+            .unwrap();
+        let is_null = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: is_true,
+                    rhs: false_c,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let null_arm = graph.create_block();
+        let nonnull_arm = graph.create_block();
+        graph.set_branch(
+            graph.startblock,
+            is_null.clone(),
+            null_arm,
+            vec![],
+            nonnull_arm,
+            vec![],
+        );
+        graph.set_return(null_arm, None);
+        graph.set_return(nonnull_arm, None);
+
+        let (flow, value_to_var, _, _, _, _) = drive_subject(&graph, &registry, true)
+            .expect("look-inside is_null of skipped *mut nongc annotates");
+        let backend_ann = value_to_var.get(&backend).and_then(|typed| {
+            typed
+                .annotation
+                .borrow()
+                .as_ref()
+                .map(|cell| (**cell).clone())
+        });
+        let SomeValue::Instance(inst) = backend_ann.as_ref().expect("call result annotated") else {
+            panic!("call result is the projector instance, got {backend_ann:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "is_null of a skipped *mut nongc must not fold, got {backend_ann:?}"
+        );
+        let (ann, _) = registry
+            .session_if_started()
+            .expect("drive_subject starts the annotator session");
+        let start = flow.borrow().startblock.clone();
+        let exits = start.borrow().exits.clone();
+        assert_eq!(exits.len(), 2, "is_null is a two-exit switch");
+        for link in &exits {
+            assert!(
+                !link_not_in_links_followed(&ann, link),
+                "both is_null exits are followed (annrpython.py follow_link); unfollowed {link:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_return_annotation_gc_raw_ptr_class_root_stays_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        // Negative: `*mut` onto a GC-declared struct (layout gckind Gc,
+        // the intern-path proxy for `gc_struct_ids`) keeps SomeInstance.
+        let (registry, _rtyper, _classdef) = root_instance_rtyper_with_classdef();
+        let owner = "PyObject";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        registry.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = LegacyGraph::new("shadow_stack_get_raw");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut PyObject".into());
+        graph.return_can_be_none = true;
+        graph.push_hint("dont_look_inside");
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a *mut registered-GC-struct residual declares SomeInstance");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("expected SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "a raw pointer return is nullable (rnone.py can_be_None)"
+        );
+        assert!(
+            inst.classdef.is_some(),
+            "GC pointee intern's the classdef, not SomePtr"
+        );
     }
 
     #[test]
@@ -20015,6 +20657,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, None);
             let (graph, result) = bodyless_extern_wrapper_call_graph(&[name], result_ty);
@@ -20065,6 +20708,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, None);
             let mut graph = LegacyGraph::new("wrapper_void_then_ext");
@@ -20178,6 +20822,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
             let crate_entry = registry
@@ -20248,12 +20893,14 @@ mod tests {
                 sig.clone(),
                 None,
                 Some(LowLevelType::Signed),
+                None,
             ),
             (
                 vec!["m".to_string(), "f".to_string()],
                 sig,
                 None,
                 Some(LowLevelType::Signed),
+                None,
             ),
         ];
         register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
@@ -20281,17 +20928,20 @@ mod tests {
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
                 None,
+                None,
             ),
             (
                 vec!["pyobject".to_string(), "is_int".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
                 None,
+                None,
             ),
             (
                 vec!["majit_gc".to_string(), "shadow_push".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("u64".to_string()),
+                None,
                 None,
             ),
             // A token `residual_return_shell` declines — 128-bit has no
@@ -20301,6 +20951,7 @@ mod tests {
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
                 Some("i128".to_string()),
+                None,
                 None,
             ),
         ];
@@ -20341,6 +20992,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);
@@ -20405,6 +21057,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
@@ -21835,6 +22488,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
@@ -21876,6 +22530,7 @@ mod tests {
             vec!["pyobject".to_string(), "shared".to_string()],
             signature,
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);

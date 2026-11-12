@@ -1022,6 +1022,169 @@ fn discover_foldable_const_lits_skips_thread_local_static_mut_and_call() {
     assert!(super::discover_foldable_const_lits(&call).is_empty());
 }
 
+fn transparent_bitflag_initializer_fixture(transparent: bool) -> Llbc {
+    use serde_json::{Value, json};
+    let word = json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let boolean = json!({"Scalar": "Bool"});
+    let adt = |id| json!({"Adt": {"id": id, "builtin": null, "generics": empty_generics()}});
+    let flag = adt(0);
+    let flags = adt(1);
+    let flags_ref = json!({"Ref": ["Erased", flags.clone(), "Shared"]});
+    let place = |i, ty: &Value| json!({"kind": {"Local": i}, "ty": ty});
+    let read = |i, ty: &Value| json!({"Read": place(i, ty)});
+    let literal = |n: &str| json!({"Const": [{"Integer": {"Unsigned": ["U8", n]}}, word.clone()]});
+    let assign = |i, ty: &Value, value: Value| json!({"span": span_json(), "kind": {"Assign": [place(i, ty), value]}});
+    let block = |statements: Vec<Value>, term: Value| {
+        json!({
+            "statements": statements, "kind": "Regular", "terminator": {"span": span_json(), "kind": term}
+        })
+    };
+    let call = |id, args: Vec<Value>, dest, ty: &Value, target| {
+        json!({"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": id}, "generics": empty_generics()}},
+                "args": args}, "dest": place(dest, ty), "target": target, "on_unwind": target
+        }})
+    };
+    let body = |args, tys: Vec<Value>, blocks: Vec<Value>| {
+        json!({"Unstructured": {
+            "span": span_json(), "locals": {"arg_count": args, "locals": tys.iter().enumerate().map(|(i, ty)|
+                json!({"index": i, "name": null, "span": span_json(), "ty": ty})).collect::<Vec<_>>()}, "body": blocks
+        }})
+    };
+    let function = |id, name, inputs: Vec<Value>, output: Value, mir: Value| {
+        json!({
+            "def_id": id, "item_meta": item_meta_json(&["fixture", name], "", true),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": output}, "body": mir
+        })
+    };
+    let init = function(
+        0,
+        "MASK",
+        vec![],
+        word.clone(),
+        body(
+            0,
+            vec![word.clone(), flag.clone(), flags.clone(), flags_ref.clone()],
+            vec![
+                block(
+                    vec![assign(
+                        1,
+                        &flag,
+                        json!({"Aggregate": [{"Adt": [{"id": 0}, 0, null]}, []]}),
+                    )],
+                    call(1, vec![read(1, &flag)], 2, &flags, 1),
+                ),
+                block(
+                    vec![assign(
+                        3,
+                        &flags_ref,
+                        json!({"Ref": {"place": place(2, &flags), "kind": "Shared", "ptr_metadata": null}}),
+                    )],
+                    call(2, vec![read(3, &flags_ref)], 0, &word, 2),
+                ),
+                block(vec![], json!("Return")),
+            ],
+        ),
+    );
+    let from_element = function(
+        1,
+        "from_element",
+        vec![flag.clone()],
+        flags.clone(),
+        body(
+            1,
+            vec![
+                flags.clone(),
+                flag.clone(),
+                word.clone(),
+                boolean.clone(),
+                word.clone(),
+            ],
+            vec![
+                block(
+                    vec![
+                        assign(2, &word, json!({"Discriminant": place(1, &flag)})),
+                        assign(
+                            3,
+                            &boolean,
+                            json!({"BinaryOp": ["Lt", read(2, &word), literal("8")]}),
+                        ),
+                    ],
+                    json!({"Switch": {"discr": read(3, &boolean), "targets": {"If": [1, 2]}}}),
+                ),
+                block(
+                    vec![
+                        assign(
+                            4,
+                            &word,
+                            json!({"BinaryOp": [{"Shl": "Wrap"}, literal("1"), read(2, &word)]}),
+                        ),
+                        assign(
+                            0,
+                            &flags,
+                            json!({"Aggregate": [{"Adt": [{"id": 1}, null, null]}, [read(4, &word)]]}),
+                        ),
+                    ],
+                    json!("Return"),
+                ),
+                block(vec![], json!("UnwindResume")),
+            ],
+        ),
+    );
+    let pointee =
+        json!({"kind": {"Projection": [place(1, &flags_ref), "Deref"]}, "ty": flags.clone()});
+    let bits = function(
+        2,
+        "bits",
+        vec![flags_ref.clone()],
+        word.clone(),
+        body(
+            1,
+            vec![word.clone(), flags_ref.clone()],
+            vec![block(
+                vec![assign(
+                    0,
+                    &word,
+                    json!({"Use": [{"Read": {
+            "kind": {"Projection": [pointee, {"Field": [null, 0]}]}, "ty": word.clone()
+        }}, "Yes"]}),
+                )],
+                json!("Return"),
+            )],
+        ),
+    );
+    let types = vec![
+        json!({"def_id": 0, "item_meta": item_meta_json(&["fixture", "Flag"], "", true),
+        "kind": {"Enum": [{"name": "Cell", "fields": [], "discriminant": {"Unsigned": ["U8", "6"]}}]}}),
+        json!({"def_id": 1, "item_meta": item_meta_json(&["fixture", "Flags"], "", true),
+            "layout": [{"key": "fixture", "value": {"repr": {
+                "repr_algo": "Rust", "align_modif": null, "transparent": transparent
+            }, "variant_layouts": []}}],
+            "kind": {"Struct": [{"name": null, "ty": word.clone(), "attr_info": null}]}}),
+    ];
+    let global = named_const_global(0, &["fixture", "MASK"], "", true, "NamedConst", 0);
+    let file = json!({"charon_version": "0.1.301", "has_errors": false, "translated": {
+        "crate_name": "fixture", "type_decls": types, "fun_decls": [init, from_element, bits],
+        "global_decls": [global], "trait_decls": [], "trait_impls": []
+    }});
+    Llbc::from_slice(file.to_string().as_bytes()).unwrap()
+}
+
+#[test]
+fn transparent_bitflag_initializer_folds_its_body() {
+    let llbc = transparent_bitflag_initializer_fixture(true);
+    assert_eq!(
+        super::discover_foldable_const_lits(&llbc),
+        vec![("fixture::MASK".to_string(), OpKind::ConstUInt(64))]
+    );
+}
+
+#[test]
+fn nontransparent_bitflag_initializer_is_not_peeled() {
+    let llbc = transparent_bitflag_initializer_fixture(false);
+    assert!(super::discover_foldable_const_lits(&llbc).is_empty());
+}
+
 #[test]
 fn discover_foldable_const_lits_skips_non_unique_name_path() {
     let path = ["fixture", "<Impl>", "CPYTHON_IMMUTABLETYPE"];
@@ -2204,6 +2367,222 @@ fn oncelock_usize_struct_global_does_not_cast_instance() {
             segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
         }),
         "OnceLock<usize> must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+fn std_once_lock_unstructured_get_or_init(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(
+            &["std", "sync", "once_lock", "<Impl>", "get_or_init"],
+            "",
+            false
+        ),
+        "signature": {"is_unsafe": false, "inputs": [], "output": {"Tuple": []}},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": {"Tuple": []}}
+            ]},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })
+}
+
+fn oncelock_usize_harvested_std_global_llbc() -> majit_charon_reader::Llbc {
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [usize_scalar()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": cell_ty},
+                            {"Use": [{"Read": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                                "ty": cell_ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        }),
+        std_once_lock_unstructured_get_or_init(1),
+    ];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![oncelock_fn_type_decl(
+            serde_json::json!({"Struct": [
+                {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                {"name": "value", "ty": usize_scalar(), "attr_info": null}
+            ]}),
+            Some(oncelock_fn_value_layout()),
+        )],
+        funs,
+        globals,
+    )
+}
+
+/// Harvested `std` FunDecl bodies make `OnceLock<usize>` a foreign
+/// generic struct (`foreign_body_generic_struct`), so
+/// `tyref_class_root_with` would wrap the refs address as
+/// `SomeInstance(OnceLock)`. The OnceLock Global lane must emit the
+/// bare `ConstRefAddr` first (`bookkeeper.py Bookkeeper.immutablevalue`).
+#[test]
+fn oncelock_usize_harvested_std_global_does_not_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_usize_harvested_std_global_llbc();
+    assert!(
+        llbc.has_body_under_crate_root("std"),
+        "fixture must harvest a std unstructured body"
+    );
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("harvested-std OnceLock<usize> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert!(
+        call_paths_in(&graph).iter().all(|segments| {
+            segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        }),
+        "harvested std OnceLock<usize> must not wrap ConstRefAddr: {graph:?}"
+    );
+}
+
+fn oncelock_usize_get_or_init_llbc() -> majit_charon_reader::Llbc {
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [usize_scalar()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell_ty, "Shared"]});
+    let usize_ref = serde_json::json!({"Ref": ["Erased", usize_scalar(), "Shared"]});
+    let init_ty = unit_fn_ptr();
+    let empty = empty_generics();
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [init_ty], "output": usize_ref},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ref},
+                    {"index": 1, "name": "init", "span": span_json(), "ty": init_ty},
+                    {"index": 2, "name": "cell", "span": span_json(), "ty": cell_ty}
+                ]},
+                "body": [
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 2}, "ty": cell_ty},
+                            {"Use": [{"Read": {
+                                "kind": {"Global": {"generics": empty.clone(), "id": 1}},
+                                "ty": cell_ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": empty}},
+                            "args": [
+                                {"Read": {"kind": {"Local": 2}, "ty": cell_ref}},
+                                {"Read": {"kind": {"Local": 1}, "ty": init_ty}}
+                            ]}, "dest": {"kind": {"Local": 0}, "ty": usize_ref},
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        {
+            let mut get_or_init = std_once_lock_unstructured_get_or_init(1);
+            get_or_init["signature"] = serde_json::json!({
+                "is_unsafe": false,
+                "inputs": [cell_ref, init_ty],
+                "output": usize_ref
+            });
+            get_or_init
+        },
+    ];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![oncelock_fn_type_decl(
+            serde_json::json!({"Struct": [
+                {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                {"name": "value", "ty": usize_scalar(), "attr_info": null}
+            ]}),
+            Some(oncelock_fn_value_layout()),
+        )],
+        funs,
+        globals,
+    )
+}
+
+/// `ONCE.get_or_init(f)` on a refs-keyed `OnceLock<usize>` is
+/// `Bookkeeper.immutablevalue` of the registered object
+/// (`cache.py Cache.getorbuild`). The harvested-std wrap must not
+/// hide the ConstRefAddr receiver from the fold.
+#[test]
+fn oncelock_usize_get_or_init_folds_to_prebuilt() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_usize_get_or_init_llbc();
+    assert!(llbc.has_body_under_crate_root("std"));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<usize>::get_or_init lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| !segments.iter().any(|s| s == "get_or_init")),
+        "get_or_init must fold to the refs row: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph).iter().all(|segments| {
+            segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        }),
+        "get_or_init receiver must stay a bare ConstRefAddr: {graph:?}"
     );
 }
 

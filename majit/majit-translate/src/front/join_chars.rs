@@ -43,6 +43,17 @@ pub(crate) const LL_JOIN_CHARS: &str = "ll_join_chars";
 /// (`Vec<u8>`). `list(str)` yields `Char`; a `Vec<u8>` item is `r_uint`.
 pub(crate) const LL_STR2UINTLIST: &str = "ll_str2uintlist";
 
+/// `rffi.py` `charpsize2str`: CCHARP + length → `STR`.
+///
+/// Upstream is `mallocfn(size)` (`rstr.py` `mallocstr`) then
+/// `copy_raw_to_string(cp, ll_str, 0, size)` then `hlstrtype(ll_str)`.
+/// The front's mallocstr analogue is the same StringBuilder markers
+/// [`LL_JOIN_CHARS`] uses; the copy is a raw-load of each `CHAR` into
+/// that builder. The interned `majit_rlib::rffi::buffer::charpsize2str`
+/// graph returns `Result<Vec<u8>, MemoryError>` and must not be the
+/// Call target of a dest-Str site.
+pub(crate) const LL_CHARPSIZE2STR: &str = "ll_charpsize2str";
+
 /// Mint and register the look-inside `ll_join_chars` helper.
 pub(crate) fn register_ll_join_chars_helper(cc: &mut CallControl) {
     let path = CallPath::from_segments([LL_JOIN_CHARS]);
@@ -64,6 +75,18 @@ pub(crate) fn register_ll_str2uintlist_helper(cc: &mut CallControl) {
     let mut graph = build_ll_str2uintlist_graph().with_return_type("ref");
     graph.return_is_str = false;
     graph.return_container_root = Some("Vec<u8>".to_string());
+    cc.register_function_graph(path, graph);
+}
+
+/// Mint and register the look-inside [`LL_CHARPSIZE2STR`] helper.
+pub(crate) fn register_ll_charpsize2str_helper(cc: &mut CallControl) {
+    let path = CallPath::from_segments([LL_CHARPSIZE2STR]);
+    if cc.has_function_graph(&path) {
+        return;
+    }
+    let mut graph = build_ll_charpsize2str_graph()
+        .with_return_type(crate::translator::rtyper::cutover::STR_RETURN_TYPE);
+    graph.return_is_str = true;
     cc.register_function_graph(path, graph);
 }
 
@@ -337,10 +360,169 @@ pub(crate) fn build_ll_join_chars_graph() -> FunctionGraph {
     graph
 }
 
+/// `rffi.py` `charpsize2str(cp, size)`: `s = mallocstr(size)` then copy
+/// `size` bytes from `cp` into `s`.
+pub(crate) fn build_ll_charpsize2str_graph() -> FunctionGraph {
+    let mut graph = FunctionGraph::new(LL_CHARPSIZE2STR);
+    let start = graph.startblock;
+
+    let cp = graph.alloc_value_var();
+    graph.push_inputarg_var(start, cp.clone());
+    graph.push_op_with_result_var(
+        start,
+        OpKind::Input {
+            name: "cp".to_string(),
+            ty: ValueType::Int,
+            // `rffi.py` `charpsize2str._annenforceargs_`: first arg is
+            // CCHARP. `derive_subject_inputcells` seeds `SomePtr(CCHARP)`
+            // only when this spelling is on the Input; `class_root: None`
+            // would seed `SomeInteger` against the stamped CCHARP lltype.
+            class_root: Some("CCHARP".to_string()),
+        },
+        cp.clone(),
+    );
+    stamp_input_as_ccharp(&cp);
+
+    let n = graph.alloc_value_var();
+    graph.push_inputarg_var(start, n.clone());
+    graph.push_op_with_result_var(
+        start,
+        OpKind::Input {
+            name: "size".to_string(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+        n.clone(),
+    );
+
+    let builder = graph.alloc_value_var();
+    graph.block_mut(start).operations.push(SpaceOperation {
+        result: Some(builder.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([STRINGBUILDER_NEW]),
+            args: crate::model::call_args(vec![n.clone()]),
+            result_ty: ValueType::StringBuilder,
+        },
+    });
+    let i = graph.alloc_value_var();
+    graph.block_mut(start).operations.push(SpaceOperation {
+        result: Some(i.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+
+    let (loop_bb, loop_args) = graph.create_block_with_arg_vars(4);
+    let (body_bb, body_args) = graph.create_block_with_arg_vars(4);
+    let (done_bb, done_args) = graph.create_block_with_arg_vars(1);
+
+    graph.set_goto(start, loop_bb, vec![cp, n, i, builder]);
+
+    let cp_loop = loop_args[0].clone();
+    let n_loop = loop_args[1].clone();
+    let i_loop = loop_args[2].clone();
+    let builder_loop = loop_args[3].clone();
+    let lt = graph.alloc_value_var();
+    graph.block_mut(loop_bb).operations.push(SpaceOperation {
+        result: Some(lt.clone()),
+        kind: OpKind::BinOp {
+            op: "lt".to_string(),
+            lhs: i_loop.clone(),
+            rhs: n_loop.clone(),
+            result_ty: ValueType::Int,
+        },
+    });
+    graph.set_branch(
+        loop_bb,
+        lt,
+        body_bb,
+        vec![
+            cp_loop.clone(),
+            n_loop.clone(),
+            i_loop.clone(),
+            builder_loop.clone(),
+        ],
+        done_bb,
+        vec![builder_loop.clone()],
+    );
+
+    let cp_body = body_args[0].clone();
+    let n_body = body_args[1].clone();
+    let i_body = body_args[2].clone();
+    let builder_body = body_args[3].clone();
+    let byte = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(byte.clone()),
+        kind: OpKind::RawLoad {
+            base: cp_body.clone(),
+            offset: i_body.clone(),
+            item_ty: ValueType::Unsigned,
+            itemsize: 1,
+            is_item_signed: false,
+        },
+    });
+    let ch = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(ch.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([CHR]),
+            args: crate::model::call_args(vec![byte]),
+            result_ty: ValueType::Int,
+        },
+    });
+    let void = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(void),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([STRINGBUILDER_APPEND]),
+            args: crate::model::call_args(vec![builder_body.clone(), ch]),
+            result_ty: ValueType::Void,
+        },
+    });
+    let one = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(one.clone()),
+        kind: OpKind::ConstInt(1),
+    });
+    let i_next = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(i_next.clone()),
+        kind: OpKind::BinOp {
+            op: "add".to_string(),
+            lhs: i_body,
+            rhs: one,
+            result_ty: ValueType::Int,
+        },
+    });
+    graph.set_goto(
+        body_bb,
+        loop_bb,
+        vec![cp_body, n_body, i_next, builder_body],
+    );
+
+    let builder_done = done_args[0].clone();
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    stamp_result_as_rstr_str(&result);
+    graph.block_mut(done_bb).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([STRINGBUILDER_BUILD]),
+            args: crate::model::call_args(vec![builder_done]),
+            result_ty: ValueType::Str,
+        },
+    });
+    graph.set_return(done_bb, Some(result));
+
+    graph
+}
+
 fn stamp_result_as_rstr_str(var: &Variable) {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
     FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::GcRef);
     var.set_concretetype(Some(STRPTR.clone()));
+}
+
+fn stamp_input_as_ccharp(var: &Variable) {
+    use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+    var.set_concretetype(Some((*CCHARP).clone()));
 }
 
 #[cfg(test)]
@@ -411,6 +593,78 @@ mod tests {
         assert!(cc.has_function_graph(&path));
         register_ll_join_chars_helper(&mut cc);
         assert!(cc.has_function_graph(&path));
+    }
+
+    fn cp_input(g: &FunctionGraph) -> Option<&OpKind> {
+        g.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if name == "cp" => Some(&op.kind),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn charpsize2str_helper_copies_window_bytes_into_a_str() {
+        let g = build_ll_charpsize2str_graph();
+        match cp_input(&g) {
+            Some(OpKind::Input {
+                ty: ValueType::Int,
+                class_root: Some(root),
+                ..
+            }) if root == "CCHARP" => {}
+            other => panic!("cp Input is Int + class_root CCHARP, got {other:?}"),
+        }
+        assert!(
+            g.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::RawLoad {
+                            itemsize: 1,
+                            item_ty: ValueType::Unsigned,
+                            ..
+                        }
+                    )
+                })
+            }),
+            "window byte is RawLoad of CHAR"
+        );
+        assert!(has_path(&g, CHR), "byte to char is builtin chr");
+        assert!(
+            has_path(&g, STRINGBUILDER_NEW),
+            "mallocstr analogue is StringBuilder::new(n)"
+        );
+        assert!(has_path(&g, STRINGBUILDER_APPEND));
+        assert!(has_path(&g, STRINGBUILDER_BUILD));
+        assert!(has_loop_back_edge(&g), "the copy loops over bytes");
+        assert!(!has_path(&g, "charpsize2str"));
+        assert!(!has_path(&g, "__len"));
+    }
+
+    #[test]
+    fn charpsize2str_helper_is_registered_on_call_control() {
+        let mut cc = CallControl::new();
+        register_ll_charpsize2str_helper(&mut cc);
+        let path = CallPath::from_segments([LL_CHARPSIZE2STR]);
+        assert!(cc.has_function_graph(&path));
+        register_ll_charpsize2str_helper(&mut cc);
+        assert!(cc.has_function_graph(&path));
+        let mut g = build_ll_charpsize2str_graph()
+            .with_return_type(crate::translator::rtyper::cutover::STR_RETURN_TYPE);
+        g.return_is_str = true;
+        assert!(g.return_is_str);
+        assert_eq!(
+            g.return_type.as_deref(),
+            Some(crate::translator::rtyper::cutover::STR_RETURN_TYPE)
+        );
+        match cp_input(&g) {
+            Some(OpKind::Input {
+                class_root: Some(root),
+                ..
+            }) if root == "CCHARP" => {}
+            other => panic!("registered helper cp Input class_root is CCHARP, got {other:?}"),
+        }
     }
 
     #[test]

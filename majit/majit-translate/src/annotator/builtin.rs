@@ -382,6 +382,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "std.ptr.copy_nonoverlapping",
         std_ptr_copy_nonoverlapping,
     );
+    // `core.ptr.write` is the same `HostObject` as `std.ptr.write`
+    // (`flowspace/model.rs`), so this qualname covers both spellings
+    // and `core.ptr.mut_ptr.<Impl>.write`.
+    analyzer_for(&mut reg, "std.ptr.write", std_ptr_write);
     // `std::alloc::alloc` / `alloc_zeroed` — `ann_malloc` (`lltype.py`)
     // returns `SomePtr` for `lltype.malloc(..., flavor='raw')`. The
     // `alloc::alloc` re-export shares the HOST_ENV callable, so this
@@ -1726,6 +1730,24 @@ fn std_ptr_copy_nonoverlapping(
     Ok(s_none())
 }
 
+/// `std::ptr::write(dst, src) -> ()`.
+///
+/// Same opaque-foreign shape as `copy_nonoverlapping`: a unique graph
+/// would `mergeinputargs` every pointee into one slot. The store is
+/// `llop.raw_store` or `llmemory.raw_memcopy` at rtype, chosen from the
+/// declared pointee of `dst`; this analyzer does not read that class:
+/// `()` is `s_None`.
+fn std_ptr_write(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new("std.ptr.write expects (dst, src)"));
+    }
+    Ok(s_none())
+}
+
 /// Analyzer for `std::alloc::alloc` / `alloc_zeroed` (and the
 /// `alloc::alloc` re-export). `ann_malloc` (`lltype.py`) returns
 /// `SomePtr` for `lltype.malloc(..., flavor='raw')`. The result is
@@ -2365,18 +2387,20 @@ fn cast_instance_intrinsic(
             ))),
         };
     }
-    // A pointer to a declared-Raw ADT is an int-bank `SomePtr`. Retargeting
-    // `*mut A as *mut B` must replace that pointee, not mint a GC instance.
-    // A by-value operand (`push_roots()` → `RootScope`, `StrKey`) is
-    // the same raw ADT: FieldRead already projects SomePtr
-    // (`project_struct_field_type`), and `llannotation.py`
-    // `pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr.
-    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root) {
+    // Dest of a by-value target is the intern a payload field of that
+    // type holds (`Bookkeeper::by_value_payload_annotation`). A
+    // harvested `raw_word_owner` stays SomePtr; a classed scalar that
+    // is not a raw-word owner uses the SomeInstance intern rather than
+    // `raw_struct_ptr_annotation` (`rclass.py` `ll_cast_to_object`:
+    // dest is the target class annotation). Operand `can_be_none` is
+    // applied on the instance arm below, unchanged.
+    let payload_dest = bk.by_value_payload_annotation(&root);
+    if matches!(&payload_dest, SomeValue::Ptr(_)) {
         return match operand {
             SomeValue::Ptr(_)
             | SomeValue::Address(_)
             | SomeValue::Integer(_)
-            | SomeValue::Instance(_) => Ok(raw_ptr),
+            | SomeValue::Instance(_) => Ok(payload_dest),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-address operand for raw root {root:?}: {other:?}"
             ))),
@@ -2478,6 +2502,10 @@ fn cast_instance_intrinsic(
     // (`annrpython.py`), and `follow_link` never sees the success
     // successor.  Keep the instantiation only when the operand's template
     // and `root` are the same declaration (`instantiates_variant_declaration`).
+    // Instance dest ClassDef is the struct-root intern of `root` (generic
+    // instantiations included). `payload_dest` only chooses Ptr vs
+    // Instance; using its ClassDef would collapse `Result<f64,E>::Ok`
+    // onto the `Result::Ok` template (`strip_generic_args`).
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     if let SomeValue::Instance(inst) = operand
         && let Some(cd) = inst.classdef.as_ref()
@@ -3063,9 +3091,11 @@ pub(crate) fn rffi_cast(
 }
 
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
-/// (builtin.py:229-242).
+/// (builtin.py:229-242). A harvested `raw_word_owner` (or a variant
+/// whose enum base is one) is `lltype.malloc(T, flavor='raw')`:
+/// `SomePtr` of the same intern `by_value_payload_annotation` gives.
 pub fn robjmodel_instantiate(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
@@ -3104,6 +3134,10 @@ pub fn robjmodel_instantiate(
     }
     let cdef = clsdef
         .ok_or_else(|| AnnotatorError::new("instantiate() called with empty descriptor set"))?;
+    let class_name = cdef.borrow().name.clone();
+    if let Some(s) = bk.instantiate_annotation(&class_name) {
+        return Ok(s);
+    }
     Ok(SomeValue::Instance(SomeInstance::new(
         Some(cdef),
         false,
@@ -6020,12 +6054,50 @@ mod tests {
         );
     }
 
+    fn cast_instance_dest_and_payload_field(
+        bk: &Rc<Bookkeeper>,
+        inner: &str,
+        payload_owner: &str,
+    ) -> (SomeValue, SomeValue) {
+        let owner_cd = bk
+            .getuniqueclassdef_for_struct_root(payload_owner)
+            .expect("payload owner registers");
+        let field = owner_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr")
+            .s_value
+            .clone();
+        let classdef = ClassDef::new_standalone(inner, None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str(inner))
+            .expect("cast root constant");
+        let dest = call_builtin(
+            bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("cast_instance dest");
+        (dest, field)
+    }
+
     #[test]
     fn cast_instance_intrinsic_raw_root_narrows_instance_to_someptr() {
+        // Pointer-bag raw container (`PosixMap { ptr, len }`): dest of
+        // `cast_instance` is the same SomePtr the payload field holds.
+        // A classed scalar that is not a raw-word owner dest is
+        // SomeInstance (`cast_instance_dest_of_classed_payload_matches_field_cell`);
+        // a `raw_word_owner` dest is SomePtr
+        // (`cast_instance_dest_of_raw_word_owner_payload_is_someptr`).
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
-        let owner = "rawcast::Scope";
+        let owner = "rawcast::PosixMap";
+        let some = "Option<rawcast::PosixMap>::Some";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
         let _ids =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
@@ -6036,7 +6108,16 @@ mod tests {
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
             owner.to_string(),
-            vec![("save_point".to_string(), "usize".to_string())],
+            vec![
+                ("ptr".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", owner,
+            )],
         );
         reg.raw_word_owners.insert(owner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -6044,6 +6125,416 @@ mod tests {
         let mut cc = crate::call::CallControl::new();
         cc.set_struct_layout(
             owner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, owner, some);
+        let SomeValue::Ptr(ptr) = &dest else {
+            panic!("pointer-bag dest must be SomePtr, got {dest:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("raw-root SomePtr must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Raw);
+        crate::annotator::model::union(&dest, &field)
+            .expect("pointer-bag dest must union with the payload field cell");
+    }
+
+    /// Classed scalar `PosError { pos: i64 }` that is not a
+    /// `raw_word_owner`, as `Result<_, PosError>::Err` payload: dest of
+    /// `cast_instance` vs the setattr field cell are both SomeInstance.
+    #[test]
+    fn cast_instance_dest_of_classed_payload_matches_field_cell() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "payloadcast::PosError";
+        let err = "core::result::Result<i64, payloadcast::PosError>::Err";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(inner.to_string(), vec![("pos".into(), "i64".into())]);
+        reg.fields.insert(
+            err.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "pos".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, err);
+        assert!(
+            matches!(&dest, SomeValue::Instance(_)),
+            "classed scalar dest must be SomeInstance, got {dest:?}"
+        );
+        assert!(
+            matches!(&field, SomeValue::Instance(_)),
+            "classed scalar field cell must be SomeInstance, got {field:?}"
+        );
+        crate::annotator::model::union(&dest, &field)
+            .expect("cast_instance dest must union with the setattr field cell");
+    }
+
+    /// `raw_word_owner` scalar bag `PosError { pos: i64 }`: dest of
+    /// `cast_instance`, the positional payload row, and a closure
+    /// capture are all SomePtr and union.
+    #[test]
+    fn cast_instance_dest_of_raw_word_owner_payload_is_someptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "payloadcast::PosError";
+        let err = "core::result::Result<i64, payloadcast::PosError>::Err";
+        let closure = "payloadcast::format::closure";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let closure_id = majit_ir::descr::StructId::from_canonical(closure);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (closure.to_string(), Some(closure_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(inner.to_string(), vec![("pos".into(), "i64".into())]);
+        reg.fields.insert(
+            err.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.fields.insert(
+            closure.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "pos".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, err);
+        assert!(
+            matches!(&dest, SomeValue::Ptr(_)),
+            "raw_word_owner dest must be SomePtr, got {dest:?}"
+        );
+        assert!(
+            matches!(&field, SomeValue::Ptr(_)),
+            "raw_word_owner positional field cell must be SomePtr, got {field:?}"
+        );
+        crate::annotator::model::union(&dest, &field)
+            .expect("raw_word_owner dest must union with the positional field cell");
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(closure)
+            .expect("closure env registers");
+        let capture = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("capture attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(&capture, SomeValue::Ptr(_)),
+            "raw_word_owner closure capture must be SomePtr, got {capture:?}"
+        );
+        crate::annotator::model::union(&dest, &capture)
+            .expect("raw_word_owner dest must union with the closure capture");
+        crate::annotator::model::union(&field, &capture)
+            .expect("raw_word_owner positional field must union with the closure capture");
+    }
+
+    #[test]
+    fn cast_instance_dest_of_storage_raw_enum_matches_field_cell() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawenum::MappedObj";
+        let some = "Option<rawenum::MappedObj>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            format!("{inner}::Mapped"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "rawenum::PosixMap",
+            )],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 24,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, some);
+        assert!(
+            matches!(&dest, SomeValue::Ptr(_)),
+            "storage-raw enum dest must be SomePtr, got {dest:?}"
+        );
+        assert!(
+            matches!(&field, SomeValue::Ptr(_)),
+            "storage-raw enum field cell must be SomePtr, got {field:?}"
+        );
+        assert_eq!(
+            dest.tag(),
+            field.tag(),
+            "storage-raw enum dest tag must match the payload field cell, dest={dest:?} field={field:?}"
+        );
+        crate::annotator::model::union(&dest, &field)
+            .expect("storage-raw enum dest must union with the payload field cell");
+    }
+
+    fn instantiate_of(bk: &Rc<Bookkeeper>, qualname: &str) -> SomeValue {
+        let host = bk.intern_class_by_qualname(qualname);
+        let pbc = bk
+            .immutablevalue(&ConstValue::HostObject(host))
+            .expect("class pbc");
+        call_builtin(
+            bk,
+            "rpython.rlib.objectmodel.instantiate",
+            &[Some(pbc)],
+            &no_kwds(),
+        )
+        .expect("instantiate")
+    }
+
+    fn const_field_name(name: &str) -> SomeValue {
+        use crate::flowspace::model::Constant;
+        let mut s = SomeString::new(false, false);
+        s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(name)));
+        SomeValue::String(s)
+    }
+
+    /// `raw_word_owner` scalar bag: instantiate is the same SomePtr
+    /// dest / positional payload hold, and setattr of a named field
+    /// goes through that SomePtr.
+    #[test]
+    fn instantiate_of_raw_word_owner_struct_unions_with_dest_and_setattr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "payloadcast::PosError";
+        let err = "core::result::Result<i64, payloadcast::PosError>::Err";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(inner.to_string(), vec![("pos".into(), "i64".into())]);
+        reg.fields.insert(
+            err.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "pos".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, inner);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of a raw_word_owner struct must be SomePtr, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, err);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("instantiate must union with the cast_instance dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("instantiate must union with the positional payload cell");
+
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
+        };
+        ptr.setattr(
+            &const_field_name("pos"),
+            &SomeValue::Integer(SomeInteger::new(false, false)),
+        )
+        .expect("setattr of a named field on the instantiate SomePtr");
+        let got = ptr
+            .getattr(&const_field_name("pos"))
+            .expect("getattr of a named field on the instantiate SomePtr");
+        assert!(
+            matches!(got, SomeValue::Integer(_)),
+            "getattr of pos must be Integer, got {got:?}"
+        );
+    }
+
+    /// Wrapper whose first field is another `raw_word_owner`: instantiate
+    /// is still the wrapper's SomePtr, setattr of an inlined parent field
+    /// (`save_point`) succeeds, and getattr of the first-struct field name
+    /// (`roots`) stays SomePtr.
+    #[test]
+    fn instantiate_of_raw_word_owner_first_struct_setattr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "gc_roots::RootScope";
+        let outer = "dictmultiobject::DictOperationGuard";
+        let some = "Option<dictmultiobject::DictOperationGuard>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let outer_id = majit_ir::descr::StructId::from_canonical(outer);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (outer.to_string(), Some(outer_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        reg.fields.insert(
+            outer.to_string(),
+            vec![
+                ("roots".into(), inner.to_string()),
+                ("root_base".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", outer,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        reg.raw_word_owners.insert(outer.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
             crate::call::StructLayout {
                 size: 8,
                 align: 8,
@@ -6061,29 +6552,541 @@ mod tests {
                 ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
+        cc.set_struct_layout(
+            outer_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
         bk.set_struct_layouts(cc.struct_layouts_handle());
 
-        let classdef = ClassDef::new_standalone(owner, None);
-        let s_obj =
-            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
-        let s_root = bk
-            .immutablevalue(&ConstValue::byte_str(owner))
-            .expect("raw root constant");
-        let out = call_builtin(
-            &bk,
-            crate::runtime_names::shims::CAST_INSTANCE,
-            &[Some(s_obj), Some(s_root)],
-            &no_kwds(),
+        let inst = instantiate_of(&bk, outer);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of a raw_word_owner wrapper must be SomePtr, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, outer, some);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("wrapper instantiate must union with the dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("wrapper instantiate must union with the payload cell");
+
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
+        };
+        ptr.setattr(
+            &const_field_name("save_point"),
+            &SomeValue::Integer(SomeInteger::new(true, true)),
         )
-        .expect("raw-root cast_instance_intrinsic must accept a SomeInstance operand");
-        let SomeValue::Ptr(ptr) = out else {
-            panic!("raw root must project dest as SomePtr, got {out:?}");
+        .expect("setattr of an inlined first-struct field on the wrapper SomePtr");
+        let nested = ptr
+            .getattr(&const_field_name("roots"))
+            .expect("getattr of the first-struct field name");
+        assert!(
+            matches!(nested, SomeValue::Ptr(_)),
+            "first-struct field name stays SomePtr, got {nested:?}"
+        );
+        ptr.setattr(
+            &const_field_name("root_base"),
+            &SomeValue::Integer(SomeInteger::new(true, true)),
+        )
+        .expect("setattr of an immediate wrapper field");
+    }
+
+    /// Fieldless variant of a harvested payload enum: instantiate is
+    /// the enum base's SomePtr, the same intern dest / Option::Some
+    /// payload use. No second intern of the variant spelling.
+    #[test]
+    fn instantiate_of_raw_word_owner_enum_variant_unions_with_base() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "type_methods::BuiltinEncoder";
+        let utf8 = "type_methods::BuiltinEncoder::Utf8";
+        let variant = "type_methods::BuiltinEncoder::Utf16Or32";
+        let form = "type_methods::Utf16Or32Form";
+        let some = "Option<type_methods::BuiltinEncoder>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            variant.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", form,
+            )],
+        );
+        reg.fields.insert(
+            form.to_string(),
+            vec![
+                ("is32".into(), "bool".into()),
+                ("order".into(), "ByteOrder".into()),
+                ("bom".into(), "bool".into()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__discriminant".into(),
+                    offset: 0,
+                    size: 1,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, utf8);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of a raw_word_owner enum variant must be SomePtr of the base, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, some);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("variant instantiate must union with the enum-base dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("variant instantiate must union with the enum-base payload cell");
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
         };
-        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
-            panic!("raw-root SomePtr must point at a Struct");
+        ptr.setattr(
+            &const_field_name("__discriminant"),
+            &SomeValue::Integer(SomeInteger::new(true, true)),
+        )
+        .expect("setattr of the discriminant on the shared base SomePtr");
+    }
+
+    /// Harvest spells a fieldless-enum field as `u8`; instantiate +
+    /// setattr of that field is Signed (`s_int` / FORCE), the same
+    /// intern dest / Option::Some payload hold.
+    #[test]
+    fn instantiate_of_raw_word_owner_setattr_fieldless_enum_field() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::FieldRow;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let form = "type_methods::Utf16Or32Form";
+        let some = "Option<type_methods::Utf16Or32Form>::Some";
+        let form_id = majit_ir::descr::StructId::from_canonical(form);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (form.to_string(), Some(form_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            form.to_string(),
+            vec![
+                FieldRow::named("is32", "bool"),
+                FieldRow::named("order", "u8").with_fieldless_enum(true),
+                FieldRow::named("bom", "bool"),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![FieldRow::positional("__pos_0", form)],
+        );
+        reg.raw_word_owners.insert(form.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            form_id,
+            crate::call::StructLayout {
+                size: 3,
+                align: 1,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "is32".into(),
+                        offset: 0,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "order".into(),
+                        offset: 1,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "bom".into(),
+                        offset: 2,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, form);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of Utf16Or32Form must be SomePtr, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, form, some);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("form instantiate must union with the dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("form instantiate must union with the payload cell");
+
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
         };
-        assert_eq!(st._name, owner);
-        assert_eq!(st._gckind, GcKind::Raw);
+        ptr.setattr(
+            &const_field_name("order"),
+            &SomeValue::Integer(SomeInteger::new(false, false)),
+        )
+        .expect("setattr of a fieldless-enum-typed field is Signed");
+        let got = ptr
+            .getattr(&const_field_name("order"))
+            .expect("getattr of a fieldless-enum-typed field");
+        match got {
+            SomeValue::Integer(i) => assert!(
+                !i.unsigned,
+                "fieldless-enum-typed field must be Signed, got unsigned"
+            ),
+            other => panic!("order must be Integer, got {other:?}"),
+        }
+    }
+
+    /// Nested payload-enum field (`Fmt.code`): instantiate of the
+    /// outer struct and setattr of the TypeDecl `name_path()` identity
+    /// (`module::struct::Code`) share the enum-base SomePtr intern dest
+    /// / Option::Some payload use. `eval::Code` is a different TypeDecl
+    /// that shares the leaf; the field row does not use that leaf.
+    #[test]
+    fn instantiate_of_raw_word_owner_setattr_payload_enum_field() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::{ClassIdentity, FieldRow};
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let fmt = "module::struct::Fmt";
+        let code = "module::struct::Code";
+        let eval_code = "eval::Code";
+        let pad = "module::struct::Code::Pad";
+        let int_v = "module::struct::Code::Int";
+        let some = "Option<module::struct::Fmt>::Some";
+        let fmt_id = majit_ir::descr::StructId::from_canonical(fmt);
+        let code_id = majit_ir::descr::StructId::from_canonical(code);
+        let eval_id = majit_ir::descr::StructId::from_canonical(eval_code);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (fmt.to_string(), Some(fmt_id)),
+                (code.to_string(), Some(code_id)),
+                (eval_code.to_string(), Some(eval_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            fmt.to_string(),
+            vec![
+                FieldRow::named("code", code),
+                FieldRow::named("size", "usize"),
+                FieldRow::named("alignment", "usize"),
+                FieldRow::named("needcount", "bool"),
+                FieldRow::named("fmtchar", "char"),
+            ],
+        );
+        reg.fields.insert(
+            code.to_string(),
+            vec![FieldRow::named("__discriminant", "u8")],
+        );
+        reg.fields.insert(
+            eval_code.to_string(),
+            vec![
+                FieldRow::named("name", "String"),
+                FieldRow::named("code", "PyObjectRef"),
+            ],
+        );
+        reg.fields
+            .insert(int_v.to_string(), vec![FieldRow::named("signed", "bool")]);
+        reg.fields
+            .insert(some.to_string(), vec![FieldRow::positional("__pos_0", fmt)]);
+        reg.class_identity.insert(
+            code.to_string(),
+            Some(ClassIdentity {
+                id: code_id,
+                spelling: code.to_string(),
+            }),
+        );
+        reg.class_identity.insert(
+            eval_code.to_string(),
+            Some(ClassIdentity {
+                id: eval_id,
+                spelling: eval_code.to_string(),
+            }),
+        );
+        reg.raw_word_owners.insert(fmt.to_string());
+        reg.raw_word_owners.insert(code.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            fmt_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            code_id,
+            crate::call::StructLayout {
+                size: 1,
+                align: 1,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__discriminant".into(),
+                    offset: 0,
+                    size: 1,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            eval_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, fmt);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of Fmt must be SomePtr, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, fmt, some);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("Fmt instantiate must union with the dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("Fmt instantiate must union with the payload cell");
+
+        let code_inst = instantiate_of(&bk, pad);
+        assert!(
+            matches!(&code_inst, SomeValue::Ptr(_)),
+            "instantiate of Code::Pad must be SomePtr of the base, got {code_inst:?}"
+        );
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
+        };
+        ptr.setattr(&const_field_name("code"), &code_inst)
+            .expect("setattr of a nested payload-enum field is the base SomePtr intern");
+        let got = ptr
+            .getattr(&const_field_name("code"))
+            .expect("getattr of a nested payload-enum field");
+        crate::annotator::model::union(&got, &code_inst)
+            .expect("getattr of code must union with instantiate of the enum base");
+        let (SomeValue::Ptr(got_ptr), SomeValue::Ptr(code_ptr)) = (&got, &code_inst) else {
+            panic!("code field and instantiate intern must both be SomePtr");
+        };
+        assert_eq!(
+            got_ptr.ll_ptrtype, code_ptr.ll_ptrtype,
+            "field intern must be the instantiate intern"
+        );
+
+        let ch = SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false));
+        ptr.setattr(&const_field_name("fmtchar"), &ch)
+            .expect("setattr of a char field is UniChar");
+        let got_ch = ptr
+            .getattr(&const_field_name("fmtchar"))
+            .expect("getattr of a char field");
+        crate::annotator::model::union(&got_ch, &ch)
+            .expect("getattr of fmtchar must union with UnicodeCodePoint");
+    }
+
+    /// `raw_word_owner` intern of a `char` field is UniChar, the same
+    /// annotation setattr of `SomeUnicodeCodePoint` writes.
+    #[test]
+    fn instantiate_of_raw_word_owner_setattr_char_field() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "payloadcast::FmtCharBag";
+        let some = "Option<payloadcast::FmtCharBag>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(inner.to_string(), vec![("fmtchar".into(), "char".into())]);
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 4,
+                align: 4,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "fmtchar".into(),
+                    offset: 0,
+                    size: 4,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, inner);
+        assert!(
+            matches!(&inst, SomeValue::Ptr(_)),
+            "instantiate of a raw_word_owner struct must be SomePtr, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, some);
+        crate::annotator::model::union(&inst, &dest).expect("instantiate must union with the dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("instantiate must union with the payload cell");
+
+        let SomeValue::Ptr(ptr) = &inst else {
+            unreachable!("asserted SomePtr");
+        };
+        let ch = SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false));
+        ptr.setattr(&const_field_name("fmtchar"), &ch)
+            .expect("setattr of a char field on the instantiate SomePtr is UniChar");
+        let got = ptr
+            .getattr(&const_field_name("fmtchar"))
+            .expect("getattr of a char field on the instantiate SomePtr");
+        crate::annotator::model::union(&got, &ch)
+            .expect("getattr of fmtchar must union with UnicodeCodePoint");
+    }
+
+    /// A classed scalar that is not a `raw_word_owner` still
+    /// instantiates SomeInstance, matching dest / payload.
+    #[test]
+    fn instantiate_of_non_raw_word_owner_stays_instance() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "payloadcast::PosError";
+        let err = "core::result::Result<i64, payloadcast::PosError>::Err";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(inner.to_string(), vec![("pos".into(), "i64".into())]);
+        reg.fields.insert(
+            err.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "pos".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let inst = instantiate_of(&bk, inner);
+        assert!(
+            matches!(&inst, SomeValue::Instance(_)),
+            "instantiate of a non-raw_word_owner class must be SomeInstance, got {inst:?}"
+        );
+        let (dest, field) = cast_instance_dest_and_payload_field(&bk, inner, err);
+        crate::annotator::model::union(&inst, &dest)
+            .expect("non-raw instantiate must union with dest");
+        crate::annotator::model::union(&inst, &field)
+            .expect("non-raw instantiate must union with the payload cell");
     }
 
     #[test]
@@ -6458,6 +7461,43 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("no analyser registered")
+        );
+    }
+
+    #[test]
+    fn ptr_write_returns_none_for_an_instance_and_a_string() {
+        let bk = bk();
+        let inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let text = SomeValue::String(SomeString::new(false, false));
+        for (dst, src) in [(&inst, &inst), (&text, &text), (&inst, &text)] {
+            let result = call_builtin(
+                &bk,
+                "std.ptr.write",
+                &[Some(dst.clone()), Some(src.clone())],
+                &no_kwds(),
+            )
+            .expect("write annotates");
+            assert!(
+                matches!(result, SomeValue::None_(_)),
+                "write returns (), got {result:?}"
+            );
+        }
+        let err = call_builtin(
+            &bk,
+            "std.ptr.write",
+            &[
+                Some(inst),
+                Some(text),
+                Some(SomeValue::Integer(SomeInteger::new(true, true))),
+            ],
+            &no_kwds(),
+        )
+        .expect_err("three arguments are not the signature");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("expects (dst, src)")
         );
     }
 

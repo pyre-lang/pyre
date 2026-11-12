@@ -524,9 +524,13 @@ pub struct CodeHookCache {
 pub static CODE_TYPE: PyType =
     pyre_object::pyobject::new_pytype_with_weakref("code", CODE_W_WEAKREFLIFELINE_OFFSET);
 
+/// `eval.py` `Code._immutable_fields_` (`co_name`) and
 /// `pycode.py` `PyCode._immutable_fields_` entries that live on the
 /// `bytecode::CodeObject` body [`PyCode::code_ptr`] addresses:
-/// `co_varnames[*]`, `co_cellvars[*]`, `co_freevars[*]`.
+/// `co_name`, `co_qualname`, `co_names_w[*]`, `co_varnames[*]`,
+/// `co_cellvars[*]`, `co_freevars[*]`, `co_code`, `co_linetable`,
+/// `co_exceptiontable`, `co_flags`, `co_argcount`, `co_posonlyargcount`,
+/// `co_kwonlyargcount`, `co_firstlineno`, `co_stacksize`.
 /// `localspluskinds[*]` is the kind byte of that layout
 /// (`CO_FAST_LOCAL` / `CO_FAST_CELL` / `CO_FAST_FREE`).
 /// `code_replace` writes the clone; `release_code_object_body` clears a
@@ -535,8 +539,7 @@ pub static CODE_TYPE: PyType =
 /// `source_path` stays mutable (`fix_code_filenames`).
 #[doc(hidden)]
 #[allow(non_upper_case_globals)]
-pub const _immutable_fields_CodeObject: &str =
-    "varnames[*],cellvars[*],freevars[*],localspluskinds[*]";
+pub const _immutable_fields_CodeObject: &str = "obj_name,qualname,names[*],varnames[*],cellvars[*],freevars[*],localspluskinds[*],instructions,linetable,exceptiontable,flags,arg_count,posonlyarg_count,kwonlyarg_count,first_line_number,max_stackdepth";
 
 /// Host `bytecode::CodeObject` is `Box::into_raw`'d host memory, never a
 /// GC object. `rclass.py getgcflavor` reads `_alloc_flavor_` off the

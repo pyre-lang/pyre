@@ -408,6 +408,16 @@ impl<'a> Lowering<'a> {
         {
             return Some((root.clone(), ValueType::Ref(Some(root))));
         }
+        // Pointer-niche `Option<&RawStruct>` is the nullable `Ptr`
+        // (`tyref_niche_option_payload_paint` /
+        // `raw_struct_ptr_annotation`). `history.getkind` of that `Ptr`
+        // is `'int'`. Painting `None` as `Ref` left `Result::ok` to
+        // union a classdef-less Instance with the Ok `Int` (`unionof`).
+        if let Some(root) =
+            niche_option_storage_raw_struct_root(option_ty, self.llbc, self.tombstoned_leaves)
+        {
+            return Some((root, ValueType::Int));
+        }
         // `None` of a nullable instance is RPython's `None`, which unions
         // into `SomeInstance(T, can_be_none=True)` and keeps the class
         // (`model.py` `unionof`). The bare `null_mut()` is classdef-less.

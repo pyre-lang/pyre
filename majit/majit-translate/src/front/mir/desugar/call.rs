@@ -1403,7 +1403,7 @@ impl<'a> Lowering<'a> {
                 // `arg_locals` is `None` for a projection; follow the mark
                 // the same way `Rvalue::Len` does.
                 if args.len() == 1
-                    && is_deref_call(&reg, self.llbc)
+                    && is_deref_call_for(&reg, first_arg_ty.as_ref(), self.llbc)
                     && tyref_is_string_family(&call.dest.ty, self.llbc)
                 {
                     let from_string = first_arg_ty
@@ -1452,7 +1452,8 @@ impl<'a> Lowering<'a> {
                 // `str` derefs resolve no struct root and keep their
                 // ordinary lowering.
                 if args.len() == 1
-                    && let Some(root) = self.deref_cast_root(&reg, &call.dest.ty)
+                    && let Some(root) =
+                        self.deref_cast_root(&reg, &call.dest.ty, first_arg_ty.as_ref())
                 {
                     let res = self
                         .graph
@@ -1481,7 +1482,11 @@ impl<'a> Lowering<'a> {
                 // [`Self::pair_of_vec`] (`ll_vec_items` / `ll_vec_length`,
                 // `rlist.py` `ll_getitem_fast` on the same list).
                 if args.len() == 1
-                    && self.is_container_identity_deref(&reg)
+                    && self.is_container_identity_deref_for(
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        Some(&call.dest.ty),
+                    )
                     && first_arg_ty
                         .as_ref()
                         .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
@@ -4775,19 +4780,24 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)`
-                // spelling follows the pointee's declared gckind.
+                // spelling follows intern of the pointer.
                 //
-                // Raw / `llmemory.Address`-like: `eq(bool(p), Constant(False))`
-                // (`llannotation.py` `SomePtr.bool`, `rptr.py`
-                // `PtrRepr.rtype_bool` → `ptr_nonzero`, `raddress.py`
-                // `AddressRepr.rtype_bool` → `adr_ne`). Flowspace has no
-                // `not_` op; `operator.not_` is `bool` plus inversion.
-                // Routing as `getattr(p, "is_null")` dies on `String`.
+                // SomePtr (word-storage ADT, flavor-raw, Address, GCREF,
+                // scalar): `eq(bool(p), Constant(False))` (`llannotation.py`
+                // `SomePtr.bool`, `rptr.py` `PtrRepr.rtype_bool` →
+                // `ptr_nonzero`, `raddress.py` `AddressRepr.rtype_bool` →
+                // `adr_ne`). `SomePtr.can_be_none` is False, so `is_`
+                // would fold. Flowspace has no `not_` op; `operator.not_`
+                // is `bool` plus inversion. Routing as
+                // `getattr(p, "is_null")` dies on `String`.
                 //
-                // GC string (`is_str_family_class_root`) or GC instance
-                // (`registered_gc_ptr_class_root_with`): `is_(p, Constant(None))`
-                // (`rnone.py` `rtype_is_None` → `ptr_iszero`). `Constant(None)`
-                // is Void (`rmodel.py` `pairtype(Repr, VoidRepr).convert_from_to`).
+                // SomeInstance / SomeString (GC string, registered GC
+                // instance, or classed T that is not word-storage):
+                // `is_(p, Constant(None))` (`rnone.py` `rtype_is_None` →
+                // `ptr_iszero`). `Constant(None)` is Void (`rmodel.py`
+                // `pairtype(Repr, VoidRepr).convert_from_to`). Classed T
+                // stays `InstanceRepr` (`rclass.py` `getgcflavor`); a
+                // type object is this case (`raw_struct_ptr_from_layout`).
                 if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
                     let keep_is_none = self.is_raw_ptr_is_null_keeps_is_none(first_arg_ty.as_ref());
                     let res = self
@@ -9068,10 +9078,18 @@ impl<'a> Lowering<'a> {
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
         // the roots already match, so the Call dest is the value.
+        //
+        // The narrowed Variable keeps the Call dest's `concretetype`
+        // (`Variable.copy`, `flowspace/model.py`): `do_fixed_newlist`
+        // reads `op.result.concretetype.TO` and
+        // `do_fixed_list_ll_arraycopy` reads the dest ARRAY, and without
+        // it the residual `OS_ARRAYCOPY` lands on
+        // `WriteAnalyzer.top_result` (`EF_RANDOM_EFFECTS`).
         if !dest_is_cell && let Some(root) = recast_result_root {
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            copy_concretetype(&result_var, &narrowed);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(narrowed.clone()),
                 kind: crate::model::cast_instance_call(root, result_var.clone()),

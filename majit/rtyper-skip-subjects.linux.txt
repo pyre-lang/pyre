@@ -6,6 +6,10 @@
 direct-skip (never reaches unported_category)	generatorentry_portal_portal
 direct-skip (never reaches unported_category)	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_Utf16Or32Form_1aad9eec5cbb6142
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::<Impl>::class_dict_strategy
+direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::delete_fast__AccessDirect_None
+direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::load_local_checked_value__AccessDirect_None
+direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::cell_slot
+direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::deref_name_and_kind
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_ConstIdx_TryFrom____0___const_generics______regi_6644b6a8b30a0282
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_Layout_LayoutError_MemoryError_closure_23cf47bf63e916b1
@@ -1130,7 +1134,6 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typeche
 two-phase-annotate-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_getdictscope
 two-phase-annotate-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_lineno
 two-phase-annotate-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_trace
-two-phase-annotate-skipped	pyre_interpreter::pyframe::cell_slot
 two-phase-annotate-skipped	pyre_interpreter::pyframe::class_scope_outer_class_freevar
 two-phase-annotate-skipped	pyre_interpreter::pyframe::code_flags_make_generator
 two-phase-annotate-skipped	pyre_interpreter::pyframe::delitem_str_object
@@ -1151,10 +1154,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__new__::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__or__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__repr__
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__reversed__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__ror__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__setitem__
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::collect_entries
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::copy
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::entry_count
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::fast_local_index
@@ -1163,7 +1164,6 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::get
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::items
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::key_is_fast_local
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::keys
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::locals_plus_value
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::locals_plus_value::<Impl>::call
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::mapping
@@ -1172,7 +1172,6 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::setdefault
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::setitem_value
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::update
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::values
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___contains__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___delitem__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___eq__
@@ -1188,21 +1187,15 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__maji
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___new__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___or__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___repr__
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___reversed__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___ror__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___setitem__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_collect_entries
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_copy
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_get
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_items
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_keys
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_pop
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_setdefault
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_update
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_values
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::append_bound_entries
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::bound_part_list
-two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::extend_bound_entries
 two-phase-annotate-skipped	pyre_interpreter::pyframe::setitem_str_object
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::binary_op__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::build_list_from_arg__AccessDirect_None
@@ -1332,7 +1325,6 @@ two-phase-annotate-skipped	pyre_interpreter::type_methods::encode_object
 two-phase-annotate-skipped	pyre_interpreter::type_methods::encode_raw_unicode_escape
 two-phase-annotate-skipped	pyre_interpreter::type_methods::encode_utf16_32
 two-phase-annotate-skipped	pyre_interpreter::type_methods::encode_utf8_with_errors
-two-phase-annotate-skipped	pyre_interpreter::type_methods::extend_from_frame_locals_proxy
 two-phase-annotate-skipped	pyre_interpreter::type_methods::extend_from_tuple
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_char
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_char::<Impl>::call_once
@@ -1364,7 +1356,6 @@ two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_list_descr_le
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_list_descr_pop
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_object_descr_new
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_set_descr_add
-two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_tuple_descr_new
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_type_descr_set_name
 two-phase-annotate-skipped	pyre_interpreter::typedef::buffer_as_bytes_like
 two-phase-annotate-skipped	pyre_interpreter::typedef::check_new_subtype
@@ -1387,7 +1378,6 @@ two-phase-annotate-skipped	pyre_interpreter::typedef::set_init_from_iterable
 two-phase-annotate-skipped	pyre_interpreter::typedef::set_method_symmetric_difference
 two-phase-annotate-skipped	pyre_interpreter::typedef::set_newobj
 two-phase-annotate-skipped	pyre_interpreter::typedef::set_operand_as_set
-two-phase-annotate-skipped	pyre_interpreter::typedef::tuple_from_frame_locals_proxy
 two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_check_encoding_errors
 two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_encode_error
 two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_error_position_w

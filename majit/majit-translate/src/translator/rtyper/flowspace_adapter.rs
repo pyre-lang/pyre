@@ -2299,10 +2299,13 @@ fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp
 /// interns by qualname and the first mint wins; a cast that minted the
 /// variant first would freeze it without bases.
 ///
-/// Returns `None` when the owner is not a registered per-instantiation
-/// payload row. A path that only contains `<Impl>` is not an enum
-/// instantiation (`bufferview::<Impl>::stride0::closure#1`): the parent
-/// has to be a registered discriminant-only enum base
+/// Returns `None` when the owner is not an enum-payload `__pos_` read.
+/// A registered per-instantiation variant row CAST+getattr's. An
+/// unregistered niche Option interned as `Ptr(T)` (and a discriminant-only
+/// enum-base owner with no `<…>`) is identity of the receiver. A path
+/// that only contains `<Impl>` is not an enum instantiation
+/// (`bufferview::<Impl>::stride0::closure#1`): the parent has to be a
+/// registered discriminant-only enum base
 /// (`StructFieldRegistry::is_enum_base`). Other `__pos_` reads stay a
 /// plain `getattr`.
 fn enum_payload_getattr_ops(
@@ -2314,7 +2317,30 @@ fn enum_payload_getattr_ops(
     let Some(owner) = field.owner_root.as_deref() else {
         return Ok(None);
     };
-    if !field.name.starts_with("__pos_") || !owner.contains('<') {
+    if !field.name.starts_with("__pos_") {
+        return Ok(None);
+    }
+    let enum_payload_owner = |name: &str| {
+        call_registry
+            .bookkeeper()
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.is_enum_base(name) || reg.enum_base_registry_key(name).is_some())
+    };
+    // Discriminant-only Option interned as SomePtr: `__pos_N` is the
+    // payload word, which is the receiver (`llannotation.py`
+    // `SomePtr.getattr` of `as_ref` is identity). Result and other
+    // payload enums keep CAST+getattr / plain getattr. A tuple-struct
+    // or closure path with no enum base stays a plain getattr.
+    if !owner.contains('<') {
+        if enum_payload_owner(owner) && enum_base_leaf_is_option(owner) {
+            return Ok(Some(vec![FlowspaceOp::new(
+                "same_as",
+                vec![base_hl],
+                result,
+            )]));
+        }
         return Ok(None);
     }
     let registered = call_registry
@@ -2327,9 +2353,6 @@ fn enum_payload_getattr_ops(
                 .get(owner)
                 .is_some_and(|rows| rows.iter().any(|row| row.name == field.name))
         });
-    if !registered {
-        return Ok(None);
-    }
     let parts = crate::model::split_qualified_path(owner);
     let Some((variant, root_parts)) = parts.split_last() else {
         return Ok(None);
@@ -2343,12 +2366,21 @@ fn enum_payload_getattr_ops(
     // the first mint would freeze the closure without its own fields.
     // Borrow of `struct_fields` ends before the intern call, which borrows
     // the same registry.
-    let enum_payload = {
-        let fields = call_registry.bookkeeper().struct_fields.borrow();
-        fields.as_ref().is_some_and(|reg| {
-            reg.is_enum_base(&enum_root) || reg.enum_base_registry_key(&enum_root).is_some()
-        })
-    };
+    let enum_payload = enum_payload_owner(&enum_root);
+    if !registered {
+        // Niche Option interned as `Ptr(T)`: the payload FieldRead is
+        // the receiver. A registered instantiation variant keeps
+        // CAST+getattr below. Result `Ok`/`Err` is a tagged payload
+        // enum even when the variant row is not yet interned.
+        if enum_payload && enum_base_leaf_is_option(&enum_root) {
+            return Ok(Some(vec![FlowspaceOp::new(
+                "same_as",
+                vec![base_hl],
+                result,
+            )]));
+        }
+        return Ok(None);
+    }
     if !enum_payload {
         return Ok(None);
     }
@@ -2389,6 +2421,15 @@ fn enum_payload_getattr_ops(
             result,
         ),
     ]))
+}
+
+/// True when `owner` names the `Option` enum (bare, crate-prefixed, or
+/// instantiated). Identity of an unregistered `__pos_N` is only sound
+/// for that intern (`Ptr(T)` niche); `Result` and other payload enums
+/// keep CAST+getattr.
+fn enum_base_leaf_is_option(owner: &str) -> bool {
+    let stripped = majit_ir::descr::strip_generic_args(owner);
+    stripped.rsplit("::").next() == Some("Option")
 }
 
 /// The `#[jit_llop]` opname declared on the callee of `target`, read off
@@ -5772,33 +5813,48 @@ pub(crate) fn derive_subject_inputcells(
                 );
                 continue;
             }
-            // `PyObjectRef` / `*mut pyobject::PyObject` is a raw pointer
-            // (`SomeInstance.__init__(can_be_None=True)`). A peeled
-            // `pyobject::PyObject` Input is a non-null instance.
-            if class_root
-                .as_deref()
-                .is_some_and(crate::front::mir::is_raw_ptr_to_classed_instance_spelling)
+            // `*mut T` / `*const T` onto a harvested owner layout is a
+            // raw pointer (`SomeInstance.__init__(can_be_None=True)`).
+            // `llannotation.py` `lltype_to_annotation` of `lltype.Ptr`;
+            // gckind follows `lltype.py` `Struct._first_struct`. A
+            // peeled `pyobject::PyObject` Input is a non-null instance.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && bk.raw_ptr_declared_owner_pointee(root).is_some()
             {
-                let root = class_root.as_deref().unwrap();
-                cells.push(if let Some(bk) = bookkeeper {
-                    bk.project_struct_field_type(root)
-                } else {
-                    crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(
-                        crate::annotator::model::SomeValue::Instance(
-                            crate::annotator::model::SomeInstance::new(
-                                None,
-                                false,
-                                std::collections::BTreeMap::new(),
-                            ),
-                        ),
-                    )
-                });
+                cells.push(bk.project_struct_field_type(root));
                 continue;
             }
-            if class_root
-                .as_deref()
-                .is_some_and(crate::front::mir::is_niche_option_gc_payload_spelling)
-            {
+            // A raw pointer whose pointee has no harvested layout is
+            // still nullable. `llannotation.py` `lltype_to_annotation`
+            // of `lltype.Ptr(lltype.OpaqueType(T))` (`rffi.py`
+            // `COpaquePtr`) is `SomePtr`. Seeding that SomePtr here
+            // mismatches the frontend Ref bank (`history.getkind` of a
+            // raw Opaque is `'int'`) and cannot union with `s_None`
+            // (`lltype.py` `SomePtr.can_be_none` is False), so
+            // `is_(p, None)` and a None-arm return fail convert. Field
+            // projection of the same undeclared spelling is the
+            // classdef-less `SomeInstance(can_be_None=True)` intern
+            // (`project_struct_field_type` Impossible pointee). Seed
+            // that shell so `unaryop.py` `SomeInstance.bool_behavior`
+            // and `binaryop.py` `is__default` stay non-constant.
+            if let Some(root) = class_root.as_deref() {
+                let s = match bookkeeper {
+                    Some(bk) => bk.undeclared_raw_ptr_nullable_annotation(root),
+                    None => {
+                        crate::annotator::bookkeeper::undeclared_raw_ptr_nullable_annotation(root)
+                    }
+                };
+                if let Some(s) = s {
+                    cells.push(s);
+                    continue;
+                }
+            }
+            if class_root.as_deref().is_some_and(|root| match bookkeeper {
+                Some(bk) => bk.is_niche_option_gc_payload_spelling(root),
+                // No Bookkeeper: string-family still noneifies; GC
+                // instance-ness is the pointee's layout, never the name.
+                None => crate::front::mir::is_niche_option_gc_payload_spelling(root, None),
+            }) {
                 let root = class_root.as_deref().unwrap();
                 cells.push(
                     crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
@@ -6401,27 +6457,35 @@ fn input_class_name(kind: &OpKind) -> Option<&str> {
     }
 }
 
+/// Declared layout spelling of `field`, after the same exact-key /
+/// `??TypeVar#N` substitution [`Bookkeeper::project_struct_rows`] applies
+/// before [`Bookkeeper::project_struct_field_type`].
+fn projected_owner_field_spelling(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    field: &crate::model::FieldDescriptor,
+) -> Option<String> {
+    let owner = field.owner_root.as_deref()?;
+    let borrowed = call_registry.bookkeeper().struct_fields.borrow();
+    crate::annotator::bookkeeper::projected_field_layout_spelling(
+        borrowed.as_ref()?,
+        owner,
+        &field.name,
+    )
+}
+
 /// Field type spelling is a fat `&dyn Trait` (`spelling_is_dyn_fat_ptr`),
-/// looked up on the owner through `StructFieldRegistry.field_type` — the
+/// looked up on the owner through the projected layout spelling — the
 /// type of the field, not its name.
 fn field_spelling_is_dyn_fat(
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     field: &crate::model::FieldDescriptor,
 ) -> bool {
-    let Some(owner) = field.owner_root.as_deref() else {
+    let Some(ty) = projected_owner_field_spelling(call_registry, field) else {
         return false;
     };
-    let bk = call_registry.bookkeeper();
-    let borrowed = bk.struct_fields.borrow();
-    let Some(reg) = borrowed.as_ref() else {
-        return false;
-    };
-    let Some(ty) = reg.field_type(owner, &field.name) else {
-        return false;
-    };
-    crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty)
-        || majit_ir::descr::is_shared_u8_slice_spelling(ty)
-        || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+    crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(&ty)
+        || majit_ir::descr::is_shared_u8_slice_spelling(&ty)
+        || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
 }
 
 /// Index of the metadata (`true`) or data (`false`) word in
@@ -6913,18 +6977,11 @@ fn function_graph_to_flowspace_inner(
             })
             .collect();
         let is_window_field = |field: &crate::model::FieldDescriptor| -> bool {
-            let Some(owner) = field.owner_root.as_deref() else {
+            let Some(ty) = projected_owner_field_spelling(call_registry, field) else {
                 return false;
             };
-            let borrowed = call_registry.bookkeeper().struct_fields.borrow();
-            let Some(reg) = borrowed.as_ref() else {
-                return false;
-            };
-            let Some(ty) = reg.field_type(owner, &field.name) else {
-                return false;
-            };
-            majit_ir::descr::is_shared_u8_slice_spelling(ty)
-                || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+            majit_ir::descr::is_shared_u8_slice_spelling(&ty)
+                || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
         };
         let window_pairs = window_field_write_pairs(&legacy_block.operations, &is_window_field);
         for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
@@ -7937,6 +7994,9 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_niche_option_instance_as_nullable() {
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_layouts(layouts);
         let mut graph = LegacyGraph::new("takes_opt_instance");
         let entry = graph.startblock;
         let var = graph
@@ -7951,7 +8011,7 @@ mod tests {
             )
             .unwrap();
         graph.push_inputarg_var(entry, var);
-        let cells = derive_subject_inputcells(&graph, None)
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("niche Option of a GC instance must project");
         assert_eq!(cells.len(), 1);
         let SomeValue::Instance(s) = &cells[0] else {
@@ -8006,13 +8066,25 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_raw_ptr_to_instance_as_nullable() {
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+            "pyobject::PyObject",
+            "PyObject",
+            "foo::bar_state",
+            "bar_state",
+        ]);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_layouts(layouts);
         for (name, class_root, expect_none) in [
             (
                 "raw_pyobject",
                 Some("*mut pyobject::PyObject".to_string()),
                 true,
             ),
-            ("pyobject_ref_alias", Some("PyObjectRef".to_string()), true),
+            (
+                "lowercase_declared",
+                Some("*mut foo::bar_state".to_string()),
+                true,
+            ),
             (
                 "owned_pyobject",
                 Some("pyobject::PyObject".to_string()),
@@ -8033,7 +8105,7 @@ mod tests {
                 )
                 .unwrap();
             graph.push_inputarg_var(entry, var);
-            let cells = derive_subject_inputcells(&graph, None)
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
                 .expect("instance Input must project to a definite SomeValue cell");
             assert_eq!(cells.len(), 1);
             let crate::annotator::model::SomeValue::Instance(s) = &cells[0] else {
@@ -8042,6 +8114,43 @@ mod tests {
             assert_eq!(
                 s.can_be_none, expect_none,
                 "{name}: can_be_None={expect_none}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_undeclared_raw_ptr_is_nullable() {
+        let bk = Rc::new(Bookkeeper::new());
+        for (name, class_root) in [
+            ("mut_undeclared", "*mut SomeUndeclared"),
+            ("const_undeclared", "*const SomeUndeclared"),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some(class_root.to_string()),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
+                .expect("undeclared raw pointer still seeds a Ref shell");
+            let SomeValue::Instance(s) = &cells[0] else {
+                panic!("{name}: must seed SomeInstance, got {:?}", cells[0]);
+            };
+            assert!(
+                s.classdef.is_none(),
+                "{name}: undeclared pointee is not classed"
+            );
+            assert!(
+                s.can_be_none,
+                "{name}: a raw pointer with no harvested layout stays nullable"
             );
         }
     }
@@ -14142,6 +14251,80 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_unregistered_niche_option_payload_is_identity() {
+        let owner = "option::Option<&rawopt::RawCell>::Some";
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("niche payload is identity");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "same_as");
+        assert_eq!(translated[0].args.len(), 1);
+
+        let unsuffixed = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some("option::Option".into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated = translate_op(&unsuffixed, &value_map, &registry)
+            .expect("unsuffixed enum-base payload is identity");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "same_as");
+
+        let result_bk = Rc::new(Bookkeeper::new());
+        let mut result_fields = crate::front::StructFieldRegistry::default();
+        result_fields.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        result_bk.set_struct_fields(Rc::new(result_fields));
+        let result_registry = CallRegistry::new(result_bk);
+        let result_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "__pos_0",
+                    Some("result::Result<(), i64>::Ok".into()),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated = translate_op(&result_op, &value_map, &result_registry)
+            .expect("unregistered Result payload is not identity");
+        assert_ne!(
+            translated[0].opname, "same_as",
+            "Result Ok payload must not alias the receiver"
+        );
+    }
+
+    #[test]
     fn translate_op_bytes_data_str_field_casts_to_string() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -15100,6 +15283,102 @@ mod tests {
             &startblock.operations[0].args[len_idx],
             Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
         ));
+        let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
+            panic!("setattr name");
+        };
+        assert!(matches!(
+            &name.value,
+            ConstValue::ByteStr(bytes) if bytes == b"__pos_0"
+        ));
+    }
+
+    #[test]
+    fn window_field_writes_instantiate_typevar_slice_as_tuple_setattr() {
+        // A generic `&B` payload intern's `&??TypeVar#0` on the template
+        // (`lookup_fields` strips `<…>`). `project_struct_field_type`
+        // substitutes `&[u8]` (`PtrRepr.rtype_getattr`); the adapter must
+        // rebuild the same Tuple (`rtuple.py` `TupleRepr.newtuple`).
+        let mut graph = LegacyGraph::new("window_typevar_slice_setattr");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new(
+            "__pos_0",
+            Some("borrow::Cow<[u8]>::Borrowed".into()),
+        );
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("borrow::Cow<[u8]>::Borrowed".to_string())),
+                        class_root: Some("borrow::Cow<[u8]>::Borrowed".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("borrow::Cow::Borrowed", "__pos_0", "&??TypeVar#0"),
+        )
+        .expect("instantiated &[u8] window pair must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["newtuple", "setattr"], "got {opnames:?}");
         let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
             panic!("setattr name");
         };

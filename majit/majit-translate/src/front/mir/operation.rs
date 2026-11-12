@@ -290,6 +290,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         );
         let item_ty = adt_field_read_value_type(
             place_ty,
@@ -1110,6 +1111,7 @@ impl<'a> Lowering<'a> {
                                         self.llbc,
                                         self.gc_struct_ids,
                                         self.immutable_fields,
+                                        &self.raw_alloc_flavor_structs,
                                     ))
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index)
@@ -1173,6 +1175,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.gc_struct_ids,
                                 self.immutable_fields,
+                                &self.raw_alloc_flavor_structs,
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
@@ -3360,6 +3363,21 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
+                            // Declared window field (`project_struct_field_type`
+                            // `&[u8]` → `dyn_fat_window_annotation`): store
+                            // `{data, len}` even when `window_operand` did not
+                            // classify the value. A whole-field CCHARP setattr
+                            // unions `Ptr(Array)` onto the Tuple the field
+                            // already carries (`ClassDef.generalize_attr`).
+                            if field_is_window {
+                                let src_ty = operand_tyref(&op).map(clone_tyref);
+                                let var = self.resolve_operand(mir_bb, op)?;
+                                let (ptr, len) =
+                                    self.owner_to_window(mir_bb, var, src_ty.as_ref())?;
+                                arg_vars.push(self.ensure_window_ccharp(mir_bb, ptr));
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
                             arg_vars.push(self.resolve_operand(mir_bb, op)?);
                             pair_lens.push(None);
                         }
@@ -3902,6 +3920,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     self.immutable_fields,
+                    &self.raw_alloc_flavor_structs,
                 );
                 let recast_tagged_sum =
                     crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
@@ -4369,6 +4388,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.gc_struct_ids,
                         self.immutable_fields,
+                        &self.raw_alloc_flavor_structs,
                     );
                     if let Some(raw) =
                         raw_field_address_value_type(&place.ty, &place.ty, owner_gc, self.llbc)
@@ -4896,8 +4916,7 @@ impl<'a> Lowering<'a> {
             ));
         }
         // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`). Split on
-        // the source pointee's gckind (`ptr_pointee_is_gc`, same
-        // predicate as `is_raw_ptr_is_null_keeps_is_none`):
+        // the source pointee's gckind (`ptr_pointee_is_gc`):
         // GC → `annlowlevel.py` `cast_instance_to_gcref` /
         // `lltype.py` `cast_opaque_ptr`; raw → `rffi.py` `cast` /
         // `lltype.py` `force_cast`. Run before the `Ref` gate so a
@@ -6758,6 +6777,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.gc_struct_ids,
                         self.immutable_fields,
+                        &self.raw_alloc_flavor_structs,
                     );
                     // Captured before `resolve_place` moves `inner`. A
                     // by-value `String` attr of a marked exception class
@@ -7727,16 +7747,25 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 // A `FnPtrCell<F>` static (`global_hook!`) or a
-                // `OnceLock<F>` static whose `F` is a bare fn pointer
-                // (`oncelock_fn_static!`) is a prebuilt constant
-                // (`bookkeeper.immutablevalue` of a module-level object).
+                // `OnceLock<T>` static (`oncelock_fn_static!`,
+                // `define_prebuilt_dict_strategy_ref`) is a prebuilt
+                // constant (`bookkeeper.py Bookkeeper.immutablevalue`).
                 // The cell is not a class instance: wrapping it in
                 // `__cast_instance_intrinsic` would mint
-                // `SomeInstance(...)` and drop the subsequent `get`
-                // load of `Option<Ptr(FuncType)>`. Emit the bare
-                // `ConstRefAddr`, keyed on the GlobalDecl's type.
+                // `SomeInstance(OnceLock)` and drop the subsequent
+                // `get` / `get_or_init`. `OnceLock<fn>::get` is a load
+                // of `Option<Ptr(FuncType)>`; `get_or_init` of a
+                // refs-keyed singleton is the registered object
+                // (`cache.py Cache.getorbuild` specialize:memo,
+                // `baseobjspace.py fromcache`).
+                // `refs_static_struct_root` already returns None for
+                // OnceLock; this lane must run before
+                // `tyref_class_root_with` re-wraps a harvested
+                // `std`/`core` Struct (`foreign_body_generic_struct`).
+                // Emit the bare `ConstRefAddr`, keyed on the
+                // GlobalDecl's type.
                 if (tyref_is_fnptrcell(&place_ty, self.llbc)
-                    || tyref_is_oncelock_fn(&place_ty, self.llbc))
+                    || tyref_is_oncelock(&place_ty, self.llbc))
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);

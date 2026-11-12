@@ -4243,9 +4243,15 @@ pub(in crate::front::mir) fn spelling_pair_field_kind(
     spelling: &str,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let spelling = spelling.trim();
+    // `PtrRepr.rtype_getattr` keeps declared `&` / `*const` wrappers, so a
+    // substituted `&[T]` field still spells the borrowed slice. Peel those
+    // constructors: no field holds an unsized `[T]` by value.
     let spelling = spelling
         .strip_prefix("*const ")
         .or_else(|| spelling.strip_prefix("*mut "))
+        .or_else(|| spelling.strip_prefix("&mut "))
+        .or_else(|| spelling.strip_prefix('&'))
+        .map(str::trim)
         .unwrap_or(spelling);
     if !(spelling.starts_with('[') && spelling.ends_with(']'))
         || shaped_array_parts(spelling).is_some()

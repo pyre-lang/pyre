@@ -2789,6 +2789,131 @@ fn cell_get_of_an_opaque_cell_without_a_field_place_stays_a_call() {
     );
 }
 
+#[test]
+fn cell_get_through_raw_struct_pointer_reads_the_field_value() {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let adt = |id| {
+        serde_json::json!({"Adt": {
+            "id": id, "builtin": null, "generics": window_empty_generics()
+        }})
+    };
+    let owner = adt(0);
+    let mut cell = adt(1);
+    cell["Adt"]["generics"]["types"] = serde_json::json!([bool_ty.clone()]);
+    let type_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let mut unsafe_cell = adt(2);
+    unsafe_cell["Adt"]["generics"]["types"] = serde_json::json!([type_var.clone()]);
+    let ptr = serde_json::json!({"RawPtr": [owner.clone(), "Shared"]});
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell.clone(), "Shared"]});
+    let family = serde_json::json!({
+        "def_id": 0, "item_meta": window_meta(&["fixture", "CellFamily"], true),
+        "kind": {"Struct": [
+            {"name": "ever_mutated", "ty": cell.clone(), "attr_info": null}
+        ]}
+    });
+    let cell_decl = serde_json::json!({
+        "def_id": 1, "item_meta": window_meta(&["core", "cell", "Cell"], false),
+        "kind": {"Struct": [{"name": "value", "ty": unsafe_cell.clone(), "attr_info": null}]},
+        "layout": [{"key": "fixture", "value": {"repr": {
+            "repr_algo": "Rust", "align_modif": null, "transparent": true
+        }, "variant_layouts": []}}]
+    });
+    let unsafe_cell_decl = serde_json::json!({
+        "def_id": 2, "item_meta": window_meta(&["core", "cell", "UnsafeCell"], false),
+        "kind": {"Struct": [{"name": "value", "ty": type_var.clone(), "attr_info": null}]},
+        "layout": [{"key": "fixture", "value": {"repr": {
+            "repr_algo": "Rust", "align_modif": null, "transparent": true
+        }, "variant_layouts": []}}]
+    });
+    let mut generic_cell = adt(1);
+    generic_cell["Adt"]["generics"]["types"] = serde_json::json!([type_var.clone()]);
+    let generic_cell_ref = serde_json::json!({"Ref": ["Erased", generic_cell.clone(), "Shared"]});
+    let mut get = window_opaque_fun(
+        1,
+        &["core", "cell", "get"],
+        vec![generic_cell_ref],
+        type_var,
+    );
+    get["item_meta"]["name"] = serde_json::json!([
+        {"Ident": ["core", 0]}, {"Ident": ["cell", 0]},
+        {"Impl": {"Ty": {"params": {
+            "regions": [], "types": [{"index": 0, "name": "T", "variance": "Unknown"}],
+            "const_generics": [], "trait_clauses": [], "regions_outlive": [],
+            "types_outlive": [], "trait_type_constraints": []
+        }, "skip_binder": {"Value": [900, generic_cell]}, "kind": "InherentImplBlock"}}},
+        {"Ident": ["get", 0]}
+    ]);
+    get["src"] = serde_json::json!("Normal");
+    let place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &ptr), "Deref"
+            ]}), &owner), {"Field": [null, 0]}
+        ]}),
+        &cell,
+    );
+    let f = serde_json::json!({
+        "def_id": 0, "item_meta": window_meta(&["fixture", "w_cell_get"], true),
+        "signature": {"is_unsafe": true, "inputs": [ptr.clone()], "output": bool_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty), window_local(1, &ptr), window_local(2, &cell_ref)
+            ]},
+            "body": [{
+                "statements": [{"span": window_span(), "kind": {"Assign": [
+                    window_place(serde_json::json!({"Local": 2}), &cell_ref),
+                    {"Ref": {"place": place, "kind": "Shared", "ptr_metadata": null}}
+                ]}}], "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": {
+                            "regions": [], "types": [bool_ty.clone()], "const_generics": [], "trait_refs": []
+                        }}},
+                        "args": [{"Move": window_place(serde_json::json!({"Local": 2}), &cell_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 0}), &bool_ty), "target": 1, "on_unwind": 2
+                }}}
+            }, {"statements": [], "kind": "Regular", "terminator": {
+                "span": window_span(), "kind": "Return"
+            }}, {"statements": [], "kind": "Cleanup", "terminator": {
+                "span": window_span(), "kind": "UnwindResume"
+            }}]
+        }}
+    });
+    let llbc = window_llbc(vec![family, cell_decl, unsafe_cell_decl], vec![f, get]);
+    assert_eq!(
+        super::impl_method_owner_for_fundecl(&llbc, llbc.fn_by_id(1).unwrap()),
+        Some(("cell::Cell".to_string(), "get".to_string()))
+    );
+    let graph = crate::test_support::lower_function(&llbc, "w_cell_get").unwrap();
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    assert!(
+        ops.iter().any(|op| matches!(&op.kind,
+            OpKind::FieldRead { field, ty: ValueType::Bool, .. }
+                if field.name == "ever_mutated" && !field.taken_by_address
+        )),
+        "{}",
+        graph.dump()
+    );
+    let is_get_call = |op: &crate::model::SpaceOperation| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|name| name == "get"),
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == "get",
+        _ => false,
+    };
+    assert!(
+        !ops.iter()
+            .any(|op| is_get_call(op) || matches!(&op.kind, OpKind::RawLoad { .. })),
+        "{}",
+        graph.dump()
+    );
+}
+
 /// `live_rbigint` clones `&RBigInt` and passes the by-value result to
 /// `RBigIntGcRoot::new`. The clone's destination is the `RBigInt` ADT,
 /// which `tyref_to_value_type` paints `Ref(None)`. Without the
@@ -11045,6 +11170,77 @@ fn option_niche_null_cast_shared_u8_slice_is_window() {
                 if r == root && (root == "[u8]" || root.starts_with("Slice<"))
         ),
         "Option<&mut [u8]> None is convert_const(None) on ListRepr, got {:?}",
+        lowering.option_niche_null_cast(&option_mut)
+    );
+}
+
+/// `None` of pointer-niche `Option<&mut RawStruct>` is the null int-bank
+/// `SomePtr` (`tyref_niche_option_payload_paint` /
+/// `raw_struct_ptr_annotation`). Painting `Ref` left `Result::ok` to
+/// union Instance with the Ok `Int`.
+#[test]
+fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
+    use crate::model::ValueType;
+
+    let mut raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    raw["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 4,
+            "align": 4,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let option_mut = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]}),
+    ));
+    assert!(
+        matches!(
+            lowering.option_niche_null_cast(&option_mut),
+            Some((_, ValueType::Int))
+        ),
+        "Option<&mut RawStruct> None is the null SomePtr int word, got {:?}",
         lowering.option_niche_null_cast(&option_mut)
     );
 }

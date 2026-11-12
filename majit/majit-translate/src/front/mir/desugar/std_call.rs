@@ -2889,13 +2889,10 @@ impl<'a> Lowering<'a> {
         &self,
         reg: &RegularCall,
         dest_ty: &TyRef,
+        first_arg_ty: Option<&TyRef>,
     ) -> Option<String> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let fd = self.llbc.fn_by_id(*id)?;
-        let np = fd.item_meta.name_path();
-        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+        let fd = deref_callee_fun_decl(reg, first_arg_ty, self.llbc)?;
+        if !is_deref_fundecl(fd, self.llbc) {
             return None;
         }
         // The body is the impl.  A one-word reinterpret would skip it.
@@ -2991,18 +2988,25 @@ impl<'a> Lowering<'a> {
     /// destination to the argument instead, the same alias shape as the
     /// blanket-`into` identity above.
     pub(in crate::front::mir) fn is_container_identity_deref(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        self.is_container_identity_deref_for(reg, None, None)
+    }
+
+    /// [`Self::is_container_identity_deref`] with a known receiver and
+    /// dest, so a Trait `Box<[T]>::deref` whose dest is a slice aliases.
+    pub(in crate::front::mir) fn is_container_identity_deref_for(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: Option<&TyRef>,
+    ) -> bool {
+        let Some(fd) = deref_callee_fun_decl(reg, first_arg_ty, self.llbc) else {
             return false;
         };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let np = fd.item_meta.name_path();
-        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+        if !is_deref_fundecl(fd, self.llbc) {
             return false;
         }
         deref_impl_owner_leaf(self.llbc, fd)
-            .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
+            .is_some_and(|leaf| container_identity_deref_owner(&leaf, dest_ty, self.llbc))
     }
 
     /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
@@ -3472,8 +3476,14 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Window → STR copy (`rffi.py` `charpsize2str`,
-    /// `majit_rlib::rffi::buffer::charpsize2str`).
+    /// Window → STR copy (`rffi.py` `charpsize2str`).
+    ///
+    /// Upstream is `mallocfn(size)` (`rstr.py` `mallocstr`) plus
+    /// `copy_raw_to_string(cp, ll_str, 0, size)` plus `hlstrtype(ll_str)`.
+    /// The dest is rstr `STR`. The interned
+    /// `majit_rlib::rffi::buffer::charpsize2str` graph returns
+    /// `Result<Vec<u8>, MemoryError>` and is the list form
+    /// ([`Self::emit_charpsize2str_list`]), not this copy.
     pub(in crate::front::mir) fn emit_charpsize2str(
         &mut self,
         mir_bb: usize,
@@ -3496,12 +3506,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(header.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path([
-                    "majit_rlib",
-                    "rffi",
-                    "buffer",
-                    "charpsize2str",
-                ]),
+                target: CallTarget::function_path([crate::front::join_chars::LL_CHARPSIZE2STR]),
                 args: crate::model::call_args(vec![ptr, len]),
                 result_ty: ValueType::Str,
             },
@@ -7293,33 +7298,106 @@ impl<'a> Lowering<'a> {
     /// the `Impl` segment sits between them.  Mutability does not change
     /// the null test.
     ///
-    /// Spelling is chosen from the pointee's declared gckind:
-    /// - Raw (non-GC) or `llmemory.Address`-like: `eq(bool(p), Constant(False))`
-    ///   (`llannotation.py` `SomePtr.bool`, `rptr.py` `PtrRepr.rtype_bool`
-    ///   → `ptr_nonzero`, `raddress.py` `AddressRepr.rtype_bool` → `adr_ne`).
-    ///   Flowspace has no `not_` op (`from_opname("not_")` is None);
-    ///   `operator.not_` is `bool` plus inversion.
-    /// - GC string (`is_str_family_class_root`) or GC instance
-    ///   (`registered_gc_ptr_class_root_with`): `is_(p, Constant(None))`
-    ///   (`rnone.py` `rtype_is_None` → `ptr_iszero`).
+    /// Spelling follows intern of the pointer, not layout gckind alone:
+    /// - SomePtr (word-storage ADT, flavor-raw, Address, GCREF, scalar):
+    ///   `eq(bool(p), Constant(False))` (`llannotation.py` `SomePtr.bool`,
+    ///   `rptr.py` `PtrRepr.rtype_bool` → `ptr_nonzero`, `raddress.py`
+    ///   `AddressRepr.rtype_bool` → `adr_ne`). `SomePtr.can_be_none` is
+    ///   False, so `is_(p, None)` would fold. Flowspace has no `not_` op
+    ///   (`from_opname("not_")` is None); `operator.not_` is `bool` plus
+    ///   inversion.
+    /// - SomeInstance / SomeString (GC string, registered GC instance, or
+    ///   classed T that is not word-storage): `is_(p, Constant(None))`
+    ///   (`rnone.py` `rtype_is_None` → `ptr_iszero`). Classed T stays
+    ///   `InstanceRepr` even when layout gckind is not GC (`rclass.py`
+    ///   `getgcflavor`); a type object is this case
+    ///   (`raw_struct_ptr_from_layout`).
     pub(in crate::front::mir) fn is_raw_ptr_is_null(&self, reg: &RegularCall) -> bool {
         self.is_raw_ptr_method(reg, "is_null")
     }
 
-    /// Keep `is_(p, None)` when the pointee is a GC string or a registered
-    /// GC instance. Every other pointee (declared-raw ADT, Address-like,
-    /// GCREF, scalar) uses `eq(bool(p), False)`.
+    /// Keep `is_(p, None)` when intern of the pointer is a nullable
+    /// `SomeInstance` / `SomeString`. `rnone.py` `rtype_is_None` then
+    /// emits `ptr_iszero`, which `optimize_goto_if_not` fuses to
+    /// `goto_if_not_ptr_iszero`.
+    ///
+    /// Intern of a raw pointer:
+    /// - GC string / registered GC instance: SomeString / SomeInstance
+    ///   ([`Self::ptr_pointee_is_gc`]).
+    /// - Classed T ([`tyref_raw_ptr_to_classed_instance_spelling`]) that
+    ///   is not a word-storage ADT: SomeInstance (`rclass.py`
+    ///   `getgcflavor` / `InstanceRepr`). A type object is this case.
+    /// - Word-storage ADT ([`adt_def_is_raw_storage`] /
+    ///   `note_raw_word_owner`), flavor-raw (`getgcflavor` `'raw'`),
+    ///   Address, GCREF, scalar: SomePtr (`llannotation.py`
+    ///   `lltype_to_annotation`). `SomePtr.can_be_none` is False so
+    ///   `is_` would fold; spelling stays `eq(bool(p), False)`
+    ///   (`SomePtr.bool` / `PtrRepr.rtype_bool`).
     pub(in crate::front::mir) fn is_raw_ptr_is_null_keeps_is_none(
         &self,
         ptr_ty: Option<&TyRef>,
     ) -> bool {
-        self.ptr_pointee_is_gc(ptr_ty)
+        if self.ptr_pointee_is_gc(ptr_ty) {
+            return true;
+        }
+        let Some(ty) = ptr_ty else {
+            return false;
+        };
+        if flavor_raw_pointer_class_root(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
+            return false;
+        }
+        if tyref_raw_ptr_to_classed_instance_spelling(ty, self.llbc).is_none() {
+            return false;
+        }
+        !self.raw_ptr_pointee_is_word_storage(ty)
+    }
+
+    /// Word-storage ADT pointee (`note_raw_word_owner` /
+    /// `adt_def_is_raw_storage`). Harvested `raw_word_owners` is that
+    /// set; a unit-test lowering has no harvest and asks the
+    /// declaration.
+    fn raw_ptr_pointee_is_word_storage(&self, ty: &TyRef) -> bool {
+        let Some(node) =
+            tyref_node(ty, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))
+        else {
+            return false;
+        };
+        let Some(pointee) = one_level_pointer_pointee(node, self.llbc) else {
+            return false;
+        };
+        let Some(pointee) = strip_ty_wrappers(pointee, self.llbc) else {
+            return false;
+        };
+        if let Some(root) = adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves)
+            && let Some(reg) = self.struct_fields
+            && !reg.raw_word_owners.is_empty()
+        {
+            return reg.raw_word_owner_contains(&root);
+        }
+        let Some(def_id) = adt_node_def_id(pointee) else {
+            return false;
+        };
+        let mut stack = Vec::new();
+        adt_def_is_raw_storage(
+            def_id,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &mut stack,
+        )
     }
 
     /// A Rust pointer's gckind is the pointee type's declaration: T is GC
     /// iff T implements `GcType` or is a first-field ancestor of one
-    /// (`PyObject`). Same predicate as
-    /// [`Self::is_raw_ptr_is_null_keeps_is_none`].
+    /// (`PyObject`). Dest-GCREF splits on this; [`Self::is_raw_ptr_is_null_keeps_is_none`]
+    /// is a superset that also keeps `is_(p, None)` for classed T.
     pub(in crate::front::mir) fn ptr_pointee_is_gc(&self, ptr_ty: Option<&TyRef>) -> bool {
         let Some(ty) = ptr_ty else {
             return false;
@@ -7329,8 +7407,13 @@ impl<'a> Lowering<'a> {
         {
             return true;
         }
-        if container_declared_gc(ty, self.llbc, self.gc_struct_ids, self.immutable_fields)
-            == Some(false)
+        if container_declared_gc(
+            ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
+        ) == Some(false)
         {
             return false;
         }

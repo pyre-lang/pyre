@@ -1,15 +1,18 @@
 use super::{
-    adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
+    charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
+    is_niche_option_gc_payload_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
+    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
+    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
     tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
     tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
-    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+    tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
+    tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -101,74 +104,192 @@ fn raw_ptr_to_str_family_spelling_is_the_star_prefix() {
     ));
 }
 
+fn classed_raw_ptr_llbc() -> Llbc {
+    let mut opaque = type_decl_struct(5, &["ffi_raw", "NativeSession"], vec![]);
+    opaque["kind"] = serde_json::json!("Opaque");
+    llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            type_decl_alias(1, &["pyre_object", "pyobject", "PyObjectRef"], {
+                serde_json::json!({"RawPtr": [adt_node(0), "Mut"]})
+            }),
+            type_decl_struct(
+                2,
+                &["foo", "bar_state"],
+                vec![serde_json::json!({
+                    "name": "sess",
+                    "ty": {"RawPtr": [adt_node(5), "Mut"]},
+                    "attr_info": null
+                })],
+            ),
+            type_decl_struct(3, &["pyre_object", "unicodeobject", "Utf8Str"], vec![]),
+            type_decl_struct(4, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            opaque,
+        ],
+        vec![],
+    )
+}
+
 #[test]
-fn raw_ptr_to_classed_instance_spelling_is_the_star_prefix() {
-    assert!(is_raw_ptr_to_classed_instance_spelling(
-        "*mut pyobject::PyObject"
+fn raw_ptr_to_classed_instance_uses_the_pointee_declaration() {
+    let llbc = classed_raw_ptr_llbc();
+    let spelling = |ty: &TyRef| tyref_raw_ptr_to_classed_instance_spelling(ty, &llbc);
+    let object = spelling(&TyRef::Other(raw_mut_adt(0)));
+    assert!(
+        object
+            .as_deref()
+            .is_some_and(|s| s.starts_with("*mut ") && s.contains("PyObject")),
+        "declared *mut PyObject is classed, got {object:?}"
+    );
+    let alias = spelling(&TyRef::Other(adt_node(1)));
+    assert!(
+        alias.as_deref().is_some_and(|s| s.starts_with("*mut ")
+            && s.contains("PyObject")
+            && !s.contains("PyObjectRef")),
+        "PyObjectRef alias peels to the pointer spelling, got {alias:?}"
+    );
+    let const_object = spelling(&TyRef::Other(serde_json::json!({
+        "RawPtr": [adt_node(0), "Shared"]
+    })));
+    assert!(
+        const_object
+            .as_deref()
+            .is_some_and(|s| s.starts_with("*const ") && s.contains("PyObject")),
+        "declared *const PyObject is classed, got {const_object:?}"
+    );
+    let lower = spelling(&TyRef::Other(raw_mut_adt(2)));
+    assert!(
+        lower
+            .as_deref()
+            .is_some_and(|s| s.starts_with("*mut ") && s.contains("bar_state")),
+        "lowercase declared struct is classed, got {lower:?}"
+    );
+    let opaque = spelling(&TyRef::Other(raw_mut_adt(5)));
+    assert!(
+        opaque
+            .as_deref()
+            .is_some_and(|s| s.starts_with("*mut ") && s.contains("NativeSession")),
+        "declared Opaque pointee is classed, got {opaque:?}"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(raw_mut_adt(99))),
+        None,
+        "*mut SomeUndeclared (uppercase, no TypeDecl) is not classed"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(adt_node(0))),
+        None,
+        "owned PyObject is not a raw pointer"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(option_shared_ref(adt_node(0)))),
+        None,
+        "&PyObject is not a raw pointer"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(raw_mut_adt(3))),
+        None,
+        "str-family pointee is not a classed instance"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(raw_mut_adt(4))),
+        None,
+        "GCREFOpaque pointee is not a classed instance"
+    );
+    assert_eq!(
+        spelling(&TyRef::Other(mut_u8_ty_json())),
+        None,
+        "*mut u8 is not a classed instance"
+    );
+    assert!(raw_ptr_pointee_is_non_adt_spelling("*mut u8", "u8"));
+    assert!(raw_ptr_pointee_is_non_adt_spelling(
+        "*mut GCREFOpaque",
+        "GCREFOpaque"
     ));
-    assert!(is_raw_ptr_to_classed_instance_spelling(
-        "*const pyobject::PyObject"
+    assert!(raw_ptr_pointee_is_non_adt_spelling(
+        "*mut unicodeobject::Utf8Str",
+        "unicodeobject::Utf8Str"
     ));
-    assert!(is_raw_ptr_to_classed_instance_spelling("PyObjectRef"));
-    assert!(is_raw_ptr_to_classed_instance_spelling(
-        "pyre_object::PyObjectRef"
-    ));
-    assert!(!is_raw_ptr_to_classed_instance_spelling(
-        "pyobject::PyObject"
-    ));
-    assert!(!is_raw_ptr_to_classed_instance_spelling(
-        "&pyobject::PyObject"
-    ));
-    assert!(!is_raw_ptr_to_classed_instance_spelling(
-        "*mut unicodeobject::Utf8Str"
-    ));
-    assert!(!is_raw_ptr_to_classed_instance_spelling("*mut u8"));
-    assert!(!is_raw_ptr_to_classed_instance_spelling("*mut GCREFOpaque"));
+}
+
+#[test]
+fn derive_program_metadata_harvests_opaque_adt_as_declared_layout_identity() {
+    let llbc = classed_raw_ptr_llbc();
+    let (_, _, fields, _, _, _, _, ids) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    assert!(
+        ids.get("ffi_raw::NativeSession")
+            .and_then(|slot| slot.as_ref())
+            .is_some(),
+        "Opaque TypeDecl must receive a StructId (lltype.py Struct._first_struct)"
+    );
+    assert!(
+        fields.fields.get("ffi_raw::NativeSession").is_some(),
+        "Opaque TypeDecl must have a harvested field row"
+    );
+    assert!(
+        ids.get("foo::bar_state")
+            .and_then(|slot| slot.as_ref())
+            .is_some(),
+        "lowercase declared struct still has a StructId"
+    );
+    assert!(
+        ids.get("SomeUndeclared").is_none(),
+        "undeclared uppercase name has no layout identity"
+    );
 }
 
 #[test]
 fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&pyobject::PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<*mut pyobject::PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "option::Option<string::String>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<*mut unicodeobject::Utf8Str>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&W_BufferedReader>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<NonNull<W_BufferedReader>>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<pyobject::PyObject>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<W_BufferedReader>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling("pyobject::PyObject"));
-    assert!(!is_niche_option_gc_payload_spelling("string::String"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<fn()>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<i64>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<*mut u8>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<&[u8]>"));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<*mut GCREFOpaque>"
-    ));
-    // `&PyObjectRef` is `*mut PyObject`; the payload pretty-print is
-    // `&*mut PyObject`. Peel the shared borrow, then the raw GC pointer.
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&*mut PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&*mut pyobject::PyObject>"
-    ));
+    let intern_none = |s: &str| is_niche_option_gc_payload_spelling(s, None);
+    assert!(intern_none("option::Option<string::String>"));
+    assert!(intern_none("Option<*mut unicodeobject::Utf8Str>"));
+    assert!(!intern_none("Option<pyobject::PyObject>"));
+    assert!(!intern_none("Option<W_BufferedReader>"));
+    assert!(!intern_none("pyobject::PyObject"));
+    assert!(!intern_none("string::String"));
+    assert!(!intern_none("Option<fn()>"));
+    assert!(!intern_none("Option<i64>"));
+    assert!(!intern_none("Option<*mut u8>"));
+    assert!(!intern_none("Option<&[u8]>"));
+    assert!(!intern_none("Option<*mut GCREFOpaque>"));
+    // Uppercase / `::` spelling is not GC without a harvested layout.
+    assert!(!intern_none("Option<&pyobject::PyObject>"));
+    assert!(!intern_none("Option<*mut pyobject::PyObject>"));
+    assert!(!intern_none("Option<&W_BufferedReader>"));
+    assert!(!intern_none("Option<NonNull<W_BufferedReader>>"));
+    assert!(!intern_none("Option<&*mut PyObject>"));
+    assert!(!intern_none("Option<*mut SomeUndeclared>"));
+
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+        "pyobject::PyObject",
+        "PyObject",
+        "W_BufferedReader",
+        "SomeUndeclared",
+    ]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
+    assert!(intern("Option<&pyobject::PyObject>"));
+    assert!(intern("Option<*mut pyobject::PyObject>"));
+    assert!(intern("Option<&W_BufferedReader>"));
+    assert!(intern("Option<NonNull<W_BufferedReader>>"));
+    assert!(intern("Option<&*mut PyObject>"));
+    assert!(intern("Option<&*mut pyobject::PyObject>"));
+    assert!(intern("Option<*mut PyObject>"));
+    // Stamp peels `type PyObjectRef = *mut PyObject` via
+    // `type_node_peel_aliases`; intern has the class-root spelling, not
+    // the TypeDecl, so an unresolved alias leaf is not GC.
+    assert!(!intern("Option<PyObjectRef>"));
+    assert!(!intern("Option<&PyObjectRef>"));
+    assert!(intern("Option<*mut SomeUndeclared>"));
+    assert!(!intern("Option<pyobject::PyObject>"));
+    assert!(!intern("Option<W_BufferedReader>"));
+    assert!(!intern("Option<*mut u8>"));
 }
 
 /// `node_is_string_value` identifies the rstr `STR` layout set by
@@ -317,6 +438,132 @@ fn node_is_string_value_uses_declaration_identity() {
     ));
 }
 
+/// rstr `STR` pointee (`Utf8Str`) is GC (`TO._gckind == 'gc'`) even
+/// without a `GcType` seed. A raw struct cannot hold that pointer
+/// (`adt_def_is_raw_storage`).
+#[test]
+fn utf8str_pointee_is_not_a_raw_word() {
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let llbc = window_llbc(vec![utf8], vec![]);
+    let node = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let gc = std::collections::HashSet::new();
+    assert!(
+        !super::pointee_is_raw_word(&node, &llbc, &gc),
+        "Utf8Str pointee is rstr STR, not a raw word"
+    );
+}
+
+/// A `dont_look_inside` residual of `*mut Utf8Str` is nullable even when
+/// Utf8Str has no `GcType` impl. `registered_gc_ptr_class_root_with` is
+/// the gckind answer and stays None; nullability follows the raw
+/// pointer (`model.py` `SomeString.noneify`). `binaryop.py`
+/// `is__default` must not fold `is_(ret, None)`. A by-value / `&`
+/// string stays non-nullable. rstr `STR` is still a GC pointee
+/// (`is_rstr_str_family_spelling` / `pointee_is_raw_word`).
+#[test]
+fn dont_look_inside_return_raw_str_ptr_is_nullable() {
+    use crate::annotator::binaryop::is__default;
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::{SomeValue, s_none};
+    use crate::flowspace::model::{Hlvalue, Variable};
+    use crate::flowspace::operation::{HLOperation, OpKind};
+
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let llbc = window_llbc(vec![utf8], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert!(
+        gc.is_empty(),
+        "Utf8Str has no GcType impl; gc_struct_ids must stay empty"
+    );
+    let empty = std::collections::HashSet::<String>::new();
+    let spec = crate::ErrorCarrierSpec::default();
+    let adt = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    }));
+    let raw = TyRef::Other(serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        }, "Mut"]
+    }));
+    let shared = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", {
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        }, "Shared"]
+    }));
+
+    assert!(super::dont_look_inside_return_is_str(&raw, &llbc, spec));
+    assert!(super::dont_look_inside_return_can_be_none(
+        &raw, &llbc, spec, &gc, &empty
+    ));
+    assert!(super::dont_look_inside_return_is_str(&adt, &llbc, spec));
+    assert!(!super::dont_look_inside_return_can_be_none(
+        &adt, &llbc, spec, &gc, &empty
+    ));
+    assert!(super::dont_look_inside_return_is_str(&shared, &llbc, spec));
+    assert!(!super::dont_look_inside_return_can_be_none(
+        &shared, &llbc, spec, &gc, &empty
+    ));
+
+    let intern = |can_be_none: bool| {
+        let s = crate::codewriter::annotation_state::valuetype_to_someshell(&ValueType::Str)
+            .expect("Str shells as SomeString");
+        if can_be_none {
+            Bookkeeper::nullable_raw_ptr_annotation(s)
+        } else {
+            s
+        }
+    };
+    let is_none_of = |s: SomeValue| {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let mut ret = Variable::named("ret");
+        let mut n = Variable::named("n");
+        ann.setbinding(&mut ret, s);
+        ann.setbinding(&mut n, s_none());
+        is__default(
+            &ann,
+            &HLOperation::new(
+                OpKind::Is,
+                vec![Hlvalue::Variable(ret), Hlvalue::Variable(n)],
+            ),
+        )
+    };
+
+    let SomeValue::String(s) = intern(true) else {
+        panic!("raw *mut Utf8Str intern is SomeString");
+    };
+    assert!(
+        s.inner.can_be_none,
+        "raw *mut Utf8Str intern is SomeString(can_be_none=true) (SomeString.noneify)"
+    );
+    assert!(
+        is_none_of(SomeValue::String(s)).const_().is_none(),
+        "is_(nullable SomeString, None) must not fold (is__default)"
+    );
+
+    let SomeValue::String(by_value) = intern(false) else {
+        panic!("by-value / & string intern is SomeString");
+    };
+    assert!(
+        !by_value.inner.can_be_none,
+        "by-value / & string intern stays SomeString(can_be_none=false)"
+    );
+    assert_eq!(
+        is_none_of(SomeValue::String(by_value)).const_(),
+        Some(&crate::flowspace::model::ConstValue::Bool(false)),
+        "is_(non-nullable SomeString, None) folds to False (is__default)"
+    );
+}
+
 fn family_ptr_newtype_llbc(
     inner_path: &[&str],
     wrapper_path: &[&str],
@@ -447,6 +694,26 @@ fn pointer_newtype_llbc(
             "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
             "kind": {"Struct": []}
         }));
+        // `*mut Obj` is a GC instance pointer only when Obj is in
+        // `gc_struct_ids` (`GcType` / first-field ancestor). A Vec field
+        // is not that declaration.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": [wrap, unwrap],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": window_meta(&["majit_gc", "header", "GcType"], false)
+                }],
+                "trait_impls": [gctype_impl_for_adt(0)]
+            }
+        });
+        return Llbc::from_slice(file.to_string().as_bytes())
+            .expect("gc object pointer newtype fixture parses");
     }
     window_llbc(types, vec![wrap, unwrap])
 }
@@ -3967,6 +4234,507 @@ fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
     );
 }
 
+/// CAST intern suffixes keep `&T` / `&mut T` (`charon_type_value_to_enum_arg`).
+/// Class-root lookup still strips the referent (`charon_type_value_to_ast_string`).
+/// Stripping the CAST suffix made `Option<&T>` intern as the tagged
+/// `Option<T>` class (`model.py` `SomeObject.noneify`).
+#[test]
+fn charon_ref_renders_ampersand_prefix() {
+    let llbc = empty_llbc();
+    let tomb = no_tombstoned_leaves();
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let shared = serde_json::json!({"Ref": ["Erased", i64_ty.clone(), "Shared"]});
+    let mutable = serde_json::json!({"Ref": ["Erased", i64_ty, "Mut"]});
+    assert_eq!(
+        charon_type_value_to_enum_arg(&shared, &llbc, 0, &tomb),
+        "&i64"
+    );
+    assert_eq!(
+        charon_type_value_to_enum_arg(&mutable, &llbc, 0, &tomb),
+        "&mut i64"
+    );
+    assert_eq!(charon_type_value_to_ast_string(&shared, &llbc, 0), "i64");
+    assert_eq!(charon_type_value_to_ast_string(&mutable, &llbc, 0), "i64");
+}
+
+/// Dest intern KEY of a generic ADT keeps `&` only when the referent is
+/// raw storage (`adt_def_is_raw_storage`). `Option<&Raw>` is then not
+/// the tagged `Option<Raw>` class (`model.py` `SomeObject.noneify`),
+/// and not `Option<i64>`. A scalar `&i64` is the integer itself, so
+/// the prefix is erased. Top-level `&T` still strips.
+#[test]
+fn option_of_ref_to_raw_storage_keeps_ampersand() {
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let opt_ref_raw = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let opt_raw = option_adt_node(0, adt_node(1));
+    let opt_ref_i64 = option_adt_node(0, option_shared_ref(i64_ty.clone()));
+    let opt_i64 = option_adt_node(0, i64_ty.clone());
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_ref_raw), &llbc),
+        "Option<&RawCell>",
+        "dest intern KEY of Option<&Raw> keeps &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_raw), &llbc),
+        "Option<RawCell>",
+        "by-value Option<Raw> is the tagged class"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_ref_i64), &llbc),
+        "Option<i64>",
+        "dest intern KEY of Option<&i64> erases scalar &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_i64), &llbc),
+        "Option<i64>",
+        "Option<i64> dest intern KEY is the tagged integer Option"
+    );
+    assert_eq!(
+        charon_type_value_to_ast_string(&option_shared_ref(i64_ty), &llbc, 0),
+        "i64",
+        "top-level &T still strips for class-root lookup"
+    );
+}
+
+/// Variant payload `&mut Raw` is the interior pointer word
+/// (`history.getkind` of `Ptr` when `TO._gckind == raw`). Parameter dest
+/// overlay of the same borrow stays `Ref` (`ty_is_raw_address` /
+/// `RootScope::get`).
+#[test]
+fn enum_payload_of_ref_to_raw_storage_is_int() {
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = no_tombstoned_leaves();
+    let flavors = std::collections::HashSet::<String>::new();
+    let mut_ref = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", adt_node(1), "Mut"]
+    }));
+    assert_eq!(
+        tyref_to_value_type(&mut_ref, &llbc),
+        ValueType::Ref(None),
+        "a borrowed raw struct parameter stays a reference"
+    );
+    assert_eq!(
+        tyref_enum_payload_value_type(&mut_ref, &llbc, tomb, &gc, &flavors),
+        ValueType::Int,
+        "Result Ok / Option Some of &mut Raw is the interior pointer word"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &mut_ref, &mut_ref, true, false, None, &llbc, tomb, &gc, &flavors
+        ),
+        ValueType::Int,
+        "enum payload FieldRead of &mut Raw follows intern ROW Int"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &mut_ref, &mut_ref, false, true, None, &llbc, tomb, &gc, &flavors
+        ),
+        ValueType::Int,
+        "closure-env capture of &mut Raw is the interior pointer word"
+    );
+}
+
+/// Closure-argument tuple of `&Raw` keeps `&` so `and_then` write and
+/// `call_once` read share `Tuple<&RawCell>` (`render_adt_type_args`).
+#[test]
+fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
+    let raw = struct_decl(
+        0,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![raw], vec![]);
+    let payload = TyRef::Other(option_shared_ref(adt_node(0)));
+    assert_eq!(
+        payload_tuple_suffix(&payload, &llbc),
+        "<&RawCell>",
+        "Tuple intern KEY of &Raw keeps &"
+    );
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let scalar = TyRef::Other(option_shared_ref(i64_ty));
+    assert_eq!(
+        payload_tuple_suffix(&scalar, &llbc),
+        "<i64>",
+        "Tuple intern KEY of &i64 erases scalar &"
+    );
+}
+
+/// Charon `monomorphize:false`: a field typed `Option<Raw>` is the
+/// Option template plus type args. The template (TypeVar payload) is
+/// not raw storage; the instantiation is, so the owner is too.
+#[test]
+fn option_instantiation_of_raw_payload_is_a_raw_word() {
+    let option = option_enum(0);
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner = struct_decl(
+        2,
+        ident_path(&["fixture", "OwnerBag"]),
+        serde_json::json!([{
+            "name": "cell",
+            "ty": option_adt_node(0, adt_node(1)),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option, raw, owner], vec![]);
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    assert!(
+        !adt_def_is_raw_storage(0, &llbc, &gc, immut, &mut Vec::new()),
+        "Option TypeDecl template (TypeVar payload) is not raw storage"
+    );
+    let inst = TyRef::Other(option_adt_node(0, adt_node(1)));
+    assert!(
+        field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<RawCell> instantiation is a raw word"
+    );
+    assert!(
+        adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<RawCell> is raw storage"
+    );
+}
+
+/// Scalar-only type args do not substitute: `Option<i64>` stays the
+/// TypeDecl template (TypeVar payload), so an owner of that field is
+/// not a raw-word owner (`getfield_gc` of the tagged Instance).
+#[test]
+fn option_instantiation_of_scalar_payload_is_not_a_raw_word() {
+    let option = option_enum(0);
+    let owner = struct_decl(
+        1,
+        ident_path(&["fixture", "OwnerBag"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": option_adt_node(0, serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option, owner], vec![]);
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    let inst = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+    ));
+    assert!(
+        !field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<i64> instantiation stays the tagged Instance intern"
+    );
+    assert!(
+        !adt_def_is_raw_storage(1, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<i64> is not raw storage"
+    );
+}
+
+/// `Atomic<T>` is Opaque; the stored word is `T` (`tyref_atomic_arg`).
+/// A scalar or a pointer to a storage-raw ADT is a raw word. A pointer
+/// to a classed instance is not (`rclass.py` `getgcflavor`; `lltype.py`
+/// `Struct.__init__` refuses a non-raw container inside a raw Struct;
+/// `quasiimmut.py` `QuasiImmut` is an ordinary instance).
+#[test]
+fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
+    fn atomic_of(atomic_id: u64, arg: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": atomic_id,
+                "generics": {
+                    "regions": [],
+                    "types": [arg],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+    let vec = vec_decl_json();
+    let atomic = opaque_type_decl(1, &["core", "sync", "atomic", "Atomic"]);
+    let classed = struct_decl(
+        2,
+        ident_path(&["fixture", "ClassedInst"]),
+        serde_json::json!([{
+            "name": "items",
+            "ty": vec_of(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let raw_cell = struct_decl(
+        3,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": i32_ty,
+            "attr_info": null
+        }]),
+        false,
+    );
+    let classed_ptr = serde_json::json!({"RawPtr": [adt_node(2), "Mut"]});
+    let raw_ptr = serde_json::json!({"RawPtr": [adt_node(3), "Mut"]});
+    let owner_of_classed = struct_decl(
+        4,
+        ident_path(&["fixture", "ClassedPtrOwner"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": atomic_of(1, classed_ptr.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_of_raw = struct_decl(
+        5,
+        ident_path(&["fixture", "RawPtrOwner"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": atomic_of(1, raw_ptr.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_of_scalar = struct_decl(
+        6,
+        ident_path(&["fixture", "ScalarAtomicOwner"]),
+        serde_json::json!([{
+            "name": "n",
+            "ty": atomic_of(1, u32_ty.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let view = struct_decl(
+        7,
+        ident_path(&["fixture", "AtomicPtrView"]),
+        serde_json::json!([
+            {
+                "name": "ptr",
+                "ty": option_shared_ref(atomic_of(1, classed_ptr.clone())),
+                "attr_info": null
+            },
+            {
+                "name": "lock",
+                "ty": option_shared_ref(atomic_of(1, classed_ptr.clone())),
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            vec,
+            atomic,
+            classed,
+            raw_cell,
+            owner_of_classed,
+            owner_of_raw,
+            owner_of_scalar,
+            view,
+        ],
+        vec![],
+    );
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    let raw = |ty: serde_json::Value| {
+        field_ty_is_raw_word(&TyRef::Other(ty), &llbc, &gc, immut, &mut Vec::new())
+    };
+    assert!(
+        raw(atomic_of(1, u32_ty)),
+        "Atomic<u32> stored word is the scalar"
+    );
+    assert!(
+        raw(atomic_of(1, raw_ptr)),
+        "Atomic<*mut RawCell> stored word is a C pointer"
+    );
+    assert!(
+        !raw(atomic_of(1, classed_ptr.clone())),
+        "Atomic<*mut ClassedInst> is a pointer to a classed instance"
+    );
+    assert!(
+        !raw(option_shared_ref(atomic_of(1, classed_ptr))),
+        "&Atomic<*mut ClassedInst> is the same stored word as the Atomic"
+    );
+    assert!(
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        "classed instance with a Vec field is not raw storage"
+    );
+    assert!(
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        "RawCell of one integer is raw storage"
+    );
+    assert!(
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of AtomicPtr to a classed instance is not a raw-word owner"
+    );
+    assert!(
+        adt_def_is_raw_storage(5, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of AtomicPtr to a storage-raw ADT is a raw-word owner"
+    );
+    assert!(
+        adt_def_is_raw_storage(6, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Atomic<u32> is a raw-word owner"
+    );
+    assert!(
+        !adt_def_is_raw_storage(7, &llbc, &gc, immut, &mut Vec::new()),
+        "borrowed view of AtomicPtr to a classed instance is not a raw-word owner"
+    );
+}
+
+/// Dest intern KEY of `Option<&TransparentWord>` erases `&` because the
+/// borrow is the integer word (`tyref_is_borrowed_transparent_scalar` /
+/// nested `repr(transparent)` wrap). A non-transparent one-integer
+/// tuple struct is still interior `Ptr(T)` and keeps `&`.
+#[test]
+fn option_of_ref_to_integer_word_erases_ampersand() {
+    let inner = struct_decl(
+        1,
+        ident_path(&["fixture", "InnerWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U16"}}},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let outer = struct_decl(
+        2,
+        ident_path(&["fixture", "OuterWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": adt_node(1),
+            "attr_info": null
+        }]),
+        true,
+    );
+    let raw_word = struct_decl(
+        3,
+        ident_path(&["fixture", "RawWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), inner, outer, raw_word],
+        vec![],
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(1)))),
+            &llbc
+        ),
+        "Option<InnerWord>",
+        "dest intern KEY of Option<&transparent u16 wrap> erases &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(1))), &llbc),
+        "Option<InnerWord>",
+        "by-value Option<transparent u16 wrap> is the integer Option"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(2)))),
+            &llbc
+        ),
+        "Option<OuterWord>",
+        "dest intern KEY of Option<&nested transparent wrap> erases &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(2))), &llbc),
+        "Option<OuterWord>",
+        "by-value Option<nested transparent wrap> is the integer Option"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(3)))),
+            &llbc
+        ),
+        "Option<&RawWord>",
+        "dest intern KEY of Option<&non-transparent integer tuple> keeps &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(3))), &llbc),
+        "Option<RawWord>",
+        "by-value Option<non-transparent integer tuple> is the tagged class"
+    );
+}
+
+/// `harvest_declared_gc_facts` walks a tuple-struct field0 through
+/// `field_is_zst` → `is_unit_type` → `charon_type_value_to_ast_string`.
+/// That spelling used to `get_or_init` `value_type_inputs` and deadlock
+/// on the same OnceLock (`orig_parse_format_link_args_are_defined`).
+#[test]
+fn render_adt_type_args_does_not_reenter_value_type_inputs() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let inner = struct_decl(
+        0,
+        ident_path(&["fixture", "InnerWrap"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": option_adt_node(1, i64_ty.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let option = option_enum(1);
+    let outer = struct_decl(
+        2,
+        ident_path(&["fixture", "OuterBag"]),
+        serde_json::json!([{
+            "name": "cell",
+            "ty": adt_node(0),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![inner, option, outer], vec![]);
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(1, i64_ty)), &llbc),
+        "Option<i64>",
+        "first dest intern KEY must not wait on value_type_inputs"
+    );
+}
+
 /// `[T]` (`{"Slice": elem}`), `str` (the `builtin: "Str"` ADT) and
 /// `dyn Trait` are unsized.  A pointer to any of them is fat, and the
 /// width proof has to decline every one of them.
@@ -4708,6 +5476,296 @@ fn trait_method_on_known_receiver_names_the_impl_graph() {
             "start_bound"
         ))
     );
+}
+
+#[test]
+fn trait_box_slice_deref_is_container_identity() {
+    // `description.py` `ClassDesc.lookup`: `<Box<[T]> as Deref>::deref`
+    // is that impl's FunDecl. The impl is bodyless (`Box::deref`); the
+    // dest is a slice, so the lifted list model aliases — same rule as
+    // `Vec`/`String`, not a `["Deref","deref"]` residual.
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let box_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Box", "generics": {"types": []}}
+    });
+    let box_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["alloc", "boxed", "Box"]),
+        "kind": {"Struct": []}
+    });
+    let deref_fd = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["boxed", 0]},
+                {"Ident": ["Box", 0]},
+                {"Impl": {
+                    "Ty": {"skip_binder": {"Value": [0, box_adt.clone()]}},
+                    "Trait": 0
+                }},
+                {"Ident": ["deref", 0]}
+            ],
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [{"Ref": [null, box_adt.clone(), "Shared"]}],
+            "output": {"Tuple": []}
+        },
+        "body": null
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [box_td],
+            "fun_decls": [null, deref_fd],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "ops", "deref", "Deref"]),
+                "methods": [{"skip_binder": {"name": "deref"}}]
+            }],
+            "trait_impls": [{
+                "impl_trait": {"id": 0, "generics": {"types": [box_adt.clone()]}},
+                "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                "methods": [{
+                    "kind": {"TraitMethod": [0, 0]},
+                    "skip_binder": {"id": 1}
+                }]
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": [null, box_adt, "Shared"]
+    }));
+    let slice_ty = TyRef::Other(serde_json::json!({
+        "Ref": [null, {"Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]}, "Shared"]
+    }));
+    let i64_ty = TyRef::Other(serde_json::json!({
+        "Ref": [null, {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
+    }));
+    let trait_impl_call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+        "kind": {"Trait": [{
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {"types": [], "const_generics": [], "trait_refs": []}
+            }}
+        }, 0]},
+        "generics": {}
+    }))
+    .expect("TraitImpl deref call parses");
+    let clause_call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+        "kind": {"Trait": [{
+            "kind": {"Clause": {"Bound": [0, 0]}},
+            "trait_decl_ref": {"skip_binder": {"id": 0}}
+        }, 0]},
+        "generics": {}
+    }))
+    .expect("Clause deref call parses");
+
+    let fd = super::deref_callee_fun_decl(&trait_impl_call, None, &llbc)
+        .expect("TraitImpl names Box::deref");
+    assert_eq!(
+        super::deref_impl_owner_leaf(&llbc, fd).as_deref(),
+        Some("Box")
+    );
+    assert!(super::is_deref_call(&trait_impl_call, &llbc));
+    assert!(super::is_deref_call_for(&clause_call, Some(&recv), &llbc));
+    assert!(super::tyref_strips_to_slice(&slice_ty, &llbc));
+    assert!(!super::tyref_strips_to_slice(&i64_ty, &llbc));
+    assert!(super::container_identity_deref_owner(
+        "Box",
+        Some(&slice_ty),
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "Box",
+        Some(&i64_ty),
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner("Box", None, &llbc));
+    assert!(!super::container_identity_deref_owner(
+        "Constants",
+        Some(&slice_ty),
+        &llbc
+    ));
+    assert!(super::container_identity_deref_owner("Vec", None, &llbc));
+    assert!(super::container_identity_deref_owner("String", None, &llbc));
+}
+
+#[test]
+fn user_trait_deref_method_is_not_ops_deref() {
+    // `description.py` `FunctionDesc.pycall` follows the selected
+    // implementation through `annotator.recursivecall`. A user trait
+    // `MyDeref::deref` on a string-family receiver keeps its body;
+    // only `<String as core::ops::deref::Deref>::deref` is the
+    // identity-deref rewrite.
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let string_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let string_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["alloc", "string", "String"]),
+        "kind": {"Struct": []}
+    });
+    let fundecl = |def_id: u64, impl_id: u64, segs: &[&str]| {
+        let mut name: Vec<serde_json::Value> = segs
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        name.push(serde_json::json!({
+            "Impl": {
+                "Ty": {"skip_binder": {"Value": [0, string_adt.clone()]}},
+                "Trait": impl_id
+            }
+        }));
+        name.push(serde_json::json!({"Ident": ["deref", 0]}));
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Ref": [null, string_adt.clone(), "Shared"]}],
+                "output": {"Ref": [null, {"Adt": {"id": 0, "builtin": "Str", "generics": {"types": []}}}, "Shared"]}
+            },
+            "body": null
+        })
+    };
+    let trait_impl = |trait_id: u64, fn_id: u64| {
+        serde_json::json!({
+            "impl_trait": {"id": trait_id, "generics": {"types": [string_adt.clone()]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [trait_id, 0]},
+                "skip_binder": {"id": fn_id}
+            }]
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [string_td],
+            "fun_decls": [
+                null,
+                fundecl(1, 0, &["alloc", "string"]),
+                fundecl(2, 1, &["fixture"])
+            ],
+            "global_decls": [],
+            "trait_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "ops", "deref", "Deref"]),
+                    "methods": [{"skip_binder": {"name": "deref"}}]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["MyDeref", 0]}],
+                        "span": span.clone(),
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "methods": [{"skip_binder": {"name": "deref"}}]
+                }
+            ],
+            "trait_impls": [trait_impl(0, 1), trait_impl(1, 2)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let ops_deref_fd = llbc.fn_by_id(1).expect("String as Deref::deref");
+    let my_deref_fd = llbc.fn_by_id(2).expect("String as MyDeref::deref");
+    assert!(super::is_deref_fundecl(ops_deref_fd, &llbc));
+    assert!(!super::is_deref_fundecl(my_deref_fd, &llbc));
+
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": [null, string_adt, "Shared"]
+    }));
+    let fun_call = |id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Fun": id},
+            "generics": {}
+        }))
+        .expect("Fun Regular call parses")
+    };
+    let trait_impl_call = |impl_id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{
+                "kind": {"TraitImpl": {
+                    "id": impl_id,
+                    "generics": {"types": [], "const_generics": [], "trait_refs": []}
+                }}
+            }, 0]},
+            "generics": {}
+        }))
+        .expect("TraitImpl call parses")
+    };
+    let clause_call = |trait_id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{
+                "kind": {"Clause": {"Bound": [0, 0]}},
+                "trait_decl_ref": {"skip_binder": {"id": trait_id}}
+            }, 0]},
+            "generics": {}
+        }))
+        .expect("Clause call parses")
+    };
+
+    assert!(super::is_deref_call(&fun_call(1), &llbc));
+    assert!(!super::is_deref_call(&fun_call(2), &llbc));
+    assert!(super::is_deref_call(&trait_impl_call(0), &llbc));
+    assert!(!super::is_deref_call(&trait_impl_call(1), &llbc));
+    assert!(super::is_deref_call_for(
+        &clause_call(0),
+        Some(&recv),
+        &llbc
+    ));
+    assert!(!super::is_deref_call_for(
+        &clause_call(1),
+        Some(&recv),
+        &llbc
+    ));
+    // Unresolved Trait fallback: full declared path, not the last segment.
+    assert!(super::is_deref_call(&clause_call(0), &llbc));
+    assert!(!super::is_deref_call(&clause_call(1), &llbc));
 }
 
 #[test]
@@ -8594,7 +9652,7 @@ fn result_with_pointer_like_err_still_paints_class_root() {
 fn option_of_raw_pointer_stays_classdef_less() {
     // `Option<*mut u8>` is the null-word niche, not an enum class.
     // `*mut u8` is not a GC pointee (`is_niche_option_gc_payload_spelling`
-    // is false); the Input stamp stays classdef-less. A GC pointee such as
+    // with no layout is false); the Input stamp stays classdef-less. A GC pointee such as
     // `*mut pyobject::PyObject` is a different test.
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let node = option_adt_node(0, raw_mut_u8_arg());
@@ -8803,9 +9861,9 @@ fn stamp_option_method_inputs(
 
 /// Substituted pointer-niche `Option<P>` Input stamp from `local.ty`.
 /// GCREF → `SomePtr` class_root; GC instance / `&PyObjectRef` /
-/// `*mut TypedItemsBlock` → `Option<{payload}>` so
-/// `is_niche_option_gc_payload_spelling` noneifies. `Option<i64>` is the
-/// tagged enum and stays `option::Option<i64>`.
+/// `*mut TypedItemsBlock` → `Option<{payload}>` so intern noneifies
+/// when the pointee has a Gc layout. `Option<i64>` is the tagged enum
+/// and stays `option::Option<i64>`.
 #[test]
 fn substituted_pointer_niche_option_param_input_stamp() {
     let llbc = option_payload_stamp_llbc();
@@ -8813,6 +9871,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
     let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
     let helper =
         |ty: &TyRef| tyref_niche_option_gc_payload_spelling(ty, &llbc, &gc_struct_ids, &empty_s);
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+        "PyObject",
+        "pyobject::PyObject",
+        "TypedItemsBlock",
+    ]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
 
     let gcref_ty = TyRef::Other(option_adt_ty(raw_mut_adt(1)));
     let gcref_root = helper(&gcref_ty);
@@ -8841,9 +9905,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<*mut PyObject> self is not Void"
     );
     assert!(
-        py_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        py_class.as_deref().is_some_and(intern),
         "Option<*mut PyObject> stamps a niche Option, got {py_class:?}"
     );
     assert!(
@@ -8859,9 +9921,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&*mut PyObject> self is not Void"
     );
     assert!(
-        borrowed_raw_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_raw_class.as_deref().is_some_and(intern),
         "Option<&*mut PyObject> stamps a niche Option, got {borrowed_raw_class:?}"
     );
 
@@ -8873,16 +9933,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&PyObjectRef> self is not Void"
     );
     assert!(
-        borrowed_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_class.as_deref().is_some_and(intern),
         "Option<&PyObjectRef> stamps a niche Option, got {borrowed_class:?}"
     );
-    assert!(
-        borrowed_class
-            .as_deref()
-            .is_some_and(|r| r.contains("PyObjectRef") || r.contains("PyObject")),
-        "peeled shared-borrow payload is PyObjectRef, got {borrowed_class:?}"
+    assert_eq!(
+        borrowed_class, borrowed_raw_class,
+        "Option<&PyObjectRef> stamps the alias-resolved pointer, got {borrowed_class:?}"
     );
 
     let block_ty = option_adt_ty(raw_mut_adt(5));
@@ -8892,9 +9948,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<*mut TypedItemsBlock> self is not Void"
     );
     assert!(
-        block_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        block_class.as_deref().is_some_and(intern),
         "Option<*mut TypedItemsBlock> stamps a niche Option, got {block_class:?}"
     );
     assert!(
@@ -8911,10 +9965,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<PyObjectRef> self is not Void"
     );
     assert!(
-        alias_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        alias_class.as_deref().is_some_and(intern),
         "Option<PyObjectRef> stamps a niche Option, got {alias_class:?}"
+    );
+    assert_eq!(
+        alias_class, py_class,
+        "Option<PyObjectRef> stamps the alias-resolved pointer, got {alias_class:?}"
     );
 
     let borrowed_object = serde_json::json!({"Ref": ["Erased", adt_node(3), "Shared"]});
@@ -8925,9 +9981,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&PyObject> self is not Void"
     );
     assert!(
-        borrowed_object_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_object_class.as_deref().is_some_and(intern),
         "Option<&PyObject> stamps a niche Option, got {borrowed_object_class:?}"
     );
 
@@ -8939,9 +9993,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&TypedItemsBlock> self is not Void"
     );
     assert!(
-        borrowed_block_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_block_class.as_deref().is_some_and(intern),
         "Option<&TypedItemsBlock> stamps a niche Option, got {borrowed_block_class:?}"
     );
 
@@ -8958,9 +10010,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<H::Value> self is not Void"
     );
     assert!(
-        assoc_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        assoc_class.as_deref().is_some_and(intern),
         "unique-impl TraitType payload *mut PyObject stamps a niche Option, got {assoc_class:?}"
     );
 
@@ -8976,9 +10026,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "tagged Option<i64> keeps its enum class_root, got {i64_class:?}"
     );
     assert!(
-        !i64_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        !i64_class.as_deref().is_some_and(intern),
         "Option<i64> is not a pointer-niche GC payload"
     );
 }
@@ -9013,16 +10061,16 @@ fn undeclared_named_object_pointee_is_not_noneify_stamp() {
     assert!(
         !py_class
             .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+            .is_some_and(|s| is_niche_option_gc_payload_spelling(s, None)),
         "Input class_root of undeclared PyObject is not a GC payload, got {py_class:?}"
     );
 }
 
 /// `Option<&RawEnum>` is the int-bank null word (`borrowed_pointee_is_raw_enum`),
-/// not a GC instance. The uppercase `&T` heuristic in
-/// `is_niche_option_gc_payload_spelling` would otherwise stamp
-/// `Option<&MappedObj>` and noneify; rtype then fails
-/// `cast_int_to_ptr` InstanceRepr → IntegerRepr.
+/// not a GC instance. Intern's layout gckind
+/// (`is_niche_option_gc_payload_spelling`) does not noneify an
+/// undeclared uppercase `&T`; rtype then fails `cast_int_to_ptr`
+/// InstanceRepr → IntegerRepr if intern did.
 #[test]
 fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
     let mut option = option_enum(0);
@@ -9074,7 +10122,7 @@ fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
     assert!(
         !class
             .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+            .is_some_and(|s| is_niche_option_gc_payload_spelling(s, None)),
         "Input class_root of Option<&RawEnum> is not a GC payload, got {class:?}"
     );
 }
@@ -9114,6 +10162,8 @@ fn niched_unwrap_or_else_keeps_self_input() {
         &[1],
         vec![],
     );
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["PyObject"]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
     let opt_ty = option_adt_ty(raw_mut_adt(1));
     let closure_ty = adt_node(2);
     let ty = TyRef::Other(opt_ty.clone());
@@ -9140,10 +10190,7 @@ fn niched_unwrap_or_else_keeps_self_input() {
         "self is a payload word, not Void"
     );
     assert!(
-        self_input
-            .2
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        self_input.2.as_deref().is_some_and(intern),
         "self class_root is the niche Option spelling, got {:?}",
         self_input.2
     );
@@ -10026,14 +11073,17 @@ fn deref_cast_root_is_one_word_handle_only() {
     let dest_ty = TyRef::Other(serde_json::json!({
         "Ref": [null, payload_adt.clone(), "Shared"]
     }));
-    let deref_fun = |def_id: u64, handle: serde_json::Value| {
+    let deref_fun = |def_id: u64, impl_id: u64, handle: serde_json::Value| {
         serde_json::json!({
             "def_id": def_id,
             "item_meta": {
                 "name": [
                     {"Ident": ["fixture", 0]},
                     {"Ident": ["Handle", 0]},
-                    {"Impl": {"Ty": {"skip_binder": {"Value": [0, handle.clone()]}}}},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, handle.clone()]}},
+                        "Trait": impl_id
+                    }},
                     {"Ident": ["deref", 0]}
                 ],
                 "span": fixture_span(),
@@ -10054,6 +11104,16 @@ fn deref_cast_root_is_one_word_handle_only() {
             "body": "Opaque"
         })
     };
+    let deref_trait_impl = |fn_id: u64, handle: serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [handle]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [0, 0]},
+                "skip_binder": {"id": fn_id}
+            }]
+        })
+    };
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -10068,14 +11128,39 @@ fn deref_cast_root_is_one_word_handle_only() {
             }],
             "type_decls": [payload, three_field, word, opaque_word],
             "fun_decls": [
-                deref_fun(0, three_field_adt),
-                deref_fun(1, box_adt),
-                deref_fun(2, word_adt),
-                deref_fun(3, opaque_word_adt)
+                deref_fun(0, 0, three_field_adt.clone()),
+                deref_fun(1, 1, box_adt.clone()),
+                deref_fun(2, 2, word_adt.clone()),
+                deref_fun(3, 3, opaque_word_adt.clone())
             ],
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": {
+                    "name": [
+                        {"Ident": ["core", 0]},
+                        {"Ident": ["ops", 0]},
+                        {"Ident": ["deref", 0]},
+                        {"Ident": ["Deref", 0]}
+                    ],
+                    "span": fixture_span(),
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [],
+                        "inline": null,
+                        "rename": null,
+                        "public": true
+                    },
+                    "is_local": false
+                },
+                "methods": [{"skip_binder": {"name": "deref"}}]
+            }],
+            "trait_impls": [
+                deref_trait_impl(0, three_field_adt),
+                deref_trait_impl(1, box_adt),
+                deref_trait_impl(2, word_adt),
+                deref_trait_impl(3, opaque_word_adt)
+            ]
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
@@ -10088,22 +11173,28 @@ fn deref_cast_root_is_one_word_handle_only() {
     };
     with_fixture_lowering(&llbc, |lowering| {
         assert_eq!(
-            lowering.deref_cast_root(&call(0), &dest_ty),
+            lowering.deref_cast_root(&call(0), &dest_ty, None),
             None,
             "a three-field non-transparent handle is not a one-word reinterpret"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(1), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(1), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "Box<T> keeps the one-word cast"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(2), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(2), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "a transparent one-word handle keeps the one-word cast"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(3), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(3), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "an opaque one-word guard (MutexGuard-shaped) keeps the one-word cast"
         );
@@ -11259,7 +12350,7 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
         specs: &'a [crate::translator::rtyper::cutover::ResidualStubSpec],
         leaf: &str,
     ) -> Option<&'a crate::translator::rtyper::cutover::ResidualStubSpec> {
-        specs.iter().find(|(segments, _, _, _)| {
+        specs.iter().find(|(segments, _, _, _, _)| {
             segments.len() == 3
                 && segments[0] == "fixture"
                 && segments[1] == "owner"
@@ -11329,9 +12420,9 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         "interp_exceptions",
         "lookup_exc_class_for_kind",
     ];
-    let (_, signature, token, _) = specs
+    let (_, signature, token, _, _) = specs
         .iter()
-        .find(|(segments, _, _, _)| {
+        .find(|(segments, _, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -11362,9 +12453,9 @@ fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         &std::collections::HashSet::<String>::new(),
     );
     let expected = ["pyre_interpreter", "typedef", "call_getset_fget_direct"];
-    let (_, signature, token, _) = specs
+    let (_, signature, token, _, _) = specs
         .iter()
-        .find(|(segments, _, _, _)| {
+        .find(|(segments, _, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -11401,9 +12492,9 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         &std::collections::HashSet::<String>::new(),
     );
     let expected = ["pyre_interpreter", "call", "metaclass_call_override"];
-    let (_, signature, token, _) = specs
+    let (_, signature, token, _, _) = specs
         .iter()
-        .find(|(segments, _, _, _)| {
+        .find(|(segments, _, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -11947,7 +13038,7 @@ fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
     let token = |leaf: &str| {
         specs
             .iter()
-            .find(|(path, _, _, _)| path.last().is_some_and(|p| p == leaf))
+            .find(|(path, _, _, _, _)| path.last().is_some_and(|p| p == leaf))
             .unwrap()
             .2
             .as_deref()

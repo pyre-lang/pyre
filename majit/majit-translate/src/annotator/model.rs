@@ -5316,6 +5316,72 @@ mod tests {
         assert!(matches!(result, SomeValue::Ptr(_)));
     }
 
+    /// Inlined `_first_struct` parent fields (`save_point` on a
+    /// `DictOperationGuard` whose first field is `RootScope`) are
+    /// getattr/setattr of that parent SomePtr. The first-struct field
+    /// name itself stays an immediate nested SomePtr.
+    #[test]
+    fn someptr_getattr_setattr_of_inlined_first_struct_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        fn field_name(name: &str) -> SomeValue {
+            let mut s_attr = SomeString::new(false, false);
+            s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(name)));
+            SomeValue::String(s_attr)
+        }
+
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new(
+                "Outer",
+                vec![
+                    ("x".into(), LowLevelType::Struct(Box::new(inner))),
+                    ("z".into(), LowLevelType::Signed),
+                ],
+            )),
+        });
+        s_ptr
+            .setattr(
+                &field_name("y"),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect("setattr of an inlined first-struct field");
+        let got = s_ptr
+            .getattr(&field_name("y"))
+            .expect("getattr of an inlined first-struct field");
+        assert!(
+            matches!(got, SomeValue::Integer(_)),
+            "inherited first-struct field must be Integer, got {got:?}"
+        );
+        let nested = s_ptr
+            .getattr(&field_name("x"))
+            .expect("getattr of the first-struct field name");
+        assert!(
+            matches!(nested, SomeValue::Ptr(_)),
+            "first-struct field name stays SomePtr, got {nested:?}"
+        );
+        s_ptr
+            .setattr(
+                &field_name("z"),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect("setattr of an immediate outer field");
+        let err = s_ptr
+            .setattr(
+                &field_name("bogus"),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect_err("missing field after the first-struct walk");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("has no field \"bogus\""),
+            "missing field must still be _nofield"
+        );
+    }
+
     #[test]
     fn someptr_len_returns_constant_for_fixedsize_array_pointer() {
         use crate::translator::rtyper::lltypesystem::lltype::{
@@ -5833,6 +5899,33 @@ mod tests {
             panic!("expected SomeInstance");
         };
         assert!(inst.classdef.is_none());
+    }
+
+    #[test]
+    fn w_root_subclasses_union_to_common_base() {
+        // `binaryop.py` `pairtype(SomeInstance, SomeInstance).union` /
+        // `ClassDef.commonbase`: two subclasses of one base unify to that
+        // base. `space.get` returns `W_Root`; Method and W_IntObject both
+        // derive from it, so their union is `SomeInstance(W_Root)`.
+        let w_root = ClassDef::new_standalone("W_Root", None);
+        let method = ClassDef::new_standalone("Method", Some(&w_root));
+        let w_int = ClassDef::new_standalone("W_IntObject", Some(&w_root));
+        let a = SomeValue::Instance(SomeInstance::new(
+            Some(method),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let b = SomeValue::Instance(SomeInstance::new(
+            Some(w_int),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let u = union(&a, &b).expect("W_Root subclasses unify");
+        let SomeValue::Instance(inst) = u else {
+            panic!("expected SomeInstance, got {u:?}");
+        };
+        let merged = inst.classdef.expect("merged classdef");
+        assert_eq!(merged.borrow().name, "W_Root");
     }
 
     #[test]

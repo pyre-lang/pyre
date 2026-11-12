@@ -406,6 +406,7 @@ fn pycode_code_ptr_is_raw_int_kind() {
         Signature::new(vec!["w_code".into(), "addrq".into()], None, None),
         Some("i64".into()),
         None,
+        None,
     ));
     for func in &program.functions {
         let path = if func.module_path.is_empty() {
