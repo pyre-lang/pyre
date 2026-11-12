@@ -219,41 +219,40 @@ unsafe extern "system" fn faulthandler_exc_handler(
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// The exception statuses `faulthandler` publishes on Windows, spelled the way
-/// `PyModule_AddIntConstant` hands the NTSTATUS values over: as signed 32-bit
-/// ints, so `_EXCEPTION_ACCESS_VIOLATION` reads -0x3ffffffb rather than
+/// The exception statuses `faulthandler` publishes on Windows, as unsigned
+/// DWORDs (`PyLong_FromUnsignedLong`): `_EXCEPTION_ACCESS_VIOLATION` reads
 /// 0xc0000005.
 #[cfg(all(windows, feature = "host_env"))]
-const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
+const WINDOWS_EXCEPTIONS: [(&str, u32); 5] = [
     (
         "_EXCEPTION_ACCESS_VIOLATION",
-        rustpython_host_env::faulthandler::EXCEPTION_ACCESS_VIOLATION as i32,
+        rustpython_host_env::faulthandler::EXCEPTION_ACCESS_VIOLATION as u32,
     ),
     (
         "_EXCEPTION_INT_DIVIDE_BY_ZERO",
-        rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO as i32,
+        rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO as u32,
     ),
     (
         "_EXCEPTION_NONCONTINUABLE",
-        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE as i32,
+        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE as u32,
     ),
     (
         "_EXCEPTION_NONCONTINUABLE_EXCEPTION",
-        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE_EXCEPTION as i32,
+        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE_EXCEPTION as u32,
     ),
     (
         "_EXCEPTION_STACK_OVERFLOW",
-        rustpython_host_env::faulthandler::EXCEPTION_STACK_OVERFLOW as i32,
+        rustpython_host_env::faulthandler::EXCEPTION_STACK_OVERFLOW as u32,
     ),
 ];
 
 #[cfg(all(windows, not(feature = "host_env")))]
-const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
-    ("_EXCEPTION_ACCESS_VIOLATION", 0xc000_0005u32 as i32),
-    ("_EXCEPTION_INT_DIVIDE_BY_ZERO", 0xc000_0094u32 as i32),
+const WINDOWS_EXCEPTIONS: [(&str, u32); 5] = [
+    ("_EXCEPTION_ACCESS_VIOLATION", 0xc000_0005),
+    ("_EXCEPTION_INT_DIVIDE_BY_ZERO", 0xc000_0094),
     ("_EXCEPTION_NONCONTINUABLE", 0x1),
-    ("_EXCEPTION_NONCONTINUABLE_EXCEPTION", 0xc000_0025u32 as i32),
-    ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fdu32 as i32),
+    ("_EXCEPTION_NONCONTINUABLE_EXCEPTION", 0xc000_0025),
+    ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fd),
 ];
 
 /// `handler.py Handler.check_err`.

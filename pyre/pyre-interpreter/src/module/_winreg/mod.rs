@@ -39,6 +39,16 @@ macro_rules! reg_int {
     (ERROR_MORE_DATA) => {
         windows_sys::Win32::Foundation::ERROR_MORE_DATA as i64
     };
+    // winnt.h's masks; `rustpython_host_env::winreg` leaves out
+    // `REG_OPTION_DONT_VIRTUALIZE` and `REG_NOTIFY_THREAD_AGNOSTIC`.
+    (REG_LEGAL_OPTION) => {
+        (rustpython_host_env::winreg::REG_LEGAL_OPTION
+            | windows_sys::Win32::System::Registry::REG_OPTION_DONT_VIRTUALIZE) as i64
+    };
+    (REG_LEGAL_CHANGE_FILTER) => {
+        (rustpython_host_env::winreg::REG_LEGAL_CHANGE_FILTER
+            | windows_sys::Win32::System::Registry::REG_NOTIFY_THREAD_AGNOSTIC) as i64
+    };
     ($name:ident) => {
         rustpython_host_env::winreg::$name as i64
     };
