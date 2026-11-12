@@ -199,13 +199,15 @@ pub(crate) fn install_applevel_builtins() {
     let _ = pyre_object::gc_roots::pin_root(handles[SORTED] as PyObjectRef);
     let sum_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(handles[SUM] as PyObjectRef);
+    let w_builtin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_builtin);
     if sorted_placeholder {
         publish_one(
             pyre_object::gc_roots::shadow_stack_get(builtins_slot),
             "sorted",
             sorted_slot,
             SIGS[SORTED],
-            w_builtin,
+            pyre_object::gc_roots::shadow_stack_get(w_builtin_slot),
         );
     }
     if sum_placeholder {
@@ -214,7 +216,7 @@ pub(crate) fn install_applevel_builtins() {
             "sum",
             sum_slot,
             SIGS[SUM],
-            w_builtin,
+            pyre_object::gc_roots::shadow_stack_get(w_builtin_slot),
         );
     }
 }
@@ -248,9 +250,21 @@ fn publish_one(
     sig_text: &str,
     w_builtin: PyObjectRef,
 ) {
-    crate::module_ns_delete(builtins, name);
+    // Caller already opened `push_roots`. Pin `builtins` and `w_builtin`
+    // into that bracket the same way `func` lives at `func_slot`;
+    // `module_ns_store` / `w_str_new` / `fset_func_text_signature` can
+    // collect (`shadowstack.py push_roots` / `pop_roots`).
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(builtins);
+    let w_builtin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_builtin);
+    crate::module_ns_delete(pyre_object::gc_roots::shadow_stack_get(builtins_slot), name);
     let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
-    crate::module_ns_store(builtins, name, func);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(builtins_slot),
+        name,
+        func,
+    );
     // `func` is the old-gen BuiltinFunction; `w_str_new` may allocate in
     // the nursery.  Reload `func` after that alloc (it cannot move) and
     // let `fset_func_text_signature` run the old-to-young write barrier.
@@ -266,7 +280,10 @@ fn publish_one(
     }
     let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     unsafe {
-        crate::function::builtin_function_set_module_obj(func, w_builtin);
+        crate::function::builtin_function_set_module_obj(
+            func,
+            pyre_object::gc_roots::shadow_stack_get(w_builtin_slot),
+        );
     }
 }
 

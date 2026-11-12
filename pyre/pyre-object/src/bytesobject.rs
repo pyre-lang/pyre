@@ -52,11 +52,13 @@ pub type BytesBlock = crate::unicodeobject::Utf8Str;
 
 /// Allocate a [`BytesBlock`] holding `bytes`.
 ///
-/// The tier is the stable (old-gen) one the storage box already used: a
-/// caller holds the returned block on the unrooted Rust stack while it
-/// allocates the object body, and `try_gc_alloc_stable_raw` is the hook whose
-/// address survives both collection kinds. It also keeps
-/// [`w_bytes_data`]'s `&'static [u8]` pointing at bytes that never move.
+/// `rstr.mallocstr` / `incminimark.malloc_varsize`: nursery allocation with
+/// old-gen spill (`gc_hook::try_gc_alloc`), then
+/// `external_malloc(..., alloc_young=True)` without the collection
+/// (`try_gc_alloc_young_nonmoving_no_collect`) when that does not allocate.
+/// A refused request aborts via `handle_alloc_error`. Only
+/// [`try_alloc_bytes_block`] reports `None` so a Python-facing caller can
+/// raise `MemoryError`.
 ///
 /// Falls back to a plain allocation before the GC is up or in a unit test,
 /// where the block is immortal, as the storage box's `malloc_raw` fallback is.
@@ -78,19 +80,27 @@ enum BlockRoute {
 
 /// Ask the managed heap for a `size`-byte block.
 ///
-/// `try_gc_alloc_stable_raw` ends the process on the third answer, because its
-/// callers meet a null by allocating outside the heap and a block holding
-/// managed references must never live there.  A bytes block holds none, and its
-/// size comes from Python, so the refusal is reported instead — nothing is
-/// allocated anywhere on that path, and the caller raises the `MemoryError`
-/// `collect_and_reserve` raises.
+/// `rstr.mallocstr` / `incminimark.malloc_varsize`: nursery bump with old-gen
+/// spill (`gc_hook::try_gc_alloc`, the outcome twin of
+/// `try_gc_alloc_nursery_raw`), then `external_malloc(..., alloc_young=True)`
+/// without the collection (`try_gc_alloc_young_nonmoving_no_collect`) when
+/// that does not allocate. Neither collects: the source slice of
+/// [`try_alloc_bytes_block`] may itself be another nursery STR. A refused
+/// request is reported so the caller raises `MemoryError`. The aborting
+/// `_raw` twins are not used here.
 fn route_bytes_block(size: usize) -> BlockRoute {
     let tid = lowlevel_str_gc_type_id();
     if tid == 0 {
         return BlockRoute::Raw;
     }
-    match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(tid, size))
-    {
+    let young = crate::gc_hook::try_gc_alloc(tid, size);
+    let outcome = match young {
+        Some(raw) if !raw.is_null() => crate::gc_hook::GcAllocOutcome::Allocated(raw),
+        _ => crate::gc_hook::GcAllocOutcome::from_hook(
+            crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect(tid, size),
+        ),
+    };
+    match outcome {
         crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
             BlockRoute::Managed(raw.cast::<BytesBlock>())
         }
@@ -178,6 +188,8 @@ fn bytes_block_layout(len: usize) -> std::alloc::Layout {
 }
 
 /// The `chars` of a block, as `rstr.py`'s `ll_chars` reads them.
+///
+/// The slice is valid until the next collection that moves the STR.
 ///
 /// # Safety
 /// `block` must name a live [`BytesBlock`].
@@ -340,13 +352,10 @@ pub fn jit_w_bytes_from_u8x4(b0: u8, b1: u8, b2: u8, b3: u8) -> PyObjectRef {
 
 /// Wrap `data`, the block the bytes were copied into, in its `W_BytesObject`.
 fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
-    // `build_list_storage` (listobject.rs) states the rule the block obeys:
-    // old-gen is mark-sweep, so a block with no heap edge yet is sweepable
-    // rather than merely immobile, and it has to be rooted across every later
-    // GC operation. `try_gc_alloc_stable_raw` is one of them
-    // (`IntArray::pin_block`), and `get_instantiate` allocates as well, so both
-    // the block and the class travel on the shadow stack and are read back from
-    // their slots once the last allocation is behind them.
+    // The STR can move; pin it across the wrapper allocation so the
+    // collector forwards it. `get_instantiate` allocates as well, so both
+    // the block and the class travel on the shadow stack and are read back
+    // from their slots once the last allocation is behind them.
     let _roots = crate::gc_roots::push_roots();
     let data_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
@@ -407,18 +416,15 @@ pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
         }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytesObject, body) };
-        // The creation barrier the GC transform emits after a `SETFIELD_GC`
-        // into a non-nursery struct.  A stable allocation is always old-gen,
-        // and `oldgen_birth_flags` (incminimark.py) stamps one born during a
-        // major marking cycle black, so the marker never traces it.  Unlike
-        // every other bytes constructor, `data` here is a block that already
-        // existed and may still be white, and `BytesListStrategy` drops the
-        // array holding it in the same strategy switch that wraps it — leaving
-        // this wrapper its only owner.  Remembering the wrapper is what puts
-        // it back on `more_objects_to_trace` at the next minor
-        // (`_add_to_more_objects_to_trace`, incminimark.py), which is the
-        // invariant `_debug_check_object_marking` states: a black object must
-        // never point to a white one.
+        // The creation barrier the GC transform emits after a `SETFIELD_GC`.
+        // Unlike every other bytes constructor, `data` here is a block that
+        // already existed and may still be white, and `BytesListStrategy`
+        // drops the array holding it in the same strategy switch that wraps
+        // it — leaving this wrapper its only owner.  Remembering the wrapper
+        // is what puts it back on `more_objects_to_trace` at the next minor
+        // (`_add_to_more_objects_to_trace`), which is the invariant
+        // `_debug_check_object_marking` states: a black object must never
+        // point to a white one.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     }
@@ -433,9 +439,8 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     let root_base = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     // The block is allocated before the body and rooted across it, not built
-    // inside the struct literal: the literal is evaluated after
-    // `try_gc_alloc_stable_raw` has already produced `raw`, which leaves that
-    // fresh body unrooted across the block's own allocation.
+    // inside the struct literal: the wrapper allocation would otherwise
+    // leave a fresh body unrooted across the block's own allocation.
     let data_slot = crate::gc_roots::shadow_stack_len();
     let data = alloc_bytes_block(bytes);
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
@@ -524,7 +529,11 @@ pub unsafe fn w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe { w_bytes_data(obj)[index] }
 }
 
-/// Get a reference to the internal data.
+/// The `chars` of this bytes object's STR.
+///
+/// The slice is valid until the next collection that moves the STR. Do not
+/// hold it across an allocation or a Python call.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -538,6 +547,17 @@ pub unsafe fn w_bytes_data(obj: PyObjectRef) -> &'static [u8] {
 /// Return the erased `rpython str` stored by PyPy's BytesListStrategy.
 pub unsafe fn w_bytes_block(obj: PyObjectRef) -> *const BytesBlock {
     unsafe { (*(obj as *const W_BytesObject)).data }
+}
+
+/// `rffi.get_raw_address_of_string` of this bytes object's STR.
+///
+/// The object must be rooted: `gc_move_out_of_nursery` can collect.
+/// A null result means MemoryError is pending (`raise_memory_error`).
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_bytes_raw_address(obj: PyObjectRef) -> *mut u8 {
+    majit_rlib::lltypesystem::rffi::get_raw_address_of_string(
+        unsafe { w_bytes_block(obj) } as *mut majit_rlib::lltypesystem::rstr::STR
+    )
 }
 
 /// bytes.find(sub, start) — find first occurrence of byte value.
@@ -636,6 +656,9 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 /// `Vec<u8>`. JIT-visible add/mul dispatch per type
 /// (`StringMethods.descr_add` / `descr_mul`, `W_BytearrayObject.descr_add`)
 /// instead of this helper.
+///
+/// A bytes STR slice is valid until the next collection that moves the STR.
+/// Do not hold it across an allocation or a Python call.
 #[inline(never)]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

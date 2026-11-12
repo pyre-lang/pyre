@@ -1018,6 +1018,13 @@ impl PyError {
         slot
     }
 
+    /// GC word this handle names. [`Self::pin`] appends; a slot reserved
+    /// before a nested bracket is filled with `RootScope::set` and this
+    /// word so that bracket's `pop_roots` cannot discard it.
+    pub fn as_gc_ref(&self) -> pyre_object::PyObjectRef {
+        self.0
+    }
+
     /// Write the forwarded handle out of `slot`.
     ///
     /// `shadowstack.py gc_restore_root` / `expand_pop_roots`: the local read

@@ -1922,7 +1922,10 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                         .ok_or_else(|| {
                             pyre_interpreter::PyError::type_error("bytes-like object expected")
                         })?;
-                    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
+                    // Host copy: `cdata_write` → `getdict_native` → `_obj_getdict`
+                    // can collect (`char_array_set_raw`).
+                    let bytes =
+                        unsafe { pyre_object::bytesobject::bytes_like_data(source) }.to_vec();
                     if bytes.len() > size {
                         return Err(pyre_interpreter::PyError::value_error("bytes too long"));
                     }
@@ -2868,18 +2871,21 @@ fn char_array_get_value(args: &[PyObjectRef]) -> PyResult {
 
 fn char_array_set_value(args: &[PyObjectRef]) -> PyResult {
     let mut obj = args[1];
-    let value = args[2];
+    let mut value = args[2];
     if !unsafe { pyre_object::is_bytes(value) } {
         return Err(pyre_interpreter::PyError::type_error("bytes expected"));
     }
+    // `cdata_len` can allocate; re-read `W_BytesObject._value` afterwards
+    // (`StringBuffer.getitem`).
+    let size = pyre_object::with_roots!(obj, value => cdata::cdata_len(obj)).unwrap_or(0);
     let src = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
-    let size = pyre_object::with_roots!(obj => cdata::cdata_len(obj)).unwrap_or(0);
     if src.len() > size {
         return Err(pyre_interpreter::PyError::value_error(
             "byte string too long",
         ));
     }
-    // Copy `src`, then a NUL terminator when the buffer has room (no tail zero).
+    // Host copy: NUL-terminate when the buffer has room, and `cdata_write`
+    // → `getdict_native` → `_obj_getdict` can collect.
     let mut buf = src.to_vec();
     if src.len() < size {
         buf.push(0);
@@ -2897,16 +2903,19 @@ fn char_array_get_raw(args: &[PyObjectRef]) -> PyResult {
 fn char_array_set_raw(args: &[PyObjectRef]) -> PyResult {
     let mut obj = args[1];
     let value = args[2];
-    let source = pyre_interpreter::typedef::buffer_as_bytes_like(value)?
+    let mut source = pyre_interpreter::typedef::buffer_as_bytes_like(value)?
         .ok_or_else(|| pyre_interpreter::PyError::type_error("bytes-like object expected"))?;
-    let src = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
-    let size = pyre_object::with_roots!(obj => cdata::cdata_len(obj)).unwrap_or(0);
+    // `cdata_len` can allocate; re-read the bytes-like payload afterwards
+    // (`StringBuffer.getitem`).
+    let size = pyre_object::with_roots!(obj, source => cdata::cdata_len(obj)).unwrap_or(0);
+    // `cdata_write` → `getdict_native` → `_obj_getdict` can collect.
+    let src = unsafe { pyre_object::bytesobject::bytes_like_data(source) }.to_vec();
     if src.len() > size {
         return Err(pyre_interpreter::PyError::value_error(
             "byte string too long",
         ));
     }
-    cdata::cdata_write(obj, 0, src);
+    cdata::cdata_write(obj, 0, &src);
     Ok(pyre_object::w_none())
 }
 

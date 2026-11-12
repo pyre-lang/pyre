@@ -85,11 +85,18 @@ pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
     unsafe { (*bio).read(size) }
 }
 
+/// `BIO_write`: a non-negative count, or a negative value after `write_eof`.
+///
 /// # Safety
-/// `bio` must point to a live [`MemoryBio`].
+/// `bio` must point to a live [`MemoryBio`]. `data` must name `len` live
+/// bytes, or `len` must be 0.
 #[inline(never)]
-pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: &[u8]) -> Result<usize, &'static str> {
-    unsafe { (*bio).write(data) }.map_err(|_| "cannot write() after write_eof()")
+pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: *const u8, len: usize) -> isize {
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    match unsafe { (*bio).write(slice) } {
+        Ok(n) => n as isize,
+        Err(_) => -1,
+    }
 }
 
 /// # Safety

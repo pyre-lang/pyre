@@ -1971,14 +1971,28 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let template = if filter_is_callable {
         None
     } else {
-        let (repl_bytes, is_bytes) = match subj {
+        Some(match subj {
             Subject::AsciiStr(_) | Subject::Str(_) => {
                 if !unsafe { is_str(w_repl()) } {
                     return Err(crate::PyError::type_error(
                         "sub: replacement must be str or callable",
                     ));
                 }
-                (unsafe { w_str_get_wtf8(w_repl()) }.as_bytes(), false)
+                if unsafe { w_str_get_wtf8(w_repl()) }
+                    .as_bytes()
+                    .contains(&b'\\')
+                {
+                    compile_template(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        w_repl(),
+                    )?
+                } else {
+                    // `subx` literal arm: no backslash, so the replacement is
+                    // copied verbatim and the template compiler is not invoked.
+                    vec![TemplateItem::Literal(
+                        unsafe { w_str_get_wtf8(w_repl()) }.as_bytes().to_vec(),
+                    )]
+                }
             }
             Subject::Bytes(_) => {
                 let Some(w_bytes) = crate::typedef::buffer_as_bytes_like(w_repl())? else {
@@ -1987,23 +2001,27 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                     ));
                 };
                 let w_bytes = pyre_object::gc_roots::pin_root(w_bytes);
-                (
-                    unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) },
-                    true,
-                )
+                // `W_SRE_Pattern.subx`: test `literal = '\\' not in filter_as_string`
+                // on the original buffer first; `space.newbytes(filter_as_string)`
+                // only in the non-literal template-compilation branch.
+                let filter_as_string =
+                    unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) };
+                if filter_as_string.contains(&b'\\') {
+                    let w_source = if !unsafe { pyre_object::is_bytes(w_bytes) } {
+                        pyre_object::gc_roots::pin_root(
+                            pyre_object::bytesobject::w_bytes_from_bytes(filter_as_string),
+                        )
+                    } else {
+                        w_bytes
+                    };
+                    compile_template(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        w_source,
+                    )?
+                } else {
+                    vec![TemplateItem::Literal(filter_as_string.to_vec())]
+                }
             }
-        };
-        Some(if repl_bytes.contains(&b'\\') {
-            parse_replacement_template(
-                w_repl(),
-                repl_bytes,
-                pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                is_bytes,
-            )?
-        } else {
-            // `subx` literal arm: no backslash, so the replacement is copied
-            // verbatim and the template compiler is not invoked.
-            vec![TemplateItem::Literal(repl_bytes.to_vec())]
         })
     };
 
@@ -2425,40 +2443,92 @@ fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
-/// Parse a replacement template into [`TemplateItem`]s by calling
-/// `re._compile_template` (`sre.c` `compile_template`).  The stdlib function
-/// is `lru_cache`d, so a repeated `(pattern, repl)` pays for `parse_template`
-/// once and then reuses the `_sre.template` object.
-fn parse_replacement_template(
-    w_template: PyObjectRef,
-    template_bytes: &[u8],
-    pat: PyObjectRef,
-    is_bytes: bool,
-) -> Result<Vec<TemplateItem>, crate::PyError> {
-    // The import and the `getattr` below collect.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let w_template = RootedObject::pin(w_template);
-    let pat = RootedObject::pin(pat);
-    let w_re = match crate::importing::get_sys_module("re") {
-        Some(w_re) => w_re,
+/// `import_re` — `AppReCache.get_re`.
+fn import_re() -> Result<PyObjectRef, crate::PyError> {
+    match crate::importing::get_sys_module("re") {
+        Some(w_re) => Ok(w_re),
         None => crate::importing::importhook(
             rustpython_wtf8::Wtf8::new("re"),
             pyre_object::w_none(),
             pyre_object::w_none(),
             0,
             crate::call::getexecutioncontext(),
-        )?,
-    };
-    let w_compile = crate::baseobjspace::getattr_str(w_re, "_compile_template")?;
-    // A buffer template (e.g. `bytearray`) is not a cache key; compile the
-    // exact `bytes` copy.  `_compile_template` still parses through
-    // `_parser.parse_template` on a miss.
-    let w_source = if is_bytes && !unsafe { pyre_object::is_bytes(w_template.get()) } {
-        pyre_object::bytesobject::w_bytes_from_bytes(template_bytes)
+        ),
+    }
+}
+
+/// `compile_template` — call `re._compile_template(pattern, template)`.
+/// The stdlib function is `lru_cache`d, so a repeated hashable
+/// `(pattern, repl)` pays for `_parser.parse_template` once.  A TypeError
+/// (an unhashable replacement such as `bytearray`) is retried after copying
+/// a str subclass to an exact str (`_PyUnicode_Copy`) or converting a
+/// buffer to exact bytes (`PyBytes_FromObject`).  Used by `Match.expand`
+/// and by `subx`'s non-literal branch.
+///
+/// [`compile_template_retry`] is the TypeError path of `compile_template`.
+fn compile_template(
+    pat: PyObjectRef,
+    w_template: PyObjectRef,
+) -> Result<Vec<TemplateItem>, crate::PyError> {
+    // The import and the `getattr` below collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_template = RootedObject::pin(w_template);
+    let pat = RootedObject::pin(pat);
+    let w_re = RootedObject::pin(import_re()?);
+    let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
+    match crate::call::call_function_impl_result(w_compile, &[pat.get(), w_template.get()]) {
+        Ok(w_result) => template_items_from_compiled(w_result),
+        Err(err) => compile_template_retry(pat.get(), w_template.get(), err),
+    }
+}
+
+/// TypeError from `_compile_template`: copy a str subclass to exact str,
+/// else a buffer to exact bytes, then call again.  Exact str / exact bytes
+/// keep the original TypeError (`PyUnicode_CheckExact` /
+/// `PyBytes_CheckExact` refuse a second try).  A non-str non-buffer also
+/// keeps it (`PyObject_CheckBuffer` is the gate).
+fn compile_template_retry(
+    pat: PyObjectRef,
+    w_template: PyObjectRef,
+    mut err: crate::PyError,
+) -> Result<Vec<TemplateItem>, crate::PyError> {
+    // `type_error_matched` (`OperationError.match`) can collect. Pin first
+    // so `pop_roots` reloads `pat` and `w_template` (`shadowstack.py
+    // push_roots` / `pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pat = RootedObject::pin(pat);
+    let w_template = RootedObject::pin(w_template);
+    if !crate::baseobjspace::type_error_matched(&mut err) {
+        return Err(err);
+    }
+    let w_converted = if unsafe { is_str(w_template.get()) } {
+        if unsafe { pyre_object::is_exact_type(w_template.get(), &pyre_object::STR_TYPE) } {
+            return Err(err);
+        }
+        let buf = unsafe { w_str_get_wtf8(w_template.get()) }.to_owned();
+        pyre_object::w_str_from_wtf8_managed(buf)
+    } else if unsafe { pyre_object::is_exact_type(w_template.get(), &pyre_object::BYTES_TYPE) } {
+        return Err(err);
     } else {
-        w_template.get()
+        match crate::typedef::buffer_as_bytes_like(w_template.get())? {
+            Some(w_buf) => {
+                let w_buf = RootedObject::pin(w_buf);
+                if unsafe { pyre_object::is_exact_type(w_buf.get(), &pyre_object::BYTES_TYPE) } {
+                    w_buf.get()
+                } else {
+                    let data =
+                        unsafe { pyre_object::bytesobject::bytes_like_data(w_buf.get()) }.to_vec();
+                    pyre_object::bytesobject::w_bytes_from_bytes(&data)
+                }
+            }
+            None => return Err(err),
+        }
     };
-    let w_result = crate::call::call_function_impl_result(w_compile, &[pat.get(), w_source])?;
+    let w_converted = RootedObject::pin(w_converted);
+    let w_re = RootedObject::pin(import_re()?);
+    let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
+    let w_result =
+        crate::call::call_function_impl_result(w_compile, &[pat.get(), w_converted.get()])?;
     template_items_from_compiled(w_result)
 }
 
@@ -2745,37 +2815,16 @@ fn sre_match_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(unsafe { slice_w(m, span, w_none()) })
 }
 
-/// `expand_w` (interp_sre.py) — substitute the parsed template
-/// against this match.  Upstream delegates to `re._expand`; pyre expands
-/// natively since it owns the template parser.
+/// `expand_w` (interp_sre.py) — delegates to the `re` module hook; with the
+/// bundled 3.15 stdlib that hook is `_compile_template` (`_sre_SRE_Match_expand_impl`).
+/// [3.15-spec] PyPy `expand_w` calls `re._expand` (3.11 stdlib); 3.15 stdlib has no `_expand`.
 fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let m = RootedObject::pin(sre_match_self(args)? as PyObjectRef);
-    let w_template = args.get(1).copied().unwrap_or_else(w_none);
-    let subj = unsafe {
-        let mp = m.get() as *const W_SRE_Match;
-        subject_of((*mp).w_string, (*mp).w_buffer)
-    };
-    let (template, is_bytes): (&[u8], bool) = match subj {
-        Subject::AsciiStr(_) | Subject::Str(_) => {
-            if !unsafe { is_str(w_template) } {
-                return Err(crate::PyError::type_error("expand: template must be str"));
-            }
-            (unsafe { w_str_get_wtf8(w_template) }.as_bytes(), false)
-        }
-        Subject::Bytes(_) => {
-            if !unsafe { pyre_object::bytesobject::is_bytes_like(w_template) } {
-                return Err(crate::PyError::type_error("expand: template must be bytes"));
-            }
-            (
-                unsafe { pyre_object::bytesobject::bytes_like_data(w_template) },
-                true,
-            )
-        }
-    };
-    let w_pat = unsafe { (*(m.get() as *const W_SRE_Match)).w_srepat };
-    let items = parse_replacement_template(w_template, template, w_pat, is_bytes)?;
-    // The parse runs Python: re-read the match and its subject.
+    let w_template = RootedObject::pin(args.get(1).copied().unwrap_or_else(w_none));
+    let w_pat = RootedObject::pin(unsafe { (*(m.get() as *const W_SRE_Match)).w_srepat });
+    let items = compile_template(w_pat.get(), w_template.get())?;
+    // Re-read after `compile_template`.
     let mp = m.get() as *const W_SRE_Match;
     let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
     let mut out: Vec<u8> = Vec::new();

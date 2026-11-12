@@ -105,8 +105,12 @@ pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
     unsafe { (*bio).read(size) }
 }
 
-pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: &[u8]) -> Result<usize, &'static str> {
-    unsafe { (*bio).write(data) }.map_err(|_| "cannot write() after write_eof()")
+pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: *const u8, len: usize) -> isize {
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    match unsafe { (*bio).write(slice) } {
+        Ok(n) => n as isize,
+        Err(_) => -1,
+    }
 }
 
 pub unsafe fn memory_bio_write_eof(bio: *mut MemoryBio) {

@@ -1076,8 +1076,7 @@ fn unpack_slow(this: &W_Struct, mut w_str: PyObjectRef) -> Result<PyObjectRef, c
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
     let fmt = pyre_object::with_roots!(w_str => crate::baseobjspace::str_utf8_w(format))?;
-    let buf = unsafe { readbuf(w_str)? };
-    do_unpack(fmt, buf)
+    do_unpack(fmt, w_str)
 }
 
 /// `BuiltinCode.func` for `Struct.pack`.
@@ -1440,8 +1439,6 @@ fn copy_endian(raw: &[u8], out: &mut [u8], bigendian: bool) {
 
 // ── unpacking driver ─────────────────────────────────────────────────
 
-/// `do_unpack` / `_unpack` — unpack the whole of `buf` (which must be
-/// exactly `calcsize(format)` bytes) according to `format`.
 /// `struct_get_unpacker` — whether an unpacker can be built for `format` at
 /// all.  A format the struct module cannot parse makes two memoryviews
 /// unequal rather than raising, so the caller needs the question answered
@@ -1453,7 +1450,11 @@ pub(crate) fn format_is_supported(format: &str) -> bool {
 /// `struct_unpack_single` — one item's fields, unwrapped when the format
 /// names exactly one of them.
 pub(crate) fn unpack_single(format: &str, item: &[u8]) -> Result<PyObjectRef, crate::PyError> {
-    let unpacked = do_unpack(format, item)?;
+    // `do_unpack` takes the buffer owner (`UnpackFormatIterator.buf`). Wrap
+    // the item window so each field can `readbuf` it; `w_bytes_from_bytes`
+    // does not collect.
+    let mut owner = w_bytes_from_bytes(item);
+    let unpacked = pyre_object::with_roots!(owner => do_unpack(format, owner))?;
     unsafe {
         match pyre_object::w_tuple_len(unpacked) {
             1 => Ok(pyre_object::w_tuple_getitem(unpacked, 0).expect("length checked")),
@@ -1462,26 +1463,71 @@ pub(crate) fn unpack_single(format: &str, item: &[u8]) -> Result<PyObjectRef, cr
     }
 }
 
-fn do_unpack_iff(format: &str, _buf: &[u8]) -> bool {
+fn do_unpack_iff(format: &str, _buf: PyObjectRef) -> bool {
     majit_rlib::jit::isconstant(format)
 }
 
+/// Re-derive the acquired window from the rooted exporter.
+///
+/// `UnpackFormatIterator.advance` / `read`: when the exporter cannot hold
+/// the acquired `offset + length`, raise
+/// `StructError("unpack str size too short for format")`.
+unsafe fn unpack_window_bytes<'a>(
+    owner: PyObjectRef,
+    offset: usize,
+    length: usize,
+) -> Result<&'a [u8], crate::PyError> {
+    match unsafe { crate::builtins::acquired_window_bytes(owner, offset, length)? } {
+        Some(buf) => Ok(buf),
+        None => Err(struct_error("unpack str size too short for format")),
+    }
+}
+
+/// `do_unpack` / `_unpack` — unpack the whole of `buf` (which must be
+/// exactly `calcsize(format)` bytes) according to `format`.
+/// `UnpackFormatIterator` keeps the Buffer and re-reads it per field.
 #[majit_macros::look_inside_iff(do_unpack_iff)]
-fn do_unpack(format: &str, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+fn do_unpack(format: &str, buf: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let buf_slot = _roots.pin_roots(&[buf]);
+    // `do_unpack`: acquire the buffer (`space.buffer_w` / `readbuf_w`)
+    // before `UnpackFormatIterator.interpret`.
+    let buflen = unsafe { readbuf(_roots.get(buf_slot))? }.len();
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
-    if buf.len() != size {
+    if buflen != size {
         return Err(struct_error(format!(
             "unpack requires a buffer of {size} bytes"
         )));
     }
-    unpack_units(&parsed, buf)
+    let owner = unsafe { crate::builtins::acquired_exporter(_roots.get(buf_slot)) };
+    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(_roots.get(buf_slot)) };
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(owner);
+    unpack_units(&parsed, owner_slot, window_offset, buflen, 0)
 }
 
 /// `UnpackFormatIterator.operate` is `@jit.unroll_safe`.
+///
+/// Each field re-derives the slice from the acquired buffer's exporter
+/// (`UnpackFormatIterator.read` / `get_buffer_and_pos` / `buf.getslice` /
+/// `buf.typed_read`) so a field allocation cannot leave a live window into a
+/// moving STR. The owner is named by a shadow-stack slot (`shadow_stack_get`),
+/// not a `&RootScope` argument. A memoryview released mid-unpack does not
+/// raise: the exporter was resolved at acquisition (`acquired_exporter`).
+///
+/// `UnpackFormatIterator.result_w` is a GC list: each converted field is
+/// appended there so later allocations cannot drop earlier results.
 #[majit_macros::unroll_safe]
-fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
-    let mut out: Vec<PyObjectRef> = Vec::new();
+fn unpack_units(
+    parsed: &Parsed,
+    owner_slot: usize,
+    window_offset: usize,
+    window_len: usize,
+    start: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_list_new_empty());
     let mut pos = 0usize;
     for (fmt, rep) in &parsed.units {
         if fmt.alignment > 1 {
@@ -1492,12 +1538,34 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
             Code::Pad => pos += rep,
             Code::Char => {
                 for _ in 0..rep {
-                    out.push(w_bytes_from_bytes(&buf[pos..pos + 1]));
+                    let b = {
+                        let buf = unsafe {
+                            unpack_window_bytes(
+                                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                                window_offset,
+                                window_len,
+                            )?
+                        };
+                        buf[start + pos]
+                    };
+                    unpack_append(result_slot, w_bytes_from_bytes(&[b]));
                     pos += 1;
                 }
             }
             Code::Str => {
-                out.push(w_bytes_from_bytes(&buf[pos..pos + rep]));
+                {
+                    let buf = unsafe {
+                        unpack_window_bytes(
+                            pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                            window_offset,
+                            window_len,
+                        )?
+                    };
+                    unpack_append(
+                        result_slot,
+                        w_bytes_from_bytes(&buf[start + pos..start + pos + rep]),
+                    );
+                }
                 pos += rep;
             }
             Code::Pascal => {
@@ -1505,62 +1573,132 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
                 // field width; the value is the following bytes.  CPython
                 // 3.14's zero-width form contributes one empty bytes value.
                 if rep == 0 {
-                    out.push(w_bytes_from_bytes(&[]));
+                    unpack_append(result_slot, w_bytes_from_bytes(&[]));
                     continue;
                 }
-                let data = &buf[pos..pos + rep];
-                let end = (1 + data[0] as usize).min(rep);
-                out.push(w_bytes_from_bytes(&data[1..end]));
+                {
+                    let buf = unsafe {
+                        unpack_window_bytes(
+                            pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                            window_offset,
+                            window_len,
+                        )?
+                    };
+                    let data = &buf[start + pos..start + pos + rep];
+                    let end = (1 + data[0] as usize).min(rep);
+                    unpack_append(result_slot, w_bytes_from_bytes(&data[1..end]));
+                }
                 pos += rep;
             }
             Code::Bool => {
                 for _ in 0..rep {
-                    out.push(boolobject::w_bool_from(buf[pos] != 0));
+                    let b = {
+                        let buf = unsafe {
+                            unpack_window_bytes(
+                                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                                window_offset,
+                                window_len,
+                            )?
+                        };
+                        buf[start + pos]
+                    };
+                    unpack_append(result_slot, boolobject::w_bool_from(b != 0));
                     pos += 1;
                 }
             }
             Code::Int { signed } => {
                 for _ in 0..rep {
-                    out.push(unpack_int(
-                        &buf[pos..pos + fmt.size],
-                        fmt.size,
-                        signed,
-                        parsed.bigendian,
-                    ));
-                    pos += fmt.size;
+                    let n = fmt.size;
+                    let raw = {
+                        let buf = unsafe {
+                            unpack_window_bytes(
+                                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                                window_offset,
+                                window_len,
+                            )?
+                        };
+                        let mut tmp = [0u8; 16];
+                        tmp[..n].copy_from_slice(&buf[start + pos..start + pos + n]);
+                        tmp
+                    };
+                    unpack_append(
+                        result_slot,
+                        unpack_int(&raw[..n], n, signed, parsed.bigendian),
+                    );
+                    pos += n;
                 }
             }
             Code::Float | Code::Double | Code::HalfFloat => {
                 for _ in 0..rep {
-                    out.push(unpack_float(
-                        &buf[pos..pos + fmt.size],
-                        fmt.code,
-                        parsed.bigendian,
-                    ));
-                    pos += fmt.size;
+                    let n = fmt.size;
+                    let raw = {
+                        let buf = unsafe {
+                            unpack_window_bytes(
+                                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                                window_offset,
+                                window_len,
+                            )?
+                        };
+                        let mut tmp = [0u8; 16];
+                        tmp[..n].copy_from_slice(&buf[start + pos..start + pos + n]);
+                        tmp
+                    };
+                    unpack_append(
+                        result_slot,
+                        unpack_float(&raw[..n], fmt.code, parsed.bigendian),
+                    );
+                    pos += n;
                 }
             }
             Code::FloatComplex | Code::DoubleComplex => {
                 for _ in 0..rep {
-                    out.push(unpack_complex(
-                        &buf[pos..pos + fmt.size],
-                        fmt.code,
-                        parsed.bigendian,
-                    ));
-                    pos += fmt.size;
+                    let n = fmt.size;
+                    let raw = {
+                        let buf = unsafe {
+                            unpack_window_bytes(
+                                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                                window_offset,
+                                window_len,
+                            )?
+                        };
+                        let mut tmp = [0u8; 16];
+                        tmp[..n].copy_from_slice(&buf[start + pos..start + pos + n]);
+                        tmp
+                    };
+                    unpack_append(
+                        result_slot,
+                        unpack_complex(&raw[..n], fmt.code, parsed.bigendian),
+                    );
+                    pos += n;
                 }
             }
         }
     }
-    Ok(w_tuple_new(out))
+    // `space.newtuple(fmtiter.result_w[:])`: the list is the GC owner;
+    // `list_to_tuple` reloads each item across the tuple allocation.
+    crate::opcode_ops::list_to_tuple_value(pyre_object::gc_roots::shadow_stack_get(result_slot))
+}
+
+/// `UnpackFormatIterator.appendobj` / `append_utf8` — `result_w.append`.
+fn unpack_append(result_slot: usize, value: PyObjectRef) {
+    unsafe {
+        w_list_append(pyre_object::gc_roots::shadow_stack_get(result_slot), value);
+    }
 }
 
 /// `do_unpack_from` — unpack `calcsize(format)` bytes of `buf` starting at
 /// `offset`, resolving a negative offset against the buffer end.
-fn do_unpack_from(format: &str, buf: &[u8], offset: i64) -> Result<PyObjectRef, crate::PyError> {
+/// `SubBuffer(buf, offset, s_size)` then `_unpack`.
+fn do_unpack_from(
+    format: &str,
+    buf: PyObjectRef,
+    offset: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let buf_slot = _roots.pin_roots(&[buf]);
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
-    let buflen = buf.len() as i64;
+    let buflen = unsafe { readbuf(_roots.get(buf_slot))? }.len() as i64;
     let mut offset = offset;
     if offset < 0 {
         if offset + size as i64 > 0 {
@@ -1584,8 +1722,17 @@ fn do_unpack_from(format: &str, buf: &[u8], offset: i64) -> Result<PyObjectRef, 
             required, size, offset, buflen
         )));
     }
-    let start = offset as usize;
-    unpack_units(&parsed, &buf[start..start + size])
+    let owner = unsafe { crate::builtins::acquired_exporter(_roots.get(buf_slot)) };
+    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(_roots.get(buf_slot)) };
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(owner);
+    unpack_units(
+        &parsed,
+        owner_slot,
+        window_offset,
+        buflen as usize,
+        offset as usize,
+    )
 }
 
 // ── half-float (IEEE 754 binary16) ───────────────────────────────────
@@ -1796,10 +1943,15 @@ impl W_Struct {
             if let Some((size, signed, bigendian)) = simple_int_format!(fmt)
                 && unsafe { bytesobject::is_bytes_like(w_str) }
             {
-                let buf = unsafe { bytesobject::bytes_like_data(w_str) };
-                if buf.len() == size
-                    && let Some(v) = unpack_simple_int(buf, size, signed, bigendian)
-                {
+                let v = {
+                    let buf = unsafe { bytesobject::bytes_like_data(w_str) };
+                    if buf.len() == size {
+                        unpack_simple_int(buf, size, signed, bigendian)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(v) = v {
                     return Ok(w_tuple_new(vec![w_int_new(v)]));
                 }
             }
@@ -1822,7 +1974,11 @@ impl W_Struct {
         let has_offset = offset.is_some();
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[format, buffer, offset.unwrap_or(pyre_object::PY_NULL)]);
-        let fmt = crate::baseobjspace::str_utf8_w(roots.get(base))?;
+        // `W_Struct.format` is a str: `set_format` stores `w_str_new_managed`
+        // of `format_to_string` (`text_or_bytes_w`). The public attribute is
+        // `interp_attrproperty` wrapfn `newtext`. Construction rejects
+        // non-ASCII, so the UTF-8 field is the format string.
+        let fmt = unsafe { as_str_unchecked(w_str_get_wtf8(roots.get(base))) };
         // Coerce `offset` before borrowing the buffer: `space_index_w` may run
         // `__index__`, which can resize or free the backing store `readbuf`
         // hands back as a raw slice.
@@ -1832,8 +1988,7 @@ impl W_Struct {
             0
         };
         buffer = roots.get(base + 1);
-        let buf = unsafe { readbuf(buffer)? };
-        do_unpack_from(fmt, buf, offset)
+        do_unpack_from(fmt, buffer, offset)
     }
 
     /// `interp_struct.py descr_iter_unpack` — a `W_UnpackIter` over
@@ -2035,7 +2190,7 @@ fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// successive fixed-size records of a buffer.  Kept in its own module
 /// because each `#[pyre_class]` emits a module-scoped `type_object()`.
 pub mod unpack_iter {
-    use super::{do_unpack, readbuf, struct_error};
+    use super::{do_unpack_from, readbuf, struct_error};
     use pyre_object::*;
 
     fn unpack_iter_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2071,17 +2226,17 @@ pub mod unpack_iter {
             if self.buffer.is_null() {
                 return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
             }
-            let buf = unsafe { readbuf(self.buffer)? };
-            if self.index >= buf.len() as i64 {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = _roots.pin_roots(&[self.format, self.buffer]);
+            let buflen = unsafe { readbuf(_roots.get(base + 1))? }.len() as i64;
+            if self.index >= buflen {
                 // CPython/PyPy release the inline Py_buffer eagerly at the
                 // first exhausted `next()`, rather than waiting for GC.
                 self.release_export();
                 return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
             }
-            let start = self.index as usize;
-            let end = start + self.size as usize;
-            let fmt = crate::baseobjspace::str_utf8_w(self.format)?;
-            let res = do_unpack(fmt, &buf[start..end])?;
+            let fmt = crate::baseobjspace::str_utf8_w(_roots.get(base))?;
+            let res = do_unpack_from(fmt, _roots.get(base + 1), self.index)?;
             self.index += self.size;
             Ok(res)
         }
@@ -2170,13 +2325,13 @@ pub mod unpack_iter {
         // after the format and leave the buffer unpublished
         // (`RootScope::pin_roots`).
         let sp = pyre_object::gc_roots::pin_roots(&[format, buffer]);
-        let buf = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? };
+        let buf_len = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? }.len();
         if size <= 0 {
             return Err(struct_error(format!(
                 "cannot iteratively unpack with a struct of length {size}"
             )));
         }
-        if buf.len() as i64 % size != 0 {
+        if buf_len as i64 % size != 0 {
             return Err(struct_error(format!(
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
@@ -2235,8 +2390,7 @@ crate::py_module! {
         }
         fn unpack(fmt_obj: PyObjectRef, mut buffer: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             let fmt = pyre_object::with_roots!(buffer => format_to_string(fmt_obj))?;
-            let buf = unsafe { readbuf(buffer)? };
-            do_unpack(&fmt, buf)
+            do_unpack(&fmt, buffer)
         }
         // `interp_struct.py unpack_from(space, w_format, w_buffer, offset=0)`.
         // `format` positional-only; `buffer` / `offset` positional-or-keyword.
@@ -2263,8 +2417,7 @@ crate::py_module! {
                 0
             };
             buffer = roots.get(base + 1);
-            let buf = unsafe { readbuf(buffer)? };
-            do_unpack_from(&fmt, buf, offset)
+            do_unpack_from(&fmt, buffer, offset)
         }
     },
     functions: {

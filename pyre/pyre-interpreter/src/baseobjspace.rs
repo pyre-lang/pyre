@@ -11392,6 +11392,45 @@ impl SimpleBufferBytes {
             );
         }
     }
+
+    /// `BytearrayBuffer.releasebuffer` / `StringBuffer`: close a transient
+    /// `buffer_w()` export.  A bytearray decrements `_exports`; immutable
+    /// bytes (`StringBuffer` / `Buffer.releasebuffer`) have no export count.
+    /// Do not call this from the Python `__release_buffer__` path
+    /// (`descr_releasebuffer` / [`Self::release`]).  `__release_buffer__` is
+    /// not invoked, so this cannot collect (`shadowstack.py gc_pop_roots`).
+    pub(crate) fn releasebuffer(mut self) {
+        debug_assert!(
+            self.release_view_slot.is_none(),
+            "BytearrayBuffer.releasebuffer is not descr_releasebuffer"
+        );
+        if self.native_export_active {
+            self.native_export_active = false;
+            let owner = pyre_object::gc_roots::shadow_stack_get(
+                self.native_owner_slot
+                    .expect("active native export has an owner"),
+            );
+            debug_assert!(
+                unsafe {
+                    pyre_object::bytearrayobject::is_bytearray(owner)
+                        || pyre_object::bytesobject::is_bytes(owner)
+                },
+                "receiver releasebuffer is for bytes/bytearray"
+            );
+            if unsafe { pyre_object::bytearrayobject::is_bytearray(owner) } {
+                unsafe { pyre_object::bytearrayobject::w_bytearray_exports_decref(owner) };
+            }
+        } else {
+            debug_assert!(
+                unsafe {
+                    pyre_object::bytesobject::is_bytes(pyre_object::gc_roots::shadow_stack_get(
+                        self._roots.base(),
+                    ))
+                },
+                "inactive native export is StringBuffer / bytes"
+            );
+        }
+    }
 }
 
 /// `ObjSpace.acquire_readbuf`: acquire and copy one `PyBUF_SIMPLE` export.
@@ -25808,6 +25847,9 @@ fn contains_bytes_like(
         // this one stays open until the export is gone. Release before each
         // return so the Result shell is a bare Ok/Err (`result_exc`
         // `lower_result_exc_returns`).
+        // CPython 3.14 bytearray search methods acquire the receiver before
+        // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
+        // resize the storage under a borrowed slice.
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[haystack, needle]);
         let exported = simple_buffer_bytes(haystack);
@@ -25821,12 +25863,12 @@ fn contains_bytes_like(
                 -1
             };
             if v < 0 || v > 255 {
-                receiver.release();
+                receiver.releasebuffer();
                 return Err(PyError::value_error("byte must be in range(0, 256)"));
             }
             if is_bytes(haystack) {
                 let found = pyre_object::bytesobject::jit_bytes_contains_byte(haystack, v) != 0;
-                receiver.release();
+                receiver.releasebuffer();
                 return Ok(found);
             }
             // `stringmethods.py descr_contains` via `_single_char`:
@@ -25842,7 +25884,7 @@ fn contains_bytes_like(
                 }
                 i += 1;
             }
-            receiver.release();
+            receiver.releasebuffer();
             return Ok(found);
         }
         match pyre_object::with_roots!(needle => {
@@ -25873,7 +25915,7 @@ fn contains_bytes_like(
                     }
                     found
                 };
-                receiver.release();
+                receiver.releasebuffer();
                 Ok(found)
             }
             Ok(None) => {
@@ -25881,18 +25923,17 @@ fn contains_bytes_like(
                     Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                     None => "object".to_string(),
                 };
-                receiver.release();
+                receiver.releasebuffer();
                 Err(PyError::type_error(format!(
                     "a bytes-like object is required, not '{tname}'"
                 )))
             }
-            Err(mut error) => {
-                // `PyError::pin` names this handle for `get_livevars_for_roots`.
-                // `release` can collect; `reload` stores the forwarded word
-                // (`shadowstack.py expand_pop_roots`).
-                let error_slot = error.pin(&roots);
-                receiver.release();
-                error.reload(&roots, error_slot);
+            Err(error) => {
+                // `descr_contains` holds the receiver export across needle
+                // conversion.  `BytearrayBuffer.releasebuffer` closes it
+                // without `memoryview_release` so the conversion error can
+                // outlive the bracket.
+                receiver.releasebuffer();
                 Err(error)
             }
         }

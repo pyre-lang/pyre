@@ -369,6 +369,23 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
         .unwrap_or(core::ptr::null_mut())
 }
 
+/// Outcome-returning twin of [`try_gc_alloc_young_nonmoving_no_collect_raw`].
+///
+/// `None` is no young-nonmoving-no-collect hook and no stable fallback hook
+/// ([`GcAllocOutcome::NoRoute`]); `Some(null)` is [`GcAllocOutcome::Failed`].
+/// Does not abort, and does not collect.
+#[inline]
+pub fn try_gc_alloc_young_nonmoving_no_collect(type_id: u32, payload_size: usize) -> Option<GCREF> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return None;
+    }
+    let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
+        return try_gc_alloc_stable(type_id, payload_size);
+    };
+    Some(hook(type_id, payload_size))
+}
+
 /// [`try_gc_alloc_stable_raw`]'s nursery twin — `malloc_fixedsize`
 /// (`framework.py`), the allocation every RPython constructor takes.
 ///

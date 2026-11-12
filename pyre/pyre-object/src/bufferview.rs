@@ -429,6 +429,20 @@ impl BufferView {
         }
     }
 
+    /// RPython-level `%r` of this view, for `descr_pypy_raw_address`.
+    pub fn internal_repr(&self) -> String {
+        let name = match self {
+            BufferView::Simple { .. } => "SimpleView",
+            BufferView::Raw { .. } => "RawBufferView",
+            BufferView::Slice { .. } => "BufferSlice",
+            BufferView::View1D { .. } => "BufferView1D",
+            BufferView::ViewND { .. } => "BufferViewND",
+            BufferView::CBuffer { .. } => "CPyBuffer",
+            BufferView::Readonly { .. } => "ReadonlyWrapper",
+        };
+        format!("<{name} object at {:p}>", self as *const BufferView)
+    }
+
     /// The backing byte storage (the root exporter's [`Buffer`]).
     #[inline]
     pub fn backing(&self) -> &Buffer {

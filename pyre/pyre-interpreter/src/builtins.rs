@@ -1786,17 +1786,28 @@ fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// `memoryview._pypy_raw_address` — the integer raw address of the view's
 /// backing store, base data pointer plus the view's byte offset
-/// (`descr_pypy_raw_address` → `get_raw_address`).  Every pyre backing
-/// (bytes / bytearray / array) is a contiguous in-heap store with a real
-/// data pointer, so the "no raw address" branch is structurally unreachable.
+/// (`descr_pypy_raw_address` → `get_raw_address`).
 fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mut mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
-        let view = pyre_object::memoryview::w_memoryview_view(mv);
-        let base = view.backing().as_bytes().as_ptr() as usize;
-        let offset = view.offset() as usize;
-        Ok(w_int_new((base + offset) as i64))
+        let (base, offset) = pyre_object::with_roots!(mv => {
+            let view = pyre_object::memoryview::w_memoryview_view(mv);
+            (view.backing().get_raw_address(), view.offset() as usize)
+        });
+        match base {
+            Ok(base) => Ok(w_int_new((base as usize + offset) as i64)),
+            Err(pyre_object::buffer::RawAddressError::Memory) => {
+                Err(crate::PyError::memory_error(""))
+            }
+            Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+                let view = pyre_object::memoryview::w_memoryview_view(mv);
+                Err(crate::PyError::value_error(format!(
+                    "cannot find the underlying address of buffer that is internally {}",
+                    view.internal_repr()
+                )))
+            }
+        }
     }
 }
 
@@ -25518,9 +25529,127 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
                 return Ok(&full[off..off + len]);
             }
         }
-        // This is the object-space acquisition layer; public gateways that
-        // own a more specific refusal (for example mmap's `Py_buffer`
-        // converter) translate this TypeError at their boundary.
+        // `ObjSpace._getarg_error("bytes-like object")` (`acquire_py_buffer`).
+        Err(crate::PyError::type_error(if pyre_object::is_none(obj) {
+            "a bytes-like object is required, not None".to_string()
+        } else {
+            format!(
+                "a bytes-like object is required, not {}",
+                crate::error::type_name_of(obj)
+            )
+        }))
+    }
+}
+
+/// Root exporter of an already-acquired buffer (`space.readbuf_w`).
+///
+/// A memoryview is resolved to `view.backing().w_obj()` so later field
+/// reads do not touch a released view (`W_MemoryView.buffer_w` returns
+/// `NonOwningReleaseView(self.view)`; `UnpackFormatIterator.read` /
+/// `StringUnmarshaller.get` hold that inner view).
+pub(crate) unsafe fn acquired_exporter(buf: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if pyre_object::memoryview::is_w_memoryview(buf) {
+            pyre_object::memoryview::w_memoryview_view(buf)
+                .backing()
+                .w_obj()
+        } else {
+            buf
+        }
+    }
+}
+
+/// Byte offset of the acquired window inside [`acquired_exporter`]'s storage.
+///
+/// `Buffer.Sub.offset` plus `BufferView.offset` (a `SubBuffer` window).
+pub(crate) unsafe fn acquired_exporter_offset(buf: PyObjectRef) -> usize {
+    unsafe {
+        if !pyre_object::memoryview::is_w_memoryview(buf) {
+            return 0;
+        }
+        let view = pyre_object::memoryview::w_memoryview_view(buf);
+        let extra = match view.backing() {
+            pyre_object::buffer::Buffer::Sub { offset, .. } => *offset,
+            _ => 0,
+        };
+        extra + view.offset() as usize
+    }
+}
+
+/// Re-derive the acquired window from the rooted exporter.
+///
+/// Not a memoryview, so this does not re-check a released view
+/// (`UnpackFormatIterator.read` / `StringUnmarshaller.get`).
+/// `Ok(None)` when the exporter's current storage cannot hold
+/// `offset + length` (`UnpackFormatIterator.advance`).
+pub(crate) unsafe fn acquired_window_bytes<'a>(
+    owner: PyObjectRef,
+    offset: usize,
+    length: usize,
+) -> Result<Option<&'a [u8]>, crate::PyError> {
+    let full = unsafe { acquire_readbuf(owner)? };
+    if offset > full.len() || length > full.len() - offset {
+        return Ok(None);
+    }
+    Ok(Some(&full[offset..offset + length]))
+}
+
+/// `space.readbuf_w` plus `Buffer.get_raw_address`: a C address that outlives
+/// this call.
+pub unsafe fn acquire_readbuf_raw_address(
+    obj: PyObjectRef,
+) -> Result<(*mut u8, usize), crate::PyError> {
+    unsafe {
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
+        {
+            return Ok((address as *mut u8, length));
+        }
+        // Bytes go through `_cffi_backend` `from_buffer` /
+        // `get_raw_address_of_string` (`RawBytesCache`) before this helper.
+        if pyre_object::bytesobject::is_bytes_like(obj) && !pyre_object::bytesobject::is_bytes(obj)
+        {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
+            return Ok((data.as_ptr() as *mut u8, data.len()));
+        }
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
+            return Ok((address as *mut u8, length));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            let data = pyre_object::interp_array::w_array_bytes(obj);
+            return Ok((data.as_ptr() as *mut u8, data.len()));
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if !memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let view = pyre_object::memoryview::w_memoryview_view(obj);
+            // Offset, length, and `%T` before `get_raw_address`
+            // (`StringBuffer.get_raw_address`): that call can collect, and
+            // `obj` / `view` are raw copies the GC does not rewrite.
+            let type_name = crate::error::type_name_of(obj);
+            let off = view.offset() as usize;
+            let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+            let base = view.backing().get_raw_address();
+            return match base {
+                Ok(base) => Ok((base.add(off), len)),
+                Err(pyre_object::buffer::RawAddressError::Memory) => {
+                    Err(crate::PyError::memory_error(""))
+                }
+                // `func.py from_buffer` `except ValueError`.
+                Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+                    Err(crate::PyError::type_error(format!(
+                        "from_buffer() got a '{type_name}' object, which supports the buffer interface but cannot be rendered as a plain raw address on PyPy"
+                    )))
+                }
+            };
+        }
         Err(crate::PyError::type_error(
             "a bytes-like object is required",
         ))

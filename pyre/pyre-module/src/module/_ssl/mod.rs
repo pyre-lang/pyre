@@ -654,6 +654,23 @@ fn allocate_ssl_session(
     session
 }
 
+/// `llstr` of `Certificate.der` for `rffi.scoped_nonmovingbuffer`.
+///
+/// Does not construct the guard: `get_info` / `__repr__` / `__hash__` hold it
+/// as a local, the `with rffi.scoped_nonmovingbuffer(data) as buf` shape of
+/// `rposix.write`.
+fn certificate_der_llstr(der: PyObjectRef) -> (majit_ir::GcRef, usize) {
+    let len = unsafe { pyre_object::bytesobject::w_bytes_len(der) };
+    let llobj = majit_ir::GcRef(unsafe { pyre_object::bytesobject::w_bytes_block(der) } as usize);
+    (llobj, len)
+}
+
+fn scoped_nonmovingbuffer_memory_error(
+    err: majit_rlib::rffi::MemoryError,
+) -> pyre_interpreter::PyError {
+    pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &err)
+}
+
 fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
     let _ = certificate_methods::type_object();
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1147,21 +1164,13 @@ mod context_methods {
                             false,
                         )
                     };
-                    let mut failure = match loaded {
-                        Ok(_) => None,
-                        Err(_) => Some(ssl_error(
-                            "not enough data: cadata does not contain a certificate",
-                        )),
-                    };
-                    if let Some(err) = failure.take() {
-                        let _roots = pyre_object::gc_roots::push_roots();
-                        let mut err = err;
-                        let slot = err.pin(&_roots);
-                        buffer.release();
-                        err.reload(&_roots, slot);
-                        return Err(err);
-                    }
+                    // `rffi.scoped_nonmovingbuffer`: close the export before
+                    // instantiating the exception so `pop_roots` cannot
+                    // discard a pin appended above it.
                     buffer.release();
+                    loaded.map_err(|_| {
+                        ssl_error("not enough data: cadata does not contain a certificate")
+                    })?;
                 }
             }
             Ok(())
@@ -1657,15 +1666,22 @@ mod memory_bio_methods {
         }
 
         fn write(&mut self, data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-            let buffer =
-                pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error("a bytes-like object is required")
-                })?;
-            let result =
-                unsafe { pyre_native::ssl::memory_bio_write(self.backend, buffer.as_bytes()) }
-                    .map_err(ssl_error);
-            buffer.release();
-            result
+            // `MemoryBIO.write`: `ffi.from_buffer` then
+            // `BIO_write(self.bio, buf, len(buf))` yields `nbytes`, the
+            // `with` closes, then `nbytes < 0` raises `ssl_error`.
+            // `acquire_readbuf` is `space.readbuf_w`. `readbuf_w` does not
+            // export, so there is no lease to close before the exception
+            // exists (`rffi.scoped_nonmovingbuffer`).
+            let bytes = unsafe { pyre_interpreter::builtins::acquire_readbuf(data)? };
+            let nbytes = unsafe {
+                pyre_native::ssl::memory_bio_write(self.backend, bytes.as_ptr(), bytes.len())
+            };
+            let result = if nbytes < 0 {
+                Err("cannot write() after write_eof()")
+            } else {
+                Ok(nbytes as usize)
+            };
+            result.map_err(ssl_error)
         }
 
         fn write_eof(&mut self) {
@@ -1833,8 +1849,15 @@ mod ssl_socket_methods {
             if !data.is_empty() {
                 let outgoing = W_MemoryBIO::from_obj(socket.outgoing)
                     .expect("_wrap_bio validated its outgoing MemoryBIO");
-                unsafe { pyre_native::ssl::memory_bio_write(outgoing.backend, &data) }
-                    .map_err(ssl_error)?;
+                let nbytes = unsafe {
+                    pyre_native::ssl::memory_bio_write(outgoing.backend, data.as_ptr(), data.len())
+                };
+                let result = if nbytes < 0 {
+                    Err("cannot write() after write_eof()")
+                } else {
+                    Ok(())
+                };
+                result.map_err(ssl_error)?;
             }
             return Ok(());
         }
@@ -2515,25 +2538,11 @@ mod ssl_socket_methods {
             if let Err((code, _)) = &result {
                 latch_eof_code(self, *code);
             }
-            let written_or_err = tls_result(result);
-            let mut failure = None;
-            let written = match written_or_err {
-                Ok(n) => Some(n),
-                Err(err) => {
-                    failure = Some(err);
-                    None
-                }
-            };
-            if let Some(err) = failure.take() {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let mut err = err;
-                let slot = err.pin(&_roots);
-                buffer.release();
-                err.reload(&_roots, slot);
-                return Err(err);
-            }
+            // `rffi.scoped_nonmovingbuffer`: close the export before
+            // instantiating the exception so `pop_roots` cannot discard a
+            // pin appended above it.
             buffer.release();
-            let written = written.unwrap();
+            let written = tls_result(result)?;
             flush_transport(self)?;
             Ok(written)
         }
@@ -3082,22 +3091,40 @@ mod certificate_methods {
             Err(pyre_interpreter::PyError::value_error("Unsupported format"))
         }
 
+        /// `Certificate.get_info` → `_decode_certificate`. The DER pin is a
+        /// local `rffi.scoped_nonmovingbuffer` (`rposix.write`).
         fn get_info(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
-            let decoded = native_result(pyre_native::ssl::certificate_decode_der(der))?;
+            let (llobj, len) = certificate_der_llstr(self.der);
+            let buf = majit_rlib::rffi::scoped_nonmovingbuffer::new(llobj)
+                .map_err(scoped_nonmovingbuffer_memory_error)?;
+            let decoded = native_result(pyre_native::ssl::certificate_decode_der(unsafe {
+                std::slice::from_raw_parts(buf.buf, len)
+            }))?;
             Ok(decoded_certificate_dict(decoded))
         }
 
+        /// `Certificate.__repr__`. The DER pin is a local
+        /// `rffi.scoped_nonmovingbuffer` (`rposix.write`).
         fn __repr__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
-            let subject = native_result(pyre_native::ssl::certificate_subject_rfc2253(der))?;
+            let (llobj, len) = certificate_der_llstr(self.der);
+            let buf = majit_rlib::rffi::scoped_nonmovingbuffer::new(llobj)
+                .map_err(scoped_nonmovingbuffer_memory_error)?;
+            let subject = native_result(pyre_native::ssl::certificate_subject_rfc2253(unsafe {
+                std::slice::from_raw_parts(buf.buf, len)
+            }))?;
             Ok(w_str_new_managed(&format!("<Certificate '{subject}'>")))
         }
 
+        /// `Certificate.__hash__`. The DER pin is a local
+        /// `rffi.scoped_nonmovingbuffer` (`rposix.write`).
         fn __hash__(&mut self) -> Result<i64, pyre_interpreter::PyError> {
             if self.hash == -1 {
-                let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
-                self.hash = native_result(pyre_native::ssl::certificate_subject_hash(der))?;
+                let (llobj, len) = certificate_der_llstr(self.der);
+                let buf = majit_rlib::rffi::scoped_nonmovingbuffer::new(llobj)
+                    .map_err(scoped_nonmovingbuffer_memory_error)?;
+                self.hash = native_result(pyre_native::ssl::certificate_subject_hash(unsafe {
+                    std::slice::from_raw_parts(buf.buf, len)
+                }))?;
                 if self.hash == -1 {
                     self.hash = -2;
                 }

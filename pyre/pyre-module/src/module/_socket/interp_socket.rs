@@ -5799,17 +5799,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let args_roots = pyre_object::gc_roots::push_roots();
             let args_base = args_roots.pin_roots(args);
             let mut obj = args_roots.get(args_base);
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            // The export owns a bracket of its own, above this one; this one
-            // keeps `obj` rooted until the export is released.
+            // `send_w` unwrap_spec(data='bufferstr', flags=int): copy the
+            // buffer and close the export before flags conversion and send.
+            // A pin above the export's RootScope would be truncated by
+            // `pop_roots`. `RSocket.send_raw` reads `self.fd` after that.
             let obj_roots = pyre_object::gc_roots::push_roots();
-            let obj_base = obj_roots.pin_roots(&[obj]);
+            let obj_slot = obj_roots.pin_roots(&[obj]);
             let acquired =
                 pyre_interpreter::baseobjspace::simple_buffer_bytes(args_roots.get(args_base + 1));
-            obj = obj_roots.get(obj_base);
             let buffer = acquired?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("send: buffer must be bytes-like")
             })?;
+            let data = buffer.into_bytes();
+            obj = obj_roots.get(obj_slot);
             let flags = if nargs >= 3 {
                 pyre_object::with_roots!(obj => {
                     pyre_interpreter::baseobjspace::c_int_w(args_roots.get(args_base + 2))
@@ -5817,26 +5819,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
-            // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
-            // `Drop`, so an export that is never released leaves a `bytearray`
-            // argument permanently exported and unable to be resized. The
-            // result is held rather than propagated so the release covers the
-            // error paths too.
-            let result = pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))
-                .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
-            match result {
-                Ok(n) => {
-                    buffer.release();
-                    Ok(pyre_object::w_int_new(n as i64))
-                }
-                Err(error) => {
-                    let mut error = error;
-                    let error_slot = error.pin(&obj_roots);
-                    buffer.release();
-                    error.reload(&obj_roots, error_slot);
-                    Err(error)
-                }
-            }
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+            pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))?;
+            let n = socket_send_bytes(obj, fd, &data, flags)?;
+            Ok(pyre_object::w_int_new(n as i64))
         })
     );
 
@@ -5853,17 +5839,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let args_roots = pyre_object::gc_roots::push_roots();
             let args_base = args_roots.pin_roots(args);
             let mut obj = args_roots.get(args_base);
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            // The export owns a bracket of its own, above this one; this one
-            // keeps `obj` rooted until the export is released.
+            // `sendall_w` unwrap_spec(data='bufferstr', flags=int): copy the
+            // buffer and close the export before flags conversion and send.
+            // `RSocket.sendall` / `send_raw` read `self.fd` after that.
             let obj_roots = pyre_object::gc_roots::push_roots();
-            let obj_base = obj_roots.pin_roots(&[obj]);
+            let obj_slot = obj_roots.pin_roots(&[obj]);
             let acquired =
                 pyre_interpreter::baseobjspace::simple_buffer_bytes(args_roots.get(args_base + 1));
-            obj = obj_roots.get(obj_base);
             let buffer = acquired?.ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
+            let data = buffer.into_bytes();
+            obj = obj_roots.get(obj_slot);
             let flags = if nargs >= 3 {
                 pyre_object::with_roots!(obj => {
                     pyre_interpreter::baseobjspace::c_int_w(args_roots.get(args_base + 2))
@@ -5879,66 +5866,51 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     std::time::Instant::now()
                         + std::time::Duration::from_secs_f64(timeout.min(i32::MAX as f64 / 1000.0))
                 });
-            // See `send` above: the export is released once the borrow of
-            // `buffer` ends, on the error path as well.
-            let result = (|| -> Result<(), pyre_interpreter::PyError> {
-                let buf = buffer.as_bytes();
-                let mut off = 0usize;
-                while off < buf.len() {
-                    if let Some(deadline) = deadline {
-                        socket_wait_writable_until(fd, deadline)?;
+            let buf = data.as_slice();
+            let mut off = 0usize;
+            while off < buf.len() {
+                // `RSocket.send_raw` reads `self.fd` on every attempt.
+                let fd = socket_fd(obj_roots.get(obj_slot))?;
+                if let Some(deadline) = deadline {
+                    socket_wait_writable_until(fd, deadline)?;
+                }
+                #[cfg(unix)]
+                let (n, errno) = match majit_rlib::rsocket::send(fd, &buf[off..], flags) {
+                    Ok(sent) => (sent, 0),
+                    Err(error) => (-1, error.errno),
+                };
+                #[cfg(windows)]
+                let (n, errno) = socket_call(|| unsafe {
+                    rffi::send(
+                        fd,
+                        buf[off..].as_ptr() as *const libc::c_void,
+                        buf.len() - off,
+                        flags,
+                    )
+                });
+                // `rsocket.py:RSocket.sendall` invokes its
+                // `signal_checker` after every attempt, not only after an
+                // EINTR.  SA_RESTART can defer the syscall return until a
+                // socket timeout, but the handler still owns the result.
+                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                if n < 0 {
+                    if rffi::error_is_interrupted(errno) {
+                        continue;
                     }
-                    #[cfg(unix)]
-                    let (n, errno) = match majit_rlib::rsocket::send(fd, &buf[off..], flags) {
-                        Ok(sent) => (sent, 0),
-                        Err(error) => (-1, error.errno),
-                    };
-                    #[cfg(windows)]
-                    let (n, errno) = socket_call(|| unsafe {
-                        rffi::send(
-                            fd,
-                            buf[off..].as_ptr() as *const libc::c_void,
-                            buf.len() - off,
-                            flags,
-                        )
-                    });
-                    // `rsocket.py:RSocket.sendall` invokes its
-                    // `signal_checker` after every attempt, not only after an
-                    // EINTR.  SA_RESTART can defer the syscall return until a
-                    // socket timeout, but the handler still owns the result.
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                    if n < 0 {
-                        if rffi::error_is_interrupted(errno) {
-                            continue;
-                        }
-                        if deadline.is_some() && rffi::error_is_would_block(errno) {
-                            // Readiness can be consumed between poll and send;
-                            // keep sendall's operation-wide deadline rather
-                            // than exposing the transient race.
-                            continue;
-                        }
-                        return Err(socket_io_err_for_operation(
-                            obj,
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
+                    if deadline.is_some() && rffi::error_is_would_block(errno) {
+                        // Readiness can be consumed between poll and send;
+                        // keep sendall's operation-wide deadline rather
+                        // than exposing the transient race.
+                        continue;
                     }
-                    off += n as usize;
+                    return Err(socket_io_err_for_operation(
+                        obj_roots.get(obj_slot),
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
-                Ok(())
-            })();
-            match result {
-                Ok(()) => {
-                    buffer.release();
-                    Ok(pyre_object::w_none())
-                }
-                Err(error) => {
-                    let mut error = error;
-                    let error_slot = error.pin(&obj_roots);
-                    buffer.release();
-                    error.reload(&obj_roots, error_slot);
-                    Err(error)
-                }
+                off += n as usize;
             }
+            Ok(pyre_object::w_none())
         })
     );
 
@@ -6003,15 +5975,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let args_roots = pyre_object::gc_roots::push_roots();
                 let args_base = args_roots.pin_roots(args);
                 let mut obj = args_roots.get(args_base);
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-                // The export owns a bracket of its own, above this one; this one
-                // keeps `obj` rooted until the export is released.
+                // `sendto_w` `bufferstr_w`: copy the buffer and close the
+                // export before flags conversion, `pack_inet_addr`, and send.
+                // `RSocket.sendto` reads `self.fd` after that.
                 let obj_roots = pyre_object::gc_roots::push_roots();
-                let obj_base = obj_roots.pin_roots(&[obj]);
+                let obj_slot = obj_roots.pin_roots(&[obj]);
                 let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(
                     args_roots.get(args_base + 1),
                 );
-                obj = obj_roots.get(obj_base);
                 let buffer = acquired?.ok_or_else(|| {
                     pyre_interpreter::PyError::type_error(format!(
                         "a bytes-like object is required, not '{}'",
@@ -6020,6 +5991,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         )
                     ))
                 })?;
+                let data = buffer.into_bytes();
+                obj = obj_roots.get(obj_slot);
                 // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
                 // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
                 // and 4 args = (self, buf, flags, addr).
@@ -6036,74 +6009,55 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     })?;
                     (flags, 3usize)
                 };
-                // See `send` above: the export is released once the borrow of
-                // `buffer` ends, on the error path as well. `pack_inet_addr` runs
-                // Python, so it is inside the released scope too.
-                let result = (|| -> Result<isize, pyre_interpreter::PyError> {
-                    let buf = buffer.as_bytes();
-                    // `getdict_native` can collect; `sendmsg` reads `_family`
-                    // / `_proto` from the live pin, and `pack_inet_addr` runs
-                    // Python, so every later use reloads the same slot.
-                    let family =
-                        socket_get_attr_i64(obj_roots.get(obj_base), "_family") as libc::c_int;
-                    let proto =
-                        socket_get_attr_i64(obj_roots.get(obj_base), "_proto") as libc::c_int;
-                    let (storage, slen) = pack_inet_addr(
-                        "sendto",
-                        family,
-                        proto,
-                        args_roots.get(args_base + addr_index),
-                    )?;
-                    socket_wait_writable(obj_roots.get(obj_base), fd)?;
-                    loop {
-                        #[cfg(unix)]
-                        let (r, errno) = {
-                            let bytes = std::slice::from_raw_parts(
-                                &storage as *const _ as *const u8,
-                                slen as usize,
-                            );
-                            match majit_rlib::rsocket::sendto(fd, buf, flags, bytes) {
-                                Ok(sent) => (sent, 0),
-                                Err(error) => (-1, error.errno),
-                            }
-                        };
-                        #[cfg(windows)]
-                        let (r, errno) = socket_call(|| {
-                            rffi::sendto(
-                                fd,
-                                buf.as_ptr() as *const libc::c_void,
-                                buf.len(),
-                                flags,
-                                &storage as *const _ as *const rffi::sockaddr,
-                                slen,
-                            )
-                        });
-                        if r >= 0 {
-                            return Ok(r);
+                let buf = data.as_slice();
+                // `getdict_native` can collect; `sendmsg` reads `_family`
+                // / `_proto` from the live pin, and `pack_inet_addr` runs
+                // Python, so every later use reloads the same slot.
+                let family = socket_get_attr_i64(obj_roots.get(obj_slot), "_family") as libc::c_int;
+                let proto = socket_get_attr_i64(obj_roots.get(obj_slot), "_proto") as libc::c_int;
+                let (storage, slen) = pack_inet_addr(
+                    "sendto",
+                    family,
+                    proto,
+                    args_roots.get(args_base + addr_index),
+                )?;
+                let fd = socket_fd(obj_roots.get(obj_slot))?;
+                socket_wait_writable(obj_roots.get(obj_slot), fd)?;
+                loop {
+                    #[cfg(unix)]
+                    let (r, errno) = {
+                        let bytes = std::slice::from_raw_parts(
+                            &storage as *const _ as *const u8,
+                            slen as usize,
+                        );
+                        match majit_rlib::rsocket::sendto(fd, buf, flags, bytes) {
+                            Ok(sent) => (sent, 0),
+                            Err(error) => (-1, error.errno),
                         }
-                        if !rffi::error_is_interrupted(errno) {
-                            return Err(socket_io_err_for_operation(
-                                obj_roots.get(obj_base),
-                                std::io::Error::from_raw_os_error(errno),
-                            ));
-                        }
-                        // EINTR: deliver a pending signal, then retry
-                        // (`converted_error` eintr_retry).
-                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    #[cfg(windows)]
+                    let (r, errno) = socket_call(|| {
+                        rffi::sendto(
+                            fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            buf.len(),
+                            flags,
+                            &storage as *const _ as *const rffi::sockaddr,
+                            slen,
+                        )
+                    });
+                    if r >= 0 {
+                        return Ok(pyre_object::w_int_new(r as i64));
                     }
-                })();
-                match result {
-                    Ok(n) => {
-                        buffer.release();
-                        Ok(pyre_object::w_int_new(n as i64))
+                    if !rffi::error_is_interrupted(errno) {
+                        return Err(socket_io_err_for_operation(
+                            obj_roots.get(obj_slot),
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
-                    Err(error) => {
-                        let mut error = error;
-                        let error_slot = error.pin(&obj_roots);
-                        buffer.release();
-                        error.reload(&obj_roots, error_slot);
-                        Err(error)
-                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 }
             })
         )

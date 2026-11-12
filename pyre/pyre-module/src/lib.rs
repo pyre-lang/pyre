@@ -407,6 +407,13 @@ pub fn register() {
                 // `mark_prebuilt_roots_dirty`, so its possibly young dicts must
                 // be forwarded on the first collection.
                 module::_pickle::walk_pickle_state_gc(fwd);
+                // `func.py RawBytesCache` weak-box keys (`WEAKDICTENTRY.key`).
+                #[cfg(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    not(target_arch = "wasm32")
+                ))]
+                module::_cffi_backend::func::walk_raw_bytes_cache_gc(fwd);
             },
             publish_fnaddrs: publish_optional_fnaddrs,
             mini_buffer_params: hook_mini_buffer_params,
