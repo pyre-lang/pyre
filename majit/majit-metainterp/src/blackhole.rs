@@ -13654,10 +13654,20 @@ fn bh_vable_type_info(
     if !bh.virtualizable_info.is_null() {
         return unsafe { &*bh.virtualizable_info };
     }
-    for jd in bh.jitdrivers_sd.iter() {
-        if !jd.virtualizable_info.is_null() {
-            return unsafe { &*jd.virtualizable_info };
-        }
+    let mut infos = bh
+        .jitdrivers_sd
+        .iter()
+        .filter(|jd| !jd.virtualizable_info.is_null())
+        .map(|jd| unsafe { &*jd.virtualizable_info });
+    if let Some(first) = infos.next() {
+        // The jitcode index does not name its owning TYPE; the scan is
+        // sound only while every registered vinfo is one VTYPE layout.
+        assert!(
+            infos.all(|info| first.same_vtype_layout(info)),
+            "vable opcode under a novirtualizable driver: registered drivers carry \
+             different VTYPE layouts, so `fielddescr.get_vinfo()` is ambiguous"
+        );
+        return first;
     }
     panic!(
         "vable opcode requires `fielddescr.get_vinfo()` \

@@ -935,6 +935,23 @@ impl TypeInfo {
 
     /// Create a type info for a fixed-size object with GC pointer fields.
     /// `offsets` lists byte offsets of GcRef fields within the payload.
+    /// Whether this row carries no collector policy beyond its layout, as
+    /// [`TypeInfo::with_gc_ptrs`] builds it.
+    pub fn is_plain_fixed(&self) -> bool {
+        self.custom_trace.is_none()
+            && !self.inherits_parent_offsets
+            && !self.is_object
+            && !self.has_subclass_range
+            && !self.hide_from_app_level_inspector
+            && !self.has_no_typedef
+            && self.app_level_inspector_hidden_edge_offset.is_none()
+            && self.parent.is_none()
+            && !self.is_weakref
+            && self.destructor.is_none()
+            && self.old_style_finalizer.is_none()
+            && self.memory_pressure_offset.is_none()
+    }
+
     pub fn with_gc_ptrs(size: usize, offsets: Vec<usize>) -> Self {
         let has_gc_ptrs = !offsets.is_empty();
         TypeInfo {
@@ -1576,12 +1593,17 @@ impl TypeRegistry {
     /// (`can_add_new_types` is false) a reconstructed SizeDescr still
     /// has to reuse that row rather than `register`. Offset order is
     /// not identity: both sides are sorted.
+    ///
+    /// Size and offsets are not a type identity: `id_of_type[TYPE]` also
+    /// owns the row's `custom_trace`, destructor, finalizer, weakref and
+    /// object bits. Only a row with the semantics `register` would give
+    /// this layout ([`TypeInfo::with_gc_ptrs`]) is reused.
     pub fn find_fixed_type(&self, size: usize, gc_ptr_offsets: &[usize]) -> Option<u32> {
         let mut want = gc_ptr_offsets.to_vec();
         want.sort_unstable();
         want.dedup();
         self.entries.iter().enumerate().find_map(|(id, info)| {
-            if info.item_size != 0 || info.size != size {
+            if info.item_size != 0 || info.size != size || !info.is_plain_fixed() {
                 return None;
             }
             let mut have = info.gc_ptr_offsets.clone();
@@ -1722,6 +1744,18 @@ mod tests {
         assert_eq!(reg.find_fixed_type(104, &[16, 24]), Some(id));
         assert_eq!(reg.find_fixed_type(104, &[0]), None);
         assert_eq!(reg.find_fixed_type(16, &[]), None);
+    }
+
+    #[test]
+    fn find_fixed_type_skips_a_row_with_collector_policy() {
+        unsafe fn noop_destructor(_obj: usize) {}
+        let mut reg = TypeRegistry::new();
+        let mut with_destructor = TypeInfo::with_gc_ptrs(64, vec![8]);
+        with_destructor.destructor = Some(noop_destructor);
+        let _ = reg.register(with_destructor);
+        assert_eq!(reg.find_fixed_type(64, &[8]), None);
+        let plain = reg.register(TypeInfo::with_gc_ptrs(64, vec![8]));
+        assert_eq!(reg.find_fixed_type(64, &[8]), Some(plain));
     }
 
     #[test]

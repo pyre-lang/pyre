@@ -18089,6 +18089,11 @@ pub fn unpack_into_w_portal(
                         pyre_object::gc_roots::shadow_stack_get(list_slot as usize),
                         pyre_object::gc_roots::shadow_stack_get(item_slot),
                     );
+                    // `generator.py` `results.append(w_result)` raises its
+                    // MemoryError here, before the next `_invoke_execute_frame`.
+                    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                        return Err(crate::runtime_ops::fetch_memory_error());
+                    }
                 }
             }
         }

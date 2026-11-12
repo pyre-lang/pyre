@@ -12862,8 +12862,11 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });
@@ -12914,8 +12917,11 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });

@@ -3302,6 +3302,12 @@ fn raw_taken_by_address_offset(
         return None;
     }
     let owner = field.owner_root.as_deref()?;
+    // `rtuple.py` lays `TUPLE_TYPE` out from its item spellings, one word
+    // per `Vec` item. That offset does not address an item of the host
+    // tuple the pointer names.
+    if majit_ir::descr::positional_shape_id(owner).is_some() {
+        return None;
+    }
     if let Some(layout) = cc.and_then(|cc| cc.struct_layout_for(owner))
         && let Some(row) = layout.fields.iter().find(|row| row.name == field.name)
     {
@@ -21179,6 +21185,23 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "one-word raw struct borrow must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `&storage.1` of a host `(Vec, Vec)` is not `int_add` of the
+    /// `TUPLE_TYPE` item offset.
+    #[test]
+    fn positional_tuple_item_borrow_is_not_a_raw_substruct_offset() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let owner =
+            "Tuple<alloc::vec::Vec<*mut object::PyObject>,alloc::vec::Vec<*mut object::PyObject>>";
+        assert!(majit_ir::descr::positional_shape_id(owner).is_some());
+        let field = FieldDescriptor::new("__pos_1", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            raw_taken_by_address_offset(&field, Some(&CallControl::new())),
+            None
         );
     }
 

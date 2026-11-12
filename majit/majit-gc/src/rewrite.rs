@@ -1521,8 +1521,12 @@ impl GcRewriterImpl {
         // A no-identity mint (`arraydescrof_concrete` without ARRAY)
         // is invisible to `register_unresolved_array_tids`; stamp here
         // while the GIL is held so path #2 `gen_initialize_tid` does
-        // not bake `UNSET_GC_TYPE_ID`.
-        majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr_ref, "handle_new_array");
+        // not bake `UNSET_GC_TYPE_ID`. NEWSTR / NEWUNICODE carry
+        // `gc_ll_descr.str_descr` / `unicode_descr`, which the GC
+        // description owns and is not an `op.getdescr()` mint.
+        if kind == 0 {
+            majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr_ref, "handle_new_array");
+        }
         let descr = descr_ref
             .as_array_descr()
             .expect("handle_new_array descr must be ArrayDescr");

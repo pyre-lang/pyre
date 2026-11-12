@@ -5638,26 +5638,35 @@ impl TraceCtx {
     /// `pyjitpl.py MIFrame.opimpl_getfield_vable_*` then runs
     /// `_nonstandard_virtualizable`, which falls back to getfield_gc when
     /// the current driver's vinfo is None.
+    ///
+    /// The jitcode index does not name its owning TYPE, so the scan is only
+    /// sound while every registered vinfo is one VTYPE layout; two
+    /// different layouts make the index ambiguous and panic here rather
+    /// than read another TYPE's offsets.
     fn vable_type_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
         if let Some(info) = self.virtualizable_info.as_ref() {
             return Some(info);
         }
-        self.metainterp_sd
+        let mut infos = self
+            .metainterp_sd
             .jitdrivers_sd
             .iter()
-            .find_map(|jd| jd.virtualizable_info.as_ref())
+            .filter_map(|jd| jd.virtualizable_info.as_ref());
+        let first = infos.next()?;
+        assert!(
+            infos.all(|info| first.same_vtype_layout(info)),
+            "vable opcode under a novirtualizable driver: registered drivers carry \
+             different VTYPE layouts, so `fielddescr.get_vinfo()` is ambiguous"
+        );
+        Some(first)
     }
 
     /// FieldDescr encoded as the jitcode `d` operand of `getfield_vable_*`.
     pub fn encoded_vable_static_field_descr(&self, field_idx: usize) -> Option<DescrRef> {
-        if let Some(info) = self.virtualizable_info.as_ref() {
-            return info.static_field_descrs().get(field_idx).cloned();
-        }
-        self.metainterp_sd
-            .jitdrivers_sd
-            .iter()
-            .filter_map(|jd| jd.virtualizable_info.as_ref())
-            .find_map(|info| info.static_field_descrs().get(field_idx).cloned())
+        self.vable_type_info()?
+            .static_field_descrs()
+            .get(field_idx)
+            .cloned()
     }
 
     /// `(arrayfielddescr, arraydescr)` encoded as the jitcode `d` pair of
@@ -5668,14 +5677,7 @@ impl TraceCtx {
             let adescr = info.array_descrs.get(array_idx)?.clone();
             Some((fdescr, adescr))
         };
-        if let Some(info) = self.virtualizable_info.as_ref() {
-            return pair(info);
-        }
-        self.metainterp_sd
-            .jitdrivers_sd
-            .iter()
-            .filter_map(|jd| jd.virtualizable_info.as_ref())
-            .find_map(|info| pair(info))
+        pair(self.vable_type_info()?)
     }
 
     /// Length of the TYPE vinfo's static-field table, for the absent-descr
@@ -10018,6 +10020,30 @@ mod tests {
             Some(expected_offset)
         );
         assert!(ctx.encoded_vable_static_field_descr(99).is_none());
+    }
+
+    /// `descr.py` `ArrayOrFieldDescr.get_vinfo`: an index only names a field
+    /// within one VTYPE. Two registered layouts make the novable fallback
+    /// ambiguous, so it must not pick the first driver's offsets.
+    #[test]
+    #[should_panic(expected = "different VTYPE layouts")]
+    fn encoded_vable_static_field_descr_rejects_two_vtype_layouts() {
+        let vinfo = |offset| {
+            let mut info = VirtualizableInfo::new(0);
+            info.add_field("f", Type::Ref, offset);
+            info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+            std::sync::Arc::new(info)
+        };
+        let mut sd = crate::MetaInterpStaticData::new();
+        for offset in [8, 16] {
+            let mut jd = JitDriverStaticData::new(vec![], vec![]);
+            jd.virtualizable_info = Some(vinfo(offset));
+            sd.jitdrivers_sd.push(jd);
+        }
+        let mut recorder = Trace::new();
+        recorder.record_input_arg(Type::Ref);
+        let ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(sd));
+        let _ = ctx.encoded_vable_static_field_descr(0);
     }
 
     /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`

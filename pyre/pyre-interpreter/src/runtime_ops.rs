@@ -2441,6 +2441,54 @@ pub extern "C" fn bh_next(iter: i64) -> i64 {
     }
 }
 
+/// Ref-returning bridges for the `next_w` bodies `shortcut_next` dispatches
+/// to.  Each rides the same convention as [`bh_next`]: the raised
+/// StopIteration (or any other error) is published as an ordinary exception
+/// for the trace's `GuardNoException`.
+macro_rules! bh_iterator_next_w {
+    ($($bridge:ident => $next_w:ident),* $(,)?) => {$(
+        #[majit_macros::jit_may_force]
+        pub extern "C" fn $bridge(iter: i64) -> i64 {
+            let iter = iter as usize as PyObjectRef;
+            match crate::baseobjspace::$next_w(iter) {
+                Ok(value) => value as usize as i64,
+                Err(mut err) => {
+                    let exc_obj = err.to_exc_object();
+                    if exc_obj != PY_NULL {
+                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                            .with(|c| c.set(exc_obj as i64));
+                    }
+                    jit_publish_exception(exc_obj);
+                    PY_NULL as usize as i64
+                }
+            }
+        }
+    )*};
+}
+bh_iterator_next_w! {
+    bh_count_next_w => count_next_w,
+    bh_repeat_next_w => repeat_next_w,
+    bh_takewhile_next_w => takewhile_next_w,
+    bh_dropwhile_next_w => dropwhile_next_w,
+    bh_filterfalse_next_w => filterfalse_next_w,
+    bh_islice_next_w => islice_next_w,
+    bh_batched_next_w => batched_next_w,
+    bh_product_next_w => product_next_w,
+    bh_groupby_next_w => groupby_next_w,
+    bh_groupby_iterator_next_w => groupby_iterator_next_w,
+    bh_tee_iterable_next_w => tee_iterable_next_w,
+    bh_compress_next_w => compress_next_w,
+    bh_starmap_next_w => starmap_next_w,
+    bh_accumulate_next_w => accumulate_next_w,
+    bh_zip_longest_next_w => zip_longest_next_w,
+    bh_filter_next_w => filter_next_w,
+    bh_map_next_w => map_next_w,
+    bh_zip_next_w => zip_next_w,
+    bh_pairwise_next_w => pairwise_next_w,
+    bh_cycle_next_w => cycle_next_w,
+    bh_chain_next_w => chain_next_w,
+}
+
 /// Residual PyPy `GET_ITER` operation.  `space.iter` may execute a user
 /// `__iter__`, so the trace treats this as may-force and consumes the
 /// published exception through the ordinary guards.
