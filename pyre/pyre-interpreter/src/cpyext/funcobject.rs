@@ -58,29 +58,6 @@ pub unsafe extern "C" fn PyMethod_Self(method: *mut CPyObject) -> *mut CPyObject
 
 // ── code objects ────────────────────────────────────────────────────────
 
-/// `RESUME 0; LOAD_COMMON_CONSTANT AssertionError; RAISE_VARARGS 1` — the
-/// body `PyCode_NewEmpty` gives the code object it builds.
-///
-/// The opcodes are named rather than spelled as the numbers `codeobject.c
-/// assert0` uses, so a renumbering is a build error rather than a body that
-/// decodes to something else.
-fn assert0() -> [u8; 6] {
-    use crate::bytecode::{CommonConstant, Opcode, RaiseKind};
-    [
-        Opcode::Resume as u8,
-        // `ResumeLocation::AtFuncStart`, which is not reachable by name here.
-        0,
-        Opcode::LoadCommonConstant as u8,
-        CommonConstant::AssertionError as u8,
-        Opcode::RaiseVarargs as u8,
-        RaiseKind::Raise as u8,
-    ]
-}
-
-/// One line-table entry covering all three units of [`assert0`], carrying the
-/// line and no columns, as `codeobject.c linetable` spells it.
-const ASSERT0_LINETABLE: [u8; 2] = [(1 << 7) | (13 << 3) | (3 - 1), 0];
-
 /// `funcobject.py PyCode_NewEmpty(filename, funcname, firstlineno)` — a
 /// code object with the given source location and a body that raises
 /// `AssertionError`.
@@ -96,33 +73,11 @@ pub unsafe extern "C" fn PyCode_NewEmpty(
     let name = unsafe { super::unicodeobject::PyUnicode_FromString(funcname) };
     let path = unsafe { super::unicodeobject::PyUnicode_DecodeFSDefault(filename) };
     let code = match (argument(name), argument(path)) {
-        (Some(name), Some(path)) => {
-            let empty_tuple = pyre_object::w_tuple_new(Vec::new());
-            let empty_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&[]);
-            // Nothing between here and the call collects: an int, a tuple, a
-            // bytes and a str are all allocated outside the nursery.
-            result(unsafe {
-                crate::pycode::code_new(&[
-                    pyre_object::PY_NULL,
-                    pyre_object::w_int_new(0),
-                    pyre_object::w_int_new(0),
-                    pyre_object::w_int_new(0),
-                    pyre_object::w_int_new(0),
-                    pyre_object::w_int_new(1),
-                    pyre_object::w_int_new(0),
-                    pyre_object::bytesobject::w_bytes_from_bytes(&assert0()),
-                    empty_tuple,
-                    empty_tuple,
-                    empty_tuple,
-                    path,
-                    name,
-                    name,
-                    pyre_object::w_int_new(firstlineno as i64),
-                    pyre_object::bytesobject::w_bytes_from_bytes(&ASSERT0_LINETABLE),
-                    empty_bytes,
-                ])
-            })
-        }
+        (Some(name), Some(path)) => result(crate::pycode::code_new_empty(
+            path,
+            name,
+            firstlineno as i64,
+        )),
         _ => std::ptr::null_mut(),
     };
     for reference in [name, path] {

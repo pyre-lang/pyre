@@ -1233,6 +1233,9 @@ pub fn init_typeobjects() {
             &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType,
         ));
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(lazy_import_type, false) };
+        // `lazyimportobject.c lazy_import_getattro` is `tp_getattro`.
+        // `getattr` only dispatches a builtin owner's own slot after this flag.
+        unsafe { pyre_object::w_type_set_dispatch_own_getattribute(lazy_import_type) };
         reg.insert(
             &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType as usize,
             lazy_import_type as usize,

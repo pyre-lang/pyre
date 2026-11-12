@@ -595,6 +595,61 @@ pub unsafe fn record_application_traceback(
     true
 }
 
+/// `traceback.c _PyTraceback_Add(funcname, filename, lineno)`: append a
+/// frame for `(funcname, filename, lineno)` to `w_exc`'s traceback.  PyPy
+/// shapes: `funcobject.py PyCode_NewEmpty`, `frameobject.py frame_realize`,
+/// `frameobject.py PyTraceBack_Here`.  A failure leaves `w_exc` unchanged.
+pub fn traceback_add(w_exc: PyObjectRef, funcname: &str, filename: &str, lineno: i64) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_exc);
+
+    let w_globals = pyre_object::w_dict_new();
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_globals);
+
+    let w_filename = pyre_object::w_str_new_managed(filename);
+    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_filename);
+    let w_name = pyre_object::w_str_new_managed(funcname);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_name);
+
+    let w_code =
+        match crate::pycode::code_new_empty(roots.get(filename_slot), roots.get(name_slot), lineno)
+        {
+            Ok(w_code) => w_code,
+            Err(_) => return,
+        };
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_code);
+
+    let frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        roots.get(code_slot) as *const (),
+        &[],
+        roots.get(globals_slot),
+        crate::call::take_last_exec_ctx(),
+        PY_NULL,
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+    ) {
+        Ok(frame) => frame,
+        Err(_) => return,
+    };
+    let mut boxed = match crate::pyframe::FrameBox::new(frame) {
+        Ok(boxed) => boxed,
+        Err(_) => return,
+    };
+    match boxed.getorcreatedebug(-1) {
+        Ok(debug) => debug.f_lineno = lineno as isize,
+        Err(_) => return,
+    }
+    if !boxed.is_gc_owned() {
+        return;
+    }
+    let frame_ptr = boxed.into_raw();
+    let _ = unsafe { record_application_traceback(roots.get(exc_slot), frame_ptr, 0) };
+}
+
 /// `PyTraceback.__init__` raises before `operror.set_traceback`, so a failed
 /// node allocation replaces the exception `record_application_traceback` was
 /// attaching a frame to. Fetch that value

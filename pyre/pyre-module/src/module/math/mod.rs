@@ -54,14 +54,6 @@ pyre_interpreter::py_module! {
         "fsum"    / 1 = m::fsum,
         "prod"    / * = m::prod; pyre_interpreter::Signature::new(vec!["iterable", "start"], None, None, 1, 1),
         "sumprod" / 2 = m::sumprod,
-
-        // Integer math
-        "factorial" / 1 = m::factorial,
-        "gcd"   / * = m::gcd; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
-        "lcm"   / * = m::lcm; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
-        "comb"  / 2 = m::comb,
-        "perm"  / * = m::perm; pyre_interpreter::Signature::new(vec!["n", "k"], None, None, 0, 2),
-        // `isqrt` is installed in `extra_init`.
     },
     extra_init: |ns| {
         // Module builtin, not a method descriptor: `BuiltinCode.func` is the
@@ -106,7 +98,6 @@ pyre_interpreter::py_module! {
         ns = install(ns, "ceil", m::__majit_wrap_math_ceil);
         ns = install(ns, "trunc", m::__majit_wrap_math_trunc);
         ns = install(ns, "frexp", m::__majit_wrap_math_frexp);
-        ns = install(ns, "isqrt", m::__majit_wrap_math_isqrt);
         // Optional base, or keyword tolerances: not a fixed arity-1 builtin.
         pyre_interpreter::__pyre_store!(
             ns,
@@ -157,12 +148,8 @@ pyre_interpreter::py_module! {
         ns = install2(ns, "atan2", m::__majit_wrap_math_atan2);
         ns = install2(ns, "ldexp", m::__majit_wrap_math_ldexp);
         // Trailing defaults live on `Function.defs_w` / `w_kw_defs`
-        // (`interp2app._getdefaults`). `perm` `k`, `prod` `start=1`,
+        // (`interp2app._getdefaults`). `prod` `start=1`,
         // `nextafter` `steps=None`.
-        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "perm") } {
-            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
-            pyre_interpreter::__pyre_store!(ns, "perm", function);
-        }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "prod") } {
             function = pyre_object::with_roots!(ns => pyre_interpreter::function_set_kwonly_defaults!(
                 function,
@@ -179,5 +166,62 @@ pyre_interpreter::py_module! {
             });
             pyre_interpreter::__pyre_store!(ns, "nextafter", function);
         }
+        // MixedModule.init: getbuiltinmodule("math.integer") then
+        // space.setitem(self.w_dict, "integer", w_submodule). math_exec
+        // copies the six functions (IMPORT_FROM_INTMATH).
+        let mut w_sub = pyre_object::with_roots!(ns => {
+            pyre_interpreter::importing::get_builtin_module("math.integer")
+                .expect("math.integer must be registered")
+        });
+        pyre_interpreter::__pyre_store!(ns, "integer", w_sub);
+        for name in ["comb", "factorial", "gcd", "isqrt", "lcm", "perm"] {
+            let mut function = pyre_object::with_roots!(ns, w_sub => unsafe {
+                pyre_object::w_dict_getitem_str(pyre_object::w_module_get_w_dict(w_sub), name)
+            })
+            .unwrap_or_else(|| panic!("math.integer must export {name}"));
+            pyre_object::with_roots!(ns, w_sub, function => {
+                pyre_interpreter::__pyre_store!(ns, name, function);
+            });
+        }
     },
+}
+
+/// `math.integer` — MixedModule.submodules entry of `math`.
+pub mod integer {
+    use super::interp_math as m;
+
+    pyre_interpreter::py_module! {
+        "math.integer",
+        module_functions: {
+            "factorial" / 1 = m::factorial,
+            "gcd"   / * = m::gcd; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
+            "lcm"   / * = m::lcm; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
+            "comb"  / 2 = m::comb,
+            "perm"  / * = m::perm; pyre_interpreter::Signature::new(vec!["n", "k"], None, None, 0, 2),
+        },
+        extra_init: |ns| {
+            pyre_interpreter::__pyre_store!(
+                ns,
+                "isqrt",
+                pyre_interpreter::make_module_builtin_function_with_arity(
+                    "isqrt",
+                    m::__majit_wrap_math_isqrt,
+                    1,
+                )
+            );
+            if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "perm") } {
+                function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+                pyre_interpreter::__pyre_store!(ns, "perm", function);
+            }
+            // py_module! has no doc slot; MixedModule.get__doc__ would
+            // otherwise publish None.
+            pyre_interpreter::__pyre_store!(
+                ns,
+                "__doc__",
+                pyre_object::w_str_new(
+                    "This module provides access to integer related mathematical functions.",
+                )
+            );
+        },
+    }
 }

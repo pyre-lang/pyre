@@ -2487,6 +2487,69 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(result)
 }
 
+/// `RESUME 0; LOAD_COMMON_CONSTANT AssertionError; RAISE_VARARGS 1` — the
+/// body `PyCode_NewEmpty` gives the code object it builds.
+///
+/// The opcodes are named rather than spelled as the numbers `codeobject.c
+/// assert0` uses, so a renumbering is a build error rather than a body that
+/// decodes to something else.
+fn assert0() -> [u8; 6] {
+    use crate::bytecode::{CommonConstant, Opcode, RaiseKind};
+    [
+        Opcode::Resume as u8,
+        // `ResumeLocation::AtFuncStart`, which is not reachable by name here.
+        0,
+        Opcode::LoadCommonConstant as u8,
+        CommonConstant::AssertionError as u8,
+        Opcode::RaiseVarargs as u8,
+        RaiseKind::Raise as u8,
+    ]
+}
+
+/// One line-table entry covering all three units of [`assert0`], carrying the
+/// line and no columns, as `codeobject.c linetable` spells it.
+const ASSERT0_LINETABLE: [u8; 2] = [(1 << 7) | (13 << 3) | (3 - 1), 0];
+
+/// `funcobject.py PyCode_NewEmpty(filename, funcname, firstlineno)` — a code
+/// object with the given source location and a body that raises
+/// `AssertionError`.
+pub fn code_new_empty(
+    w_filename: PyObjectRef,
+    w_name: PyObjectRef,
+    firstlineno: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_filename);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_name);
+    let empty_tuple = w_tuple_new(Vec::new());
+    let empty_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&[]);
+    let result = unsafe {
+        code_new(&[
+            PY_NULL,
+            w_int_new(0),
+            w_int_new(0),
+            w_int_new(0),
+            w_int_new(0),
+            w_int_new(1),
+            w_int_new(0),
+            pyre_object::bytesobject::w_bytes_from_bytes(&assert0()),
+            empty_tuple,
+            empty_tuple,
+            empty_tuple,
+            pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            w_int_new(firstlineno),
+            pyre_object::bytesobject::w_bytes_from_bytes(&ASSERT0_LINETABLE),
+            empty_bytes,
+        ])
+    };
+    drop(roots);
+    result
+}
+
 fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
     // `co_name` / `co_qualname` are the realized str slots (`descr_code__eq__`
     // reads `self.co_name`), not the compiler `String` mirror.

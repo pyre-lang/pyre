@@ -4093,7 +4093,7 @@ pub fn set_default_importlib_import(w_import: PyObjectRef) {
 }
 
 /// `space.w_default_importlib_import`, or `None` before builtins is bound.
-fn default_importlib_import() -> Option<PyObjectRef> {
+pub(crate) fn default_importlib_import() -> Option<PyObjectRef> {
     let w_import = DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef;
     (!w_import.is_null()).then_some(w_import)
 }
@@ -7078,6 +7078,10 @@ fn dunder_import_inner(
             let w_mod_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_mod);
             let w_mod = || pyre_object::gc_roots::shadow_stack_get(w_mod_slot);
+            // `PyImport_ImportModuleLevelObject`: cached, fully initialized
+            // (`GcdCache::Ready` or post-`wait_initializing_module`) and still
+            // the `sys.modules` object → `_PyImport_ClearLazySubmodule(abs_name, 1)`.
+            crate::lazyimport::clear_lazy_submodule(reload_import(0), true)?;
             // `interp_import.py interp___import__` — the list is tested once
             // the cache hit is in hand, and a dotted name's head is resolved
             // only inside the empty-list arm.  Resolving it ahead of the test
@@ -8810,8 +8814,10 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
                 }
                 return Ok(value);
             }
-            if let Some(loaded) = pyre_object::with_roots!(module => crate::lazyimport::try_load_lazy_submodule(module, name))?
-            {
+            // `_PyEval_ImportFrom` uses `PyObject_GetOptionalAttr` → `_Py_module_getattro_impl(..., suppress=1)`.
+            if let Some(loaded) = pyre_object::with_roots!(module => {
+                crate::lazyimport::try_load_lazy_submodule(module, name, true)
+            })? {
                 return Ok(loaded);
             }
         }

@@ -706,6 +706,10 @@
       "dynasm": "SKIP",
       "reason": "CPython Windows py.exe launcher"
     },
+    "test.test_lazy_import": {
+      "dynasm": "FAIL",
+      "reason": "test_add_lazy_to_exec_builtins_after_specialization: a function defined in exec'd code does not see names added to the exec __builtins__ mapping; pypy3 raises the same NameError (pypyoption.py honor__builtins__ defaults to False, so pyframe.py get_builtin returns space.builtin)"
+    },
     "test.test_linecache": {
       "dynasm": "PASS"
     },
@@ -745,6 +749,9 @@
     "test.test_math": {
       "dynasm": "TIMEOUT",
       "reason": "test_sumprod_stress exceeds the 600s budget on ubuntu: Decimal arithmetic through _pydecimal runs ~50x slower than PyPy because BINARY_OP on Decimal residualizes the whole __mul__ (ContextVar.get has no jitcode; type-call with overridden __new__ and loop-bearing callees decline)"
+    },
+    "test.test_math_integer": {
+      "dynasm": "PASS"
     },
     "test.test_math_property": {
       "cranelift": "SKIP",

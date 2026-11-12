@@ -128,6 +128,10 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
+    pyre_interpreter::importing::register_builtin_module(
+        "math.integer",
+        module::math::integer::init,
+    );
     #[cfg(all(windows, feature = "host_env"))]
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
     #[cfg(all(
