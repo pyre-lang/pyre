@@ -14282,6 +14282,15 @@ impl CallControl {
         if hinted(|f| f.close_stack) {
             return true;
         }
+        if crate::model::is_unknown_indirect_call_path(spelled)
+            || crate::model::is_unknown_indirect_call_path(path)
+        {
+            // CollectAnalyzer.top_result (`graphanalyze.py` `indirect_call`
+            // with graphs=None). Other analyzers still walk `__dyn_call` as
+            // an external graphless call until it lowers to
+            // `IndirectCall(graphs=None)`.
+            return true;
+        }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
@@ -14372,6 +14381,11 @@ impl CallControl {
                         // a recurse / graphless `canmallocgc` mark.
                         OpKind::Call { target, .. }
                             if is_lltype_malloc_varsize_clear_target(target) =>
+                        {
+                            break 'walk true;
+                        }
+                        OpKind::Call { target, .. }
+                            if crate::model::is_unknown_indirect_call_target(target) =>
                         {
                             break 'walk true;
                         }
@@ -28279,6 +28293,65 @@ mod tests {
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
         );
+    }
+
+    /// A graph that residualizes `Call(__dyn_call)` is CollectAnalyzer
+    /// top (`graphanalyze.py` `indirect_call` graphs=None) with no
+    /// `canmallocgc` mark, and RandomEffectsAnalyzer still answers False.
+    #[test]
+    fn a_graph_that_residualizes_unknown_indirect_collects_without_random_effects() {
+        let holder = CallPath::from_segments(["holder"]);
+        let mut graph = FunctionGraph::new("holder");
+        let start = graph.startblock;
+        graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                crate::model::UNKNOWN_INDIRECT_CALL,
+            ])));
+        graph.set_return(start, None);
+
+        let mut cc = CallControl::new();
+        cc.register_function_graph(holder.clone(), graph);
+
+        assert!(
+            cc.analyze_can_collect(&holder, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "CollectAnalyzer.top_result for unknown-target indirect_call"
+        );
+        assert!(
+            !cc.analyze_random_effects(&holder, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "RandomEffectsAnalyzer still walks `__dyn_call` as an external graphless call"
+        );
+
+        let placeholder = CallPath::from_segments([crate::model::UNKNOWN_INDIRECT_CALL]);
+        assert!(
+            cc.analyze_can_collect(
+                &placeholder,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "the placeholder path itself is CollectAnalyzer top"
+        );
+        assert!(
+            !cc.analyze_random_effects(
+                &placeholder,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "the placeholder path is not RandomEffects"
+        );
+
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["holder"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(descr.extra_info.can_collect);
+        assert_ne!(descr.extra_info.extraeffect, ExtraEffect::RandomEffects);
     }
 
     /// A registered funcobj whose build produced no graph is

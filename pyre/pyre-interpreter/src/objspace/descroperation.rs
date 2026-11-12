@@ -7689,10 +7689,10 @@ fn compare_op_from_discriminant(value: i64) -> Option<CompareOp> {
         .find(|op| *op as i64 == value)
 }
 
-/// One-word residual-call ABI for [`compare_slot`].
+/// One-word residual-call ABI for [`compare_slot`] / [`compare_slot_rest`].
 ///
-/// `compare_slot` itself is `(PyObjectRef, PyObjectRef, CompareOp) -> PyResult`,
-/// and neither end of that signature fits the residual-call ABI: `PyError` is
+/// Each slot is `(PyObjectRef, PyObjectRef, CompareOp) -> PyResult`, and
+/// neither end of that signature fits the residual-call ABI: `PyError` is
 /// far wider than a register so `Result<PyObjectRef, PyError>` returns through
 /// an sret pointer, and `CompareOp` is not a `ResidualSlot`. Publishing the
 /// raw address would pass one register where the callee reads a hidden return
@@ -7706,16 +7706,36 @@ fn compare_op_from_discriminant(value: i64) -> Option<CompareOp> {
 /// takes the same route `call_jit.rs` takes for an unknown compare tag — a
 /// published `TypeError` and the null sentinel, so a `GUARD_NO_EXCEPTION`
 /// fires instead of a silently wrong comparison.
-pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) -> PyObjectRef {
+fn compare_kind_jit_abi(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: i64,
+    slot: fn(PyObjectRef, PyObjectRef, CompareOp) -> PyResult,
+) -> PyObjectRef {
     let Some(op) = compare_op_from_discriminant(op) else {
         return crate::runtime_ops::jit_publish_residual_error_ref(PyError::type_error(format!(
             "unknown compare op discriminant {op}"
         )));
     };
-    match compare_slot(a, b, op) {
+    match slot(a, b, op) {
         Ok(result) => result,
         Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
     }
+}
+
+pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) -> PyObjectRef {
+    compare_kind_jit_abi(a, b, op, compare_slot)
+}
+
+/// Word ABI for the loop-containing comparison tail (`policy.py`
+/// `look_inside_graph`). An unbound hash aborts the walk after `space.next`
+/// has already run (`do_residual_call` before `SwitchToBlackhole`).
+pub extern "C" fn compare_slot_rest_jit_abi(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: i64,
+) -> PyObjectRef {
+    compare_kind_jit_abi(a, b, op, compare_slot_rest)
 }
 
 /// Comparison operator enum (mirrors RustPython's ComparisonOperator).

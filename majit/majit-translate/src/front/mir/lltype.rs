@@ -13605,6 +13605,10 @@ pub(in crate::front::mir) fn tyref_mut_ref_pointee(ty: &TyRef, llbc: &Llbc) -> O
 /// Shared by callee input seeding (`gc_mut_ref_param_locals`), caller
 /// wrapping (`gc_mut_ref_signature`), and Method routing
 /// (`impl_method_owner`).
+///
+/// `*mut GCREF` / `&mut GCREF` is a pointer to a GCREF *slot*:
+/// `classify_gc_mut_ref_arg` wraps that argument as the cell
+/// (`collect_and_reserve` traces `*root`).
 pub(in crate::front::mir) fn tyref_gc_mut_ref_cell_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -13613,16 +13617,38 @@ pub(in crate::front::mir) fn tyref_gc_mut_ref_cell_root(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
-    tyref_mut_ref_pointee(ty, llbc).and_then(|pointee| {
-        mut_ref_cell_root_of(
-            &pointee,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-            struct_fields,
-        )
-    })
+    tyref_mut_ref_pointee(ty, llbc)
+        .and_then(|pointee| {
+            mut_ref_cell_root_of(
+                &pointee,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                struct_fields,
+            )
+        })
+        .or_else(|| tyref_gcref_slot_cell_root(ty, llbc))
+}
+
+/// One pointer onto a GCREF word: `*mut GCREF`, `&mut GCREF`. The word
+/// lives in the cell's `value` field; a residual that takes the slot
+/// receives the cell (`collect_and_reserve` traces `*root`). The GCREF
+/// spelling itself (`tyref_is_gcref_spelling`) is the payload, not the
+/// slot.
+pub(in crate::front::mir) fn tyref_gcref_slot_cell_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    let node = tyref_node(ty, llbc)?;
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    if !fn_ptr_pointee_is_gcref(pointee, llbc) {
+        return None;
+    }
+    Some(format!(
+        "MutRef<{}>",
+        tyref_to_ast_string(&TyRef::Other(pointee.clone().into()), llbc)
+    ))
 }
 
 pub(in crate::front::mir) fn tyref_is_type_var(ty: &TyRef, llbc: &Llbc) -> bool {

@@ -22929,6 +22929,26 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
         Some("ref"),
         "*mut *mut GCREFOpaque slot token"
     );
+    assert!(
+        super::tyref_gcref_slot_cell_root(&mut_gcref, &llbc)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "*mut GCREF extra-root occupies a MutRef cell"
+    );
+    assert!(
+        super::tyref_gcref_slot_cell_root(&ref_gcref, &llbc)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut GCREF extra-root occupies a MutRef cell"
+    );
+    assert!(
+        super::tyref_gcref_slot_cell_root(&gcref_alias, &llbc).is_none(),
+        "GCREF word is the payload, not the slot"
+    );
+    assert!(
+        super::tyref_gcref_slot_cell_root(&mut_gcrefopaque, &llbc).is_none(),
+        "*mut GCREFOpaque is the GCREF word"
+    );
 }
 
 /// Live interpreter ULLBC sees `GCREFOpaque` as a Foreign Opaque

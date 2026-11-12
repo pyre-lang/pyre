@@ -14630,6 +14630,133 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
     assert!(lowering.gc_mut_ref_signature(&call(2), &[]).is_none());
 }
 
+/// A `dont_look_inside` residual whose parameter is `*mut GCREF` wraps
+/// that extra-root slot as a MutRef cell. `collect_and_reserve` traces
+/// `*root`.
+#[test]
+fn dont_look_inside_gcref_slot_wraps_as_mut_ref_cell() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let gcrefopaque = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let gcref_alias = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let gcref_slot = serde_json::json!({"RawPtr": [gcref_alias.clone(), "Mut"]});
+    let item = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": item(&["majit_gc", "header", "GCREFOpaque"]),
+                    "kind": "Opaque",
+                    "layout": [],
+                    "generics": empty_g.clone()
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": item(&["majit_gc", "header", "GCREF"]),
+                    "kind": {"Alias": {"aliased_ty": {"RawPtr": [gcrefopaque.clone(), "Mut"]}}},
+                    "layout": [],
+                    "generics": empty_g.clone()
+                }
+            ],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": item(&["gc_hook", "residual_gcref_slot"]),
+                "signature": {
+                    "is_unsafe": true,
+                    "inputs": [gcref_slot],
+                    "output": gcref_alias
+                },
+                "body": {"Unstructured": {
+                    "locals": {"arg_count": 0, "locals": []},
+                    "body": [],
+                    "span": span.clone()
+                }}
+            }],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let mut dont_look_inside = std::collections::HashSet::new();
+    dont_look_inside.insert("residual_gcref_slot".to_string());
+    let subject: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "span": span,
+        "locals": {"arg_count": 0, "locals": []},
+        "body": [],
+    }))
+    .unwrap();
+    let accum = super::AccumulatorFacts::build(&llbc, &subject);
+    let tombstoned_leaves = std::collections::HashSet::new();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture::holder".into(),
+        &subject,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned_leaves,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let call = serde_json::from_value::<super::CallFunc>(serde_json::json!({
+        "Regular": {
+            "kind": {"Fun": 0},
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }))
+    .unwrap();
+    let sig = lowering
+        .gc_mut_ref_signature(&call, &[])
+        .expect("dont_look_inside *mut GCREF is a MutRef cell");
+    assert_eq!(sig.0, Some(0));
+    assert_eq!(sig.1.len(), 1);
+    assert_eq!(sig.1[0].0, 0);
+    assert!(
+        sig.1[0].1.starts_with("MutRef<"),
+        "extra-root cell name, got {}",
+        sig.1[0].1
+    );
+}
+
 /// `Arguments::new` holds `Option<Vec<PyObjectRef>>`. A `Vec` of one-word
 /// items is the address of its raw header, never null, so that `Option`
 /// keeps its enum tag instead of a null test, and no ref-kinded null
@@ -14723,8 +14850,11 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });
@@ -14775,8 +14905,11 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });

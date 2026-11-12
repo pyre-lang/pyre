@@ -1530,8 +1530,32 @@ impl<'a> Lowering<'a> {
                 // has `&mut T` in its signature: wrap so pycall of the
                 // defining graph (`FunctionDesc.pycall`) sees the cell
                 // (`expand_pop_roots`).
+                //
+                // A one-level pointer to a GCREF word (`*mut GCREF` /
+                // `&mut GCREF`) is the extra-root *slot*:
+                // `collect_and_reserve` (`incminimark.py`) traces `*root`,
+                // so that residual receives the MutRef cell.
                 if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) {
-                    return None;
+                    let mut cells = Vec::new();
+                    for (index, ty) in fd.signature.inputs.iter().enumerate() {
+                        let root = tyref_gcref_slot_cell_root(ty, self.llbc).or_else(|| {
+                            if !tyref_is_type_var(ty, self.llbc) {
+                                return None;
+                            }
+                            call_arg_tys
+                                .get(index)
+                                .and_then(Option::as_ref)
+                                .and_then(|arg_ty| tyref_gcref_slot_cell_root(arg_ty, self.llbc))
+                        });
+                        let Some(root) = root else {
+                            continue;
+                        };
+                        cells.push((index, root));
+                    }
+                    if cells.is_empty() {
+                        return None;
+                    }
+                    return Some((Some(id), cells));
                 }
                 let mut cells = Vec::new();
                 for (index, ty) in fd.signature.inputs.iter().enumerate() {
