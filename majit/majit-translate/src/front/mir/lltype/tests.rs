@@ -10456,10 +10456,9 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
     );
 }
 
-/// `#[repr(transparent)] struct Anchor { depth: usize, _not_send: PhantomData }`
-/// plus a rustc closure env that captures `&Anchor`. Mirrors
-/// `eval::FrameAnchor` / `_trace::{closure#2}.__pos_5`.
-fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
+/// `#[repr(transparent)] struct ScalarWrapper { depth: usize, _not_send: PhantomData }`
+/// plus a rustc closure env that captures `&ScalarWrapper`.
+fn llbc_with_transparent_scalar_closure_env() -> (Llbc, TyRef, TyRef) {
     let generics = serde_json::json!({
         "regions": [], "types": [], "const_generics": [], "trait_refs": []
     });
@@ -10489,7 +10488,7 @@ fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
                 },
                 {
                     "def_id": 1,
-                    "item_meta": type_decl_meta(&["eval", "FrameAnchor"]),
+                    "item_meta": type_decl_meta(&["eval", "ScalarWrapper"]),
                     "kind": {"Struct": [
                         {
                             "name": "depth",
@@ -10552,12 +10551,12 @@ fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
 
 /// A closure env that captures `&TransparentWrapper` of a scalar must
 /// paint that field as the inner word, matching `Rvalue::Ref` aliasing
-/// of the local. Layout `&eval::FrameAnchor` would project
-/// `Ptr(FrameAnchor)` against the stored Integer
+/// of the local. Layout `&eval::ScalarWrapper` would project
+/// `Ptr(ScalarWrapper)` against the stored Integer
 /// (`annotator/model.py` `unionof`).
 #[test]
 fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
-    let (llbc, borrowed, by_value) = llbc_with_transparent_anchor_closure_env();
+    let (llbc, borrowed, by_value) = llbc_with_transparent_scalar_closure_env();
     let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let raw = std::collections::HashSet::<String>::new();
     let tomb = no_tombstoned_leaves();
@@ -10579,7 +10578,7 @@ fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
     assert_eq!(
         super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
         "usize",
-        "a captured &Wrapper layout is the inner scalar, not &eval::FrameAnchor"
+        "a captured &Wrapper layout is the inner scalar, not &eval::ScalarWrapper"
     );
     let ordinary = llbc.type_by_id(2).expect("ordinary holder");
     let env = llbc.type_by_id(3).expect("closure env");

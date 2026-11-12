@@ -7611,6 +7611,9 @@ pub use shadow_stack_erase::{
 #[path = "owner_root_guard.rs"]
 mod owner_root_guard;
 
+#[path = "frame_anchor.rs"]
+mod frame_anchor;
+
 #[path = "rbigint_gc_root.rs"]
 mod rbigint_gc_root;
 
@@ -7701,6 +7704,13 @@ pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_le
 /// `(graph path, callee path)`.
 pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
     owner_root_guard::residual_escape_census(llbc)
+}
+
+/// Graphs that pass a pointer to `FrameAnchor` (or to an aggregate that
+/// contains one) into a callee that stays residual. Each row is
+/// `(graph path, callee path)`.
+pub fn residual_frame_anchor_escapes(llbc: &Llbc) -> Vec<(String, String)> {
+    frame_anchor::residual_escape_census(llbc)
 }
 
 /// Graphs that pass `RBigIntGcRoot` (or an aggregate that contains one)

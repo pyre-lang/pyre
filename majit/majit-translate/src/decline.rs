@@ -135,6 +135,9 @@ pub mod gate {
     /// A lowered graph passed a pointer to `OwnerRootGuard`, or to an
     /// aggregate that contains one, into a callee that stays residual.
     pub const OWNER_ROOT_GUARD_ESCAPE: &str = "mir::owner_root_guard";
+    /// A lowered graph passed a pointer to `FrameAnchor`, or to an
+    /// aggregate that contains one, into a callee that stays residual.
+    pub const FRAME_ANCHOR_ESCAPE: &str = "mir::frame_anchor";
     /// A lowered graph passed `RBigIntGcRoot`, or an aggregate that
     /// contains one, by value or through a pointer, into a callee that
     /// stays residual, or received one as the call destination.

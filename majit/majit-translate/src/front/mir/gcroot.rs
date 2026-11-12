@@ -83,14 +83,6 @@ impl<'a> Lowering<'a> {
         place: &Place,
         glue: Option<&RegularCall>,
     ) -> Result<bool, LowerError> {
-        if drop_place_is_frame_anchor(place, self.body, self.llbc) {
-            self.emit_one_word_guard_release(
-                mir_bb,
-                place,
-                ["pyre_interpreter", "eval", "frame_anchor_release"],
-            )?;
-            return Ok(true);
-        }
         if drop_place_is_object_lock_guard(place, self.llbc) {
             self.emit_one_word_guard_release(mir_bb, place, OBJECT_LOCK_RELEASE_PATH)?;
             return Ok(true);
@@ -106,9 +98,12 @@ impl<'a> Lowering<'a> {
             return Ok(true);
         }
         // The guard's slot does not exist in a jitcode. Dropping it, or the
-        // `Option` that holds it, releases nothing.
+        // `Option` that holds it, releases nothing. `FrameAnchor` is the
+        // same: the JIT word is the frame, Drop emits nothing.
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_erased_drop(&place.ty, self.llbc)
+            || frame_anchor::tyref_is_erased_drop(&place.ty, self.llbc)
+            || drop_place_is_frame_anchor(place, self.body, self.llbc)
         {
             return Ok(true);
         }
@@ -199,12 +194,8 @@ impl<'a> Lowering<'a> {
     /// Drop a one-word guard local by passing its word to the bound release
     /// residual `release`. The caller continues to the drop's successor.
     ///
-    /// A [`FrameAnchor`] is one such guard. `front::mir` aliases that local
-    /// to its depth `Int`. `FrameAnchor::drop` takes `&mut self` (`Ref`), so
-    /// emitting that path as the residual made the containing graph fail to
-    /// look-inside (`opcode_compare_op` residualized as unbound `ri`).
-    /// `frame_anchor_release` is already `dont_look_inside` and takes the
-    /// depth as `usize`.
+    /// [`ObjectLockGuard`] is one such guard: its `Drop` releases the lock
+    /// word. `front::mir` aliases that local to the word the residual takes.
     pub(in crate::front::mir) fn emit_one_word_guard_release(
         &mut self,
         mir_bb: usize,
@@ -628,6 +619,71 @@ impl<'a> Lowering<'a> {
         )))
     }
 
+    /// [`frame_anchor`]: `new` / `from_raw` / `frame_anchor_push` alias the
+    /// frame argument, `live` / `frame_anchor_live` alias the anchor word
+    /// (the frame), and `Drop` / `frame_anchor_release` do not call.
+    pub(in crate::front::mir) fn lower_frame_anchor_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(op) = frame_anchor::classify(call, self.llbc) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        match op {
+            frame_anchor::Op::New | frame_anchor::Op::Live => {
+                let source = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased FrameAnchor {op:?} without a plain-local operand"
+                    ))
+                })?;
+                let value = self.local_var[source]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased FrameAnchor {op:?} reads unbound MIR local {source}"
+                        ))
+                    })?
+                    .one()?;
+                self.local_var[dest_local] = Some(LocalValue::One(value));
+            }
+            frame_anchor::Op::Drop => {
+                let unit = self.emit_unit(bb_id);
+                self.local_var[dest_local] = Some(LocalValue::One(unit));
+            }
+        }
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// A residual callee runs the real Rust layout. A pointer to the
+    /// anchor, or to an aggregate that contains one, would show it the
+    /// erased word.
+    pub(in crate::front::mir) fn refuse_residual_frame_anchor(
+        &self,
+        mir_bb: usize,
+        call: &CallPayload,
+    ) -> Result<(), LowerError> {
+        let Some(callee) = frame_anchor::residual_escape(call, self.llbc, self.dont_look_inside)
+        else {
+            return Ok(());
+        };
+        crate::decline::record_named(
+            crate::decline::gate::FRAME_ANCHOR_ESCAPE,
+            "pointer-to-residual",
+            &self.graph.name,
+        );
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: `{}` passes a pointer to FrameAnchor into residual `{callee}`",
+            self.graph.name
+        )))
+    }
+
     /// [`rbigint_gc_root`]: `new` and `deref` alias the rooted `RBigInt`,
     /// `set` writes that value back, `normalize` is `RBigInt::_normalize`,
     /// `Drop` does not call, and `Option::as_ref` / `as_deref` convert the
@@ -1019,35 +1075,18 @@ pub(in crate::front::mir) fn root_scope_drop_glue_template(
     }))
 }
 
-/// Match Charon's `eval::FrameAnchor::<Impl>::drop_in_place` path.
-///
-/// `frame_anchor_new_jit_abi` publishes the slot and forgets `Drop`;
-/// the matching `drop_in_place` must become a residual
-/// `frame_anchor_release` or compiled loops leak every iteration.
+/// Match Charon's `eval::FrameAnchor::<Impl>::drop` / `drop_in_place` path.
+#[cfg(test)]
 pub(in crate::front::mir) fn frame_anchor_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     let last = segments.last().copied();
-    // Charon names the Drop impl `FrameAnchor::drop`; the MIR
-    // terminator glue is `drop_in_place`. Either must close the
-    // `frame_anchor_new_jit_abi` slot.
     (last == Some("drop_in_place") || last == Some("drop")) && segments.contains(&"FrameAnchor")
 }
 
 pub(in crate::front::mir) fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_class_root(ty, llbc).is_some_and(|root| root.contains("FrameAnchor")) {
-        return true;
-    }
-    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    if let Some(id) = adt_id_flexible(node)
-        && llbc
-            .type_by_id(id)
-            .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
-    {
-        return true;
-    }
-    false
+    frame_anchor::tyref_is_anchor(ty, llbc)
+        || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
+        || frame_anchor::tyref_is_option_of_anchor(ty, llbc)
 }
 
 pub(in crate::front::mir) fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
@@ -1131,12 +1170,9 @@ pub(in crate::front::mir) fn drop_lowers_as_glue_call(
     if !matches!(place.kind, PlaceKind::Local(_)) {
         return false;
     }
-    if tyref_is_frame_anchor(&place.ty, llbc) {
-        return true;
-    }
     regular_call_name_path(fn_ptr, llbc)
         .as_deref()
-        .is_some_and(|name| gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name))
+        .is_some_and(|name| gc_root_scope_drop_glue_path(name))
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
@@ -1158,27 +1194,11 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
-/// Match the bound [`frame_anchor_release`] residual emitted for a
-/// `FrameAnchor` Drop. Result/exception rewrites must keep it on the
-/// Err edge the same way they keep a RootScope close: `set_raise`
-/// bypasses the forwarding block that held the Drop.
-pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
-    let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
-        ..
-    } = kind
-    else {
-        return false;
-    };
-    segments.last().map(String::as_str) == Some("frame_anchor_release")
-}
-
 /// Guard releases that an exceptional Result rewrite must replay on the
 /// raise edge: shadow-stack closes, the shared object-lock release and the
 /// free of a raw array buffer that ends with the frame.
 pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
     is_root_scope_drop_glue_call(kind)
-        || is_frame_anchor_release_call(kind)
         || is_object_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
         || is_rust_vec_free_call(kind)
@@ -1432,8 +1452,7 @@ pub(in crate::front::mir) fn glue_call_drop_blocks(
         // A later block's Drop reads the guard or Vec header word to emit
         // the release or glue call. An unmarked word is absent there, and
         // the destructor is skipped.
-        let lowers = drop_place_is_frame_anchor(place, body, llbc)
-            || drop_place_is_object_lock_guard(place, llbc)
+        let lowers = drop_place_is_object_lock_guard(place, llbc)
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),

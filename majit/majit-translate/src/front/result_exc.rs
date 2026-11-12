@@ -2691,8 +2691,8 @@ fn lower_result_exc_returns_inner(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close` residual) and FrameAnchor closes are re-emitted
-        // at the raise site rather than left in a tail the rewrite bypasses.
+        // `root_scope_close` residual) are re-emitted at the raise site
+        // rather than left in a tail the rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),

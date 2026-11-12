@@ -19586,7 +19586,7 @@ mod tests {
             .push(SpaceOperation {
                 result: None,
                 kind: OpKind::Call {
-                    target: CallTarget::function_path(["frame_anchor_release"]),
+                    target: CallTarget::function_path(["object_lock_release"]),
                     args: crate::model::call_args([ip]),
                     result_ty: ValueType::Void,
                 },
