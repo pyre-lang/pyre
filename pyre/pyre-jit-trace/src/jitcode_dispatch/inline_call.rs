@@ -987,13 +987,11 @@ pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
 }
 
 /// Relaxed variant of [`callee_fast_path_inlinable`] for the multi-frame
-/// inline path (#68): a FORWARD `goto_if_not`
-/// (branch target ahead of the branch op) is now inlinable because its
-/// in-callee guard resumes through a multi-frame snapshot
-/// ([`walker_capture_snapshot_for_last_guard_impl`]'s parent-frame branch).
-/// A BACKWARD `goto_if_not` (a loop back-edge) and any `switch` still decline:
-/// a loop in the callee needs a `jit_merge_point` the inline snapshot does
-/// not model, and a multi-target switch is not yet handled.
+/// inline path.  Branch ops of any direction and `switch` are admitted
+/// because the sub-walk dispatches them with in-callee guards that resume
+/// through a multi-frame snapshot, and a callee loop is cut at its
+/// `jit_merge_point` (`SubLoopCalleeCallAssembler`), as `perform_call` /
+/// `opimpl_jit_merge_point` do upstream.
 ///
 /// Vable ops are accepted in two cases: (a) a scalar static-field read
 /// (`pycode` / `w_globals`) resolvable without a seeded frame
@@ -1005,7 +1003,7 @@ pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
 /// `opimpl_getfield_vable_*` (`pyjitpl.py`) folds a field of that virtual the
 /// same way `opimpl_getfield_gc_*` does.  A vable op against a base reg OTHER
 /// than the seeded frame still declines.
-pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
+pub(crate) fn callee_fast_path_inlinable_multiframe<Sym: WalkSym>(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_, Sym>,
@@ -1019,33 +1017,6 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
         return false;
     };
     for d in &ops {
-        if d.opname.starts_with("switch") {
-            if fbw_strict_diag_enabled() {
-                eprintln!("[strict-reject-mf] pc={} op={} (switch)", d.pc, d.opname);
-            }
-            return false;
-        }
-        if d.opname.starts_with("goto_if_not") {
-            // Label is the last operand (`branch.rs` `goto.argcodes.len() - 1`,
-            // `label_operand_offset`).  A fused compare (`goto_if_not_int_lt/iiL`)
-            // puts two Int regs before `L`; reading offset 1 takes the second
-            // register as the label and treats a forward `if k < 0` as a
-            // back-edge, so `try_multiframe` refuses the callee.
-            // `perform_call` (`pyjitpl.py`) has no such screen.
-            let Some(off) = label_operand_offset(d.argcodes) else {
-                return false;
-            };
-            let target = read_label(body_code, d, off);
-            if target <= d.pc {
-                if fbw_strict_diag_enabled() {
-                    eprintln!(
-                        "[strict-reject-mf] pc={} op={} target={target} (backward branch)",
-                        d.pc, d.opname
-                    );
-                }
-                return false;
-            }
-        }
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, d, callee_frame_reg)
@@ -10080,7 +10051,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // conversion, so an unseeded caller-boundary resume is not part of that
     // route's deopt discipline.
     let try_multiframe = multiframe_eligible
-        && callee_fast_path_inlinable_allowing_forward_branch(
+        && callee_fast_path_inlinable_multiframe(
             body.code,
             callee_descr_refs,
             ctx,
@@ -11252,11 +11223,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // BAD_LOOP, ESCAPE, FORCE_QUASIIMMUT, SEGMENTED_TRACE) has no
     // cannot-inline-this-callee reason at all.
     //
-    // The variant's own doc justifies abort-over-residual for a callee whose
-    // short inner loops would compile and deopt-storm — but
-    // `callee_fast_path_inlinable_allowing_forward_branch` already rejects every
-    // backward `goto_if_not` and every `switch`, so a `try_multiframe` callee
-    // provably has no inner loop and that rationale does not reach here.
+    // The multi-frame screen admits branches and switches; a callee loop is
+    // cut at its own `jit_merge_point` into `SubLoopCalleeCallAssembler`, so
+    // the "short inner loops would compile and deopt-storm" rationale does
+    // not apply.
     //
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
     // below), so returning costs nothing but the inline.
