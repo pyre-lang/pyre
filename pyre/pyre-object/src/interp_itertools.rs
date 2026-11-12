@@ -851,6 +851,7 @@ pub struct W_GroupByIterator {
     pub w_tgtkey: PyObjectRef,
 }
 
+#[majit_macros::dont_look_inside]
 pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let groupby = crate::gc_roots::pin_root(groupby);
@@ -893,6 +894,7 @@ pub struct W_TeeChainedListNode {
     pub running: bool,
 }
 
+#[majit_macros::dont_look_inside]
 pub fn w_tee_chained_list_node_new() -> PyObjectRef {
     W_TeeChainedListNode::allocate_stable(W_TeeChainedListNode {
         ob: PyObject {
@@ -920,6 +922,7 @@ pub struct W_TeeIterable {
     pub w_chained_list: PyObjectRef,
 }
 
+#[majit_macros::dont_look_inside]
 pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_iterator = crate::gc_roots::pin_root(w_iterator);

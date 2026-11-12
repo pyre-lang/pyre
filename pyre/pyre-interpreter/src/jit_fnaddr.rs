@@ -2505,6 +2505,113 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::runtime_ops::bh_next,
     );
     cp1!(&mut entries, "next", crate::runtime_ops::bh_next);
+    // The `next_w` bodies `shortcut_next` dispatches to are residual calls in
+    // its JitCode; each binds to its `bh_*_next_w` bridge.
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::count_next_w",
+        crate::runtime_ops::bh_count_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::repeat_next_w",
+        crate::runtime_ops::bh_repeat_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::takewhile_next_w",
+        crate::runtime_ops::bh_takewhile_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::dropwhile_next_w",
+        crate::runtime_ops::bh_dropwhile_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filterfalse_next_w",
+        crate::runtime_ops::bh_filterfalse_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::islice_next_w",
+        crate::runtime_ops::bh_islice_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::batched_next_w",
+        crate::runtime_ops::bh_batched_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::product_next_w",
+        crate::runtime_ops::bh_product_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::groupby_next_w",
+        crate::runtime_ops::bh_groupby_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::groupby_iterator_next_w",
+        crate::runtime_ops::bh_groupby_iterator_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::tee_iterable_next_w",
+        crate::runtime_ops::bh_tee_iterable_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::compress_next_w",
+        crate::runtime_ops::bh_compress_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::starmap_next_w",
+        crate::runtime_ops::bh_starmap_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::accumulate_next_w",
+        crate::runtime_ops::bh_accumulate_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::zip_longest_next_w",
+        crate::runtime_ops::bh_zip_longest_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filter_next_w",
+        crate::runtime_ops::bh_filter_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::map_next_w",
+        crate::runtime_ops::bh_map_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::zip_next_w",
+        crate::runtime_ops::bh_zip_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::pairwise_next_w",
+        crate::runtime_ops::bh_pairwise_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::cycle_next_w",
+        crate::runtime_ops::bh_cycle_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::chain_next_w",
+        crate::runtime_ops::bh_chain_next_w,
+    );
     cpa2!(
         &mut entries,
         "pyre_object::listobject::drain_list_append",

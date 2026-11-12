@@ -2550,8 +2550,14 @@ pub unsafe fn w_module_dict_strategy_or_null(
 /// the comparison is only performed against the SAME dict the iterator
 /// was opened on.
 ///
+/// Residual: the id is the address of the strategy, and
+/// `jtransform.py rewrite_op_cast_ptr_to_adr` has no look-inside form for
+/// the address of a GC pointer (`bhimpl_cast_ptr_to_int` takes a tagged
+/// immediate only).
+///
 /// # Safety
 /// `obj` must point to a valid dict (W_DictObject or W_ModuleDictObject).
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
     if is_module_dict(obj) {
         let m = &*(obj as *const W_ModuleDictObject);
