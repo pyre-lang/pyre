@@ -646,8 +646,12 @@ fn ll_listslice_inner_is_depth_neutral() {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
-            names.iter().any(|id| id.contains("ll_listslice_inner")),
-            "ll_listslice_inner must be depth-neutral"
+            names.iter().any(|id| {
+                id.split('|')
+                    .next()
+                    .is_some_and(|n| n.ends_with("::ll_listslice_inner"))
+            }),
+            "ll_listslice_inner must be depth-neutral, got {names:?}"
         );
     });
 }
@@ -687,8 +691,12 @@ fn eval_slice_index_is_depth_neutral() {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
-            names.iter().any(|id| id.contains("eval_slice_index")),
-            "eval_slice_index must be depth-neutral"
+            names.iter().any(|id| {
+                id.split('|')
+                    .next()
+                    .is_some_and(|n| n.ends_with("::eval_slice_index"))
+            }),
+            "eval_slice_index must be depth-neutral, got {names:?}"
         );
         let graph = lower_named(llbc, "eval_slice_index");
         for leaf in [
