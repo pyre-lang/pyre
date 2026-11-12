@@ -2594,15 +2594,26 @@ pub(crate) fn eval_frame_plain_with_resume(
     // give it back when it returns.  Every Python frame costs the same unit —
     // module body, called function, `exec`ed code, resumed generator — so the
     // depth `stack_check()` reads is the number of live Python frames.
-    let _recursion_depth = crate::call::enter_recursive_frame(frame);
+    //
+    // `enter_recursive_frame`, `enter`, `call_trace`, `return_trace` and
+    // `leave` cross write barriers or run application Python, so a
+    // nursery-born frame moves under them.  The raw `frame` argument is the
+    // abandoned copy after the first of them; the JIT portal re-reads through
+    // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`
+    // (`shadowstack.py` `push_roots` / `pop_roots`).
+    let frame_anchor = FrameAnchor::new(frame);
+    let _recursion_depth = crate::call::enter_recursive_frame(frame_anchor.live());
+    let frame = unsafe { &mut *frame_anchor.live() };
     frame.fix_array_ptrs();
     crate::reload_resume_args!(pins, resume);
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
         crate::reload_resume_args!(pins, resume);
+        let frame = unsafe { &mut *frame_anchor.live() };
         if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
             return Ok(value);
         }
+        let frame = unsafe { &mut *frame_anchor.live() };
         return eval_loop(frame, ec, /* relink */ true);
     }
     let execution_context = unsafe { &mut *ec };
@@ -2612,12 +2623,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // replace that thread-owned slot from a frame field; doing so lets a
     // collapsed/stale translated frame identity poison every subsequent
     // `space.getexecutioncontext()` lookup.
-    execution_context.enter(frame as *mut PyFrame);
-    // `call_trace` / `return_trace` / `leave` run application Python, so a
-    // nursery-born frame moves under them.  The raw `frame` argument is the
-    // abandoned copy after the first callback; the JIT portal re-reads through
-    // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`.
-    let frame_anchor = FrameAnchor::new(frame);
+    execution_context.enter(frame_anchor.live());
     crate::reload_resume_args!(pins, resume);
     let mut got_exception = true;
     // pyframe.py PyFrame.execute_frame parity:
