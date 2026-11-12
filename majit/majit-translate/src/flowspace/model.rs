@@ -2727,13 +2727,18 @@ impl HostEnv {
                 .expect("core.ptr.null_mut bound above"),
         );
 
-        // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics
-        // (`lltype.malloc(STRUCT, flavor='gc')` parity).  Exposed as a host
-        // builtin so its body is never looked-inside; the `malloc_typed_alloc`
-        // analyzer types the result as `SomeInstance(T)`.  Callsites carry the
-        // crate-qualified FunctionPath `["pyre_object","lltype","malloc_typed"]`,
-        // which `translate_op`'s Layer-3b resolves via this module
-        // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
+        // `pyre_object::lltype::malloc[_typed]` / `malloc_varsize_clear` —
+        // GC allocation intrinsics (`lltype.malloc(STRUCT, flavor='gc')` /
+        // `lltype.malloc(ARRAY, n, zero=True)` parity).  Exposed as a host
+        // builtin so the body is never looked-inside; the `malloc_typed_alloc`
+        // analyzer types the result as `SomeInstance(T)`, and
+        // `malloc_varsize_clear_alloc` types `*mut ItemsBlock`.  Callsites
+        // carry the crate-qualified FunctionPath
+        // `["pyre_object","lltype","malloc_typed"]` /
+        // `["pyre_object","lltype","malloc_varsize_clear"]`, which
+        // `translate_op`'s Layer-3b resolves via this module
+        // (prefix `pyre_object.lltype`, leaf `malloc_typed` /
+        // `malloc_varsize_clear`).
         let lltype_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_LLTYPE);
         lltype_module.module_set(
             "malloc",
@@ -2750,6 +2755,10 @@ impl HostEnv {
         lltype_module.module_set(
             "malloc_typed_stable",
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_TYPED_STABLE),
+        );
+        lltype_module.module_set(
+            "malloc_varsize_clear",
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_VARSIZE_CLEAR),
         );
         // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Exposed as a

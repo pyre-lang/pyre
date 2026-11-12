@@ -2514,6 +2514,27 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if canonical_strip == ["lltype", "malloc_raw"] {
         return Some("skip-malloc-raw-intrinsic");
     }
+    // `pyre_object::lltype::malloc_varsize_clear` is `lltype.malloc(ARRAY, n, zero=True)`,
+    // recognised as a host builtin (annotator `malloc_varsize_clear_alloc`, HOST_ENV
+    // `pyre_object.lltype` module). Its body writes the GcArray length header, which only the
+    // allocator may do (`framework.py` `gct_fv_gc_malloc_varsize`). With no registry entry,
+    // callsites resolve to the HOST_ENV builtin (Layer-3b) and `rtype_malloc_varsize_clear`
+    // emits the `malloc_varsize` llop.
+    //
+    // `canonical_dedup_key` strips only the crate root, so a generic
+    // instantiation is `["lltype", "malloc_varsize_clear::<ItemsBlock>"]`.
+    // `template_callable_leaf` is the declaration leaf `registration_decline`
+    // keys (`clause_spec.rs`). `malloc_typed::<T>` is fused by the frontend
+    // (`fuse_boxing_alloc`) so its exact-name arm does not need this strip.
+    if matches!(
+        canonical_strip,
+        [module, leaf]
+            if module == "lltype"
+                && crate::front::clause_spec::template_callable_leaf(leaf)
+                    == "malloc_varsize_clear"
+    ) {
+        return Some("skip-malloc-varsize-intrinsic");
+    }
     // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, not a
     // graph: its whole purpose is that the annotator must NOT see the
     // argument's constancy, and the identity body lifted from
@@ -9276,6 +9297,18 @@ mod tests {
                 "unsafe stub still registered for {segments:?}"
             );
         }
+    }
+
+    #[test]
+    fn registration_decline_skips_malloc_varsize_clear() {
+        assert_eq!(
+            registration_decline(&["lltype".into(), "malloc_varsize_clear".into()]),
+            Some("skip-malloc-varsize-intrinsic")
+        );
+        assert_eq!(
+            registration_decline(&["lltype".into(), "malloc_varsize_clear::<ItemsBlock>".into()]),
+            Some("skip-malloc-varsize-intrinsic")
+        );
     }
 
     #[test]

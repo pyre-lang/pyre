@@ -170,6 +170,7 @@ pub(crate) mod modules {
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
+    pub(crate) const MALLOC_VARSIZE_CLEAR: &str = "pyre_object.lltype.malloc_varsize_clear";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
     /// `rgc.py` `ll_arraycopy` residual (`object_array::jit_ll_arraycopy`).
     /// `@specialize.ll()` wrappers keep one ARRAY per graph; this shared

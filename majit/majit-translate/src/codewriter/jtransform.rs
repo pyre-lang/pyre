@@ -10981,6 +10981,15 @@ impl<'a> Transformer<'a> {
             if crate::translator::rtyper::cutover::is_no_effect_external(segments) {
                 return RewriteResult::Replace(Vec::new());
             }
+            // `rewrite_op_malloc_varsize` → `new_array_clear`. Reuse the
+            // `newlist_clear` oopspec path (`_handle_list_call` /
+            // `do_fixed_newlist_clear` / `newlist_clear_shape`).
+            if crate::codewriter::call::is_lltype_malloc_varsize_clear_target(target)
+                && let Some(result) =
+                    self._handle_list_call("newlist_clear", op, args, graph, graph_name)
+            {
+                return result;
+            }
             // `rewrite_op_same_as` / `rewrite_op_cast_pointer` /
             // `rewrite_op_cast_opaque_ptr`: one operand alias, no jitcode
             // op. `current_gc_ref` is the residual stand-in for the GC
@@ -43150,6 +43159,138 @@ mod tests {
             other => panic!("expected NewArrayClear, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `rewrite_op_malloc_varsize` (`jtransform.py`): a Call of
+    /// `pyre_object::lltype::malloc_varsize_clear` lowers to
+    /// `new_array_clear` through `_handle_list_call("newlist_clear")`.
+    /// `collectanalyze.py` answers True for gc `malloc_varsize`, so
+    /// `getcalldescr` of a caller whose graph contains that Call
+    /// reports `can_collect`.
+    #[test]
+    fn malloc_varsize_clear_lowers_to_new_array_clear() {
+        use crate::codewriter::call::AnalysisCache;
+        use crate::parse::CallPath;
+        use majit_ir::descr::OopSpecIndex;
+        use majit_ir::value::Type;
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("malloc_varsize_clear");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["pyre_object", "lltype", "malloc_varsize_clear"]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![count.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&count),
+            &result_ty,
+            "malloc_varsize_clear",
+            &mut graph,
+        );
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+                array: _,
+            } => {
+                assert_eq!(length, &count);
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "malloc_varsize_clear names the GcArray(OBJECTPTR) identity"
+                );
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+
+        let generic = CallTarget::function_path([
+            "pyre_object",
+            "lltype",
+            "malloc_varsize_clear::<ItemsBlock>",
+        ]);
+        let generic_op = SpaceOperation {
+            result: Some(graph.alloc_value_var_with_type(ConcreteType::GcRef)),
+            kind: OpKind::Call {
+                target: generic.clone(),
+                args: crate::model::call_args(vec![count.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let generic_rewrite = transformer.rewrite_op_direct_call(
+            &generic_op,
+            &generic,
+            std::slice::from_ref(&count),
+            &result_ty,
+            "malloc_varsize_clear_generic",
+            &mut graph,
+        );
+        let RewriteResult::Replace(generic_ops) = generic_rewrite else {
+            panic!("generic malloc_varsize_clear must lower");
+        };
+        assert!(
+            matches!(generic_ops[0].kind, OpKind::NewArrayClear { .. }),
+            "generic malloc_varsize_clear must lower to NewArrayClear, got {:?}",
+            generic_ops[0].kind
+        );
+
+        let mut cc = crate::call::CallControl::new();
+        let mut caller = FunctionGraph::new("caller_of_malloc_varsize_clear");
+        let start = caller.startblock;
+        let n = caller.alloc_value_var_with_type(ConcreteType::Signed);
+        let allocated = caller.alloc_value_var_with_type(ConcreteType::GcRef);
+        caller.blocks[start.0].operations.push(SpaceOperation {
+            result: Some(allocated),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([
+                    "pyre_object",
+                    "lltype",
+                    "malloc_varsize_clear",
+                ]),
+                args: crate::model::call_args(vec![n]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.set_return(start, None);
+        let caller_path = CallPath::from_segments(["caller_of_malloc_varsize_clear"]);
+        cc.register_function_graph(caller_path, caller);
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["caller_of_malloc_varsize_clear"]),
+                    args: vec![],
+                    result_ty: ValueType::Void,
+                },
+            },
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            descr.extra_info.can_collect,
+            "collectanalyze.py: gc malloc_varsize is canmallocgc"
+        );
     }
 
     /// Two-field length-prefixed items block: `{length: Signed, items:

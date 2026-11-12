@@ -12855,6 +12855,14 @@ impl CallControl {
                             target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if crate::codewriter::jtransform::is_gc_write_barrier_path(segments) => {}
+                        // `collectanalyze.py` `malloc_varsize` with
+                        // `flavor='gc'` is canmallocgc. `malloc_typed` stays
+                        // a recurse / graphless `canmallocgc` mark.
+                        OpKind::Call { target, .. }
+                            if is_lltype_malloc_varsize_clear_target(target) =>
+                        {
+                            break 'walk true;
+                        }
                         OpKind::Call { target, .. } => {
                             // graphanalyze.py: analyze_direct_call — recurse
                             let callee_path = match self.target_to_path(target) {
@@ -13529,23 +13537,37 @@ fn is_rposix_errno_helper(path: &CallPath) -> bool {
 }
 
 /// `lltype.malloc` / `malloc_typed` / `malloc_typed_managed` /
-/// `malloc_typed_stable` is the `malloc` operation `FreshMallocs.__init__`
-/// and `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`) key
-/// on. The Call spelling is that allocator before `rewrite_op_malloc`
-/// (`jtransform.py`) lowers it to `new` / `new_with_vtable`.
-fn is_lltype_malloc_target(target: &CallTarget) -> bool {
+/// `malloc_typed_stable` / `malloc_varsize_clear` is the `malloc` /
+/// `malloc_varsize` operation `FreshMallocs.__init__` and
+/// `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`) key
+/// on. The Call spelling is that allocator before `rewrite_op_malloc` /
+/// `rewrite_op_malloc_varsize` (`jtransform.py`) lowers it.
+fn lltype_malloc_leaf(target: &CallTarget) -> Option<&str> {
     let CallTarget::FunctionPath { segments, .. } = target else {
-        return false;
+        return None;
     };
     if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
-        return false;
+        return None;
     }
-    let leaf = crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]);
+    let leaf = crate::front::clause_spec::template_callable_leaf(&segments[segments.len() - 1]);
     let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
     matches!(
         leaf,
-        "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+        "malloc"
+            | "malloc_typed"
+            | "malloc_typed_managed"
+            | "malloc_typed_stable"
+            | "malloc_varsize_clear"
     )
+    .then_some(leaf)
+}
+
+fn is_lltype_malloc_target(target: &CallTarget) -> bool {
+    lltype_malloc_leaf(target).is_some()
+}
+
+pub(crate) fn is_lltype_malloc_varsize_clear_target(target: &CallTarget) -> bool {
+    lltype_malloc_leaf(target) == Some("malloc_varsize_clear")
 }
 
 pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {

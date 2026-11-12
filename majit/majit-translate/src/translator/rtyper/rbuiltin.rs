@@ -546,6 +546,11 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "malloc_raw",
             rtype_malloc_raw,
         ),
+        (
+            crate::runtime_names::modules::OBJECT_LLTYPE,
+            "malloc_varsize_clear",
+            rtype_malloc_varsize_clear,
+        ),
         // `rgc.py` `ll_arraycopy`. Harvest-skip plus this typer mint
         // one `ll_arraycopy` helper per ARRAY (`@specialize.ll()`);
         // `mark_oopspec(["ll_arraycopy"])` rewrites it to OS_ARRAYCOPY.
@@ -2206,6 +2211,73 @@ pub fn rtype_malloc_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
     vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
 
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
+/// `@typer_for(pyre_object.lltype.malloc_varsize_clear)` — `rbuiltin.py`
+/// `rtype_malloc` varsize arm (`lltype.malloc(ARRAY, n, zero=True)`).
+///
+/// The ARRAY is the `TO` of `hop.r_result.lowleveltype()` (the Rust
+/// spelling is `malloc_varsize_clear::<ItemsBlock>(n)`, one Signed arg).
+/// Flags are `{flavor: gc, zero: true}`; the llop is `malloc_varsize`.
+pub fn rtype_malloc_varsize_clear(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+    use crate::translator::rtyper::rmodel::lowlevel_type_const;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let result_lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_malloc_varsize_clear: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    let array_type = match &result_lltype {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => {
+                Some(LowLevelType::Array(Box::new(arr.clone())))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+    .ok_or_else(|| {
+        TyperError::message(format!(
+            "rtype_malloc_varsize_clear: r_result.lowleveltype must be Ptr(GcArray), got {result_lltype:?}"
+        ))
+    })?;
+
+    // `rbuiltin.py` `rtype_malloc`: flags = {'flavor': 'gc'}; flags['zero'] = True
+    let mut flags_map = IndexMap::new();
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(b"gc".to_vec()),
+    );
+    flags_map.insert(
+        ConstValue::ByteStr(b"zero".to_vec()),
+        ConstValue::Bool(true),
+    );
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )?;
+
+    let v_n = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?;
+    let vlist = vec![
+        lowlevel_type_const(array_type),
+        Hlvalue::Constant(cflags),
+        v_n,
+    ];
+
+    hop.has_implicit_exception("MemoryError");
+    hop.exception_is_here()?;
+    Ok(hop.genop("malloc_varsize", vlist, GenopResult::LLType(result_lltype)))
 }
 
 /// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header)`.
@@ -8913,6 +8985,92 @@ mod tests {
             map.get(&ConstValue::byte_str("flavor")),
             Some(&ConstValue::byte_str("raw"))
         );
+    }
+
+    #[test]
+    fn rtype_malloc_varsize_clear_emits_malloc_varsize_zero() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, Ptr, PtrTarget};
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let signed = hop
+            .rtyper
+            .getprimitiverepr(&LowLevelType::Signed)
+            .expect("Signed");
+        let n = Variable::named("n");
+        n.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(n));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(signed));
+
+        let ptr = Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        };
+        let r_result: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let out = rtype_malloc_varsize_clear(&hop, &HashMap::new())
+            .expect("rtype_malloc_varsize_clear")
+            .expect("malloc_varsize result");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "malloc_varsize");
+        assert_eq!(ops.ops[0].result, out);
+        assert_eq!(ops.ops[0].args.len(), 3);
+
+        let Hlvalue::Constant(array_const) = &ops.ops[0].args[0] else {
+            panic!("malloc_varsize arg0 is the ARRAY const");
+        };
+        assert_eq!(array_const.concretetype, Some(LowLevelType::Void));
+        let ConstValue::LowLevelType(array_ll) = &array_const.value else {
+            panic!(
+                "malloc_varsize arg0 value is LowLevelType, got {:?}",
+                array_const.value
+            );
+        };
+        match array_ll.as_ref() {
+            LowLevelType::Array(arr) if arr._gckind == GcKind::Gc => {}
+            other => panic!("ARRAY const must be GcArray, got {other:?}"),
+        }
+
+        let Hlvalue::Constant(flags) = &ops.ops[0].args[1] else {
+            panic!("malloc_varsize flags");
+        };
+        let ConstValue::Dict(map) = &flags.value else {
+            panic!("malloc_varsize flags dict, got {:?}", flags.value);
+        };
+        assert_eq!(
+            map.get(&ConstValue::byte_str("flavor")),
+            Some(&ConstValue::byte_str("gc"))
+        );
+        assert_eq!(
+            map.get(&ConstValue::byte_str("zero")),
+            Some(&ConstValue::Bool(true))
+        );
+
+        match &ops.ops[0].args[2] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("size must stay a Signed Variable, got {other:?}"),
+        }
+
+        let Hlvalue::Variable(result) = &out else {
+            panic!("malloc_varsize result is a Variable");
+        };
+        match result.concretetype() {
+            Some(LowLevelType::Ptr(p)) => match &p.TO {
+                PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => {}
+                other => panic!("result TO must be GcArray, got {other:?}"),
+            },
+            other => panic!("result lltype must be Ptr(GcArray), got {other:?}"),
+        }
     }
 
     #[test]

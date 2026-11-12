@@ -175,6 +175,29 @@ impl crate::lltype::GcType for ItemsBlock {
     const SIZE: usize = 0;
 }
 
+impl crate::lltype::GcArrayType for ItemsBlock {
+    fn type_id() -> u32 {
+        PY_OBJECT_ARRAY_GC_TYPE_ID
+    }
+
+    fn gc_enabled() -> bool {
+        itemsblock_gc_enabled()
+    }
+
+    fn payload_layout(n: i64) -> Option<Layout> {
+        let n = usize::try_from(n).ok()?;
+        try_items_block_layout(n)
+    }
+
+    unsafe fn write_length_header(ptr: *mut Self, n: i64) {
+        unsafe { (*ptr).capacity = n as usize };
+    }
+
+    unsafe fn alloc_fallback(layout: Layout) -> Option<*mut Self> {
+        unsafe { std_alloc_gc_array(layout, false).map(|p| p as *mut Self) }
+    }
+}
+
 pub const ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(ItemsBlock, items);
 
 /// Offset of the `capacity` header the collector reads as the GcArray length.
@@ -865,42 +888,18 @@ unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
 }
 
 /// [`alloc_items_block_gc`] for a capacity that came from Python.
-/// The bool is whether the block came from `try_gc_alloc` (GC-owned)
-/// rather than `std::alloc`.
+/// The bool is whether the block is GC-owned
+/// ([`crate::gc_hook::try_gc_owns_object`]).
 unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)> {
-    if itemsblock_gc_enabled() {
-        let payload = try_items_block_layout(cap)?.size();
-        match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-            PY_OBJECT_ARRAY_GC_TYPE_ID,
-            payload,
+    let block = unsafe { crate::lltype::malloc_varsize_clear::<ItemsBlock>(cap as i64) };
+    if block.is_null() {
+        None
+    } else {
+        Some((
+            block,
+            crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF),
         ))
-        .allocated_or_raise()
-        {
-            Some(raw) => {
-                let block = raw as *mut ItemsBlock;
-                unsafe {
-                    // IncrementalMiniMark does not zero-fill. Publish
-                    // `capacity` only after the payload is NULL: the type-9
-                    // walker traces `items[0..capacity]` as soon as this
-                    // block is a root, and callers `pin_root` it before
-                    // `try_gc_owns_object`. Zeroing the whole payload first
-                    // leaves a 0 length header so a concurrent walk cannot
-                    // follow dirty nursery words
-                    // (`rlist.py` `_ll_list_resize_hint_really` mallocs
-                    // through `gc_malloc_array`, which leaves GCREF slots
-                    // NULL).
-                    // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
-                    // on the GCREF itself writes no bytes. Zero through `*mut u8`.
-                    std::ptr::write_bytes(raw as *mut u8, 0, payload);
-                    (*block).capacity = cap;
-                }
-                return Some((block, true));
-            }
-            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
-            None => {}
-        }
     }
-    unsafe { try_alloc_items_block(cap).map(|block| (block, false)) }
 }
 
 /// List-construction allocator on the Phase L2 nursery path. Pins each
@@ -1179,19 +1178,13 @@ pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsB
     if !itemsblock_gc_enabled() {
         return None;
     }
-    let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-        PY_OBJECT_ARRAY_GC_TYPE_ID,
-        payload,
-    ))
-    .allocated_or_raise()?;
-    let block = raw as *mut ItemsBlock;
-    unsafe {
-        (*block).capacity = cap;
-        let base = items_block_items_base(block);
-        for i in 0..cap {
-            *base.add(i) = PY_NULL;
-        }
+    let block = unsafe { crate::lltype::malloc_varsize_clear::<ItemsBlock>(cap as i64) };
+    if block.is_null() {
+        return None;
+    }
+    if !crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF) {
+        unsafe { dealloc_items_block(block) };
+        return None;
     }
     Some(block)
 }
@@ -2545,6 +2538,19 @@ mod tests {
         );
         assert!(!arr.is_null());
         assert_eq!(gcarray_len(arr), 1);
+    }
+
+    #[test]
+    fn malloc_varsize_clear_writes_the_length_header() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        unsafe {
+            let block = crate::lltype::malloc_varsize_clear::<ItemsBlock>(3);
+            assert!(!block.is_null());
+            assert_eq!((*block).capacity, 3);
+            dealloc_list_items_block(block);
+        }
     }
 
     #[test]

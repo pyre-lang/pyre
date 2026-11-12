@@ -5783,6 +5783,22 @@ impl Bookkeeper {
                 return self.project_struct_field_type(parts[1]);
             }
         }
+        // `Bookkeeper.getdesc` keys on the class object: a GcArray
+        // (`ItemsBlock` ↔ `object_array::ItemsBlock`) is resolved
+        // through `intern_class_key`. Other registered-struct lookups
+        // keep the harvested spelling (a withdrawn duplicate leaf such
+        // as `RDict` stays unresolved there).
+        let interned = self.intern_class_key(stripped);
+        let gcarray_root = if interned != stripped
+            && !interned.is_empty()
+            && stripped
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
+            interned.as_str()
+        } else {
+            stripped
+        };
         // A declared two-field `{integer, [T; 0]}` is `GcArray` itself
         // (`lltype.py` `GcArray`): `rlist.py` `l.items`,
         // `rordereddict.py` `DICTENTRYARRAY = GcArray(DICTENTRY)`.
@@ -5807,10 +5823,10 @@ impl Bookkeeper {
         // alone is not a `GcArray`. The tail field is read from the
         // declared rows, not from an owner-leaf allowlist.
         let items_field = self.struct_fields.borrow().as_ref().and_then(|reg| {
-            if !crate::front::mir::spelling_is_declared_gc(&reg.gc_struct_ids, stripped) {
+            if !crate::front::mir::spelling_is_declared_gc(&reg.gc_struct_ids, gcarray_root) {
                 return None;
             }
-            let rows = reg.field_rows(stripped)?;
+            let rows = reg.field_rows(gcarray_root)?;
             flexible_gcarray_wrapper_items_field(rows)
         });
         if let Some((items_field, items_ty)) = items_field {
@@ -5821,7 +5837,9 @@ impl Bookkeeper {
                 let guard = self.struct_fields.borrow();
                 guard.as_ref().and_then(|reg| {
                     crate::front::mir::struct_item_flexible_gcarray_block_annotation(
-                        reg, stripped, &items_ty,
+                        reg,
+                        gcarray_root,
+                        &items_ty,
                     )
                 })
             } {
@@ -5833,7 +5851,7 @@ impl Bookkeeper {
             // as `SomeInstance` so a later `__cast_instance_intrinsic`
             // onto `[PyObject]` / `[i64]` can install the real item.
             if !flexible_gcarray_erased_byte_tail(&items_ty) {
-                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
+                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(gcarray_root)
                     && let Some(s_items) =
                         super::classdesc::ClassDef::about_attribute(&classdef, &items_field)
                     && matches!(s_items, SomeValue::List(_))
@@ -10327,6 +10345,91 @@ mod tests {
                 matches!(list.listdef.s_value(), SomeValue::Instance(_)),
                 "{spelling} object-item list must keep the instance item, got {:?}",
                 list.listdef.s_value()
+            );
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_items_block_leaf_ptr_matches_cast_root() {
+        // Harvest dual-publishes full + crate-stripped keys; the Charon
+        // field/tuple AST keeps the TypeDecl leaf (`ItemsBlock`) which
+        // is not a `fields` alias after harden / leaf_free. CAST and
+        // FUNC.ARGS use `class_identity_spelling` (`object_array::ItemsBlock`).
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let items_rows = vec![
+            ("capacity".to_string(), "usize".to_string()),
+            ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+        ];
+        let identity = "object_array::ItemsBlock";
+        let full = "pyre_object::object_array::ItemsBlock";
+        for key in [full, identity] {
+            reg.fields.insert(key.to_string(), items_rows.clone());
+        }
+        harvest_class_identity(&mut reg, identity, &[full, identity, "ItemsBlock"]);
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        note_declared_gc(&mut reg, &[identity, "ItemsBlock"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let from_leaf = bk.project_struct_field_type("*mut ItemsBlock");
+        let from_ident = bk.project_struct_field_type("*mut object_array::ItemsBlock");
+        let SomeValue::List(_) = &from_leaf else {
+            panic!("*mut ItemsBlock must be SomeList, got {from_leaf:?}");
+        };
+        assert_eq!(from_leaf, from_ident);
+
+        let SomeValue::Tuple(t) = bk.project_struct_field_type("(*mut ItemsBlock,bool)") else {
+            panic!("tuple payload must be SomeTuple");
+        };
+        assert!(matches!(t.items[0], SomeValue::List(_)));
+        assert!(matches!(t.items[1], SomeValue::Bool(_)));
+    }
+
+    #[test]
+    fn project_struct_field_type_withdrawn_struct_leaf_is_not_interned() {
+        // Harvest dual-publishes `class_identity[RDict]` onto
+        // `rordereddict::RDict` while harden / leaf_free drops
+        // `fields["RDict"]`. GcArray intern must not rebind that
+        // withdrawn leaf into the registered-struct arm.
+        use crate::front::StructFieldRegistry;
+
+        let identity = "rordereddict::RDict";
+        let rows = vec![
+            ("num_items".to_string(), "usize".to_string()),
+            ("resize_counter".to_string(), "usize".to_string()),
+        ];
+        let project = |with_leaf_identity: bool| {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert(identity.to_string(), rows.clone());
+            let aliases: &[&str] = if with_leaf_identity {
+                &[identity, "RDict"]
+            } else {
+                &[identity]
+            };
+            harvest_class_identity(&mut reg, identity, aliases);
+            note_declared_gc(&mut reg, &[identity]);
+            bk.set_struct_fields(Rc::new(reg));
+            bk.project_struct_field_type("RDict")
+        };
+
+        let with_leaf = project(true);
+        let without_leaf = project(false);
+        assert_eq!(
+            with_leaf, without_leaf,
+            "GcArray intern must not change a withdrawn struct leaf, with={with_leaf:?} without={without_leaf:?}"
+        );
+        if let SomeValue::Instance(inst) = &with_leaf {
+            let name = inst.classdef.as_ref().map(|cd| cd.borrow().name.clone());
+            assert_ne!(
+                name.as_deref(),
+                Some(identity),
+                "withdrawn RDict leaf must not intern as {identity}, got {with_leaf:?}"
             );
         }
     }

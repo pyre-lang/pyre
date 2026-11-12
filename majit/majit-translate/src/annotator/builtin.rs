@@ -326,6 +326,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         crate::runtime_names::modules::MALLOC_TYPED_STABLE,
         malloc_typed_alloc,
     );
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::MALLOC_VARSIZE_CLEAR,
+        malloc_varsize_clear_alloc,
+    );
     // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
     // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Recognising it
     // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the
@@ -2153,6 +2158,75 @@ fn instantiates_variant_declaration(
     }
 }
 
+/// Front CAST ByteStr for `*mut ItemsBlock`
+/// (`class_identity_spelling` of `pyre_object::object_array::ItemsBlock`).
+const ITEMS_BLOCK_CAST_ROOT: &str = "object_array::ItemsBlock";
+
+/// Dest annotation of `__cast_instance_intrinsic` for `root`, with the
+/// operand's nullability applied. `malloc_varsize_clear_alloc` returns
+/// this for [`ITEMS_BLOCK_CAST_ROOT`] so a GC array malloc is the same
+/// SomeList the front's `raw as *mut ItemsBlock` CAST produces.
+fn project_cast_root(
+    bk: &Rc<Bookkeeper>,
+    root: &str,
+    can_be_none: bool,
+) -> Result<SomeValue, AnnotatorError> {
+    let mut projected = if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
+        // RPython GC-transform root slots are llmemory.GCREF.  Rust spells
+        // the helper parameter/return as PyObjectRef / `*mut GCREFOpaque`,
+        // but that carrier must not mint a classdef instance: every concrete
+        // GC pointer is cast_opaque_ptr'd into this slot and restored
+        // afterward.  `pairtype(SomePtr, SomeObject).union` (`llannotation.py`)
+        // refuses Instance ∪ Ptr, so a GCREFOpaque classdef cannot share a
+        // `dstorage` / `frame_ptr` attr with the SomePtr field projection.
+        crate::annotator::bookkeeper::gcref_ptr_annotation()
+    } else if majit_ir::descr::is_list_container_spelling(root) {
+        // `[T]` / `Vec<T>` dests are the current op's list (`Bookkeeper.getlistdef`),
+        // not a fresh ListDef per projection. `setbinding` then `contains`
+        // the same object on reflow (`TLS.no_side_effects_in_union`).
+        bk.project_list_spelling_at_position(root)
+    } else if majit_ir::descr::is_shaped_tuple_name(root) {
+        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF to
+        // the tuple of two lists. Same projection
+        // `derive_subject_inputcells` uses for a `Tuple<A,B>` parameter
+        // (`Bookkeeper::project_shaped_tuple`). `stable_projected_root`
+        // caches list-bearing tuples so reflow `setbinding` sees the
+        // same ListDefs.
+        bk.stable_projected_root(root)
+    } else {
+        // One projection per position (`Bookkeeper.getlistdef`,
+        // bookkeeper.py). Reflow setbinding then sees the same ListDefs.
+        bk.stable_projected_root(root)
+    };
+    if let SomeValue::String(str_) = &mut projected {
+        // `project_struct_field_type("Option<String>")` already
+        // `noneify`s (`union(s_str0, s_None)`). A residual host
+        // call shells as a classdef-less instance with
+        // `can_be_none=false`; copying that onto the projection
+        // would undo the Option's nullability and make `s is None`
+        // (`pairtype(SomeObject, SomeObject).is_`) a constant false.
+        str_.inner.can_be_none = can_be_none || str_.inner.can_be_none;
+    }
+    // A list root is one `ListDef` for this operation
+    // (`Bookkeeper.newlist` / `getlistdef`). `project_struct_field_type`
+    // mints a fresh list, and the next reflow's `setbinding` refuses it:
+    // the new list does not contain the one already bound.
+    if let SomeValue::List(list) = &projected
+        && bk.position_entered.get()
+    {
+        let item = list.listdef.s_value();
+        match bk.newlist(&[item], None) {
+            Ok(stable) => return Ok(SomeValue::List(stable)),
+            Err(err) => {
+                return Err(AnnotatorError::new(format!(
+                    "__cast_instance_intrinsic: {err}"
+                )));
+            }
+        }
+    }
+    Ok(projected)
+}
+
 /// Analyzer for `__cast_instance_intrinsic` — the front-end pointer-downcast
 /// narrow (#298).  `front::mir` aliases the classdef-less pointer for a
 /// same-bank `obj as *const RegisteredStruct` cast, so a field read on
@@ -2209,33 +2283,6 @@ fn cast_instance_intrinsic(
         }
     };
     let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
-    let projected = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
-        // RPython GC-transform root slots are llmemory.GCREF.  Rust spells
-        // the helper parameter/return as PyObjectRef / `*mut GCREFOpaque`,
-        // but that carrier must not mint a classdef instance: every concrete
-        // GC pointer is cast_opaque_ptr'd into this slot and restored
-        // afterward.  `pairtype(SomePtr, SomeObject).union` (`llannotation.py`)
-        // refuses Instance ∪ Ptr, so a GCREFOpaque classdef cannot share a
-        // `dstorage` / `frame_ptr` attr with the SomePtr field projection.
-        crate::annotator::bookkeeper::gcref_ptr_annotation()
-    } else if majit_ir::descr::is_list_container_spelling(&root) {
-        // `[T]` / `Vec<T>` dests are the current op's list (`Bookkeeper.getlistdef`),
-        // not a fresh ListDef per projection. `setbinding` then `contains`
-        // the same object on reflow (`TLS.no_side_effects_in_union`).
-        bk.project_list_spelling_at_position(&root)
-    } else if majit_ir::descr::is_shaped_tuple_name(&root) {
-        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF to
-        // the tuple of two lists. Same projection
-        // `derive_subject_inputcells` uses for a `Tuple<A,B>` parameter
-        // (`Bookkeeper::project_shaped_tuple`). `stable_projected_root`
-        // caches list-bearing tuples so reflow `setbinding` sees the
-        // same ListDefs.
-        bk.stable_projected_root(&root)
-    } else {
-        // One projection per position (`Bookkeeper.getlistdef`,
-        // bookkeeper.py). Reflow setbinding then sees the same ListDefs.
-        bk.stable_projected_root(&root)
-    };
     // Nullability travels with the value, not with the target spelling: a
     // downcast of a nullable pointer is itself nullable, and a null operand
     // is a legal one — `cast_opaque_ptr` answers `nullptr(PTRTYPE.TO)` for it
@@ -2248,18 +2295,7 @@ fn cast_instance_intrinsic(
         SomeValue::None_(_) => true,
         _ => false,
     };
-    let with_nullability = |mut projected: SomeValue| {
-        if let SomeValue::String(str_) = &mut projected {
-            // `project_struct_field_type("Option<String>")` already
-            // `noneify`s (`union(s_str0, s_None)`). A residual host
-            // call shells as a classdef-less instance with
-            // `can_be_none=false`; copying that onto the projection
-            // would undo the Option's nullability and make `s is None`
-            // (`pairtype(SomeObject, SomeObject).is_`) a constant false.
-            str_.inner.can_be_none = operand_can_be_none || str_.inner.can_be_none;
-        }
-        projected
-    };
+    let projected = project_cast_root(bk, &root, operand_can_be_none)?;
     // The symmetric external-item boundary rlist uses: a GCREF read from
     // `GcArray(GCREF)` becomes its concrete external pointer (StringRepr
     // here).  `AbstractBaseListRepr.recast` (`rpython/rtyper/rlist.py`)
@@ -2282,7 +2318,7 @@ fn cast_instance_intrinsic(
             | SomeValue::List(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
-            | SomeValue::None_(_) => Ok(with_nullability(projected)),
+            | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for string root {root:?}: {other:?}"
             ))),
@@ -2322,24 +2358,7 @@ fn cast_instance_intrinsic(
     // `SomeList` carries no `can_be_None` — upstream's does not either — so
     // the nullability computed above has nowhere to land on this arm; a null
     // operand is still admitted rather than hard-errored.
-    // A list root is one `ListDef` for this operation
-    // (`Bookkeeper.newlist` / `getlistdef`). `project_struct_field_type`
-    // mints a fresh list, and the next reflow's `setbinding` refuses it:
-    // the new list does not contain the one already bound.
-    if let SomeValue::List(list) = &projected {
-        let projected = if bk.position_entered.get() {
-            let item = list.listdef.s_value();
-            match bk.newlist(&[item], None) {
-                Ok(stable) => SomeValue::List(stable),
-                Err(err) => {
-                    return Err(AnnotatorError::new(format!(
-                        "__cast_instance_intrinsic: {err}"
-                    )));
-                }
-            }
-        } else {
-            projected.clone()
-        };
+    if matches!(&projected, SomeValue::List(_)) {
         return match operand {
             SomeValue::List(_) => Ok(operand.clone()),
             SomeValue::Instance(_)
@@ -3341,6 +3360,34 @@ fn malloc_typed_alloc(
             "malloc[_typed](): expected a struct value to box, got {other:?}"
         ))),
     }
+}
+
+/// Analyzer for `pyre_object::lltype::malloc_varsize_clear::<T>(n) -> *mut T`
+/// — `lltype.malloc(ARRAY, n, zero=True)`. Registered as a builtin so the
+/// body (which writes the GcArray length header) is never looked-inside.
+/// One `SomeInteger` length; the result is the annotation
+/// `__cast_instance_intrinsic` returns for a nullable
+/// [`ITEMS_BLOCK_CAST_ROOT`] operand (`gc_alloc_failed_pending` can yield
+/// null).
+fn malloc_varsize_clear_alloc(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "malloc_varsize_clear() expects a single (length) positional argument",
+        ));
+    }
+    match arg_at(args_s, 0, "malloc_varsize_clear") {
+        SomeValue::Integer(_) => {}
+        other => {
+            return Err(AnnotatorError::new(format!(
+                "malloc_varsize_clear(): expected an integer length, got {other:?}"
+            )));
+        }
+    }
+    project_cast_root(bk, ITEMS_BLOCK_CAST_ROOT, true)
 }
 
 /// Analyzer for `pyre_object::lltype::malloc_raw::<T>(value: T) -> *mut T`
@@ -7466,6 +7513,57 @@ mod tests {
             after.contains(&first),
             "setbinding: new value must contain old after the listdef item noneifies"
         );
+    }
+
+    #[test]
+    fn malloc_varsize_clear_alloc_matches_nullable_items_block_cast() {
+        // `malloc_varsize_clear` returns the same annotation as
+        // `__cast_instance_intrinsic` of a nullable operand onto the
+        // front CAST ByteStr for `*mut ItemsBlock`
+        // (`class_identity_spelling` → `object_array::ItemsBlock`).
+        use crate::annotator::bookkeeper::PositionKey;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let items_rows = vec![
+            ("capacity".to_string(), "usize".to_string()),
+            ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+        ];
+        reg.fields
+            .insert(ITEMS_BLOCK_CAST_ROOT.to_string(), items_rows.clone());
+        reg.fields.insert("ItemsBlock".to_string(), items_rows);
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.note_declared_gc_name(ITEMS_BLOCK_CAST_ROOT);
+        bk.set_struct_fields(Rc::new(reg));
+        bk.set_position_key(Some(PositionKey::new(4, 5, 6)));
+
+        let malloc = call_builtin(
+            &bk,
+            crate::runtime_names::modules::MALLOC_VARSIZE_CLEAR,
+            &[Some(SomeValue::Integer(SomeInteger::new(true, true)))],
+            &no_kwds(),
+        )
+        .expect("malloc_varsize_clear_alloc");
+        let s_null = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str(ITEMS_BLOCK_CAST_ROOT))
+            .expect("ItemsBlock root constant");
+        let cast = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_null), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("nullable ItemsBlock cast_instance_intrinsic");
+        assert!(
+            malloc.contains(&cast) && cast.contains(&malloc),
+            "malloc_varsize_clear_alloc must match nullable ItemsBlock CAST, malloc={malloc:?} cast={cast:?}"
+        );
+        assert_eq!(malloc, cast);
     }
 
     #[test]

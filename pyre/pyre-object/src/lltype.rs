@@ -733,6 +733,68 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
     }
 }
 
+/// A GC array type `lltype.malloc` can allocate (`GcArray`).
+///
+/// Implemented for [`crate::object_array::ItemsBlock`]
+/// (`rlist.py` `GcArray(OBJECTPTR)`). The allocator body reads the tid,
+/// the payload layout for `n`, and writes the length header here so a
+/// looked-inside caller never stores that header.
+pub trait GcArrayType {
+    fn type_id() -> u32;
+    fn gc_enabled() -> bool;
+    fn payload_layout(n: i64) -> Option<std::alloc::Layout>;
+    /// Store the GcArray length header. Called only from [`malloc_varsize_clear`].
+    unsafe fn write_length_header(ptr: *mut Self, n: i64);
+    /// `std::alloc` fallback; items are not zeroed.
+    unsafe fn alloc_fallback(layout: std::alloc::Layout) -> Option<*mut Self>;
+}
+
+/// `lltype.malloc(ARRAY, n, zero=True)` / `gct_fv_gc_malloc_varsize`.
+///
+/// The allocator writes the GcArray length header; callers must not.
+/// Returns null on failure and keeps the `gc_alloc_failed_pending`
+/// contract. GC ownership of a non-null result is
+/// [`crate::gc_hook::try_gc_owns_object`].
+#[inline]
+pub unsafe fn malloc_varsize_clear<T: GcArrayType>(n: i64) -> *mut T {
+    if T::gc_enabled() {
+        match T::payload_layout(n) {
+            Some(payload) => {
+                match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+                    T::type_id(),
+                    payload.size(),
+                ))
+                .allocated_or_raise()
+                {
+                    Some(raw) => unsafe {
+                        // IncrementalMiniMark does not zero-fill. Publish
+                        // the length header only after the payload is NULL:
+                        // the walker traces `items[0..length]` as soon as
+                        // this block is a root. Zero through `*mut u8`
+                        // (`GCREF` is `*mut GCREFOpaque`, `size_of` 0).
+                        std::ptr::write_bytes(raw as *mut u8, 0, payload.size());
+                        let ptr = raw as *mut T;
+                        T::write_length_header(ptr, n);
+                        return ptr;
+                    },
+                    None if crate::gc_hook::gc_alloc_failed_pending() => {
+                        return std::ptr::null_mut();
+                    }
+                    None => {}
+                }
+            }
+            None => return std::ptr::null_mut(),
+        }
+    }
+    match T::payload_layout(n).and_then(|layout| unsafe { T::alloc_fallback(layout) }) {
+        Some(ptr) => {
+            unsafe { T::write_length_header(ptr, n) };
+            ptr
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// `lltype.malloc(T, flavor='raw')` parity. Non-GC heap allocation;
 /// caller manages lifetime via `Box::from_raw` later.
 ///
