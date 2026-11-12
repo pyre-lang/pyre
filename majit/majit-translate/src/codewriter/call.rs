@@ -10039,16 +10039,6 @@ impl CallControl {
         self.declared_graph_result_type(&graph)
     }
 
-    /// Raw ADT returns have a coarse `ref` frontend token but an int-bank
-    /// `FUNC.RESULT`. Recover that declared repr for untyped call sites too.
-    pub(crate) fn declared_raw_result_for_target(&self, target: &CallTarget) -> bool {
-        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
-            return false;
-        };
-        graph.return_type.as_deref() == Some("ref")
-            && self.declared_graph_result_type(&graph) == Some(Type::Int)
-    }
-
     /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's
     /// `_gckind`. A frontend `ref` token also needs its declared class root
     /// to distinguish a raw Struct pointer from a GC reference.

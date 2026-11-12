@@ -453,6 +453,16 @@ fn signed_ids_that_must_stay_int(
             {
                 stay.insert(result.id());
             }
+            // `call.py getcalldescr` RESULT is FUNC.RESULT. `history.py
+            // getkind` banks a raw Ptr as int, and `jtransform.py
+            // rewrite_call` uses that kind for the dest. A following
+            // getfield_gc base reads `cast_int_to_ptr` of this cell.
+            if let OpKind::InlineCall {
+                result_kind: 'i', ..
+            } = &op.kind
+            {
+                stay.insert(result.id());
+            }
         }
     }
     let mut ties: Vec<(Variable, Variable)> = Vec::new();
