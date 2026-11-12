@@ -2318,12 +2318,13 @@ pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
 }
 
 // One registration per *kind* of root storage, as framework.py registers
-// GcRootMap sources: the interpreter's process-global off-GC slots
-// (`walk_interpreter_global_roots`), the exceptions parked outside GC
-// discipline (`walk_parked_exception_roots`), the immortal process-global
-// stores (`walk_immortal_store_roots`), and the per-loop gc_table walker
-// registered from gcreftracer.rs — four in a native build, three on wasm and
-// under `sandbox`, where the faulthandler source is compiled out.
+// GcRootMap sources. Production installs four: the interpreter's
+// process-global off-GC slots (`walk_interpreter_global_roots`; faulthandler
+// roots ride inside this walker and are compiled out of its body on wasm and
+// under `sandbox`), the exceptions parked outside GC discipline
+// (`walk_parked_exception_roots`), the immortal process-global stores
+// (`walk_immortal_store_roots`), and the per-loop gc_table walker registered
+// from gcreftracer.rs.
 //
 // Anything that enumerates a population belongs inside one of those, not in a
 // slot of its own; the cap is what stops the array from drifting back into a

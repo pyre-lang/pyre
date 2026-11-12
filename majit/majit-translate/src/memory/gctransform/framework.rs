@@ -440,6 +440,8 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     // `external_malloc`'s `threshold_reached` collection, for a host object
     // whose payload is charged as memory pressure instead of allocated.
     "majit_gc::maybe_collect_for_external_malloc",
+    // `incminimark.py` `minor_collection_with_major_progress`.
+    "majit_gc::collect_nursery_with_major_progress",
     // The host hook the interpreter reaches them through.
     "gc_hook::try_gc_alloc_collecting_rooted",
     // A requested collection, which is the one collection point an interpreter
@@ -448,6 +450,197 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "gc_hook::try_gc_collect_step",
     "gc_hook::try_gc_collect_oldgen",
 ];
+
+/// Public `majit_gc` dispatchers whose every path, including the installed
+/// MiniMark implementation of the trait method they dispatch to, performs
+/// no collection. Analog of `lloperation.py` `LL_OPERATIONS` rows with
+/// `canmallocgc=False`. A name not listed stays in `indirect`.
+const NONCOLLECTING_GC_OPS: &[&str] = &[
+    "majit_gc::gc_write_barrier",
+    "majit_gc::gc_write_barrier_managed",
+    "majit_gc::gc_write_barrier_from_array",
+    "majit_gc::gc_write_barrier_before_move",
+    "majit_gc::gc_writebarrier_before_copy",
+    "majit_gc::can_move",
+    "majit_gc::pin",
+    "majit_gc::unpin",
+    "majit_gc::is_pinned",
+    "majit_gc::gc_register_finalizer",
+    "majit_gc::gc_ignore_finalizer",
+    "majit_gc::gc_fq_next_dead",
+    "majit_gc::gc_set_enabled",
+    "majit_gc::gc_isenabled",
+    "majit_gc::gc_shrink_array",
+];
+
+/// Closed callee families for `global_hook!` wrappers.
+///
+/// `GraphAnalyzer.analyze_indirect_call` walks a known `graphs` set;
+/// `top_result` is only when `graphs is None`. Each wrapper here reads one
+/// `FnPtrCell` whose production body is installed by
+/// `install_pyre_object_hooks` (plus `register_maybe_finalizer_hook` and
+/// `register_stale_array_holder_hook`), so the trampoline is a one-element
+/// family rather than an unknown fn-pointer. `gc_identity_hash` is omitted:
+/// whether its shadow malloc is a collection is decided separately.
+pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "gc_hook::try_gc_alloc",
+        &["eval::pyre_object_gc_alloc_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_with_placement",
+        &["eval::pyre_object_gc_alloc_with_placement_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_stable",
+        &["eval::pyre_object_gc_alloc_stable_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_stable_raw",
+        &["eval::pyre_object_gc_alloc_stable_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_young_nonmoving_raw",
+        &["eval::pyre_object_gc_alloc_young_nonmoving_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw",
+        &["eval::pyre_object_gc_alloc_young_nonmoving_no_collect_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_nursery_raw",
+        &["eval::pyre_object_gc_alloc_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_alloc_collecting_rooted",
+        &[
+            "eval::pyre_object_gc_alloc_collecting_rooted_trampoline",
+            "eval::pyre_object_gc_alloc_collecting_trampoline",
+        ],
+    ),
+    (
+        "gc_hook::try_gc_collect",
+        &["eval::pyre_object_gc_collect_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_collect_step",
+        &["eval::pyre_object_gc_collect_step_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_collect_oldgen",
+        &["eval::pyre_object_gc_collect_oldgen_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_minor_with_major_progress",
+        &["eval::pyre_object_gc_collect_nursery_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_set_enabled",
+        &["eval::pyre_object_gc_set_enabled_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_isenabled",
+        &["eval::pyre_object_gc_isenabled_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_register_finalizer",
+        &["eval::pyre_object_gc_register_finalizer_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_ignore_finalizer",
+        &["eval::pyre_object_gc_ignore_finalizer_trampoline"],
+    ),
+    (
+        "gc_hook::maybe_register_finalizer",
+        &["executioncontext::maybe_register_user_finalizer"],
+    ),
+    (
+        "gc_hook::try_gc_major_threshold_reached",
+        &["eval::pyre_object_gc_major_threshold_reached_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_add_root",
+        &["eval::pyre_object_gc_add_root_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_remove_root",
+        &["eval::pyre_object_gc_remove_root_trampoline"],
+    ),
+    (
+        "gc_hook::report_stale_array_holder",
+        &["pyframe::report_stale_locals_array_holder"],
+    ),
+    (
+        "gc_hook::try_gc_owns_object",
+        &["eval::pyre_object_gc_owns_object_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_write_barrier",
+        &["eval::pyre_object_gc_write_barrier_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_write_barrier_prebuilt",
+        &[
+            "eval::pyre_object_gc_owns_object_trampoline",
+            "eval::pyre_object_gc_write_barrier_trampoline",
+        ],
+    ),
+    (
+        "gc_hook::try_gc_write_barrier_from_array",
+        &["eval::pyre_object_gc_write_barrier_from_array_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_write_barrier_before_move",
+        &["eval::pyre_object_gc_write_barrier_before_move_trampoline"],
+    ),
+    (
+        "gc_hook::try_gc_write_barrier_managed",
+        &["eval::pyre_object_gc_write_barrier_managed_trampoline"],
+    ),
+];
+
+/// Public majit_gc dispatchers that can collect and must stay in
+/// `indirect`. They are not [`COLLECTING_SEEDS`]: proving
+/// `alloc_young_nonmoving_typed` would mark every host `FrameBox`
+/// birth as an unbracketed collecting call.
+const OPAQUE_COLLECTING_GC_DISPATCH: &[&str] = &["majit_gc::alloc_young_nonmoving_typed"];
+
+/// `register_stale_array_holder_hook` installs this abort reporter.
+/// Its body calls `emit_stderr`, which can reach Python; a
+/// flow-insensitive `GraphAnalyzer.analyze_indirect_call` edge would
+/// then prove every `try_gc_write_barrier_from_array` caller collecting
+/// and fire the alias-closed tier-1.5 invariant. The family edge is
+/// kept; the reporter's callees are not.
+const ABORT_REPORTER_LEAVES: &[&str] = &["pyframe::report_stale_locals_array_holder"];
+
+fn name_matches_seed(name: &str, pat: &str) -> bool {
+    name == pat || name.ends_with(&format!("::{pat}"))
+}
+
+/// [`HOOK_CALL_FAMILIES`] wrapper keys, plus nested helpers Charon
+/// records under the wrapper (`_jit_look_inside_*`, `_MAJIT_OPAQUE`).
+/// `try_gc_write_barrier_managed` does not match `try_gc_write_barrier`
+/// because the nested form requires `::{pat}::`.
+fn name_matches_hook_wrapper(name: &str, pat: &str) -> bool {
+    name_matches_seed(name, pat) || name.contains(&format!("::{pat}::"))
+}
+
+fn name_last_segment(name: &str) -> &str {
+    let last = name.rsplit("::").next().unwrap_or(name);
+    last.split('#').next().unwrap_or(last)
+}
+
+/// `lltype.malloc` typed helpers that still call their allocation hook;
+/// only the `GcType::type_id` unresolved call is discharged.
+/// `CollectAnalyzer.analyze_simple_operation` does not treat that as
+/// `canmallocgc`. Specs keep the `#…` suffix; the last segment match
+/// covers both.
+fn name_is_typed_malloc_helper(name: &str) -> bool {
+    matches!(
+        name_last_segment(name),
+        "malloc_typed_managed" | "malloc_typed" | "malloc_typed_immortal" | "malloc_typed_stable"
+    )
+}
 
 /// Host calls that leave the collector's RUNNING census.
 ///
@@ -529,7 +722,7 @@ impl CallGraph {
                 // would let `fastcall::call_callable` answer for the
                 // `call::call_callable` seed, and an over-matched seed widens
                 // every verdict downstream of `reaching`.
-                if name == pat || name.ends_with(&format!("::{pat}")) {
+                if name_matches_seed(name, pat) {
                     ids.insert(id);
                     any = true;
                 }
@@ -550,6 +743,108 @@ impl CallGraph {
             s.push_str(&format!("; UNMATCHED patterns: {unmatched:?}"));
         }
         s
+    }
+
+    /// `GraphAnalyzer.analyze_indirect_call` over a hook wrapper's closed
+    /// trampoline family.
+    ///
+    /// A Dynamic / Ptr call inside a [`HOOK_CALL_FAMILIES`] wrapper is a
+    /// known `graphs` set, not `graphs is None`. Edges are added only when
+    /// every family name resolves (never drop a member silently). Called
+    /// from the artefact build and again from [`Joined::build`], because a
+    /// trampoline can live in a donor artefact.
+    pub fn apply_hook_call_families(&mut self) {
+        for &(wrapper_pat, family) in HOOK_CALL_FAMILIES {
+            let wrappers: Vec<u64> = self
+                .names
+                .iter()
+                .filter(|(id, name)| {
+                    self.indirect.contains(id) && name_matches_hook_wrapper(name, wrapper_pat)
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            if wrappers.is_empty() {
+                continue;
+            }
+            let mut member_ids: Vec<u64> = Vec::new();
+            let mut missing = false;
+            for &member_pat in family {
+                let mut any = false;
+                for (&id, name) in &self.names {
+                    if name_matches_seed(name, member_pat) {
+                        member_ids.push(id);
+                        any = true;
+                    }
+                }
+                if !any {
+                    missing = true;
+                    break;
+                }
+            }
+            if missing {
+                continue;
+            }
+            for w in wrappers {
+                let entry = self.callees.entry(w).or_default();
+                for &m in &member_ids {
+                    entry.insert(m);
+                    self.callers.entry(m).or_default().insert(w);
+                }
+                self.indirect.remove(&w);
+            }
+        }
+        self.leaf_abort_reporters();
+        self.drop_noncollecting_gc_dispatch();
+    }
+
+    /// Keep the [`HOOK_CALL_FAMILIES`] edge to an abort reporter and
+    /// drop the reporter's own callees. See [`ABORT_REPORTER_LEAVES`].
+    fn leaf_abort_reporters(&mut self) {
+        let ids: Vec<u64> = self
+            .names
+            .iter()
+            .filter(|(_, name)| {
+                ABORT_REPORTER_LEAVES
+                    .iter()
+                    .any(|pat| name_matches_seed(name, pat))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            if let Some(cs) = self.callees.get_mut(&id) {
+                cs.clear();
+            }
+        }
+    }
+
+    /// Drop `indirect` on [`NONCOLLECTING_GC_OPS`] dispatchers a trampoline
+    /// Regular-calls, and on typed `lltype.malloc` helpers whose
+    /// unresolved call is `GcType::type_id`. `gct_gc_writebarrier`
+    /// does not `push_roots`; `CollectAnalyzer.analyze_simple_operation`
+    /// treats `gc_writebarrier` / `gc_fq_register` as `canmallocgc=False`.
+    /// Collection is [`COLLECTING_SEEDS`]; [`OPAQUE_COLLECTING_GC_DISPATCH`]
+    /// stays unresolved so a host `FrameBox` birth is not proven collecting.
+    fn drop_noncollecting_gc_dispatch(&mut self) {
+        let collecting = self.seeds_for(COLLECTING_SEEDS).0;
+        let drop: Vec<u64> = self
+            .names
+            .iter()
+            .filter(|(id, name)| {
+                self.indirect.contains(id)
+                    && (NONCOLLECTING_GC_OPS
+                        .iter()
+                        .any(|pat| name_matches_seed(name, pat))
+                        || name_is_typed_malloc_helper(name))
+                    && !collecting.contains(id)
+                    && !OPAQUE_COLLECTING_GC_DISPATCH
+                        .iter()
+                        .any(|pat| name_matches_seed(name, pat))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in drop {
+            self.indirect.remove(&id);
+        }
     }
 }
 
@@ -661,7 +956,6 @@ impl Joined {
             canonical.push(mine);
         }
         let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
-        let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
         let mut indirect: HashSet<u64> = HashSet::new();
         for (part, map) in parts.iter().zip(&canonical) {
             for (caller, cs) in &part.callees {
@@ -681,21 +975,25 @@ impl Joined {
                 }
             }
         }
-        for (&caller, cs) in &callees {
+        let mut graph = CallGraph {
+            names,
+            keys: joined_keys,
+            callees,
+            callers: HashMap::new(),
+            indirect,
+            opaque: OpaqueCensus::default(),
+            spec_memo: HashMap::new(),
+        };
+        // Family members are often in a donor artefact; the joined name
+        // table is the first place every trampoline is visible at once.
+        graph.apply_hook_call_families();
+        for (&caller, cs) in &graph.callees {
             for &c in cs {
-                callers.entry(c).or_default().insert(caller);
+                graph.callers.entry(c).or_default().insert(caller);
             }
         }
         Self {
-            graph: CallGraph {
-                names,
-                keys: joined_keys,
-                callees,
-                callers,
-                indirect,
-                opaque: OpaqueCensus::default(),
-                spec_memo: HashMap::new(),
-            },
+            graph,
             canonical,
             joined_names,
             ambiguous_names: ambiguous.len(),
@@ -711,6 +1009,14 @@ impl Joined {
             .filter(|(_, cid)| joined.contains(cid))
             .map(|(&def_id, _)| def_id)
             .collect()
+    }
+
+    /// Map one artefact's def id onto the joined graph's node id.
+    ///
+    /// `path_to` on the joined graph wants these ids; a liveness finding
+    /// reports the artefact's.  `part` indexes the slice `build` was given.
+    pub fn canonical_id(&self, part: usize, def_id: u64) -> Option<u64> {
+        self.canonical.get(part)?.get(&def_id).copied()
     }
 }
 
@@ -1239,6 +1545,9 @@ mod tests {
             joined.project(1, &HashSet::from([node])),
             HashSet::from([5])
         );
+        assert_eq!(joined.canonical_id(0, 1), Some(node));
+        assert_eq!(joined.canonical_id(1, 5), Some(node));
+        assert_eq!(joined.canonical_id(0, 99), None);
     }
 
     fn item_meta(path: &[&str]) -> serde_json::Value {
@@ -1740,6 +2049,753 @@ mod tests {
         assert!(
             open_callees.contains(&3),
             "unresolved caller must edge to the generic node, callees={open_callees:?}"
+        );
+    }
+
+    /// Generic `outer` Regular-calls generic `inner`; only `inner` has the
+    /// Clause Trait terminator. A monomorphic `TraitImpl` site must still
+    /// specialize both.
+    fn llbc_forwarding_generic_instantiation() -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let unstructured = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": blocks
+                }
+            })
+        };
+        let call_term = |func: serde_json::Value, target: u64, on_unwind: u64| {
+            serde_json::json!({
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {"func": func, "args": []}, "dest": place(0),
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }}
+        });
+        let clause_ref = serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}}
+        });
+        let fun =
+            |id: u64, name: &str, body: serde_json::Value, generics: Option<serde_json::Value>| {
+                let mut row = serde_json::json!({
+                    "def_id": id,
+                    "item_meta": item_meta(&["fixture", name]),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                    "body": body
+                });
+                if let Some(g) = generics {
+                    row.as_object_mut().unwrap().insert("generics".into(), g);
+                }
+                row
+            };
+        let clause_generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_clauses": [{"clause_id": 0}],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "trait_type_constraints": []
+        });
+        let inner = fun(
+            2,
+            "inner",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Trait": [clause_ref.clone(), 0]},
+                        "generics": empty_g.clone()
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ]),
+            Some(clause_generics.clone()),
+        );
+        let outer = fun(
+            3,
+            "outer",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 2},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [clause_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ]),
+            Some(clause_generics),
+        );
+        let closure = fun(1, "closure_body", unstructured(vec![ret.clone()]), None);
+        let use_concrete = fun(
+            0,
+            "use_concrete",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 3},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [impl_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind,
+                ret,
+            ]),
+            None,
+        );
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [use_concrete, closure, inner, outer],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["fixture", "Apply"])
+                }],
+                "trait_impls": [{
+                    "def_id": 0,
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }],
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    },
+                    "implied_trait_refs": []
+                }]
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("forwarding-generic fixture parses")
+    }
+
+    fn first_regular_fun_call(
+        llbc: &majit_charon_reader::Llbc,
+        fd_id: u64,
+    ) -> (u64, serde_json::Value) {
+        use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
+        let fd = llbc.fn_by_id(fd_id).expect("fun decl");
+        let body = fd.unstructured().expect("body");
+        let TermKind::Call { call, .. } = body.body[0].term(llbc).expect("call") else {
+            panic!("expected Call");
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            panic!("expected Regular");
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            panic!("expected Fun Regular");
+        };
+        (*id, reg.generics.clone())
+    }
+
+    /// Generic `outer<T: Tr>` whose body only Regular-calls generic
+    /// `inner<T: Tr>` (which holds the Clause Trait call). A monomorphic
+    /// caller with a `TraitImpl` gets a non-indirect spec of `outer` with
+    /// an edge to a non-indirect spec of `inner`, which has an edge to the
+    /// impl method.
+    #[test]
+    fn forwarding_generic_specializes_through_regular_call() {
+        let llbc = llbc_forwarding_generic_instantiation();
+        let cg = build(&llbc);
+        assert!(
+            cg.indirect.contains(&2),
+            "the inner generic template stays indirect: {:?}",
+            cg.indirect
+        );
+        let (callee, generics) = first_regular_fun_call(&llbc, 0);
+        let spec_outer = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec_outer, 3, "concrete call must name a spec of outer");
+        assert!(
+            !cg.indirect.contains(&spec_outer),
+            "spec of outer must not be indirect"
+        );
+        let outer_callees = cg.callees.get(&spec_outer).expect("spec outer callees");
+        let spec_inner = outer_callees
+            .iter()
+            .copied()
+            .find(|&id| id != 2 && id != 3)
+            .expect("spec of outer must edge to a spec of inner");
+        assert_ne!(spec_inner, 2, "inner spec must not be the generic");
+        assert!(
+            !cg.indirect.contains(&spec_inner),
+            "spec of inner must not be indirect"
+        );
+        let inner_callees = cg.callees.get(&spec_inner).expect("spec inner callees");
+        assert!(
+            inner_callees.contains(&1),
+            "spec of inner must edge to the impl method, callees={inner_callees:?}"
+        );
+        let caller_callees = cg.callees.get(&0).expect("use_concrete callees");
+        assert!(
+            caller_callees.contains(&spec_outer),
+            "concrete caller must edge to spec outer, callees={caller_callees:?}"
+        );
+        assert!(
+            !caller_callees.contains(&3),
+            "concrete caller must not keep the generic outer edge, callees={caller_callees:?}"
+        );
+    }
+
+    fn llbc_hook_wrapper(with_family_member: bool) -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["gc_hook", "try_gc_write_barrier"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let mut fun_decls = vec![wrapper];
+        if with_family_member {
+            fun_decls.push(serde_json::json!({
+                "def_id": 1,
+                "item_meta": item_meta(&[
+                    "eval",
+                    "pyre_object_gc_write_barrier_trampoline"
+                ]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            }));
+        }
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": fun_decls,
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("hook-wrapper fixture parses")
+    }
+
+    /// A wrapper with a Ptr/Dynamic call and a resolved family entry is
+    /// not `indirect` and has an edge to the family member.
+    #[test]
+    fn hook_wrapper_family_resolves_ptr_call() {
+        let llbc = llbc_hook_wrapper(true);
+        let cg = build(&llbc);
+        assert!(
+            !cg.indirect.contains(&0),
+            "resolved family must drop indirect: {:?}",
+            cg.indirect
+        );
+        let callees = cg.callees.get(&0).expect("wrapper callees");
+        assert!(
+            callees.contains(&1),
+            "wrapper must edge to the family member, callees={callees:?}"
+        );
+    }
+
+    /// A wrapper whose family name does not resolve stays `indirect`.
+    #[test]
+    fn hook_wrapper_unresolved_family_stays_indirect() {
+        let llbc = llbc_hook_wrapper(false);
+        let cg = build(&llbc);
+        assert!(
+            cg.indirect.contains(&0),
+            "unresolved family must keep the wrapper indirect"
+        );
+        let callees = cg.callees.get(&0).cloned().unwrap_or_default();
+        assert!(
+            !callees.contains(&1),
+            "missing family member must not invent an edge, callees={callees:?}"
+        );
+    }
+
+    /// Trampoline Regular-calls a majit_gc dispatcher whose body is
+    /// Dynamic (`gc_writebarrier` `canmallocgc=False`). The wrapper
+    /// must leave `reaching(indirect)`.
+    #[test]
+    fn hook_wrapper_gc_dispatch_not_in_reaching_indirect() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["gc_hook", "try_gc_write_barrier"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let trampoline = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&[
+                "eval",
+                "pyre_object_gc_write_barrier_trampoline"
+            ]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": empty_g
+                            }},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let dispatch = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["majit_gc", "gc_write_barrier"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [wrapper, trampoline, dispatch],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("hook-dispatch fixture parses");
+        let cg = build(&llbc);
+        assert!(
+            !cg.indirect.contains(&0),
+            "wrapper must drop indirect: {:?}",
+            cg.indirect
+        );
+        assert!(
+            !cg.indirect.contains(&2),
+            "majit_gc dispatcher must drop indirect: {:?}",
+            cg.indirect
+        );
+        let opaque = cg.reaching(&cg.indirect);
+        assert!(
+            !opaque.contains(&0),
+            "wrapper must not stay in reaching(indirect): {:?}",
+            opaque
+        );
+    }
+
+    /// The abort reporter's body may Regular-call a collecting seed
+    /// (`emit_stderr` reaches Python). The family edge is recorded; the
+    /// reporter does not forward that seed, so the wrapper stays out of
+    /// `reaching(COLLECTING_SEEDS)`.
+    #[test]
+    fn abort_reporter_family_does_not_prove_collection() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["gc_hook", "report_stale_array_holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let reporter = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&[
+                "pyframe",
+                "report_stale_locals_array_holder"
+            ]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": empty_g
+                            }},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let collect = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["gc_hook", "try_gc_collect"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [wrapper, reporter, collect],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("abort-reporter fixture parses");
+        let cg = build(&llbc);
+        assert!(
+            !cg.indirect.contains(&0),
+            "wrapper must drop indirect: {:?}",
+            cg.indirect
+        );
+        let wrapper_callees = cg.callees.get(&0).expect("wrapper callees");
+        assert!(
+            wrapper_callees.contains(&1),
+            "family edge to the abort reporter must remain, callees={wrapper_callees:?}"
+        );
+        let reporter_callees = cg.callees.get(&1).cloned().unwrap_or_default();
+        assert!(
+            reporter_callees.is_empty(),
+            "abort reporter must be a leaf, callees={reporter_callees:?}"
+        );
+        let collecting = cg.seeds_for(COLLECTING_SEEDS).0;
+        let reach = cg.reaching(&collecting);
+        assert!(
+            !reach.contains(&0),
+            "wrapper must not prove collection through the abort reporter: {reach:?}"
+        );
+    }
+
+    /// A typed `lltype.malloc` helper whose body is Dynamic is still
+    /// `canmallocgc=False`; it must leave `indirect`.
+    #[test]
+    fn typed_malloc_helper_drops_indirect() {
+        let llbc = {
+            let span = serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+            });
+            let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+            let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+            let local = |id: u64| {
+                serde_json::json!({
+                    "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+                })
+            };
+            let ret = serde_json::json!({
+                "statements": [], "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "Return"}
+            });
+            let unwind = serde_json::json!({
+                "statements": [], "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+            });
+            let malloc = serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta(&["lltype", "malloc_typed_managed"]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": {"Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": [
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": [
+                                    {"Read": place(0)},
+                                    {"regions": []}
+                                ]},
+                                "args": []
+                            },
+                            "dest": place(0),
+                            "target": 2,
+                            "on_unwind": 1
+                        }}}},
+                        unwind,
+                        ret
+                    ]
+                }}
+            });
+            let file = serde_json::json!({
+                "charon_version": "0.1.201",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [],
+                    "fun_decls": [malloc],
+                    "global_decls": [],
+                    "trait_decls": [],
+                    "trait_impls": []
+                }
+            });
+            majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+                .expect("typed-malloc fixture parses")
+        };
+        let cg = build(&llbc);
+        assert!(
+            !cg.indirect.contains(&0),
+            "typed malloc helper must drop indirect: {:?}",
+            cg.indirect
+        );
+    }
+
+    /// A `core::convert` `into` template whose body is a Trait call
+    /// stays in `indirect`: `From::from` is arbitrary code.
+    #[test]
+    fn convert_into_template_stays_indirect() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let into = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["convert", "into"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [into],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("convert-into fixture parses");
+        let cg = build(&llbc);
+        assert!(
+            cg.indirect.contains(&0),
+            "convert into template must stay indirect: {:?}",
+            cg.indirect
         );
     }
 }

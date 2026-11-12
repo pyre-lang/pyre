@@ -30683,24 +30683,26 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     unsafe {
         crate::builtins::bytearray_check_exports(pyre_object::gc_roots::shadow_stack_get(base))?;
     }
-    let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
     // Materialize the new bytes before mutating so `x.extend(x)` is safe.
+    // Reload `args[1]` from its pin for every use so a raw `PyObjectRef`
+    // local is not live across `type_error_matched` (`shadowstack.py pop_roots`).
     let appended: Vec<u8> = unsafe {
         // bytearrayobject.py:561-569 `makebytearraydata_w` asks for
         // `BUF_FULL_RO` before falling back to the integer iterator.  This
         // matters for exporters such as `array('i')`: iteration yields ten
         // integers, while its buffer contains forty bytes.
-        if let Some(buffer) = buffer_as_bytes_like(other)? {
+        if let Some(buffer) =
+            buffer_as_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+        {
             pyre_object::bytesobject::bytes_like_data(buffer).to_vec()
         } else {
             // `PyObject_GetIter` — a non-iterable operand is the "can't extend" case.
             // [3.15-spec] `bytearray_extend_impl` rewrites via
             // `PyErr_ExceptionMatches(PyExc_TypeError)` (subclasses included).
             // PyPy `_from_byte_sequence` lets `space.iter` propagate.
-            let it = crate::baseobjspace::iter(other).map_err(|mut e| {
+            let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(base + 1))
+                .map_err(|mut e| {
                 if crate::baseobjspace::type_error_matched(&mut e) {
-                    // Reload after `type_error_matched` (`shadowstack.py
-                    // pop_roots` re-reads each live GCREF).
                     let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     crate::PyError::type_error(format!(
                         "can't extend bytearray with {}",

@@ -23,7 +23,7 @@ exit test wait on.
 | group | findings | waits on |
 |---|---|---|
 | opcode coverage | F4 | — |
-| GC roots and allocation | F3, F17, F18, F19 | F17, which needs a decision |
+| GC roots and allocation | F3, F17, F18, F19 | F17 (LLBC analysis is the rooting authority) |
 | translator spine | F5, F6, F7, F8, F9 | F5 |
 | interpreter ↔ JIT contract | F10, F11 | charter §3.7 |
 | majit internals | F12, F13, F14, F15, F16 | — (F13 feeds F12) |
@@ -215,13 +215,21 @@ audit-reported.
   `push_roots` ×2013, pin family ×4129, 247 manual barrier API calls (446
   counting every `*write_barrier(`) with no checker;
   `gc-root-brackets.baseline.json` tolerates 2044 unbracketed collecting calls
-  on darwin. A2. *Decision needed:* LLBC analysis as a hard
-  gate at zero, a handle-typed API, or conservative native-stack scanning with
-  pinning.
+  on darwin. A2. *Decided:* the LLBC call-graph analysis is the rooting
+  authority and a hard gate, converging on zero unresolved collecting calls.
+  This is `framework.py` `gct_direct_call` (push/pop roots around a call the
+  analyzer says can collect) driven by `collectanalyze.py` `CollectAnalyzer`
+  over `graphanalyze.py` `GraphAnalyzer`: `analyze_direct_call` walks the
+  callee graph, `analyze_indirect_call` walks the known family, and only
+  `graphs is None` is `top_result()`. A handle API and a conservative stack
+  scan have no upstream counterpart under shadowstack. Open:
+  `majit_gc::alloc_young_nonmoving_typed` (host `FrameBox` birth) and
+  `gc_identity_hash` (`canmallocgc=True` upstream) are still unresolved, not
+  proven.
 - **F18 — stable / nursery / collecting allocation split. [v]**
   `gc_hook.rs`: "the non-moving old generation is what stands in for that
   missing root today." This is F3's "oldgen-nonmoving concession"; deletable
-  only after F17.
+  only after F17 (the LLBC-analysis ruling above).
 - **F19 — GC type info has several owners.** ~110 hand `register_type` sites in
   `pyre-jit/src/eval.rs`, registration-order type ids, 37 of 67 checks only
   `debug_assert_eq!`, `#[pyre_class]` offsets, custom tracers and JIT
@@ -299,10 +307,11 @@ class-(b) step:
   graph, and build the instrument that compares the jitcode it emits byte for
   byte with the legacy path's before anything is switched over. F8 falls as
   hints are retired and needs no ordering of its own. F10 / F11 follow §3.7.
-- **Rooting chain: F17 → F18 → gh#396.** F17 cannot start until one endpoint
-  is chosen: LLBC analysis as a hard gate at zero, a handle-typed API, or
-  conservative native-stack scanning with pinning. F18's non-moving old
-  generation is F3's concession and can go only after F17 lands.
+- **Rooting chain: F17 → F18 → gh#396.** F17 is decided: the LLBC call-graph
+  analysis is the rooting authority and a hard gate at zero unresolved
+  collecting calls (`gct_direct_call` / `CollectAnalyzer` / `GraphAnalyzer`;
+  see F17). F18's non-moving old generation is F3's concession and can go
+  only after F17 lands.
 - **Independent:** F12 (after F13, which feeds it), F14, F15, F16, F19, F21.
   F20 needs its written decision in §3.3 first.
 

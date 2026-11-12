@@ -675,14 +675,30 @@ fn main() {
         );
         mark("scan 2/4 (opaque-folded, gc locals)");
         if let Ok(path) = std::env::var("GC_CONSERVATIVE_JSON") {
+            // Chain from the callee to the nearest function that itself holds
+            // an unresolved call; null when the callee only reaches a
+            // collection seed.  Cached per callee: many findings share one.
+            let mut via_cache: std::collections::HashMap<u64, Option<Vec<String>>> =
+                Default::default();
             let mut out = String::new();
             for f in &found_conservative {
+                let via = via_cache
+                    .entry(f.callee_id)
+                    .or_insert_with(|| {
+                        joined
+                            .canonical_id(0, f.callee_id)
+                            .and_then(|id| joined.graph.path_to(id, &joined.graph.indirect))
+                    })
+                    .clone();
+                let indirect_root = via.as_ref().and_then(|c| c.last()).cloned();
                 let row = serde_json::json!({
                     "file": f.file, "line": f.line, "func": f.func_name,
                     "callee": f.callee_name,
                     "movable": f.movable_use,
                     "live_non_arg": f.live_non_arg,
                     "live_arg": f.live_arg,
+                    "via": via,
+                    "indirect_root": indirect_root,
                 });
                 out.push_str(&row.to_string());
                 out.push('\n');
