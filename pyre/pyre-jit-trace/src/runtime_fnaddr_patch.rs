@@ -111,10 +111,12 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
             "patch_constants_i_fnaddrs: Arc<JitCode> already shared before patch — \
              every caller must run this before publishing the table to consumers",
         );
-        if let Some(ConstIRelocKind::FnAddr { path, .. }) = &jc.fnaddr_reloc
-            && let Some(runtime) = runtime_fnaddr_by_path(path)
-        {
-            jc.fnaddr = runtime;
+        if let Some(ConstIRelocKind::FnAddr { path, symbolic }) = &jc.fnaddr_reloc {
+            match runtime_fnaddr_by_path(path) {
+                Some(runtime) => jc.fnaddr = runtime,
+                None if *symbolic => panic_if_unresolved_dyn_impl_vtable(path),
+                None => {}
+            }
         }
         // Some shells reach the persisted table without a committed body
         // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
@@ -126,11 +128,17 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
                 .reloc_consts_i
                 .iter()
                 .filter_map(|desc| {
-                    let ConstIRelocKind::FnAddr { path, .. } = &desc.kind else {
+                    let ConstIRelocKind::FnAddr { path, symbolic } = &desc.kind else {
                         return None;
                     };
-                    runtime_fnaddr_for_reloc_path(path)
-                        .map(|runtime| (desc.constants_i_index, runtime))
+                    match runtime_fnaddr_for_reloc_path(path) {
+                        Some(runtime) => Some((desc.constants_i_index, runtime)),
+                        None if *symbolic => {
+                            panic_if_unresolved_dyn_impl_vtable(path);
+                            None
+                        }
+                        None => None,
+                    }
                 })
                 .collect();
             for (index, runtime) in updates {
@@ -148,6 +156,16 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
 /// function that shares a leaf.
 fn runtime_fnaddr_for_reloc_path(path: &str) -> Option<i64> {
     runtime_fnaddr_by_path(path)
+}
+
+/// A symbolic Unsize vtable `ConstFnAddr` (`rclass.py` `getvtable` /
+/// `OBJECT.typeptr`) must resolve to a rustc vtable word. Keeping the
+/// symbolic hash would store a hash, not a vtable. Ordinary function
+/// paths that miss `jit_trace_fnaddrs` stay symbolic.
+fn panic_if_unresolved_dyn_impl_vtable(path: &str) {
+    if pyre_interpreter::is_dyn_impl_vtable_const_path(path) {
+        panic!("unresolved dyn impl vtable ConstFnAddr `{path}`");
+    }
 }
 
 fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
@@ -180,16 +198,25 @@ fn insert_minted_exception_class_rows(map: &mut HashMap<&'static str, i64>) {
 }
 
 /// The runtime address published for `path` in `jit_trace_fnaddrs`, or
-/// `None` when the path is not published.  A walker fold that recognises a
-/// residual by its callee compares the call's funcbox against this.
+/// the rustc vtable word of a `dyn_impl_vtable_const_path` key, or
+/// `None` when neither table publishes the path.  A walker fold that
+/// recognises a residual by its callee compares the call's funcbox
+/// against this.
 ///
 /// Tagged reloc lookup uses this same set as the old value-based
 /// correspondence / disarm: `fnaddr_bindings.bin` serialises exactly
-/// these names, so every bound slot has a runtime address.
+/// these names, so every bound slot has a runtime address. Unsize
+/// vtable constants reuse the same `ConstIRelocKind::FnAddr` reloc
+/// (`rclass.py` `getvtable` / `OBJECT.typeptr`). A symbolic key of that
+/// form that does not resolve panics in the reloc patch rather than
+/// keeping the hash.
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied()
+    RUNTIME_FNADDRS
+        .get(path)
+        .copied()
+        .or_else(|| pyre_interpreter::dyn_impl_vtable_addr_for_path(path))
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -2323,6 +2350,44 @@ mod tests {
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
         );
+    }
+
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_dyn_impl_vtable_module_dict_strategy() {
+        let tables = pyre_interpreter::dyn_impl_vtables();
+        let entry = tables
+            .iter()
+            .find(|e| {
+                e.impl_key.ends_with("::ModuleDictStrategy") && e.trait_leaf == "DictStrategy"
+            })
+            .expect("ModuleDictStrategy DictStrategy vtable");
+        let path = pyre_interpreter::dyn_impl_vtable_const_path(entry.impl_key, entry.trait_leaf);
+        assert_eq!(runtime_fnaddr_by_path(&path), Some(entry.vtable as i64));
+    }
+
+    #[test]
+    #[should_panic(expected = "unresolved dyn impl vtable ConstFnAddr")]
+    fn patch_constants_i_panics_on_unresolved_symbolic_dyn_impl_vtable() {
+        use majit_jitcode::jitcode::{ConstIRelocDescriptor, ConstIRelocKind};
+
+        let path = pyre_interpreter::dyn_impl_vtable_const_path(
+            "no_such_crate::GhostStrategy",
+            "DictStrategy",
+        );
+        let jc = JitCode::new("unresolved_dyn_impl_vtable");
+        jc.set_body(JitCodeBody {
+            constants_i: vec![0x1111],
+            reloc_consts_i: vec![ConstIRelocDescriptor {
+                constants_i_index: 0,
+                kind: ConstIRelocKind::FnAddr {
+                    path,
+                    symbolic: true,
+                },
+            }],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_constants_i_fnaddrs(&mut jcs);
     }
 
     /// An untagged `constants_i` word that equals a build-process fnaddr

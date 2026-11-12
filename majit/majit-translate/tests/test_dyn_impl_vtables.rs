@@ -5,7 +5,7 @@
 mod common;
 
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc_if_present};
-use majit_charon_reader::ullbc::{Operand, Rvalue, StmtKind};
+use majit_charon_reader::ullbc::{Operand, PlaceKind, Rvalue, StmtKind};
 use majit_charon_reader::{GlobalDecl, Llbc};
 use serde_json::Value;
 
@@ -83,35 +83,86 @@ fn ty_adt_leaf(llbc: &Llbc, ty: &Value) -> Option<String> {
     None
 }
 
-fn dyn_impl_trait_leaf(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+fn operand_str_literal(llbc: &Llbc, op: &Operand, local_strs: &[Option<String>]) -> Option<String> {
+    match op {
+        Operand::Const(expr) => llbc
+            .const_expr_literal(expr)?
+            .get("Str")?
+            .as_str()
+            .map(str::to_string),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(i) => local_strs.get(*i as usize).cloned().flatten(),
+            _ => None,
+        },
+    }
+}
+
+fn dyn_impl_desc_strings(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, String)> {
     let init_id = gd.init_fun_id()?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let n = body.locals.locals.len();
+    let mut local_strs = vec![None; n];
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n {
+                continue;
+            }
+            if let Rvalue::Use(Operand::Const(expr), _) = rvalue {
+                local_strs[dest] = llbc
+                    .const_expr_literal(&expr)
+                    .and_then(|lit| lit.get("Str")?.as_str().map(str::to_string));
+            }
+        }
+    }
     for block in &body.body {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind() else {
                 continue;
             };
-            let Operand::Const(expr) = operands.get(1)? else {
+            let Some(impl_key) = operands
+                .first()
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
                 continue;
             };
-            return llbc
-                .const_expr_literal(expr)?
-                .get("Str")?
-                .as_str()
-                .map(str::to_string);
+            let Some(trait_leaf) = operands
+                .get(1)
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
+                continue;
+            };
+            return Some((impl_key, trait_leaf));
         }
     }
     None
 }
 
+fn dyn_impl_vtable_desc_adt_path(path: &str) -> bool {
+    path == "pyre_object::lltype::DynImplVtableDesc"
+}
+
+fn global_ty_is_dyn_impl_vtable_desc(llbc: &Llbc, gd: &GlobalDecl) -> bool {
+    llbc.global_ty_adt_def_id(gd)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(&td.item_meta.name_path()))
+}
+
 fn registered_dyn_impls(llbc: &Llbc) -> Vec<(String, String)> {
     llbc.iter_global_decls()
         .filter_map(|gd| {
-            let path = gd.item_meta.name_path();
-            let leaf = path.rsplit("::").next()?;
-            let type_leaf = leaf.strip_prefix("DYN_IMPL_")?;
-            let trait_leaf = dyn_impl_trait_leaf(llbc, gd)?;
-            Some((trait_leaf, type_leaf.to_string()))
+            if !global_ty_is_dyn_impl_vtable_desc(llbc, gd) {
+                return None;
+            }
+            let (impl_key, trait_leaf) = dyn_impl_desc_strings(llbc, gd)?;
+            let type_leaf = impl_key.rsplit("::").next()?.to_string();
+            Some((trait_leaf, type_leaf))
         })
         .collect()
 }

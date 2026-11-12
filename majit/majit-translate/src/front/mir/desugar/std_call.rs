@@ -4234,14 +4234,66 @@ impl<'a> Lowering<'a> {
         ptr: Variable,
         len: Variable,
     ) -> Result<(), LowerError> {
+        self.emit_fat_pair_field_write(
+            mir_bb,
+            inner,
+            elem,
+            ptr,
+            len,
+            crate::model::VecFieldPart::FatData,
+            crate::model::VecFieldPart::FatLen,
+            ValueType::Unsigned,
+            ValueType::Int,
+            Some(false),
+        )
+    }
+
+    /// Two `FieldWrite`s of a fat `&dyn Trait` pair into `{data, vtable}`.
+    /// `rclass.py` `OBJECT.typeptr`; the dest type of an `Unsize` to `dyn`
+    /// decides this shape (`tyref_is_fat_dyn`).
+    pub(in crate::front::mir) fn emit_dyn_fat_field_write(
+        &mut self,
+        mir_bb: usize,
+        inner: Place,
+        elem: ProjectionElem,
+        ptr: Variable,
+        meta: Variable,
+    ) -> Result<(), LowerError> {
+        self.emit_fat_pair_field_write(
+            mir_bb,
+            inner,
+            elem,
+            ptr,
+            meta,
+            crate::model::VecFieldPart::FatData,
+            crate::model::VecFieldPart::FatMeta,
+            ValueType::Ref(None),
+            ValueType::Int,
+            None,
+        )
+    }
+
+    fn emit_fat_pair_field_write(
+        &mut self,
+        mir_bb: usize,
+        inner: Place,
+        elem: ProjectionElem,
+        ptr: Variable,
+        meta: Variable,
+        data_part: crate::model::VecFieldPart,
+        meta_part: crate::model::VecFieldPart,
+        data_ty: ValueType,
+        meta_ty: ValueType,
+        owner_declared_gc: Option<bool>,
+    ) -> Result<(), LowerError> {
         let ProjectionElem::Tagged(v) = elem else {
             return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: window field write through a non-field projection"
+                "bb{mir_bb}: fat-pair field write through a non-field projection"
             )));
         };
         let field_payload = v.as_object().and_then(|m| m.get("Field")).ok_or_else(|| {
             LowerError::Unsupported(format!(
-                "bb{mir_bb}: window field write without a Field payload"
+                "bb{mir_bb}: fat-pair field write without a Field payload"
             ))
         })?;
         let field_base_ty = clone_tyref(&inner.ty);
@@ -4255,39 +4307,38 @@ impl<'a> Lowering<'a> {
             Some((owner_root, field_name, _, owner_id, host_index)) => {
                 FieldDescriptor::new(field_name, Some(owner_root))
                     .with_owner_id(owner_id)
-                    .with_owner_declared_gc(Some(false))
                     .with_base_is_deref(base_is_deref)
                     .with_host_index(host_index)
             }
             None => {
                 let idx = self.positional_field_index(field_payload).ok_or_else(|| {
                     LowerError::Unsupported(format!(
-                        "bb{mir_bb}: window field write: unresolved field index"
+                        "bb{mir_bb}: fat-pair field write: unresolved field index"
                     ))
                 })?;
-                FieldDescriptor::new(format!("__pos_{idx}"), None)
-                    .with_owner_declared_gc(Some(false))
-                    .with_base_is_deref(base_is_deref)
+                FieldDescriptor::new(format!("__pos_{idx}"), None).with_base_is_deref(base_is_deref)
             }
+        };
+        let field = match owner_declared_gc {
+            Some(gc) => field.with_owner_declared_gc(Some(gc)),
+            None => field,
         };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base: base.clone(),
-                field: field
-                    .clone()
-                    .with_vec_part(crate::model::VecFieldPart::FatData),
+                field: field.clone().with_vec_part(data_part),
                 value: LinkArg::Value(ptr),
-                ty: ValueType::Unsigned,
+                ty: data_ty,
             },
         });
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base,
-                field: field.with_vec_part(crate::model::VecFieldPart::FatLen),
-                value: LinkArg::Value(len),
-                ty: ValueType::Int,
+                field: field.with_vec_part(meta_part),
+                value: LinkArg::Value(meta),
+                ty: meta_ty,
             },
         });
         Ok(())

@@ -352,6 +352,11 @@ pub(in crate::front::mir) struct AggregateField {
     /// Shared `&[u8]` field: store `{data, len}` via `FatData`/`FatLen`,
     /// not `pair_len_field_name`.
     pub(in crate::front::mir) window: bool,
+    /// Fat `&dyn Trait` field: store `{data, vtable}` via `FatData`/`FatMeta`.
+    /// `rclass.py` `OBJECT.typeptr`; `new_with_vtable` takes the class
+    /// vtable as a prebuilt constant. The dest type of an `Unsize` to
+    /// `dyn` decides this shape (`tyref_is_fat_dyn`).
+    pub(in crate::front::mir) dyn_fat: bool,
     /// Declared field type is `*mut u8` / `*const u8` (`rffi.py` `CCHARP`).
     pub(in crate::front::mir) raw_u8: bool,
     /// Declared value type is `ValueType::Str` (`Ptr(STR)`). A by-value
@@ -424,6 +429,38 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             continue;
         };
         if let Some(Some(len)) = pair_lens.get(i) {
+            if field.dyn_fat {
+                for (part, stored, ty) in [
+                    (
+                        crate::model::VecFieldPart::FatData,
+                        value.clone(),
+                        ValueType::Ref(None),
+                    ),
+                    (
+                        crate::model::VecFieldPart::FatMeta,
+                        len.clone(),
+                        ValueType::Int,
+                    ),
+                ] {
+                    let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
+                    graph.block_mut(block).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: res.clone(),
+                            field: crate::model::FieldDescriptor::new(
+                                field.name.clone(),
+                                Some(field_owner),
+                            )
+                            .with_owner_id(field_owner_id)
+                            .with_base_is_deref(false)
+                            .with_vec_part(part),
+                            value: crate::model::LinkArg::Value(stored),
+                            ty,
+                        },
+                    });
+                }
+                continue;
+            }
             if field.window {
                 for (part, stored, ty) in [
                     (

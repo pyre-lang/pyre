@@ -3303,6 +3303,12 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// Decoded marker-const strings. The payload is a property of the artefact.
     global_marker_strs:
         std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<str>>>>,
+    /// `(impl_key, trait_leaf)` pairs of `DynImplVtableDesc` statics
+    /// (`register_dyn_impl_vtable!`). An Unsize vtable ConstFnAddr is
+    /// emitted only when this set contains the pair (`rclass.py`
+    /// `getvtable` / `OBJECT.typeptr`).
+    pub(in crate::front::mir) registered_dyn_impl_vtables:
+        std::sync::OnceLock<Vec<(String, String)>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -10592,6 +10598,82 @@ pub(in crate::front::mir) fn node_is_dyn_trait(node: &serde_json::Value, llbc: &
         .is_some_and(|obj| obj.contains_key("DynTrait"))
 }
 
+/// Trait decl id of a fat `&dyn Trait` / `Box<dyn Trait>` type, if the
+/// `DynTrait` body names one. Used to look up `impl Trait for Src` when
+/// an `Unsize` forms the vtable word (`rclass.py` `getvtable`).
+pub(in crate::front::mir) fn tyref_dyn_trait_decl_id(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let node = tyref_node(ty, llbc)?;
+    let inner = if let Some(pointee) = type_node_box_pointee(node, llbc) {
+        if type_node_is_thin_box(node, llbc) {
+            return None;
+        }
+        pointee
+    } else {
+        strip_ty_indirections(node, llbc)?
+            .as_object()?
+            .get("Ref")?
+            .as_array()?
+            .get(1)?
+    };
+    json_dyn_trait_decl_id(inner).or_else(|| json_dyn_predicate_principal_trait_id(inner))
+}
+
+/// Scan a Charon type node for the first `{"trait_decl_id": id}`.
+pub(in crate::front::mir) fn json_dyn_trait_decl_id(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(id) = m.get("trait_decl_id").and_then(serde_json::Value::as_u64) {
+                return Some(id);
+            }
+            m.values().find_map(json_dyn_trait_decl_id)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(json_dyn_trait_decl_id),
+        _ => None,
+    }
+}
+
+/// Principal trait of a Charon `DynPredicate` (`vtable_ref`): the first
+/// trait clause's `TraitDeclRef.id`. Also accepts a fixture
+/// `{"trait_decl_id": id}` / `{"DynTrait": {"id": id}}`.
+pub(in crate::front::mir) fn json_dyn_predicate_principal_trait_id(
+    v: &serde_json::Value,
+) -> Option<u64> {
+    let dynt = v.get("DynTrait").unwrap_or(v);
+    if let Some(id) = dynt
+        .get("trait_decl_id")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(id);
+    }
+    if let Some(id) = dynt
+        .pointer("/binder/params/trait_clauses/0/trait_/skip_binder/id")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(id);
+    }
+    if dynt.get("binder").is_none() {
+        return dynt.get("id").and_then(serde_json::Value::as_u64);
+    }
+    None
+}
+
+/// ADT def id of a Charon type JSON value (`Deduplicated` / `Value` / `Adt`).
+pub(in crate::front::mir) fn json_ty_adt_def_id(
+    llbc: &Llbc,
+    ty: &serde_json::Value,
+) -> Option<u64> {
+    let obj = ty.as_object()?;
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_to_adt_def_id(id);
+    }
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return json_ty_adt_def_id(llbc, &arr[1]).or_else(|| adt_node_def_id(&arr[1]));
+    }
+    adt_node_def_id(ty)
+}
+
 /// Strip the indirection wrappers a Charon type node can carry —
 /// `{"Deduplicated": id}` / `{"Value": [id, ty]}` /
 /// `{"HashConsedValue": [id, ty]}` / `{"Ref": [region, ty, kind]}` —
@@ -12918,21 +13000,9 @@ pub(in crate::front::mir) fn charon_dyn_trait_to_ast_string(
     llbc: &Llbc,
 ) -> String {
     // Charon nests the principal trait id a few ways across revisions;
-    // scan for the first `{"trait_decl_id": <id>}` (or bare `id`) and
-    // resolve it to the trait's leaf name.
-    fn find_trait_id(v: &serde_json::Value) -> Option<u64> {
-        match v {
-            serde_json::Value::Object(m) => {
-                if let Some(id) = m.get("trait_decl_id").and_then(serde_json::Value::as_u64) {
-                    return Some(id);
-                }
-                m.values().find_map(find_trait_id)
-            }
-            serde_json::Value::Array(a) => a.iter().find_map(find_trait_id),
-            _ => None,
-        }
-    }
-    match find_trait_id(dynt).and_then(|id| llbc.trait_by_id(id)) {
+    // scan for the first `{"trait_decl_id": <id>}` and resolve it to
+    // the trait's leaf name.
+    match json_dyn_trait_decl_id(dynt).and_then(|id| llbc.trait_by_id(id)) {
         Some(td) => {
             let name = td.item_meta.name_path();
             let leaf = name.rsplit("::").next().unwrap_or(&name);

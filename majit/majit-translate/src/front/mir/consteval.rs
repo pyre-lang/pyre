@@ -3089,6 +3089,7 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
                 None
             }
         }
+        Some(majit_charon_reader::GlobalTy::Adt(_)) => None,
         None => None,
     }
 }

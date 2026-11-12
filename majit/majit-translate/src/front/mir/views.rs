@@ -564,11 +564,14 @@ impl<'a> Lowering<'a> {
                     .map(|(ptr, len, _)| (ptr, len)));
             }
         };
-        if tyref_pair_field_kind(&place.ty, self.llbc).is_none() {
+        if tyref_pair_field_kind(&place.ty, self.llbc).is_none()
+            && !tyref_is_fat_dyn(&place.ty, self.llbc)
+        {
             return Ok(None);
         }
         match self.pair_place_parts(mir_bb, place)? {
             Some(parts) => Ok(Some(parts)),
+            None if tyref_is_fat_dyn(&place.ty, self.llbc) => Ok(None),
             None => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: pair slice read through a projection"
             ))),
@@ -593,7 +596,8 @@ impl<'a> Lowering<'a> {
                 {
                     Some(LocalValue::One(_))
                         if self.local_holds_str_view(*local as usize)
-                            || self.local_holds_list_view(*local as usize) =>
+                            || self.local_holds_list_view(*local as usize)
+                            || tyref_is_fat_dyn(&place.ty, self.llbc) =>
                     {
                         Ok(None)
                     }
@@ -615,7 +619,8 @@ impl<'a> Lowering<'a> {
             PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
                 if atom == "Deref"
                     && (tyref_is_u8_window(&inner.ty, self.llbc)
-                        || self.pair_slice_kind(&inner.ty).is_some()) =>
+                        || self.pair_slice_kind(&inner.ty).is_some()
+                        || tyref_is_fat_dyn(&inner.ty, self.llbc)) =>
             {
                 self.pair_place_parts(mir_bb, inner)
             }
@@ -1763,6 +1768,10 @@ impl<'a> Lowering<'a> {
             Some(pair) => Some(pair),
             None => self.window_rvalue_parts(mir_bb, &rvalue)?,
         };
+        let source = match source {
+            Some(pair) => Some(pair),
+            None => self.dyn_fat_rvalue_parts(mir_bb, &rvalue, &dest_ty)?,
+        };
         let Some((ptr, len)) = source else {
             let detail = match &rvalue {
                 Rvalue::Cast(kind, ..) => format!("Cast {kind}"),
@@ -2142,6 +2151,157 @@ impl<'a> Lowering<'a> {
         });
         let len = self.emit_const_uint(mir_bb, len);
         Some((ptr, len, kind))
+    }
+
+    /// Whether `rvalue` produces the two-word `{data, vtable}` pair of a
+    /// fat `&dyn Trait`: an `Unsize` of a thin instance pointer whose
+    /// `impl Trait for Src` vtable key resolves, or a copy of a local
+    /// already bound as that pair. `rclass.py` `OBJECT.typeptr`. An
+    /// `Unsize` whose source is already a one-word dyn (a parameter),
+    /// or whose vtable is unregistered, stays one word.
+    pub(in crate::front::mir) fn rvalue_is_dyn_fat_pair(&self, rvalue: &Rvalue) -> bool {
+        match rvalue {
+            Rvalue::UnaryOp(cast, op) if cast_kind_is_unsize(cast) => {
+                self.unsize_rvalue_is_pair(cast, op)
+            }
+            Rvalue::Cast(cast, op, _) if cast_kind_is_unsize(cast) => {
+                self.unsize_rvalue_is_pair(cast, op)
+            }
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.operand_is_dyn_fat_pair(op),
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                self.place_is_dyn_fat_pair(place)
+            }
+            _ => false,
+        }
+    }
+
+    fn unsize_rvalue_is_pair(&self, cast: &serde_json::Value, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(src) | Operand::Move(src) if tyref_is_fat_dyn(&src.ty, self.llbc) => {
+                self.place_is_dyn_fat_pair(src)
+            }
+            Operand::Copy(src) | Operand::Move(src) => {
+                unsize_cast_dest_ty(cast).as_ref().is_some_and(|dest_ty| {
+                    dyn_unsize_vtable_const_path(src, dest_ty, self.llbc).is_some()
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn operand_is_dyn_fat_pair(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self.place_is_dyn_fat_pair(place),
+            Operand::Const(_) => false,
+        }
+    }
+
+    fn place_is_dyn_fat_pair(&self, place: &Place) -> bool {
+        let local = match &place.kind {
+            PlaceKind::Local(local) => *local as usize,
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                let PlaceKind::Local(local) = inner.kind else {
+                    return false;
+                };
+                local as usize
+            }
+            _ => return false,
+        };
+        matches!(
+            self.local_var.get(local).and_then(|slot| slot.as_ref()),
+            Some(LocalValue::Pair(_, _, _))
+        )
+    }
+
+    /// `{data, vtable}` of an rvalue whose dest type is fat `&dyn Trait`.
+    /// `Unsize` of a thin instance pointer is the source pointer plus the
+    /// `impl Trait for Src` vtable constant (`rclass.py` `getvtable`).
+    pub(in crate::front::mir) fn dyn_fat_rvalue_parts(
+        &mut self,
+        mir_bb: usize,
+        rvalue: &Rvalue,
+        dest_ty: &TyRef,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        if !tyref_is_fat_dyn(dest_ty, self.llbc) {
+            return Ok(None);
+        }
+        match rvalue {
+            Rvalue::UnaryOp(cast, Operand::Copy(src) | Operand::Move(src))
+                if cast_kind_is_unsize(cast) =>
+            {
+                self.dyn_fat_unsize_source(mir_bb, src, dest_ty)
+            }
+            Rvalue::Cast(cast, Operand::Copy(src) | Operand::Move(src), _)
+                if cast_kind_is_unsize(cast) =>
+            {
+                self.dyn_fat_unsize_source(mir_bb, src, dest_ty)
+            }
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => match op {
+                Operand::Copy(place) | Operand::Move(place)
+                    if tyref_is_fat_dyn(&place.ty, self.llbc) =>
+                {
+                    self.pair_place_parts(mir_bb, place)
+                }
+                _ => Ok(None),
+            },
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+                PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                    if atom == "Deref" && tyref_is_fat_dyn(&inner.ty, self.llbc) =>
+                {
+                    self.pair_place_parts(mir_bb, inner)
+                }
+                _ if tyref_is_fat_dyn(&place.ty, self.llbc) => self.pair_place_parts(mir_bb, place),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn dyn_fat_unsize_source(
+        &mut self,
+        mir_bb: usize,
+        src: &Place,
+        dest_ty: &TyRef,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        if tyref_is_fat_dyn(&src.ty, self.llbc) {
+            return self.pair_place_parts(mir_bb, src);
+        }
+        let data = self.resolve_place(mir_bb, src.clone())?;
+        let meta = self.emit_dyn_unsize_vtable(mir_bb, src, dest_ty)?;
+        Ok(Some((data, meta)))
+    }
+
+    /// Vtable word of `impl Trait for Src`: a `ConstFnAddr` of
+    /// `{impl_key}::{trait_leaf}` when that crate-local impl is in LLBC
+    /// and the pair is a `DynImplVtableDesc` registration. `runtime_fnaddr_by_path`
+    /// resolves it to `dyn_impl_vtables` (`rclass.py` `getvtable` /
+    /// `OBJECT.typeptr`). An unregistered Unsize declines rather than
+    /// emitting a zero word.
+    fn emit_dyn_unsize_vtable(
+        &mut self,
+        mir_bb: usize,
+        src: &Place,
+        dest_ty: &TyRef,
+    ) -> Result<Variable, LowerError> {
+        let Some(path) = dyn_unsize_vtable_const_path(src, dest_ty, self.llbc) else {
+            let (src_name, trait_name) = dyn_unsize_src_trait_names(src, dest_ty, self.llbc);
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: Unsize vtable of {src_name} as dyn {trait_name} is not registered"
+            )));
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::ConstFnAddr {
+                path,
+                value: 0,
+                symbolic: true,
+            },
+        });
+        Ok(var)
     }
 
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
@@ -4811,8 +4971,16 @@ pub(in crate::front::mir) fn pair_len_shadows(
     // (`BytesDictStrategy.unwrap`), one `Ptr(STR)` word. A window ABI on
     // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
     mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
+    let dyn_fat_pairs = dyn_fat_pair_locals(body, llbc);
     (
-        pair_len_shadows_of(&body.locals, llbc, &views, &str_views, &list_views),
+        pair_len_shadows_of(
+            &body.locals,
+            llbc,
+            &views,
+            &str_views,
+            &list_views,
+            &dyn_fat_pairs,
+        ),
         str_views,
         list_views,
         list_view_fixed,
@@ -5446,12 +5614,411 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
     view
 }
 
+/// `{impl_key}::{trait_leaf}` of a crate-local `impl Trait for Src`
+/// recorded in LLBC and registered as a `DynImplVtableDesc` static. Same key
+/// `dyn_impl_vtable_addr_for_path` resolves at runtime (`rclass.py`
+/// `getvtable` / `OBJECT.typeptr`). A local impl without that static,
+/// and core `FnMut` shims, stay one-word.
+pub(in crate::front::mir) fn dyn_unsize_vtable_const_path(
+    src: &Place,
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    let pointee = ref_pointee_ty(&src.ty, llbc).unwrap_or_else(|| clone_tyref(&src.ty));
+    let src_id = json_ty_adt_def_id(llbc, tyref_node(&pointee, llbc)?)?;
+    let trait_id = tyref_dyn_trait_decl_id(dest_ty, llbc)?;
+    let trait_decl = llbc.trait_by_id(trait_id)?;
+    if !trait_decl.item_meta.is_local {
+        return None;
+    }
+    let trait_path = trait_decl.item_meta.name_path();
+    let trait_leaf = trait_path
+        .rsplit("::")
+        .next()
+        .unwrap_or(trait_path.as_str());
+    for row in llbc.trait_impls_of(trait_id) {
+        let Some(self_ty) = row
+            .get("impl_trait")
+            .and_then(|impl_trait| impl_trait.get("generics"))
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+        else {
+            continue;
+        };
+        let Some(impl_src_id) = json_ty_adt_def_id(llbc, self_ty) else {
+            continue;
+        };
+        if same_nominal_adt(llbc, src_id, impl_src_id) {
+            let impl_key = llbc.type_by_id(src_id)?.item_meta.name_path();
+            if !dyn_impl_vtable_pair_is_registered(llbc, &impl_key, trait_leaf) {
+                return None;
+            }
+            return Some(format!("{impl_key}::{trait_leaf}"));
+        }
+    }
+    None
+}
+
+fn dyn_impl_vtable_pair_is_registered(llbc: &Llbc, impl_key: &str, trait_leaf: &str) -> bool {
+    registered_dyn_impl_vtable_pairs(llbc)
+        .iter()
+        .any(|(key, leaf)| leaf == trait_leaf && dyn_impl_registered_key_matches(impl_key, key))
+}
+
+fn dyn_impl_registered_key_matches(impl_path: &str, impl_key: &str) -> bool {
+    impl_path == impl_key
+        || impl_path.ends_with(&format!("::{impl_key}"))
+        || impl_key.ends_with(&format!("::{impl_path}"))
+}
+
+fn registered_dyn_impl_vtable_pairs(llbc: &Llbc) -> &[(String, String)] {
+    llbc_derived(llbc)
+        .registered_dyn_impl_vtables
+        .get_or_init(|| harvest_registered_dyn_impl_vtables(llbc))
+}
+
+/// `(impl_key, trait_leaf)` of each static whose declared type is
+/// `pyre_object::lltype::DynImplVtableDesc` (`register_dyn_impl_vtable!`).
+/// The static ident is caller-chosen; selection is the ADT name path
+/// (`Llbc::global_ty_adt_def_id`). Reads the init body through
+/// [`crate::front::llbc_hints::marker_init_fun_id`], the same path other
+/// global initializers use.
+fn harvest_registered_dyn_impl_vtables(llbc: &Llbc) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for gd in llbc.iter_global_decls() {
+        if !global_ty_is_dyn_impl_vtable_desc(llbc, gd) {
+            continue;
+        }
+        if let Some(pair) = dyn_impl_vtable_desc_strings(llbc, gd) {
+            out.push(pair);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn global_ty_is_dyn_impl_vtable_desc(
+    llbc: &Llbc,
+    gd: &majit_charon_reader::ullbc::GlobalDecl,
+) -> bool {
+    llbc.global_ty_adt_def_id(gd)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(&td.item_meta.name_path()))
+}
+
+fn dyn_impl_vtable_desc_adt_path(path: &str) -> bool {
+    path == "pyre_object::lltype::DynImplVtableDesc"
+}
+
+fn dyn_impl_vtable_desc_strings(
+    llbc: &Llbc,
+    gd: &majit_charon_reader::ullbc::GlobalDecl,
+) -> Option<(String, String)> {
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let n = body.locals.locals.len();
+    let mut local_strs = vec![None; n];
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = &place.kind else {
+                continue;
+            };
+            let dest = *dest as usize;
+            if dest >= n {
+                continue;
+            }
+            if let Rvalue::Use(Operand::Const(expr), _) = rvalue {
+                local_strs[dest] = llbc
+                    .const_expr_literal(expr)
+                    .and_then(|lit| lit.get("Str")?.as_str().map(str::to_string));
+            }
+        }
+    }
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind_ref()
+            else {
+                continue;
+            };
+            let Some(impl_key) = operands
+                .first()
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
+                continue;
+            };
+            let Some(trait_leaf) = operands
+                .get(1)
+                .and_then(|op| operand_str_literal(llbc, op, &local_strs))
+            else {
+                continue;
+            };
+            return Some((impl_key, trait_leaf));
+        }
+    }
+    None
+}
+
+fn operand_str_literal(llbc: &Llbc, op: &Operand, local_strs: &[Option<String>]) -> Option<String> {
+    match op {
+        Operand::Const(expr) => llbc
+            .const_expr_literal(expr)
+            .and_then(|lit| lit.get("Str")?.as_str().map(str::to_string)),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(i) => local_strs.get(*i as usize).cloned().flatten(),
+            _ => None,
+        },
+    }
+}
+
+pub(in crate::front::mir) fn dyn_unsize_src_trait_names(
+    src: &Place,
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+) -> (String, String) {
+    let pointee = ref_pointee_ty(&src.ty, llbc).unwrap_or_else(|| clone_tyref(&src.ty));
+    let src_name = tyref_node(&pointee, llbc)
+        .and_then(|node| json_ty_adt_def_id(llbc, node))
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| td.item_meta.name_path())
+        .unwrap_or_else(|| "?".to_string());
+    let trait_name = tyref_dyn_trait_decl_id(dest_ty, llbc)
+        .and_then(|id| llbc.trait_by_id(id))
+        .map(|td| {
+            let path = td.item_meta.name_path();
+            path.rsplit("::")
+                .next()
+                .unwrap_or(path.as_str())
+                .to_string()
+        })
+        .unwrap_or_else(|| "Trait".to_string());
+    (src_name, trait_name)
+}
+
+fn unsize_cast_dest_ty(cast: &serde_json::Value) -> Option<TyRef> {
+    let payload = cast
+        .get("Cast")
+        .and_then(|c| c.get("Unsize"))
+        .or_else(|| cast.get("Unsize"))?;
+    let dest = payload.as_array()?.get(1)?;
+    Some(TyRef::Other(dest.clone()))
+}
+
+/// Body locals that hold the two-word `{data, vtable}` of an `Unsize`
+/// to `&dyn Trait` whose vtable key resolves (`rclass.py`
+/// `OBJECT.typeptr`). A field copy of a dyn-fat slot stays one word
+/// (`dyn_trait_field_vtable_slot_reads_the_metadata_word`). An
+/// unregistered Unsize stays one word.
+fn dyn_fat_pair_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let mut pair = vec![false; n];
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n || !tyref_is_fat_dyn(&place.ty, llbc) {
+                continue;
+            }
+            if rvalue_unsize_vtable_resolves(rvalue, &place.ty, llbc) {
+                pair[dest] = true;
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if dest >= n || pair[dest] || !tyref_is_fat_dyn(&place.ty, llbc) {
+                    continue;
+                }
+                if rvalue_copies_dyn_fat_pair(rvalue, &pair) {
+                    pair[dest] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    pair
+}
+
+fn rvalue_unsize_vtable_resolves(rvalue: &Rvalue, dest_ty: &TyRef, llbc: &Llbc) -> bool {
+    match rvalue_thin_unsize_src(rvalue, llbc) {
+        Some(src) => dyn_unsize_vtable_const_path(src, dest_ty, llbc).is_some(),
+        None => false,
+    }
+}
+
+fn rvalue_thin_unsize_src<'a>(rvalue: &'a Rvalue, llbc: &Llbc) -> Option<&'a Place> {
+    match rvalue {
+        Rvalue::UnaryOp(cast, Operand::Copy(src) | Operand::Move(src))
+        | Rvalue::Cast(cast, Operand::Copy(src) | Operand::Move(src), _)
+            if cast_kind_is_unsize(cast) =>
+        {
+            (!tyref_is_fat_dyn(&src.ty, llbc)).then_some(src)
+        }
+        _ => None,
+    }
+}
+
+/// Source type and trait of an unregistered thin `Unsize` that defined
+/// `place` (or a copy of that dest). Field copies of a dyn-fat slot are
+/// not Unsize dests and keep the one-word ABI.
+pub(in crate::front::mir) fn unregistered_dyn_unsize_names(
+    body: &Unstructured,
+    llbc: &Llbc,
+    place: &Place,
+) -> Option<(String, String)> {
+    let local = match &place.kind {
+        PlaceKind::Local(local) => *local as usize,
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+            let PlaceKind::Local(local) = inner.kind else {
+                return None;
+            };
+            local as usize
+        }
+        _ => return None,
+    };
+    unregistered_dyn_unsize_local_names(body, llbc)
+        .get(local)
+        .cloned()
+        .flatten()
+}
+
+fn unregistered_dyn_unsize_local_names(
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> Vec<Option<(String, String)>> {
+    let n = body.locals.locals.len();
+    let mut names = vec![None; n];
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n || !tyref_is_fat_dyn(&place.ty, llbc) {
+                continue;
+            }
+            let Some(src) = rvalue_thin_unsize_src(rvalue, llbc) else {
+                continue;
+            };
+            if dyn_unsize_vtable_const_path(src, &place.ty, llbc).is_none() {
+                names[dest] = Some(dyn_unsize_src_trait_names(src, &place.ty, llbc));
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if dest >= n || names[dest].is_some() || !tyref_is_fat_dyn(&place.ty, llbc) {
+                    continue;
+                }
+                let Some(src_local) = rvalue_dyn_fat_src_local(rvalue) else {
+                    continue;
+                };
+                if let Some(src_names) = names.get(src_local).cloned().flatten() {
+                    names[dest] = Some(src_names);
+                    changed = true;
+                }
+            }
+        }
+    }
+    names
+}
+
+fn rvalue_dyn_fat_src_local(rvalue: &Rvalue) -> Option<usize> {
+    match rvalue {
+        Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) | Rvalue::Use(op, _) => match op {
+            Operand::Copy(place) | Operand::Move(place) => place_dyn_fat_src_local(place),
+            Operand::Const(_) => None,
+        },
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_dyn_fat_src_local(place),
+        _ => None,
+    }
+}
+
+fn place_dyn_fat_src_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(local) => Some(*local as usize),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+            match inner.kind {
+                PlaceKind::Local(local) => Some(local as usize),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn rvalue_copies_dyn_fat_pair(rvalue: &Rvalue, pair: &[bool]) -> bool {
+    match rvalue {
+        Rvalue::UnaryOp(cast, op) | Rvalue::Cast(cast, op, _) if cast_kind_is_unsize(cast) => {
+            operand_is_dyn_fat_pair_local(op, pair)
+        }
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => operand_is_dyn_fat_pair_local(op, pair),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_is_dyn_fat_pair_local(place, pair)
+        }
+        _ => false,
+    }
+}
+
+fn operand_is_dyn_fat_pair_local(op: &Operand, pair: &[bool]) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_is_dyn_fat_pair_local(place, pair),
+        Operand::Const(_) => false,
+    }
+}
+
+fn place_is_dyn_fat_pair_local(place: &Place, pair: &[bool]) -> bool {
+    match &place.kind {
+        PlaceKind::Local(local) => pair.get(*local as usize).copied().unwrap_or(false),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+            matches!(
+                inner.kind,
+                PlaceKind::Local(local) if pair.get(local as usize).copied().unwrap_or(false)
+            )
+        }
+        _ => false,
+    }
+}
+
 pub(in crate::front::mir) fn pair_len_shadows_of(
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     view_locals: &[bool],
     str_view_locals: &[bool],
     list_view_locals: &[bool],
+    dyn_fat_pair_locals: &[bool],
 ) -> Vec<Option<usize>> {
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
@@ -5472,6 +6039,17 @@ pub(in crate::front::mir) fn pair_len_shadows_of(
                 {
                     return None;
                 }
+                next += 1;
+                return Some(next - 1);
+            }
+            // An `Unsize` dest (and copies of it) is `{data, vtable}`.
+            // Other body-local `&dyn Trait` slots keep the one-word ABI
+            // (`new_with_vtable` takes the class vtable as a prebuilt
+            // constant only at the Unsize).
+            if index > arg_count
+                && tyref_is_fat_dyn(&local.ty, llbc)
+                && dyn_fat_pair_locals.get(index).copied().unwrap_or(false)
+            {
                 next += 1;
                 return Some(next - 1);
             }
