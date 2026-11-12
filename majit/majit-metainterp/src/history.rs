@@ -398,6 +398,53 @@ pub(crate) mod test_support {
         operand
     }
 
+    pub(crate) fn rooted_inputarg_operands(types: &[Type]) -> Vec<Operand> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(index, &tp)| rooted_inputarg_operand(tp, index as u32))
+            .collect()
+    }
+
+    /// Build `trace_inputargs` from the bound InputArg boxes the ops already
+    /// hold (`history.py TreeLoop.inputargs`). Walk each op's `args_slice()`
+    /// then `guard_fail_args()`; the first box seen for an `InputArg.index`
+    /// is that slot's box. Unused slots get a fresh
+    /// [`rooted_inputarg_operand`] of `types[idx]`.
+    pub(crate) fn trace_inputargs_from_ops<I>(ops: I, types: &[Type]) -> Vec<Operand>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<Op>,
+    {
+        let mut boxes: Vec<Option<Operand>> = vec![None; types.len()];
+        for op in ops {
+            let op = op.as_ref();
+            let mut consider = |arg: &Operand| {
+                if let Some(ia) = arg.bound_inputarg() {
+                    let idx = ia.index as usize;
+                    if idx < boxes.len() && boxes[idx].is_none() {
+                        boxes[idx] = Some(arg.clone());
+                    }
+                }
+            };
+            for arg in op.args_slice() {
+                consider(arg);
+            }
+            if let Some(fail_args) = op.guard_fail_args() {
+                for arg in fail_args {
+                    consider(arg);
+                }
+            }
+        }
+        boxes
+            .into_iter()
+            .enumerate()
+            .map(|(idx, existing)| {
+                existing.unwrap_or_else(|| rooted_inputarg_operand(types[idx], idx as u32))
+            })
+            .collect()
+    }
+
     pub(crate) fn rooted_operand_from_opref(a: OpRef) -> Operand {
         if a.is_none() || a.is_constant() {
             return Operand::from_opref(a);

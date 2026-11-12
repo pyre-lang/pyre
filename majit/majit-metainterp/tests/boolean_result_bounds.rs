@@ -29,7 +29,7 @@ fn postponed_boolean_result_is_not_retested_for_truth() {
         let finish = OpRc::new(Op::new(OpCode::Finish, &[Operand::from_bound_op(&truth)]));
         finish.pos().set(OpRef::op_typed(3, Type::Void));
         let mut optimizer = Optimizer::default_pipeline();
-        optimizer.trace_inputargs = OpRef::inputarg_refs(&[Type::Int]);
+        optimizer.trace_inputargs = vec![Operand::from_bound_inputarg(&input)];
         let mut constants = ConstMap::<Value>::default();
         let optimized = optimizer
             .optimize_with_constants_and_inputs_oprc(

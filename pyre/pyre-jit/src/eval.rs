@@ -26,6 +26,7 @@ use std::rc::Rc;
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
+use majit_ir::operand::Operand;
 use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
@@ -8836,7 +8837,16 @@ fn drive_generatorentry_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let outcome = meta.compile_loop(&jump_args);
+        // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+        let jump_boxes: Vec<Operand> = {
+            let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
+        let outcome = meta.compile_loop(&jump_boxes);
         if dbg {
             eprintln!("[jd2] compile_loop outcome={outcome:?}");
         }
@@ -9660,7 +9670,16 @@ fn drive_unpack_iterable_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let outcome = meta.compile_loop(&jump_args);
+        // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+        let jump_boxes: Vec<Operand> = {
+            let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
+        let outcome = meta.compile_loop(&jump_boxes);
         if dbg {
             eprintln!("[jd1] compile_loop outcome={outcome:?}");
         }

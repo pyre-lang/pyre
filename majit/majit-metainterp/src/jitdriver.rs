@@ -991,6 +991,7 @@ use crate::warmstate::{
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
+use majit_ir::operand::Operand;
 use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
 
 /// Bucket the variables of a given kind by IR `Type`, returning
@@ -4083,7 +4084,7 @@ impl<S: JitState> JitDriver<S> {
     /// success stashes the just-compiled key for the single-pass direct-entry
     /// hook. The loop's merge-point pc is the cell's greens
     /// (`warmstate.py` `BaseJitCell`), not a field written here.
-    fn compile_and_record_loop(&mut self, jump_args: &[OpRef]) -> crate::CompileOutcome {
+    fn compile_and_record_loop(&mut self, jump_args: &[Operand]) -> crate::CompileOutcome {
         let (loop_header_pc, loop_green_key, start_cell_key) = match self.meta.trace_ctx() {
             Some(ctx) => (
                 Some(ctx.header_pc),
@@ -4638,6 +4639,21 @@ impl<S: JitState> JitDriver<S> {
                         .into_iter()
                         .map(|(o, _)| o)
                         .collect();
+                    // recorder → compile edge (`MetaInterp.compile_loop`
+                    // `live_arg_boxes`). `close_loop_live_values` still
+                    // unpacks the recorder-namespace OpRef list.
+                    let jump_boxes: Vec<Operand> = {
+                        let rec = &mut self
+                            .meta
+                            .trace_ctx()
+                            .expect("reached_loop_header: live TraceCtx")
+                            .recorder;
+                        live_arg_boxes
+                            .iter()
+                            .copied()
+                            .map(|r| rec.box_for_operand(r))
+                            .collect()
+                    };
                     // pyjitpl.py reached_loop_header:
                     //
                     //     if not self.partial_trace:
@@ -4696,13 +4712,13 @@ impl<S: JitState> JitDriver<S> {
                             // origin is a ResumeFromInterpDescr entry bridge
                             // (`compile_trace_from_interp`, compile.py:1002-1021).
                             result = if self.meta.bridge_info().is_some() {
-                                self.meta.close_bridge(target_key, &live_arg_boxes)
+                                self.meta.close_bridge(target_key, &jump_boxes)
                             } else {
                                 match self.compile_trace_entry_data() {
                                     Some(original_green_key) => {
                                         let outcome = self.meta.compile_trace_from_interp(
                                             target_key,
-                                            &live_arg_boxes,
+                                            &jump_boxes,
                                             original_green_key,
                                         );
                                         self.meta.classify_compile_outcome(outcome)
@@ -4902,7 +4918,6 @@ impl<S: JitState> JitDriver<S> {
                                 // ptoken)`: the bridge JUMP passes the very list
                                 // built above — not a second, separately
                                 // normalized one.
-                                let finish_args = live_arg_boxes.clone();
                                 let continue_running_normally_values = {
                                     let trace_meta = self.meta.trace_meta().cloned();
                                     match (trace_meta, self.sym.as_ref()) {
@@ -4912,14 +4927,14 @@ impl<S: JitState> JitDriver<S> {
                                                     ctx,
                                                     sym,
                                                     &meta,
-                                                    &finish_args,
+                                                    &live_arg_boxes,
                                                 )
                                             })
                                         }
                                         _ => None,
                                     }
                                 };
-                                let result = self.meta.close_bridge(target_key, &finish_args);
+                                let result = self.meta.close_bridge(target_key, &jump_boxes);
                                 match result {
                                     crate::pyjitpl::BridgeCompileResult::Compiled => {
                                         self.sym = None;
@@ -5030,10 +5045,9 @@ impl<S: JitState> JitDriver<S> {
                         return;
                     };
                     if S::validate_close(sym, &trace_meta) {
-                        // pyjitpl.py:3019/3059: the merge-point scan and the
+                        // `reached_loop_header`: the merge-point scan and
                         // `current_merge_points.append` both read the one
                         // `live_arg_boxes` built at the top of this arm.
-                        let jump_args = live_arg_boxes;
                         // Read via `trace_meta().cloned()` so the
                         // `active_trace_session` envelope stays live for
                         // `close_loop_live_values`. `compile_loop` owns
@@ -5050,11 +5064,11 @@ impl<S: JitState> JitDriver<S> {
                                 provisional_meta
                             }
                         };
-                        let continue_running_normally_values = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                        let outcome = self.compile_and_record_loop(&jump_args);
+                        let continue_running_normally_values =
+                            self.meta.trace_ctx().and_then(|ctx| {
+                                S::close_loop_live_values(ctx, sym, &meta, &live_arg_boxes)
+                            });
+                        let outcome = self.compile_and_record_loop(&jump_boxes);
                         match outcome {
                             crate::CompileOutcome::Compiled { .. } => {
                                 // pyjitpl.py raise_if_successful →
@@ -5137,6 +5151,21 @@ impl<S: JitState> JitDriver<S> {
                     jump_args,
                     loop_header_pc,
                 } => {
+                    // recorder → compile edge (`MetaInterp.compile_loop`
+                    // `live_arg_boxes`). `close_loop_live_values` still
+                    // unpacks the recorder-namespace OpRef list.
+                    let jump_boxes: Vec<Operand> = {
+                        let rec = &mut self
+                            .meta
+                            .trace_ctx()
+                            .expect("reached_loop_header: live TraceCtx")
+                            .recorder;
+                        jump_args
+                            .iter()
+                            .copied()
+                            .map(|r| rec.box_for_operand(r))
+                            .collect()
+                    };
                     // pyjitpl.py reached_loop_header parity.
                     //
                     // pyjitpl.py `if not self.partial_trace:` gates the whole
@@ -5170,7 +5199,7 @@ impl<S: JitState> JitDriver<S> {
                                     _ => None,
                                 }
                             };
-                            let result = self.meta.close_bridge(target_key, &jump_args);
+                            let result = self.meta.close_bridge(target_key, &jump_boxes);
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
                                     self.sym = None;
@@ -5276,7 +5305,7 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                        let outcome = self.compile_and_record_loop(&jump_args);
+                        let outcome = self.compile_and_record_loop(&jump_boxes);
                         match outcome {
                             crate::CompileOutcome::Compiled { .. } => {
                                 // pyjitpl.py raise_if_successful →
@@ -9369,7 +9398,10 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// RPython-compatible wrapper used by compile.py.
-    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef]) -> crate::pyjitpl::CompileOutcome {
+    pub fn send_loop_to_backend(
+        &mut self,
+        jump_args: &[Operand],
+    ) -> crate::pyjitpl::CompileOutcome {
         self.meta.compile_loop(jump_args)
     }
 
@@ -9377,7 +9409,7 @@ impl<S: JitState> JitDriver<S> {
     pub fn send_bridge_to_backend(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
     ) -> crate::pyjitpl::BridgeCompileResult {
         self.meta.close_bridge(green_key, finish_args)
     }
@@ -12231,6 +12263,16 @@ pub(crate) fn compiled_token_guard_descr(
 mod tests {
     use super::*;
     use crate::test_greens::{gk, gk_with_uhash};
+    use majit_ir::operand::Operand;
+
+    fn jump_boxes_from_recorder(meta: &mut MetaInterp<()>, oprefs: &[OpRef]) -> Vec<Operand> {
+        let rec = &mut meta.trace_ctx().expect("compile_loop test seed").recorder;
+        oprefs
+            .iter()
+            .copied()
+            .map(|r| rec.box_for_operand(r))
+            .collect()
+    }
 
     fn keys_sharing_index(index_of: impl Fn(u64) -> usize, n: usize) -> Vec<majit_ir::GreenKey> {
         let first = gk(1);
@@ -13295,7 +13337,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(hash));
         let state = TypedRestoreState {
             live_values: vec![1],
@@ -13436,7 +13479,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(hash));
         (driver, hash, key)
     }
@@ -15162,11 +15206,15 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         };
-        driver.meta.compile_loop(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_float(2),
-        ]);
+        let jump_boxes = jump_boxes_from_recorder(
+            &mut driver.meta,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
+        );
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let mut state = TypedInputState {
@@ -15223,11 +15271,15 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         }
-        driver.meta.compile_loop(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_float(2),
-        ]);
+        let jump_boxes = jump_boxes_from_recorder(
+            &mut driver.meta,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
+        );
+        driver.meta.compile_loop(&jump_boxes);
         let token = driver
             .meta
             .get_procedure_token_on_driver(0, key.get_uhash())
@@ -15431,7 +15483,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let stats = driver.get_stats();
@@ -16329,7 +16382,8 @@ mod tests {
         };
 
         // Close: JUMP args must match body inputargs after preamble peeling.
-        driver.meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[sum]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let events = compile_events.lock();
@@ -16365,7 +16419,8 @@ mod tests {
     ) {
         start_hash_trace(&mut driver.meta, key, &[0]);
         let sum = record_trace_of(driver, n_adds);
-        driver.meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[sum]);
+        driver.meta.compile_loop(&jump_boxes);
     }
 
     /// Compile twice at one green key and hand back both MetaInterp high-waters.
@@ -16473,10 +16528,9 @@ mod tests {
              previously compiled trace's high-water (a={high_a}, b={high_b})"
         );
 
+        let finish_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
         assert_eq!(
-            driver
-                .meta
-                .close_bridge(key_b.get_uhash(), &[OpRef::input_arg_int(0)]),
+            driver.meta.close_bridge(key_b.get_uhash(), &finish_boxes),
             crate::pyjitpl::BridgeCompileResult::Compiled,
         );
         assert!(
@@ -16508,7 +16562,8 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+            let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+            driver.meta.compile_loop(&jump_boxes);
             assert!(driver.has_compiled_loop(key.get_uhash()));
         }
 
@@ -16554,7 +16609,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[sum]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         // First guard on the compiled token (`compiled_token_guard_descr`
@@ -16572,9 +16628,8 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        let result = driver
-            .meta
-            .close_bridge(key.get_uhash(), &[OpRef::input_arg_int(0)]);
+        let finish_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        let result = driver.meta.close_bridge(key.get_uhash(), &finish_boxes);
         assert_eq!(
             result,
             crate::pyjitpl::BridgeCompileResult::Compiled,
@@ -16649,7 +16704,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[sum]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let fail_index = 0u32;
@@ -16661,10 +16717,9 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
+        let finish_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
         assert_eq!(
-            driver
-                .meta
-                .close_bridge(key.get_uhash(), &[OpRef::input_arg_int(0)]),
+            driver.meta.close_bridge(key.get_uhash(), &finish_boxes),
             crate::pyjitpl::BridgeCompileResult::Compiled,
         );
 
@@ -16702,7 +16757,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(g, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(green_key.get_uhash()));
         let failure = driver
             .meta
@@ -16795,7 +16851,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         // warmstate.py maybe_compile_and_run reads the compiling
         // jitdriver_sd.warmstate cell, not leftover portal 0.
         let failure = driver
@@ -16912,7 +16969,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         let failure = driver
             .meta
             .run_compiled_detailed_with_values_on_driver(
@@ -17011,7 +17069,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         let failure = driver
             .meta
             .run_compiled_detailed_with_values_on_driver(
@@ -17105,7 +17164,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         let cell_key = driver
             .meta
             .warm_state_for_driver(source_driver)
@@ -17291,7 +17351,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         let failure = driver
             .meta
             .run_compiled_detailed(green_key.get_uhash(), &[0])
@@ -17447,7 +17508,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         let failure = driver
             .meta
             .run_compiled_detailed(green_key.get_uhash(), &[0])
@@ -17532,7 +17594,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[sum]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         // "func_b" can see the compiled loop via the same green_key.
@@ -18433,9 +18496,11 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
-        driver
-            .meta
-            .compile_loop(&[OpRef::input_arg_ref(0), OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(
+            &mut driver.meta,
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(0)],
+        );
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(compiled_key.get_uhash()));
         let token = driver
             .runnable_procedure_token(compiled_key.get_uhash())
@@ -18506,7 +18571,17 @@ mod tests {
 mod cross_loop_cut_close_tests {
     use super::*;
     use crate::test_greens::{gk, gk_with_uhash};
+    use majit_ir::operand::Operand;
     use majit_ir::{GreenType, OpCode, OpRef};
+
+    fn jump_boxes_from_recorder(meta: &mut MetaInterp<()>, oprefs: &[OpRef]) -> Vec<Operand> {
+        let rec = &mut meta.trace_ctx().expect("compile_loop test seed").recorder;
+        oprefs
+            .iter()
+            .copied()
+            .map(|r| rec.box_for_operand(r))
+            .collect()
+    }
 
     /// Greens the compiled inner loop is registered under.
     /// Matches `cut_close_driver` `_green_args_spec` / `gk_with_uhash`
@@ -18609,7 +18684,8 @@ mod cross_loop_cut_close_tests {
                 ctx.cut_inner_green_key = Some(typed.clone());
             }
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut driver.meta, &[OpRef::input_arg_int(0)]);
+        driver.meta.compile_loop(&jump_boxes);
         assert!(driver.has_compiled_loop(key), "inner loop must compile");
     }
 

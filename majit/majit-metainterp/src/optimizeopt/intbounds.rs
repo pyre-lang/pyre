@@ -1807,33 +1807,30 @@ impl OptIntBoundsState {
 
     /// Bounds learned in the preamble must be visible when optimizing the
     /// loop body. RPython keeps these on stable Box identities via
-    /// `box._forwarded`; pyre rebuilds `OptContext` around flat `OpRef`
-    /// positions, so this export surface has to carry the bound explicitly
-    /// until `setinfo_from_preamble` imports all needed `IntBound` state.
+    /// `box._forwarded`. This export surface carries the bound explicitly
+    /// until `setinfo_from_preamble` imports the `IntBound` state.
     fn export_arg_int_bounds(
         &self,
-        args: &[OpRef],
+        args: &[Operand],
         ctx: &OptContext,
-    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+    ) -> indexmap::IndexMap<Operand, IntBound> {
         let mut exported = indexmap::IndexMap::new();
-        for &arg in args {
-            // An IntBound only lives on a value-bearing box; an unresolvable
-            // arg position carries none. Resolve the canonical box once and
-            // key the export by box identity (`Rc::ptr_eq`), matching RPython's
-            // `box._forwarded` IntBound storage. `&OptContext` here forbids the
-            // `materialize_operand_at` fallback, so an unbound arg is simply skipped.
-            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
-                continue;
-            };
-            // optimizer.py `setintbound`: an IntBound is never stored
-            // on a Const (history.py a Const carries its value inline);
-            // unroll.py:483 likewise skips Const args when exporting info, so
-            // a Const resolved arg has no preamble bound to carry across the
-            // peel boundary. The consumer already recovers a Const's bound via
-            // `synthesize_const_info` before this table is consulted.
-            if arg_box.is_constant() {
+        for arg in args {
+            // An IntBound only lives on a value-bearing box. Walk
+            // `get_box_replacement(false)` and key the export by box
+            // identity, matching `box._forwarded` IntBound storage. An
+            // unbound arg (`is_none()`) is skipped.
+            let arg_box = arg.get_box_replacement(false);
+            if arg_box.is_none() || arg_box.is_constant() {
                 continue;
             }
+            // optimizer.py `setintbound`: an IntBound is never stored
+            // on a Const (`history.py` Const carries its value inline);
+            // `unroll.py OptUnroll.export_state` likewise skips Const args
+            // when exporting info, so a Const resolved arg has no preamble
+            // bound to carry across the peel boundary. The consumer already
+            // recovers a Const's bound via `synthesize_const_info` before
+            // this table is consulted.
             if arg_box.type_() != majit_ir::Type::Int {
                 continue;
             }
@@ -1891,9 +1888,9 @@ impl Optimization for OptIntBounds {
 
     fn export_arg_int_bounds(
         &self,
-        args: &[OpRef],
+        args: &[Operand],
         ctx: &OptContext,
-    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+    ) -> indexmap::IndexMap<Operand, IntBound> {
         self.state.borrow().export_arg_int_bounds(args, ctx)
     }
 }
@@ -1965,27 +1962,22 @@ impl IntegerAnalysisLogger {
     }
 
     /// RPython `IntegerAnalysisLogger.log_result(self, op)`.
-    pub fn log_result(&mut self, op: &Op, ctx: &mut OptContext) {
+    pub fn log_result(&mut self, op: &Op) {
+        use majit_ir::forwarding::ForwardingHost;
         if op.result_type() != majit_ir::Type::Int {
             return;
         }
-        let pos = op.pos().get();
-        if pos.is_none() || pos.is_constant() {
-            return;
-        }
-        let Some(op_box) = ctx.get_box_replacement_operand_opt(pos) else {
-            return;
-        };
-        let Some(bound) = ctx.peek_intbound_box(&op_box) else {
+        let Some(bound) = op.int_bound() else {
             return;
         };
         if op.opcode.returns_bool() {
             return;
         }
+        let bound = (*bound).clone();
         let repr = format!("{bound:?}");
         self.lines
-            .push(format!("# {:?} -> {}   {}", op_box, bound, repr));
-        self.last_printed_repr_memo.insert(pos, repr);
+            .push(format!("# {:?} -> {}   {}", op, bound, repr));
+        self.last_printed_repr_memo.insert(op.pos().get(), repr);
     }
 
     /// RPython `IntegerAnalysisLogger.log_inputargs(self, inputargs)`.
@@ -2021,6 +2013,7 @@ mod tests {
     //! integration.
 
     use super::*;
+    use crate::history::test_support::trace_inputargs_from_ops;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::{Descr, DescrRef};
     use std::sync::Arc;
@@ -3374,8 +3367,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         // IntLt/IntAddOvf operate on Int-typed inputs — override the
         // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![majit_ir::Type::Int; 1024]);
         opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);

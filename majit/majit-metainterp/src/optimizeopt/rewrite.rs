@@ -18,7 +18,7 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 #[derive(Clone, Debug)]
 enum LoopInvariantEntry {
     /// Regular result (already forced or body-computed).
-    Direct(OpRef),
+    Direct(Operand),
     /// shortpreamble.py: LoopInvariantOp.produce_op stores
     /// PreambleOp(op, preamble_op, invented_name) in the dict.
     Preamble(PreambleOp),
@@ -131,9 +131,9 @@ enum Nullness {
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
 pub struct OptRewrite {
-    /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
+    /// rewrite.py `loop_invariant_results` — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
-    /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
+    /// Value: Direct(Operand) or Preamble(PreambleOp) — RPython isinstance check.
     loop_invariant_results: RefCell<IndexMap<i64, LoopInvariantEntry>>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py).
@@ -1929,7 +1929,7 @@ impl OptRewrite {
                     if let Some((_, pop)) = ctx
                         .imported_loop_invariant_results
                         .iter()
-                        .find(|(k, _)| *k == func_val)
+                        .find(|(key, _)| *key == func_val)
                         && !already_cached
                     {
                         // `LoopInvariantOp.produce_op` stored
@@ -1940,31 +1940,31 @@ impl OptRewrite {
                             .borrow_mut()
                             .insert(func_val, LoopInvariantEntry::Preamble(pop.clone()));
                     }
-                    // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
+                    // rewrite.py: isinstance(resvalue, PreambleOp)
                     // → force_op_from_preamble → replace in dict
                     let cached = self.loop_invariant_results.borrow().get(&func_val).cloned();
                     if let Some(entry) = cached {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
                                 // unroll.py: force_op_from_preamble(preamble_op)
-                                let forced = ctx.force_op_from_preamble_op(pop).to_opref();
+                                let forced = ctx.force_op_from_preamble_op(pop);
                                 self.loop_invariant_results
                                     .borrow_mut()
-                                    .insert(func_val, LoopInvariantEntry::Direct(forced));
+                                    .insert(func_val, LoopInvariantEntry::Direct(forced.clone()));
                                 forced
                             }
-                            LoopInvariantEntry::Direct(r) => r,
+                            LoopInvariantEntry::Direct(box_) => box_,
                         };
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement_operand(cached_result);
-                        ctx.make_equal_to(&b_old, &b_cached);
+                        ctx.make_equal_to(&b_old, &cached_result);
                         ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
                     // Cache miss: demote and record result
-                    self.loop_invariant_results
-                        .borrow_mut()
-                        .insert(func_val, LoopInvariantEntry::Direct(op.pos().get()));
+                    self.loop_invariant_results.borrow_mut().insert(
+                        func_val,
+                        LoopInvariantEntry::Direct(Operand::from_bound_op(op_rc)),
+                    );
                     // rewrite.py `CallLoopinvariantOptimizationResult`:
                     // `_callback` records the emitted producer.
                     self.pending_loopinvariant_key.set(Some(func_val));
@@ -2188,23 +2188,23 @@ impl OptRewrite {
     }
 
     /// rewrite.py serialize_optrewrite
-    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
+    fn serialize_optrewrite(&self) -> Vec<(i64, Operand)> {
         self.loop_invariant_results
             .borrow()
             .iter()
             .map(|(func_ptr, entry)| match entry {
-                LoopInvariantEntry::Direct(r) => (*func_ptr, *r),
-                LoopInvariantEntry::Preamble(pop) => (*func_ptr, pop.op.to_opref()),
+                LoopInvariantEntry::Direct(box_) => (*func_ptr, box_.clone()),
+                LoopInvariantEntry::Preamble(pop) => (*func_ptr, pop.op.clone()),
             })
             .collect()
     }
 
     /// rewrite.py deserialize_optrewrite
-    fn deserialize_optrewrite(&self, entries: &[(i64, OpRef)]) {
-        for &(func_ptr, result) in entries {
+    fn deserialize_optrewrite(&self, entries: &[(i64, Operand)]) {
+        for (func_ptr, result) in entries {
             self.loop_invariant_results
                 .borrow_mut()
-                .insert(func_ptr, LoopInvariantEntry::Direct(result));
+                .insert(*func_ptr, LoopInvariantEntry::Direct(result.clone()));
         }
     }
 }
@@ -2244,11 +2244,11 @@ impl Optimization for OptRewrite {
         OptRewrite::produce_potential_short_preamble_ops(self, sb, ctx);
     }
 
-    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
+    fn serialize_optrewrite(&self) -> Vec<(i64, Operand)> {
         OptRewrite::serialize_optrewrite(self)
     }
 
-    fn deserialize_optrewrite(&self, entries: &[(i64, OpRef)]) {
+    fn deserialize_optrewrite(&self, entries: &[(i64, Operand)]) {
         OptRewrite::deserialize_optrewrite(self, entries);
     }
 }
@@ -2262,6 +2262,7 @@ impl Default for OptRewrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
 
@@ -2550,7 +2551,7 @@ mod tests {
         pass.loop_invariant_results.borrow_mut().insert(
             func_val,
             LoopInvariantEntry::Preamble(PreambleOp {
-                op: source_op,
+                op: source_op.clone(),
                 invented_name: false,
                 preamble_op: OpRc::new(replay),
                 same_as_source: None,
@@ -2567,7 +2568,9 @@ mod tests {
         assert!(matches!(result, OptimizationResult::Remove));
         let cached = pass.loop_invariant_results.borrow().get(&func_val).cloned();
         match cached {
-            Some(LoopInvariantEntry::Direct(_)) => {}
+            Some(LoopInvariantEntry::Direct(box_)) => {
+                assert!(box_.same_box(&source_op));
+            }
             other => panic!("expected Direct after Preamble hit, got {other:?}"),
         }
     }
@@ -2886,13 +2889,13 @@ mod tests {
         let ops = {
             let mut guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
             guard.pos().set(OpRef::void_op(0));
-            let mut finish = Op::new(OpCode::Finish, &[p0]);
+            let mut finish = Op::new(OpCode::Finish, &[p0.clone()]);
             finish.pos().set(OpRef::void_op(1));
             vec![guard, finish]
         };
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Ref]);
+        opt.trace_inputargs = vec![p0.clone()];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -3671,7 +3674,10 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[majit_ir::Type::Int; 2]);
+        opt.trace_inputargs = vec![
+            Operand::from_bound_inputarg(&i0_rc),
+            Operand::from_bound_inputarg(&i1_rc),
+        ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -3689,12 +3695,12 @@ mod tests {
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Int, 0);
         let neg_one = b.const_int(-1);
-        let prod = b.op(OpCode::IntMul, &[x, neg_one]);
+        let prod = b.op(OpCode::IntMul, &[x.clone(), neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = vec![x.clone()];
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
@@ -3716,12 +3722,12 @@ mod tests {
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Float, 0);
         let neg_one = Operand::const_from_value(Value::Float(-1.0));
-        let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
+        let prod = b.op(OpCode::FloatMul, &[x.clone(), neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = vec![x.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
@@ -3738,11 +3744,11 @@ mod tests {
         let cond = Operand::const_from_value(Value::Int(0));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
-        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::CondCallN, &[cond, func.clone(), arg.clone()]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = vec![func.clone(), arg.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
@@ -3762,11 +3768,11 @@ mod tests {
         let cond = Operand::const_from_value(Value::Int(1));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
-        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::CondCallN, &[cond, func.clone(), arg.clone()]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = vec![func.clone(), arg.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();

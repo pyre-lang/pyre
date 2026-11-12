@@ -89,9 +89,9 @@ pub(crate) struct VirtualizableConfig {
     /// marker is installed.
     ///
     /// The decline is not total. On the bridge path (`ctx.building_bridge`)
-    /// `identity_input_ref` returns `Some(input_arg_ref(ctx.inputarg_base))`
-    /// before it consults this field at all, so a tracker is still installed
-    /// there with this set to `None`.
+    /// `identity_input_box` returns `ctx.inputarg_at(0)` before it consults
+    /// this field at all, so a tracker is still installed there with this
+    /// set to `None`.
     pub identity_input_index: Option<usize>,
 }
 
@@ -153,13 +153,12 @@ impl VirtualizableTracker {
         self.needs_setup = true;
     }
 
-    /// The input-arg slot the virtualizable identity occupies, or `None` when
-    /// no sound slot is known and the tracker must decline.
+    /// The bound `InputArg` box the virtualizable identity occupies, or
+    /// `None` when no sound slot is known and the tracker must decline.
     ///
-    /// The answer is always expressed in this run's own OpRef namespace:
-    /// inputarg `#i` is raw OpRef `inputarg_base + i`. Phase 1 runs at base 0;
-    /// Phase 2 and bridges are shifted above the parent trace's high water
-    /// mark.
+    /// `virtualize.py` `OptVirtualize` hangs `PtrInfo` on the live input
+    /// box itself (`ctx.inputargs[index]`). Phase 2 and bridges already
+    /// store their own typed `InputArg` boxes in `ctx.inputargs`.
     ///
     /// A bridge keeps the identity at slot 0: its input args are rebuilt from
     /// the deadframe frame-first, so the front end's resolved offset does not
@@ -174,13 +173,13 @@ impl VirtualizableTracker {
     /// `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be. On the
     /// banked layout that is an Int scalar, and the loop-close Jump then fails
     /// to match the Ref-typed preview (`VirtualStatesCantMatch`).
-    fn identity_input_ref(&self, ctx: &OptContext) -> Option<OpRef> {
-        if ctx.building_bridge {
-            return Some(OpRef::input_arg_ref(ctx.inputarg_base));
-        }
-        Some(OpRef::input_arg_ref(
-            ctx.inputarg_base + self.config.identity_input_index? as u32,
-        ))
+    fn identity_input_box(&self, ctx: &OptContext) -> Option<Operand> {
+        let index = if ctx.building_bridge {
+            0
+        } else {
+            self.config.identity_input_index?
+        };
+        ctx.inputarg_at(index)
     }
 
     /// Apply deferred virtualizable setup if needed.
@@ -189,33 +188,25 @@ impl VirtualizableTracker {
             self.needs_setup = false;
             // No sound identity slot — decline rather than install
             // `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be.
-            let Some(identity_ref) = self.identity_input_ref(ctx) else {
+            let Some(identity) = self.identity_input_box(ctx) else {
                 return;
             };
-            let first_check = ctx
-                .get_box_replacement_operand_opt(identity_ref)
-                .as_ref()
-                .is_some_and(|b| ctx.has_ptr_info(b));
+            let identity = identity.get_box_replacement(false);
+            let first_check = ctx.has_ptr_info(&identity);
             if !first_check {
                 self.init(ctx);
-                let second_check = ctx
-                    .get_box_replacement_operand_opt(identity_ref)
-                    .as_ref()
-                    .is_some_and(|b| ctx.has_ptr_info(b));
-                if !second_check {
-                    {
-                        let b = ctx.materialize_operand_at(identity_ref);
-                        ctx.set_ptr_info(
-                            &b,
-                            PtrInfo::Virtualizable(VirtualizableFieldState {
-                                fields: vec![],
-                                field_descrs: vec![],
-                                arrays: vec![],
-                                heap_fields: vec![],
-                                last_guard_pos: -1,
-                            }),
-                        );
-                    }
+                let identity = identity.get_box_replacement(false);
+                if !ctx.has_ptr_info(&identity) {
+                    ctx.set_ptr_info(
+                        &identity,
+                        PtrInfo::Virtualizable(VirtualizableFieldState {
+                            fields: vec![],
+                            field_descrs: vec![],
+                            arrays: vec![],
+                            heap_fields: vec![],
+                            last_guard_pos: -1,
+                        }),
+                    );
                 }
             }
         }
@@ -228,7 +219,7 @@ impl VirtualizableTracker {
         }
         // Same decline as `ensure_setup`: without a known identity slot there is
         // nothing to hang the seeded `VirtualizableFieldState` on.
-        let Some(identity_ref) = self.identity_input_ref(ctx) else {
+        let Some(identity) = self.identity_input_box(ctx) else {
             return;
         };
 
@@ -239,8 +230,7 @@ impl VirtualizableTracker {
             heap_fields: vec![],
             last_guard_pos: -1,
         };
-        let b = ctx.materialize_operand_at(identity_ref);
-        ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
+        ctx.set_ptr_info(&identity, PtrInfo::Virtualizable(state));
     }
 }
 
@@ -1605,22 +1595,19 @@ impl OptVirtualize {
 
         // virtualize.py: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = majit_ir::OpRc::new(Op::new(OpCode::ForceToken, &[]));
-        let token_ref = if let Some(o) = opt.as_deref_mut() {
+        if let Some(o) = opt.as_deref_mut() {
             if let Err(crate::optimize::InvalidLoop(reason)) =
                 o.send_extra_operation_after(ctx.current_pass_idx, &token_op, ctx)
             {
                 ctx.signal_invalid_loop(reason);
             }
-            token_op.pos().get()
         } else {
             // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
-            ctx.emit_rc(token_op.clone())
-        };
-        if let Some(b) = ctx.get_box_replacement_operand_opt(token_ref) {
-            ctx.set_ptr_info(&b, PtrInfo::nonnull());
+            ctx.emit_rc(token_op.clone());
         }
+        ctx.set_ptr_info(&Operand::from_bound_op(&token_op), PtrInfo::nonnull());
 
-        // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
+        // virtualize.py optimize_VIRTUAL_REF: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
 
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
@@ -2941,6 +2928,7 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::test_support::trace_inputargs_from_ops;
     use crate::optimizeopt::info::RawBufferPtrInfo;
     use crate::optimizeopt::optimizer::Optimizer;
     use std::sync::Arc;
@@ -4288,16 +4276,16 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![Type::Ref; 1024]);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -4311,8 +4299,8 @@ mod tests {
         for &idx in float_slots {
             types[idx as usize] = Type::Float;
         }
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -6137,7 +6125,7 @@ mod tests {
         let mut types = vec![Type::Ref; 1024];
         types[60] = Type::Float;
         types[61] = Type::Float;
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);

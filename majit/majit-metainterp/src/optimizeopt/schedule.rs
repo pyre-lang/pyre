@@ -223,16 +223,14 @@ impl VecScheduleState {
     /// PyPy stores the vecinfo on `op._forwarded`; pyre keeps it in this
     /// scheduler's pos-keyed store.
     ///
-    /// `constant_of` resolves the optimizer's const-pool so the
-    /// `resoperation.py INT_SIGNEXT` branch can read `arg1.value`
-    /// at stamp time — PyPy reads the value off the `ConstInt` instance
-    /// directly because `_args[1]` IS the const; pyre's flat-OpRef
-    /// encoding stores constants as a pool index, so the resolver fills
-    /// the same role at the moment we populate the inline vecinfo slot.
+    /// `constant_of` reads `arg1.value` for the
+    /// `resoperation.py VectorizationInfo.__init__` INT_SIGNEXT branch —
+    /// PyPy reads the value off the `ConstInt` instance because
+    /// `_args[1]` IS the const.
     pub(crate) fn set_op_forwarded_vecinfo(
         &mut self,
         op: &Op,
-        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        constant_of: &dyn Fn(&Operand) -> Option<i64>,
     ) {
         let info = if op.opcode == OpCode::IntSignext {
             self.int_signext_vecinfo(op, constant_of)
@@ -250,19 +248,19 @@ impl VecScheduleState {
 
     /// `resoperation.py VectorizationInfo.__init__` INT_SIGNEXT
     /// branch.  PyPy reads `op.getarg(1).value` off the `ConstInt` object
-    /// directly, after `assert isinstance(arg1, history.ConstInt)`; pyre's
-    /// flat-OpRef encoding stores the const as a pool index, so the
-    /// caller-supplied resolver materialises `arg1.value`.  An unresolvable
-    /// `arg1` is a malformed INT_SIGNEXT, so this fails fast (mirroring the
-    /// `assert`) rather than silently degrading to a generic vecinfo.
+    /// directly, after `assert isinstance(arg1, history.ConstInt)`. An
+    /// unresolvable `arg1` is a malformed INT_SIGNEXT, so this fails fast
+    /// (mirroring the `assert`) rather than silently degrading to a
+    /// generic vecinfo.
     fn int_signext_vecinfo(
         &self,
         op: &Op,
-        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        constant_of: &dyn Fn(&Operand) -> Option<i64>,
     ) -> majit_ir::VectorizationInfo {
         // resoperation.py `assert isinstance(arg1, history.ConstInt)`.
-        let bytesize = constant_of(op.arg(1).to_opref())
-            .expect("INT_SIGNEXT arg1 must resolve to a ConstInt (resoperation.py:185)");
+        let bytesize = constant_of(&op.arg(1)).expect(
+            "INT_SIGNEXT arg1 must resolve to a ConstInt (resoperation.py VectorizationInfo.__init__)",
+        );
         assert!(
             (i8::MIN as i64..=i8::MAX as i64).contains(&bytesize),
             "INT_SIGNEXT byte size {bytesize} out of VectorizationInfo range"

@@ -196,6 +196,7 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::descr::FieldDescr;
+use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 
 /// Descriptor accessor carried by an active MIFrame walk.
@@ -15034,16 +15035,24 @@ fn reached_loop_header<Sym: WalkSym>(
         let has_targets = driver.meta_interp().has_compiled_targets(key);
         // pyjitpl.py `if not self.partial_trace` is the only compile_trace gate.
         if !has_partial && has_targets {
+            // recorder → compile edge (`MetaInterp.compile_trace` jumpargs).
+            let boxes: Vec<Operand> = {
+                let meta = driver.meta_interp_mut();
+                let ctx = meta.trace_ctx().expect("compile_trace: live TraceCtx");
+                live_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.operand_for(r))
+                    .collect()
+            };
             let outcome =
                 if from_guard {
-                    driver
-                        .meta_interp_mut()
-                        .compile_trace(key, &live_args, true)
+                    driver.meta_interp_mut().compile_trace(key, &boxes, true)
                 } else {
                     match driver.compile_trace_entry_data() {
                         Some(original_green_key) => driver
                             .meta_interp_mut()
-                            .compile_trace_from_interp(key, &live_args, original_green_key),
+                            .compile_trace_from_interp(key, &boxes, original_green_key),
                         // No `ResumeFromInterpDescr` payload: `compile_trace` with
                         // `from_guard=false` and no entry data answers `Cancelled`
                         // after cloning the trace. Decline here instead.

@@ -121,7 +121,7 @@ impl Optimization for OptSimplify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::TraceBuilder;
+    use crate::history::test_support::{TraceBuilder, trace_inputargs_from_ops};
     use majit_ir::operand::Operand;
     use majit_ir::{OpRc, OpRef, Type};
 
@@ -149,7 +149,7 @@ mod tests {
         let (ops, inputs) = builder.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptSimplify::new()));
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &inputs);
         opt.snapshot_boxes = seed_oprc(&ops);
         let num_inputs = inputs.len();
         opt.optimize_with_constants_and_inputs_oprc(

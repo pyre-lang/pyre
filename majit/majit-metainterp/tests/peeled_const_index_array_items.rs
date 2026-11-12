@@ -113,8 +113,11 @@ fn optimize_sum_of_three_items(array_is_a_field: bool) -> Vec<OpRc> {
     let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
 
     let mut optimizer = UnrollOptimizer::new();
-    optimizer.trace_inputargs = OpRef::inputarg_refs(&[Type::Float, Type::Int, Type::Ref]);
-    optimizer.trace_inputarg_boxes = vec![acc, index, obj];
+    optimizer.trace_inputargs = vec![
+        Operand::from_bound_inputarg(&acc),
+        Operand::from_bound_inputarg(&index),
+        Operand::from_bound_inputarg(&obj),
+    ];
     optimizer.snapshot_boxes = vec![
         Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),
         Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),

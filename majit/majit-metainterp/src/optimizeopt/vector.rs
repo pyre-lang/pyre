@@ -720,11 +720,12 @@ impl VectorLoop {
     /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
     /// `op._forwarded`; pyre's flat-OpRef operands keep the per-op vecinfo
     /// in the scheduler's pos-keyed store, so `state` carries it. INT_SIGNEXT
-    /// reads arg1's constant through `constant_of` (resoperation.py).
+    /// reads arg1's constant through `constant_of`
+    /// (`resoperation.py VectorizationInfo.__init__`).
     pub fn setup_vectorization(
         &self,
         state: &mut VecScheduleState,
-        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        constant_of: &dyn Fn(&Operand) -> Option<i64>,
     ) {
         for op in &self.operations {
             state.set_op_forwarded_vecinfo(op, constant_of);
@@ -1223,11 +1224,11 @@ impl VectorizingOptimizerState {
         }
 
         // vector.py: analyse_index_calculations → reorder.
-        // resoperation.py reads `op.getarg(1).value` off the inline
-        // ConstInt; the standalone pass has no Optimizer context, so an
-        // inline `OpRef::ConstInt` is the only — and the faithful — const
-        // source for INT_SIGNEXT bytesize and adjacent-ref index detection.
-        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
+        // resoperation.py VectorizationInfo.__init__ reads `op.getarg(1).value`
+        // off the inline ConstInt; the standalone pass has no Optimizer
+        // context, so `Operand::const_int` is the faithful const source for
+        // INT_SIGNEXT bytesize and adjacent-ref index detection.
+        let constant_of = |b: &Operand| -> Option<i64> { b.const_int() };
         if let Some(graph) = self.analyse_index_calculations(loop_, &constant_of) {
             let schedule = schedule_operations(&graph);
             if schedule.len() == loop_.operations.len() {
@@ -1770,7 +1771,7 @@ impl VectorizingOptimizerState {
     fn analyse_index_calculations(
         &self,
         loop_: &VectorLoop,
-        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        constant_of: &dyn Fn(&Operand) -> Option<i64>,
     ) -> Option<DependencyGraph> {
         // vector.py:529: graph = DependencyGraph(loop)
         let mut graph = DependencyGraph::build(&loop_.operations_as_ops(), constant_of);
@@ -1888,10 +1889,7 @@ impl VectorizingOptimizerState {
             return None;
         }
 
-        let constant_of = |opref: OpRef| -> Option<i64> {
-            ctx.get_box_replacement_operand_opt(opref)
-                .and_then(|cb| cb.const_int())
-        };
+        let constant_of = |b: &Operand| -> Option<i64> { b.get_box_replacement(false).const_int() };
 
         // Seed fresh vector OpRefs one past the highest live position, mirroring
         // run_optimization (`max(op.pos.raw()) + 1`). A count-based start
@@ -1916,9 +1914,9 @@ impl VectorizingOptimizerState {
         let mut sched_state = VecScheduleState::new(start_pos);
         // vector.py loop.setup_vectorization() — stamps
         // VectorizationInfo on each op. INT_SIGNEXT reads arg1's const
-        // value for bytesize (resoperation.py); the constant_of
-        // resolver feeds that through so the inline vecinfo slot matches
-        // PyPy's VectorizationInfo(op) constructor.
+        // value for bytesize (`resoperation.py VectorizationInfo.__init__`);
+        // the constant_of resolver feeds that through so the inline vecinfo
+        // slot matches PyPy's VectorizationInfo(op) constructor.
         loop_.setup_vectorization(&mut sched_state, &constant_of);
 
         // First schedule operations for ILP before packing.
@@ -2860,8 +2858,9 @@ mod tests {
 
     /// `run_optimization`'s standalone resolver has no Optimizer context, so
     /// an `INT_SIGNEXT(x, ConstInt(n))` must take arg1's bytesize from the
-    /// inline `OpRef::ConstInt` (resoperation.py reads `arg1.value`).
-    /// Regression: the resolver previously returned `None` for every opref,
+    /// Const box (`resoperation.py VectorizationInfo.__init__` reads
+    /// `arg1.value`).
+    /// Regression: the resolver previously returned `None` for every box,
     /// so `int_signext_vecinfo`'s fail-fast `.expect()` panicked on a valid
     /// INT_SIGNEXT.
     #[test]
@@ -2878,7 +2877,7 @@ mod tests {
 
         let mut st = VecScheduleState::new(100);
         // The standalone run_optimization resolver: inline consts only.
-        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
+        let constant_of = |b: &Operand| -> Option<i64> { b.const_int() };
         vloop.setup_vectorization(&mut st, &constant_of);
 
         let info = st.forwarded_vecinfo(&vloop.operations[0]);

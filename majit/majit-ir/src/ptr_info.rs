@@ -529,22 +529,18 @@ pub enum PtrInfo {
     Str(StrPtrInfo),
 }
 
-/// vstring.py _visitor_walk_recursive / 255-257 / 319-324: enumerate the child OpRefs that
-/// each `StrPtrInfo` variant registers via `_visitor_walk_recursive`.  Used
-/// by the generic walkers (`PtrInfo::visitor_walk_recursive`, `num_fields`)
-/// so Str-typed virtuals participate in GC rooting and resume encoding.
-fn str_child_oprefs(s: &StrPtrInfo) -> Vec<OpRef> {
+/// vstring.py `_visitor_walk_recursive`: enumerate the child boxes that
+/// each `StrPtrInfo` variant registers. Used by the generic walkers
+/// (`PtrInfo::visitor_walk_recursive`, `num_fields`) so Str-typed virtuals
+/// participate in GC rooting and resume encoding.
+fn str_child_oprefs(s: &StrPtrInfo) -> Vec<Operand> {
     match &s.variant {
         VStringVariant::Ptr => Vec::new(),
-        VStringVariant::Plain(p) => p
-            ._chars
-            .iter()
-            .filter_map(|slot| slot.as_ref().map(|b| b.to_opref()))
-            .collect(),
+        VStringVariant::Plain(p) => p._chars.iter().filter_map(|slot| slot.clone()).collect(),
         VStringVariant::Slice(sl) => {
-            vec![sl.s.to_opref(), sl.start.to_opref(), sl.lgtop.to_opref()]
+            vec![sl.s.clone(), sl.start.clone(), sl.lgtop.clone()]
         }
-        VStringVariant::Concat(c) => vec![c.vleft.to_opref(), c.vright.to_opref()],
+        VStringVariant::Concat(c) => vec![c.vleft.clone(), c.vright.clone()],
     }
 }
 
@@ -912,36 +908,60 @@ impl PtrInfo {
         }
     }
 
-    /// Enumerate all OpRef values stored in this virtual's fields/items.
-    pub fn visitor_walk_recursive(&self) -> Vec<OpRef> {
+    /// Enumerate the field boxes stored in this virtual
+    /// (`info.py` `AbstractVirtualPtrInfo.visitor_walk_recursive`).
+    /// High-water consumers convert each box with `to_opref()`; identity
+    /// consumers keep the boxes.
+    pub fn visitor_walk_recursive(&self) -> Vec<Operand> {
         match self {
-            PtrInfo::Instance(v) => v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect(),
-            PtrInfo::Struct(v) => v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect(),
-            PtrInfo::Array(v) => v.items.iter().filter_map(|e| e.as_opref()).collect(),
-            PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
-            PtrInfo::VirtualArray(v) => v.items.iter().map(|b| b.to_opref()).collect(),
-            PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
+            PtrInfo::Instance(v) => v
+                .fields
+                .iter()
+                .map(|(_, entry)| entry.as_seen_operand())
+                .collect(),
+            PtrInfo::Struct(v) => v
+                .fields
+                .iter()
+                .map(|(_, entry)| entry.as_seen_operand())
+                .collect(),
+            PtrInfo::Array(v) => v
+                .items
+                .iter()
+                .map(|entry| entry.as_seen_operand())
+                .collect(),
+            PtrInfo::Virtual(v) => v
+                .fields
+                .iter()
+                .map(|(_, operand)| operand.clone())
+                .collect(),
+            PtrInfo::VirtualArray(v) => v.items.iter().cloned().collect(),
+            PtrInfo::VirtualStruct(v) => v
+                .fields
+                .iter()
+                .map(|(_, operand)| operand.clone())
+                .collect(),
             PtrInfo::VirtualArrayStruct(v) => v
                 .element_fields
                 .iter()
-                .flat_map(|fields| fields.iter().map(|(_, r)| r.to_opref()))
+                .flat_map(|fields| fields.iter().map(|(_, operand)| operand.clone()))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => {
-                v.buffer.values().iter().map(|b| b.to_opref()).collect()
-            }
-            PtrInfo::VirtualRawSlice(v) => vec![v.parent.to_opref()],
+            PtrInfo::VirtualRawBuffer(v) => v.buffer.values().iter().cloned().collect(),
+            PtrInfo::VirtualRawSlice(v) => vec![v.parent.clone()],
             PtrInfo::Virtualizable(v) => {
-                let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| r.to_opref()).collect();
+                let mut refs: Vec<Operand> = v
+                    .fields
+                    .iter()
+                    .map(|(_, operand)| operand.clone())
+                    .collect();
                 for (_, items) in &v.arrays {
-                    refs.extend(items.iter().map(|b| b.to_opref()));
+                    refs.extend(items.iter().cloned());
                 }
                 refs
             }
-            // vstring.py / 255-257 / 319-324: each `StrPtrInfo`
-            // variant registers its child OpRefs via
-            // `_visitor_walk_recursive`. Mirror that here so GC rooting
-            // (`unroll.rs` exported_infos walk) and other generic-walker
-            // consumers see them.
+            // vstring.py `_visitor_walk_recursive`: each `StrPtrInfo`
+            // variant registers its child boxes. Mirror that here so GC
+            // rooting (`unroll.rs` exported_infos walk) and other
+            // generic-walker consumers see them.
             PtrInfo::Str(s) => str_child_oprefs(s),
             _ => Vec::new(),
         }

@@ -16,11 +16,11 @@
 //!
 //! `decode_box` lives with the resume tag helpers, but is re-exported here
 //! because the upstream import path is `optimizeopt.bridgeopt.decode_box`.
-//! `decoded_box_to_opref` is a small helper for folding a typed
-//! `Const{Int,Float,Ptr}` from that decoded form back into the optimizer's
-//! constant pool.
+//! Optimizer-side consumption uses `decode_knowledge_box`, which returns
+//! the live InputArg / Const box already in hand.
 
 use majit_ir::OpRef;
+use majit_ir::operand::Operand;
 
 use crate::optimizeopt::OptContext;
 pub use crate::resume::decode_box;
@@ -216,11 +216,11 @@ pub fn deserialize_optimizer_knowledge(
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
-    use crate::resume::DecodedBox;
     use majit_ir::resumecode::Reader;
 
     let mut reader = Reader::new(rd_numb);
-    // bridgeopt.py:126: assert len(frontend_boxes) == len(liveboxes)
+    // bridgeopt.py deserialize_optimizer_knowledge:
+    // assert len(frontend_boxes) == len(liveboxes)
     assert!(
         frontend_boxes.len() == liveboxes.len(),
         "frontend_boxes.len()={} != liveboxes.len()={}",
@@ -228,21 +228,44 @@ pub fn deserialize_optimizer_knowledge(
         liveboxes.len(),
     );
 
-    // bridgeopt.py:130-131: skip resume section
+    // Class-C once: resume numbering `liveboxes` → the bound InputArg
+    // already in `ctx.inputargs` (setup ran `ensure_inputarg_bindings`).
+    let livebox_boxes: Vec<Operand> = liveboxes
+        .iter()
+        .map(|&r| {
+            ctx.inputargs
+                .iter()
+                .find(|b| b.to_opref() == r)
+                .cloned()
+                .or_else(|| {
+                    // const / resop livebox (rare): the bound producer in
+                    // input_ops / new_operations. Never rematerialize.
+                    ctx.input_ops
+                        .iter()
+                        .find(|op| op.pos().get() == r)
+                        .map(Operand::from_bound_op)
+                })
+                .expect("decoded livebox must retain its bound bridge InputArg")
+        })
+        .collect();
+
+    // bridgeopt.py deserialize_optimizer_knowledge: skip resume section
     let startcount = reader.next_item();
     reader.jump((startcount - 1) as usize);
 
-    // bridgeopt.py:133-146: class knowledge
+    // bridgeopt.py deserialize_optimizer_knowledge: class knowledge
     let mut bitfield: i32 = 0;
     let mut mask: i32 = 0;
-    for (i, &livebox) in liveboxes.iter().enumerate() {
-        // bridgeopt.py:135 reads `box.type` (intrinsic on the Box).
-        // pyre's parallel side table must cover `liveboxes`.
+    for (i, livebox_box) in livebox_boxes.iter().enumerate() {
+        // bridgeopt.py deserialize_optimizer_knowledge reads `box.type`.
+        // The parallel `livebox_types` array is the type the serializer
+        // counted (`fail_arg_types`); InputArg.type_() can diverge after
+        // unboxing, so the bitfield still walks the array.
         let tp = livebox_types.get(i).copied().unwrap_or_else(|| {
             panic!(
                 "missing livebox_types[{}] (liveboxes.len()={}): \
-                 RPython bridgeopt.py:135 reads box.type intrinsically; \
-                 pyre's parallel array must match liveboxes length",
+                 bridgeopt.py deserialize_optimizer_knowledge reads box.type; \
+                 the parallel array must match liveboxes length",
                 i,
                 liveboxes.len()
             )
@@ -257,107 +280,134 @@ pub fn deserialize_optimizer_knowledge(
         let class_known = (bitfield & mask) != 0;
         mask >>= 1;
         if class_known {
-            // bridgeopt.py:145-146:
+            // bridgeopt.py deserialize_optimizer_knowledge:
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
             // RPython's type system guarantees frontend_boxes[i] is a valid
             // GcRef when box.type == "r" and class_known is set. Our raw
-            // i64 encoding requires a nonnull check (RPython's
-            // `box.nonnull()` equivalent, info.py get_known_class).
+            // i64 encoding requires a nonnull check (`box.nonnull()`,
+            // info.py get_known_class).
             let raw_ref = frontend_boxes[i];
             if raw_ref != 0 {
-                // bridgeopt.py:145 `optimizer.cpu.cls_of_box(box)` — the
-                // runtime box is a `ConstPtr` carrying the GcRef payload.
+                // bridgeopt.py deserialize_optimizer_knowledge
+                // `optimizer.cpu.cls_of_box(box)` — the runtime box is a
+                // `ConstPtr` carrying the GcRef payload.
                 let const_box = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Ref(
                     majit_ir::GcRef(raw_ref as usize),
                 ));
                 let cls = cpu.cls_of_box(&const_box);
                 // optimizer.py `make_constant_class` updates
-                // `_forwarded` after `get_box_replacement`. `livebox` is a
-                // bridge livebox (= inputarg materialized by
-                // `ensure_inputarg_bindings`, which runs before
-                // `deserialize_optimizer_knowledge`), so it always resolves
-                // and the class info install is never skipped.
-                if let Some(b) = ctx.get_box_replacement_operand_opt(livebox) {
-                    super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
-                }
+                // `_forwarded` after `get_box_replacement`.
+                super::optimizer::Optimizer::make_constant_class(ctx, livebox_box, cls, true);
             }
         }
     }
 
-    // bridgeopt.py:148-158: heap knowledge (struct fields)
+    // bridgeopt.py deserialize_optimizer_knowledge: heap knowledge (struct fields)
     let length = reader.next_item();
     let mut result_struct = Vec::new();
     for _ in 0..length {
         let tagged = reader.next_item() as i16;
-        let box1 = decode_box(tagged, rd_consts, liveboxes);
+        let object = decode_knowledge_box(tagged, rd_consts, liveboxes, &livebox_boxes);
         let descr_index = reader.next_item();
         let tagged2 = reader.next_item() as i16;
-        let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        // bridgeopt.py:155: descr = metainterp_sd.all_descrs[descr_index]
+        let value = decode_knowledge_box(tagged2, rd_consts, liveboxes, &livebox_boxes);
+        // bridgeopt.py deserialize_optimizer_knowledge:
+        // descr = metainterp_sd.all_descrs[descr_index]
         let descr = &all_descrs[descr_index as usize];
-        let opref1 = decoded_box_to_opref(&box1, ctx);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
-        result_struct.push((opref1, descr.clone(), opref2));
+        result_struct.push((object, descr.clone(), value));
     }
-    // bridgeopt.py:159-169: heap knowledge (array items)
+    // bridgeopt.py deserialize_optimizer_knowledge: heap knowledge (array items)
     let length = reader.next_item();
     let mut result_array = Vec::new();
     for _ in 0..length {
         let tagged = reader.next_item() as i16;
-        let box1 = decode_box(tagged, rd_consts, liveboxes);
+        let object = decode_knowledge_box(tagged, rd_consts, liveboxes, &livebox_boxes);
         let index = reader.next_item() as i64;
         let descr_index = reader.next_item();
         let tagged2 = reader.next_item() as i16;
-        let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        // bridgeopt.py:166: descr = metainterp_sd.all_descrs[descr_index]
+        let value = decode_knowledge_box(tagged2, rd_consts, liveboxes, &livebox_boxes);
+        // bridgeopt.py deserialize_optimizer_knowledge:
+        // descr = metainterp_sd.all_descrs[descr_index]
         let descr = &all_descrs[descr_index as usize];
-        let opref1 = decoded_box_to_opref(&box1, ctx);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
-        result_array.push((opref1, index, descr.clone(), opref2));
+        result_array.push((object, index, descr.clone(), value));
     }
-    // bridgeopt.py:170-171: optimizer.optheap.deserialize_optheap(...)
+    // bridgeopt.py deserialize_optimizer_knowledge:
+    // optimizer.optheap.deserialize_optheap(...)
     if !result_struct.is_empty() || !result_array.is_empty() {
         optimizer.import_heap_knowledge(&result_struct, &result_array, ctx);
     }
 
-    // bridgeopt.py:173-185: call_loopinvariant knowledge
+    // bridgeopt.py deserialize_optimizer_knowledge: call_loopinvariant knowledge
     let length = reader.next_item();
     let mut result_loopinvariant = Vec::new();
     for _ in 0..length {
         let tagged1 = reader.next_item() as i16;
-        let const_box = decode_box(tagged1, rd_consts, liveboxes);
-        // bridgeopt.py:179-180: assert isinstance(const, ConstInt); i = const.getint()
-        let DecodedBox::Const(majit_ir::Const::Int(const_int)) = const_box else {
+        let const_box = decode_knowledge_box(tagged1, rd_consts, liveboxes, &livebox_boxes);
+        // bridgeopt.py deserialize_optimizer_knowledge:
+        // assert isinstance(const, ConstInt); i = const.getint()
+        let Some(const_int) = const_box.const_int() else {
             panic!(
                 "bridgeopt: loopinvariant entry must be ConstInt, got {:?}",
                 const_box
             );
         };
         let tagged2 = reader.next_item() as i16;
-        let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
-        // bridgeopt.py:183: result_loopinvariant.append((i, box))
+        let result = decode_knowledge_box(tagged2, rd_consts, liveboxes, &livebox_boxes);
+        // bridgeopt.py deserialize_optimizer_knowledge:
+        // result_loopinvariant.append((i, box))
         // No sentinel check — ConstInt(0) is a valid func_ptr value.
-        result_loopinvariant.push((const_int, opref2));
+        result_loopinvariant.push((const_int, result));
     }
-    // bridgeopt.py:184-185: optimizer.optrewrite.deserialize_optrewrite(...)
+    // bridgeopt.py deserialize_optimizer_knowledge:
+    // optimizer.optrewrite.deserialize_optrewrite(...)
     if !result_loopinvariant.is_empty() {
         optimizer.import_loopinvariant_knowledge(&result_loopinvariant);
     }
 }
 
-/// Convert a DecodedBox to an OpRef for the bridge optimizer context.
-///
-/// RPython's deserialize path passes Const/Box objects directly. In majit,
-/// constants must be registered in the optimizer's context to get an OpRef.
-fn decoded_box_to_opref(decoded: &crate::resume::DecodedBox, ctx: &mut OptContext) -> OpRef {
-    use crate::resume::DecodedBox;
-    use majit_ir::Const;
-    match decoded {
-        DecodedBox::LiveBox(opref) => *opref,
-        DecodedBox::Const(Const::Int(v)) => ctx.make_constant_int(*v),
-        DecodedBox::Const(Const::Ref(r)) => ctx.make_constant_ref(*r),
-        DecodedBox::Const(Const::Float(f)) => ctx.make_constant_float(*f),
+fn decode_knowledge_box(
+    tagged: i16,
+    rd_consts: &[majit_ir::Const],
+    liveboxes: &[OpRef],
+    livebox_boxes: &[Operand],
+) -> Operand {
+    use crate::resume::{NULLREF, TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, tagged_eq, untag};
+    let (num, tag_type) = untag(tagged);
+    match tag_type {
+        TAGBOX => {
+            debug_assert_eq!(liveboxes.len(), livebox_boxes.len());
+            livebox_boxes.get(num as usize).cloned().unwrap_or_else(|| {
+                panic!(
+                    "bridgeopt decode_knowledge_box TAGBOX out-of-range: \
+                         idx={} liveboxes.len()={} (corrupt knowledge stream — \
+                         see decode_box TAGBOX)",
+                    num as usize,
+                    liveboxes.len()
+                )
+            })
+        }
+        TAGINT => Operand::const_(majit_ir::Const::Int(num as i64)),
+        TAGCONST => {
+            if tagged_eq(tagged, NULLREF) {
+                Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL))
+            } else {
+                let idx = (num - TAG_CONST_OFFSET) as usize;
+                let c = rd_consts.get(idx).copied().unwrap_or_else(|| {
+                    panic!(
+                        "bridgeopt decode_knowledge_box TAGCONST out-of-range: \
+                         idx={} rd_consts.len()={} (corrupt knowledge stream — \
+                         see decode_box TAGCONST)",
+                        idx,
+                        rd_consts.len()
+                    )
+                });
+                Operand::const_(c)
+            }
+        }
+        _ => unreachable!(
+            "bridgeopt decode_knowledge_box: unexpected tag type {}",
+            tag_type
+        ),
     }
 }

@@ -1386,9 +1386,8 @@ mod byte_snapshot_map_tests {
         opt.trace_inputargs = rec
             .inputargs()
             .iter()
-            .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        opt.trace_inputarg_boxes = rec.inputargs().to_vec();
         let mut constants = Default::default();
         let optimized = opt
             .optimize_loop(&ops, &mut constants, 2, None, 0)
@@ -1440,7 +1439,7 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     /// Byte-mode prepare cache, keyed by the recording `OpRef` raw.
     /// `None` on the `Vec<Op>` recorder, whose snapshots were already
     /// rewritten into `snapshot_boxes`.
@@ -1523,6 +1522,24 @@ pub(crate) fn translate_trace_iter_opref(
     translated
 }
 
+/// `opencoder.py` `TraceIterator._get`: rewrite one original JUMP /
+/// `runtime_boxes` entry into the fresh-iterator namespace. Const boxes
+/// stay the same object (`ConstInt` identity); they never occupy `_cache`.
+/// Bound boxes look up `_cache` by recorder position (class-C key).
+fn translate_trace_iter_runtime_box(box_: Operand, cache: &[Option<Operand>]) -> Operand {
+    if box_.is_none() {
+        return Operand::None;
+    }
+    if box_.is_constant() {
+        return box_;
+    }
+    let opref = box_.to_opref();
+    cache
+        .get(opref.raw() as usize)
+        .and_then(Clone::clone)
+        .unwrap_or_else(|| panic!("runtime box {opref:?} missing from trace-iterator cache"))
+}
+
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
     cache: &[Option<majit_ir::operand::Operand>],
@@ -1541,7 +1558,8 @@ fn translate_trace_iter_box_map(
     box_map
 }
 
-/// `unroll.py:187 trace = trace.get_iter()` parity.
+/// `unroll.py` `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+/// parity.
 ///
 /// RPython mints fresh `InputArg` / `ResOperation` objects before
 /// `optimize_bridge()` consumes the trace; `opencoder.py
@@ -1569,7 +1587,7 @@ fn prepare_bridge_trace_from_owned(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
     // `Operand::Op` already shares the producer `Rc`. Later uses hold a
@@ -1732,7 +1750,7 @@ fn prepare_bridge_from_byte_recorder(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> Option<PreparedBridgeTrace> {
     // unroll.py `optimize_bridge` `trace = trace.get_iter()`.
@@ -1772,7 +1790,7 @@ fn finish_prepared_bridge(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
 ) -> PreparedBridgeTrace {
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
@@ -1787,7 +1805,7 @@ fn finish_prepared_bridge(
     });
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .map(|box_| translate_trace_iter_runtime_box(box_, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -1812,7 +1830,7 @@ fn prepare_bridge_trace_for_optimizer<T>(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace
 where
@@ -1824,7 +1842,8 @@ where
     // two preparations share one.
     #[cfg(feature = "jit-audits")]
     next_audit_prepare_generation();
-    // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
+    // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+    // parity for bridge traces.
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
     // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
@@ -1844,12 +1863,12 @@ where
     // `cls()` whose result box defaults `_resint`/`_resref` to 0/NULL — it does
     // NOT carry the recorded box's observed runtime value. RPython tolerates
     // this because `runtime_boxes` are the SEPARATE original history boxes
-    // (pyjitpl.py:3213 `live_arg_boxes[num_green_args:]`), whose `_resint` is
-    // intact and read un-forwarded by `runtime_box.getint()`
-    // (virtualstate.py:494). Pyre resolves a runtime box's value through its
-    // producing op, so the re-minted op must keep the recorded value to expose
-    // the same un-forwarded `_resint` that drives the IntBound runtime fallback
-    // (`get_virtual_runtime_field` / virtualstate.py:493-498). The source/
+    // (`pyjitpl.py` `compile_trace` `live_arg_boxes[num_green_args:]`), whose
+    // `_resint` is intact and read un-forwarded by `runtime_box.getint()`
+    // (`virtualstate.py` `generate_guards`). Pyre resolves a runtime box's
+    // value through its producing op, so the re-minted op must keep the
+    // recorded value to expose the same un-forwarded `_resint` that drives
+    // the IntBound runtime fallback (`get_virtual_runtime_field`). The source/
     // re-minted op lists are 1:1 (one `next()` per recorded op), so copy each
     // observed value across.
     for (src, dst) in bridge_ops
@@ -1883,14 +1902,15 @@ where
             .collect();
         prd
     });
-    // unroll.py:105/153/166 `runtime_boxes` are the closing JUMP's live boxes.
-    // They are harvested from the pre-iterator trace and must be rewritten into
-    // the fresh-iterator namespace alongside `liveboxes` / snapshot feeds —
-    // otherwise `runtime_value_of` / `getptrinfo` lookups in optimize_bridge
-    // (which runs in the re-minted namespace) miss the producing op.
+    // unroll.py `UnrollOptimizer.optimize_bridge` `runtime_boxes` are the
+    // closing JUMP's live boxes. They are harvested from the pre-iterator
+    // trace and must be rewritten into the fresh-iterator namespace
+    // alongside `liveboxes` / snapshot feeds — otherwise `runtime_value_of`
+    // / `getptrinfo` lookups in optimize_bridge (which runs in the
+    // re-minted namespace) miss the producing op.
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .map(|box_| translate_trace_iter_runtime_box(box_, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -2025,35 +2045,18 @@ fn densify_root_loop_inputargs(
 
 /// compile.py compile_new_bridge `new_trace.inputargs = info.renamed_inputargs`.
 ///
-/// Reuse the same `InputArgRc` boxes the ops already carry, instead of
-/// minting a second InputArg for the same OpRef.
-fn retrace_inputarg_boxes(renamed: &[OpRef], ops: &[majit_ir::OpRc]) -> Vec<InputArgRc> {
-    let mut bound: crate::FxIndexMap<OpRef, InputArgRc> = crate::FxIndexMap::default();
-    for op in ops {
-        for arg in op
-            .args_slice()
-            .iter()
-            .chain(op.guard_fail_args().unwrap_or(&[]))
-        {
-            if arg.is_inputarg()
-                && let Some(ia) = arg.bound_inputarg()
-            {
-                bound.entry(arg.to_opref()).or_insert(ia);
-            }
-        }
-    }
+/// Recover the bound `InputArgRc` already stored on each exported
+/// `ExportedState.renamed_inputargs` box.
+fn retrace_inputarg_boxes(renamed: &[Operand]) -> Vec<InputArgRc> {
     renamed
         .iter()
-        .map(|&opref| {
-            bound.get(&opref).cloned().unwrap_or_else(|| {
-                let tp = opref.ty().unwrap_or_else(|| {
-                    panic!(
-                        "renamed inputarg {:?} has no intrinsic type \
-                         (history.py:220 Box.type invariant)",
-                        opref
-                    )
-                });
-                InputArgRc::new(InputArg::from_type(tp, opref.raw()))
+        .map(|box_| {
+            box_.bound_inputarg().unwrap_or_else(|| {
+                panic!(
+                    "renamed inputarg {:?} is not the typed InputArg box \
+                     stored by VirtualState.make_inputargs",
+                    box_.to_opref(),
+                )
             })
         })
         .collect()
@@ -8673,7 +8676,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// RPython-compatible helper name from compile.py.
-    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    pub fn send_loop_to_backend(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         self.compile_loop(jump_args)
     }
 
@@ -8944,8 +8947,9 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Close the current trace, optimize, and compile.
     ///
-    /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
-    /// in the same order as the InputArgs registered during `on_back_edge`.
+    /// `jump_args` are the live boxes at the end of the loop
+    /// (`compile.py` `compile_loop` `jumpargs`), in the same order as
+    /// the InputArgs registered during `on_back_edge`.
     /// pyjitpl.py `reached_loop_header` → `compile_loop` dispatch.
     ///
     /// This public entry wraps `Self::compile_loop_body` so every exit
@@ -8959,7 +8963,7 @@ impl<M: Clone> MetaInterp<M> {
     /// inner path consumed `self.tracing`. If so, the session envelope
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
-    pub fn compile_loop(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    pub fn compile_loop(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
         // at translation. Close before the optimizer reads it. A trace that
         // did not enter through `force_start_tracing` still reaches here.
@@ -8980,7 +8984,7 @@ impl<M: Clone> MetaInterp<M> {
         outcome
     }
 
-    fn compile_loop_body(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    fn compile_loop_body(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -9338,11 +9342,12 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2969: GUARD_FUTURE_CONDITION and heapcache.py:176:
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
+        let jump_oprefs: Vec<OpRef> = jump_args.iter().map(|b| b.to_opref()).collect();
         self.compile_tracing
             .as_mut()
             .unwrap()
             .recorder
-            .close_loop(jump_args);
+            .close_loop(&jump_oprefs);
         // `materialize_ops` copies `FrontendSlot.concrete` onto op values
         // and interns. `walk_active_trace_refs` stops seeing this recorder
         // at `take`, so materialize first.
@@ -9566,10 +9571,8 @@ impl<M: Clone> MetaInterp<M> {
             .base
             .inputargs()
             .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -9638,6 +9641,7 @@ impl<M: Clone> MetaInterp<M> {
                 num_trace_inputargs,
                 vable_config.clone(),
                 Some(&mut phase1_out),
+                preamble_data.runtime_boxes,
             )
         };
         let mut retried_without_unroll = false;
@@ -9740,10 +9744,11 @@ impl<M: Clone> MetaInterp<M> {
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
                         // needed (callers read via `OpRef::ty()`).
-                        let inputarg_types: Vec<majit_ir::Type> =
-                            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-                        simple_opt.trace_inputargs =
-                            majit_ir::OpRef::inputarg_refs(&inputarg_types);
+                        simple_opt.trace_inputargs = trace
+                            .inputargs
+                            .iter()
+                            .map(Operand::from_bound_inputarg)
+                            .collect();
                         // Move, not clone: keeps the rooted buffers in place so
                         // the slots collected above now point into simple_opt.
                         simple_opt.snapshot_boxes = snapshot_map;
@@ -9761,7 +9766,6 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
-                        simple_opt.trace_inputarg_boxes = trace.inputargs.clone();
                         // Consumed here and nowhere else, so the operations move
                         // into their `Rc`s instead of being copied into them.
                         // Unroll's TraceIterator allocates fresh operations
@@ -9926,10 +9930,10 @@ impl<M: Clone> MetaInterp<M> {
             match unroll_opt
                 .final_exported_state
                 .as_ref()
-                .map(|es| es.renamed_inputargs.as_slice())
+                .map(|es| &es.renamed_inputargs)
                 .filter(|args| args.len() == final_num_inputs)
             {
-                Some(args) => Some(args.to_vec()),
+                Some(args) => Some(args.iter().map(Operand::to_opref).collect::<Vec<OpRef>>()),
                 None => {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -10535,9 +10539,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` is the same `live_arg_boxes` upstream appends, already
     /// normalized by `remove_consts_and_duplicates`, so every element is a
     /// typed box; a `None`/`TempVar` here would silently change the label's
-    /// arity against the closing JUMP (compile.py:334), so decline to
-    /// register rather than record a short list.
-    fn register_retrace_merge_point(&mut self, jump_args: &[OpRef]) {
+    /// arity against the closing JUMP (`compile.py` `compile_loop` jumpargs),
+    /// so decline to register rather than record a short list.
+    fn register_retrace_merge_point(&mut self, jump_args: &[Operand]) {
         let Some(ctx) = self.tracing.as_ref() else {
             return;
         };
@@ -10545,12 +10549,12 @@ impl<M: Clone> MetaInterp<M> {
         // is unconditional. A missing type is a bookkeeping bug, not a
         // reason to skip the append.
         debug_assert!(
-            jump_args.iter().all(|op| op.ty().is_some()),
+            jump_args.iter().all(|b| !b.is_none()),
             "retrace merge-point jump_args must carry box.type (history.py)"
         );
         let green_boxes: Vec<crate::trace_ctx::GreenBox> = jump_args
             .iter()
-            .map(|&op| crate::trace_ctx::GreenBox::new(op, op.ty().unwrap_or(majit_ir::Type::Void)))
+            .map(|b| crate::trace_ctx::GreenBox::new(b.to_opref(), b.type_()))
             .collect();
         // pyjitpl.py:3059-3060 `self.current_merge_points.append(
         // (live_arg_boxes, start))` appends the greens the trace is closing
@@ -10645,7 +10649,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn compile_trace(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         from_guard: bool,
     ) -> CompileOutcome {
         let outcome = self.compile_trace_inner(green_key, finish_args, from_guard, None, None);
@@ -10657,7 +10661,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn compile_trace_from_interp(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         original_green_key: u64,
     ) -> CompileOutcome {
         // ResumeFromInterpDescr.get_resumestorage() is None — an interp-origin
@@ -10685,7 +10689,24 @@ impl<M: Clone> MetaInterp<M> {
         from_guard: bool,
         finish_descr: majit_ir::DescrRef,
     ) -> CompileOutcome {
-        self.compile_trace_inner(green_key, finish_args, from_guard, Some(finish_descr), None)
+        let finish_boxes: Vec<Operand> = self
+            .tracing
+            .as_mut()
+            .map(|ctx| {
+                finish_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.recorder.box_for_operand(r))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.compile_trace_inner(
+            green_key,
+            &finish_boxes,
+            from_guard,
+            Some(finish_descr),
+            None,
+        )
     }
 
     /// compile.py `compile_trace` + `ResumeFromInterpDescr.compile_and_attach`
@@ -10703,7 +10724,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compile_trace_inner(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         from_guard: bool,
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<u64>,
@@ -10755,6 +10776,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        let finish_oprefs: Vec<OpRef> = finish_args.iter().map(|b| b.to_opref()).collect();
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
@@ -10763,10 +10785,10 @@ impl<M: Clone> MetaInterp<M> {
 
         // pyjitpl.py compile_trace: record tentative JUMP or FINISH
         if let Some(descr) = finish_descr {
-            ctx.finish(finish_args, descr);
+            ctx.finish(&finish_oprefs, descr);
         } else {
             ctx.recorder.close_loop_with_descr(
-                finish_args,
+                &finish_oprefs,
                 Some(crate::call_descr::jit_cell_token_as_descr(
                     jump_token.expect("JUMP token resolved before recording"),
                 )),
@@ -11040,7 +11062,7 @@ impl<M: Clone> MetaInterp<M> {
     /// concatenates with partial_trace ops.
     ///
     /// Returns true if compilation succeeded.
-    pub fn compile_retrace(&mut self, jump_args: &[OpRef]) -> bool {
+    pub fn compile_retrace(&mut self, jump_args: &[Operand]) -> bool {
         self.remember_compiled_graph_write();
         // compile.py compile_retrace: jitlog.start_new_trace(faildescr=resumekey).
         let descr_id = self
@@ -11246,7 +11268,8 @@ impl<M: Clone> MetaInterp<M> {
             let jump_cut = {
                 let ctx = self.compile_tracing.as_mut().unwrap();
                 let jump_cut = ctx.get_trace_position();
-                ctx.close_loop(jump_args);
+                let jump_oprefs: Vec<OpRef> = jump_args.iter().map(|b| b.to_opref()).collect();
+                ctx.close_loop(&jump_oprefs);
                 jump_cut
             };
             // Decode snapshots and copy `FrontendSlot.concrete` while
@@ -11401,8 +11424,11 @@ impl<M: Clone> MetaInterp<M> {
         // (`TraceIterator.__init__` / `inputarg_from_tp`). Their `.index` is
         // the position the rewritten ops name, including a hole-filtered
         // retrace whose original last live arg was `InputArg(2)`.
-        unroll_opt.trace_inputargs = trace.inputargs.iter().map(|ia| ia.opref()).collect();
-        unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
+        unroll_opt.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         // `compile.py compile_retrace` `trace.cut_trace_from` is a view over
         // the same opencoder buffer, so `get_iter` seeds `_cache` at the
         // original `get_position()` and snapshots stay in that coordinate
@@ -11454,6 +11480,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             trace.inputargs.len(),
             vable_config,
+            jump_args,
         );
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
@@ -12475,9 +12502,11 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
-        let inputarg_types: Vec<majit_ir::Type> =
-            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
+        optimizer.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself; no raw-u32 type side-table
         // propagation is needed.
@@ -12510,7 +12539,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
@@ -12967,9 +12995,11 @@ impl<M: Clone> MetaInterp<M> {
         // `store_final_boxes_in_guard` with nothing to bind it to
         // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
         // Same seeding as the no-unroll retry inside `compile_loop`.
-        let inputarg_types: Vec<majit_ir::Type> =
-            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
+        optimizer.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
 
         let (
             mut snapshot_map,
@@ -12988,7 +13018,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
@@ -15197,7 +15226,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py: close_bridge — compile_trace wrapper that
     /// maps CompileOutcome to BridgeCompileResult.
-    pub fn close_bridge(&mut self, green_key: u64, finish_args: &[OpRef]) -> BridgeCompileResult {
+    pub fn close_bridge(&mut self, green_key: u64, finish_args: &[Operand]) -> BridgeCompileResult {
         let outcome = self.compile_trace(green_key, finish_args, true);
         self.classify_compile_outcome(outcome)
     }
@@ -15206,7 +15235,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn send_bridge_to_backend(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
     ) -> BridgeCompileResult {
         self.close_bridge(green_key, finish_args)
     }
@@ -15236,7 +15265,7 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<crate::jitdriver::JitDriverStaticData>>,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15286,14 +15315,12 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py `deserialize_optimizer_knowledge` receives
         // `frontend_boxes` (the source guard's live boxes) alongside
         // `liveboxes` (the bridge inputargs). It reads class knowledge
-        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
-        // and heap knowledge through `decode_box` at :153-157.
+        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` and heap
+        // knowledge through `decode_box`.
         //
         // Pyre stamps the `frontend_boxes` concrete values onto the
         // bridge inputarg operands here, so `runtime_value_of` and
         // `cls_of_box` consumers in the optimizer can read them.
-        // The stamp must precede `closing_jump_runtime_boxes`, which folds a
-        // valued inputarg JUMP arg into an inline Const.
         if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
             // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
             // failed source-guard `fail_args` must be paired 1:1 with
@@ -15304,7 +15331,8 @@ impl<M: Clone> MetaInterp<M> {
                 frontend_boxes.len(),
                 bridge_inputargs.len(),
                 "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
-                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
+                 fail_args plumbing diverged from liveboxes \
+                 (bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`)",
                 frontend_boxes.len(),
                 bridge_inputargs.len(),
             );
@@ -15315,17 +15343,18 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(value);
             }
         }
-        // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
-        // separately from the trace iterator and stay as the original live
-        // boxes from the closing JUMP.
-        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+        // compile.py `BridgeCompileData` / unroll.py `optimize_bridge`:
+        // runtime_boxes are passed separately from the trace iterator and
+        // stay as the original live boxes from the closing JUMP.
+        let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
-            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs)
+            Self::closing_jump_runtime_boxes(bridge_ops)
         };
-        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
-        // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`:
+        // mint fresh InputArg / ResOperation objects in a disjoint OpRef
+        // namespace (`opencoder.py` `TraceIterator.__init__`
+        // `self.inputargs = [rop.inputarg_from_tp(...)]`).
         let use_byte_iter = self
             .tracing
             .as_ref()
@@ -15361,9 +15390,10 @@ impl<M: Clone> MetaInterp<M> {
         let byte_unique_cache = prepared.byte_unique_cache.take();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
-        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
-        // into the fresh-iterator namespace; consume the translated list so
-        // optimize_bridge's generate_guards reads them in the re-minted space.
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+        // rewrote the runtime boxes into the fresh-iterator namespace; consume
+        // the translated list so optimize_bridge's generate_guards reads them
+        // in the re-minted space.
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
@@ -15390,10 +15420,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -15460,8 +15488,7 @@ impl<M: Clone> MetaInterp<M> {
             tok.set_retraced_count(retraced_count);
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
-                let renamed_inputargs =
-                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
+                let renamed_inputargs = retrace_inputarg_boxes(&es.renamed_inputargs);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -15657,61 +15684,19 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Build the bridge's `runtime_boxes` (compile.py:1056 / unroll.py:183):
-    /// the live boxes from the closing JUMP, carrying the concrete runtime
-    /// values they held at the jump point.
-    ///
-    /// In RPython every box carries its `_resint`/`_resref`/`_resfloat`
-    /// (history.py:680) because the metainterp executes each op concretely
-    /// while tracing, so `runtime_box.getint()` / `get_runtime_field`
-    /// (virtualstate.py, :493) read real values during the optimizer's
-    /// jump_to_existing_trace virtual-state match. pyre stamps the same
-    /// concrete values onto the recorded `Op` / `InputArg` identities during
-    /// tracing (recorder `set_concrete_at` → `Op::set_value`), but the raw
-    /// closing-jump arg oprefs do not survive `prepare_bridge_trace_for_optimizer`'s
-    /// fresh OpRef namespace, so `runtime_value_of` cannot recover them. Recover
-    /// the value here from the recorded identities and materialize each as an
-    /// inline-Const OpRef, which carries the value namespace-independently. A
-    /// jump arg with no recorded value (or a Void result) is passed through
-    /// unchanged, leaving the corresponding virtual-state entry to match
-    /// statically as before.
-    fn closing_jump_runtime_boxes<T>(
-        bridge_ops: &[T],
-        bridge_inputargs: &[majit_ir::InputArgRc],
-    ) -> Vec<OpRef>
+    /// `compile.py` `BridgeCompileData` / `unroll.py` `optimize_bridge`:
+    /// the live boxes from the closing JUMP, recorder namespace.
+    /// `prepare_bridge_*` rewrites them through `TraceIterator._cache`.
+    fn closing_jump_runtime_boxes<T>(bridge_ops: &[T]) -> Vec<Operand>
     where
         T: std::borrow::Borrow<majit_ir::Op>,
     {
-        let jump_arg_oprefs: Vec<OpRef> = bridge_ops
+        bridge_ops
             .last()
             .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
-            .unwrap_or_default();
-        if jump_arg_oprefs.is_empty() {
-            return jump_arg_oprefs;
-        }
-        let mut concrete: rustc_hash::FxHashMap<OpRef, Value> = rustc_hash::FxHashMap::default();
-        for ia in bridge_inputargs {
-            if let Some(v) = ia.get_value() {
-                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
-            }
-        }
-        for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
-            let pos = op.pos().get();
-            if !pos.is_none()
-                && let Some(v) = op.get_value()
-            {
-                concrete.insert(pos, v);
-            }
-        }
-        jump_arg_oprefs
-            .into_iter()
-            .map(|a| match concrete.get(&a) {
-                Some(v) if !matches!(v, Value::Void) => OpRef::const_inline_from_value(v),
-                _ => a,
-            })
-            .collect()
+            .map(|op| op.getarglist_copy().to_vec())
+            .unwrap_or_default()
     }
 
     /// Compile a bridge from a guard failure point.
@@ -15757,7 +15742,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr_arc: &majit_ir::DescrRef,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15952,10 +15937,10 @@ impl<M: Clone> MetaInterp<M> {
         // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
-        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+        let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
-            Self::closing_jump_runtime_boxes(&bridge_ops, bridge_inputargs)
+            Self::closing_jump_runtime_boxes(&bridge_ops)
         };
         // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
         // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
@@ -16020,16 +16005,12 @@ impl<M: Clone> MetaInterp<M> {
         let (enable_opts, _pureop_historylength) = self.snapshot_compiling_opt_params();
         let bridge_inline_short_preamble = inline_short_preamble;
         let bridge_call_pure_results = call_pure_results.clone();
-        let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
-            .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
-            .collect();
         let bridge_inputargs = prepared_inputargs.as_slice();
         let bridge_ops = bridge_trace_data.ops.as_slice();
-        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
-        // into the fresh-iterator namespace; consume the translated list so
-        // optimize_bridge's generate_guards reads them in the re-minted space.
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+        // rewrote the runtime boxes into the fresh-iterator namespace; consume
+        // the translated list so optimize_bridge's generate_guards reads them
+        // in the re-minted space.
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
@@ -16055,11 +16036,10 @@ impl<M: Clone> MetaInterp<M> {
                 recorder, cache,
             ));
         }
-        // Store bridge inputarg types so export_state can mint typed
-        // `renamed_inputargs` OpRefs that carry their type intrinsically
-        // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
-        optimizer.trace_inputargs = bridge_inputarg_types;
-        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
+        optimizer.trace_inputargs = prepared_inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -16202,8 +16182,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             if let Some(es) = exported {
-                let renamed_inputargs =
-                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
+                let renamed_inputargs = retrace_inputarg_boxes(&es.renamed_inputargs);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -30099,6 +30078,16 @@ mod metainterp_static_data_tests {
 mod tests {
     use super::*;
     use crate::JitArgKind;
+    use majit_ir::operand::Operand;
+
+    fn jump_boxes_from_recorder(meta: &mut MetaInterp<()>, oprefs: &[OpRef]) -> Vec<Operand> {
+        let rec = &mut meta.trace_ctx().expect("compile_loop test seed").recorder;
+        oprefs
+            .iter()
+            .copied()
+            .map(|r| rec.box_for_operand(r))
+            .collect()
+    }
 
     fn start_hash_trace(meta: &mut MetaInterp<()>, key: &majit_ir::GreenKey, live: &[i64]) {
         let live_values: Vec<Value> = live.iter().copied().map(Value::Int).collect();
@@ -30124,6 +30113,21 @@ mod tests {
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    #[test]
+    fn test_retrace_inputarg_boxes_preserves_exported_identity() {
+        let (exported, exported_root) =
+            crate::history::test_support::bound_inputarg_operand(Type::Int, 17);
+        let (same_position_decoy, _decoy_root) =
+            crate::history::test_support::bound_inputarg_operand(Type::Int, 17);
+
+        assert!(!exported.same_box(&same_position_decoy));
+
+        let rebuilt = retrace_inputarg_boxes(std::slice::from_ref(&exported));
+
+        assert_eq!(rebuilt.len(), 1);
+        assert!(InputArgRc::ptr_eq(&rebuilt[0], &exported_root));
+    }
 
     /// A resume that starts while another resume is running (a residual call
     /// re-entering the driver) acquires from the same builder.
@@ -30882,10 +30886,11 @@ mod tests {
             .getconst_ref(memo_dead.0 as i64)
             .expect("pool the parked memo const");
 
+        let prod_box = majit_ir::operand::Operand::from_opref(prod_const);
         let sb = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
-            &[prod_const],
+            std::slice::from_ref(&prod_box),
             &[],
-            &[prod_const],
+            std::slice::from_ref(&prod_box),
         );
         let tt = crate::history::TargetToken::new_loop(15);
         let mut producer = Some(
@@ -32057,7 +32062,7 @@ mod tests {
 
         // The closing JUMP's args are the bridge `runtime_boxes`; they must be
         // rewritten into the fresh-iterator namespace like the snapshot feeds.
-        let bridge_runtime_boxes = vec![OpRef::ref_op(2), OpRef::int_op(3)];
+        let bridge_runtime_boxes = bridge_ops[2].getarglist_copy().to_vec();
         let prepared = prepare_bridge_trace_for_optimizer(
             &bridge_ops,
             &bridge_inputargs,
@@ -32134,11 +32139,12 @@ mod tests {
                 .clone(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_ref(11)]
         );
-        // runtime_boxes are translated into the fresh-iterator namespace.
-        assert_eq!(
-            prepared.runtime_boxes,
-            vec![OpRef::ref_op(12), OpRef::int_op(13)]
+        // runtime_boxes remap onto the reminted JUMP args.
+        assert!(
+            prepared.runtime_boxes[0].same_box(&prepared.ops[2].arg(0)),
+            "runtime_boxes remap onto the reminted JUMP args"
         );
+        assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[2].arg(1)));
     }
 
     #[test]
@@ -32162,6 +32168,7 @@ mod tests {
             live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
         );
+        let runtime_boxes = vec![rec.box_for_operand(add)];
         let prepared = prepare_bridge_from_byte_recorder(
             &rec,
             &live,
@@ -32171,7 +32178,7 @@ mod tests {
             Vec::new(),
             SnapshotFramePcs::new(),
             None,
-            vec![add],
+            runtime_boxes,
             1000,
         )
         .expect("byte buffer");
@@ -32209,7 +32216,7 @@ mod tests {
             Vec::new(),
             SnapshotFramePcs::new(),
             None,
-            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            bridge_ops[0].getarglist_copy().to_vec(),
             556,
         );
         assert_eq!(
@@ -32229,6 +32236,8 @@ mod tests {
             vec![OpRef::input_arg_ref(556), OpRef::input_arg_ref(558)],
             "JUMP[1] remints through the cache onto the Vm failarg"
         );
+        assert!(prepared.runtime_boxes[0].same_box(&prepared.ops[0].arg(0)));
+        assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[0].arg(1)));
     }
 
     /// `pyjitpl.py compile_trace` + `unroll.py optimize_bridge`: original
@@ -32636,7 +32645,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[sum]);
+        meta.compile_loop(&jump_boxes);
         assert!(
             meta.get_procedure_token(green_key.get_uhash()).is_some(),
             "compile_loop must install a live origin token"
@@ -33819,11 +33829,15 @@ mod tests {
         meta.set_on_compile_loop(move |_, _, _, opcodes| {
             *captured.lock() = opcodes.to_vec();
         });
-        meta.compile_loop(&[
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_int(2),
-        ]);
+        let jump_boxes = jump_boxes_from_recorder(
+            &mut meta,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+            ],
+        );
+        meta.compile_loop(&jump_boxes);
 
         let opcodes = compiled_opcodes.lock();
         assert!(
@@ -33942,7 +33956,8 @@ mod tests {
             "no front target tokens, so this key is one compile_loop proceeds from"
         );
 
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         let fresh = meta
             .get_procedure_token(green_key.get_uhash())
@@ -34001,7 +34016,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
         }
 
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Compiled { .. }),
             "compile_loop must install a loop, got {outcome:?}"
@@ -34138,7 +34154,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         // Charge the live token. `history.py JitCellToken.target_tokens` is
         // the label list `unroll.py optimize_bridge` scans; a hollow
@@ -34234,7 +34251,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         let events = compile_events.lock();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -34258,7 +34276,8 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+            let jump_boxes = jump_boxes_from_recorder(meta, &[OpRef::input_arg_int(0)]);
+            let outcome = meta.compile_loop(&jump_boxes);
             let CompileOutcome::Compiled { green_key: key, .. } = outcome else {
                 panic!("compile_loop must produce a loop, got {outcome:?}");
             };
@@ -35227,7 +35246,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
         assert_eq!(
             *compile_count.lock(),
             1,
@@ -35267,7 +35287,11 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
-            meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]);
+            let jump_boxes = jump_boxes_from_recorder(
+                &mut meta,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            );
+            meta.compile_loop(&jump_boxes);
         }
 
         let events = events.lock();
@@ -35524,7 +35548,8 @@ mod tests {
         });
         meta.retracing_from = Some(start);
         let before = meta.trace_ctx().unwrap().current_merge_points.len();
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "retrace cancel must keep tracing, got {outcome:?}"
@@ -35602,7 +35627,8 @@ mod tests {
             Vec::new(),
         ));
         let loops_before = meta.stats.loops_aborted;
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Aborted),
             "tag overflow must abort, got {outcome:?}"
@@ -35696,7 +35722,8 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(matches!(outcome, CompileOutcome::Cancelled));
         let stored = meta
             .trace_ctx()
@@ -35781,7 +35808,8 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "compile_loop retrace cancel: {outcome:?}"
@@ -35824,9 +35852,14 @@ mod tests {
         );
         assert_eq!(prepared.inputargs[1].get_value(), Some(Value::Int(22)));
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
-        unroll_opt.trace_inputargs = prepared.inputargs.iter().map(|ia| ia.opref()).collect();
-        unroll_opt.trace_inputarg_boxes = prepared.inputargs.clone();
+        unroll_opt.trace_inputargs = prepared
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         let mut phase1_out = None;
+        let live0 = Operand::from_bound_inputarg(&live[0]);
+        let live1 = Operand::from_bound_inputarg(&live[1]);
         unroll_opt
             .optimize_trace_with_constants_and_inputs_vable_out(
                 &prepared.ops,
@@ -35834,13 +35867,18 @@ mod tests {
                 prepared.inputargs.len(),
                 None,
                 Some(&mut phase1_out),
+                &[live0.clone(), live1.clone()],
             )
             .expect("sparse retrace must optimize");
         let state = phase1_out.expect("phase 1 export").1;
+        assert!(
+            state.runtime_boxes[1].same_box(&live1),
+            "the closing JUMP's last live arg is the InputArg(2) box"
+        );
         assert_eq!(
-            state.runtime_boxes[1],
-            OpRef::const_int(22),
-            "the closing JUMP's last live arg is InputArg(2)'s value"
+            state.runtime_boxes[1].get_value(),
+            Some(Value::Int(22)),
+            "observed runtime value lives on that InputArg"
         );
     }
 

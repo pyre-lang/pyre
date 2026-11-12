@@ -3945,7 +3945,7 @@ impl OptHeapState {
     /// The `available_boxes` filter (heap.py:836,845) is applied later, in
     /// `bridgeopt::serialize_optimizer_knowledge`, once the live-box set is
     /// known; this raw export accepts every cached field.
-    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(OpRef, DescrRef, OpRef)> {
+    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(Operand, DescrRef, Operand)> {
         let mut result = Vec::new();
         // heap.py:827-846: for descr, cf in cached_fields.iteritems():
         for (field_idx, descr, cf) in &self.cached_fields {
@@ -4009,28 +4009,32 @@ impl OptHeapState {
                 if seen.is_none() {
                     continue;
                 }
-                // heap.py:844: box2 = box2.get_box_replacement(). The export
-                // triple still stores the terminal position.
-                let val = ctx.with_resolved_operand(&seen, |b| b.to_opref());
-                // heap.py:845 `box2 in available_boxes` is enforced later in
-                // bridgeopt; here the resolved field is exported unconditionally.
-                result.push((obj.to_opref(), descr.clone(), val));
+                // serialize_optheap: box2 = box2.get_box_replacement(); keep
+                // the boxes. `available_boxes` is applied later in bridgeopt.
+                let obj = obj.get_box_replacement(false);
+                let val = seen.get_box_replacement(false);
+                result.push((obj, descr.clone(), val));
             }
         }
         result
     }
 
     /// heap.py OptHeap.deserialize_optheap (struct half)
-    fn import_cached_fields(&mut self, entries: &[(OpRef, DescrRef, OpRef)], ctx: &mut OptContext) {
+    fn import_cached_fields(
+        &mut self,
+        entries: &[(Operand, DescrRef, Operand)],
+        ctx: &mut OptContext,
+    ) {
         use crate::optimizeopt::info::PtrInfo;
         for (box1, descr, box2) in entries {
             if box1.is_none() || box2.is_none() {
                 continue;
             }
             let field_idx = Self::field_slot_index(descr);
-            let resolved = ctx.get_replacement_opref(*box1);
-            // heap.py:872-873: parent_descr = descr.get_parent_descr()
-            //                  assert parent_descr.is_object()
+            let resolved = box1.get_box_replacement(false);
+            // heap.py deserialize_optheap:
+            //     parent_descr = descr.get_parent_descr()
+            //     assert parent_descr.is_object()
             let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
             debug_assert!(
                 parent_descr
@@ -4039,7 +4043,7 @@ impl OptHeapState {
                     .is_some_and(|sd| sd.is_object()),
                 "deserialize_optheap: parent_descr must be is_object()"
             );
-            // heap.py:874-881:
+            // heap.py deserialize_optheap:
             //     if box1.is_constant():
             //         structinfo = info.ConstPtrInfo(box1)
             //     else:
@@ -4049,49 +4053,30 @@ impl OptHeapState {
             //             structinfo.init_fields(parent_descr, descr.get_index())
             //             box1.set_forwarded(structinfo)
             // The `isinstance` test is against `AbstractVirtualPtrInfo`, which
-            // a NON-virtual `InstancePtrInfo` also satisfies (info.py ->
-            // :175 -> :124), so an info that is merely class-known keeps its
-            // class. Reading it as `is_virtual` instead replaces it with a
-            // fresh `Instance(known_class: None)` and discards the class bit
-            // `make_constant_class` just decoded from the parent's rd_numb.
-            let resolved_has_info = ctx
-                .get_box_replacement_operand_opt(*box1)
-                .as_ref()
-                .and_then(Operand::ptr_info)
+            // a NON-virtual `InstancePtrInfo` also satisfies (`info.py`
+            // `AbstractVirtualPtrInfo`), so an info that is merely class-known
+            // keeps its class. Reading it as `is_virtual` instead replaces it
+            // with a fresh `Instance(known_class: None)` and discards the class
+            // bit `make_constant_class` just decoded from the parent's rd_numb.
+            let resolved_has_info = resolved
+                .ptr_info()
                 .is_some_and(|info| info.is_abstract_virtual_ptr_info());
-            let needs_install = ctx
-                .get_box_replacement_operand_opt(resolved)
-                .and_then(|cb| cb.const_value())
-                .is_none()
-                && !resolved_has_info;
+            let needs_install = resolved.const_value().is_none() && !resolved_has_info;
             if needs_install {
                 // info.py InstancePtrInfo + init_fields
-                if let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
-                    ctx.set_ptr_info(&b, PtrInfo::instance(parent_descr.clone(), None));
-                }
+                ctx.set_ptr_info(&resolved, PtrInfo::instance(parent_descr.clone(), None));
             }
-            // heap.py: cf = self.field_cache(&descr)
-            //                  structinfo.setfield(descr, box1, box2, optheap, cf=cf)
-            let box1_op = ctx.materialize_operand_at(*box1);
-            self.cache_field(&box1_op, descr);
-            let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
-            if resolved_box
-                .as_ref()
-                .and_then(|cb| cb.const_value())
-                .is_some()
-            {
-                let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(info) = resolved_box
-                    .as_ref()
-                    .and_then(|cb| ctx.get_const_info_mut_box(cb, parent_descr.clone()))
-                {
-                    info.setfield(field_idx, box2);
+            // heap.py deserialize_optheap:
+            //     cf = self.field_cache(descr)
+            //     structinfo.setfield(descr, box1, box2, optheap, cf=cf)
+            self.cache_field(&resolved, descr);
+            let value = box2.get_box_replacement(false);
+            if resolved.const_value().is_some() {
+                if let Some(info) = ctx.get_const_info_mut_box(&resolved, parent_descr.clone()) {
+                    info.setfield(field_idx, value.clone());
                 }
             } else {
-                let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(b) = resolved_box.as_ref() {
-                    ctx.with_ptr_info_mut(b, |info| info.setfield(field_idx, box2.clone()));
-                }
+                ctx.with_ptr_info_mut(&resolved, |info| info.setfield(field_idx, value.clone()));
             }
         }
     }
@@ -4099,7 +4084,10 @@ impl OptHeapState {
     /// heap.py serialize_optheap (array half) — emit array-item quads.
     /// The `available_boxes` filter (heap.py:855,866) is applied later, in
     /// `bridgeopt::serialize_optimizer_knowledge`; this raw export accepts all.
-    fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
+    fn export_cached_arrayitems(
+        &self,
+        ctx: &mut OptContext,
+    ) -> Vec<(Operand, i64, DescrRef, Operand)> {
         let mut result = Vec::new();
         for (_, descr, submap) in &self.cached_arrayitems {
             // heap.py:849: if descr.get_descr_index() == -1: continue
@@ -4146,12 +4134,14 @@ impl OptHeapState {
                     if seen.is_none() {
                         continue;
                     }
-                    // heap.py:865: box2 = box2.get_box_replacement(). The export
-                    // quad still stores the terminal position.
-                    let val = ctx.with_resolved_operand(&seen, |b| b.to_opref());
-                    // heap.py:866 `box2 in available_boxes` is enforced later in
-                    // bridgeopt; here the resolved item is exported unconditionally.
-                    result.push((obj.to_opref(), index, descr.clone(), val));
+                    // serialize_optheap: box2 = box2.get_box_replacement(); keep
+                    // the boxes. `available_boxes` is applied later in bridgeopt.
+                    result.push((
+                        obj.get_box_replacement(false),
+                        index,
+                        descr.clone(),
+                        seen.get_box_replacement(false),
+                    ));
                 }
             }
         }
@@ -4161,7 +4151,7 @@ impl OptHeapState {
     /// heap.py deserialize_optheap (array half)
     fn import_cached_arrayitems(
         &mut self,
-        entries: &[(OpRef, i64, DescrRef, OpRef)],
+        entries: &[(Operand, i64, DescrRef, Operand)],
         ctx: &mut OptContext,
     ) {
         use crate::optimizeopt::info::PtrInfo;
@@ -4169,8 +4159,8 @@ impl OptHeapState {
             if box1.is_none() || box2.is_none() {
                 continue;
             }
-            let resolved = ctx.get_replacement_opref(*box1);
-            // heap.py:886-892:
+            let resolved = box1.get_box_replacement(false);
+            // heap.py deserialize_optheap:
             //     if box1.is_constant(): arrayinfo = info.ConstPtrInfo(box1)
             //     else:
             //         arrayinfo = box1.get_forwarded()
@@ -4178,52 +4168,36 @@ impl OptHeapState {
             //             arrayinfo = info.ArrayPtrInfo(descr)
             //             box1.set_forwarded(arrayinfo)
             // Same `AbstractVirtualPtrInfo` test as the struct half above: an
-            // existing non-virtual `ArrayPtrInfo` satisfies it (info.py ->
-            // :124) and must be kept, along with the length bound it carries.
-            let resolved_has_info = ctx
-                .get_box_replacement_operand_opt(*box1)
-                .as_ref()
-                .and_then(Operand::ptr_info)
+            // existing non-virtual `ArrayPtrInfo` satisfies it
+            // (`AbstractVirtualPtrInfo`) and must be kept, along with the
+            // length bound it carries.
+            let resolved_has_info = resolved
+                .ptr_info()
                 .is_some_and(|info| info.is_abstract_virtual_ptr_info());
-            let needs_install = ctx
-                .get_box_replacement_operand_opt(resolved)
-                .and_then(|cb| cb.const_value())
-                .is_none()
-                && !resolved_has_info;
-            if needs_install && let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
+            let needs_install = resolved.const_value().is_none() && !resolved_has_info;
+            if needs_install {
                 ctx.set_ptr_info(
-                    &b,
+                    &resolved,
                     PtrInfo::array(
                         descr.clone(),
                         crate::optimizeopt::intutils::IntBound::nonnegative(),
                     ),
                 );
             }
-            // heap.py: cf = self.arrayitem_cache(descr, index)
-            //                  arrayinfo.setitem(descr, index, box1, box2, optheap, cf=cf)
-            let box1_op = ctx.materialize_operand_at(*box1);
+            // heap.py deserialize_optheap:
+            //     cf = self.arrayitem_cache(descr, index)
+            //     arrayinfo.setitem(descr, index, box1, box2, optheap, cf=cf)
             let cai = self.arrayitem_cache(descr, *index);
-            cai.register_info(&box1_op);
-            let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
-            if resolved_box
-                .as_ref()
-                .and_then(|cb| cb.const_value())
-                .is_some()
-            {
+            cai.register_info(&resolved);
+            let value = box2.get_box_replacement(false);
+            if resolved.const_value().is_some() {
                 // info.py ConstPtrInfo.setitem → _get_array_info
-                let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(info) = resolved_box
-                    .as_ref()
-                    .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
-                {
-                    info.setitem(*index as usize, box2);
+                if let Some(info) = ctx.get_const_info_array_mut_box(&resolved, descr.clone()) {
+                    info.setitem(*index as usize, value.clone());
                 }
             } else {
                 let idx = *index as usize;
-                let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(b) = &resolved_box {
-                    ctx.with_ptr_info_mut(b, |info| info.setitem(idx, box2.clone()));
-                }
+                ctx.with_ptr_info_mut(&resolved, |info| info.setitem(idx, value.clone()));
             }
         }
     }
@@ -4301,7 +4275,7 @@ impl Optimization for OptHeap {
             .set_vrefinfo(vrefinfo);
     }
 
-    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(OpRef, DescrRef, OpRef)> {
+    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(Operand, DescrRef, Operand)> {
         self.state
             .borrow()
             .as_ref()
@@ -4309,7 +4283,7 @@ impl Optimization for OptHeap {
             .export_cached_fields(ctx)
     }
 
-    fn import_cached_fields(&self, entries: &[(OpRef, DescrRef, OpRef)], ctx: &mut OptContext) {
+    fn import_cached_fields(&self, entries: &[(Operand, DescrRef, Operand)], ctx: &mut OptContext) {
         self.state
             .borrow_mut()
             .as_mut()
@@ -4317,7 +4291,10 @@ impl Optimization for OptHeap {
             .import_cached_fields(entries, ctx);
     }
 
-    fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
+    fn export_cached_arrayitems(
+        &self,
+        ctx: &mut OptContext,
+    ) -> Vec<(Operand, i64, DescrRef, Operand)> {
         self.state
             .borrow()
             .as_ref()
@@ -4327,7 +4304,7 @@ impl Optimization for OptHeap {
 
     fn import_cached_arrayitems(
         &self,
-        entries: &[(OpRef, i64, DescrRef, OpRef)],
+        entries: &[(Operand, i64, DescrRef, Operand)],
         ctx: &mut OptContext,
     ) {
         self.state
@@ -4364,7 +4341,9 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::{OptHeap, OptHeapState};
-    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+    use crate::history::test_support::{
+        rooted_inputarg_operand, rooted_resop_operand, trace_inputargs_from_ops,
+    };
 
     /// oparser-faithful drop-in for `Operand::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
@@ -4933,17 +4912,11 @@ mod tests {
         let obj = rooted_resop_operand(Type::Ref, 10);
         ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(Some(size.clone()), None));
-        let class_a = OpRef::const_ptr(GcRef(0xaaa));
-        let map_word = OpRef::const_int(0xbbb);
+        let class_a = Operand::from_opref(OpRef::const_ptr(GcRef(0xaaa)));
+        let map_word = Operand::from_opref(OpRef::const_int(0xbbb));
         ctx.with_ptr_info_mut(&obj, |info| {
-            info.setfield(
-                OptHeap::field_slot_index(&w_class_ref),
-                Operand::from_opref(class_a),
-            );
-            info.setfield(
-                OptHeap::field_slot_index(&map_ref),
-                Operand::from_opref(map_word),
-            );
+            info.setfield(OptHeap::field_slot_index(&w_class_ref), class_a.clone());
+            info.setfield(OptHeap::field_slot_index(&map_ref), map_word.clone());
         })
         .unwrap();
         heap.state
@@ -4969,6 +4942,22 @@ mod tests {
             2,
             "w_class and payload map both serialize, got {exported:?}"
         );
+        let w_class_triple = exported
+            .iter()
+            .find(|(_, descr, _)| descr.as_field_descr().is_some_and(|f| f.is_w_class()))
+            .expect("w_class triple");
+        assert!(w_class_triple.0.same_box(&obj));
+        assert!(w_class_triple.2.same_box(&class_a));
+        let map_triple = exported
+            .iter()
+            .find(|(_, descr, _)| {
+                descr
+                    .as_field_descr()
+                    .is_some_and(|f| f.field_key() == "map")
+            })
+            .expect("map triple");
+        assert!(map_triple.0.same_box(&obj));
+        assert!(map_triple.2.same_box(&map_word));
     }
 
     /// `CachedField.invalidate` keeps a `?` field across `clean_caches`
@@ -5128,7 +5117,7 @@ mod tests {
         let obj = rooted_resop_operand(Type::Ref, 10);
         ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(None, None));
-        let const_code = OpRef::const_ptr(GcRef(0xaaa));
+        let const_code = Operand::from_opref(OpRef::const_ptr(GcRef(0xaaa)));
         let mut replay = Op::with_descr(
             OpCode::GetfieldGcR,
             std::slice::from_ref(&obj),
@@ -5139,7 +5128,7 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(&descr),
                 PreambleOp {
-                    op: Operand::from_opref(const_code),
+                    op: const_code.clone(),
                     invented_name: false,
                     preamble_op: OpRc::new(replay),
                     same_as_source: None,
@@ -5160,10 +5149,7 @@ mod tests {
         );
 
         ctx.with_ptr_info_mut(&obj, |info| {
-            info.setfield(
-                OptHeap::field_slot_index(&descr),
-                Operand::from_opref(const_code),
-            );
+            info.setfield(OptHeap::field_slot_index(&descr), const_code.clone());
         })
         .unwrap();
         let exported = heap.export_cached_fields(&mut ctx);
@@ -5172,7 +5158,8 @@ mod tests {
             1,
             "a forced Const field value is serializable"
         );
-        assert_eq!(exported[0].2, const_code);
+        assert!(exported[0].0.same_box(&obj));
+        assert!(exported[0].2.same_box(&const_code));
     }
 
     fn initialize_imported_short_heap_field(
@@ -5186,13 +5173,13 @@ mod tests {
     ) {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
-        let object_ref = object.to_opref();
         ctx.seed_boxes_canonical(std::slice::from_ref(object));
         let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
         preamble_op.pos().set(source);
+        let resolved_box = bound_arg(resolved);
         ctx.initialize_imported_short_preamble_builder(
-            &[object_ref, resolved],
-            &[object_ref, resolved],
+            &[object.clone(), resolved_box.clone()],
+            &[object.clone(), resolved_box.clone()],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: OpRc::new(preamble_op.clone()),
                 source_op: None,
@@ -5217,8 +5204,7 @@ mod tests {
             );
         })
         .unwrap();
-        let _ = resolved;
-        heap.import_cached_fields(&[(object_ref, descr.clone(), resolved)], ctx);
+        heap.import_cached_fields(&[(object.clone(), descr.clone(), resolved_box)], ctx);
     }
 
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
@@ -5300,8 +5286,8 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -5395,32 +5381,49 @@ mod tests {
         let inner_pos = OpRef::ref_op(101);
         let outer_box = ctx.materialize_operand_at(outer_pos);
         let inner_box = ctx.materialize_operand_at(inner_pos);
-        let heap_entry = |op: Op, res: &Operand| ProducedShortOp {
-            kind: PreambleOpKind::Heap,
-            res: res.clone(),
-            source_op: OpRc::new(op.clone()),
-            preamble_op: OpRc::new(op),
-            invented_name: false,
-            same_as_source: None,
-            label_arg_idx: None,
+        let heap_entry = |op: Op, res: &Operand| {
+            let preamble_op = OpRc::new(op.clone());
+            let replay_box = Operand::from_bound_op(&preamble_op);
+            (
+                replay_box,
+                ProducedShortOp {
+                    kind: PreambleOpKind::Heap,
+                    res: res.clone(),
+                    source_op: OpRc::new(op),
+                    preamble_op,
+                    invented_name: false,
+                    same_as_source: None,
+                    label_arg_idx: None,
+                },
+            )
         };
-        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], object_descr(1));
+        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], object_descr(1));
         outer.pos().set(outer_pos);
-        let mut inner = Op::with_descr(OpCode::GetfieldGcR, &[outer_box.clone()], object_descr(2));
+        let outer_entry = heap_entry(outer, &outer_box);
+        // `HeapOp.add_op_to_short` stores `sb.produce_arg(sop.getarg(0))` on
+        // the replay op: a dependent getfield names the producer's replay box.
+        let mut inner = Op::with_descr(
+            OpCode::GetfieldGcR,
+            &[outer_entry.0.clone()],
+            object_descr(2),
+        );
         inner.pos().set(inner_pos);
-        let short_boxes = vec![
-            (outer_pos, heap_entry(outer, &outer_box)),
-            (inner_pos, heap_entry(inner, &inner_box)),
-        ];
+        let short_boxes = vec![outer_entry, heap_entry(inner, &inner_box)];
         let mut result_map = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        for &(source, _) in &short_boxes {
-            result_map.insert(source, ctx.alloc_op_position_typed(Type::Ref));
+        for (source, produced) in &short_boxes {
+            let pos = ctx.alloc_op_position_typed(Type::Ref).raw();
+            let inputarg = majit_ir::InputArg::from_type_rc(Type::Ref, pos);
+            let result = Operand::from_bound_inputarg(&inputarg);
+            assert!(result.bound_inputarg().is_some());
+            assert_eq!(result.type_(), produced.preamble_op.result_type());
+            assert!(!result.same_box(source));
+            result_map.insert(source.clone(), result);
         }
 
         assert!(
             ctx.initialize_imported_short_preamble_builder_from_short_boxes(
-                &[p0],
-                &[p0],
+                std::slice::from_ref(&p0_box),
+                std::slice::from_ref(&p0_box),
                 &short_boxes,
                 &result_map,
                 &indexmap::IndexMap::new(),
@@ -6126,8 +6129,8 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -7401,15 +7404,15 @@ mod tests {
             .cache_field(&pos100, &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::ref_op(100),
-            OpRef::ref_op(101),
+            pos100.clone(),
+            val101.clone(),
         ]);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         // Register the objects the cache already names, before
-        // add_short_input_arg materializes those positions.
+        // add_short_input_arg consumes those interned boxes.
         ctx.seed_boxes_canonical(&[pos100.clone(), val101.clone()]);
-        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(100), majit_ir::Type::Ref);
-        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(101), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, pos100.clone());
+        sb.add_short_input_arg(&mut ctx, val101.clone());
         use crate::optimizeopt::info::PtrInfo;
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         // Seed the slot the reader will consult: `field_slot_index`, not the
@@ -8276,8 +8279,8 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
         opt.set_vrefinfo(vrefinfo);
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![Type::Ref; 1024]);
         opt.snapshot_boxes = snapshots;
 
         let result =

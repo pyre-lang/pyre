@@ -339,7 +339,7 @@ impl StrPtrInfoExt for StrPtrInfo {
         match &self.variant {
             // vstring.py: base StrPtrInfo.getstrlen always emits
             // STRLEN and caches in lgtop; never returns a constant from
-            // lenbound. The caller (getstrlen_opref) handles STRLEN emission.
+            // lenbound. The caller (`getstrlen_with`) handles STRLEN emission.
             VStringVariant::Ptr => None,
             // vstring.py: VStringPlainInfo.getstrlen
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
@@ -1141,8 +1141,8 @@ impl PtrInfoExt for PtrInfo {
 /// vstring.py `StrPtrInfo.getstrlen` / `VStringPlainInfo.getstrlen` /
 /// `VStringSliceInfo.getstrlen` / `VStringConcatInfo.getstrlen`.
 /// `StrPtrInfo.force_box` calls `self.getstrlen(op, optforce.optimizer.optstring, self.mode)`
-/// on the info already in hand. An opref round-trip would miss a virtual that
-/// is not in `new_operations`.
+/// on the info already in hand. A position rematerialize would miss a virtual
+/// that is not in `new_operations`.
 fn strptrinfo_getstrlen(
     sinfo: &mut StrPtrInfo,
     op: &Operand,
@@ -1158,15 +1158,15 @@ fn strptrinfo_getstrlen(
     enum Action {
         Plain(i64),
         Slice(Operand),
-        Concat { vleft: OpRef, vright: OpRef },
+        Concat { vleft: Operand, vright: Operand },
         Ptr,
     }
     let action = match &sinfo.variant {
         VStringVariant::Plain(p) => Action::Plain(p._chars.len() as i64),
         VStringVariant::Slice(s) => Action::Slice(s.lgtop.clone()),
         VStringVariant::Concat(c) => Action::Concat {
-            vleft: c.vleft.to_opref(),
-            vright: c.vright.to_opref(),
+            vleft: c.vleft.clone(),
+            vright: c.vright.clone(),
         },
         VStringVariant::Ptr => Action::Ptr,
     };
@@ -1178,14 +1178,14 @@ fn strptrinfo_getstrlen(
         }
         Action::Slice(lgtop) => ctx.resolve_operand_operand_opt(&lgtop).unwrap_or(lgtop),
         Action::Concat { vleft, vright } => {
-            let left_len = ctx.getstrlen_opref_with(optimizer, vleft, mode);
-            let right_len = ctx.getstrlen_opref_with(optimizer, vright, mode);
+            let left_len = ctx.getstrlen_with(optimizer, &vleft, mode);
+            let right_len = ctx.getstrlen_with(optimizer, &vright, mode);
             let result =
                 crate::optimizeopt::vstring::_int_add_with(optimizer, &left_len, &right_len, ctx);
             sinfo.lgtop = Some(result.clone());
             result
         }
-        Action::Ptr => ctx.getstrlen_opref_with(optimizer, op.to_opref(), mode),
+        Action::Ptr => ctx.getstrlen_with(optimizer, op, mode),
     }
 }
 
@@ -3236,10 +3236,14 @@ mod tests {
     fn test_ptr_info_visitor_walk() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(0, field_op(Type::Int, 10));
-        info.setfield(1, field_op(Type::Int, 20));
+        let expected0 = field_op(Type::Int, 10);
+        let expected1 = field_op(Type::Int, 20);
+        info.setfield(0, expected0.clone());
+        info.setfield(1, expected1.clone());
         let refs = info.visitor_walk_recursive();
-        assert_eq!(refs, vec![OpRef::int_op(10), OpRef::int_op(20)]);
+        assert_eq!(refs.len(), 2);
+        assert!(refs[0].same_box(&expected0));
+        assert!(refs[1].same_box(&expected1));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use pyre_object::pyobject::is_int;
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use majit_ir::GcRef;
+use majit_ir::operand::Operand;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_jit_trace::trace::trace_bytecode;
 
@@ -6036,9 +6037,19 @@ fn compile_bridge_jump(
 ) -> BridgeResolution {
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
+        // recorder → compile edge (`MetaInterp.compile_trace` jumpargs).
+        let boxes: Vec<Operand> = {
+            let meta = driver.meta_interp_mut();
+            let ctx = meta.trace_ctx().expect("compile_trace: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
         driver
             .meta_interp_mut()
-            .compile_trace(green_key, jump_args, true)
+            .compile_trace(green_key, &boxes, true)
     };
     match outcome {
         majit_metainterp::CompileOutcome::Compiled { .. } => {

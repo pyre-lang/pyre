@@ -421,7 +421,7 @@ pub struct DependencyGraph {
 impl DependencyGraph {
     /// dependency.py __init__: Build a dependency graph from loop operations.
     /// Uses DefTracker and IntegralForwardModification for precise analysis.
-    pub fn build(ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) -> Self {
+    pub fn build(ops: &[Op], constant_of: &dyn Fn(&Operand) -> Option<i64>) -> Self {
         let nodes: Vec<Node> = ops
             .iter()
             .enumerate()
@@ -558,7 +558,7 @@ impl DependencyGraph {
 
     /// dependency.py: build_dependencies — construct def-use chains
     /// with DefTracker and IntegralForwardModification.
-    fn build_dependencies(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
+    fn build_dependencies(&mut self, ops: &[Op], constant_of: &dyn Fn(&Operand) -> Option<i64>) {
         let mut tracker = DefTracker::new(self);
         let mut intformod = IntegralForwardModification::new(constant_of);
 
@@ -1541,13 +1541,13 @@ pub struct IntegralForwardModification<'a> {
     pub index_vars: indexmap::IndexMap<OpRef, IndexVar>,
     /// Node index → MemoryRef mapping
     pub memory_refs: indexmap::IndexMap<usize, MemoryRef>,
-    /// Callback to resolve constant OpRef → i64 value.
-    /// dependency.py: is_const_integral + box.getint()
-    constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
+    /// Callback to resolve constant Operand → i64 value.
+    /// dependency.py IntegralForwardModification.is_const_integral + box.getint()
+    constant_of: &'a dyn Fn(&Operand) -> Option<i64>,
 }
 
 impl<'a> IntegralForwardModification<'a> {
-    pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
+    pub fn new(constant_of: &'a dyn Fn(&Operand) -> Option<i64>) -> Self {
         IntegralForwardModification {
             index_vars: indexmap::IndexMap::new(),
             memory_refs: indexmap::IndexMap::new(),
@@ -1563,12 +1563,12 @@ impl<'a> IntegralForwardModification<'a> {
         self.memory_refs.insert(node_idx, mref);
     }
 
-    fn is_const(opref: OpRef) -> bool {
-        opref.is_constant()
+    fn is_const(arg: &Operand) -> bool {
+        arg.is_constant()
     }
 
-    fn const_val(&self, opref: OpRef) -> Option<i64> {
-        (self.constant_of)(opref)
+    fn const_val(&self, arg: &Operand) -> Option<i64> {
+        (self.constant_of)(arg)
     }
 
     /// `arg_box` is the BOUND operand for `arg` (`arg_box.to_opref() == arg`),
@@ -1577,8 +1577,8 @@ impl<'a> IntegralForwardModification<'a> {
     /// already in `index_vars` keeps its own (possibly box-carrying) entry.
     fn get_or_create(&mut self, arg: OpRef, arg_box: &Operand) -> IndexVar {
         self.index_vars.get(&arg).cloned().unwrap_or_else(|| {
-            if Self::is_const(arg) {
-                let val = self.const_val(arg).unwrap_or(0);
+            if Self::is_const(arg_box) {
+                let val = self.const_val(arg_box).unwrap_or(0);
                 IndexVar::new_const(arg, val)
             } else {
                 IndexVar::new_boxed(arg_box.clone())
@@ -1586,23 +1586,23 @@ impl<'a> IntegralForwardModification<'a> {
         })
     }
 
-    /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
+    /// dependency.py operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
         let result = op.pos().get();
         let b0 = op.arg(0);
         let b1 = op.arg(1);
         let a0 = b0.to_opref();
         let a1 = b1.to_opref();
-        if Self::is_const(a0) && Self::is_const(a1) {
+        if Self::is_const(&b0) && Self::is_const(&b1) {
             let mut idx = IndexVar::new(result);
-            let v0 = self.const_val(a0).unwrap_or(0);
-            let v1 = self.const_val(a1).unwrap_or(0);
+            let v0 = self.const_val(&b0).unwrap_or(0);
+            let v1 = self.const_val(&b1).unwrap_or(0);
             idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
             self.set_index_var(result, idx);
-        } else if Self::is_const(a0) {
+        } else if Self::is_const(&b0) {
             let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
-            if let Some(v) = self.const_val(a0) {
+            if let Some(v) = self.const_val(&b0) {
                 if is_sub {
                     idx.constant -= v;
                 } else {
@@ -1610,10 +1610,10 @@ impl<'a> IntegralForwardModification<'a> {
                 }
             }
             self.set_index_var(result, idx);
-        } else if Self::is_const(a1) {
+        } else if Self::is_const(&b1) {
             let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
-            if let Some(v) = self.const_val(a1) {
+            if let Some(v) = self.const_val(&b1) {
                 if is_sub {
                     idx.constant -= v;
                 } else {
@@ -1623,35 +1623,36 @@ impl<'a> IntegralForwardModification<'a> {
             self.set_index_var(result, idx);
         }
         // No var/var branch: `additive_func_source` only handles const/const,
-        // const/var, and var/const (dependency.py:899-913); a non-const ±
-        // non-const result is intentionally left untracked in `index_vars`.
+        // const/var, and var/const (`dependency.py operation_INT_ADD`); a
+        // non-const ± non-const result is intentionally left untracked in
+        // `index_vars`.
     }
 
-    /// dependency.py:922-948: operation_INT_MUL.
+    /// dependency.py operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
         let result = op.pos().get();
         let b0 = op.arg(0);
         let b1 = op.arg(1);
         let a0 = b0.to_opref();
         let a1 = b1.to_opref();
-        if Self::is_const(a0) && Self::is_const(a1) {
+        if Self::is_const(&b0) && Self::is_const(&b1) {
             let mut idx = IndexVar::new(result);
-            let v0 = self.const_val(a0).unwrap_or(0);
-            let v1 = self.const_val(a1).unwrap_or(0);
+            let v0 = self.const_val(&b0).unwrap_or(0);
+            let v1 = self.const_val(&b1).unwrap_or(0);
             idx.constant = v0 * v1;
             self.set_index_var(result, idx);
-        } else if Self::is_const(a0) {
+        } else if Self::is_const(&b0) {
             let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
-            if let Some(v) = self.const_val(a0) {
+            if let Some(v) = self.const_val(&b0) {
                 idx.coefficient_mul *= v;
                 idx.constant *= v;
             }
             self.set_index_var(result, idx);
-        } else if Self::is_const(a1) {
+        } else if Self::is_const(&b1) {
             let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
-            if let Some(v) = self.const_val(a1) {
+            if let Some(v) = self.const_val(&b1) {
                 idx.coefficient_mul *= v;
                 idx.constant *= v;
             }
