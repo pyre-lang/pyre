@@ -3642,8 +3642,7 @@ pub(crate) fn fbw_journaled_effect_delta_since(mark: FbwEffectJournalMark) -> us
 /// executed an unrecoverable effect has none left, so the useful question at
 /// a stuck walk is which residual took this branch.  Six call sites forward a
 /// cause here and the flag itself keeps no provenance; `PYRE_UNJOURNALED_SITE`
-/// names the caller, in the shape `PYRE_LB_SITE` uses for the callee-inline
-/// declines.
+/// names the caller for the callee-inline declines.
 fn unjournaled_site_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_UNJOURNALED_SITE").is_some())

@@ -808,11 +808,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     .payload
                     .forward_py_pc_for_jitcode_pc(op_pc)
                     .unwrap_or_else(|| {
-                        crate::py_coord::note_empty_twin_fallback(
-                            "capture_seam",
-                            jc.index,
-                            op_pc as i32,
-                        );
                         crate::py_coord::containing_py_pc_for_jitcode_pc(
                             &jc.payload.metadata,
                             op_pc,
@@ -2685,14 +2680,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
                 }
                 ft
             }
-            None => {
-                crate::py_coord::note_empty_twin_fallback(
-                    "inline_caller_fallthrough",
-                    jc.index,
-                    call_jit_pc as i32,
-                );
-                legacy_fallthrough()
-            }
+            None => legacy_fallthrough(),
         };
         (
             jc.index as u32,

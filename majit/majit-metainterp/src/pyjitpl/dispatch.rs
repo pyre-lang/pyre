@@ -3597,15 +3597,14 @@ where
             };
             if !matches!(action, TraceAction::Continue) {
                 self.stash_portal_reds(ctx, sym);
-                if (crate::majit_log_enabled() || crate::tldbg_enabled()) && self.frames.is_empty()
-                {
+                if crate::majit_log_enabled() && self.frames.is_empty() {
                     // Every `Finish` return drains the framestack first.
                     eprintln!(
                         "[interpret] run_to_end action={:?} ops={} framestack drained",
                         action,
                         ctx.num_recorded_ops(),
                     );
-                } else if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                } else if crate::majit_log_enabled() {
                     let fr = self.frames.current_mut();
                     let last_op = fr
                         .jitcode

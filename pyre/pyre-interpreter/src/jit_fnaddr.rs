@@ -5637,12 +5637,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     pa0!(
         &mut entries,
-        "pyre_interpreter::call::pyre_debug_call_enabled",
-        "pyre_interpreter::pyre_debug_call_enabled",
-        crate::call::pyre_debug_call_enabled,
-    );
-    pa0!(
-        &mut entries,
         "pyre_interpreter::executioncontext::arm_async_eval_breaker",
         "pyre_interpreter::arm_async_eval_breaker",
         crate::executioncontext::arm_async_eval_breaker,

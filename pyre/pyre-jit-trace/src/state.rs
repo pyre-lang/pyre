@@ -970,9 +970,7 @@ fn walk_jitcode_code_roots_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let probe = probe14_enabled();
-    for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
+    for jc in sd.jitcodes.iter() {
         pyre_interpreter::pycode::walk_live_code_wrapper(
             jc.payload.code_ptr as *const (),
             &mut |wrapper| {
@@ -980,54 +978,11 @@ fn walk_jitcode_code_roots_in(
                 if old == 0 {
                     return;
                 }
-                if probe {
-                    PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
-                    probe14_note_nursery(
-                        "CODE WRAPPER",
-                        old,
-                        jc.payload.jitcode.name(),
-                        jitcode_index,
-                    );
-                }
                 let root = unsafe {
                     &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef)
                 };
                 visitor(root);
-                if probe && root.0 != old {
-                    let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
-                    if n <= 20 {
-                        eprintln!(
-                            "[probe14] RELOCATION KEPT #{n}: code wrapper 0x{old:x} -> 0x{:x} \
-                             (jitcode {jitcode_index}/{})",
-                            root.0,
-                            sd.jitcodes.len(),
-                        );
-                    }
-                }
             },
-        );
-    }
-}
-
-/// Report whether either JitCode-owned population reaches the nursery. This is
-/// expected for newly-created movable code wrappers and runtime constants; the
-/// counters verify that the corresponding root walk sees them before reset.
-fn probe14_note_nursery(kind: &str, addr: usize, name: &str, jitcode_index: usize) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if !majit_gc::gc_is_nursery_object(addr) {
-        return;
-    }
-    let n = PROBE14_NURSERY.fetch_add(1, Relaxed) + 1;
-    if n <= 20 {
-        // Address and header word only.  Reading the object's TYPE here is not
-        // sound: measured, on the run that aborts the slot is already invalid
-        // at walk time, and `type_name_of` returned a multi-kilobyte garbage
-        // string from unmapped bytes.  The header word says the same thing
-        // safely — a plausible type id means the corpse is still ahead.
-        let header = unsafe { (addr as *const usize).offset(-1).read_unaligned() };
-        eprintln!(
-            "[probe14] NURSERY ROOT #{n}: {kind} 0x{addr:x} header={header:#x} in jitcode \
-             {jitcode_index} {name:?}"
         );
     }
 }
@@ -1314,45 +1269,11 @@ pub unsafe fn walk_jitcode_constants_refs_area(
     walk_jitcode_constants_refs_in(sd, visitor);
 }
 
-/// Forwarding probe for [`walk_jitcode_constants_refs`] above.
-/// `drag_out_root` relocates a root only when it is a nursery object start, so
-/// a slot whose value the visitor CHANGES is one where a movable object entered
-/// the pool and the walk had to write the new address back.  Before that
-/// write-back existed the same count named relocations the walk DISCARDED.
-///
-/// `WALKS`/`SLOTS` are the arming witnesses: `RELOCATED == 0` means nothing
-/// moved only when `SLOTS > 0`.  With `SLOTS == 0` the walker observed
-/// nothing and the run says nothing either way.
-///
-/// Gated on `PYRE_PROBE14=1`; reports on stderr as it happens because the
-/// fault this chases is a non-unwinding abort that never reaches shutdown.
-pub static PROBE14_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE14_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// Companion witnesses for the OTHER half of this area, the `code_ptr ->
-/// wrapper` roots, and for the invariant a relocation count cannot test.
-///
-/// A relocation counter alone cannot refute that the remembered-set boundary
-/// missed a movable object: a missed pool is never offered to the visitor.
-/// Membership of the nursery in every pool that is offered can, so the probe
-/// records that independently.
-pub static PROBE14_CODE_SLOTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn probe14_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PYRE_PROBE14").as_deref() == Ok("1"))
-}
-
 fn walk_jitcode_constant_pool(
     sd: &MetaInterpStaticData,
     jitcode_index: usize,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-    probe: bool,
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(jc) = sd.jitcodes.get(jitcode_index) else {
         return;
     };
@@ -1387,32 +1308,9 @@ fn walk_jitcode_constant_pool(
         let cell = &pool[pool_slot];
         let mut gcref = majit_ir::GcRef(cell.get() as usize);
         let before = gcref.0;
-        if probe {
-            probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
-        }
         visitor(&mut gcref);
         if gcref.0 != before {
             cell.set(gcref.0 as i64);
-        }
-        if probe {
-            PROBE14_SLOTS.fetch_add(1, Relaxed);
-            if gcref.0 != before {
-                let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
-                if n <= 20 {
-                    eprintln!(
-                        "[probe14] RELOCATION APPLIED #{n}: constants_r slot \
-                         0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
-                         jitcode {}/{}, pool_slot {}/{})",
-                        gcref.0,
-                        PROBE14_WALKS.load(Relaxed),
-                        PROBE14_SLOTS.load(Relaxed),
-                        jitcode_index,
-                        sd.jitcodes.len(),
-                        pool_slot,
-                        pool_len,
-                    );
-                }
-            }
         }
     }
 }
@@ -1421,11 +1319,6 @@ fn walk_jitcode_constants_refs_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let probe = probe14_enabled();
-    if probe {
-        PROBE14_WALKS.fetch_add(1, Relaxed);
-    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     if is_minor {
@@ -1437,45 +1330,14 @@ fn walk_jitcode_constants_refs_in(
         // `remember_jitcode_constants_write`.
         let pending = std::mem::take(&mut *sd.jitcodes_with_young_constants.borrow_mut());
         for jitcode_index in pending {
-            walk_jitcode_constant_pool(sd, jitcode_index, visitor, probe);
+            walk_jitcode_constant_pool(sd, jitcode_index, visitor);
         }
     } else {
         // `incminimark.py collect_nonstack_roots` / `visit_all_objects`:
         // major marking follows every live JitCode field, irrespective of its
         // remembered-set state.
         for jitcode_index in 0..sd.jitcodes.len() {
-            walk_jitcode_constant_pool(sd, jitcode_index, visitor, probe);
-        }
-    }
-    // ARMING WITNESS.  The relocation report above prints only when a slot
-    // MOVES, so on a run with no relocations it emits nothing at all — and
-    // "nothing" is indistinguishable from "this walker never ran" or "the pool
-    // was empty".  Those are the REFUTES and NOT-EXERCISED branches of this
-    // probe's pre-registration, and they must not share a rendering.  Emit the
-    // observed population unconditionally so a silent run is always readable as
-    // one or the other.  Printed as it happens, not at shutdown: the fault this
-    // chases is a non-unwinding abort that never reaches shutdown.
-    if probe {
-        let walks = PROBE14_WALKS.load(Relaxed);
-        // Window widened after the first run: `walks <= 3 || walks % 200 == 0`
-        // sampled ONLY the walks before any jitcode was installed (jitcodes=0,
-        // slots=0) and then nothing until walk 200, but the abort lands around
-        // walk 5.  The arming witness therefore reported slots=0 -- "NOT
-        // EXERCISED" -- for runs whose own relocation reports proved the
-        // opposite.  An arming witness whose sampling window misses the armed
-        // regime is worse than none: it manufactures the null it exists to rule
-        // out.  Cover every early walk, then thin out.
-        if walks <= 50 || walks % 50 == 0 {
-            eprintln!(
-                "[probe14] ARMED walk={} slots_cumulative={} code_slots_cumulative={} \
-                 relocated_cumulative={} nursery_cumulative={} jitcodes={}",
-                walks,
-                PROBE14_SLOTS.load(Relaxed),
-                PROBE14_CODE_SLOTS.load(Relaxed),
-                PROBE14_RELOCATED.load(Relaxed),
-                PROBE14_NURSERY.load(Relaxed),
-                sd.jitcodes.len(),
-            );
+            walk_jitcode_constant_pool(sd, jitcode_index, visitor);
         }
     }
 }
@@ -2167,144 +2029,6 @@ pub(crate) struct BridgeSemanticMaps {
     pub pcdep_entries: Vec<(u8, u16, u16)>,
 }
 
-/// Counters for the `via_py_pc` fallback of
-/// [`bridge_semantic_maps_at_with_jitcode_pc`], which indexes the
-/// Python-PC-keyed `LiveVars::depth_at_py_pc`. One instance per *leg* that
-/// reaches the fallback — the `site=` field of the printed line names the leg,
-/// not the caller.
-///
-/// The partition that decides whether a Python coordinate is being read at a
-/// point the caller did not mean: an offset past the end of the table reads
-/// `None` and the fallback answers 0, but one that lands inside returns a real
-/// depth belonging to a different instruction.
-///
-/// Which bucket a caller can produce is fixed by the argument it passes, so the
-/// two ends must not be welded together:
-/// * `setup_bridge_sym` is the one consumer that reads `stack_depth_at_pc`
-///   outside a `pcdep_entries` loop (`seed_deferred_to_overlay` compares
-///   pcdep depth to the resumed virtualizable stack), and it passes `None`
-///   — so `no_py_pc` is the only bucket reachable from there and
-///   `in_range_*` is structurally unreachable.
-/// * `in_range_nonzero` can only come from the one caller that supplies a
-///   `Some` coordinate, `resume_snapshot.rs`
-///   `walker_capture_snapshot_for_last_guard_impl`'s `liveness_py_pc`, whose
-///   depth feeds that function's own `semantic_limit`. That call is dominated
-///   by `resolve_resume_pc_with_jitcode_pc` on the same payload, `op_live` and
-///   coordinate, and that helper returns `Some` only under
-///   `can_decode_live_vars` — the very predicate selecting the twin arm here.
-///   So `site=non_decodable` is unreachable from that caller: only
-///   `EMPTY_TWIN_MISS` can fire there. A printed `site=non_decodable` line
-///   therefore never belongs to the one `Some` caller, which is what excludes
-///   it from every fire the corpus has produced so far.
-///
-/// That caller's coordinate is a Python PC by construction, so a nonzero depth
-/// there is the designed result of the leg, not an anomaly — the bucket records
-/// which leg ran, and does not by itself witness a coordinate mixup.
-///
-/// The counters are per leg, not per process: with one shared counter only the
-/// leg that fires first is ever named, so a run in which one leg never executed
-/// is indistinguishable from one in which it executed second.
-///
-/// Pure telemetry — with the variable unset every counter path is skipped.
-struct EmptyTwinSite {
-    name: &'static str,
-    hits: std::sync::atomic::AtomicU64,
-    no_py_pc: std::sync::atomic::AtomicU64,
-    null_code: std::sync::atomic::AtomicU64,
-    out_of_range: std::sync::atomic::AtomicU64,
-    in_range_zero: std::sync::atomic::AtomicU64,
-    in_range_nonzero: std::sync::atomic::AtomicU64,
-}
-
-impl EmptyTwinSite {
-    const fn new(name: &'static str) -> Self {
-        const fn zero() -> std::sync::atomic::AtomicU64 {
-            std::sync::atomic::AtomicU64::new(0)
-        }
-        Self {
-            name,
-            hits: zero(),
-            no_py_pc: zero(),
-            null_code: zero(),
-            out_of_range: zero(),
-            in_range_zero: zero(),
-            in_range_nonzero: zero(),
-        }
-    }
-}
-
-/// The carried jitcode coordinate decoded, but the twin tables had no entry.
-static EMPTY_TWIN_MISS: EmptyTwinSite = EmptyTwinSite::new("twin_miss");
-/// No usable jitcode coordinate: either none was carried (`NO_JITCODE_PC`) or
-/// the carried offset does not decode as a `-live-` anchored startpoint.
-static EMPTY_TWIN_NON_DECODABLE: EmptyTwinSite = EmptyTwinSite::new("non_decodable");
-
-/// `jit_pc` / `twin` report the coordinate that reached the fallback and the
-/// jitcode-keyed containing depth used there. Before that twin became the
-/// production fallback, the 399-file synth corpus showed all 20 executions at
-/// `jit_pc >= 0` with `twin = Some(3..=5)` while the function returned 0.
-///
-/// Read the `Some`-ness of that pair narrowly. `twin` is a FLOOR lookup over
-/// `depth_containing_by_jit_pc`, whose keys are those of a table the codewriter
-/// pads with key 0 (`py_floor_by_jit_pc`'s `insert(0, (0, 0))`), so once the
-/// twin is populated at all it answers `Some` at every non-negative offset. A
-/// `None` here therefore records an empty twin, not an out-of-range offset;
-/// only the values carry per-coordinate information.
-///
-/// The counters remain per leg, not per call site, so a fire cannot be
-/// attributed to one of the callers. `setup_bridge_sym` is the consumer whose
-/// `stack_depth_at_pc` read is unconditional.
-fn empty_twin_census(
-    site: &EmptyTwinSite,
-    rp: Option<usize>,
-    table_len: Option<usize>,
-    depth: u16,
-    jit_pc: i32,
-    twin: Option<u16>,
-) {
-    // Shares `PYRE_M73_EMPTYTWIN_CENSUS` with `py_coord::note_empty_twin_fallback`,
-    // so one run reports both. That one prints `[m73-emptytwin]`; this one prints
-    // `[m73-bridge-maps]`, distinct under a case-insensitive filter too.
-    if !crate::py_coord::emptytwin_census_enabled() {
-        return;
-    }
-    use std::sync::atomic::Ordering;
-    let name = site.name;
-    let hits = site.hits.fetch_add(1, Ordering::Relaxed) + 1;
-    // `rp >= len` must be tested before the `depth == 0` arm: `table.get(rp)`
-    // already collapses an out-of-range read to 0, so the zero arm would
-    // otherwise swallow it and the two would be indistinguishable.
-    let (bucket, counter, live) = match (rp, table_len) {
-        (None, _) => ("no_py_pc", &site.no_py_pc, false),
-        (Some(_), None) => ("null_code", &site.null_code, false),
-        (Some(rp), Some(len)) if rp >= len => ("out_of_range", &site.out_of_range, false),
-        (Some(_), Some(_)) if depth == 0 => ("in_range_zero", &site.in_range_zero, false),
-        (Some(_), Some(_)) => ("in_range_nonzero", &site.in_range_nonzero, true),
-    };
-    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    // Every bucket announces its first witness, so the buckets that do fire are
-    // the positive control for the ones that do not: a bucket that stays silent
-    // on a stream carrying other buckets' lines is empty, not unprinted.
-    // `in_range_nonzero` gets 20 rather than one because it is the only bucket
-    // whose value varies — the rest answer 0 by construction, so one witness
-    // says everything about them.
-    if n == 1 || (live && n <= 20) {
-        eprintln!(
-            "[m73-bridge-maps] site={name} bucket={bucket} n={n} rp={rp:?} len={table_len:?} depth={depth} jit_pc={jit_pc} twin={twin:?}"
-        );
-    }
-    if hits % 100_000 == 0 {
-        eprintln!(
-            "[m73-bridge-maps] totals site={name} hits={hits} no_py_pc={} null_code={} out_of_range={} in_range_zero={} in_range_nonzero={}",
-            site.no_py_pc.load(Ordering::Relaxed),
-            site.null_code.load(Ordering::Relaxed),
-            site.out_of_range.load(Ordering::Relaxed),
-            site.in_range_zero.load(Ordering::Relaxed),
-            site.in_range_nonzero.load(Ordering::Relaxed),
-        );
-    }
-}
-
 /// When a kept-stack branch guard carries the guard's own jitcode
 /// coordinate (`jitcode_pc != NO_JITCODE_PC`), the pcdep/depth tables
 /// must be keyed at the GUARD's Python PC — the encode side
@@ -2361,15 +2085,11 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `depth_trivia_for_jitcode_pc` reads it at the trivia-skipped py.
         // `collect_outer_active_boxes`, the encode half this mirrors, already
         // sources its own `stack_depth_at_pc` from the JitCode-keyed depth twin
-        // with no Python PC in hand. The census below measured what it answers:
-        // over the 399-file synth corpus every one of the 20 executions of this
-        // leg carried a non-negative offset at which the containing twin
-        // answers 3, 4 or 5. Returning 0 truncated the reconstructed frame's
-        // semantic prefix and dropped exactly those operand-stack slots.
+        // with no Python PC in hand.
         //
         // What this leg must not do, and did before the `Option`, is index the
         // Python-keyed table with the JitCode word.
-        let via_py_pc = |rp: Option<i32>, site: &'static EmptyTwinSite| -> usize {
+        let via_py_pc = |rp: Option<i32>| -> usize {
             // The JitCode-keyed static twin is the production fallback when no
             // sanctioned Python coordinate is carried.  It is built from the
             // same `depth_at_py_pc` table as the raw read below and therefore
@@ -2379,18 +2099,13 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 .then(|| payload.depth_containing_for_jitcode_pc(jitcode_pc as usize))
                 .flatten();
             let Some(rp) = rp.and_then(|p| usize::try_from(p).ok()) else {
-                let depth = twin.unwrap_or(0);
-                empty_twin_census(site, None, None, depth, jitcode_pc, twin);
-                return depth as usize;
+                return twin.unwrap_or(0) as usize;
             };
             if payload.code_ptr.is_null() {
-                empty_twin_census(site, Some(rp), None, 0, jitcode_pc, twin);
                 return 0;
             }
             let table = crate::liveness::liveness_for(payload.code_ptr).depth_at_py_pc();
-            let depth = table.get(rp).copied().unwrap_or(0);
-            empty_twin_census(site, Some(rp), Some(table.len()), depth, jitcode_pc, twin);
-            depth as usize
+            table.get(rp).copied().unwrap_or(0) as usize
         };
         let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0
             && payload
@@ -2409,7 +2124,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
-                .unwrap_or_else(|| via_py_pc(py_pc, &EMPTY_TWIN_MISS));
+                .unwrap_or_else(|| via_py_pc(py_pc));
             (depth, pcdep)
         } else {
             // RPython resume.py rebuild_from_resumedata does
@@ -2419,7 +2134,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // register stream cannot supply a color-to-slot pcdep map.  Keep
             // the independently useful static frame width, but do not combine
             // it with pcdep from a coordinate whose values cannot be decoded.
-            (via_py_pc(py_pc, &EMPTY_TWIN_NON_DECODABLE), Vec::new())
+            (via_py_pc(py_pc), Vec::new())
         };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
@@ -9856,29 +9571,6 @@ pub(crate) fn reconstruct_inline_recipe(
                 continue;
             }
             if registers_r[s] == OpRef::NONE {
-                if crate::jitcode_dispatch::p2_diag_enabled() {
-                    let sem: Vec<(u32, Option<usize>)> = reg_indices
-                        .ref_
-                        .iter()
-                        .map(|&c| {
-                            (
-                                c,
-                                semantic_ref_slot_for_reg_color(
-                                    nlocals,
-                                    stack_only,
-                                    &maps.pcdep_entries,
-                                    c as usize,
-                                ),
-                            )
-                        })
-                        .collect();
-                    eprintln!(
-                        "[p2-recipe] jitcode_index={} pc={} py_pc={py_pc} in_a_call={in_a_call} \
-                         nlocals={nlocals} stack_only={stack_only} vsd={valuestackdepth} \
-                         missing={s} arr={arr:?} pframe={pframe_reg} pec={pec_reg} live_ref={sem:?}",
-                        frame.jitcode_index, frame.pc
-                    );
-                }
                 crate::jitcode_dispatch::census_record("P2Recipe::MandatoryOperandMissing");
                 return None;
             }
@@ -12800,13 +12492,6 @@ impl JitState for PyreJitState {
         // frame at its own pc while the carrier callees resume at their
         // frames[i].pc. A negative (no-snapshot) root pc aborts the
         // multi-frame path.
-        if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-            let pcs: Vec<i32> = resume_data.frames.iter().map(|f| f.pc).collect();
-            eprintln!(
-                "[mframe] resume frames.len()={} pcs={pcs:?}",
-                resume_data.frames.len()
-            );
-        }
         if resume_data.frames.len() > 1 {
             let root_jitcode_index = resume_data.frames[0].jitcode_index;
             let root_pc_valid = resume_data.frames[0].pc >= 0;

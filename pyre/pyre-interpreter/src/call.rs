@@ -116,27 +116,6 @@ pub(crate) unsafe fn walk_pending_call_error_area(
     }
 }
 
-/// Cold debug flag probe for `call_function_impl_raw`. This is a
-/// `dont_look_inside` scalar wrapper so the two-phase rtyper sees a plain
-/// bool residual instead of `std::env::var`'s `Result<String, VarError>` ABI.
-#[majit_macros::dont_look_inside]
-pub fn pyre_debug_call_enabled() -> bool {
-    // The debug knob reads the real process env; under sandbox host access must
-    // go through the seam, so report disabled rather than touch the host env.
-    #[cfg(not(feature = "sandbox"))]
-    {
-        // Cached: this sits on the per-call path and is also reachable from
-        // compiled code through the fnaddr registry, so an uncached read would
-        // pay a `getenv` plus a `String` allocation on every call.
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("PYRE_DEBUG_CALL").is_some())
-    }
-    #[cfg(feature = "sandbox")]
-    {
-        false
-    }
-}
-
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use crate::eval::eval_frame_plain;
@@ -4772,38 +4751,12 @@ pub fn register_build_class() {
 /// recover them via `take_call_error()` after a `PY_NULL` return.
 pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let called = call_function_impl_result(callable, args);
-    let mut e = match called {
+    let e = match called {
         Ok(result) => return result,
         Err(e) => e,
     };
-    if pyre_debug_call_enabled() {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let slot = e.pin(&_roots);
-        // `error.py OperationError.errorstr` runs at display time, not at
-        // raise time. Format inside the residual sink so a descent scan of
-        // this look_inside caller does not follow `message_text` into
-        // `space.str` (`py_str_wtf8`).
-        log_call_error(&e);
-        e.reload(&_roots, slot);
-    }
     set_call_error(e);
     PY_NULL
-}
-
-/// Cold debug-diagnostic sink for `call_function_impl_raw`. Residualized so
-/// the `eprintln!` formatting machinery (`fmt::rt::Argument`) stays out of the
-/// traced graph — the whole body is a host-stderr write behind the env probe,
-/// which the tracer cannot model. `message_text` (`error.py
-/// OperationError.errorstr`) lives here with that write. No-op under
-/// `sandbox` (host access must go through the seam).
-#[majit_macros::dont_look_inside]
-fn log_call_error(err: &PyError) {
-    #[cfg(not(feature = "sandbox"))]
-    if pyre_debug_call_enabled() {
-        eprintln!("[call_function_impl] error: {}", err.message_text());
-    }
-    #[cfg(feature = "sandbox")]
-    let _ = err;
 }
 
 /// Cold `descroperation.py call` non-callable error materialisation.
@@ -7581,28 +7534,6 @@ fn build_class_inner(
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
-    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-    // Debug: dump code object for __class__ cell investigation. Reads the real
-    // process env + writes real stderr, so keep it out of the sandbox build.
-    #[cfg(not(feature = "sandbox"))]
-    {
-        let code_ref = unsafe { &*func_code };
-        if std::env::var("PYRE_DEBUG_CLASS").is_ok() {
-            eprintln!("[build_class] name={name}");
-            eprintln!("  varnames: {:?}", code_ref.varnames);
-            eprintln!("  cellvars: {:?}", code_ref.cellvars);
-            eprintln!("  freevars: {:?}", code_ref.freevars);
-            eprintln!(
-                "  nlocals={} ncells={} nfree={}",
-                code_ref.varnames.len(),
-                code_ref.cellvars.len(),
-                code_ref.freevars.len()
-            );
-            for (i, instr) in code_ref.instructions.iter().enumerate().take(20) {
-                eprintln!("  {i}: {:?}", instr);
-            }
-        }
-    }
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(

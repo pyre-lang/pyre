@@ -4360,22 +4360,6 @@ impl Optimizer {
         }
         let _detached_jump_pub = self.publish_live_op_vec(&detached_jump);
 
-        if optimized_ops.len() < 120 && crate::smallir_enabled() {
-            eprintln!(
-                "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
-                optimized_ops.len(),
-                !detached_jump.is_empty() as i32,
-                target_tokens.len(),
-            );
-            for (i, op) in optimized_ops.iter().enumerate() {
-                eprintln!(
-                    "@@@SMALLIR   B[{i}] {:?} pos={:?}",
-                    op.opcode,
-                    op.pos().get()
-                );
-            }
-        }
-
         // A FINISH-only trace belongs on SimpleCompileData.optimize_loop
         // (`compile.py compile_trace` `ends_with_jump=False`).
         let Some(terminal_jump) = detached_jump.last().map(|op| (**op).clone()) else {

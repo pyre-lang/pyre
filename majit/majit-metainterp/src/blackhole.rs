@@ -1412,7 +1412,6 @@ impl BlackholeInterpreter {
     /// reads it as a raw signed byte (`'c'` argcode, assembler.py:312
     /// `USE_C_FORM`).
     pub(crate) fn bhimpl_jit_merge_point(&mut self, opcode: u8) -> Result<(), DispatchError> {
-        let nbody_debug = crate::nbody_debug_enabled();
         let jdindex_byte = self.next_reg();
         let jdindex = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
             (jdindex_byte as i8) as usize
@@ -1426,17 +1425,6 @@ impl BlackholeInterpreter {
         self._get_list_of_values_i_into(&mut args.red_int);
         self._get_list_of_values_r_into(&mut args.red_ref);
         self._get_list_of_values_f_into(&mut args.red_float);
-        if nbody_debug {
-            eprintln!(
-                "[nbody-debug][bh-jmp] pos={} jdindex={} gi={:?} gr={:?} ri={:?} rr={:#x?}",
-                self.last_opcode_position,
-                jdindex,
-                args.green_int,
-                args.green_ref,
-                args.red_int,
-                args.red_ref,
-            );
-        }
 
         if self.nextblackholeinterp.is_none() {
             // blackhole.py:1068-1069: bottommost level.
@@ -13735,18 +13723,11 @@ fn handler_getarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
     let value =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
-    if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
-        eprintln!(
-            "[nbody-debug][bh-vable-get-r] position={} last_opcode_position={} index={} value={:#x}",
-            bh.position, bh.last_opcode_position, index, value as usize
-        );
-    }
     bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
 }
@@ -13769,17 +13750,10 @@ fn handler_setarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
     let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
-    if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
-        eprintln!(
-            "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
-            bh.position, bh.last_opcode_position, index, value as usize
-        );
-    }
     unsafe {
         crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }

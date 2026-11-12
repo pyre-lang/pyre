@@ -97,12 +97,6 @@ pub(crate) fn fbw_mf_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_MF_DIAG").is_some())
 }
 
-/// `PYRE_P2_DIAG`: self-recursive CALL_ASSEMBLER fold diagnostics.
-pub(crate) fn p2_diag_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_P2_DIAG").is_some())
-}
-
 /// `PYRE_BRIDGE_LATCH_AUDIT`: report what the bridge sub-walk's abort latch
 /// would have been refused for at the walk-level latch site.
 ///

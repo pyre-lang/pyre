@@ -4311,15 +4311,9 @@ impl DispatchError {
     /// Construct the callee-inline decline.  The
     /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
     /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
-    /// route them through one constructor that records the source location
-    /// under `PYRE_LB_SITE` to tell the decline reasons apart in a census.
-    #[track_caller]
+    /// route them through one constructor.
     #[inline]
     pub(crate) fn callee_inline_unsupported(pc: usize) -> Self {
-        if std::env::var_os("PYRE_LB_SITE").is_some() {
-            let loc = std::panic::Location::caller();
-            eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
-        }
         // Most call sites have no MIFrame session, so they cannot see the
         // per-frame effect delta `fbw_decline_inline_callee` reads.  An
         // in-flight consume those sites still have to honor: a generator,
@@ -10154,10 +10148,9 @@ pub(crate) struct MidBodyPayload {
     /// The rebuilt callee's native abort coordinate, resolved at the
     /// interpreter flush boundary.
     pub callee_jitcode_index: u32,
-    pub abort_jitcode_pc: usize,
-    /// Forward-carried Python instruction PC for `abort_jitcode_pc`, stamped
-    /// once at capture so the flush reads a scalar instead of re-inverting the
-    /// coordinate through the jitcode->py tables.
+    /// Forward-carried Python instruction PC for the rebuilt callee's abort
+    /// coordinate, stamped once at capture so the flush reads a scalar instead
+    /// of re-inverting the coordinate through the jitcode->py tables.
     pub callee_py_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
     pub w_globals: pyre_object::PyObjectRef,
@@ -14454,13 +14447,6 @@ fn guarded_branch_core<Sym: WalkSym>(
         } else {
             Some(Vec::new())
         };
-        if std::env::var_os("PYRE_DIAG124C").is_some() && kept_stack {
-            eprintln!(
-                "[edge124] pc={} depth={resume_depth:?} raw_target={raw_branch_target} \
-                 moves(dst<-src)={kept_recovered:?}",
-                op.pc,
-            );
-        }
         // PARITY DEVIATION (converges at the symbolic-valuestack
         // capture, #73/#423): `opimpl_goto_if_not` (pyjitpl.py)
         // always records GUARD_TRUE/FALSE for a non-constant condition
@@ -14903,9 +14889,6 @@ fn reached_loop_header<Sym: WalkSym>(
         snapshot_jit_pc,
         markers,
     } = header;
-    if std::env::var("PYRE_DIAG_51C").is_ok() {
-        eprintln!("[51c-redclose] pc={snapshot_jit_pc} reds={reds:?}");
-    }
     // pyjitpl.py `self.heapcache.reset()` before the reds are deduplicated.
     // pyjitpl.py self.heapcache.reset()
     // The walker's cached sys_exc_value box is a heap-field cache too
@@ -15001,14 +14984,6 @@ fn reached_loop_header<Sym: WalkSym>(
         if before[i] != live_args[i] {
             ctx.trace_ctx
                 .set_virtualizable_box_at(i - red_len, live_args[i]);
-        }
-    }
-    if std::env::var("PYRE_DIAG_51C").is_ok() {
-        for (idx, &arg) in live_args.iter().enumerate() {
-            eprintln!(
-                "[51c-redclose]   live_arg[{idx}] {arg:?} concrete={:?}",
-                ctx.trace_ctx.concrete_of_opref(arg)
-            );
         }
     }
     // pyjitpl.py `reached_loop_header`: one `GUARD_FUTURE_CONDITION` before
@@ -15840,14 +15815,6 @@ fn handle<Sym: WalkSym>(
             let switchcase = match ctx.trace_ctx.concrete_of_opref(valuebox) {
                 Some(Value::Int(v)) => v,
                 _ => {
-                    if std::env::var("PYRE_DIAG_GIN").is_ok() {
-                        let tb = read_int_reg_concrete(code, op, 0, ctx);
-                        let reg = code[op.pc + 1] as usize;
-                        eprintln!(
-                            "[diag-gin] pc={} valuebox={:?} reg={} concrete_of_opref=NON-INT typed_bank={:?}",
-                            op.pc, valuebox, reg, tb
-                        );
-                    }
                     return Err(DispatchError::GotoIfNotValueNotConcrete {
                         pc: op.pc,
                         value: valuebox,

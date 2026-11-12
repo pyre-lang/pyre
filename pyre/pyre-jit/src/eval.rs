@@ -6917,11 +6917,10 @@ unsafe fn jitcode_constants_root_walker_area(
     // consequence was the fault it was meant to make impossible: upstream
     // builds every jitcode at translation time, while pyre builds one per
     // CodeObject at RUN time, so a trace's `Operand::ConstRef` reaches the pool
-    // straight off the heap. Measured with `PYRE_PROBE14=1` on
-    // `_pending/exec_foreign_globals_gc_root.py`, one slot holds a NURSERY
-    // object on the first post-publication walk; skipped by the old blanket
-    // minor bypass, it was neither kept alive nor forwarded, and the next
-    // major seeded a corpse
+    // straight off the heap. On `_pending/exec_foreign_globals_gc_root.py`, one
+    // slot holds a NURSERY object on the first post-publication walk; skipped
+    // by the old blanket minor bypass, it was neither kept alive nor forwarded,
+    // and the next major seeded a corpse
     // (`GC BUG: invalid type_id ... site=jitcode_constants`).
     unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
 }
@@ -6935,8 +6934,7 @@ unsafe fn jitcode_constants_root_walker_area(
 /// barrier.  The walk is not free -- it iterates every
 /// `MetaInterpStaticData.jitcodes` entry and takes the `LIVE_CODE_WRAPPERS`
 /// lock once per entry -- so running it per nursery cycle would cost a whole
-/// registry scan for nothing.  `PYRE_PROBE14=1` tests the placement claim
-/// directly rather than by its relocation consequence.
+/// registry scan for nothing.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
