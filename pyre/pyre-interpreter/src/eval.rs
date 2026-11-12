@@ -3074,18 +3074,22 @@ impl SharedOpcodeHandler for PyFrame {
         // only thing keeping it reachable while `getattr_str` runs arbitrary
         // Python — and the failing branch below still has to read its type.
         let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
+        let base = roots.base();
         let obj = roots.pin_root(obj);
         let anchor = FrameAnchor::new(self);
-        getattr_str(obj, name).inspect_err(|error| {
-            if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                // Keep this write on the live virtualizable red frame.  The
-                // opaque helper only answers the semantic type question;
-                // writing `frame.flags` inside it would race the JIT's
-                // register-resident copy of the same field.
-                unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+        match getattr_str(obj, name) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if finalize_failed_attr_receiver_now(roots.get(base)) {
+                    // Keep this write on the live virtualizable red frame.  The
+                    // opaque helper only answers the semantic type question;
+                    // writing `frame.flags` inside it would race the JIT's
+                    // register-resident copy of the same field.
+                    unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+                }
+                Err(err)
             }
-        })
+        }
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {

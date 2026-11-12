@@ -4585,50 +4585,76 @@ pub fn funccall_valuestack(
         // live across dropvalues() and the gateway call.  The Python frame
         // slots cease to be roots when dropvalues() clears them, so publish
         // the same live-variable set on pyre's shadow stack before doing so.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        match nargs {
-            0 => {}
+        let result = match nargs {
+            0 => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe { crate::builtin_code_call(roots.get(base), &[]) }
+            }
             1 => {
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe { crate::builtin_code_call(roots.get(base), &[roots.get(base + 1)]) }
             }
             2 => {
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[roots.get(base + 1), roots.get(base + 2)],
+                    )
+                }
             }
             3 => {
-                let _ = _roots.pin_root(frame.peekvalue(2));
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(2));
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[
+                            roots.get(base + 1),
+                            roots.get(base + 2),
+                            roots.get(base + 3),
+                        ],
+                    )
+                }
             }
             4 => {
-                let _ = _roots.pin_root(frame.peekvalue(3));
-                let _ = _roots.pin_root(frame.peekvalue(2));
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(3));
+                let _ = roots.pin_root(frame.peekvalue(2));
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[
+                            roots.get(base + 1),
+                            roots.get(base + 2),
+                            roots.get(base + 3),
+                            roots.get(base + 4),
+                        ],
+                    )
+                }
             }
-            _ => unreachable!(),
-        }
-        unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-
-        let code = _roots.get(root_base);
-        let rooted_arg = |index| _roots.get(root_base + 1 + index);
-        // Pyre builtins share a single fn(&[PyObjectRef]) signature, so use
-        // fixed-size stack arrays instead of heap-allocating a Vec.
-        let result = match nargs {
-            0 => unsafe { crate::builtin_code_call(code, &[]) },
-            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
-            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
-            3 => unsafe {
-                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
-            },
-            4 => unsafe {
-                crate::builtin_code_call(
-                    code,
-                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
-                )
-            },
             _ => unreachable!(),
         };
         return match result {
