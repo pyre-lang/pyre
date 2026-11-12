@@ -4523,6 +4523,10 @@ mod tests {
             !merge_flat(&slot, ValueType::Ref(Some("string::String".into())), None).unwrap(),
             "str-family Ref ∪ Str is identity"
         );
+        assert!(
+            !merge_flat(&slot, ValueType::Ref(Some("path::PathBuf".into())), None).unwrap(),
+            "PathBuf Ref ∪ Str is identity (`rpath.py` s_Str0 / `rstr.py` one string type)"
+        );
         assert_eq!(read_binding(&slot), ValueType::Str);
         assert!(
             matches!(

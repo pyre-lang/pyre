@@ -169,8 +169,20 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
 /// segfault on the next memory access. The trampoline is wired up, but
 /// safe enablement is not yet implemented: it requires a shadowstack
 /// pass that registers every live PyObjectRef as a GC root.
-fn pyre_object_gc_collect_trampoline(generation: i64) {
-    majit_gc::collect_generation(generation);
+fn pyre_object_gc_collect_trampoline(generation: i64) -> i64 {
+    majit_gc::collect_generation(generation)
+}
+
+fn pyre_object_gc_freeze_trampoline() {
+    majit_gc::freeze();
+}
+
+fn pyre_object_gc_unfreeze_trampoline() {
+    majit_gc::unfreeze();
+}
+
+fn pyre_object_gc_freeze_count_trampoline() -> i64 {
+    majit_gc::freeze_count()
 }
 
 fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {
@@ -5929,6 +5941,9 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_alloc_collecting_rooted_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
+    pyre_object::gc_hook::register_gc_freeze_hook(pyre_object_gc_freeze_trampoline);
+    pyre_object::gc_hook::register_gc_unfreeze_hook(pyre_object_gc_unfreeze_trampoline);
+    pyre_object::gc_hook::register_gc_freeze_count_hook(pyre_object_gc_freeze_count_trampoline);
     pyre_object::gc_hook::register_gc_collect_step_hook(pyre_object_gc_collect_step_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
     pyre_object::gc_hook::register_gc_minor_with_major_progress_hook(

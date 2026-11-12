@@ -1070,9 +1070,27 @@ pub trait GcAllocator: Send {
     /// singleton does not reach.
     ///
     /// A collector with no state machine has no generation to select, so the
-    /// default answers every one of them with the whole collection.
-    fn collect_generation(&mut self, _generation: i64) {
+    /// default answers every one of them with the whole collection. Impls that
+    /// do not count what they free return 0; MiniMark returns the objects this
+    /// call released.
+    fn collect_generation(&mut self, _generation: i64) -> i64 {
         self.collect_full();
+        0
+    }
+
+    /// `gc.freeze()`: snapshot currently live objects into a permanent set
+    /// that later collections treat as extra roots (`incminimark.py`
+    /// `prebuilt_root_objects`). Collectors without a freeze set no-op.
+    fn freeze(&mut self) {}
+
+    /// `gc.unfreeze()`: empty the freeze set. Collectors without a freeze
+    /// set no-op.
+    fn unfreeze(&mut self) {}
+
+    /// `gc.get_freeze_count()`: size of the freeze set, or 0 when the
+    /// collector has none.
+    fn freeze_count(&mut self) -> i64 {
+        0
     }
 
     /// `incminimark.py collect_step`: perform one minor collection
@@ -2015,8 +2033,17 @@ impl GcAllocator for GcHandle {
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
     }
-    fn collect_generation(&mut self, generation: i64) {
+    fn collect_generation(&mut self, generation: i64) -> i64 {
         gc_sync::gc_op(|gc| gc.collect_generation(generation))
+    }
+    fn freeze(&mut self) {
+        gc_sync::gc_op(|gc| gc.freeze())
+    }
+    fn unfreeze(&mut self) {
+        gc_sync::gc_op(|gc| gc.unfreeze())
+    }
+    fn freeze_count(&mut self) -> i64 {
+        gc_sync::gc_op(|gc| gc.freeze_count())
     }
     fn collect_step(&mut self) -> GcStepTransition {
         gc_sync::gc_op(|gc| gc.collect_step())
@@ -3693,9 +3720,9 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_roots(
 /// active backend's GC. App-level `gc.collect(n)` reaches the live GC through
 /// this trampoline, carrying the generation it was given: the backends do not
 /// share one GC, so the dispatch cannot happen on `gc_sync`'s singleton.
-/// Returns silently when no backend has installed a hook (callers treat it as
-/// a no-op).
-pub type CollectGenerationFn = fn(i64);
+/// Returns 0 when no backend has installed a hook (callers treat it as a
+/// no-op).
+pub type CollectGenerationFn = fn(i64) -> i64;
 
 global_hook!(static ACTIVE_COLLECT_GENERATION: CollectGenerationFn);
 
@@ -3705,10 +3732,12 @@ pub fn set_active_collect_generation(hook: Option<CollectGenerationFn>) {
 }
 
 /// Run `incminimark.py collect(gen)` on the active backend's GC.
-/// No-op when no backend has installed a hook.
-pub fn collect_generation(generation: i64) {
-    if let Some(f) = ACTIVE_COLLECT_GENERATION.get() {
-        f(generation);
+/// Returns the number of old-generation objects that call freed, or 0 when
+/// no backend has installed a hook.
+pub fn collect_generation(generation: i64) -> i64 {
+    match ACTIVE_COLLECT_GENERATION.get() {
+        Some(f) => f(generation),
+        None => 0,
     }
 }
 
@@ -3716,6 +3745,69 @@ pub fn collect_generation(generation: i64) {
 /// separately because `majit-translate`'s gctransform knows this symbol.
 pub fn collect_full() {
     collect_generation(2);
+}
+
+/// Process-global callback that runs `GcAllocator::freeze` on the active
+/// backend's GC. App-level `gc.freeze()` reaches the live GC through this
+/// trampoline. No-op when no backend has installed a hook.
+pub type FreezeFn = fn();
+
+global_hook!(static ACTIVE_FREEZE: FreezeFn);
+
+/// Install the active backend's freeze trampoline. Pass `None` to clear.
+pub fn set_active_freeze(hook: Option<FreezeFn>) {
+    ACTIVE_FREEZE.set(hook);
+}
+
+/// Run `gc.freeze()` on the active backend's GC. No-op when no backend has
+/// installed a hook.
+pub fn freeze() {
+    if let Some(f) = ACTIVE_FREEZE.get() {
+        f();
+    }
+}
+
+/// Process-global callback that runs `GcAllocator::unfreeze` on the active
+/// backend's GC. App-level `gc.unfreeze()` reaches the live GC through this
+/// trampoline. No-op when no backend has installed a hook.
+pub type UnfreezeFn = fn();
+
+global_hook!(static ACTIVE_UNFREEZE: UnfreezeFn);
+
+/// Install the active backend's unfreeze trampoline. Pass `None` to clear.
+pub fn set_active_unfreeze(hook: Option<UnfreezeFn>) {
+    ACTIVE_UNFREEZE.set(hook);
+}
+
+/// Run `gc.unfreeze()` on the active backend's GC. No-op when no backend has
+/// installed a hook.
+pub fn unfreeze() {
+    if let Some(f) = ACTIVE_UNFREEZE.get() {
+        f();
+    }
+}
+
+/// Process-global callback that runs `GcAllocator::freeze_count` on the
+/// active backend's GC. App-level `gc.get_freeze_count()` reaches the live
+/// GC through this trampoline. Returns 0 when no backend has installed a
+/// hook.
+pub type FreezeCountFn = fn() -> i64;
+
+global_hook!(static ACTIVE_FREEZE_COUNT: FreezeCountFn);
+
+/// Install the active backend's freeze-count trampoline. Pass `None` to
+/// clear.
+pub fn set_active_freeze_count(hook: Option<FreezeCountFn>) {
+    ACTIVE_FREEZE_COUNT.set(hook);
+}
+
+/// Run `gc.get_freeze_count()` on the active backend's GC. Returns 0 when
+/// no backend has installed a hook.
+pub fn freeze_count() -> i64 {
+    match ACTIVE_FREEZE_COUNT.get() {
+        Some(f) => f(),
+        None => 0,
+    }
 }
 
 /// Active-backend trampoline for `incminimark.py collect_step`.

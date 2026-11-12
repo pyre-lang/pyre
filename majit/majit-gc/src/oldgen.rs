@@ -81,6 +81,9 @@ pub struct OldGen {
     rawmalloced_total_size: usize,
     /// incminimark.py:386,1073-1074 `rawmalloced_peak_size`.
     rawmalloced_peak_size: usize,
+    /// Unvisited old rawmalloc objects actually released by
+    /// `incminimark.py` `free_unvisited_rawmalloc_objects_step`. Monotonic.
+    rawmalloc_objects_freed: usize,
     /// llarena debug-fill parity for old-generation allocations.  The same
     /// opt-in detector covers both recycled arena blocks and rawmalloc blocks.
     poison_on_alloc: bool,
@@ -104,6 +107,7 @@ impl OldGen {
             rawmalloced_pages_freed: 0,
             rawmalloced_total_size: 0,
             rawmalloced_peak_size: 0,
+            rawmalloc_objects_freed: 0,
             poison_on_alloc: crate::gc_nursery_poison_enabled(),
         }
     }
@@ -420,6 +424,13 @@ impl OldGen {
             + self.raw_malloc_might_sweep.len()
     }
 
+    /// Arena `walk_page` frees plus unvisited old rawmalloc objects actually
+    /// released (`minimarkpage.py` `walk_page`, `incminimark.py`
+    /// `free_unvisited_rawmalloc_objects_step`).
+    pub(crate) fn objects_freed(&self) -> usize {
+        self.ac.objects_freed() + self.rawmalloc_objects_freed
+    }
+
     pub(crate) fn debug_validate_freeblocks(&self, site: &str) {
         self.ac.debug_validate_freeblocks(site);
     }
@@ -467,6 +478,7 @@ impl OldGen {
                         hdr.type_id()
                     );
                 }
+                self.rawmalloc_objects_freed += 1;
                 self.rawmalloced_total_size -= object.layout.size();
                 let removed = self
                     .rawmalloced_payloads

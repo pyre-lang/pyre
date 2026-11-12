@@ -200,6 +200,43 @@ fn raw_scalar_pointer_tuple_field_is_int_banked() {
     }
 }
 
+/// `rpath.py` `_posix_rnormpath` `s_Str0`: PathBuf/OsString paint the
+/// same owned-header `Ref` as rust-heap `String`, and a tuple item is
+/// that word rather than `&PathBuf`.
+#[test]
+fn os_path_family_tuple_field_is_owned_header_ref() {
+    use crate::model::ValueType;
+    for spelling in [
+        "PathBuf",
+        "path::PathBuf",
+        "std::path::PathBuf",
+        "OsString",
+        "ffi::OsString",
+        "std::ffi::OsString",
+    ] {
+        assert_eq!(
+            super::tuple_field_value_type(spelling),
+            ValueType::Ref(Some(spelling.into())),
+            "{spelling}"
+        );
+        assert_eq!(
+            super::positional_field_type(spelling),
+            spelling,
+            "{spelling} is not prefixed with &"
+        );
+    }
+    assert_eq!(
+        super::tuple_field_value_type("other::PathBuf"),
+        ValueType::Ref(None),
+        "a lookalike stays classdef-less"
+    );
+    assert_eq!(
+        super::positional_field_type("other::PathBuf"),
+        "&other::PathBuf",
+        "a lookalike instance is still a GC pointer"
+    );
+}
+
 use super::{no_tombstoned_leaves, scalar_replace_named_struct_aggregates};
 
 use crate::flowspace::model::Variable;

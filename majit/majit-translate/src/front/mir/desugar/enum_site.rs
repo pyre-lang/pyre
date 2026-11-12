@@ -557,12 +557,14 @@ impl<'a> Lowering<'a> {
         // A rust-heap `String` payload still paints `Ref` so `ll_strconcat`
         // does not consume `{cap, ptr, len}`. The `None` of `Option<String>`
         // / `Option<&String>` is that same null Ref, not a `STR` pointer.
+        // `PathBuf` / `OsString` is `rpath.py` `s_Str0`; `None` of
+        // `Option<PathBuf>` is that same null Ref (`StringRepr.convert_const(None)`).
         if tyref_is_option_of_string_value(option_ty, self.llbc)
             || matches!(payload_ty, ValueType::Str)
         {
             return Some((rendered, ValueType::Str));
         }
-        if tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc) {
+        if tyref_is_string_or_os_path_family(&TyRef::Other(payload.clone()), self.llbc) {
             return Some((rendered, payload_ty));
         }
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
@@ -624,9 +626,19 @@ impl<'a> Lowering<'a> {
         if self
             .option_niche_null_cast(place_ty)
             .is_some_and(|(root, ty)| {
-                matches!(ty, ValueType::Ref(Some(_)))
-                    && !root.starts_with("Vec<")
-                    && !root.starts_with("VecDeque<")
+                // `Result<Option<*mut T>>::Ok.__pos_0` recasts a nullable
+                // GC instance through W_ROOT. A string/path payload is
+                // `rstr.py` `SomeString` / `rpath.py` `_posix_rnormpath`
+                // `s_Str0` (`StringRepr.convert_const(None)`); W_ROOT
+                // would plant `Ref(PyObject)` onto that word.
+                matches!(
+                    &ty,
+                    ValueType::Ref(Some(payload))
+                        if !root.starts_with("Vec<")
+                            && !root.starts_with("VecDeque<")
+                            && !crate::front::mir::is_str_family_class_root(&root)
+                            && !crate::front::mir::is_str_family_class_root(payload)
+                )
             })
         {
             return true;

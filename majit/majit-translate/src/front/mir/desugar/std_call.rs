@@ -8467,12 +8467,13 @@ impl<'a> Lowering<'a> {
     /// `T: Into<Wtf8Buf>` — a `CallKind::Trait` whose trait ref is a
     /// *clause* (no resolved impl for [`Self::blanket_into_devirt`] to
     /// read).  The blanket `impl<T, U: From<T>> Into<U> for T` makes the
-    /// result `U::from(self)`; for a string-family target the conversion
-    /// is identity in the lifted value model (`String`, `&str`, `Wtf8`
-    /// and `Wtf8Buf` all lower to the immutable rpy_string), so the
-    /// caller may alias the destination to the argument.  The callsite's
-    /// `dest` type *is* the trait ref's target type argument, so it is
-    /// the only payload field consulted besides the trait identity.
+    /// result `U::from(self)`; for a string-family or os-path-family
+    /// target the conversion is identity in the lifted value model
+    /// (`String`, `&str`, `Wtf8`, `Wtf8Buf`, `PathBuf` all lower to the
+    /// immutable rpy_string / `rpath.py` `s_Str0`), so the caller may
+    /// alias the destination to the argument.  The callsite's `dest`
+    /// type *is* the trait ref's target type argument, so it is the
+    /// only payload field consulted besides the trait identity.
     pub(in crate::front::mir) fn trait_clause_into_string_identity(
         &self,
         reg: &RegularCall,
@@ -8491,7 +8492,31 @@ impl<'a> Lowering<'a> {
             .llbc
             .trait_by_id(trait_id)
             .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into");
-        is_into && tyref_is_string_value(dest_ty, self.llbc)
+        is_into && tyref_is_string_or_os_path_family(dest_ty, self.llbc)
+    }
+
+    /// Opaque `From::from` whose source and destination are both the
+    /// string/path family. The blanket `Into::into` is `U::from(self)`
+    /// (`core::convert::<Impl>::into`); std's `From<&str> for String` and
+    /// `From<String> for PathBuf` are Opaque in the LLBC, so the Trait
+    /// call residualizes as `["From","from"]`. At annotation they are
+    /// identity (`rstr.py` one string type; `rpath.py` `_posix_rnormpath`
+    /// `s_Str0`). `From<Vec<u8>> for OsString` has a non-string source
+    /// and keeps the Call.
+    pub(in crate::front::mir) fn from_string_path_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        if !self.callee_is_from_from(reg) {
+            return false;
+        }
+        let Some(src) = first_arg_ty else {
+            return false;
+        };
+        tyref_is_string_or_os_path_family(src, self.llbc)
+            && tyref_is_string_or_os_path_family(dest_ty, self.llbc)
     }
 
     /// Whether the FunDecl's first signature input is the given ADT,

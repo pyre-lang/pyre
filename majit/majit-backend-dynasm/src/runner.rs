@@ -534,6 +534,9 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
         dynasm_alloc_young_nonmoving_typed_no_collect,
     ));
     majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
+    majit_gc::set_active_freeze(Some(dynasm_freeze));
+    majit_gc::set_active_unfreeze(Some(dynasm_unfreeze));
+    majit_gc::set_active_freeze_count(Some(dynasm_freeze_count));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_get_referents(Some(dynasm_get_referents));
@@ -1047,11 +1050,32 @@ fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_
 /// where every live PyObjectRef is either in a registered root, on the
 /// Python value stack, or on the shadow stack — Rust-stack PyObjectRef
 /// in nursery would dangle after the embedded minor cycle.
-fn dynasm_collect_generation(generation: i64) {
-    if gc_box::with_mut(|g| g.collect_generation(generation)).is_some() {
+fn dynasm_collect_generation(generation: i64) -> i64 {
+    if let Some(freed) = gc_box::with_mut(|g| g.collect_generation(generation)) {
+        return freed;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.collect_generation(generation))
+}
+
+fn dynasm_freeze() {
+    if gc_box::with_mut(|g| g.freeze()).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_generation(generation));
+    majit_gc::gc_sync::gc_op(|g| g.freeze())
+}
+
+fn dynasm_unfreeze() {
+    if gc_box::with_mut(|g| g.unfreeze()).is_some() {
+        return;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.unfreeze())
+}
+
+fn dynasm_freeze_count() -> i64 {
+    if let Some(n) = gc_box::with_mut(|g| g.freeze_count()) {
+        return n;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.freeze_count())
 }
 
 fn dynasm_collect_step() -> majit_gc::GcStepTransition {

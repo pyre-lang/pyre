@@ -6986,8 +6986,17 @@ impl<'a> Lowering<'a> {
                         // (`op_gc_restore_root` / `GCRefRepr.convert_from_to`)
                         // before W_ROOT paints `PyObject` onto a `Ptr(STR)`
                         // the BlockRoute phi then unions (`rstr.py`
-                        // `mallocstr`).
+                        // `mallocstr`). A rust-heap `String` / `PathBuf`
+                        // paints `Ref` of a str-family class root so
+                        // `ll_strconcat` does not consume the owned header
+                        // (`rpath.py` `_posix_rnormpath` `s_Str0`; `rstr.py`
+                        // one string type); that Ref is still SomeString.
                         if matches!(ty, ValueType::Str)
+                            || matches!(
+                                &ty,
+                                ValueType::Ref(Some(root))
+                                    if crate::front::mir::is_str_family_class_root(root)
+                            )
                             || self.dest_ty_is_rstr_str(&place_ty)
                             || self.dest_ty_is_rstr_str(&field_ty)
                         {
