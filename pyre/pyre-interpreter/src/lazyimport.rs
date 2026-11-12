@@ -920,6 +920,10 @@ pub fn load_lazy_import_child(
 }
 
 /// `_PyImport_TryLoadLazySubmodule`.
+///
+/// Residual (`@jit.dont_look_inside`, as `importing.py load_compiled_module`):
+/// the body loads a submodule through the import machinery.
+#[majit_macros::dont_look_inside]
 pub fn try_load_lazy_submodule(
     mut module: PyObjectRef,
     attr_name: &str,
