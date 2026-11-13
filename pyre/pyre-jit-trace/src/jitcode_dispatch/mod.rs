@@ -4716,6 +4716,7 @@ fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
         crate::genentry_state::GENERATORENTRY_JD_INDEX => {
             crate::genentry_state::GENENTRY_PORTAL_KEY
         }
+        crate::tuplehash_state::TUPLEHASH_JD_INDEX => crate::tuplehash_state::TUPLEHASH_PORTAL_KEY,
         _ => return None,
     };
     crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())

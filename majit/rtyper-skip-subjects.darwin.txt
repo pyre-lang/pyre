@@ -1744,6 +1744,7 @@ two-phase-annotate-skipped	rordereddict::ll_dict_setitem_lookup_done_orig__spec_
 two-phase-annotate-skipped	rustpython_compiler_core::bytecode::_::<Impl>::intersects
 two-phase-annotate-skipped	shared_opcode::opcode_load_attr__spec_PyFrame_bea5423a2f36110c__AccessDirect_None
 two-phase-annotate-skipped	shared_opcode::opcode_store_attr__spec_PyFrame_f994b4a4dbc39903__AccessDirect_None
+two-phase-annotate-skipped	tuple_hash_portal_portal
 two-phase-divergence	option::Option::is_none__spec_PyError__357b36b4f6ad637b
 two-phase-divergence	option::Option::is_some__spec_PyError__4c49ffce009676d1
 two-phase-divergence	pyopcode::execute_import_from__spec_PyFrame_70d95c4663465655__AccessDirect_None
