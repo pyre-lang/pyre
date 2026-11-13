@@ -3353,9 +3353,10 @@ fn producer_kind(
                 | OpKind::ArrayRead { item_ty: ty, .. }
                 | OpKind::RawLoad { item_ty: ty, .. }
                 | OpKind::GcLoadIndexed { item_ty: ty, .. } => ProducerKind::Typed(ty.clone()),
-                OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstUInt(_) => {
-                    ProducerKind::Typed(ValueType::Int)
-                }
+                OpKind::ConstInt(_)
+                | OpKind::ConstFnAddr { .. }
+                | OpKind::ConstVtable { .. }
+                | OpKind::ConstUInt(_) => ProducerKind::Typed(ValueType::Int),
                 OpKind::ConstBool(_) => ProducerKind::Typed(ValueType::Bool),
                 OpKind::ConstFloat(_) => ProducerKind::Typed(ValueType::Float),
                 OpKind::ConstSingleFloat(_) => ProducerKind::Typed(ValueType::SingleFloat),
@@ -4039,6 +4040,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstSingleFloat(_)
@@ -9139,6 +9141,16 @@ fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Con
         ConstValue::Int(n) => (OpKind::ConstInt(*n), ConcreteType::Signed),
         ConstValue::UInt(n) => (OpKind::ConstUInt(*n), ConcreteType::Signed),
         ConstValue::Bool(b) => (OpKind::ConstBool(*b), ConcreteType::Signed),
+        ConstValue::Vtable {
+            impl_key,
+            trait_leaf,
+        } => (
+            OpKind::ConstVtable {
+                impl_key: impl_key.clone(),
+                trait_leaf: trait_leaf.clone(),
+            },
+            ConcreteType::Signed,
+        ),
         ConstValue::ByteStr(s) => (OpKind::ConstStr(s.clone()), ConcreteType::GcRef),
         ConstValue::Float(bits) => (OpKind::ConstFloat(*bits), ConcreteType::Float),
         ConstValue::None => (OpKind::ConstNone, ConcreteType::GcRef),
@@ -9887,6 +9899,7 @@ fn is_pure_env_const_kind(kind: &OpKind) -> bool {
         kind,
         OpKind::ConstInt(_)
             | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstVtable { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstInt128(_)
             | OpKind::ConstUInt128(_)
@@ -13603,7 +13616,10 @@ fn is_forwarding_restore_op(kind: &OpKind) -> bool {
                 || leaf == Some("ll_slice_setitem_fast_r")
                 || crate::front::mir::is_shadow_stack_bracket_close(kind)
         }
-        OpKind::ConstUInt(_) | OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => true,
+        OpKind::ConstUInt(_)
+        | OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. } => true,
         _ => false,
     }
 }
@@ -15907,6 +15923,7 @@ fn concrete_type_of_producer(kind: &OpKind) -> Option<crate::model::ConcreteType
         | OpKind::ConstSymbolic { ty, .. } => concrete_type_of_value(ty),
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstInt128(_)

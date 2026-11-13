@@ -592,6 +592,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         // char that `value_type_to_kind` already produced.
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstStr(_)

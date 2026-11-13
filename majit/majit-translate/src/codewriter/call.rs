@@ -16039,6 +16039,7 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)

@@ -94,15 +94,18 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 /// symbolic object itself rather than inferring a funcptr from integer
 /// bits.
 pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
-    let has_fnaddr_reloc = jitcodes.iter().any(|jc| {
+    let has_i_reloc = jitcodes.iter().any(|jc| {
         matches!(jc.fnaddr_reloc, Some(ConstIRelocKind::FnAddr { .. }))
             || jc.try_body().is_some_and(|body| {
-                body.reloc_consts_i
-                    .iter()
-                    .any(|d| matches!(d.kind, ConstIRelocKind::FnAddr { .. }))
+                body.reloc_consts_i.iter().any(|d| {
+                    matches!(
+                        d.kind,
+                        ConstIRelocKind::FnAddr { .. } | ConstIRelocKind::Vtable { .. }
+                    )
+                })
             })
     });
-    if !has_fnaddr_reloc {
+    if !has_i_reloc {
         return;
     }
 
@@ -111,12 +114,10 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
             "patch_constants_i_fnaddrs: Arc<JitCode> already shared before patch — \
              every caller must run this before publishing the table to consumers",
         );
-        if let Some(ConstIRelocKind::FnAddr { path, symbolic }) = &jc.fnaddr_reloc {
-            match runtime_fnaddr_by_path(path) {
-                Some(runtime) => jc.fnaddr = runtime,
-                None if *symbolic => panic_if_unresolved_dyn_impl_vtable(path),
-                None => {}
-            }
+        if let Some(ConstIRelocKind::FnAddr { path, symbolic: _ }) = &jc.fnaddr_reloc
+            && let Some(runtime) = runtime_fnaddr_by_path(path)
+        {
+            jc.fnaddr = runtime;
         }
         // Some shells reach the persisted table without a committed body
         // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
@@ -127,18 +128,17 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
             let updates: Vec<(usize, i64)> = body
                 .reloc_consts_i
                 .iter()
-                .filter_map(|desc| {
-                    let ConstIRelocKind::FnAddr { path, symbolic } = &desc.kind else {
-                        return None;
-                    };
-                    match runtime_fnaddr_for_reloc_path(path) {
-                        Some(runtime) => Some((desc.constants_i_index, runtime)),
-                        None if *symbolic => {
-                            panic_if_unresolved_dyn_impl_vtable(path);
-                            None
-                        }
-                        None => None,
-                    }
+                .filter_map(|desc| match &desc.kind {
+                    ConstIRelocKind::FnAddr { path, .. } => runtime_fnaddr_for_reloc_path(path)
+                        .map(|runtime| (desc.constants_i_index, runtime)),
+                    ConstIRelocKind::Vtable {
+                        impl_key,
+                        trait_leaf,
+                    } => Some((
+                        desc.constants_i_index,
+                        runtime_vtable_addr(impl_key, trait_leaf),
+                    )),
+                    ConstIRelocKind::StaticAddr { .. } => None,
                 })
                 .collect();
             for (index, runtime) in updates {
@@ -158,14 +158,15 @@ fn runtime_fnaddr_for_reloc_path(path: &str) -> Option<i64> {
     runtime_fnaddr_by_path(path)
 }
 
-/// A symbolic Unsize vtable `ConstFnAddr` (`rclass.py` `getvtable` /
-/// `OBJECT.typeptr`) must resolve to a rustc vtable word. Keeping the
-/// symbolic hash would store a hash, not a vtable. Ordinary function
-/// paths that miss `jit_trace_fnaddrs` stay symbolic.
-fn panic_if_unresolved_dyn_impl_vtable(path: &str) {
-    if pyre_interpreter::is_dyn_impl_vtable_const_path(path) {
-        panic!("unresolved dyn impl vtable ConstFnAddr `{path}`");
-    }
+/// Rustc vtable word of a registered `(impl_key, trait_leaf)` pair
+/// (`rclass.py` `getvtable` / `OBJECT.typeptr`). Exact equality only;
+/// a miss panics naming both strings rather than storing 0.
+fn runtime_vtable_addr(impl_key: &str, trait_leaf: &str) -> i64 {
+    pyre_interpreter::dyn_impl_vtables()
+        .iter()
+        .find(|entry| entry.impl_key == impl_key && entry.trait_leaf == trait_leaf)
+        .map(|entry| entry.vtable as i64)
+        .unwrap_or_else(|| panic!("unresolved dyn impl vtable `{impl_key}` `{trait_leaf}`"))
 }
 
 fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
@@ -198,25 +199,20 @@ fn insert_minted_exception_class_rows(map: &mut HashMap<&'static str, i64>) {
 }
 
 /// The runtime address published for `path` in `jit_trace_fnaddrs`, or
-/// the rustc vtable word of a `dyn_impl_vtable_const_path` key, or
-/// `None` when neither table publishes the path.  A walker fold that
+/// `None` when that table does not publish the path.  A walker fold that
 /// recognises a residual by its callee compares the call's funcbox
 /// against this.
 ///
 /// Tagged reloc lookup uses this same set as the old value-based
 /// correspondence / disarm: `fnaddr_bindings.bin` serialises exactly
 /// these names, so every bound slot has a runtime address. Unsize
-/// vtable constants reuse the same `ConstIRelocKind::FnAddr` reloc
-/// (`rclass.py` `getvtable` / `OBJECT.typeptr`). A symbolic key of that
-/// form that does not resolve panics in the reloc patch rather than
-/// keeping the hash.
+/// vtable constants use [`ConstIRelocKind::Vtable`] and resolve through
+/// `dyn_impl_vtables` by exact pair equality (`rclass.py` `getvtable` /
+/// `OBJECT.typeptr`).
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS
-        .get(path)
-        .copied()
-        .or_else(|| pyre_interpreter::dyn_impl_vtable_addr_for_path(path))
+    RUNTIME_FNADDRS.get(path).copied()
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -588,6 +584,7 @@ fn reloc_kind_is_unpaired_build(kind: &ConstIRelocKind) -> bool {
             !*symbolic && runtime_fnaddr_by_path(path).is_none()
         }
         ConstIRelocKind::StaticAddr { name } => runtime_static_addr_by_name(name).is_none(),
+        ConstIRelocKind::Vtable { .. } => false,
     }
 }
 
@@ -2353,7 +2350,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_fnaddr_by_path_resolves_dyn_impl_vtable_module_dict_strategy() {
+    fn patch_constants_i_resolves_vtable_reloc_module_dict_strategy() {
+        use majit_jitcode::jitcode::{ConstIRelocDescriptor, ConstIRelocKind};
+
         let tables = pyre_interpreter::dyn_impl_vtables();
         let entry = tables
             .iter()
@@ -2361,27 +2360,38 @@ mod tests {
                 e.impl_key.ends_with("::ModuleDictStrategy") && e.trait_leaf == "DictStrategy"
             })
             .expect("ModuleDictStrategy DictStrategy vtable");
-        let path = pyre_interpreter::dyn_impl_vtable_const_path(entry.impl_key, entry.trait_leaf);
-        assert_eq!(runtime_fnaddr_by_path(&path), Some(entry.vtable as i64));
+        let jc = JitCode::new("vtable_reloc_module_dict_strategy");
+        jc.set_body(JitCodeBody {
+            constants_i: vec![0],
+            reloc_consts_i: vec![ConstIRelocDescriptor {
+                constants_i_index: 0,
+                kind: ConstIRelocKind::Vtable {
+                    impl_key: entry.impl_key.to_string(),
+                    trait_leaf: entry.trait_leaf.to_string(),
+                },
+            }],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_constants_i_fnaddrs(&mut jcs);
+        assert_eq!(jcs[0].body().constants_i[0], entry.vtable as i64);
     }
 
     #[test]
-    #[should_panic(expected = "unresolved dyn impl vtable ConstFnAddr")]
-    fn patch_constants_i_panics_on_unresolved_symbolic_dyn_impl_vtable() {
+    #[should_panic(
+        expected = "unresolved dyn impl vtable `no_such_crate::GhostStrategy` `DictStrategy`"
+    )]
+    fn patch_constants_i_panics_on_unresolved_vtable_reloc() {
         use majit_jitcode::jitcode::{ConstIRelocDescriptor, ConstIRelocKind};
 
-        let path = pyre_interpreter::dyn_impl_vtable_const_path(
-            "no_such_crate::GhostStrategy",
-            "DictStrategy",
-        );
         let jc = JitCode::new("unresolved_dyn_impl_vtable");
         jc.set_body(JitCodeBody {
-            constants_i: vec![0x1111],
+            constants_i: vec![0],
             reloc_consts_i: vec![ConstIRelocDescriptor {
                 constants_i_index: 0,
-                kind: ConstIRelocKind::FnAddr {
-                    path,
-                    symbolic: true,
+                kind: ConstIRelocKind::Vtable {
+                    impl_key: "no_such_crate::GhostStrategy".to_string(),
+                    trait_leaf: "DictStrategy".to_string(),
                 },
             }],
             ..Default::default()
@@ -2423,7 +2433,9 @@ mod tests {
                 .filter(|d| {
                     matches!(
                         d.kind,
-                        ConstIRelocKind::FnAddr { .. } | ConstIRelocKind::StaticAddr { .. }
+                        ConstIRelocKind::FnAddr { .. }
+                            | ConstIRelocKind::StaticAddr { .. }
+                            | ConstIRelocKind::Vtable { .. }
                     )
                 })
                 .map(|d| d.constants_i_index)
@@ -2712,6 +2724,10 @@ mod tests {
         match kind {
             ConstIRelocKind::FnAddr { path, .. } => runtime_fnaddr_for_reloc_path(path),
             ConstIRelocKind::StaticAddr { name } => runtime_static_addr_by_name(name),
+            ConstIRelocKind::Vtable {
+                impl_key,
+                trait_leaf,
+            } => Some(runtime_vtable_addr(impl_key, trait_leaf)),
         }
     }
 
@@ -2733,6 +2749,17 @@ mod tests {
             TaggedRelocMismatchClass::IcfCollision
         } else {
             TaggedRelocMismatchClass::Unexpected
+        }
+    }
+
+    fn tagged_reloc_tag(kind: &ConstIRelocKind) -> String {
+        match kind {
+            ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
+            ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
+            ConstIRelocKind::Vtable {
+                impl_key,
+                trait_leaf,
+            } => format!("Vtable {impl_key}::{trait_leaf}"),
         }
     }
 
@@ -2768,10 +2795,58 @@ mod tests {
         }
     }
 
+    /// Shared per-slot check for [`tagged_reloc_path_matches_old_value_correspondence`].
+    /// Vtable slots have no build word, so they skip the value oracle and
+    /// must equal [`runtime_vtable_addr`]. FnAddr / StaticAddr keep the
+    /// old-vs-new correspondence, including IcfCollision.
+    fn check_tagged_reloc_slot(
+        kind: &ConstIRelocKind,
+        location: String,
+        build: i64,
+        old: i64,
+        new: i64,
+        colliding: &std::collections::HashSet<i64>,
+        unexpected: &mut Vec<String>,
+        vtable_bad: &mut Vec<String>,
+    ) {
+        if let ConstIRelocKind::Vtable {
+            impl_key,
+            trait_leaf,
+        } = kind
+        {
+            let expected = runtime_vtable_addr(impl_key, trait_leaf);
+            if new == 0 || new != expected {
+                vtable_bad.push(format!(
+                    "{} in {location} new={new:#x} expected={expected:#x}",
+                    tagged_reloc_tag(kind)
+                ));
+            }
+            return;
+        }
+        if old == new {
+            return;
+        }
+        note_tagged_reloc_mismatch(
+            tagged_reloc_tag(kind),
+            location,
+            build,
+            old,
+            new,
+            runtime_lookup_for_reloc_kind(kind),
+            colliding,
+            unexpected,
+        );
+    }
+
     /// Every tagged FnAddr / StaticAddr slot's final value after the
     /// provenance pipeline must equal the final value HEAD's value-based
     /// pipeline writes for the same build word — including slots that
     /// pipeline zeroed.
+    ///
+    /// Vtable slots carry no build word (the assembler writes 0 and the
+    /// reloc carries `{impl_key, trait_leaf}`). They are checked against
+    /// `runtime_vtable_addr` (the `rclass.py` `getvtable` constant), not
+    /// against the value oracle.
     ///
     /// Optimized MSVC links pass `/OPT:REF,ICF` to link.exe, so identical-
     /// COMDAT folding can give several distinct functions one build address
@@ -2792,77 +2867,58 @@ mod tests {
 
         let colliding = production_colliding_build_words();
         let mut unexpected = Vec::new();
+        let mut vtable_bad = Vec::new();
         for ((orig_jc, old_jc), new_jc) in orig.iter().zip(&old_jcs).zip(&new_jcs) {
             let Some(orig_body) = orig_jc.try_body() else {
                 continue;
             };
             let old_body = old_jc.try_body().expect("old oracle kept the body");
             let new_body = new_jc.try_body().expect("new pipeline kept the body");
-            if let Some(kind) = &orig_jc.fnaddr_reloc
-                && old_jc.fnaddr != new_jc.fnaddr
-            {
-                let tag = match kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+            if let Some(kind) = &orig_jc.fnaddr_reloc {
+                check_tagged_reloc_slot(
+                    kind,
                     format!("fnaddr in {}", orig_jc.name),
                     orig_jc.fnaddr,
                     old_jc.fnaddr,
                     new_jc.fnaddr,
-                    runtime_lookup_for_reloc_kind(kind),
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
             for desc in &orig_body.reloc_consts_i {
                 let idx = desc.constants_i_index;
-                let build = orig_body.constants_i[idx];
-                let old = old_body.constants_i[idx];
-                let new = new_body.constants_i[idx];
-                if old == new {
-                    continue;
-                }
-                let tag = match &desc.kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+                check_tagged_reloc_slot(
+                    &desc.kind,
                     format!("{} constants_i[{idx}]", orig_jc.name),
-                    build,
-                    old,
-                    new,
-                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    orig_body.constants_i[idx],
+                    old_body.constants_i[idx],
+                    new_body.constants_i[idx],
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
             for desc in &orig_body.reloc_consts_r {
                 let idx = desc.constants_r_index;
-                let build = orig_body.constants_r[idx].get();
-                let old = old_body.constants_r[idx].get();
-                let new = new_body.constants_r[idx].get();
-                if old == new {
-                    continue;
-                }
-                let tag = match &desc.kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+                check_tagged_reloc_slot(
+                    &desc.kind,
                     format!("{} constants_r[{idx}]", orig_jc.name),
-                    build,
-                    old,
-                    new,
-                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    orig_body.constants_r[idx].get(),
+                    old_body.constants_r[idx].get(),
+                    new_body.constants_r[idx].get(),
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
         }
+        vtable_bad.sort();
+        vtable_bad.dedup();
+        assert!(
+            vtable_bad.is_empty(),
+            "Vtable slot did not equal runtime_vtable_addr or was zero: {vtable_bad:?}"
+        );
         unexpected.sort();
         unexpected.dedup();
         assert!(

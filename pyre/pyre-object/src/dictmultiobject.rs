@@ -2105,19 +2105,13 @@ impl W_ModuleDictObject {
 ///     W_ModuleDictObject.__init__(w_obj, space, strategy, storage)
 ///     return w_obj
 /// ```
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// `fuse_boxing_alloc` already rewrites the `malloc_typed_stable`
-/// (`W_ModuleDictObject`) cluster to `new_with_vtable` on the constant
-/// `&MODULE_DICT_TYPE` type word. The hint stays because looking inside
-/// still fails `setattr("imp")` (`UnionError`: `Instance(ModuleDictStrategy)`
-/// ∪ Tuple, the trait-object field) and residualizes
-/// `gc_roots::push_roots` / `RootScope::{publish,get}`,
-/// `gc_storage::gc_alloc_storage_box` (`specialize_argtype(0)`), and
-/// `celldict.py ModuleDictStrategy.__init__` (`Mutex::new` unresolvable).
-/// Removing it before those bodies record Skips `_flat_pycall` /
-/// `make_user_call_frame` / `module_value`. The `-> PyObjectRef` result
-/// is a plain GCREF with no discriminant to erase.
-#[majit_macros::dont_look_inside]
+///
+/// The translator looks inside this body the way RPython traces
+/// `celldict.py ModuleDictStrategy.__init__` and the
+/// `W_ModuleDictObject` allocation. `Unsize` of the strategy box to
+/// `&dyn DictStrategy` is `{data, vtable}` (`rclass.py` `getvtable` /
+/// `OBJECT.typeptr`). The `-> PyObjectRef` result is a plain GCREF with
+/// no discriminant to erase.
 pub fn w_module_dict_new() -> PyObjectRef {
     let roots = crate::gc_roots::push_roots();
     let strategy = crate::gc_storage::gc_alloc_storage_box(

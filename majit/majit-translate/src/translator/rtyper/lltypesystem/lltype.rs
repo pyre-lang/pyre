@@ -514,6 +514,7 @@ impl LowLevelType {
                     ConstValue::Int(_)
                         | ConstValue::AddressOffset(_)
                         | ConstValue::InheritanceId { .. }
+                        | ConstValue::Vtable { .. }
                         | ConstValue::AddressAsInt(_)
                 )
             }
@@ -5645,9 +5646,10 @@ impl std::fmt::Display for CastWhateverError {
 /// RPython `lltype.typeOf` for a flow-graph `Constant.value`.
 pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverError> {
     match value {
-        ConstValue::Int(_) | ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. } => {
-            Ok(LowLevelType::Signed)
-        }
+        ConstValue::Int(_)
+        | ConstValue::AddressOffset(_)
+        | ConstValue::InheritanceId { .. }
+        | ConstValue::Vtable { .. } => Ok(LowLevelType::Signed),
         ConstValue::Long(n) => Err(typeof_prebuilt_long_overflow(n)),
         ConstValue::UInt(_) => Ok(LowLevelType::Unsigned),
         ConstValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),

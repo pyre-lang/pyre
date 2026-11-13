@@ -449,6 +449,21 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstVtable {
+                    impl_key,
+                    trait_leaf,
+                } => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Vtable {
+                                impl_key: impl_key.clone(),
+                                trait_leaf: trait_leaf.clone(),
+                            },
+                            LowLevelType::Signed,
+                        )),
+                    );
+                }
                 OpKind::ConstUInt(n) => {
                     map.insert(
                         result,
@@ -3243,6 +3258,7 @@ pub fn translate_op(
         // `legacy_const_define_hlvalue` the same way `ConstInt` does.
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
@@ -4965,6 +4981,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
         OpKind::ConstFnAddr { .. } => "ConstFnAddr",
+        OpKind::ConstVtable { .. } => "ConstVtable",
         OpKind::ConstUInt(_) => "ConstUInt",
         OpKind::ConstBool(_) => "ConstBool",
         OpKind::ConstSymbolic { .. } => "ConstSymbolic",
@@ -5212,6 +5229,16 @@ fn legacy_const_define_hlvalue(
         OpKind::ConstFnAddr { value, .. } => Ok(Some(Hlvalue::Constant(
             Constant::with_concretetype(ConstValue::Int(*value), LowLevelType::Signed),
         ))),
+        OpKind::ConstVtable {
+            impl_key,
+            trait_leaf,
+        } => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Vtable {
+                impl_key: impl_key.clone(),
+                trait_leaf: trait_leaf.clone(),
+            },
+            LowLevelType::Signed,
+        )))),
         OpKind::ConstUInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::UInt(*n),
             LowLevelType::Unsigned,
@@ -15686,7 +15713,7 @@ mod tests {
         // then `setattr`, the same shape as a `&[u8]` window
         // (`rtuple.py` `TupleRepr.newtuple`, `rclass.py`
         // `InstanceRepr.setfield`). FatMeta is the Unsize vtable
-        // `ConstFnAddr` of `{impl_key}::{trait_leaf}`.
+        // `ConstVtable` of `(impl_key, trait_leaf)`.
         let mut graph = LegacyGraph::new("dyn_fat_to_tuple_setattr");
         let vars = mint_vars(&mut graph, 6);
         let field = crate::model::FieldDescriptor::new("slot", Some("Holder".into()));
@@ -15708,10 +15735,9 @@ mod tests {
                 },
                 SpaceOperation {
                     result: Some(vars[3].clone()),
-                    kind: OpKind::ConstFnAddr {
-                        path: "fixture::Concrete::Storage".to_string(),
-                        value: 20,
-                        symbolic: true,
+                    kind: OpKind::ConstVtable {
+                        impl_key: "fixture::Concrete".to_string(),
+                        trait_leaf: "Storage".to_string(),
                     },
                 },
                 SpaceOperation {
@@ -15779,7 +15805,11 @@ mod tests {
         ));
         assert!(matches!(
             &startblock.operations[0].args[meta_idx],
-            Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
+            Hlvalue::Constant(c) if matches!(
+                &c.value,
+                ConstValue::Vtable { impl_key, trait_leaf }
+                    if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+            )
         ));
         let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
             panic!("setattr name");

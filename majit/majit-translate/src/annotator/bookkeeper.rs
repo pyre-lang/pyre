@@ -6882,8 +6882,9 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))
             }
-            ConstValue::InheritanceId { .. } => {
+            ConstValue::InheritanceId { .. } | ConstValue::Vtable { .. } => {
                 // A symbolic inheritance id is a Signed integer marker.
+                // A vtable word is `inputconst(CLASSTYPE, getvtable())`.
                 let mut s = SomeInteger::new(false, false);
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))

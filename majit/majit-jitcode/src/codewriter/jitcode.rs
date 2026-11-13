@@ -209,6 +209,14 @@ pub enum ConstIRelocKind {
     /// Host static consumed as an integer (`HostStaticAddrs.pytypes` /
     /// exception-class llexitcase). `name` is the shared binding name.
     StaticAddr { name: String },
+    /// Unsize vtable word (`rclass.py` `ClassRepr.getvtable` /
+    /// `OBJECT.typeptr`). `impl_key` and `trait_leaf` are the
+    /// `DynImplVtableDesc` registration strings; the runtime resolves
+    /// by exact pair equality.
+    Vtable {
+        impl_key: String,
+        trait_leaf: String,
+    },
 }
 
 /// One relocatable `constants_i` slot. Parallel to

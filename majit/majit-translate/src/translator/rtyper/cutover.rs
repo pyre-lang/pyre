@@ -792,6 +792,7 @@ fn is_const_define_op(kind: &OpKind) -> bool {
         kind,
         OpKind::ConstInt(_)
             | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstVtable { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstInt128(_)
             | OpKind::ConstUInt128(_)
@@ -841,6 +842,13 @@ fn opkind_from_rtyper_constant(c: &Constant) -> Option<OpKind> {
             _address::IntCast(n) => Some(OpKind::ConstInt(*n)),
             _address::Fake(_) => None,
         },
+        ConstValue::Vtable {
+            impl_key,
+            trait_leaf,
+        } => Some(OpKind::ConstVtable {
+            impl_key: impl_key.clone(),
+            trait_leaf: trait_leaf.clone(),
+        }),
         ConstValue::None => match kind {
             Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
             Some(crate::model::ConcreteType::GcRef) => Some(OpKind::ConstRefNull),
@@ -1665,6 +1673,7 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::GetSlice { .. }
             | OpKind::ConstInt(_)
             | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstVtable { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)

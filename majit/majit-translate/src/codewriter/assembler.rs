@@ -513,6 +513,13 @@ trait AssemblerEncode {
         callcontrol: Option<&CallControl>,
     ) -> u8;
 
+    fn emit_vtable_const(
+        &mut self,
+        impl_key: &str,
+        trait_leaf: &str,
+        state: &mut AssemblyState,
+    ) -> u8;
+
     fn emit_const_r_reloc(
         &mut self,
         value: i64,
@@ -1841,6 +1848,26 @@ impl AssemblerEncode for Assembler {
                     },
                     state,
                 );
+                state.code.push(idx);
+                argcodes.push('i');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("int_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::ConstVtable {
+                impl_key,
+                trait_leaf,
+            } => {
+                // `assembler.py emit_const` stores the CLASSTYPE object
+                // (`rclass.py` `getvtable`); provenance is the vtable
+                // pair, never a funcptr path or a literal 0.
+                let idx = self.emit_vtable_const(impl_key, trait_leaf, state);
                 state.code.push(idx);
                 argcodes.push('i');
                 if let Some(result) = op.result.as_ref() {
@@ -4036,6 +4063,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::GcLoadIndexed { .. } => "GcLoadIndexed",
                 OpKind::ConstInt(_) => "ConstInt",
                 OpKind::ConstFnAddr { .. } => "ConstFnAddr",
+                OpKind::ConstVtable { .. } => "ConstVtable",
                 OpKind::ConstUInt(_) => "ConstUInt",
                 OpKind::ConstInt128(_) => "ConstInt128",
                 OpKind::ConstUInt128(_) => "ConstUInt128",
@@ -4244,6 +4272,13 @@ impl AssemblerEncode for Assembler {
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) -> u8 {
+        if let ConstValue::Vtable {
+            impl_key,
+            trait_leaf,
+        } = value
+        {
+            return self.emit_vtable_const(impl_key, trait_leaf, state);
+        }
         let value = Self::resolve_const_i_value(value, callcontrol);
         self.emit_const_i(value, state)
     }
@@ -4265,6 +4300,13 @@ impl AssemblerEncode for Assembler {
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) -> (u8, char) {
+        if let ConstValue::Vtable {
+            impl_key,
+            trait_leaf,
+        } = value
+        {
+            return (self.emit_vtable_const(impl_key, trait_leaf, state), 'i');
+        }
         let value = Self::resolve_const_i_value(value, callcontrol);
         self.emit_const_i_allow_short(value, allow_short, state)
     }
@@ -4336,6 +4378,24 @@ impl AssemblerEncode for Assembler {
             ),
         };
         self.emit_const_i_reloc(fnaddr, ConstIRelocKind::FnAddr { path, symbolic }, state)
+    }
+
+    /// `assembler.py emit_const` of `CLASSTYPE` / `getvtable`: the
+    /// constant object is the reloc key, never a short `c` byte.
+    fn emit_vtable_const(
+        &mut self,
+        impl_key: &str,
+        trait_leaf: &str,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        self.emit_const_i_reloc(
+            0,
+            ConstIRelocKind::Vtable {
+                impl_key: impl_key.to_string(),
+                trait_leaf: trait_leaf.to_string(),
+            },
+            state,
+        )
     }
 
     fn emit_const_r_reloc(
@@ -7418,9 +7478,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         },
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
-        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstUInt(_) => {
-            "int_copy".into()
-        }
+        OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
+        | OpKind::ConstUInt(_) => "int_copy".into(),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
@@ -9575,6 +9636,69 @@ mod tests {
             }
         );
         assert!(state.constants_r.is_empty());
+    }
+
+    /// `ConstVtable` is `int_copy/i>i` with a `Vtable` reloc
+    /// (`assembler.py emit_const` of `CLASSTYPE` / `getvtable`).
+    #[test]
+    fn const_vtable_int_dest_emits_vtable_reloc() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstVtable {
+                impl_key: "fixture::Concrete".into(),
+                trait_leaf: "Storage".into(),
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "int_copy/i>i";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(state.code, vec![asm.insns[key], 1, 0]);
+        assert_eq!(state.constants_i, vec![0]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(
+            state.reloc_consts_i[0].kind,
+            ConstIRelocKind::Vtable {
+                impl_key: "fixture::Concrete".into(),
+                trait_leaf: "Storage".into(),
+            }
+        );
+        assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn emit_const_vtable_value_emits_vtable_reloc() {
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        let _idx = asm.emit_const(
+            &ConstValue::Vtable {
+                impl_key: "fixture::Concrete".into(),
+                trait_leaf: "Storage".into(),
+            },
+            'i',
+            &mut state,
+            None,
+        );
+        assert_eq!(state.constants_i, vec![0]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(
+            state.reloc_consts_i[0].kind,
+            ConstIRelocKind::Vtable {
+                impl_key: "fixture::Concrete".into(),
+                trait_leaf: "Storage".into(),
+            }
+        );
     }
 
     #[test]

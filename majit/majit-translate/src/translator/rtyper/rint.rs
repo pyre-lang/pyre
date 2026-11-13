@@ -267,7 +267,9 @@ impl Repr for IntegerRepr {
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         if matches!(
             value,
-            ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. }
+            ConstValue::AddressOffset(_)
+                | ConstValue::InheritanceId { .. }
+                | ConstValue::Vtable { .. }
         ) {
             return Ok(Constant::with_concretetype(
                 value.clone(),
@@ -297,6 +299,7 @@ impl Repr for IntegerRepr {
         let converted = match value {
             ConstValue::AddressOffset(_) => value.clone(),
             ConstValue::InheritanceId { .. } => value.clone(),
+            ConstValue::Vtable { .. } => value.clone(),
             ConstValue::RInt(_, _, _) => {
                 crate::translator::rtyper::lltypesystem::lltype::cast_primitive(&self.lltype, value)
                     .map_err(|e| TyperError::message(e.to_string()))?

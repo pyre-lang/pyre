@@ -1313,7 +1313,7 @@ fn is_drop_guard_identity_op(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments, .. },
             ..
         } if is_same_as_identity_call_path(segments) => true,
-        OpKind::Live { .. } | OpKind::ConstFnAddr { .. } => true,
+        OpKind::Live { .. } | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => true,
         _ => false,
     }
 }
@@ -1875,7 +1875,10 @@ fn const_kind_of_op(kind: &OpKind) -> Option<ConstKind> {
         OpKind::ConstRefNull => ConstValue::None,
         OpKind::ConstNone => ConstValue::None,
         OpKind::ConstRefAddr(addr) => ConstValue::LLAddress(_address::IntCast(*addr)),
-        OpKind::ConstFnAddr { .. } | OpKind::ConstSymbolic { .. } | OpKind::ConstSingleFloat(_) => {
+        OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
+        | OpKind::ConstSymbolic { .. }
+        | OpKind::ConstSingleFloat(_) => {
             return Some(ConstKind::Other);
         }
         OpKind::Call {
@@ -17267,6 +17270,13 @@ fn materialize_const_result(
                 _address::Fake(_) => return materialize_const_result_copy(result, c),
             }
         }
+        ConstValue::Vtable {
+            impl_key,
+            trait_leaf,
+        } => OpKind::ConstVtable {
+            impl_key: impl_key.clone(),
+            trait_leaf: trait_leaf.clone(),
+        },
         ConstValue::None => OpKind::ConstNone,
         ConstValue::ByteStr(s) => OpKind::ConstStr(s.clone()),
         ConstValue::UniStr(s) => OpKind::ConstInternedStr(s.as_bytes().to_vec()),
@@ -17481,6 +17491,7 @@ fn remap_op_renamings(
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)

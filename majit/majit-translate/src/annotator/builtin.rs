@@ -1164,6 +1164,7 @@ pub fn builtin_bool(
             | ConstValue::SpecTag(_) => true,
             ConstValue::AddressOffset(_) => true,
             ConstValue::InheritanceId { .. } => true,
+            ConstValue::Vtable { .. } => true,
             ConstValue::LLAddress(addr) | ConstValue::AddressAsInt(addr) => addr.nonzero(),
             // Placeholder never appears in production flow; stay
             // conservative rather than crash.

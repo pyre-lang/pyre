@@ -6004,6 +6004,52 @@ fn box_dyn_ptr_metadata_is_fat_meta() {
     );
 }
 
+/// Charon wraps a `DynTrait` predicate in `Value`. The principal trait
+/// is the first clause's `TraitDeclRef.id` after that peel (`rclass.py`
+/// `getvtable`).
+#[test]
+fn tyref_dyn_trait_decl_id_peels_value_wrapped_dyn_predicate() {
+    let llbc = llbc_with_trait_impls(serde_json::json!([]));
+    let binder = serde_json::json!({
+        "binder": {
+            "params": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_clauses": [{
+                    "clause_id": 0,
+                    "origin": "Dyn",
+                    "trait_": {
+                        "regions": [],
+                        "outlives": [],
+                        "skip_binder": {
+                            "id": 7,
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    });
+    let wrapped = super::TyRef::Other(serde_json::json!({
+        "Ref": ["static", {"Value": [1870, {"DynTrait": binder.clone()}]}, "Shared"]
+    }));
+    assert!(super::tyref_is_fat_dyn(&wrapped, &llbc));
+    assert_eq!(super::tyref_dyn_trait_decl_id(&wrapped, &llbc), Some(7));
+    let outer_value = super::TyRef::Other(serde_json::json!({
+        "Value": [1869, {
+            "Ref": ["static", {"Value": [1870, {"DynTrait": binder}]}, "Shared"]
+        }]
+    }));
+    assert!(super::tyref_is_fat_dyn(&outer_value, &llbc));
+    assert_eq!(super::tyref_dyn_trait_decl_id(&outer_value, &llbc), Some(7));
+}
+
 #[test]
 fn window_classifier_predicates() {
     use crate::model::ValueType;
@@ -7851,6 +7897,111 @@ fn foreign_opaque_string_new_keeps_str_family_root() {
     assert!(
         super::is_str_family_class_root(root),
         "String::new residual class root must be str-family, got {root:?}"
+    );
+}
+
+/// Foreign opaque associated constructor: TypeDecl is Opaque, FunDecl is
+/// a one-argument inherent method whose result is that ADT and whose
+/// first input is the payload, not `self`. `rthread.py` `allocate_lock`
+/// residualizes `ll_allocate_lock` the same way — the lock constructor
+/// is `extfunc.py` `register_external`, not a look-inside graph.
+fn opaque_associated_constructor_fixture() -> Llbc {
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": name,
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let mutex_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics.clone()}
+    });
+    let payload_ty = serde_json::json!({"Scalar": "Bool"});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, mutex_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let mutex_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(
+            vec![ident("lock_api"), ident("mutex"), ident("Mutex")],
+            false,
+        ),
+        "kind": "Opaque"
+    });
+    let mutex_new = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(
+            vec![ident("lock_api"), ident("mutex"), impl_seg, ident("new")],
+            false,
+        ),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [payload_ty],
+            "output": mutex_ty
+        },
+        "body": "Opaque"
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [mutex_decl],
+            "fun_decls": [mutex_new],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("opaque associated constructor fixture Llbc parses")
+}
+
+#[test]
+fn foreign_opaque_associated_constructor_is_harvested() {
+    let llbc = opaque_associated_constructor_fixture();
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let row = harvested.iter().find(|(segments, _, _)| {
+        segments.last().map(String::as_str) == Some("new") && segments.iter().any(|s| s == "Mutex")
+    });
+    assert!(
+        row.is_some(),
+        "one-arg opaque associated constructor must be harvested: {harvested:?}"
+    );
+    let (segments, signature, result_ty) = row.unwrap();
+    assert_eq!(
+        signature.argnames.len(),
+        1,
+        "payload argument: {segments:?}"
+    );
+    assert_eq!(
+        result_ty,
+        &crate::model::ValueType::Ref(None),
+        "opaque constructor residual is classdef-less SomeInstance, got {result_ty:?}"
     );
 }
 

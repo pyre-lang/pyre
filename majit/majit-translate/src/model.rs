@@ -1055,6 +1055,14 @@ pub enum OpKind {
         /// `fnaddr_binding_for_target` lookup, never inferred from bits.
         symbolic: bool,
     },
+    /// Vtable word of `impl Trait for Src` (`rclass.py`
+    /// `InstanceRepr.new_instance` `inputconst(CLASSTYPE, getvtable())`).
+    /// `assembler.py emit_const` keys the constant object itself; the
+    /// assembler records [`crate::jitcode::ConstIRelocKind::Vtable`].
+    ConstVtable {
+        impl_key: String,
+        trait_leaf: String,
+    },
     /// Word-sized unsigned integer constant. RPython stores the same Python
     /// integer value as `ConstInt`, but its `Constant.concretetype` is
     /// `lltype.Unsigned`; keeping the source tag prevents `r_uint ∪ int`

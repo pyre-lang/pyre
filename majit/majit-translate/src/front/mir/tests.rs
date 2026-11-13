@@ -7282,6 +7282,20 @@ fn dyn_predicate_trait0() -> serde_json::Value {
     })
 }
 
+struct UnsizeDynFatCfg {
+    with_impl: bool,
+    registered: bool,
+    store_field: bool,
+    read_metadata: bool,
+    trait_is_local: bool,
+    registered_impl_key: &'static str,
+    local_then_field: bool,
+    /// Charon `Unsize(tgt, VTable(impl), extra)` rather than the
+    /// fixture `[src, dest, "VTable"]`. The assignment dest still names
+    /// the trait (`rclass.py` `getvtable`).
+    charon_unsize_payload: bool,
+}
+
 /// `Unsize` of `&Concrete` to `&dyn Storage`, optionally stored in
 /// `Holder.slot` or followed by `PtrMetadata`. `with_impl` records
 /// `impl Storage for Concrete`. `registered` adds a `DynImplVtableDesc`
@@ -7292,6 +7306,19 @@ fn unsize_into_dyn_fat_llbc(
     store_field: bool,
     read_metadata: bool,
 ) -> Llbc {
+    unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl,
+        registered,
+        store_field,
+        read_metadata,
+        trait_is_local: true,
+        registered_impl_key: "fixture::Concrete",
+        local_then_field: false,
+        charon_unsize_payload: false,
+    })
+}
+
+fn unsize_into_dyn_fat_llbc_cfg(cfg: UnsizeDynFatCfg) -> Llbc {
     let span = serde_json::json!({"data": {
         "file_id": 0,
         "beg": {"line": 1, "col": 0},
@@ -7353,18 +7380,72 @@ fn unsize_into_dyn_fat_llbc(
     });
     let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
     let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let unsize_payload = if cfg.charon_unsize_payload {
+        serde_json::json!([
+            fat_ty.clone(),
+            {"VTable": [
+                {
+                    "regions": [],
+                    "outlives": [],
+                    "skip_binder": {
+                        "kind": {"TraitImpl": {"id": 0, "generics": empty_generics.clone()}},
+                        "trait_decl_ref": {
+                            "id": 0,
+                            "generics": {
+                                "regions": [],
+                                "types": [concrete_adt.clone()],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    }
+                },
+                {"Value": [0, [{"Str": "vtable"}, {"Literal": "Str"}]]}
+            ]},
+            []
+        ])
+    } else {
+        serde_json::json!([concrete_ref.clone(), fat_ty.clone(), "VTable"])
+    };
     let unsize_rvalue = |src_local: u64| {
         serde_json::json!({"UnaryOp": [
-            {"Cast": {"Unsize": [
-                concrete_ref.clone(),
-                fat_ty.clone(),
-                "VTable"
-            ]}},
+            {"Cast": {"Unsize": unsize_payload.clone()}},
             {"Move": place(serde_json::json!({"Local": src_local}), &concrete_ref)}
         ]})
     };
     let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Mut"]});
-    let (fn_name, inputs, locals, statements) = if store_field {
+    let (fn_name, inputs, locals, statements) = if cfg.local_then_field {
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        (
+            "unsize_into_dyn_fat_local_then_field",
+            vec![holder_ref.clone(), concrete_ref.clone()],
+            vec![
+                local(0, &unit),
+                local(1, &holder_ref),
+                local(2, &concrete_ref),
+                local(3, &fat_ty),
+            ],
+            vec![
+                serde_json::json!({"span": span, "kind": {"Assign": [
+                    place(serde_json::json!({"Local": 3}), &fat_ty),
+                    unsize_rvalue(2)
+                ]}}),
+                serde_json::json!({"span": span, "kind": {"Assign": [
+                    slot_place,
+                    {"Use": [{"Move": place(serde_json::json!({"Local": 3}), &fat_ty)}, "No"]}
+                ]}}),
+            ],
+        )
+    } else if cfg.store_field {
         let slot_place = place(
             serde_json::json!({"Projection": [
                 place(serde_json::json!({"Projection": [
@@ -7393,21 +7474,22 @@ fn unsize_into_dyn_fat_llbc(
             place(serde_json::json!({"Local": 2}), &fat_ty),
             unsize_rvalue(1)
         ]}});
-        if read_metadata {
+        if cfg.read_metadata {
+            // Return the metadata word so ConstVtable stays live
+            // (`transform_dead_op_vars` drops an unused Unsize dest).
             let meta_ty = serde_json::json!({"Literal": "Usize"});
             (
                 "unsize_into_dyn_fat_local_meta",
                 vec![concrete_ref.clone()],
                 vec![
-                    local(0, &unit),
+                    local(0, &meta_ty),
                     local(1, &concrete_ref),
                     local(2, &fat_ty),
-                    local(3, &meta_ty),
                 ],
                 vec![
                     unsize_stmt,
                     serde_json::json!({"span": span, "kind": {"Assign": [
-                        place(serde_json::json!({"Local": 3}), &meta_ty),
+                        place(serde_json::json!({"Local": 0}), &meta_ty),
                         {"Use": [{"Read": place(
                             serde_json::json!({"Projection": [
                                 place(serde_json::json!({"Local": 2}), &fat_ty),
@@ -7428,10 +7510,15 @@ fn unsize_into_dyn_fat_llbc(
         }
     };
     let arg_count = inputs.len();
+    let output = if cfg.read_metadata && !cfg.store_field && !cfg.local_then_field {
+        serde_json::json!({"Literal": "Usize"})
+    } else {
+        unit
+    };
     let caller = serde_json::json!({
         "def_id": 0,
         "item_meta": meta(&["fixture", fn_name]),
-        "signature": {"is_unsafe": false, "inputs": inputs, "output": unit},
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
         "body": {"Unstructured": {
             "span": span,
             "locals": {"arg_count": arg_count, "locals": locals},
@@ -7442,7 +7529,7 @@ fn unsize_into_dyn_fat_llbc(
             }]
         }}
     });
-    let trait_impls = if with_impl {
+    let trait_impls = if cfg.with_impl {
         serde_json::json!([{
             "impl_trait": {"id": 0, "generics": {"types": [{
                 "Value": [0, {"Adt": {"id": 0, "builtin": null, "generics": empty_generics}}]
@@ -7453,7 +7540,7 @@ fn unsize_into_dyn_fat_llbc(
     };
     let mut fun_decls = vec![caller];
     let mut global_decls = Vec::new();
-    if with_impl && registered {
+    if cfg.with_impl && cfg.registered {
         fun_decls.push(serde_json::json!({
             "def_id": 1,
             "item_meta": meta(&["fixture", "RegisteredVtable"]),
@@ -7469,7 +7556,7 @@ fn unsize_into_dyn_fat_llbc(
                             {"Aggregate": [
                                 "Tuple",
                                 [
-                                    {"Const": [{"Str": "fixture::Concrete"}, {"Literal": "Str"}]},
+                                    {"Const": [{"Str": cfg.registered_impl_key}, {"Literal": "Str"}]},
                                     {"Const": [{"Str": "Storage"}, {"Literal": "Str"}]}
                                 ]
                             ]}
@@ -7498,6 +7585,10 @@ fn unsize_into_dyn_fat_llbc(
             ]]}
         }));
     }
+    let mut trait_meta = meta(&["fixture", "Storage"]);
+    if !cfg.trait_is_local {
+        trait_meta["is_local"] = serde_json::json!(false);
+    }
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -7508,7 +7599,7 @@ fn unsize_into_dyn_fat_llbc(
             "global_decls": global_decls,
             "trait_decls": [{
                 "def_id": 0,
-                "item_meta": meta(&["fixture", "Storage"]),
+                "item_meta": trait_meta,
                 "methods": [{"skip_binder": {"name": "head"}}]
             }],
             "trait_impls": trait_impls
@@ -7519,7 +7610,7 @@ fn unsize_into_dyn_fat_llbc(
 
 /// `Unsize` of a thin instance pointer into a dyn-fat field stores
 /// `{data, vtable}` as `FatData` + `FatMeta`, and the vtable word is a
-/// trait-qualified `ConstFnAddr` (`rclass.py` `getvtable` / `OBJECT.typeptr`).
+/// `ConstVtable` (`rclass.py` `getvtable` / `OBJECT.typeptr`).
 #[test]
 fn unsize_of_thin_instance_into_dyn_fat_field_emits_fatdata_fatmeta() {
     use crate::model::{OpKind, ValueType, VecFieldPart};
@@ -7553,18 +7644,198 @@ fn unsize_of_thin_instance_into_dyn_fat_field_emits_fatdata_fatmeta() {
         !slot_writes.iter().any(|(part, _)| part.is_none()),
         "the dyn-fat store must not be a one-word identity write; writes={slot_writes:?} ops={ops:?}"
     );
-    let vtable_paths: Vec<&str> = ops
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstVtable { impl_key, trait_leaf }
+                if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+        )),
+        "Unsize vtable ConstVtable must name the registered pair; ops={ops:?}"
+    );
+}
+
+/// A registered `Unsize` into a body local is the `{data, vtable}` pair
+/// (`rclass.py` `new_instance` / `getvtable`).
+#[test]
+fn unsize_of_thin_instance_into_dyn_fat_local_emits_const_vtable() {
+    use crate::model::OpKind;
+
+    // Returning PtrMetadata keeps the Unsize dest live so DCE does not
+    // drop ConstVtable (`transform_dead_op_vars`).
+    let llbc = unsize_into_dyn_fat_llbc(true, true, false, true);
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_meta")
+        .expect("lower unsize_into_dyn_fat_local_meta");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstVtable { impl_key, trait_leaf }
+                if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+        )),
+        "registered Unsize local must emit ConstVtable; ops={ops:?}"
+    );
+}
+
+/// A registered `Unsize` into a local, then stored into a dyn-fat field,
+/// writes `{data, vtable}` (`rclass.py` `new_instance` / `setfield`).
+#[test]
+fn unsize_of_registered_local_then_field_emits_const_vtable() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let llbc = unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl: true,
+        registered: true,
+        store_field: false,
+        read_metadata: false,
+        trait_is_local: true,
+        registered_impl_key: "fixture::Concrete",
+        local_then_field: true,
+        charon_unsize_payload: false,
+    });
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_then_field")
+        .expect("registered Unsize local then field must lower");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstVtable { impl_key, trait_leaf }
+                if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+        )),
+        "registered Unsize local then field must emit ConstVtable; ops={ops:?}"
+    );
+    let slot_writes: Vec<_> = ops
         .iter()
         .filter_map(|op| match &op.kind {
-            OpKind::ConstFnAddr { path, symbolic, .. } if *symbolic => Some(path.as_str()),
+            OpKind::FieldWrite { field, ty, .. } if field.name == "slot" => {
+                Some((field.vec_part, ty.clone()))
+            }
             _ => None,
         })
         .collect();
     assert!(
-        vtable_paths
+        slot_writes.iter().any(|(part, ty)| {
+            *part == Some(VecFieldPart::FatData) && matches!(ty, ValueType::Ref(_))
+        }),
+        "local then field must write FatData; writes={slot_writes:?} ops={ops:?}"
+    );
+    assert!(
+        slot_writes
             .iter()
-            .any(|path| path.ends_with("Concrete::Storage")),
-        "Unsize vtable ConstFnAddr must be trait-qualified {{impl_key}}::{{trait_leaf}}; paths={vtable_paths:?} ops={ops:?}"
+            .any(|(part, ty)| *part == Some(VecFieldPart::FatMeta) && *ty == ValueType::Int),
+        "local then field must write FatMeta; writes={slot_writes:?} ops={ops:?}"
+    );
+}
+
+/// Charon `Unsize(tgt, VTable(impl), extra)` still emits `{data, vtable}`
+/// because the assignment dest names the trait (`rclass.py` `getvtable`).
+#[test]
+fn unsize_of_charon_vtable_payload_into_dyn_fat_local_emits_const_vtable() {
+    use crate::model::OpKind;
+
+    let llbc = unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl: true,
+        registered: true,
+        store_field: false,
+        read_metadata: true,
+        trait_is_local: true,
+        registered_impl_key: "fixture::Concrete",
+        local_then_field: false,
+        charon_unsize_payload: true,
+    });
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_meta")
+        .expect("Charon Unsize VTable payload must lower");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstVtable { impl_key, trait_leaf }
+                if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+        )),
+        "Charon Unsize VTable payload must emit ConstVtable; ops={ops:?}"
+    );
+}
+
+/// Registration `impl_key` that is not the Charon `name_path()` of the
+/// source ADT is unregistered (`getvtable` is type-directed).
+#[test]
+fn unsize_of_exact_impl_key_miss_into_dyn_fat_field_is_unsupported() {
+    let llbc = unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl: true,
+        registered: true,
+        store_field: true,
+        read_metadata: false,
+        trait_is_local: true,
+        registered_impl_key: "other::Concrete",
+        local_then_field: false,
+        charon_unsize_payload: false,
+    });
+    let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
+        .expect_err("exact-match miss must decline");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, super::LowerError::Unsupported(_)),
+        "exact-match miss into a dyn-fat field must be Unsupported; {msg}"
+    );
+    assert!(
+        msg.contains("Concrete") && msg.contains("Storage"),
+        "Unsupported must name the source type and trait; {msg}"
+    );
+}
+
+/// A registered impl of a trait whose decl is not crate-local still
+/// emits `ConstVtable` (registration is the gate, not `is_local`).
+#[test]
+fn unsize_of_registered_nonlocal_trait_emits_const_vtable() {
+    use crate::model::OpKind;
+
+    let llbc = unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl: true,
+        registered: true,
+        store_field: true,
+        read_metadata: false,
+        trait_is_local: false,
+        registered_impl_key: "fixture::Concrete",
+        local_then_field: false,
+        charon_unsize_payload: false,
+    });
+    let graph = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_field")
+        .expect("registered Unsize of a non-local trait must lower");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstVtable { impl_key, trait_leaf }
+                if impl_key == "fixture::Concrete" && trait_leaf == "Storage"
+        )),
+        "non-local trait with a registered impl must emit ConstVtable; ops={ops:?}"
+    );
+}
+
+/// Storing an unregistered Unsize local into a dyn-fat field declines
+/// rather than writing one word into a two-word slot
+/// (`InstanceRepr.setfield`).
+#[test]
+fn unsize_of_unregistered_local_then_field_is_unsupported() {
+    let llbc = unsize_into_dyn_fat_llbc_cfg(UnsizeDynFatCfg {
+        with_impl: false,
+        registered: false,
+        store_field: false,
+        read_metadata: false,
+        trait_is_local: true,
+        registered_impl_key: "fixture::Concrete",
+        local_then_field: true,
+        charon_unsize_payload: false,
+    });
+    let err = crate::test_support::lower_function(&llbc, "unsize_into_dyn_fat_local_then_field")
+        .expect_err("one-word dyn-fat field store must decline");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, super::LowerError::Unsupported(_)),
+        "one-word dyn-fat field store must be Unsupported; {msg}"
+    );
+    assert!(
+        msg.contains("slot"),
+        "Unsupported must name the field; {msg}"
     );
 }
 
@@ -7605,9 +7876,11 @@ fn unsize_of_unregistered_into_dyn_fat_local_stays_one_word() {
         "unregistered Unsize local must not form a fat pair; ops={ops:?}"
     );
     assert!(
-        !ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { .. })),
-        "unregistered Unsize local must not emit a vtable ConstFnAddr; ops={ops:?}"
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. }
+        )),
+        "unregistered Unsize local must not emit a vtable constant; ops={ops:?}"
     );
 }
 
@@ -7648,9 +7921,11 @@ fn unsize_of_impl_without_registration_into_dyn_fat_local_stays_one_word() {
         "unregistered impl Unsize local must not form a fat pair; ops={ops:?}"
     );
     assert!(
-        !ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { .. })),
-        "unregistered impl Unsize local must not emit a vtable ConstFnAddr; ops={ops:?}"
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. }
+        )),
+        "unregistered impl Unsize local must not emit a vtable constant; ops={ops:?}"
     );
 }
 
@@ -11310,7 +11585,9 @@ fn return_merge_arm_value_types(graph: &crate::model::FunctionGraph) -> Vec<Valu
                     | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
                     OpKind::Input { ty, .. } => Some(ty.clone()),
                     OpKind::ConstRefNull => Some(ValueType::Ref(None)),
-                    OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ValueType::Int),
+                    OpKind::ConstInt(_)
+                    | OpKind::ConstFnAddr { .. }
+                    | OpKind::ConstVtable { .. } => Some(ValueType::Int),
                     OpKind::ConstUInt(_) => Some(ValueType::Unsigned),
                     _ => None,
                 }) {

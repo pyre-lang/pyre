@@ -630,6 +630,13 @@ pub(crate) fn remap_op_kind(
             path: path.clone(),
             symbolic: *symbolic,
         },
+        OpKind::ConstVtable {
+            impl_key,
+            trait_leaf,
+        } => OpKind::ConstVtable {
+            impl_key: impl_key.clone(),
+            trait_leaf: trait_leaf.clone(),
+        },
         OpKind::RawLoad {
             base,
             offset,
@@ -1245,6 +1252,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstSingleFloat(_)
@@ -1553,6 +1561,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstVtable { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstSingleFloat(_)

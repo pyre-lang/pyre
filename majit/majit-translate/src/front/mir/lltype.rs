@@ -3320,9 +3320,9 @@ pub(in crate::front::mir) struct LlbcDerived {
     global_marker_strs:
         std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<str>>>>,
     /// `(impl_key, trait_leaf)` pairs of `DynImplVtableDesc` statics
-    /// (`register_dyn_impl_vtable!`). An Unsize vtable ConstFnAddr is
-    /// emitted only when this set contains the pair (`rclass.py`
-    /// `getvtable` / `OBJECT.typeptr`).
+    /// (`register_dyn_impl_vtable!`). An Unsize `ConstVtable` is
+    /// emitted only when this set contains the pair by exact
+    /// equality (`rclass.py` `getvtable` / `OBJECT.typeptr`).
     pub(in crate::front::mir) registered_dyn_impl_vtables:
         std::sync::OnceLock<Vec<(String, String)>>,
 }
@@ -11142,6 +11142,10 @@ pub(in crate::front::mir) fn tyref_dyn_trait_decl_id(ty: &TyRef, llbc: &Llbc) ->
             .as_array()?
             .get(1)?
     };
+    // Charon wraps the `DynTrait` predicate in `Value` / `Deduplicated`.
+    // `node_is_dyn_trait` peels those; the principal trait lives on the
+    // peeled node (`rclass.py` `getvtable`).
+    let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
     json_dyn_trait_decl_id(inner).or_else(|| json_dyn_predicate_principal_trait_id(inner))
 }
 
