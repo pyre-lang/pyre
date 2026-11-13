@@ -1159,6 +1159,7 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
 fn capture_vable_shadow_stack_image<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable_frame: usize,
+    py_pc: usize,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
     let (Some(valuestackdepth), Some(last_instr)) = latched_vable_scalars(ctx) else {
@@ -1191,7 +1192,7 @@ fn capture_vable_shadow_stack_image<Sym: WalkSym>(
         }
     }
     Some(MirrorStackImage {
-        py_pc: ctx.vstack_cur_pypc as usize,
+        py_pc,
         slots,
         valuestackdepth: Some(valuestackdepth),
         last_instr: Some(last_instr),
@@ -1234,23 +1235,6 @@ fn paused_parent_vable_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Op
     }
     let addr = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
     (addr != 0).then_some(addr)
-}
-
-/// Operand depth of the root parent paused in an inlined CALL.
-///
-/// `_opimpl_setfield_vable` (`pyjitpl.py`) writes `valuestackdepth` after
-/// each `emit_popvalue_ref!` pop (`_opimpl_*call*` /
-/// `do_residual_or_indirect_call`); `synchronize_virtualizable` leaves that
-/// word on the parent frame `_copy_data_from_miframe` copies.
-/// `tracing_vable_frame_addr` is that frame — the portal parent
-/// `capture_root_parent_resume_stack` publishes. Depth is that one word.
-/// `Some(0)` is a real empty operand stack (`vsd == nlocals`).
-fn paused_parent_operand_depth<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    nlocals: usize,
-) -> Option<usize> {
-    let addr = paused_parent_vable_frame(ctx)?;
-    crate::state::concrete_stack_depth(addr).and_then(|vsd| vsd.checked_sub(nlocals))
 }
 
 /// Operand-stack slots `nlocals..valuestackdepth` of the standard
@@ -1317,21 +1301,23 @@ fn resolve_operand_boxes<Sym: WalkSym>(
     Some(slots)
 }
 
-/// Rebuild frame 0's post-CALL operand stack from the exact caller image
-/// captured when the first inline level was pushed.
-///
-/// RPython keeps this stack in the root `MIFrame.registers_r` while its callee
-/// frames are paused above it.  Pyre's live `PyFrame` is still parked at the
-/// outer loop header, so the multi-frame blackhole adopter must publish the
-/// paused caller image before it drives those frames.  The CALL result is a
-/// register (`_setup_return_value_*`); remaining jitcode pushes it.  Every
-/// live post-pop slot comes from `call_stack_overrides`.
-pub(crate) fn capture_root_parent_resume_stack<Sym: WalkSym>(
+/// Frame 0 is the portal virtualizable; its operand stack, `valuestackdepth`
+/// and `last_instr` are the virtualizable boxes as they stand at the latch
+/// (`pyjitpl.py` `synchronize_virtualizable`), the same source as the
+/// single-frame arm; `ctx` being the innermost callee does not change which
+/// boxes those are; `py_pc` is frame 0's resume coordinate, only a label for
+/// a synchronized image.
+fn capture_root_vable_stack_image<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
+    origin: &'static str,
 ) -> Option<MirrorStackImage> {
+    let Some(vable_frame) = paused_parent_vable_frame(ctx) else {
+        latchdbg!("origin={origin} root-vable: no paused vable frame");
+        return None;
+    };
     // Every refusal below names itself: an adopter that declines on a missing
     // root-parent stack reports only "not capturable", so without these the
-    // seven silent `?` exits are indistinguishable from "never reached".
+    // silent `?` exits are indistinguishable from "never reached".
     macro_rules! need {
         ($opt:expr, $what:literal) => {
             match $opt {
@@ -1343,103 +1329,36 @@ pub(crate) fn capture_root_parent_resume_stack<Sym: WalkSym>(
             }
         };
     }
-    let session = ctx.session.borrow();
-    let parent = need!(
-        need!(session.first_inline(), "empty framestack")
-            .parents
-            .first(),
-        "innermost frame has no parent"
-    );
-    let pjc = need!(
-        crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32),
-        "parent jitcode index unresolved"
-    );
-    // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
-    // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
-    // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
-    // A live inline still resolves `CallFallthrough` through that arm.
-    let call_jit_pc = need!(
-        parent.call_pc.or(parent.call_jitcode_pc),
-        "parent has no call jitcode pc"
-    );
-    let resume_py_pc = if parent.call_jitcode_pc.is_none()
-        && let Some(resume_pc) = parent.resume_pc
-    {
-        need!(
-            resolve_resume_coord_py_pc(
-                parent.jitcode_index,
-                ParentResumeCoord::Backxlat(resume_pc),
-            ),
-            "parent resume py_pc unresolved"
-        ) as usize
-    } else {
-        need!(
-            resolve_parent_resume_py_pc(parent),
-            "parent resume py_pc unresolved"
-        ) as usize
+    let resume_py_pc = {
+        let session = ctx.session.borrow();
+        let parent = need!(
+            need!(session.first_inline(), "empty framestack")
+                .parents
+                .first(),
+            "innermost frame has no parent"
+        );
+        // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
+        // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
+        // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
+        // A live inline still resolves `CallFallthrough` through that arm.
+        if parent.call_jitcode_pc.is_none()
+            && let Some(resume_pc) = parent.resume_pc
+        {
+            need!(
+                resolve_resume_coord_py_pc(
+                    parent.jitcode_index,
+                    ParentResumeCoord::Backxlat(resume_pc),
+                ),
+                "parent resume py_pc unresolved"
+            ) as usize
+        } else {
+            need!(
+                resolve_parent_resume_py_pc(parent),
+                "parent resume py_pc unresolved"
+            ) as usize
+        }
     };
-    if pjc.code_ptr.is_null() {
-        latchdbg!("root-parent-stack: parent code_ptr null");
-        return None;
-    }
-    // `MIFrame`'s operand stack starts after locals *and* cell/freevar
-    // entries (`pyframe.py:111`).  `call_stack_overrides` uses that same
-    // semantic slot space through `caller_sym.nlocals()`; using only
-    // `varnames` here would shift every closure caller's paused stack into
-    // its cells when the multi-frame blackhole image is adopted.
-    let code = unsafe { &*pjc.code_ptr };
-    let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let depth = need!(
-        paused_parent_operand_depth(ctx, nlocals),
-        "parent operand depth unavailable"
-    );
-    // `resume_py_pc` is the CALL's own py pc (equal to `call_py_pc`); `pyopcode.py dispatch_bytecode` sets `last_instr = next_instr` at opcode start.
-    let last_instr = parent
-        .caller_py_pc
-        .map(|pc| pc as isize)
-        .unwrap_or(resume_py_pc as isize);
-    let mut slots = Vec::with_capacity(depth);
-    for slot in nlocals..nlocals + depth {
-        let Some(value) = parent
-            .call_stack_overrides
-            .iter()
-            .find_map(|&(candidate, value)| (candidate == slot).then_some(value))
-            .or_else(|| {
-                // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) writes each
-                // operand-stack slot through `setarrayitem_vable_via_metainterp`
-                // → `store_live_frame_array_slot` onto the inline callee's
-                // `callee_shadow.concrete_frame` before a nested sub-walk
-                // starts.  `paused_concrete_frame` is that shadow's frame
-                // (None on a root parent, whose live PyFrame is still parked
-                // at the loop header).  Fill a missing override from that
-                // array so a complete image can latch when the CALL-site
-                // capture was sparse.
-                parent
-                    .paused_concrete_frame()
-                    .and_then(|frame| crate::state::concrete_stack_value(frame, slot))
-            })
-        else {
-            latchdbg!(
-                "root-parent-stack: no call_stack_override for slot {slot} \
-                 (nlocals={nlocals} depth={depth} resume_py_pc={resume_py_pc} \
-                 call_jit_pc={call_jit_pc} have={:?})",
-                parent
-                    .call_stack_overrides
-                    .iter()
-                    .map(|&(s, _)| s)
-                    .collect::<Vec<_>>()
-            );
-            return None;
-        };
-        slots.push(value);
-    }
-    Some(MirrorStackImage {
-        py_pc: resume_py_pc,
-        slots,
-        valuestackdepth: Some(nlocals + depth),
-        last_instr: Some(last_instr),
-        synchronized: true,
-    })
+    capture_vable_shadow_stack_image(ctx, vable_frame, resume_py_pc, origin)
 }
 
 /// Runtime `JitCode` for a translated helper at `MetaInterpStaticData.jitcodes[index]`.
@@ -1468,74 +1387,57 @@ pub(crate) fn helper_index_for_sub_body(sub_body: &SubJitCodeBody) -> Option<usi
 
 /// Operand-stack image of the Python portal paused under a helper.
 ///
-/// `capture_root_parent_resume_stack` needs `first_inline()`; a helper
+/// `capture_root_vable_stack_image` needs `first_inline()`; a helper
 /// entered from the portal has only `framestack[0]` (`InlineFrame::portal`)
 /// plus `bind_paused_caller_regs` live banks.
 ///
-/// The paused `vstack_boxes` snapshot is the opcode-ENTRY stack. Portal
-/// jitcode that pops before the CALL has already run
-/// `_opimpl_setarrayitem_vable` / `_opimpl_setfield_vable`. Helper-entry
-/// mirroring rewrites the vable scalars to the opcode-entry image for
-/// guard snapshots; the abort-point pair is on the paused portal
-/// `LiveFrameRegs`. A ForceQuasiImmutable abort resumes that MIFrame at
-/// the CALL's `next_pc` (`blackhole.py _setup_return_value_*`), so the
-/// published image is the abort-point stack (`_copy_data_from_miframe`).
+/// Portal jitcode that pops before the CALL has already run
+/// `_opimpl_setarrayitem_vable` / `_opimpl_setfield_vable`. The published
+/// image is that post-pop stack from the ordinary vable boxes
+/// (`pyjitpl.py` `capture_resumedata` passes `virtualizable_boxes` as they
+/// stand; `blackhole.py` `_copy_data_from_miframe`).
 pub(crate) fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
-    let paused = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .last()
-            .and_then(|frame| frame.paused_live())
-    }?;
+    if ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .and_then(|frame| frame.paused_live())
+        .is_none()
+    {
+        return None;
+    }
     let py_pc = ctx.fbw_mode.inline_caller_py_pc.unwrap_or(0) as usize;
-    let (abort_vsd, abort_last) = paused.abort_point_scalars();
-    if let Some(valuestackdepth) = abort_vsd {
-        let nlocals = {
-            let sym = ctx.fbw_mode.snapshot_sym;
-            if sym.is_null() {
-                latchdbg!("origin={origin} paused-portal-mirror no-snapshot-sym");
-                return None;
-            }
-            // SAFETY: pointer live for the full-body walk; read-only.
-            let n = unsafe { (*sym).nlocals() };
-            let frame = unsafe { (*sym).live_vable_frame_addr() };
-            crate::state::concrete_nlocals(frame).unwrap_or(n)
-        };
-        if valuestackdepth < nlocals {
-            latchdbg!(
-                "origin={origin} paused-portal-mirror abort vsd={valuestackdepth} \
-                 below nlocals={nlocals}"
-            );
+    let nlocals = {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            latchdbg!("origin={origin} paused-portal-mirror no-snapshot-sym");
             return None;
         }
-        let height = valuestackdepth - nlocals;
-        let slots = stack_slots_from_vable_boxes(ctx.trace_ctx, nlocals, valuestackdepth).or_else(
-            || {
-                let boxes = paused.frame_state().borrow().vstack_boxes.clone();
-                resolve_operand_boxes(ctx, &boxes, height, origin)
-            },
-        )?;
-        return Some(MirrorStackImage {
-            py_pc,
-            slots,
-            valuestackdepth: Some(valuestackdepth),
-            last_instr: abort_last,
-            synchronized: true,
-        });
-    }
-    let boxes = paused.frame_state().borrow().vstack_boxes.clone();
-    let slots = resolve_operand_boxes(ctx, &boxes, boxes.len(), origin)?;
+        // SAFETY: pointer live for the full-body walk; read-only.
+        let n = unsafe { (*sym).nlocals() };
+        let frame = unsafe { (*sym).live_vable_frame_addr() };
+        crate::state::concrete_nlocals(frame).unwrap_or(n)
+    };
     let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
+    let valuestackdepth = valuestackdepth?;
+    if valuestackdepth < nlocals {
+        latchdbg!(
+            "origin={origin} paused-portal-mirror vsd={valuestackdepth} \
+             below nlocals={nlocals}"
+        );
+        return None;
+    }
+    let slots = stack_slots_from_vable_boxes(ctx.trace_ctx, nlocals, valuestackdepth)?;
     Some(MirrorStackImage {
         py_pc,
         slots,
-        valuestackdepth,
+        valuestackdepth: Some(valuestackdepth),
         last_instr,
-        synchronized: false,
+        synchronized: true,
     })
 }
 
@@ -1834,7 +1736,12 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // opcode's pops; `synchronize_virtualizable` (`pyjitpl.py`) hands the
         // blackhole the virtualizable as it stands there, so the stack comes from
         // those boxes, not from an opcode-entry reconstruction.
-        let mirror_stack = capture_vable_shadow_stack_image(ctx, vable_frame, origin);
+        let mirror_stack = capture_vable_shadow_stack_image(
+            ctx,
+            vable_frame,
+            ctx.vstack_cur_pypc as usize,
+            origin,
+        );
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[latch-accept] origin={origin} single-frame pc={} jitcode={:?} index={:?}",
@@ -1879,11 +1786,11 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             latchdbg!("origin={origin} mf-preflight");
             return false;
         }
-        // `ctx` is the innermost callee, so its ordinary vstack mirror names
-        // the wrong frame.  Reconstruct frame 0 from the paused caller image
-        // captured at the outermost inline push, exactly where RPython keeps
-        // that root MIFrame's register bank.  A helper entered from the
-        // portal has no `first_inline()`; use the paused portal banks
+        // Frame 0's operand stack is the portal virtualizable's boxes
+        // (`synchronize_virtualizable` in `pyjitpl.py`), the same source as
+        // the single-frame arm, which is why `ctx` (the innermost callee)
+        // does not matter.  A helper entered from the portal has no
+        // `first_inline()`; use the paused portal banks
         // `bind_paused_caller_regs` stored instead.
         //
         // The MIFrame stack is the convert image (`pyjitpl.py`
@@ -1901,7 +1808,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         let mirror_stack = if ctx.session.borrow().at_portal() {
             capture_paused_portal_mirror_stack(ctx, origin)
         } else {
-            capture_root_parent_resume_stack(ctx)
+            capture_root_vable_stack_image(ctx, origin)
         };
         if fbw_debug_abort_enabled() {
             let names: Vec<&str> = framestack
@@ -3065,7 +2972,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
     // Capture it first so a missing image publishes nothing, rather than a
     // latch whose adopt then declines into entry replay of the dunder.
     let mirror_stack = if ctx.fbw_mode.inline_subwalk {
-        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+        let Some(mirror_stack) = capture_root_vable_stack_image(ctx, origin) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
             return None;
         };
@@ -3269,7 +3176,7 @@ fn latch_assembler_continuation_escape<Sym: WalkSym>(
     census: &'static str,
 ) -> bool {
     let mirror_stack = if ctx.fbw_mode.inline_subwalk {
-        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+        let Some(mirror_stack) = capture_root_vable_stack_image(ctx, origin) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
             return false;
         };
@@ -8039,10 +7946,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     // reason: a root walk keeps its virtualizable symbolic, so
                     // nothing the walk pushed or popped reached the live
                     // frame's slot array and it still holds the stack from
-                    // before the walk began.  The mirror has to come from the
-                    // paused caller image rather than `capture_vstack_mirror_image`,
-                    // because `ctx` is the innermost callee on this arm and its
-                    // own vstack mirror names that frame, not frame 0.
+                    // before the walk began.  Frame 0's stack is the portal
+                    // virtualizable's boxes (`synchronize_virtualizable`),
+                    // which is why `ctx` (the innermost callee) does not
+                    // matter.
                     //
                     // Leaving the stack alone resumes the blackhole on the
                     // stale one.  The witness is a nested `for` whose walk
@@ -8058,7 +7965,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                             banks,
                             last_exc_value,
                             raising_exception,
-                            mirror_stack: capture_root_parent_resume_stack(ctx),
+                            mirror_stack: capture_root_vable_stack_image(ctx, "escape-flush"),
                             origin: "escape-flush",
                         });
                     });

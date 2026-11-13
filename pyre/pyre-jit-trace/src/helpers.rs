@@ -1061,6 +1061,15 @@ pub fn emit_instance_inline(
 /// `old_len == 0`, so the loop body disappears and only the allocation and
 /// the two field stores remain.
 ///
+/// The walk applies the transition with `store_attr_add_commit` first.
+/// `MetaInterp.execute_and_record` (`pyjitpl.py`) executes every recorded
+/// op and the box is born with that result (`history.py` `History.record` /
+/// `_make_op(..., value)`), so `NewArrayClear` is recorded with
+/// `new_block_value`, the block commit installed. The caller records
+/// `old_block` as the `GETFIELD` of `storage` before the commit, the same
+/// order `MapdictStorageMixin._set_mapdict_increase_storage1` reads
+/// `old_storage = self.storage` before installing the grown block.
+///
 /// The point of emitting this rather than calling a residual is virtualization:
 /// with the store folded, an instance built and thrown away inside one loop
 /// iteration escapes nowhere and the optimizer removes it, its storage block,
@@ -1090,21 +1099,28 @@ pub fn emit_mapdict_add_attr_inline(
     ctx: &mut TraceCtx,
     obj: OpRef,
     old_len: usize,
+    old_block: Option<OpRef>,
+    new_block_value: majit_ir::Value,
     new_map: OpRef,
     value: OpRef,
     map_descr: majit_ir::DescrRef,
     storage_descr: majit_ir::DescrRef,
 ) {
+    debug_assert_eq!(old_block.is_some(), old_len > 0);
     let new_len = ctx.const_int(old_len as i64 + 1);
-    let new_block = ctx.record_op_with_descr(
+    let new_block = ctx.record_op_with_descr_value(
         OpCode::NewArrayClear,
         &[new_len],
         crate::state::mapdict_storage_gcarray_descr(),
+        Some(new_block_value),
     );
     ctx.heap_cache_mut().new_object(new_block);
 
     if old_len > 0 {
-        let old_block = crate::state::opimpl_getfield_gc_r(ctx, obj, storage_descr.clone());
+        let old_block = old_block.expect(
+            "mapdict add fold: old storage GETFIELD precedes \
+             MapdictStorageMixin._set_mapdict_increase_storage1",
+        );
         for index in 0..old_len {
             let index_op = ctx.const_int(index as i64);
             let item = crate::state::trace_mapdict_storage_getitem(ctx, old_block, index_op);
@@ -1126,25 +1142,44 @@ pub fn emit_mapdict_add_attr_inline(
 /// int attribute stores a one-element longlong list — the same int GcArray
 /// `erase_unboxed` allocates — in the new slot, emitted inline so
 /// OptVirtualize removes it with the instance when nothing escapes.
+///
+/// `list_block_value` is that one-element int list, already installed in
+/// slot `old_len` of the committed storage; `NewArray` is born with it
+/// (`history.py` `_make_op(..., value)` / `MetaInterp.execute_and_record`).
+/// The committed storage is rooted by the caller (`new_block_slot`) and
+/// re-read after the int-list recordings, which can collect (`history.py`
+/// `*FrontendOp.value`).
 pub fn emit_mapdict_add_unboxed_attr_inline(
     ctx: &mut TraceCtx,
     obj: OpRef,
     old_len: usize,
+    old_block: Option<OpRef>,
+    new_block_slot: usize,
+    list_block_value: majit_ir::Value,
     new_map: OpRef,
     raw: OpRef,
     map_descr: majit_ir::DescrRef,
     storage_descr: majit_ir::DescrRef,
 ) {
     let one = ctx.const_int(1);
-    let list_block =
-        ctx.record_op_with_descr(OpCode::NewArray, &[one], crate::state::int_gcarray_descr());
+    let list_block = ctx.record_op_with_descr_value(
+        OpCode::NewArray,
+        &[one],
+        crate::state::int_gcarray_descr(),
+        Some(list_block_value),
+    );
     ctx.heap_cache_mut().new_array(list_block, one, true);
     let zero = ctx.const_int(0);
     crate::state::trace_int_block_setitem_value(ctx, list_block, zero, raw);
+    let new_block_value = majit_ir::Value::Ref(majit_ir::GcRef(
+        pyre_object::gc_roots::shadow_stack_get(new_block_slot) as usize,
+    ));
     emit_mapdict_add_attr_inline(
         ctx,
         obj,
         old_len,
+        old_block,
+        new_block_value,
         new_map,
         list_block,
         map_descr,

@@ -2683,6 +2683,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::set_add_value",
         crate::opcode_ops::jit_opcode_ops_set_add_value,
     );
+    // `__majit_wrap_list_descr_init`'s void `inline_call_r_v`. The graph is
+    // `list_extend_items`; this bridge is the one-word address blackhole calls.
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::type_methods::list_extend_items",
+        crate::opcode_ops::jit_type_methods_list_extend_items,
+    );
     // LOAD_GLOBAL's `inline_call_ir_r` (`flatten.rs inline_call_targets`).
     // The graph is `PyFrame.load_global_value`; this bridge is the one-word
     // address blackhole `bh_call_r` calls. Argument order is the graph's
@@ -8825,6 +8832,10 @@ mod tests {
             (
                 "pyre_interpreter::opcode_ops::set_add_value",
                 crate::opcode_ops::jit_opcode_ops_set_add_value as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::type_methods::list_extend_items",
+                crate::opcode_ops::jit_type_methods_list_extend_items as *const () as usize as i64,
             ),
             (
                 "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",

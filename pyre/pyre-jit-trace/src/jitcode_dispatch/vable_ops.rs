@@ -48,7 +48,7 @@ pub(super) fn bind_paused_caller_regs(
     registers_f: &RegisterBank,
     frame_state: &WalkFrameState,
 ) {
-    let mut live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
+    let live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
     let mut session = session.borrow_mut();
     if session.framestack.is_empty() {
         session.framestack.push(InlineFrame::portal());
@@ -57,79 +57,7 @@ pub(super) fn bind_paused_caller_regs(
         .framestack
         .last_mut()
         .expect("portal occupies framestack[0]");
-    // `run_orthodox_helper_subwalk` records the abort-point scalars on a
-    // placeholder live before this bind. Keep them: the banks change, the
-    // CALL-`next_pc` resume image does not (`_copy_data_from_miframe`).
-    if let Some(paused) = frame.live.as_ref() {
-        let (vsd, last) = paused.abort_point_scalars();
-        live.abort_point_valuestackdepth = vsd;
-        live.abort_point_last_instr = last;
-    }
     frame.live = Some(live);
-}
-
-/// Portal jitcode `last_instr` / `valuestackdepth` as `_opimpl_setfield_vable`
-/// left them, before helper-entry mirroring rewrites the boxes to the
-/// opcode-entry image.
-fn portal_abort_point_scalars(ctx: &TraceCtx) -> (Option<usize>, Option<isize>) {
-    let vable_int = |name: &str| {
-        ctx.virtualizable_info()
-            .and_then(|info| info.static_field_index_by_name(name))
-            .and_then(|idx| ctx.virtualizable_entry_at(idx))
-            .and_then(|(_, value)| match value {
-                majit_ir::Value::Int(value) => Some(value),
-                _ => None,
-            })
-    };
-    let valuestackdepth =
-        vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
-    let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
-    (valuestackdepth, last_instr)
-}
-
-/// Store the abort-point scalars on the paused portal `LiveFrameRegs`
-/// (`framestack[0].live`) for the helper walk.
-pub(crate) fn record_paused_portal_abort_point(
-    session: &std::cell::RefCell<WalkSession>,
-    ctx: &TraceCtx,
-) {
-    let (vsd, last) = portal_abort_point_scalars(ctx);
-    let mut session = session.borrow_mut();
-    if session.framestack.is_empty() {
-        session.framestack.push(InlineFrame::portal());
-    }
-    let frame = session
-        .framestack
-        .last_mut()
-        .expect("portal occupies framestack[0]");
-    match frame.live.as_mut() {
-        Some(live) => {
-            live.abort_point_valuestackdepth = vsd;
-            live.abort_point_last_instr = last;
-        }
-        None => {
-            let mut live = LiveFrameRegs::new(
-                &RegisterBank::default(),
-                &RegisterBank::default(),
-                &RegisterBank::default(),
-                &WalkFrameState::new(WalkFrameStateData::default()),
-            );
-            live.abort_point_valuestackdepth = vsd;
-            live.abort_point_last_instr = last;
-            frame.live = Some(live);
-        }
-    }
-}
-
-/// Drop the abort-point scalars when helper-entry mirroring is restored.
-pub(crate) fn clear_paused_portal_abort_point(session: &std::cell::RefCell<WalkSession>) {
-    let mut session = session.borrow_mut();
-    if let Some(frame) = session.framestack.last_mut()
-        && let Some(live) = frame.live.as_mut()
-    {
-        live.abort_point_valuestackdepth = None;
-        live.abort_point_last_instr = None;
-    }
 }
 
 pub(super) fn push_helper_live(

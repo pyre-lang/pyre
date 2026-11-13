@@ -1466,9 +1466,8 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
 /// judged by what carries it:
 ///
 /// * A box [`null_ref_is_a_value`] accepts carries the operand's own null.
-///   Answering unresolved for one left every paused-caller image built over
-///   that stack one slot short and `capture_root_parent_resume_stack`
-///   declined it.
+///   Answering unresolved for one left the portal virtualizable's operand
+///   stack one slot short and `capture_root_vable_stack_image` declined it.
 /// * Any other box may read back `Ref(0)` while the walk still holds the
 ///   operand symbolically — a deferred `LOAD_ATTR name + NULL|self` pair is
 ///   the shape that reaches here.  Answer unresolved, as

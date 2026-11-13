@@ -5225,6 +5225,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // STORE_ATTR in the trace (`MapdictStorageMixin._set_mapdict_increase_storage1`).
         // The shape guard and the holder pins can minor-collect. Both pointers
         // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
+        // Old storage is read before the transition, as in
+        // `_set_mapdict_increase_storage1`; the existing `live_box_ref`
+        // lines after it already cover a collection the GETFIELD recording
+        // may trigger.
+        let old_block = (add.storageindex > 0)
+            .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         let concrete_value = live_box_ref(ctx, value, concrete_value);
         let committed = unsafe {
@@ -5241,12 +5247,29 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             drop(pyre_interpreter::runtime_ops::fetch_memory_error());
             return Ok(None);
         }
+        // `MetaInterp.execute_and_record` / `History.record` / `_make_op(..., value)`:
+        // the recorded `NewArrayClear` is born with the block commit installed.
+        let (new_block_value, new_block_ptr) = match ctx.trace_ctx.field_sanity_load(
+            majit_gc::gc_current_object_address(concrete_obj as usize) as i64,
+            &storage_descr,
+            majit_ir::Type::Ref,
+        ) {
+            Some(majit_ir::Value::Ref(r)) if !r.is_null() => {
+                (majit_ir::Value::Ref(r), r.as_usize() as i64)
+            }
+            got => panic!(
+                "mapdict store_attr_add fold: store_attr_add_commit installed \
+                 W_ObjectObject.storage, field_sanity_load returned {got:?}"
+            ),
+        };
         match unboxed_raw {
             None => {
                 crate::helpers::emit_mapdict_add_attr_inline(
                     ctx.trace_ctx,
                     obj,
                     add.storageindex,
+                    old_block,
+                    new_block_value,
                     new_map_const,
                     value,
                     map_descr,
@@ -5254,10 +5277,33 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 );
             }
             Some(raw) => {
+                let list_block_value = match ctx.trace_ctx.array_sanity_load(
+                    new_block_ptr,
+                    add.storageindex as i64,
+                    &crate::state::mapdict_storage_gcarray_descr(),
+                    majit_ir::Type::Ref,
+                ) {
+                    Some(majit_ir::Value::Ref(r)) if !r.is_null() => majit_ir::Value::Ref(r),
+                    got => panic!(
+                        "mapdict store_attr_add unboxed fold: committed int list \
+                         block in slot {} is {got:?}",
+                        add.storageindex
+                    ),
+                };
+                // The unboxed helper records NewArray + setitem before
+                // NewArrayClear; those can minor-collect. Pin the committed
+                // storage the way `history.py *FrontendOp.value` keeps the
+                // execute result.
+                let _storage_roots = pyre_object::gc_roots::push_roots();
+                let storage_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(new_block_ptr as pyre_object::PyObjectRef);
                 crate::helpers::emit_mapdict_add_unboxed_attr_inline(
                     ctx.trace_ctx,
                     obj,
                     add.storageindex,
+                    old_block,
+                    storage_slot,
+                    list_block_value,
                     new_map_const,
                     raw,
                     map_descr,
@@ -16650,14 +16696,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             )
         }
     };
-    // `_opimpl_setfield_vable` already left the abort-point scalars on the
-    // vable (`pyjitpl.py`); do not rewrite them for the helper walk (#245).
-    // Record the pair on the paused portal `LiveFrameRegs` so a
-    // ForceQuasiImmutable multi-frame blackhole can resume the CALL
-    // (`blackhole.py _setup_return_value_*` / `_copy_data_from_miframe`).
-    if !nested_helper && sym.owns_virtualizable_shadow() {
-        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
-    }
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
@@ -16702,8 +16740,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let saved_fbw_mode = ctx.fbw_mode.clone();
     // Pause this Python MIFrame (portal or inlined callee) with the banks
     // `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe` copy.
-    // `record_paused_portal_abort_point` may already have left abort-point
-    // scalars on a placeholder live; bind keeps those and fills the banks.
     // A nested helper walk already occupies a helper MIFrame — rebinding
     // would overwrite that frame with the inner helper's register file.
     if !saved_fbw_mode.transparent_helper_subwalk {
@@ -16738,9 +16774,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
-    if !nested_helper && sym.owns_virtualizable_shadow() {
-        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
-    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →

@@ -333,38 +333,6 @@ pub(crate) fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
     }
 }
 
-/// Live STANDARD `last_instr` / `valuestackdepth` boxes saved across a
-/// resume-image publish.
-///
-/// `pyjitpl.py` `capture_resumedata` saves `frame.pc` before rewriting it for
-/// the snapshot and restores it afterwards. The walker publishes those
-/// scalars into `virtualizable_boxes` because `build_snapshot_vable_vref_boxes`
-/// reads that shadow. The restore writes both scalars back to the live frame
-/// as well as the box (`_opimpl_setfield_vable` synchronizes the field it
-/// stores), so a publish that reached the live frame is undone there too and
-/// the live frame and the box agree afterwards
-/// (`check_synchronized_virtualizable`). `close_loop_args_at` reads the
-/// concrete depth, which the walker otherwise never advances.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct SavedVableResumeScalars {
-    last_instr: Option<(OpRef, Value)>,
-    valuestackdepth: Option<(OpRef, Value)>,
-}
-
-fn vable_static_entry(ctx: &TraceCtx, static_field_name: &str) -> Option<(OpRef, Value)> {
-    let idx = ctx
-        .virtualizable_info()?
-        .static_field_index_by_name(static_field_name)?;
-    ctx.virtualizable_entry_at(idx)
-}
-
-pub(crate) fn save_vable_resume_scalars(ctx: &TraceCtx) -> SavedVableResumeScalars {
-    SavedVableResumeScalars {
-        last_instr: vable_static_entry(ctx, "last_instr"),
-        valuestackdepth: vable_static_entry(ctx, "valuestackdepth"),
-    }
-}
-
 /// True when the STANDARD static is already the interned `ConstInt(want)`.
 /// Overlaying `const_int(want)` would write that same box, so skip is
 /// byte-identical (`opencoder.py` `_encode` TAGINT / small-int).
@@ -382,15 +350,6 @@ pub(crate) fn vable_static_box_is_const_int(
     ctx.virtualizable_box_at(idx)
         .and_then(|op| op.inline_const_to_value())
         == Some(Value::Int(want))
-}
-
-pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVableResumeScalars) {
-    if let Some((opref, concrete)) = saved.last_instr {
-        mirror_vable_static_to_boxes(ctx, "last_instr", opref, concrete);
-    }
-    if let Some((opref, concrete)) = saved.valuestackdepth {
-        mirror_vable_static_to_boxes(ctx, "valuestackdepth", opref, concrete);
-    }
 }
 
 /// Resolve the mutable frame-mirror index for a stack slot.

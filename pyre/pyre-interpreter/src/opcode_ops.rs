@@ -1598,6 +1598,19 @@ pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObject
     }
 }
 
+// `__majit_wrap_list_descr_init`'s void `inline_call_r_v` calls this address.
+// The recorded graph is `list_extend_items`; its Rust `Result` is a different
+// ABI, so the two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_type_methods_list_extend_items(list: PyObjectRef, other: PyObjectRef) {
+    match crate::type_methods::list_extend_items(list, other) {
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
+    }
+}
+
 // Residual target of every jitcode call to `builtins::try_hash_value`, which
 // the codewriter does not look inside. Its Rust `Result` is a different ABI.
 #[inline(never)]

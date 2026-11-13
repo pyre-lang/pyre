@@ -5113,11 +5113,12 @@ fn try_adopt_multi_frame_blackhole(
     // walker's OpRef mirror is that bank.  `WalkAbort` / `VableEscape`
     // stop INSIDE an opcode; `ABORT_TOO_LONG` / `CarrierAbort` stop after
     // the reconstructed callee has run, still on a root walk whose array
-    // was never refreshed.  Multi-frame latches reconstruct frame 0 from
-    // the paused caller image (`capture_root_parent_resume_stack`) because
-    // their `ctx` is the innermost callee; a latch that could not build
-    // one leaves no mirror here, which declines the adopt and keeps the
-    // legacy replay.  The paused-CALL mirror is what lets `_resume_mainloop`
+    // was never refreshed.  Multi-frame latches publish frame 0 from the
+    // portal virtualizable's boxes (`capture_root_vable_stack_image`,
+    // `synchronize_virtualizable`); `ctx` being the innermost callee does
+    // not change which boxes those are.  A latch that could not build one
+    // leaves no mirror here, which declines the adopt and keeps the
+    // legacy replay.  The published stack is what lets `_resume_mainloop`
     // deliver the callee result and run the root's remaining body.
     let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
         || commit_leg == WalkEndCommitLeg::VableEscape
