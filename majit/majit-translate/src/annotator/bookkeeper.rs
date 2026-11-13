@@ -2093,11 +2093,11 @@ impl Bookkeeper {
         if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
             return true;
         }
-        let inner = strip_generic_one(spelling.trim(), "Option<")
+        let inner = strip_generic_leaf(spelling.trim(), "Option")
             .map(str::trim)
             .unwrap_or(spelling.trim());
         self.profilefunc_spellings.borrow().iter().any(|known| {
-            let known_inner = strip_generic_one(known.trim(), "Option<")
+            let known_inner = strip_generic_leaf(known.trim(), "Option")
                 .map(str::trim)
                 .unwrap_or(known.trim());
             known == spelling
@@ -19820,5 +19820,12 @@ mod tests {
             matches!(generic, SomeValue::Impossible),
             "generic Option<fn> is lattice bottom until a PBC store, got {generic:?}"
         );
+    }
+
+    #[test]
+    fn is_profilefunc_type_spelling_peels_qualified_option() {
+        let bk = bk();
+        bk.set_profilefunc_family(vec![], vec![], vec!["Option<fn(i64) -> i64>".into()]);
+        assert!(bk.is_profilefunc_type_spelling("option::Option<fn(i64) -> i64>"));
     }
 }

@@ -93,15 +93,63 @@ pub(crate) fn spelling_is_profilefunc(spelling: &str) -> bool {
     })
 }
 
-fn peel_option(spelling: &str) -> &str {
+/// Strip one `Option<…>` wrapper, including Charon's `option::Option<…>`
+/// / `core::option::Option<…>`.
+///
+/// Same shape as `strip_generic_leaf` in `annotator/bookkeeper.rs`: the
+/// last `::` segment of the text before the first `<` is exactly
+/// `Option`, and the text ends with `>`. Returns the trimmed inner, or
+/// the trimmed input unchanged.
+pub(crate) fn peel_option(spelling: &str) -> &str {
     let t = spelling.trim();
-    t.strip_prefix("Option<")
-        .and_then(|s| s.strip_suffix('>'))
-        .map(str::trim)
-        .unwrap_or(t)
+    let Some((head, rest)) = t.split_once('<') else {
+        return t;
+    };
+    if !rest.ends_with('>') {
+        return t;
+    }
+    let head_leaf = head.trim().rsplit("::").next().unwrap_or(head.trim());
+    if head_leaf == "Option" {
+        rest[..rest.len() - 1].trim()
+    } else {
+        t
+    }
 }
 
 fn leaf_is_profilefunc(spelling: &str) -> bool {
     let t = peel_option(spelling);
     t == "ProfileFunc" || t.ends_with("::ProfileFunc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RestoreFamily;
+
+    impl Drop for RestoreFamily {
+        fn drop(&mut self) {
+            register_profilefunc_family(Vec::new(), Vec::new());
+        }
+    }
+
+    #[test]
+    fn qualified_option_spelling_matches_published_fn_spelling() {
+        let _restore = RestoreFamily;
+        register_profilefunc_family(
+            Vec::new(),
+            vec!["Option<fn(i64) -> i64>".into(), "fn(i64) -> i64".into()],
+        );
+        assert!(spelling_is_profilefunc("option::Option<fn(i64) -> i64>"));
+        assert!(spelling_is_profilefunc("core::option::Option<ProfileFunc>"));
+        assert!(!spelling_is_profilefunc("option::Option<fn(u8) -> u8>"));
+        assert_eq!(
+            peel_option("option::Option<fn(i64) -> Result<(),E>>"),
+            "fn(i64) -> Result<(),E>"
+        );
+        assert_eq!(
+            peel_option("fn(i64) -> Result<(),E>"),
+            "fn(i64) -> Result<(),E>"
+        );
+    }
 }

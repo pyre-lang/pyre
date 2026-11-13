@@ -211,21 +211,13 @@ fn spelling_matches_profilefunc(spelling: &str, published: &[String]) -> bool {
     if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
         return true;
     }
-    let inner = peel_option_spelling(spelling);
+    let inner = crate::profilefunc_family::peel_option(spelling);
     published.iter().any(|known| {
         known == spelling
             || known == inner
-            || peel_option_spelling(known) == inner
-            || peel_option_spelling(known) == spelling
+            || crate::profilefunc_family::peel_option(known) == inner
+            || crate::profilefunc_family::peel_option(known) == spelling
     })
-}
-
-fn peel_option_spelling(spelling: &str) -> &str {
-    let t = spelling.trim();
-    t.strip_prefix("Option<")
-        .and_then(|s| s.strip_suffix('>'))
-        .map(str::trim)
-        .unwrap_or(t)
 }
 
 struct ProfileFuncTypeInfo {
@@ -309,7 +301,7 @@ fn absorb_profilefunc_ty(ty: &TyRef, llbc: &Llbc, info: &mut ProfileFuncTypeInfo
     }
     let rendered = tyref_to_ast_string(ty, llbc);
     push_unique_spelling(&mut info.spellings, rendered.clone());
-    let inner = peel_option_spelling(&rendered);
+    let inner = crate::profilefunc_family::peel_option(&rendered);
     if inner != rendered {
         push_unique_spelling(&mut info.spellings, inner.to_string());
     }
