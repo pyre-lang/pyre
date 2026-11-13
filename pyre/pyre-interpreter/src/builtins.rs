@@ -22366,14 +22366,26 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
 /// `tupleobject.py hash_driver`.
 ///
 /// `JitDriver(name='tuple.hash', greens=['w_type'], reds='auto')`.
-/// Untranslated `JitDriver.jit_merge_point` does nothing. This receiver
-/// is not a `jitdriver_receiver_roots` entry: `handle_jit_marker__jit_merge_point`
-/// rejects a marker whose graph is not that driver's portal.
+/// `warmspot.py rewrite_jit_merge_point` makes the marker
+/// `return portal_runner(*args)`: the merge point calls the JIT hook with the
+/// green and the live reds, and a `Some` result is the portal's return value.
 struct TupleHashJitDriver;
 
 impl TupleHashJitDriver {
-    #[inline(always)]
-    fn jit_merge_point(&self, _w_type: PyObjectRef) {}
+    /// `hash_driver.jit_merge_point(w_type=w_type)`. Greens first (`w_type`),
+    /// then the `reds='auto'` values `w_tuple`, `len`, `acc`, `i`; pyre cannot
+    /// auto-collect Rust locals, so the marker passes them explicitly.
+    #[inline]
+    fn jit_merge_point(
+        &self,
+        w_type: PyObjectRef,
+        w_tuple: PyObjectRef,
+        len: usize,
+        acc: u64,
+        i: usize,
+    ) -> Option<Result<u64, crate::PyError>> {
+        crate::call::tuple_hash_merge_point(w_type, w_tuple, len, acc, i)
+    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -22441,27 +22453,31 @@ unsafe fn _descr_hash_unroll_w(obj: PyObjectRef) -> Result<u64, crate::PyError> 
     }
 }
 
-/// `tupleobject.py _descr_hash_jitdriver`.
-///
-/// `w_type` is fixed from the first item, then every iteration hits
-/// `hash_driver.jit_merge_point(w_type=w_type)` before `space.hash_w`.
-unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
+/// Portal graph of `hash_driver` (`tupleobject.py _descr_hash_jitdriver` from the merge point on).
+/// `split_before_jit_merge_point` starts the portal at the marker; ContinueRunningNormally re-enters here with the
+/// live reds.
+pub unsafe fn tuple_hash_portal(
+    w_type: PyObjectRef,
+    w_tuple: PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Result<u64, crate::PyError> {
     unsafe {
-        let len = w_tuple_len(obj);
-        if len == 0 {
-            return Ok(XXPRIME_5);
-        }
-        // `tuple_hash_w_type` reaches `w_tuple_getitem`, whose body boxes
-        // an `_ii` / `_ff` payload. Reload `obj` before the element walk
-        // pins both words for those boxes and for `try_hash_value`.
-        let mut obj = obj;
-        let w_type = pyre_object::with_roots!(obj => tuple_hash_w_type(obj));
         let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[obj, w_type]);
-        let mut acc = XXPRIME_5;
-        let mut i = 0_usize;
+        let base = pyre_object::gc_roots::pin_roots(&[w_tuple, w_type]);
+        let mut acc = acc;
+        let mut i = i;
         while i < len {
-            hash_driver.jit_merge_point(pyre_object::gc_roots::shadow_stack_get(base + 1));
+            if let Some(result) = hash_driver.jit_merge_point(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(base),
+                len,
+                acc,
+                i,
+            ) {
+                return result;
+            }
             let mut item = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(base), i as i64)
                 .expect("tuple index below w_tuple_len is always present");
             let lane = pyre_object::with_roots!(item => try_hash_value(item))? as u64;
@@ -22472,11 +22488,31 @@ unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyErro
     }
 }
 
+/// `tupleobject.py _descr_hash_jitdriver`.
+///
+/// Prologue: length, empty early return, `w_type` from the first item.
+/// The walk lives in [`tuple_hash_portal`], whose first loop statement is
+/// `hash_driver.jit_merge_point`.
+unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
+    unsafe {
+        let len = w_tuple_len(obj);
+        if len == 0 {
+            return Ok(XXPRIME_5);
+        }
+        // `tuple_hash_w_type` reaches `w_tuple_getitem`, whose body boxes
+        // an `_ii` / `_ff` payload. Reload `obj` before handing both words
+        // to the portal.
+        let mut obj = obj;
+        let w_type = pyre_object::with_roots!(obj => tuple_hash_w_type(obj));
+        tuple_hash_portal(w_type, obj, len, XXPRIME_5, 0)
+    }
+}
+
 /// Shared xxHash walk of `tupleobject.py` `_descr_hash_unroll` /
 /// `_descr_hash_jitdriver` for `hash_value`. Expanded into each arm so
 /// the unroll-safe graph contains the n-loop. `tuple_structural_hash`
 /// does not use this macro: its long arm is `_descr_hash_jitdriver_w`,
-/// which calls `hash_driver.jit_merge_point`.
+/// which calls `tuple_hash_portal`.
 macro_rules! hash_tuple_xx_storage {
     ($obj:ident) => {{
         let len = w_tuple_len($obj);
