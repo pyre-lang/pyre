@@ -2900,13 +2900,29 @@ impl<'l> CrateLowering<'l> {
         } = self.state;
         let llbc = self.llbc;
         let fd = llbc.fn_by_id(req.fn_id)?;
-        let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
+        let mut body = crate::front::clause_spec::substituted_unstructured(
             fd,
             llbc,
             &req.trait_refs,
             &req.types,
             &req.const_generics,
-        ) else {
+        );
+        if body.is_none() && fun_decl_is_reflexive_from(llbc, fd) {
+            // `impl<T> From<T> for T` is `fn from(t: T) -> T { t }`.
+            // core extracts as Opaque; `FunctionDesc.getuniquegraph`
+            // still builds that identity (`description.py` `specialize`,
+            // `bookkeeper.py` `getdesc`).
+            if let Some(src) = fd.signature.inputs.first() {
+                let ty = crate::front::clause_spec::subst_tyref(
+                    src,
+                    llbc,
+                    &req.types,
+                    &req.const_generics,
+                );
+                body = crate::front::clause_spec::identity_unstructured(&ty);
+            }
+        }
+        let Some(mut body) = body else {
             skipped
                 .borrow_mut()
                 .push((req.leaf, "no substituted unstructured body".into()));

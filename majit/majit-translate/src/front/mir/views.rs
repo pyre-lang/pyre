@@ -1938,9 +1938,15 @@ impl<'a> Lowering<'a> {
         // `&str` / integer / fn-item literal. The by-value model is the
         // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
         // `fn_const`).
-        if let Some(value) = promoted_const_copied_const(&body)
-            && let Ok(decoded) = decode_constant(self.llbc, &value)
-        {
+        if let Some(value) = promoted_const_copied_const(&body) {
+            let decoded = if let Some(segments) = self.fn_item_const_segments(&value) {
+                DecodedConst::FnPath(segments)
+            } else {
+                match decode_constant(self.llbc, &value) {
+                    Ok(decoded) => decoded,
+                    Err(_) => return Ok(false),
+                }
+            };
             let bb_id = self.block_id[mir_bb];
             let res = self.emit_decoded_const(bb_id, decoded);
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;

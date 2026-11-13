@@ -5464,9 +5464,36 @@ impl<'a> Lowering<'a> {
             });
             return Ok(var);
         }
+        if let Some(segments) = self.fn_item_const_segments(value) {
+            let bb_id = self.emit_bb(mir_bb);
+            return Ok(self.emit_decoded_const(bb_id, DecodedConst::FnPath(segments)));
+        }
         let decoded = decode_constant(self.llbc, value)?;
         let bb_id = self.emit_bb(mir_bb);
         Ok(self.emit_decoded_const(bb_id, decoded))
+    }
+
+    /// Path a `FnDef` constant names. A reflexive `impl<T> From<T> for T`
+    /// is `FunctionDesc.cachedgraph` of that instantiation
+    /// (`description.py` `getuniquegraph` / `specialize`,
+    /// `bookkeeper.py` `getdesc`): enqueue the spec so the identity body
+    /// `fn from(t: T) -> T { t }` is a registered callee. Direct calls of
+    /// the same impl alias (`is_reflexive_from`); a fn-item value cannot.
+    pub(in crate::front::mir) fn fn_item_const_segments(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<Vec<String>> {
+        let reg = fn_def_of_const(self.llbc, value)?;
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if fun_decl_is_reflexive_from(self.llbc, fd)
+            && let Some(segments) = self.enqueue_spec(fd, &reg.generics)
+        {
+            return Some(segments);
+        }
+        None
     }
 
     /// Emit `decoded` onto `bb_id`. A Unicode scalar is

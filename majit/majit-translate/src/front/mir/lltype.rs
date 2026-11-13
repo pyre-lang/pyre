@@ -13093,6 +13093,80 @@ pub(in crate::front::mir) fn ty_dedup_key(v: &serde_json::Value) -> Option<u64> 
     obj.get("Value")?.as_array()?.first()?.as_u64()
 }
 
+/// `core::convert::From` — the trait `blanket_into_devirt` and
+/// `from_impl_conversion` resolve by `TraitDecl.item_meta.name_path`.
+pub(in crate::front::mir) fn trait_decl_is_convert_from(llbc: &Llbc, trait_id: u64) -> bool {
+    llbc.trait_by_id(trait_id)
+        .is_some_and(|td| td.item_meta.name_path() == "core::convert::From")
+}
+
+/// `core::convert::Into` — the trait `callee_is_blanket_into` selects.
+pub(in crate::front::mir) fn trait_decl_is_convert_into(llbc: &Llbc, trait_id: u64) -> bool {
+    llbc.trait_by_id(trait_id)
+        .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into")
+}
+
+fn trait_impl_decl_id(llbc: &Llbc, impl_id: u64) -> Option<u64> {
+    llbc.trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("impl_trait")?
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// `U: From<T>` / `impl From<T> for U` stores `[U, T]`. Equal args
+/// select the reflexive blanket `impl<T> From<T> for T`
+/// (`IntoDevirt::Identity`).
+pub(in crate::front::mir) fn from_trait_args_are_reflexive(types: &[serde_json::Value]) -> bool {
+    types.len() == 2
+        && match (ty_dedup_key(&types[0]), ty_dedup_key(&types[1])) {
+            (Some(a), Some(b)) => a == b,
+            _ => types[0] == types[1],
+        }
+}
+
+/// The impl of `core::convert::From` whose `impl_trait` generics are
+/// `[T, T]` — the reflexive blanket. `blanket_into_devirt` reads the
+/// same pair off a `U: From<T>` obligation.
+pub(in crate::front::mir) fn trait_impl_is_reflexive_from(llbc: &Llbc, impl_id: u64) -> bool {
+    let Some(trait_id) = trait_impl_decl_id(llbc, impl_id) else {
+        return false;
+    };
+    if !trait_decl_is_convert_from(llbc, trait_id) {
+        return false;
+    }
+    llbc.trait_impls_raw()
+        .get(impl_id as usize)
+        .and_then(|row| row.get("impl_trait"))
+        .and_then(|impl_trait| impl_trait.get("generics"))
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| from_trait_args_are_reflexive(types))
+}
+
+/// FunDecl whose selected impl is `core::convert::From` (any `U: From<T>`).
+pub(in crate::front::mir) fn fun_decl_is_convert_from_impl(llbc: &Llbc, fd: &FunDecl) -> bool {
+    trait_impl_id_for_fundecl(fd)
+        .and_then(|impl_id| trait_impl_decl_id(llbc, impl_id))
+        .is_some_and(|trait_id| trait_decl_is_convert_from(llbc, trait_id))
+}
+
+/// FunDecl whose selected impl is `core::convert::Into`. The blanket
+/// `impl<T, U: From<T>> Into<U> for T` never lifts (`blanket_into_devirt`).
+pub(in crate::front::mir) fn fun_decl_is_convert_into_impl(llbc: &Llbc, fd: &FunDecl) -> bool {
+    trait_impl_id_for_fundecl(fd)
+        .and_then(|impl_id| trait_impl_decl_id(llbc, impl_id))
+        .is_some_and(|trait_id| trait_decl_is_convert_into(llbc, trait_id))
+}
+
+/// FunDecl of the reflexive `impl<T> From<T> for T`. Direct calls alias
+/// (`is_reflexive_from`); a fn-item value is
+/// `FunctionDesc.getuniquegraph` of that instantiation
+/// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
+pub(in crate::front::mir) fn fun_decl_is_reflexive_from(llbc: &Llbc, fd: &FunDecl) -> bool {
+    trait_impl_id_for_fundecl(fd).is_some_and(|impl_id| trait_impl_is_reflexive_from(llbc, impl_id))
+}
+
 /// Outcome of devirtualizing a blanket `core::convert::<Impl>::into`
 /// callsite — see `Lowering::blanket_into_devirt`.
 pub(in crate::front::mir) enum IntoDevirt {

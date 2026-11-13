@@ -2280,7 +2280,15 @@ impl<'a> Lowering<'a> {
     /// monomorphized instance's `Self` is a concrete type, so its path
     /// renders under that type's name.
     pub(in crate::front::mir) fn callee_is_blanket_into(&self, reg: &RegularCall) -> bool {
-        self.callee_template_is(reg, "core::convert::<Impl>::into")
+        if self.callee_template_is(reg, "core::convert::<Impl>::into") {
+            return true;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fun_decl_is_convert_into_impl(self.llbc, fd))
     }
 
     /// The callee is `From::from`: a `CallKind::Trait` on
@@ -2353,7 +2361,7 @@ impl<'a> Lowering<'a> {
         };
         let src = self.tyref_body(first_arg_ty?)?;
         let dst = self.tyref_body(dest_ty)?;
-        (src == dst).then(|| arg.clone())
+        from_trait_args_are_reflexive(&[src.clone(), dst.clone()]).then(|| arg.clone())
     }
 
     /// Resolve the trait-spelled `Into::into` (`["Into", "into"]` — a

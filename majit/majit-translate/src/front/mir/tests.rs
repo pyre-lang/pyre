@@ -16009,6 +16009,498 @@ fn map_or_i64_from_fn_item_is_identity_select() {
     );
 }
 
+/// `opt.map_or(-1, i64::from)` shape: a `FnDef` constant of the
+/// reflexive `impl<T> From<T> for T`. Direct calls alias
+/// (`is_reflexive_from`); a fn-item value is
+/// `FunctionDesc.getuniquegraph` of that instantiation
+/// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
+fn reflexive_from_fn_item_llbc(
+    self_ty: serde_json::Value,
+    arg_ty: serde_json::Value,
+    from_generic: bool,
+) -> Llbc {
+    let i64_ty = interior_i64();
+    let type_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let from_input = if from_generic {
+        type_var.clone()
+    } else {
+        arg_ty.clone()
+    };
+    let from_output = if from_generic {
+        type_var
+    } else {
+        self_ty.clone()
+    };
+    let from_generics = if from_generic {
+        serde_json::json!({"types": [{"index": 0}], "const_generics": [], "trait_clauses": []})
+    } else {
+        serde_json::json!({"types": [], "const_generics": [], "trait_clauses": []})
+    };
+    let fn_def_generics = serde_json::json!({
+        "regions": [],
+        "types": [i64_ty.clone()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let fn_ty = serde_json::json!({
+        "FnDef": {
+            "kind": {"Fun": 1},
+            "generics": fn_def_generics.clone()
+        }
+    });
+    let from = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["convert", 0]},
+                {"Impl": {"Trait": 0}},
+                {"Ident": ["from", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [from_input],
+            "output": from_output
+        },
+        "generics": from_generics,
+        "body": "Opaque"
+    });
+    let caller = interior_caller(
+        "take_from_item",
+        0,
+        vec![],
+        fn_ty.clone(),
+        vec![interior_local(0, None, &fn_ty)],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &fn_ty),
+                serde_json::json!({"Use": [{"Const": [{
+                    "FnDef": {
+                        "kind": {"Fun": 1},
+                        "generics": fn_def_generics
+                    }
+                }, fn_ty.clone()]}, "No"]}),
+            )],
+            interior_return(),
+        )],
+    );
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["convert", 0]},
+                {"Ident": ["From", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "methods": [{"skip_binder": {"name": "from"}}]
+    });
+    let trait_impl = serde_json::json!({
+        "def_id": 0,
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [self_ty, arg_ty]
+            }
+        },
+        "methods": []
+    });
+    llbc_with_types_traits(
+        "fixture",
+        vec![],
+        vec![caller, from],
+        vec![trait_decl],
+        vec![trait_impl],
+    )
+}
+
+fn fn_const_tails(graph: &FunctionGraph) -> Vec<Vec<String>> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => {
+                crate::model::fn_const_segments(target).map(|segs| segs.to_vec())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `FnDef` constant of reflexive `impl<T> From<T> for T` names the
+/// specialized identity graph (`FunctionDesc.getuniquegraph`), not the
+/// unregistered generic template `from`.
+#[test]
+fn reflexive_from_fn_item_const_registers_identity_spec() {
+    let i64_ty = interior_i64();
+    let llbc = reflexive_from_fn_item_llbc(i64_ty.clone(), i64_ty, true);
+    let from = llbc.fn_by_id(1).expect("From::from FunDecl");
+    assert!(
+        super::fun_decl_is_reflexive_from(&llbc, from),
+        "impl_trait [T, T] selects the reflexive From impl"
+    );
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for reflexive From fn-item");
+    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let spec = program
+        .functions
+        .iter()
+        .find(|f| f.name.starts_with("from__spec_"))
+        .unwrap_or_else(|| panic!("expected from__spec_ graph, functions={names:?}"));
+    let caller = program
+        .functions
+        .iter()
+        .find(|f| f.name == "take_from_item")
+        .unwrap_or_else(|| panic!("expected take_from_item, functions={names:?}"));
+    let tails = fn_const_tails(caller.graph());
+    assert_eq!(
+        tails.len(),
+        1,
+        "caller materialises one fn-item constant; ops={:?}",
+        graph_ops(caller.graph())
+    );
+    let tail = &tails[0];
+    assert!(
+        tail.last()
+            .is_some_and(|leaf| leaf.starts_with("from__spec_")),
+        "fn-const names the specialized identity, not the generic template; tail={tail:?}"
+    );
+    assert_eq!(
+        tail.last().map(String::as_str),
+        Some(spec.name.as_str()),
+        "fn-const leaf is the registered spec function"
+    );
+    let residual_from = spec
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("from")
+            )
+        });
+    assert!(
+        !residual_from,
+        "identity body has no residual from call; ops={:?}",
+        graph_ops(spec.graph())
+    );
+}
+
+/// `impl From<u8> for i64` is not the reflexive blanket: a FnDef constant
+/// of that `from` does not enqueue an identity spec.
+#[test]
+fn non_reflexive_from_fn_item_const_is_not_identity_spec() {
+    let i64_ty = interior_i64();
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let llbc = reflexive_from_fn_item_llbc(i64_ty, u8_ty, false);
+    let from = llbc.fn_by_id(1).expect("From::from FunDecl");
+    assert!(
+        !super::fun_decl_is_reflexive_from(&llbc, from),
+        "impl_trait [i64, u8] is not the reflexive From impl"
+    );
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for non-reflexive From fn-item");
+    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        !names.iter().any(|name| name.starts_with("from__spec_")),
+        "non-reflexive From must not enqueue an identity spec; functions={names:?}"
+    );
+}
+
+fn convert_trait_decl(def_id: u64, leaf: &str) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["convert", 0]},
+                {"Ident": [leaf, 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "methods": [{"skip_binder": {"name": leaf.to_ascii_lowercase()}}]
+    })
+}
+
+fn interior_trait_call(
+    trait_ref: serde_json::Value,
+    args: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+    target: u64,
+    unwind: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": interior_span(),
+        "kind": {
+            "Call": {
+                "call": {
+                    "func": {
+                        "Regular": {
+                            "kind": {"Trait": [trait_ref, 0]},
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    },
+                    "args": args}, "dest": dest,
+                "target": target,
+                "on_unwind": unwind
+            }
+        }
+    })
+}
+
+fn call_path_leaves(graph: &FunctionGraph) -> Vec<Vec<String>> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Blanket `Into` as `CallKind::Trait` with equal type args is the same
+/// `T -> T` identity as a Fun `into` (`IntoDevirt::Identity`). Copied
+/// `TryFrom` / `impl Into<T>` bodies spell `value.into()` this way.
+#[test]
+fn trait_into_equal_types_is_identity() {
+    let i64_ty = interior_i64();
+    let trait_ref = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone(), i64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let caller = interior_caller(
+        "into_i64",
+        1,
+        vec![i64_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &i64_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_trait_call(
+                    trait_ref,
+                    vec![interior_copy(interior_place(1, &i64_ty))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![],
+        vec![caller],
+        vec![convert_trait_decl(0, "Into")],
+        vec![],
+    );
+    let graph = lower_interior(&llbc, "into_i64");
+    let paths = call_path_leaves(&graph);
+    assert!(
+        paths
+            .iter()
+            .all(|segs| segs.last().map(String::as_str) != Some("into")),
+        "equal-type Trait Into must alias, not residualize into; ops={:?} paths={paths:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// Unequal-type Trait `into` retargets to the selected `From::from`
+/// (`IntoDevirt::Target`), the same decision as a Fun blanket Into.
+#[test]
+fn trait_into_targets_selected_from() {
+    let i64_ty = interior_i64();
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let from_ref = serde_json::json!({
+        "kind": {"TraitImpl": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }},
+        "trait_decl_ref": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let into_ref = serde_json::json!({
+        "kind": {"TraitImpl": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u8_ty.clone(), i64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": [from_ref]
+            }
+        }},
+        "trait_decl_ref": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u8_ty.clone(), i64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let from = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["convert", 0]},
+                {"Impl": {"Trait": 0}},
+                {"Ident": ["from", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [u8_ty.clone()],
+            "output": i64_ty.clone()
+        },
+        "body": "Opaque"
+    });
+    let caller = interior_caller(
+        "into_u8",
+        1,
+        vec![u8_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &u8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_trait_call(
+                    into_ref,
+                    vec![interior_copy(interior_place(1, &u8_ty))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let from_impl = serde_json::json!({
+        "def_id": 0,
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [i64_ty.clone(), u8_ty.clone()]}
+        },
+        "methods": [{
+            "kind": {"TraitMethod": [0, 0]},
+            "skip_binder": {"id": 1, "generics": {}}
+        }]
+    });
+    let into_impl = serde_json::json!({
+        "def_id": 1,
+        "impl_trait": {
+            "id": 1,
+            "generics": {"types": [u8_ty.clone(), i64_ty.clone()]}
+        },
+        "methods": []
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![],
+        vec![caller, from],
+        vec![convert_trait_decl(0, "From"), convert_trait_decl(1, "Into")],
+        vec![from_impl, into_impl],
+    );
+    let graph = lower_interior(&llbc, "into_u8");
+    let paths = call_path_leaves(&graph);
+    assert!(
+        paths.iter().any(|segs| segs
+            .last()
+            .is_some_and(|leaf| leaf == "from" || leaf.starts_with("from__spec_"))),
+        "unequal Trait Into must name the selected From; ops={:?} paths={paths:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|segs| segs.last().map(String::as_str) != Some("into")),
+        "blanket Into must not remain residual; ops={:?} paths={paths:?}",
+        graph_ops(&graph)
+    );
+}
+
 /// `i64::from(u8)` (`core::convert::num::<Impl>::from`) is
 /// `rarithmetic.intmask` with `result_ty: Int`. Same marker
 /// `Rvalue::Cast` uses for unsigned→signed (`rarithmetic.py` `intmask`;

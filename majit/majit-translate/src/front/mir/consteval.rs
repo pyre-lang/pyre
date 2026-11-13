@@ -4099,6 +4099,11 @@ pub(in crate::front::mir) fn decode_fn_def_const(
     // (`CallPath::for_impl_method(self_ty_root, leaf)`), exactly as the
     // Call terminator does (`call_target_segments`). A free function keeps
     // `name_path()`: that is its registered spelling.
+    //
+    // A reflexive `impl<T> From<T> for T` used as a value is not this
+    // template path: `Lowering::fn_item_const_segments` enqueues
+    // `FunctionDesc.cachedgraph` of the identity body
+    // (`description.py` `getuniquegraph` / `specialize`).
     Ok(DecodedConst::FnPath(fundecl_fn_item_segments(llbc, fd)))
 }
 

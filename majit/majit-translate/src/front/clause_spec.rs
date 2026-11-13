@@ -306,6 +306,60 @@ pub(crate) fn substituted_unstructured(
     Some(u)
 }
 
+/// `fn from(t: T) -> T { t }` as an Unstructured body. core's reflexive
+/// `impl<T> From<T> for T` extracts Opaque; `FunctionDesc.getuniquegraph`
+/// still builds this identity (`description.py` `specialize`).
+pub(crate) fn identity_unstructured(ty: &TyRef) -> Option<Unstructured> {
+    let ty_json = match ty {
+        TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
+        TyRef::Other(v) => v.clone(),
+    };
+    let span = serde_json::json!({
+        "data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }
+    });
+    let local = |index: u64, name: Option<&str>| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty_json
+        })
+    };
+    let place = |index: u64| {
+        serde_json::json!({
+            "kind": {"Local": index},
+            "ty": ty_json
+        })
+    };
+    let value = serde_json::json!({
+        "locals": {
+            "arg_count": 1,
+            "locals": [local(0, None), local(1, Some("t"))]
+        },
+        "span": span,
+        "body": [{
+            "statements": [{
+                "kind": {
+                    "Assign": [
+                        place(0),
+                        {"Use": [{"Read": place(1)}, "No"]}
+                    ]
+                },
+                "span": span
+            }],
+            "terminator": {"span": span, "kind": "Return"}
+        }]
+    });
+    let mut u: Unstructured = serde_json::from_value(value).ok()?;
+    duplicate_return(&mut u);
+    Some(u)
+}
+
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
 pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64> {
     let arr = payload.as_array()?;
@@ -1535,6 +1589,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_charon_reader::ullbc::TyRef;
     use serde_json::json;
 
     fn empty_llbc() -> Llbc {
@@ -2296,6 +2351,28 @@ mod tests {
         let expected = fndef.clone();
         substitute_type_vars(&mut fndef, &llbc, &[], &[replacement]);
         assert_eq!(fndef, expected);
+    }
+
+    /// `fn from(t: T) -> T { t }` parses as one Assign of the argument
+    /// and a Return (`FunctionDesc.getuniquegraph` of the reflexive From).
+    #[test]
+    fn identity_unstructured_is_copy_and_return() {
+        let ty = TyRef::Other(json!({"Scalar": {"Integer": {"Signed": "I64"}}}));
+        let u = identity_unstructured(&ty).expect("identity body");
+        assert_eq!(u.locals.arg_count, 1);
+        assert_eq!(u.locals.locals.len(), 2);
+        assert_eq!(u.body.len(), 1);
+        assert_eq!(u.body[0].statements.len(), 1);
+        let kind = u.body[0].statements[0].kind_value();
+        assert!(
+            kind.get("Assign").is_some(),
+            "identity assigns the argument to the return local; kind={kind}"
+        );
+        assert_eq!(
+            u.body[0].terminator.kind.get(),
+            "\"Return\"",
+            "identity terminator is Return"
+        );
     }
 
     /// FunDecl::unstructured keeps rustc unwind cleanup at its original

@@ -1363,6 +1363,11 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
+                        || self.into_place_types_identity(
+                            &reg,
+                            first_arg_ty.as_ref(),
+                            &call.dest.ty,
+                        )
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.from_string_path_identity(
                             &reg,
@@ -9454,6 +9459,12 @@ impl<'a> Lowering<'a> {
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
         let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
         let fd = self.llbc.fn_by_id(fn_id)?;
+        // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
+        // Naming that graph residualizes the unspecialized Into path;
+        // Identity / Target run at `lower_call` / `call_target_segments`.
+        if fun_decl_is_convert_into_impl(self.llbc, fd) {
+            return None;
+        }
         // No unstructured body: keep the ordinary `CallKind::Trait` route.
         // A spec path for this method would name a graph nobody registers.
         // A zero-arg opaque impl method is the exception: it has no body
@@ -9461,6 +9472,23 @@ impl<'a> Lowering<'a> {
         // the impl path when `foreign_opaque_method_result_valuetype`
         // accepts the result (`Default::default` on an opaque `Self`).
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            // Reflexive `impl<T> From<T> for T` is opaque in core; a
+            // Trait call still selects that impl. Direct Fun calls
+            // alias (`is_reflexive_from`); a residual path must name
+            // `FunctionDesc.cachedgraph` of the identity body
+            // (`description.py` `getuniquegraph` / `specialize`).
+            if fun_decl_is_reflexive_from(self.llbc, fd)
+                && let Some(segments) = self.enqueue_spec(fd, &generics)
+            {
+                return Some((segments, None));
+            }
+            let path = fd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or("fn");
+            // Any other selected `From` impl: the registered identity
+            // path, not the generic trait residual `["From", "from"]`.
+            if fun_decl_is_convert_from_impl(self.llbc, fd) {
+                return Some((spec_segments(self.llbc, fd, leaf), None));
+            }
             return self.opaque_nullary_impl_target(fd);
         }
         let path = fd.item_meta.name_path();
@@ -9507,9 +9535,22 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
+        // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
+        // Copying that body residualizes `["From", "from"]`; the
+        // selected From impl is the graph (`description.py`
+        // `ClassDesc.lookup`).
+        if fun_decl_is_convert_into_impl(self.llbc, fd) {
+            return None;
+        }
         // Only a body this LLBC extracted can be copied. An opaque
-        // declaration (a foreign crate's or std's) keeps its bare path.
-        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        // declaration (a foreign crate's or std's) keeps its bare path,
+        // except the reflexive `impl<T> From<T> for T`: its body is
+        // identity (`fn from(t: T) -> T { t }`) and
+        // `FunctionDesc.getuniquegraph` still builds that graph
+        // (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+            && !fun_decl_is_reflexive_from(self.llbc, fd)
+        {
             return None;
         }
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
@@ -9647,22 +9688,23 @@ impl<'a> Lowering<'a> {
                     if let Some(leaf) = instance_leaf(self.llbc, fd) {
                         return (spec_segments(self.llbc, fd, &leaf), None);
                     }
-                    if let Some(segments) = self.specialized_fun_segments(fd, reg) {
-                        return (segments, None);
-                    }
-                    if let Some(segments) = self.residual_generic_fun_segments(fd, &reg.generics) {
-                        return (segments, None);
-                    }
                     // Blanket `impl<T, U: From<T>> Into<U> for T`
                     // (core::convert) — `x.into()` is `U::from(x)`.
                     // The callsite's resolved `U: From<T>` obligation
                     // names the concrete From impl, so devirtualize to
                     // that impl's `from` the way rustc's
                     // monomorphization does.  The blanket body itself
-                    // is generic-trait shaped and never lifts.  (The
-                    // reflexive `Identity` outcome is intercepted at
-                    // `lower_call` before reaching here.)
+                    // is generic-trait shaped and never lifts: run this
+                    // before `enqueue_spec` copies it.  (The reflexive
+                    // `Identity` outcome is intercepted at `lower_call`
+                    // before reaching here.)
                     if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                        return (segments, None);
+                    }
+                    if let Some(segments) = self.specialized_fun_segments(fd, reg) {
+                        return (segments, None);
+                    }
+                    if let Some(segments) = self.residual_generic_fun_segments(fd, &reg.generics) {
                         return (segments, None);
                     }
                     if let Some(segments) =
@@ -9711,6 +9753,11 @@ impl<'a> Lowering<'a> {
             // the trait-method shape (e.g. when arr[2] is missing or
             // points at an `Impl` block).
             CallKind::Trait(v) => {
+                // Same Target-before-spec as the Fun arm: a Trait
+                // `into` is still `U::from(self)` (`ClassDesc.lookup`).
+                if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                    return Ok((segments, None));
+                }
                 if let Some(target) = self.specialized_trait_target(v) {
                     return Ok(target);
                 }

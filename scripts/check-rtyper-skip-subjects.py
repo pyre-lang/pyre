@@ -149,6 +149,20 @@ def baseline_path() -> pathlib.Path:
     return ROOT / "majit" / f"rtyper-skip-subjects.{platform_key()}.txt"
 
 
+# Where cargo keeps a build script's stderr, relative to BUILD_DIR.  Up to
+# 1.99 the run directory is `<pkg>-<hash>/` and holds both `out/` and
+# `stderr`; from 1.100 it is `<pkg>/<hash>/`, with `out/` there and the
+# stderr under `run/`.
+STDERR_GLOBS = (f"{PACKAGE}-*/stderr", f"{PACKAGE}/*/run/stderr")
+
+
+def stderr_beside(out_dir: pathlib.Path) -> pathlib.Path:
+    """The build script stderr that belongs to cargo's reported `out_dir`."""
+    unit_dir = out_dir.parent
+    new_layout = unit_dir / "run" / "stderr"
+    return new_layout if new_layout.is_file() else unit_dir / "stderr"
+
+
 def scan_for_stderr() -> pathlib.Path:
     """The one build script stderr on disk that holds a census.
 
@@ -161,13 +175,14 @@ def scan_for_stderr() -> pathlib.Path:
     """
     found = [
         (p.stat().st_mtime, p)
-        for p in sorted(BUILD_DIR.glob(f"{PACKAGE}-*/stderr"))
+        for pattern in STDERR_GLOBS
+        for p in sorted(BUILD_DIR.glob(pattern))
         if CENSUS_BANNER in p.read_text(errors="replace")
     ]
     if not found:
         sys.exit(
             f"error: no build script stderr under {BUILD_DIR.relative_to(ROOT)}/"
-            f"{PACKAGE}-*/ holds a `{CENSUS_BANNER}` line.\n"
+            f"{PACKAGE}* holds a `{CENSUS_BANNER}` line.\n"
             "  The census is off in every build on disk, so there is nothing "
             "to read. Take one by dropping --no-build."
         )
@@ -210,8 +225,7 @@ def run_build() -> pathlib.Path:
             f"error: cargo reported no build script for {PACKAGE}.\n"
             "  Nothing ran the prepass, so there is no census to read."
         )
-    # `out_dir` is `<build>/<pkg>-<hash>/out`; the stderr sits beside it.
-    return out_dirs[-1].parent / "stderr"
+    return stderr_beside(out_dirs[-1])
 
 
 def parse(text: str) -> dict[str, set[str]]:

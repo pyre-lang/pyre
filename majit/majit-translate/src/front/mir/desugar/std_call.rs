@@ -7707,20 +7707,35 @@ impl<'a> Lowering<'a> {
     /// `OpArg` argument, so the `From` sees a `u32` on both sides and
     /// rustc selects the reflexive impl.
     pub(in crate::front::mir) fn is_reflexive_from(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if fd.item_meta.name_path() != "core::convert::<Impl>::from" {
-            return false;
-        }
-        let Some(src) = fd.signature.inputs.first() else {
-            return false;
-        };
-        match (self.tyref_body(src), self.tyref_body(&fd.signature.output)) {
-            (Some(src_ty), Some(dst_ty)) => src_ty == dst_ty,
+        match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => {
+                let Some(fd) = self.llbc.fn_by_id(*id) else {
+                    return false;
+                };
+                if fun_decl_is_reflexive_from(self.llbc, fd) {
+                    return true;
+                }
+                // Inherent `From::from` fixtures have no TraitImpl id; the
+                // declared `from(T) -> T` signature is the same identity.
+                if fd.item_meta.name_path() != "core::convert::<Impl>::from" {
+                    return false;
+                }
+                let Some(src) = fd.signature.inputs.first() else {
+                    return false;
+                };
+                match (self.tyref_body(src), self.tyref_body(&fd.signature.output)) {
+                    (Some(src_ty), Some(dst_ty)) => src_ty == dst_ty,
+                    _ => false,
+                }
+            }
+            // Blanket `Into` copies `U::from(self)` as `CallKind::Trait`.
+            // The selected impl is the same `impl_trait` pair
+            // `fun_decl_is_reflexive_from` reads off a Fun call
+            // (`description.py` `ClassDesc.lookup`).
+            CallKind::Trait(payload) => {
+                crate::front::clause_spec::resolved_trait_impl_id(payload, self.llbc)
+                    .is_some_and(|impl_id| trait_impl_is_reflexive_from(self.llbc, impl_id))
+            }
             _ => false,
         }
     }
@@ -8405,10 +8420,54 @@ impl<'a> Lowering<'a> {
         &self,
         reg: &RegularCall,
     ) -> Option<IntoDevirt> {
-        if !self.callee_is_blanket_into(reg) {
+        match &reg.kind {
+            CallKind::Fun(_) => {
+                if !self.callee_is_blanket_into(reg) {
+                    return None;
+                }
+                self.from_obligation_devirt(reg.generics.get("trait_refs")?.as_array()?)
+            }
+            // Blanket `TryFrom` / `impl Into<T>` copies `value.into()` as
+            // `CallKind::Trait`. Same `U::from(self)` decision as the Fun
+            // arm (`description.py` `ClassDesc.lookup`).
+            CallKind::Trait(payload) => self.into_devirt_from_trait_payload(payload),
+            _ => None,
+        }
+    }
+
+    /// `Into<U> for T` whose type args are equal is identity; otherwise
+    /// the nested `U: From<T>` obligation is [`Self::from_obligation_devirt`].
+    pub(in crate::front::mir) fn into_devirt_from_trait_payload(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<IntoDevirt> {
+        let tref = payload.as_array()?.first()?;
+        let decl_id = traitref_decl_id(tref, self.llbc, 0)?;
+        if !trait_decl_is_convert_into(self.llbc, decl_id) {
             return None;
         }
-        let trait_refs = reg.generics.get("trait_refs")?.as_array()?;
+        let unwrapped = traitref_unwrap(tref, self.llbc, 0)?;
+        if let Some(types) = crate::front::clause_spec::trait_decl_pred(unwrapped)
+            .and_then(|decl| decl.get("generics"))
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            && from_trait_args_are_reflexive(types)
+        {
+            return Some(IntoDevirt::Identity);
+        }
+        let from_refs = unwrapped
+            .pointer("/kind/TraitImpl/generics/trait_refs")
+            .and_then(serde_json::Value::as_array);
+        from_refs.and_then(|refs| self.from_obligation_devirt(refs.as_slice()))
+    }
+
+    /// Walk `U: From<T>` trait refs: equal args are
+    /// [`IntoDevirt::Identity`]; a selected impl is
+    /// [`IntoDevirt::Target`] of that `from` (`spec_segments`).
+    pub(in crate::front::mir) fn from_obligation_devirt(
+        &self,
+        trait_refs: &[serde_json::Value],
+    ) -> Option<IntoDevirt> {
         for tref in trait_refs {
             let Some(tref) = traitref_unwrap(tref, self.llbc, 0) else {
                 continue;
@@ -8419,11 +8478,7 @@ impl<'a> Lowering<'a> {
             let Some(decl_id) = decl.get("id").and_then(serde_json::Value::as_u64) else {
                 continue;
             };
-            let is_from = self
-                .llbc
-                .trait_by_id(decl_id)
-                .is_some_and(|td| td.item_meta.name_path() == "core::convert::From");
-            if !is_from {
+            if !trait_decl_is_convert_from(self.llbc, decl_id) {
                 continue;
             }
             // `U: From<T>` decl-ref generics carry `[U, T]`; equal
@@ -8431,14 +8486,8 @@ impl<'a> Lowering<'a> {
             // hash-cons id so an inline `Value: [id, …]`
             // matches its `Deduplicated: id` reference.
             let types = decl.get("generics")?.get("types")?.as_array()?;
-            if types.len() == 2 {
-                let reflexive = match (ty_dedup_key(&types[0]), ty_dedup_key(&types[1])) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => types[0] == types[1],
-                };
-                if reflexive {
-                    return Some(IntoDevirt::Identity);
-                }
+            if from_trait_args_are_reflexive(types) {
+                return Some(IntoDevirt::Identity);
             }
             let impl_id = traitref_impl_id(tref, self.llbc, 0)?;
             let fn_id = self
@@ -8453,14 +8502,45 @@ impl<'a> Lowering<'a> {
                     m.fn_id
                 })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
-            let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
-            let identity = crate::front::clause_spec::render_trait_impl(self.llbc, impl_id)?;
-            let path = crate::parse::CallPath::from_segments(trait_impl_identity_path(
-                &owner, &identity, &method,
-            ));
-            return Some(IntoDevirt::Target(path.segments));
+            let path = fd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or("from");
+            return Some(IntoDevirt::Target(spec_segments(self.llbc, fd, leaf)));
         }
         None
+    }
+
+    /// Blanket `Into` whose instantiated source and destination are the
+    /// same type — `T -> T` identity when the `U: From<T>` obligation is
+    /// still a `Clause` (a copied spec body) so
+    /// [`Self::from_obligation_devirt`] has nothing to read.
+    pub(in crate::front::mir) fn into_place_types_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        if !self.call_is_convert_into(reg) {
+            return false;
+        }
+        let Some(src) = first_arg_ty.and_then(|ty| self.tyref_body(ty)) else {
+            return false;
+        };
+        let Some(dst) = self.tyref_body(dest_ty) else {
+            return false;
+        };
+        from_trait_args_are_reflexive(&[src.clone(), dst.clone()])
+    }
+
+    fn call_is_convert_into(&self, reg: &RegularCall) -> bool {
+        match &reg.kind {
+            CallKind::Fun(_) => self.callee_is_blanket_into(reg),
+            CallKind::Trait(payload) => payload
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|tref| traitref_decl_id(tref, self.llbc, 0))
+                .is_some_and(|decl_id| trait_decl_is_convert_into(self.llbc, decl_id)),
+            _ => false,
+        }
     }
 
     /// `msg.into()` on a generic parameter bound `T: Into<String>` or

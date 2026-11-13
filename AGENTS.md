@@ -98,7 +98,7 @@ python3 scripts/install-charon.py    # idempotent, usually a no-op
 python3 scripts/extract-llbc.py      # pyre-object pyre-interpreter pyre-module pyre-jit
 touch pyre/pyre-jit-trace/build.rs
 PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepass
-# census: target/release/build/pyre-jit-trace-*/stderr, rg -c 'PREPASS phaseA fail'
+# census: target/release/build/pyre-jit-trace-*/stderr (cargo >= 1.100: pyre-jit-trace/*/run/stderr), rg -c 'PREPASS phaseA fail'
 ```
 
 - `extract-llbc.py` **skips** a crate whose source fingerprint is unchanged;
