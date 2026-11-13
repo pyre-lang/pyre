@@ -457,18 +457,15 @@ fn waitid_result_seq_type() -> PyObjectRef {
 }
 
 /// `posix.sched_param` structseq — the single field `app_posix.py`
-/// declares.  `_structseq.py:102-107` already wraps the scalar a 1-field
+/// declares.  `_structseq.py` already wraps the scalar a 1-field
 /// structseq is handed, so `__new__` only has to name the argument;
 /// `__reduce__` has to be replaced outright, because the generic one hands
 /// back `(tuple(self), self.__dict__)` and this `__new__` takes one argument.
-#[cfg(all(
-    unix,
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
+/// `moduledef.py` publishes the type with `sched_getparam`. posix_spawn's
+/// scheduler tuple on linux also isinstance-checks it.
+#[cfg(any(
+    rposix_have_sched_getparam,
+    all(target_os = "linux", not(target_env = "musl"))
 ))]
 fn sched_param_seq_type() -> PyObjectRef {
     static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
@@ -514,14 +511,9 @@ fn sched_param_seq_type() -> PyObjectRef {
 
 /// `os_sched_param_reduce` — `(type(self), (self[0],))`, the one shape this
 /// type's own `__new__` can be called back with.
-#[cfg(all(
-    unix,
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
+#[cfg(any(
+    rposix_have_sched_getparam,
+    all(target_os = "linux", not(target_env = "musl"))
 ))]
 fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some(&inst) = args.first().filter(|inst| !inst.is_null()) else {
@@ -548,16 +540,10 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// The `w_param` argument `sched_setparam` and `sched_setscheduler` share.
 /// `interp_posix.py` refuses anything that is not a `sched_param`,
 /// reads field 0 through the sequence protocol, and refuses a priority the C
-/// `int` cannot hold.
-#[cfg(all(
-    unix,
-    not(target_env = "musl"),
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
+/// `int` cannot hold. posix_spawn's scheduler tuple on linux uses it too.
+#[cfg(any(
+    all(rposix_have_sched_getparam, not(target_env = "musl")),
+    all(target_os = "linux", not(target_env = "musl"))
 ))]
 fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -2274,39 +2260,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
-        // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        for (name, val) in [
-            ("MFD_CLOEXEC", libc::MFD_CLOEXEC as i64),
-            ("MFD_ALLOW_SEALING", libc::MFD_ALLOW_SEALING as i64),
-            ("MFD_HUGETLB", libc::MFD_HUGETLB as i64),
-            ("MFD_HUGE_SHIFT", libc::MFD_HUGE_SHIFT as i64),
-            ("MFD_HUGE_MASK", libc::MFD_HUGE_MASK as i64),
-            ("MFD_HUGE_64KB", libc::MFD_HUGE_64KB as i64),
-            ("MFD_HUGE_512KB", libc::MFD_HUGE_512KB as i64),
-            ("MFD_HUGE_1MB", libc::MFD_HUGE_1MB as i64),
-            ("MFD_HUGE_2MB", libc::MFD_HUGE_2MB as i64),
-            ("MFD_HUGE_8MB", libc::MFD_HUGE_8MB as i64),
-            ("MFD_HUGE_16MB", libc::MFD_HUGE_16MB as i64),
-            ("MFD_HUGE_32MB", libc::MFD_HUGE_32MB as i64),
-            ("MFD_HUGE_256MB", libc::MFD_HUGE_256MB as i64),
-            ("MFD_HUGE_512MB", libc::MFD_HUGE_512MB as i64),
-            ("MFD_HUGE_1GB", libc::MFD_HUGE_1GB as i64),
-            ("MFD_HUGE_2GB", libc::MFD_HUGE_2GB as i64),
-            ("MFD_HUGE_16GB", libc::MFD_HUGE_16GB as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+        // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists,
+        // and only the names whose probe value is not None.
+        #[cfg(rposix_have_memfd_create)]
+        for &(name, val) in majit_rlib::rposix::MFD_NAMES {
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
-        // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`.
-        // `rposix.XATTR_SIZE_MAX` is `linux/limits.h` (65536); libc has no
-        // `XATTR_SIZE_MAX`.
+        // `moduledef.py` publishes `CLONE_*` when `rposix.unshare` exists,
+        // and only the names whose probe value is not None.
+        #[cfg(rposix_have_unshare)]
+        for &(name, val) in majit_rlib::rposix::CLONE_NAMES {
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+        }
+        // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`
+        // and `getattr(rposix, _name) is not None`.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         for (name, val) in [
-            ("XATTR_SIZE_MAX", 65536i64),
-            ("XATTR_CREATE", libc::XATTR_CREATE as i64),
-            ("XATTR_REPLACE", libc::XATTR_REPLACE as i64),
+            ("XATTR_SIZE_MAX", majit_rlib::rposix::XATTR_SIZE_MAX),
+            ("XATTR_CREATE", majit_rlib::rposix::XATTR_CREATE),
+            ("XATTR_REPLACE", majit_rlib::rposix::XATTR_REPLACE),
         ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+            if let Some(val) = val {
+                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+            }
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
@@ -8447,17 +8423,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // The scheduling-policy group `moduledef.py:168-174` publishes as one —
-        // the two getters, the two setters and the `sched_param` type they
-        // exchange — plus `sched_rr_get_interval`, which `moduledef.py:166-167`
-        // gates on its own but which the same libcs carry. The setters are left
-        // out where the libc is musl, which declares neither.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "linux",
-            target_os = "netbsd"
-        ))]
+        // `moduledef.py` publishes `sched_rr_get_interval` /
+        // `sched_getscheduler` / `sched_getparam` / `sched_setparam` /
+        // `sched_param` when `hasattr(rposix, 'sched_getparam')` (and the
+        // interval name), which is `HAVE_SCHED_GETPARAM`. The setters are
+        // left out where the libc is musl, which declares neither.
+        #[cfg(rposix_have_sched_getparam)]
         {
             crate::__pyre_put_new!(ns_slot, "sched_param", sched_param_seq_type());
 
@@ -8479,12 +8450,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "sched_rr_get_interval() requires 1 argument",
                             ));
                         }
-                        // interp_posix.py:3061 `@unwrap_spec(pid=int)`; the
-                        // timespec the call fills is answered as one float
-                        // (`rposix.py:2525`).
+                        // interp_posix.py `sched_rr_get_interval` `@unwrap_spec(pid=int)`;
+                        // the TIMESPEC the call fills is answered as one float
+                        // (`rposix.sched_rr_get_interval`).
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                        let mut interval: libc::timespec =
-                            unsafe { core::mem::zeroed::<libc::timespec>() };
+                        let mut interval: majit_rlib::rposix::TIMESPEC =
+                            unsafe { core::mem::zeroed::<majit_rlib::rposix::TIMESPEC>() };
                         // interp_posix.py `sched_rr_get_interval`: retry on EINTR.
                         // `rposix.c_sched_rr_get_interval` uses
                         // `RFFI_FULL_ERRNO_ZERO` and releases the GIL.
@@ -8503,7 +8474,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             )?;
                         }
                         Ok(pyre_object::w_float_new(
-                            interval.tv_sec as f64 + 1e-9 * interval.tv_nsec as f64,
+                            interval.c_tv_sec as f64 + 1e-9 * interval.c_tv_nsec as f64,
                         ))
                     },
                     1,
@@ -8522,7 +8493,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "sched_getscheduler() requires 1 argument",
                             ));
                         }
-                        // interp_posix.py:3073 `@unwrap_spec(pid=int)`.
+                        // interp_posix.py `sched_getscheduler` `@unwrap_spec(pid=int)`.
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         // interp_posix.py `sched_getscheduler`: retry on EINTR.
                         // `rposix.c_sched_getscheduler` uses
@@ -8557,15 +8528,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "sched_getparam() requires 1 argument",
                             ));
                         }
-                        // interp_posix.py:3103 `@unwrap_spec(pid=int)`; the
-                        // priority the call fills in is handed back wrapped in
-                        // the type, not bare (`interp_posix.py:3113`).
+                        // interp_posix.py `sched_getparam` `@unwrap_spec(pid=int)`;
+                        // the priority the call fills in is handed back wrapped
+                        // in the type, not bare.
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         // interp_posix.py `sched_getparam`: retry on EINTR.
                         // `rposix.c_sched_getparam` uses `RFFI_FULL_ERRNO_ZERO`
                         // and releases the GIL.
                         let param = loop {
-                            let mut param: libc::sched_param = unsafe { core::mem::zeroed() };
+                            let mut param: majit_rlib::rposix::SCHED_PARAM =
+                                unsafe { core::mem::zeroed() };
                             let ret =
                                 unsafe { majit_rlib::rposix::c_sched_getparam(pid, &mut param) };
                             if ret >= 0 {
@@ -8580,16 +8552,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         };
                         Ok(crate::_structseq::new_instance(
                             sched_param_seq_type(),
-                            vec![pyre_object::w_int_new(param.sched_priority as i64)],
+                            vec![pyre_object::w_int_new(param.c_sched_priority as i64)],
                         ))
                     },
                     1,
                 )
             );
 
-            // Both setters answer None. `interp_posix.py:3097`/`:3131` hand
-            // back the raw `handle_posix_error` result instead, which is 0 on
-            // every success and which `os.sched_setparam` does not publish.
+            // Both setters answer None. `interp_posix.sched_setscheduler` /
+            // `sched_setparam` hand back the raw `handle_posix_error` result
+            // instead, which is 0 on every success and which `os.sched_setparam`
+            // does not publish.
             #[cfg(not(target_env = "musl"))]
             {
                 // os.sched_setscheduler(pid, policy, param)
@@ -8615,9 +8588,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 crate::baseobjspace::int_w(w_policy)
                             })? as libc::c_int;
                             let priority = sched_priority_w(w_param)?;
-                            let mut param: libc::sched_param =
-                                unsafe { core::mem::zeroed::<libc::sched_param>() };
-                            param.sched_priority = priority;
+                            let mut param: majit_rlib::rposix::SCHED_PARAM =
+                                unsafe { core::mem::zeroed::<majit_rlib::rposix::SCHED_PARAM>() };
+                            param.c_sched_priority = priority;
                             // interp_posix.py `sched_setscheduler`: retry on EINTR.
                             // `rposix.c_sched_setscheduler` uses
                             // `RFFI_FULL_ERRNO_ZERO` and releases the GIL.
@@ -8653,16 +8626,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                     "sched_setparam() requires 2 arguments",
                                 ));
                             }
-                            // interp_posix.py:3117 `@unwrap_spec(pid=int)`.
+                            // interp_posix.py `sched_setparam` `@unwrap_spec(pid=int)`.
                             let w_pid = args[0];
                             let mut w_param = args[1];
                             let pid = pyre_object::with_roots!(w_param => {
                                 crate::baseobjspace::c_int_w(w_pid)
                             })? as libc::pid_t;
                             let priority = sched_priority_w(w_param)?;
-                            let mut param: libc::sched_param =
-                                unsafe { core::mem::zeroed::<libc::sched_param>() };
-                            param.sched_priority = priority;
+                            let mut param: majit_rlib::rposix::SCHED_PARAM =
+                                unsafe { core::mem::zeroed::<majit_rlib::rposix::SCHED_PARAM>() };
+                            param.c_sched_priority = priority;
                             // interp_posix.py `sched_setparam`: retry on EINTR.
                             // `rposix.c_sched_setparam` uses
                             // `RFFI_FULL_ERRNO_ZERO` and releases the GIL.
@@ -8842,10 +8815,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // interp_posix.py `memfd_create`. `rposix.c_memfd_create` releases
         // the GIL and saves errno. Default flags are `rposix.MFD_CLOEXEC`.
-        #[cfg(all(
-            not(feature = "sandbox"),
-            any(target_os = "linux", target_os = "android")
-        ))]
+        #[cfg(all(not(feature = "sandbox"), rposix_have_memfd_create))]
         crate::__pyre_put_new!(
             ns_slot,
             "memfd_create",
@@ -8867,7 +8837,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::text_w(w_name)
                     })?;
                     let flags = if w_flags.is_null() {
-                        libc::MFD_CLOEXEC as majit_rlib::rffi::UINT
+                        majit_rlib::rposix::MFD_CLOEXEC.expect("MFD_CLOEXEC")
+                            as majit_rlib::rffi::UINT
                     } else {
                         pyre_object::with_roots!(w_name, w_flags => {
                             crate::baseobjspace::int_w(w_flags)
@@ -8892,15 +8863,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
+        // interp_posix.py `unshare`. `rposix.c_unshare` releases the GIL and
+        // saves errno. `wrap_oserror(..., eintr_retry=False)`.
+        #[cfg(all(not(feature = "sandbox"), rposix_have_unshare))]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "unshare",
+            crate::make_builtin_function_with_arity(
+                "unshare",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("unshare() requires 1 argument"));
+                    }
+                    // interp_posix.py `@unwrap_spec(flags=c_int)`.
+                    let flags = crate::baseobjspace::c_int_w(args[0])? as majit_rlib::rffi::INT;
+                    let ret = unsafe { majit_rlib::rposix::c_unshare(flags) };
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            )
+        );
+
         // interp_posix.py `getxattr` / `setxattr` / `removexattr` / `listxattr`.
         // `rposix.c_*xattr` release the GIL and save errno. ERANGE retries
-        // `rposix.buf_sizes` = [256, XATTR_SIZE_MAX] in the product builtin.
+        // `rposix.buf_sizes`.
         #[cfg(all(
             not(feature = "sandbox"),
             any(target_os = "linux", target_os = "android")
         ))]
         {
-            const XATTR_BUF_SIZES: [usize; 2] = [256, 65536];
+            const XATTR_BUF_SIZES: [usize; 2] = majit_rlib::rposix::BUF_SIZES;
             crate::__pyre_put_new!(
                 ns_slot,
                 "getxattr",
@@ -15566,17 +15564,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // The policy calls reach the host scheduler; only the setters mutate,
         // but a policy read is a host-process leak in the same way `getpriority`
         // above is. `sched_param` is left alone — it carries no host access.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "linux",
-            target_os = "netbsd"
-        ))]
-        for name in [
-            "sched_getscheduler",
-            "sched_getparam",
-            "sched_rr_get_interval",
-        ] {
+        #[cfg(rposix_have_sched_getparam)]
+        for name in ["sched_getscheduler", "sched_getparam", "sched_rr_get_interval"] {
             crate::__pyre_put_new!(
                 ns_slot,
                 name,
@@ -15589,7 +15578,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         for name in [
             "sched_getaffinity",
             "sched_setaffinity",
-            "memfd_create",
             "getxattr",
             "setxattr",
             "removexattr",
@@ -15601,6 +15589,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::make_builtin_function(name, sandbox_unavailable)
             );
         }
+        #[cfg(rposix_have_memfd_create)]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "memfd_create",
+            crate::make_builtin_function("memfd_create", sandbox_unavailable)
+        );
+        #[cfg(rposix_have_unshare)]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "unshare",
+            crate::make_builtin_function("unshare", sandbox_unavailable)
+        );
         #[cfg(rposix_have_fadvise)]
         for name in ["posix_fallocate", "posix_fadvise"] {
             crate::__pyre_put_new!(
@@ -15609,15 +15609,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::make_builtin_function(name, sandbox_unavailable)
             );
         }
-        #[cfg(all(
-            not(target_env = "musl"),
-            any(
-                target_os = "android",
-                target_os = "freebsd",
-                target_os = "linux",
-                target_os = "netbsd"
-            )
-        ))]
+        #[cfg(all(rposix_have_sched_getparam, not(target_env = "musl")))]
         for name in ["sched_setscheduler", "sched_setparam"] {
             crate::__pyre_put_new!(
                 ns_slot,

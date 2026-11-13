@@ -22,6 +22,21 @@ pub mod cConfig {
 /// `rposix.py` `dirent_config` `DIRENT`.
 #[cfg(unix)]
 pub use cConfig::DIRENT;
+/// `rposix.py` `if HAVE_SCHED_GETPARAM:` `SCHED_PARAM`.
+#[cfg(rposix_have_sched_getparam)]
+pub use cConfig::SCHED_PARAM;
+/// `rposix.py` linux `CConfig` `XATTR_*`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{XATTR_CREATE, XATTR_REPLACE, XATTR_SIZE_MAX};
+/// `rposix.buf_sizes`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const BUF_SIZES: [usize; 2] = [
+    256,
+    match XATTR_SIZE_MAX {
+        Some(v) => v as usize,
+        None => panic!("XATTR_SIZE_MAX"),
+    },
+];
 /// `rposix.py` `times_config` `TIMEVAL`.
 #[cfg(rposix_have_utimes)]
 pub use cConfig::TIMEVAL;
@@ -43,6 +58,13 @@ pub use cConfig::{
     HAVE_FADVISE, HAVE_FALLOCATE, HAVE_PIPE2, HAVE_UTIMES, O_NONBLOCK, OFF_T, OFF_T_SIZE,
     PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
     SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
+};
+/// `rposix.py` linux `CConfig` `CLONE_*` / `HAVE_UNSHARE`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{
+    CLONE_FILES, CLONE_FS, CLONE_NAMES, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
+    CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SIGHAND, CLONE_SYSVSEM,
+    CLONE_THREAD, CLONE_VM, HAVE_UNSHARE,
 };
 /// `rposix.py` `ConfConfig` `pathconf_names` / `confstr_names` / `sysconf_names`.
 #[cfg(unix)]
@@ -68,6 +90,14 @@ pub use cConfig::{
     HAVE_LCHMOD, HAVE_LCHOWN, HAVE_LINKAT, HAVE_LSTAT, HAVE_LUTIMES, HAVE_MKDIRAT, HAVE_MKFIFOAT,
     HAVE_MKNODAT, HAVE_OPENAT, HAVE_READLINKAT, HAVE_RENAMEAT, HAVE_SCHED_GETPARAM, HAVE_SYMLINKAT,
     HAVE_UNLINKAT, HAVE_UTIMENSAT,
+};
+/// `rposix.py` linux `CConfig` `MFD_*` / `HAVE_MEMFD_CREATE`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{
+    HAVE_MEMFD_CREATE, MFD_ALLOW_SEALING, MFD_CLOEXEC, MFD_HUGE_1GB, MFD_HUGE_1MB, MFD_HUGE_2GB,
+    MFD_HUGE_2MB, MFD_HUGE_8MB, MFD_HUGE_16GB, MFD_HUGE_16MB, MFD_HUGE_32MB, MFD_HUGE_64KB,
+    MFD_HUGE_256MB, MFD_HUGE_512KB, MFD_HUGE_512MB, MFD_HUGE_MASK, MFD_HUGE_SHIFT, MFD_HUGETLB,
+    MFD_NAMES,
 };
 /// `rposix.py` `advise_config`.
 #[cfg(rposix_have_fadvise)]
@@ -2440,29 +2470,20 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix.c_sched_rr_get_interval`, `c_sched_getscheduler`,
-// `c_sched_getparam`, `c_sched_setscheduler`, and `c_sched_setparam` use
-// `RFFI_FULL_ERRNO_ZERO`. The setters are absent from musl.
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+// `rposix.c_sched_rr_get_interval`, `c_sched_getscheduler`, `c_sched_getparam`,
+// `c_sched_setscheduler`, and `c_sched_setparam` sit under
+// `if HAVE_SCHED_GETPARAM:`. They use `RFFI_FULL_ERRNO_ZERO`. The setters
+// are absent from musl.
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_rr_get_interval = "sched_rr_get_interval",
-    [libc::pid_t, *mut libc::timespec],
+    [libc::pid_t, *mut TIMESPEC],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_getscheduler = "sched_getscheduler",
     [libc::pid_t],
@@ -2471,58 +2492,38 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_getparam = "sched_getparam",
-    [libc::pid_t, *mut libc::sched_param],
+    [libc::pid_t, *mut SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(all(
-    not(target_env = "musl"),
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
-))]
+#[cfg(all(rposix_have_sched_getparam, not(target_env = "musl")))]
 crate::rffi::llexternal!(
     pub c_sched_setscheduler = "sched_setscheduler",
-    [libc::pid_t, crate::rffi::INT, *const libc::sched_param],
+    [libc::pid_t, crate::rffi::INT, *const SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(all(
-    not(target_env = "musl"),
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
-))]
+#[cfg(all(rposix_have_sched_getparam, not(target_env = "musl")))]
 crate::rffi::llexternal!(
     pub c_sched_setparam = "sched_setparam",
-    [libc::pid_t, *const libc::sched_param],
+    [libc::pid_t, *const SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-// `rposix.c_unshare`, `c_sched_getaffinity`, and `c_sched_setaffinity`
-// save errno. `sys.platform.startswith('linux')`. The affinity mask is a
+// `rposix.c_unshare` saves errno. Behind `HAVE_UNSHARE`.
+// `c_sched_getaffinity` and `c_sched_setaffinity` save errno.
+// `sys.platform.startswith('linux')`. The affinity mask is a
 // `c_ulong` word array (`rposix.CPU_MASK_P`), not `cpu_set_t`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(rposix_have_unshare)]
 crate::rffi::llexternal!(
     pub c_unshare = "unshare",
     [crate::rffi::INT],
@@ -3238,14 +3239,15 @@ pub fn sendfile_hdtr(
 }
 
 // `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// Behind `HAVE_MEMFD_CREATE`.
+#[cfg(rposix_have_memfd_create)]
 crate::rffi::external_compilation_info! {
     const MMAN_ECI = {
         includes: ["sys/mman.h"],
     };
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(rposix_have_memfd_create)]
 crate::rffi::llexternal!(
     pub c_memfd_create = "memfd_create",
     [*const libc::c_char, crate::rffi::UINT],
@@ -3644,6 +3646,26 @@ mod tests {
             std::mem::size_of::<TIMESPEC>(),
             std::mem::size_of::<libc::timespec>()
         );
+        #[cfg(rposix_have_sched_getparam)]
+        assert_eq!(
+            std::mem::size_of::<SCHED_PARAM>(),
+            std::mem::size_of::<libc::sched_param>()
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(HAVE_SCHED_GETPARAM);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(!HAVE_SCHED_GETPARAM);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(XATTR_SIZE_MAX, Some(65536));
+            assert_eq!(XATTR_CREATE, Some(libc::XATTR_CREATE as i32));
+            assert_eq!(XATTR_REPLACE, Some(libc::XATTR_REPLACE as i32));
+            assert_eq!(BUF_SIZES, [256, 65536]);
+            assert!(HAVE_MEMFD_CREATE);
+            assert_eq!(MFD_CLOEXEC, Some(libc::MFD_CLOEXEC as i32));
+            assert!(HAVE_UNSHARE);
+            assert_eq!(CLONE_FILES, Some(libc::CLONE_FILES as i32));
+        }
         assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
         assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
         assert_eq!(AT_SYMLINK_NOFOLLOW, Some(libc::AT_SYMLINK_NOFOLLOW as i32));
@@ -4909,13 +4931,22 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(rposix_have_unshare)]
+    #[test]
+    fn c_unshare_zero_flags_or_saves_errno() {
+        let ret = unsafe { c_unshare(0) };
+        if ret < 0 {
+            assert_ne!(get_saved_errno(), 0);
+        }
+    }
+
+    #[cfg(rposix_have_memfd_create)]
     #[test]
     fn c_memfd_create_opens_or_saves_errno() {
         let fd = unsafe {
             c_memfd_create(
                 c"pyre-rffi-memfd".as_ptr(),
-                libc::MFD_CLOEXEC as crate::rffi::UINT,
+                MFD_CLOEXEC.expect("MFD_CLOEXEC") as crate::rffi::UINT,
             )
         };
         if fd >= 0 {
@@ -4990,7 +5021,7 @@ mod tests {
                 name.as_ptr(),
                 value.as_ptr() as *const libc::c_char,
                 value.len(),
-                libc::XATTR_CREATE as crate::rffi::INT,
+                XATTR_CREATE.expect("XATTR_CREATE") as crate::rffi::INT,
             )
         };
         if ret < 0 {

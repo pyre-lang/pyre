@@ -15,6 +15,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_chflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_lchflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fexecve)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_sched_getparam)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_memfd_create)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_unshare)");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_PIPE2");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_FADVISE");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_FALLOCATE");
@@ -22,6 +25,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_CHFLAGS");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_LCHFLAGS");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_FEXECVE");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_SCHED_GETPARAM");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_MEMFD_CREATE");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_UNSHARE");
     // These mirror `moduledef.py`'s `rposix.HAVE_PIPE2` / `hasattr(rposix, 'posix_fadvise')`.
     if std::env::var("DEP_MAJIT_RLIB_HAVE_PIPE2").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=rposix_have_pipe2");
@@ -43,6 +49,15 @@ fn main() {
     }
     if std::env::var("DEP_MAJIT_RLIB_HAVE_FEXECVE").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=rposix_have_fexecve");
+    }
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_SCHED_GETPARAM").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rposix_have_sched_getparam");
+    }
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_MEMFD_CREATE").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rposix_have_memfd_create");
+    }
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_UNSHARE").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rposix_have_unshare");
     }
     majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     let target = std::env::var("TARGET").unwrap_or_default();

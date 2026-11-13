@@ -3,8 +3,11 @@
 //! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
 //! `configure(CConfig)`), `rposix.py` `pipe_config`, `advise_config`, and
 //! the "f... and ...at families" `CConfig`, the `AT_*`/`UTIME_*`/
-//! `TIMESPEC` `CConfig`, and `ConfConfig` (`pathconf_consts_defs` /
-//! `confstr_consts_defs` / `sysconf_consts_defs`) probes go through
+//! `TIMESPEC` `CConfig`, `ConfConfig` (`pathconf_consts_defs` /
+//! `confstr_consts_defs` / `sysconf_consts_defs`), and the
+//! `HAVE_SCHED_GETPARAM` `SCHED_PARAM` `CConfig`, the linux `XATTR_*`
+//! `CConfig`, the linux `MFD_*` / `HAVE_MEMFD_CREATE` `CConfig`, and the
+//! linux `CLONE_*` / `HAVE_UNSHARE` `CConfig` probes go through
 //! `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -54,6 +57,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_chflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_lchflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fexecve)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_sched_getparam)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_memfd_create)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_unshare)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -72,19 +78,11 @@ fn main() {
     {
         write_clibffi_cconfig();
     }
-    let (
-        have_pipe2,
-        have_fadvise,
-        have_fallocate,
-        have_d_type,
-        have_chflags,
-        have_lchflags,
-        have_fexecve,
-    ) = if target_is_unix_or_windows() {
+    let haves = if target_is_unix_or_windows() {
         write_rdynload_cconfig();
         write_rposix_cconfig(&pipe_config)
     } else {
-        (false, false, false, false, false, false, false)
+        RposixHaves::default()
     };
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
@@ -93,13 +91,22 @@ fn main() {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
         ..Default::default()
     });
-    println!("cargo::metadata=HAVE_PIPE2={}", have_pipe2 as u8);
-    println!("cargo::metadata=HAVE_FADVISE={}", have_fadvise as u8);
-    println!("cargo::metadata=HAVE_FALLOCATE={}", have_fallocate as u8);
-    println!("cargo::metadata=HAVE_D_TYPE={}", have_d_type as u8);
-    println!("cargo::metadata=HAVE_CHFLAGS={}", have_chflags as u8);
-    println!("cargo::metadata=HAVE_LCHFLAGS={}", have_lchflags as u8);
-    println!("cargo::metadata=HAVE_FEXECVE={}", have_fexecve as u8);
+    println!("cargo::metadata=HAVE_PIPE2={}", haves.pipe2 as u8);
+    println!("cargo::metadata=HAVE_FADVISE={}", haves.fadvise as u8);
+    println!("cargo::metadata=HAVE_FALLOCATE={}", haves.fallocate as u8);
+    println!("cargo::metadata=HAVE_D_TYPE={}", haves.d_type as u8);
+    println!("cargo::metadata=HAVE_CHFLAGS={}", haves.chflags as u8);
+    println!("cargo::metadata=HAVE_LCHFLAGS={}", haves.lchflags as u8);
+    println!("cargo::metadata=HAVE_FEXECVE={}", haves.fexecve as u8);
+    println!(
+        "cargo::metadata=HAVE_SCHED_GETPARAM={}",
+        haves.sched_getparam as u8
+    );
+    println!(
+        "cargo::metadata=HAVE_MEMFD_CREATE={}",
+        haves.memfd_create as u8
+    );
+    println!("cargo::metadata=HAVE_UNSHARE={}", haves.unshare as u8);
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -216,6 +223,48 @@ const RPOSIX_AT_CONST_NAMES: &[&str] = &[
     "AT_EMPTY_PATH",
     "UTIME_NOW",
     "UTIME_OMIT",
+];
+
+/// `rposix.py` linux `CConfig` `XATTR_*` (`DefinedConstantInteger`).
+const RPOSIX_XATTR_CONST_NAMES: &[&str] = &["XATTR_SIZE_MAX", "XATTR_CREATE", "XATTR_REPLACE"];
+
+/// `rposix.py` linux `CConfig` `MFD_*` (`DefinedConstantInteger`), upstream order.
+const RPOSIX_MFD_CONST_NAMES: &[&str] = &[
+    "MFD_CLOEXEC",
+    "MFD_ALLOW_SEALING",
+    "MFD_HUGETLB",
+    "MFD_HUGE_SHIFT",
+    "MFD_HUGE_MASK",
+    "MFD_HUGE_64KB",
+    "MFD_HUGE_512KB",
+    "MFD_HUGE_1MB",
+    "MFD_HUGE_2MB",
+    "MFD_HUGE_8MB",
+    "MFD_HUGE_16MB",
+    "MFD_HUGE_32MB",
+    "MFD_HUGE_256MB",
+    "MFD_HUGE_512MB",
+    "MFD_HUGE_1GB",
+    "MFD_HUGE_2GB",
+    "MFD_HUGE_16GB",
+];
+
+/// `rposix.py` linux `CConfig` `CLONE_*` (`DefinedConstantInteger`), upstream order.
+const RPOSIX_CLONE_CONST_NAMES: &[&str] = &[
+    "CLONE_FILES",
+    "CLONE_FS",
+    "CLONE_NEWCGROUP",
+    "CLONE_NEWIPC",
+    "CLONE_NEWNET",
+    "CLONE_NEWNS",
+    "CLONE_NEWPID",
+    "CLONE_NEWTIME",
+    "CLONE_NEWUSER",
+    "CLONE_NEWUTS",
+    "CLONE_SIGHAND",
+    "CLONE_SYSVSEM",
+    "CLONE_THREAD",
+    "CLONE_VM",
 ];
 
 /// `rposix.py` `pathconf_consts_defs` (key, C macro).
@@ -647,11 +696,24 @@ fn rposix_pipe_config() -> Vec<(String, ConfigValue)> {
     configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"))
 }
 
+/// The `rposix` probe results `main` re-publishes as cfgs and `cargo::metadata`.
+#[derive(Default)]
+struct RposixHaves {
+    pipe2: bool,
+    fadvise: bool,
+    fallocate: bool,
+    d_type: bool,
+    chflags: bool,
+    lchflags: bool,
+    fexecve: bool,
+    sched_getparam: bool,
+    memfd_create: bool,
+    unshare: bool,
+}
+
 /// `rposix.py` `CConfig` / `configure(CConfig)` / `globals().update(config)`.
 /// The probe ECI is `rposix.eci`.
-fn write_rposix_cconfig(
-    pipe_config: &Option<Vec<(String, ConfigValue)>>,
-) -> (bool, bool, bool, bool, bool, bool, bool) {
+fn write_rposix_cconfig(pipe_config: &Option<Vec<(String, ConfigValue)>>) -> RposixHaves {
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
     let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
 
@@ -998,24 +1060,37 @@ fn write_rposix_cconfig(
         println!("cargo:rustc-cfg=rposix_have_fallocate");
     }
 
-    let (have_chflags, have_lchflags, have_fexecve) = write_rposix_at_family(&mut text, windows);
+    let (have_chflags, have_lchflags, have_fexecve, have_sched_getparam) =
+        write_rposix_at_family(&mut text, windows);
+    write_rposix_sched_param_config(&mut text, have_sched_getparam);
     if unix {
         write_rposix_at_timespec_config(&mut text);
         write_rposix_conf_config(&mut text);
+    }
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let mut have_memfd_create = false;
+    let mut have_unshare = false;
+    if target_os == "linux" || target_os == "android" {
+        write_rposix_xattr_config(&mut text);
+        have_memfd_create = write_rposix_memfd_config(&mut text);
+        have_unshare = write_rposix_unshare_config(&mut text);
     }
 
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rposix_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-    (
-        have_pipe2,
-        have_fadvise,
-        have_fallocate,
-        have_d_type,
-        have_chflags,
-        have_lchflags,
-        have_fexecve,
-    )
+    RposixHaves {
+        pipe2: have_pipe2,
+        fadvise: have_fadvise,
+        fallocate: have_fallocate,
+        d_type: have_d_type,
+        chflags: have_chflags,
+        lchflags: have_lchflags,
+        fexecve: have_fexecve,
+        sched_getparam: have_sched_getparam,
+        memfd_create: have_memfd_create,
+        unshare: have_unshare,
+    }
 }
 
 /// `rposix.py` `CConfig` "f... and ...at families" `HAVE_<NAME>`.
@@ -1028,14 +1103,14 @@ fn rposix_at_family_have_name(name: &str) -> String {
 ///
 /// Upstream merges `sys/statvfs.h` into `eci` unconditionally. That header is
 /// absent on Windows, so the probe would fail; every `HAVE_*` is false there.
-fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool) {
+fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool, bool) {
     text.push_str("// rposix.py CConfig (f... and ...at families)\n");
     if windows {
         for name in RPOSIX_AT_FAMILY_NAMES {
             let have = rposix_at_family_have_name(name);
             text.push_str(&format!("pub const {have}: bool = false;\n"));
         }
-        return (false, false, false);
+        return (false, false, false, false);
     }
     let at_eci = rposix_eci().merge(&[&ExternalCompilationInfo {
         includes: vec!["sys/statvfs.h".into()],
@@ -1060,6 +1135,7 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
     let mut have_chflags = false;
     let mut have_lchflags = false;
     let mut have_fexecve = false;
+    let mut have_sched_getparam = false;
     for name in RPOSIX_AT_FAMILY_NAMES {
         let have = rposix_at_family_have_name(name);
         if have == "HAVE_LCHMOD" && linux {
@@ -1076,6 +1152,7 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
             "HAVE_CHFLAGS" => have_chflags = flag,
             "HAVE_LCHFLAGS" => have_lchflags = flag,
             "HAVE_FEXECVE" => have_fexecve = flag,
+            "HAVE_SCHED_GETPARAM" => have_sched_getparam = flag,
             _ => {}
         }
     }
@@ -1088,7 +1165,44 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
     if have_fexecve {
         println!("cargo:rustc-cfg=rposix_have_fexecve");
     }
-    (have_chflags, have_lchflags, have_fexecve)
+    if have_sched_getparam {
+        println!("cargo:rustc-cfg=rposix_have_sched_getparam");
+    }
+    (
+        have_chflags,
+        have_lchflags,
+        have_fexecve,
+        have_sched_getparam,
+    )
+}
+
+/// `rposix.py` `if HAVE_SCHED_GETPARAM:` `CConfig` `SCHED_PARAM`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/stat.h', 'unistd.h', 'sched.h'])`.
+fn write_rposix_sched_param_config(text: &mut String, have_sched_getparam: bool) {
+    if !have_sched_getparam {
+        return;
+    }
+    let sched_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/stat.h".into(), "unistd.h".into(), "sched.h".into()],
+            ..Default::default()
+        },
+        entries: vec![(
+            "SCHED_PARAM".into(),
+            CConfigEntry::struct_type(
+                "struct sched_param",
+                vec![("sched_priority".into(), FieldType::int())],
+                None,
+            ),
+        )],
+        single_entries: vec![],
+    };
+    let results = configure(&sched_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig SCHED_PARAM (HAVE_SCHED_GETPARAM)\n");
+    text.push_str(
+        &struct_layout("SCHED_PARAM", cconfig_lookup(&results, "SCHED_PARAM"))
+            .rust_struct_source("SCHED_PARAM", &[]),
+    );
 }
 
 /// `rposix.py` `CConfig` `AT_*` / `UTIME_*` / `TIMESPEC` under `if not _WIN32`.
@@ -1130,6 +1244,123 @@ fn write_rposix_at_timespec_config(text: &mut String) {
         &struct_layout("TIMESPEC", cconfig_lookup(&at_results, "TIMESPEC"))
             .rust_struct_source("TIMESPEC", &[]),
     );
+}
+
+/// `rposix.py` linux `CConfig` `XATTR_SIZE_MAX` / `XATTR_CREATE` / `XATTR_REPLACE`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/xattr.h', 'linux/limits.h'])`.
+fn write_rposix_xattr_config(text: &mut String) {
+    let mut entries = Vec::new();
+    for name in RPOSIX_XATTR_CONST_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    let xattr_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/xattr.h".into(), "linux/limits.h".into()],
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![],
+    };
+    let results = configure(&xattr_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig XATTR_*\n");
+    for name in RPOSIX_XATTR_CONST_NAMES {
+        emit_option_i32(text, name, cconfig_lookup(&results, name));
+    }
+}
+
+/// `rposix.py` linux `CConfig` `MFD_*` / `HAVE_MEMFD_CREATE`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/mman.h'])`.
+fn write_rposix_memfd_config(text: &mut String) -> bool {
+    let mut entries = Vec::new();
+    for name in RPOSIX_MFD_CONST_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    let memfd_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/mman.h".into()],
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![(
+            "HAVE_MEMFD_CREATE".into(),
+            CConfigSingleEntry::Has("memfd_create".into()),
+        )],
+    };
+    let results = configure(&memfd_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig MFD_* / HAVE_MEMFD_CREATE\n");
+    for name in RPOSIX_MFD_CONST_NAMES {
+        emit_option_i32(text, name, cconfig_lookup(&results, name));
+    }
+    let mfd_defs: Vec<(&str, &str)> = RPOSIX_MFD_CONST_NAMES
+        .iter()
+        .map(|&name| (name, name))
+        .collect();
+    emit_defined_name_i32_slice(text, "MFD_NAMES", &results, &mfd_defs);
+    let have_memfd_create = match cconfig_lookup(&results, "HAVE_MEMFD_CREATE") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_MEMFD_CREATE: {other:?}"),
+    };
+    emit_bool(
+        text,
+        "HAVE_MEMFD_CREATE",
+        cconfig_lookup(&results, "HAVE_MEMFD_CREATE"),
+    );
+    if have_memfd_create {
+        println!("cargo:rustc-cfg=rposix_have_memfd_create");
+    }
+    have_memfd_create
+}
+
+/// `rposix.py` linux `CConfig` `CLONE_*` / `HAVE_UNSHARE`.
+/// Fresh `ExternalCompilationInfo(includes=['sched.h'])`.
+fn write_rposix_unshare_config(text: &mut String) -> bool {
+    let mut entries = Vec::new();
+    for name in RPOSIX_CLONE_CONST_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    let unshare_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sched.h".into()],
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![(
+            "HAVE_UNSHARE".into(),
+            CConfigSingleEntry::Has("unshare".into()),
+        )],
+    };
+    let results = configure(&unshare_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig CLONE_* / HAVE_UNSHARE\n");
+    for name in RPOSIX_CLONE_CONST_NAMES {
+        emit_option_i32(text, name, cconfig_lookup(&results, name));
+    }
+    let clone_defs: Vec<(&str, &str)> = RPOSIX_CLONE_CONST_NAMES
+        .iter()
+        .map(|&name| (name, name))
+        .collect();
+    emit_defined_name_i32_slice(text, "CLONE_NAMES", &results, &clone_defs);
+    let have_unshare = match cconfig_lookup(&results, "HAVE_UNSHARE") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_UNSHARE: {other:?}"),
+    };
+    emit_bool(
+        text,
+        "HAVE_UNSHARE",
+        cconfig_lookup(&results, "HAVE_UNSHARE"),
+    );
+    if have_unshare {
+        println!("cargo:rustc-cfg=rposix_have_unshare");
+    }
+    have_unshare
 }
 
 /// `rposix.py` `ConfConfig` / `configure(ConfConfig)` / `pathconf_names` /

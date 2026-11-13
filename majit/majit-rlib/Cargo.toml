@@ -6,7 +6,8 @@ license.workspace = true
 repository.workspace = true
 description = "RPython rlib runtime support library"
 # Dependents read `DEP_MAJIT_RLIB_HAVE_PIPE2` / `HAVE_FADVISE` / `HAVE_FALLOCATE` /
-# `HAVE_D_TYPE` / `HAVE_CHFLAGS` / `HAVE_LCHFLAGS` / `HAVE_FEXECVE`.
+# `HAVE_D_TYPE` / `HAVE_CHFLAGS` / `HAVE_LCHFLAGS` / `HAVE_FEXECVE` /
+# `HAVE_SCHED_GETPARAM` / `HAVE_MEMFD_CREATE` / `HAVE_UNSHARE`.
 links = "majit_rlib"
 
 [features]
