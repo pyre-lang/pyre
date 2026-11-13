@@ -3353,10 +3353,14 @@ fn register_configured_jitdrivers(
              must share one JitDriverStaticData",
             spec.portal.canonical_key(),
         );
-        // `warmspot.py find_portals` runs `autodetect_jit_markers_redvars`
-        // before `split_graph_and_record_jitdriver`, so an autoreds portal
-        // splits once numreds is known. `jtransform.py try_handle_jit_marker`
-        // still rediscovers those reds when emitting the merge-point op.
+        // `warmspot.py find_portals` runs
+        // `support.autodetect_jit_markers_redvars(graph)` on the original
+        // (`op.args.extend(reds_v)`), then `split_graph_and_record_jitdriver`
+        // copies it so original and portal share greens + autodetected reds.
+        // `rewrite_jit_merge_point` then turns origportalgraph's marker into
+        // `return portal_runner(*greens, *reds)` with that `jd.numreds`.
+        let mut numreds = spec.reds.len();
+        let mut extra_declared: Vec<crate::model::ValueType> = Vec::new();
         let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
@@ -3367,6 +3371,75 @@ fn register_configured_jitdrivers(
             // (`annrpython.py recursivecall`), not the pre-fixpoint set.
             drop(portal_graph);
             call_control.annotate_access_directly(std::slice::from_ref(&spec.portal));
+            // `warmspot.py find_portals` mutates the original marker before
+            // `copygraph`, so the portal copy and `rewrite_jit_merge_point`
+            // (`jd._jit_merge_point_in`) see the same greens+reds.
+            numreds = {
+                let original = call_control
+                    .function_graphs_mut()
+                    .get_mut(&spec.portal)
+                    .expect("portal graph remains after annotate_access_directly");
+                if spec.autoreds {
+                    let (marker_block, marker_index) =
+                        crate::codewriter::support::find_jit_merge_point(original, driver_roots)
+                            .expect("no jit_merge_point found in configured portal graph");
+                    let greens = match &original
+                        .block(marker_block)
+                        .operations
+                        .get(marker_index)
+                        .expect("find_jit_merge_point returned a live marker")
+                        .kind
+                    {
+                        crate::model::OpKind::Call { args, .. } => args
+                            .iter()
+                            .skip(1)
+                            .take(spec.greens.len())
+                            .filter_map(|a| a.as_variable().cloned())
+                            .collect::<Vec<_>>(),
+                        _ => panic!("jit_merge_point must be a call"),
+                    };
+                    let reds = crate::codewriter::jtransform::autodetect_jit_markers_redvars(
+                        original,
+                        &greens,
+                        driver_roots,
+                    );
+                    // `support.py autodetect_jit_markers_redvars` does
+                    // `op.args.extend(reds_v)` on a marker that carries greens
+                    // only (`reds='auto'` drivers never pass reds). pyre's
+                    // source marker carries hook payload after the greens, and
+                    // `jtransform.rs try_handle_jit_marker` already ignores
+                    // `user_args[num_greens..]` for an autoreds driver
+                    // (`reds_raw = detected_reds...`). Truncate to receiver
+                    // plus greens so the marker becomes
+                    // `receiver, greens..., autodetected reds...`.
+                    match &mut original.block_mut(marker_block).operations[marker_index].kind {
+                        crate::model::OpKind::Call { args, .. } => {
+                            args.truncate(1 + spec.greens.len());
+                            args.extend(reds.iter().cloned().map(crate::model::LinkArg::from));
+                        }
+                        _ => panic!("jit_merge_point must be a call"),
+                    }
+                    // `seed_split_portal_input_ops` reuses `declared` for
+                    // named-red drivers. Autoreds extras have empty
+                    // `red_kinds`, so type each green+red from this original
+                    // graph (`producer_input_type` chases inputargs) before
+                    // `copygraph`.
+                    extra_declared = {
+                        let mut vars = greens;
+                        vars.extend(reds.iter().cloned());
+                        vars.iter()
+                            .map(|var| {
+                                crate::codewriter::support::producer_input_type(original, var)
+                                    .map(|(ty, _)| ty)
+                                    .unwrap_or(crate::model::ValueType::Ref(None))
+                            })
+                            .collect()
+                    };
+                    reds.len()
+                } else {
+                    spec.reds.len()
+                }
+            };
             let original = call_control
                 .function_graphs()
                 .get(&spec.portal)
@@ -3398,42 +3471,6 @@ fn register_configured_jitdrivers(
             let (marker_block, marker_index) =
                 crate::codewriter::support::find_jit_merge_point(&portal, driver_roots)
                     .expect("no jit_merge_point found in configured portal graph");
-            // `support.py autodetect_jit_markers_redvars` before
-            // `split_before_jit_merge_point`: declared reds stay as written,
-            // autoreds learn the live set at the marker.
-            let numreds = if spec.autoreds {
-                let greens = match &portal
-                    .block(marker_block)
-                    .operations
-                    .get(marker_index)
-                    .expect("find_jit_merge_point returned a live marker")
-                    .kind
-                {
-                    crate::model::OpKind::Call { args, .. } => args
-                        .iter()
-                        .skip(1)
-                        .take(spec.greens.len())
-                        .filter_map(|a| a.as_variable().cloned())
-                        .collect::<Vec<_>>(),
-                    _ => panic!("jit_merge_point must be a call"),
-                };
-                let reds = crate::codewriter::jtransform::autodetect_jit_markers_redvars(
-                    &portal,
-                    &greens,
-                    driver_roots,
-                );
-                // support.py autodetect_jit_markers_redvars: `op.args.extend(reds_v)`
-                // so `decode_hp_hint_args` can split greens/reds off the marker.
-                match &mut portal.block_mut(marker_block).operations[marker_index].kind {
-                    crate::model::OpKind::Call { args, .. } => {
-                        args.extend(reds.iter().cloned().map(crate::model::LinkArg::from));
-                    }
-                    _ => panic!("jit_merge_point must be a call"),
-                }
-                reds.len()
-            } else {
-                spec.reds.len()
-            };
             portal.startblock = crate::codewriter::support::split_before_jit_merge_point(
                 &mut portal,
                 marker_block,
@@ -3449,6 +3486,7 @@ fn register_configured_jitdrivers(
                 &spec.green_kinds,
                 &spec.red_kinds,
                 &spec.red_types,
+                &extra_declared,
             );
             // `warmspot.py split_graph_and_record_jitdriver` copies the
             // portal after the annotator has already flagged the merge-point
@@ -3501,8 +3539,11 @@ fn register_configured_jitdrivers(
         // `warmspot.py WarmRunnerDesc.rewrite_jit_merge_point` runs on
         // `_jit_merge_point_in`, the graph callers still name, after
         // `split_graph_and_record_jitdriver` has copied the loop into
-        // `portal_graph`. The copy keeps the marker. `guess_call_kind`
-        // classifies a direct call to `portal_runner_ptr` as recursive.
+        // `portal_graph`. The original already carries greens plus
+        // autodetected reds (`find_portals` /
+        // `support.py autodetect_jit_markers_redvars`), so decode uses
+        // that `numreds`. `guess_call_kind` classifies a direct call to
+        // `portal_runner_ptr` as recursive.
         if spec.split_portal
             && let Some(runner) = spec.portal_runner.clone()
             && let Some(original) = call_control.function_graphs_mut().get_mut(&spec.portal)
@@ -3511,7 +3552,7 @@ fn register_configured_jitdrivers(
                 original,
                 &runner,
                 spec.greens.len(),
-                spec.reds.len(),
+                numreds,
                 driver_roots,
             );
         }
@@ -5337,6 +5378,255 @@ mod portal_driver_tests {
                 &GraphTransformConfig::default().jitdriver_receiver_roots,
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn autoreds_split_portal_drops_hook_payload_after_greens() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::Link;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "unpackiterable"]);
+        let mut graph = FunctionGraph::new("unpackiterable");
+        let receiver = Variable::named("driver");
+        let green = Variable::named("greenkey");
+        let w_iterator = Variable::named("w_iterator");
+        let items = Variable::named("items");
+        let extra = Variable::named("hook_payload");
+        for variable in [&receiver, &green, &w_iterator, &items, &extra] {
+            FunctionGraph::set_concretetype_of_inline(variable, ConcreteType::GcRef);
+        }
+        graph.block_mut(graph.startblock).inputargs =
+            vec![green.clone(), w_iterator.clone(), items.clone()];
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(receiver.clone()),
+                kind: OpKind::ConstRefNull,
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("UnpackIterableJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone(), extra.clone()]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.block_mut(graph.startblock).exits = vec![Link::from_variables(
+            &graph,
+            vec![green, w_iterator, items],
+            graph.startblock,
+            None,
+        )];
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let mut spec = driver(portal.clone());
+        spec.greens = vec!["greenkey".into()];
+        spec.autoreds = true;
+        spec.split_portal = true;
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[spec],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
+        let split = CallPath::from_segments(["fixture", "unpackiterable_portal"]);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split)
+            .expect("autoreds split registers the cut portal");
+        let roots = GraphTransformConfig::default().jitdriver_receiver_roots;
+        let (block, index) = crate::codewriter::support::find_jit_merge_point(&split_graph, &roots)
+            .expect("split portal keeps jit_merge_point");
+        let OpKind::Call { args, .. } = &split_graph.block(block).operations[index].kind else {
+            panic!("jit_merge_point must be a call");
+        };
+        let marker_vars = crate::model::call_arg_vars(args);
+        assert!(
+            marker_vars
+                .iter()
+                .all(|var| !var.name_prefix().starts_with("hook_payload")),
+            "autoreds extend must drop the source hook payload: {marker_vars:?}"
+        );
+        // receiver + one green + two autodetected reds
+        assert_eq!(marker_vars.len(), 4, "marker args: {marker_vars:?}");
+        // `find_portals` extends the original before `copygraph`; this
+        // fixture has no `portal_runner`, so `rewrite_jit_merge_point`
+        // does not run and the original still holds that marker.
+        let original_graph = call_control
+            .function_graphs()
+            .get(&portal)
+            .expect("original portal remains");
+        let (block, index) =
+            crate::codewriter::support::find_jit_merge_point(&original_graph, &roots)
+                .expect("original keeps jit_merge_point until rewrite_jit_merge_point");
+        let OpKind::Call { args, .. } = &original_graph.block(block).operations[index].kind else {
+            panic!("jit_merge_point must be a call");
+        };
+        let original_vars = crate::model::call_arg_vars(args);
+        assert!(
+            original_vars
+                .iter()
+                .all(|var| !var.name_prefix().starts_with("hook_payload")),
+            "original autoreds extend must drop the source hook payload: {original_vars:?}"
+        );
+        assert_eq!(
+            original_vars.len(),
+            4,
+            "original marker args: {original_vars:?}"
+        );
+    }
+
+    #[test]
+    fn autoreds_split_portal_seeds_integer_red_carried_through_inputarg() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "tuple_hash"]);
+        let mut graph = FunctionGraph::new("tuple_hash");
+        let w_type = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(graph.startblock).inputargs = vec![w_type.clone(), obj.clone()];
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(w_type.clone()),
+                kind: OpKind::Input {
+                    name: "w_type".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(obj.clone()),
+                kind: OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+            });
+        let len = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(len.clone()),
+                kind: OpKind::ConstUInt(3),
+            });
+        let acc = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(acc.clone()),
+                kind: OpKind::ConstUInt(0),
+            });
+        let i = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(i.clone()),
+                kind: OpKind::ConstUInt(0),
+            });
+
+        let (loop_block, loop_ins) = graph.create_block_with_arg_vars(5);
+        FunctionGraph::set_concretetype_of_inline(&loop_ins[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&loop_ins[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&loop_ins[2], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&loop_ins[3], ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&loop_ins[4], ConcreteType::GcRef);
+        graph.set_goto(graph.startblock, loop_block, vec![len, acc, i, obj, w_type]);
+        let len_phi = loop_ins[0].clone();
+        let acc_phi = loop_ins[1].clone();
+        let i_phi = loop_ins[2].clone();
+        let obj_phi = loop_ins[3].clone();
+        let w_type_phi = loop_ins[4].clone();
+
+        let receiver = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: Some(receiver.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::method("jit_merge_point", Some("TupleHashJitDriver".into())),
+                args: crate::model::call_args(vec![receiver, w_type_phi.clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        let one = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: Some(one.clone()),
+            kind: OpKind::ConstInt(1),
+        });
+        let i2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: Some(i2.clone()),
+            kind: OpKind::BinOp {
+                op: "int_add".into(),
+                lhs: i_phi.clone(),
+                rhs: one,
+                result_ty: ValueType::Int,
+            },
+        });
+        graph.set_goto(
+            loop_block,
+            loop_block,
+            vec![len_phi, acc_phi, i2, obj_phi, w_type_phi],
+        );
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let mut spec = driver(portal);
+        spec.greens = vec!["w_type".into()];
+        spec.green_kinds = vec![majit_ir::Type::Ref];
+        spec.autoreds = true;
+        spec.split_portal = true;
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[spec],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
+        let split = CallPath::from_segments(["fixture", "tuple_hash_portal"]);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split)
+            .expect("autoreds split registers the cut portal");
+        let input_tys: Vec<ValueType> = split_graph
+            .block(split_graph.startblock)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } => Some(ty.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            input_tys
+                .iter()
+                .any(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+            "integer red carried through a block inputarg must be seeded with the integer type, got {input_tys:?}"
+        );
+        assert_eq!(
+            input_tys
+                .iter()
+                .filter(|ty| matches!(ty, ValueType::Unsigned))
+                .count(),
+            3,
+            "len/acc/i ConstUInt reds stay Unsigned through the inputarg copy, got {input_tys:?}"
         );
     }
 }

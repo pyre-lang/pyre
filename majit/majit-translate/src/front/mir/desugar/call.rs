@@ -5022,6 +5022,25 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::str::<Impl>::strip_prefix(s, pat)` is
+                // `Some(s[len(pat):])` when `s.startswith(pat)`, else
+                // `None` (`rstr.py` `ll_startswith` +
+                // `ll_stringslice_startonly`). A `char` Pattern is
+                // `unichr_as_utf8` then the String+String startswith
+                // pair; `&str` / `&String` stay the string.
+                if self.try_lower_str_strip_prefix(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    arg_operands.get(1),
+                    second_arg_ty.as_ref(),
+                    second_const_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)`
                 // spelling follows intern of the pointer.
                 //

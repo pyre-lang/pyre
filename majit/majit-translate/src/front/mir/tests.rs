@@ -31092,6 +31092,112 @@ fn str_contains_lowers_as_binop_contains() {
     );
 }
 
+/// `core::str::<Impl>::strip_prefix` with a returned dest, so the
+/// startswith / getslice diamond survives `prune_dead_phis`. A `char`
+/// Pattern is `unichr_as_utf8` then `startswith` +
+/// `__getslice_rangefrom` (`rstr.py` `ll_startswith` +
+/// `ll_stringslice_startonly`); `&str` skips the UTF-8 rewrite.
+#[test]
+fn str_strip_prefix_lowers_to_startswith_and_getslice() {
+    let str_ty = str_ref_ty();
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let dest_ty = option_adt_node(0, str_ty.clone());
+    let type_decls = vec![option_enum(0)];
+
+    let graph = crate::test_support::lower_function(
+        &std_extern_call_fixture_with_types(
+            "str_strip_prefix_char",
+            &["core", "str", "<Impl>", "strip_prefix"],
+            &[str_ty.clone(), char_ty],
+            dest_ty.clone(),
+            type_decls.clone(),
+        ),
+        "str_strip_prefix_char",
+    )
+    .expect("lower str::strip_prefix(char)");
+    assert_strip_prefix_diamond(&graph, true);
+
+    let graph = crate::test_support::lower_function(
+        &std_extern_call_fixture_with_types(
+            "str_strip_prefix_str",
+            &["core", "str", "<Impl>", "strip_prefix"],
+            &[str_ty.clone(), str_ty],
+            dest_ty,
+            type_decls,
+        ),
+        "str_strip_prefix_str",
+    )
+    .expect("lower str::strip_prefix(&str)");
+    assert_strip_prefix_diamond(&graph, false);
+
+    fn assert_strip_prefix_diamond(graph: &crate::model::FunctionGraph, char_needle: bool) {
+        let paths = oefmt_call_paths(graph);
+        assert!(
+            !paths.iter().any(|segments| {
+                segments.last().map(String::as_str) == Some("strip_prefix")
+                    && segments.iter().any(|s| s == "str")
+            }),
+            "str::strip_prefix must not remain residual: {paths:#?}"
+        );
+        let has_startswith = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::Method { name, .. },
+                    ..
+                } if name == "startswith"
+            )
+        });
+        assert!(
+            has_startswith,
+            "strip_prefix must become startswith; paths={paths:#?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|segments| segments == &["__strlen".to_string()]),
+            "matched arm must take pat len via __strlen: {paths:#?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|segments| segments == &["__getslice_rangefrom".to_string()]),
+            "matched arm must slice via __getslice_rangefrom: {paths:#?}"
+        );
+        let has_unichr = paths.iter().any(|segments| {
+            segments.last().map(String::as_str)
+                == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+        });
+        assert_eq!(
+            has_unichr, char_needle,
+            "char needle must become unichr_as_utf8; &str must not: {paths:#?}"
+        );
+    }
+}
+
+/// Lowered `str::strip_prefix` annotates and rtypes: `startswith` →
+/// `ll_startswith`, `__getslice_rangefrom` → `ll_stringslice_startonly`.
+/// A `char` literal folds to a UTF-8 string constant
+/// (`rutf8.py unichr_as_utf8`) before that pair, so the rtyped ops are
+/// the same String+String shape as an `&str` Pattern.
+#[test]
+fn str_strip_prefix_annotates_and_rtypes() {
+    let _lock = crate::translator::rtyper::cutover::specialize_test_lock();
+    let str_ty = str_ref_ty();
+    let dest_ty = option_adt_node(0, str_ty.clone());
+    let llbc = std_extern_call_fixture_with_types(
+        "str_strip_prefix_str",
+        &["core", "str", "<Impl>", "strip_prefix"],
+        &[str_ty.clone(), str_ty],
+        dest_ty,
+        vec![option_enum(0)],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "str_strip_prefix_str")
+        .expect("lower str::strip_prefix(&str)");
+    crate::translator::rtyper::cutover::specialize_legacy_graph(&graph)
+        .expect("str::strip_prefix graph must annotate and rtype");
+}
+
 /// `exception_descr_str_wtf8` indexes the Python unicode carrier through
 /// `Wtf8::index(RangeFrom)`. The frontend already models Wtf8 as
 /// RPython's string repr, so this is its ordinary `getslice(start, None)`
