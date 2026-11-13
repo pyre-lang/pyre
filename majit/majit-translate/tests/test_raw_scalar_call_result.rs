@@ -2534,7 +2534,7 @@ fn usize_covering_the_spilled_field_is_not_lowered() {
     assert!(msg.contains("unspilled raw argument"), "{msg}");
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PackedArg {
     /// `f(&mut word, (q,))` with `q = &raw mut word`.
     TupleRawSame,
@@ -2999,103 +2999,69 @@ fn ref_assign_mut(dest: u64, dest_ty: &Value, src: Value) -> Value {
 }
 
 fn assert_packed_escapes(alias: PackedArg) {
-    let err = lower_packed_alias(alias).expect_err("a packed spill alias must not lower");
+    let err = lower_packed_alias(alias)
+        .expect_err(&format!("a packed spill alias must not lower: {alias:?}"));
     let msg = err.to_string();
-    assert!(msg.contains("unspilled raw argument"), "{msg}");
+    assert!(msg.contains("unspilled raw argument"), "{alias:?}: {msg}");
 }
 
 fn assert_packed_frees(alias: PackedArg) {
     let graph = lower_packed_alias(alias).unwrap_or_else(|err| {
-        panic!("a packed value that misses the spill must still lower: {err}")
+        panic!("a packed value that misses the spill must still lower ({alias:?}): {err}")
     });
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "{alias:?}: one spilled place\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
-    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 0), &ptrs[0], "{alias:?}");
     assert_ne!(
         call_arg(call, 1),
         &ptrs[0],
-        "the packed argument stays the caller's value\n{}",
+        "{alias:?}: the packed argument stays the caller's value\n{}",
         op_lines(&graph)
     );
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        "{alias:?}: the spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
 
 #[test]
-fn tuple_raw_alias_of_the_spilled_place_is_not_lowered() {
-    assert_packed_escapes(PackedArg::TupleRawSame);
+fn packed_raw_aliases_of_the_spilled_place_are_not_lowered() {
+    for arg in [
+        PackedArg::TupleRawSame,
+        PackedArg::NestedTupleRawSame,
+        PackedArg::StructRawSame,
+        PackedArg::CopiedTupleRawSame,
+        PackedArg::TupleUsizeSame,
+        PackedArg::TupleUnknownRaw,
+        PackedArg::RefOfTupleRawSame,
+        PackedArg::FieldStoreRawSame,
+        PackedArg::ArrayRawSame,
+    ] {
+        assert_packed_escapes(arg);
+    }
 }
 
 #[test]
-fn tuple_raw_alias_of_another_place_still_frees() {
-    assert_packed_frees(PackedArg::TupleRawOther);
+fn packed_values_beside_the_spill_still_free() {
+    for arg in [
+        PackedArg::TupleRawOther,
+        PackedArg::TupleI64,
+        PackedArg::TupleUsizeOther,
+        PackedArg::TupleUsizeConst,
+        PackedArg::TupleNarrow,
+    ] {
+        assert_packed_frees(arg);
+    }
 }
 
-#[test]
-fn nested_tuple_raw_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::NestedTupleRawSame);
-}
-
-#[test]
-fn struct_raw_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::StructRawSame);
-}
-
-#[test]
-fn copied_tuple_raw_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::CopiedTupleRawSame);
-}
-
-#[test]
-fn tuple_of_i64_beside_the_spill_still_frees() {
-    assert_packed_frees(PackedArg::TupleI64);
-}
-
-#[test]
-fn tuple_usize_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::TupleUsizeSame);
-}
-
-#[test]
-fn tuple_usize_of_another_place_still_frees() {
-    assert_packed_frees(PackedArg::TupleUsizeOther);
-}
-
-#[test]
-fn tuple_usize_constant_beside_the_spill_still_frees() {
-    assert_packed_frees(PackedArg::TupleUsizeConst);
-}
-
-#[test]
-fn tuple_unknown_raw_is_not_lowered() {
-    assert_packed_escapes(PackedArg::TupleUnknownRaw);
-}
-
-#[test]
-fn tuple_narrow_integer_beside_the_spill_still_frees() {
-    assert_packed_frees(PackedArg::TupleNarrow);
-}
-
-#[test]
-fn reference_to_a_tuple_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::RefOfTupleRawSame);
-}
-
-#[test]
-fn field_store_of_a_raw_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::FieldStoreRawSame);
-}
-
-#[test]
-fn array_raw_alias_is_not_lowered() {
-    assert_packed_escapes(PackedArg::ArrayRawSame);
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TracedInt {
     /// `f(&mut word, pair.0)` with `pair = (q,)` and `q` naming `word`.
     FieldSame,
@@ -3535,114 +3501,100 @@ fn lower_traced_int(
 }
 
 fn assert_traced_escapes(kind: TracedInt) {
-    let err = lower_traced_int(kind).expect_err("an untraced address-sized integer must not lower");
+    let err = lower_traced_int(kind).expect_err(&format!(
+        "an untraced address-sized integer must not lower: {kind:?}"
+    ));
     let msg = err.to_string();
-    assert!(msg.contains("unspilled raw argument"), "{msg}");
+    assert!(msg.contains("unspilled raw argument"), "{kind:?}: {msg}");
 }
 
 fn assert_traced_frees(kind: TracedInt) {
-    let graph = lower_traced_int(kind)
-        .unwrap_or_else(|err| panic!("an integer that misses the spill must still lower: {err}"));
+    let graph = lower_traced_int(kind).unwrap_or_else(|err| {
+        panic!("an integer that misses the spill must still lower ({kind:?}): {err}")
+    });
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "{kind:?}: one spilled place\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
-    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 0), &ptrs[0], "{kind:?}");
     assert_ne!(
         call_arg(call, 1),
         &ptrs[0],
-        "the integer stays the caller's value\n{}",
+        "{kind:?}: the integer stays the caller's value\n{}",
         op_lines(&graph)
     );
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        "{kind:?}: the spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
 
 fn assert_traced_relocates(kind: TracedInt) {
-    let graph = lower_traced_int(kind)
-        .unwrap_or_else(|err| panic!("a field that names the spill must use that address: {err}"));
+    let graph = lower_traced_int(kind).unwrap_or_else(|err| {
+        panic!("a field that names the spill must use that address ({kind:?}): {err}")
+    });
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "{kind:?}: one spilled place\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
-    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 0), &ptrs[0], "{kind:?}");
     assert_eq!(
         call_arg(call, 1),
         &ptrs[0],
-        "the integer is the spill pointer\n{}",
+        "{kind:?}: the integer is the spill pointer\n{}",
         op_lines(&graph)
     );
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        "{kind:?}: the spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
 
 #[test]
-fn field_usize_alias_uses_the_spill_address() {
-    assert_traced_relocates(TracedInt::FieldSame);
+fn traced_usize_aliases_are_not_lowered() {
+    for arg in [
+        TracedInt::Param,
+        TracedInt::CallResult,
+        TracedInt::TupleParam,
+        TracedInt::TupleFieldSame,
+        TracedInt::Sum,
+        TracedInt::ConflictStore,
+        TracedInt::RoundTripU8,
+    ] {
+        assert_traced_escapes(arg);
+    }
 }
 
 #[test]
-fn field_usize_of_another_place_still_frees() {
-    assert_traced_frees(TracedInt::FieldOther);
+fn traced_usize_aliases_use_the_spill_address() {
+    for arg in [
+        TracedInt::FieldSame,
+        TracedInt::CopiedField,
+        TracedInt::SameStore,
+    ] {
+        assert_traced_relocates(arg);
+    }
 }
 
 #[test]
-fn field_usize_constant_still_frees() {
-    assert_traced_frees(TracedInt::FieldConst);
-}
-
-#[test]
-fn usize_parameter_beside_the_spill_is_not_lowered() {
-    assert_traced_escapes(TracedInt::Param);
-}
-
-#[test]
-fn usize_call_result_beside_the_spill_is_not_lowered() {
-    assert_traced_escapes(TracedInt::CallResult);
-}
-
-#[test]
-fn direct_usize_constant_beside_the_spill_still_frees() {
-    assert_traced_frees(TracedInt::DirectConst);
-}
-
-#[test]
-fn tuple_of_a_usize_parameter_is_not_lowered() {
-    assert_traced_escapes(TracedInt::TupleParam);
-}
-
-#[test]
-fn tuple_of_a_field_usize_alias_is_not_lowered() {
-    assert_traced_escapes(TracedInt::TupleFieldSame);
-}
-
-#[test]
-fn usize_sum_beside_the_spill_is_not_lowered() {
-    assert_traced_escapes(TracedInt::Sum);
-}
-
-#[test]
-fn copied_field_usize_alias_uses_the_spill_address() {
-    assert_traced_relocates(TracedInt::CopiedField);
-}
-
-#[test]
-fn field_store_of_the_same_usize_alias_uses_the_spill_address() {
-    assert_traced_relocates(TracedInt::SameStore);
-}
-
-#[test]
-fn field_store_over_a_usize_constant_is_not_lowered() {
-    assert_traced_escapes(TracedInt::ConflictStore);
-}
-
-#[test]
-fn usize_round_trip_through_u8_is_not_lowered() {
-    assert_traced_escapes(TracedInt::RoundTripU8);
+fn traced_usize_values_beside_the_spill_still_free() {
+    for arg in [
+        TracedInt::FieldOther,
+        TracedInt::FieldConst,
+        TracedInt::DirectConst,
+    ] {
+        assert_traced_frees(arg);
+    }
 }
 
 fn lower_field_out() -> FunctionGraph {
@@ -3988,17 +3940,17 @@ fn result_of(ok: &Value, err: &Value) -> Value {
     adt_ty(1, vec![ok.clone(), err.clone()])
 }
 
-fn assert_spill_freed(result_ty: &Value, extra: &[Value], carrier: Option<&str>) {
+fn assert_spill_freed(label: &str, result_ty: &Value, extra: &[Value], carrier: Option<&str>) {
     let graph = lower_returned_address_with(result_ty, extra, carrier)
-        .unwrap_or_else(|err| panic!("a status result must still free the spill: {err}"));
+        .unwrap_or_else(|err| panic!("{label}: a status result must still free the spill: {err}"));
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
-        "the spill is allocated\n{}",
+        "{label}: the spill is allocated\n{}",
         op_lines(&graph)
     );
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        "{label}: the spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
@@ -4023,13 +3975,37 @@ fn returned_pointer_under_four_options_is_not_lowered() {
 }
 
 #[test]
-fn returned_i64_under_four_options_still_frees_the_spill() {
-    assert_spill_freed(&nest_option(i64_ty(), 4), &[], None);
-}
-
-#[test]
-fn returned_i64_under_nine_options_still_frees_the_spill() {
-    assert_spill_freed(&nest_option(i64_ty(), 9), &[], None);
+fn returned_scalar_aggregates_still_free_the_spill() {
+    let cases: [(&str, Value, Vec<Value>); 5] = [
+        (
+            "returned_i64_under_four_options",
+            nest_option(i64_ty(), 4),
+            vec![],
+        ),
+        (
+            "returned_i64_under_nine_options",
+            nest_option(i64_ty(), 9),
+            vec![],
+        ),
+        (
+            "returned_tuple_of_i64",
+            tuple_ty(vec![i64_ty(), i64_ty()]),
+            vec![],
+        ),
+        (
+            "returned_pair_of_i64",
+            adt_ty(1, vec![i64_ty(), i64_ty()]),
+            vec![pair_decl()],
+        ),
+        (
+            "returned_deduped_i64_argument",
+            adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
+            vec![pair_decl(), dedup_holder(i64_ty())],
+        ),
+    ];
+    for (label, ty, decls) in cases {
+        assert_spill_freed(label, &ty, &decls, None);
+    }
 }
 
 #[test]
@@ -4057,11 +4033,6 @@ fn returned_tuple_pointer_is_not_lowered() {
 }
 
 #[test]
-fn returned_tuple_of_i64_still_frees_the_spill() {
-    assert_spill_freed(&tuple_ty(vec![i64_ty(), i64_ty()]), &[], None);
-}
-
-#[test]
 fn returned_struct_pointer_field_is_not_lowered() {
     let ptr = raw_ptr(&i64_ty(), "Const");
     let decl = named_decl(
@@ -4079,7 +4050,7 @@ fn returned_struct_i64_field_still_frees_the_spill() {
         &["probe", "Hold"],
         json!({"Struct": [field_decl("word", &i64_ty())]}),
     );
-    assert_spill_freed(&adt_ty(1, vec![]), &[decl], None);
+    assert_spill_freed("struct_i64_field", &adt_ty(1, vec![]), &[decl], None);
 }
 
 #[test]
@@ -4112,7 +4083,12 @@ fn returned_carrier_err_still_frees_the_spill() {
         json!({"Struct": [field_decl("obj", &ptr)]}),
     );
     let result = result_of(&i64_ty(), &adt_ty(2, vec![]));
-    assert_spill_freed(&result, &[result_decl(), decl], Some(carrier));
+    assert_spill_freed(
+        "carrier_err",
+        &result,
+        &[result_decl(), decl],
+        Some(carrier),
+    );
 }
 
 #[test]
@@ -4131,7 +4107,7 @@ fn returned_opaque_i64_generic_is_not_lowered() {
 fn returned_phantom_pointer_still_frees_the_spill() {
     let ptr = raw_ptr(&i64_ty(), "Const");
     let decl = named_decl(1, &["core", "marker", "PhantomData"], json!({"Struct": []}));
-    assert_spill_freed(&adt_ty(1, vec![ptr]), &[decl], None);
+    assert_spill_freed("phantom_pointer", &adt_ty(1, vec![ptr]), &[decl], None);
 }
 
 #[test]
@@ -4143,7 +4119,7 @@ fn returned_zero_sized_opaque_still_frees_the_spill() {
         json!("Opaque"),
         zero_sized_layout(),
     );
-    assert_spill_freed(&adt_ty(1, vec![ptr]), &[decl], None);
+    assert_spill_freed("zero_sized_opaque", &adt_ty(1, vec![ptr]), &[decl], None);
 }
 
 #[test]
@@ -4164,7 +4140,12 @@ fn returned_typevar_i64_field_still_frees_the_spill() {
         &["probe", "Hold"],
         json!({"Struct": [type_var_field("value", 0)]}),
     );
-    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[decl], None);
+    assert_spill_freed(
+        "typevar_i64_field",
+        &adt_ty(1, vec![i64_ty()]),
+        &[decl],
+        None,
+    );
 }
 
 #[test]
@@ -4201,7 +4182,12 @@ fn returned_option_typevar_i64_still_frees_the_spill() {
         &["probe", "Hold"],
         json!({"Struct": [option_typevar_field()]}),
     );
-    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[decl], None);
+    assert_spill_freed(
+        "option_typevar_i64",
+        &adt_ty(1, vec![i64_ty()]),
+        &[decl],
+        None,
+    );
 }
 
 #[test]
@@ -4234,7 +4220,12 @@ fn returned_nested_struct_typevar_i64_still_frees_the_spill() {
         &["probe", "Inner"],
         json!({"Struct": [type_var_field("word", 0)]}),
     );
-    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[hold, inner], None);
+    assert_spill_freed(
+        "nested_struct_typevar_i64",
+        &adt_ty(1, vec![i64_ty()]),
+        &[hold, inner],
+        None,
+    );
 }
 
 #[test]
@@ -4270,11 +4261,6 @@ fn returned_caller_typevar_in_a_generic_argument_is_not_lowered() {
 }
 
 #[test]
-fn returned_pair_of_i64_still_frees_the_spill() {
-    assert_spill_freed(&adt_ty(1, vec![i64_ty(), i64_ty()]), &[pair_decl()], None);
-}
-
-#[test]
 fn returned_pair_pointer_argument_is_not_lowered() {
     let ptr = raw_ptr(&i64_ty(), "Const");
     assert_spill_escapes(&adt_ty(1, vec![i64_ty(), ptr]), &[pair_decl()], None);
@@ -4286,15 +4272,6 @@ fn returned_deduped_caller_typevar_is_not_lowered() {
     assert_spill_escapes(
         &adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
         &[pair_decl(), dedup_holder(caller)],
-        None,
-    );
-}
-
-#[test]
-fn returned_deduped_i64_argument_still_frees_the_spill() {
-    assert_spill_freed(
-        &adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
-        &[pair_decl(), dedup_holder(i64_ty())],
         None,
     );
 }
