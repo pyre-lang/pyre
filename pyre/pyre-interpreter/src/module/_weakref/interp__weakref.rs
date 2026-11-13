@@ -1247,9 +1247,19 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
     }
     let others = unsafe { pyre_object::weakref::w_weakref_lifeline_other_refs(lifeline) };
     if !others.is_null() {
-        let length = unsafe { pyre_object::w_list_len(others) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let others_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(others);
+        let length = unsafe {
+            pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(others_slot))
+        };
         for i in 0..length {
-            let Some(weak) = (unsafe { pyre_object::w_list_getitem(others, i as i64) }) else {
+            let Some(weak) = (unsafe {
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(others_slot),
+                    i as i64,
+                )
+            }) else {
                 continue;
             };
             let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };

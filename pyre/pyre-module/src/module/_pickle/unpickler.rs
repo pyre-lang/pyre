@@ -1700,15 +1700,43 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::OBJ => {
             let args = pop_mark(slot)?;
-            let n = unsafe { pyre_object::listobject::w_list_len(args) };
+            let _obj_roots = pyre_object::gc_roots::push_roots();
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(args);
+            let n = unsafe {
+                pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                    args_slot,
+                ))
+            };
             if n == 0 {
                 return Err(unpickling_error("OBJ opcode with empty stack"));
             }
-            let mut w_cls = unsafe { pyre_object::listobject::w_list_getitem(args, 0).unwrap() };
-            let rest: Vec<PyObjectRef> = (1..n)
-                .map(|i| unsafe {
-                    pyre_object::listobject::w_list_getitem(args, i as i64).unwrap()
-                })
+            let mut w_cls = unsafe {
+                pyre_object::listobject::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(args_slot),
+                    0,
+                )
+                .unwrap()
+            };
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_cls);
+            let mut rest_slots = Vec::with_capacity((n as usize).saturating_sub(1));
+            for i in 1..n {
+                let item = unsafe {
+                    pyre_object::listobject::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(args_slot),
+                        i as i64,
+                    )
+                    .unwrap()
+                };
+                let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(item);
+                rest_slots.push(item_slot);
+            }
+            w_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+            let rest: Vec<PyObjectRef> = rest_slots
+                .iter()
+                .map(|&s| pyre_object::gc_roots::shadow_stack_get(s))
                 .collect();
             let w_rest =
                 pyre_object::with_roots!(w_cls => pyre_object::listobject::w_list_new(rest));
@@ -1865,17 +1893,24 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
         return Err(unpickling_error("odd number of items for DICT"));
     }
     let mut i = 0;
+    let k_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+    let v_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     while i < n {
         let current_items = pyre_object::gc_roots::shadow_stack_get(base + 1);
         let k =
             unsafe { pyre_object::listobject::w_list_getitem(current_items, i as i64).unwrap() };
+        pyre_object::gc_roots::shadow_stack_set(k_slot, k);
+        let current_items = pyre_object::gc_roots::shadow_stack_get(base + 1);
         let v = unsafe {
             pyre_object::listobject::w_list_getitem(current_items, (i + 1) as i64).unwrap()
         };
+        pyre_object::gc_roots::shadow_stack_set(v_slot, v);
         pyre_interpreter::baseobjspace::setitem(
             pyre_object::gc_roots::shadow_stack_get(base),
-            k,
-            v,
+            pyre_object::gc_roots::shadow_stack_get(k_slot),
+            pyre_object::gc_roots::shadow_stack_get(v_slot),
         )?;
         i += 2;
     }

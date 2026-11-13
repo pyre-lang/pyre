@@ -349,12 +349,17 @@ impl RawBytesCache {
         wdict: &std::collections::HashMap<usize, Vec<RawBytesEntry>>,
         w_x: PyObjectRef,
     ) -> Option<*mut u8> {
-        let hash = pyre_object::gc_hook::gc_identity_hash(w_x as usize);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let x_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_x);
+        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
+            x_slot,
+        ) as usize);
         let bucket = wdict.get(&hash)?;
         for entry in bucket {
             let target =
                 unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, w_x) {
+            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(x_slot)) {
                 return Some(entry.ptr as *mut u8);
             }
         }
@@ -367,25 +372,29 @@ impl RawBytesCache {
         key: PyObjectRef,
         ptr: *mut u8,
     ) {
-        let hash = pyre_object::gc_hook::gc_identity_hash(w_x as usize);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pair = pyre_object::gc_roots::pin_roots(&[w_x, key]);
+        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
+            pair,
+        ) as usize);
         let bucket = wdict.entry(hash).or_default();
         // `ll_set_nonnull` replaces a matching live key.
         for entry in bucket.iter_mut() {
             let target =
                 unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, w_x) {
+            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(pair)) {
                 if entry.ptr != 0 && entry.ptr != ptr as usize {
                     unsafe {
                         majit_rlib::rffi::free_charp(entry.ptr as *mut u8, false);
                     }
                 }
-                entry.key = key as usize;
+                entry.key = pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize;
                 entry.ptr = ptr as usize;
                 return;
             }
         }
         bucket.push(RawBytesEntry {
-            key: key as usize,
+            key: pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize,
             ptr: ptr as usize,
         });
     }

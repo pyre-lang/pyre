@@ -73,6 +73,10 @@ pub extern "C" fn jit_set_function_attribute(
     attr: PyObjectRef,
     flag: i64,
 ) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pair = pyre_object::gc_roots::pin_roots(&[func, attr]);
+    let func = pyre_object::gc_roots::shadow_stack_get(pair);
+    let attr = pyre_object::gc_roots::shadow_stack_get(pair + 1);
     match flag {
         0 => unsafe { crate::function_set_defaults(func, attr) },
         1 => unsafe { crate::function::function_set_kwdefaults_from_definition(func, attr) },
@@ -81,14 +85,24 @@ pub extern "C" fn jit_set_function_attribute(
             // annotations dict is stamped on the typed `Function.w_ann`
             // slot via `function_write_barrier`, so `f.__annotations__ is
             // f.__annotations__` holds through the getattr arm.
-            unsafe { crate::function::function_set_annotations(func, attr) };
+            unsafe {
+                crate::function::function_set_annotations(
+                    pyre_object::gc_roots::shadow_stack_get(pair),
+                    pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                )
+            };
         }
         3 => unsafe { crate::function_set_closure(func, attr) },
         4 => {
             // PEP 649: `attr` is the `__annotate__` callable the runtime
             // `__annotations__` getter evaluates lazily; stored on the
             // typed `w_annotate` slot.
-            unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
+            unsafe {
+                crate::function::function_set_annotate_unchecked(
+                    pyre_object::gc_roots::shadow_stack_get(pair),
+                    pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                )
+            };
         }
         // `TypeParams = 5` names a PEP 695 type-parameter tuple, but the
         // codegen never sets that bit: a generic `def` stamps its parameters
@@ -97,7 +111,7 @@ pub extern "C" fn jit_set_function_attribute(
         // rather than panic on a bytecode stream that does carry it.
         _ => {}
     }
-    func as i64
+    pyre_object::gc_roots::shadow_stack_get(pair) as i64
 }
 
 #[majit_macros::dont_look_inside]
