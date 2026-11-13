@@ -8369,14 +8369,14 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_ok_or_else_sites.push(site);
         }
-        // Capture UNSIGNED `usize::checked_{add,sub,mul}()` results
-        // (`Option<usize>`) for the native-overflow rewiring pass
-        // (`front::checked_arith_uint`).  Signed arithmetic stays on
-        // `front::checked_arith` (→ `*_ovf` + OverflowError); unsigned has no
-        // signed-overflow op, so it lowers to `uint_mul_high` / `uint_lt`
-        // overflow tests + a virtualized `Option`.  The operand-signedness
-        // gate lives here because the operand types are only in hand at the
-        // call site.
+        // Capture UNSIGNED `checked_{add,sub,mul}()` results (`Option<T>`)
+        // for the native-overflow rewiring pass (`front::checked_arith_uint`).
+        // Signed arithmetic stays on `front::checked_arith` (→ `*_ovf` +
+        // OverflowError); unsigned has no signed-overflow op, so it lowers
+        // to `uint_mul_high` / `uint_lt` (bank) or `uint_gt(result, max)`
+        // (narrower than the JIT int bank) + a virtualized `Option`.  The
+        // operand-signedness gate lives here because the operand types are
+        // only in hand at the call site.
         //
         // Either operand answers for both: these are
         // `fn(self, rhs: Self) -> Option<Self>`, so the two are one type.  A
@@ -8424,7 +8424,8 @@ impl<'a> Lowering<'a> {
                         .as_ref()
                         .and_then(|ty| self.tyref_literal_uint_atom(ty))
                 });
-            if crate::front::checked_arith_uint::unsigned_word_atom(dest_atom, [op0, op1]).is_some()
+            if let Some(bits) =
+                crate::front::checked_arith_uint::checked_uint_atom(dest_atom, [op0, op1])
             {
                 let payload_hint = dest_payload
                     .as_ref()
@@ -8433,17 +8434,19 @@ impl<'a> Lowering<'a> {
                     .or(peel1.as_ref())
                     .or(first_arg_ty.as_ref())
                     .or(second_arg_ty.as_ref());
-                if let Some(site) =
-                    self.recognize_checked_arith_uint_site(dest_class_ty, &result_var, payload_hint)
-                {
+                if let Some(site) = self.recognize_checked_arith_uint_site(
+                    dest_class_ty,
+                    &result_var,
+                    payload_hint,
+                    bits,
+                ) {
                     self.checked_arith_uint_sites.push(site);
                 }
             }
         }
         // Word-sized `{u64,usize}::saturating_mul`.  Narrow unsigned
         // saturating mul is not a word high-word test (`u32::MAX *
-        // u32::MAX` fits in u64), so the dest atom is required here —
-        // the same width gate as unsigned `checked_mul`.
+        // u32::MAX` fits in u64), so the dest atom is required here.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,

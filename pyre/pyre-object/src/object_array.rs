@@ -194,7 +194,7 @@ impl crate::lltype::GcArrayType for ItemsBlock {
     }
 
     unsafe fn alloc_fallback(layout: Layout) -> Option<*mut Self> {
-        unsafe { std_alloc_gc_array(layout, false).map(|p| p as *mut Self) }
+        unsafe { std_alloc_gc_array(layout, true).map(|p| p as *mut Self) }
     }
 }
 
@@ -2549,6 +2549,10 @@ mod tests {
             let block = crate::lltype::malloc_varsize_clear::<ItemsBlock>(3);
             assert!(!block.is_null());
             assert_eq!((*block).capacity, 3);
+            let base = items_block_items_base(block);
+            for i in 0..3 {
+                assert!((*base.add(i)).is_null());
+            }
             dealloc_list_items_block(block);
         }
     }

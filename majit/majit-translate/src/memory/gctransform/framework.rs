@@ -631,15 +631,27 @@ fn name_last_segment(name: &str) -> &str {
 }
 
 /// `lltype.malloc` typed helpers that still call their allocation hook;
-/// only the `GcType::type_id` unresolved call is discharged.
-/// `CollectAnalyzer.analyze_simple_operation` does not treat that as
+/// only the `GcType::type_id` unresolved call is discharged, plus
+/// `malloc_varsize_clear`'s `GcArrayType` accessors.
+/// `CollectAnalyzer.analyze_simple_operation` does not treat type_id as
 /// `canmallocgc`. Specs keep the `#…` suffix; the last segment match
 /// covers both.
 fn name_is_typed_malloc_helper(name: &str) -> bool {
     matches!(
         name_last_segment(name),
-        "malloc_typed_managed" | "malloc_typed" | "malloc_typed_immortal" | "malloc_typed_stable"
+        "malloc_typed_managed"
+            | "malloc_typed"
+            | "malloc_typed_immortal"
+            | "malloc_typed_stable"
+            | "malloc_varsize_clear"
     )
+}
+
+/// `lltype.malloc(ARRAY, n, zero=True)` / `malloc_varsize` flavor=gc.
+/// `CollectAnalyzer.analyze_simple_operation` returns True.
+/// Specs keep the `#…` suffix; last-segment match covers both.
+fn name_is_varsize_malloc_helper(name: &str) -> bool {
+    name_last_segment(name) == "malloc_varsize_clear"
 }
 
 /// Host calls that leave the collector's RUNNING census.
@@ -743,6 +755,21 @@ impl CallGraph {
             s.push_str(&format!("; UNMATCHED patterns: {unmatched:?}"));
         }
         s
+    }
+
+    /// Collecting seeds for reachability.
+    ///
+    /// [`COLLECTING_SEEDS`] plus every `malloc_varsize_clear` node (template
+    /// and `#…` specs). `CollectAnalyzer.analyze_simple_operation` answers
+    /// can-collect for `malloc_varsize` with `flavor == 'gc'`.
+    pub fn collecting_seed_ids(&self) -> HashSet<u64> {
+        let (mut ids, _) = self.seeds_for(COLLECTING_SEEDS);
+        for (&id, name) in &self.names {
+            if name_is_varsize_malloc_helper(name) {
+                ids.insert(id);
+            }
+        }
+        ids
     }
 
     /// `GraphAnalyzer.analyze_indirect_call` over a hook wrapper's closed
@@ -2538,7 +2565,7 @@ mod tests {
     /// The abort reporter's body may Regular-call a collecting seed
     /// (`emit_stderr` reaches Python). The family edge is recorded; the
     /// reporter does not forward that seed, so the wrapper stays out of
-    /// `reaching(COLLECTING_SEEDS)`.
+    /// `reaching(collecting_seed_ids())`.
     #[test]
     fn abort_reporter_family_does_not_prove_collection() {
         let span = serde_json::json!({
@@ -2651,7 +2678,7 @@ mod tests {
             reporter_callees.is_empty(),
             "abort reporter must be a leaf, callees={reporter_callees:?}"
         );
-        let collecting = cg.seeds_for(COLLECTING_SEEDS).0;
+        let collecting = cg.collecting_seed_ids();
         let reach = cg.reaching(&collecting);
         assert!(
             !reach.contains(&0),
@@ -2727,6 +2754,105 @@ mod tests {
             !cg.indirect.contains(&0),
             "typed malloc helper must drop indirect: {:?}",
             cg.indirect
+        );
+    }
+
+    /// A `malloc_varsize_clear` helper whose body is a Trait call is
+    /// discharged from `indirect`; `CollectAnalyzer.analyze_simple_operation`
+    /// treats `malloc_varsize` as `canmallocgc`, so the template and its
+    /// `#…` spec are collecting seeds.
+    #[test]
+    fn varsize_malloc_helper_is_a_collecting_seed() {
+        let llbc = {
+            let span = serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+            });
+            let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+            let empty_g = serde_json::json!({
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            });
+            let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+            let local = |id: u64| {
+                serde_json::json!({
+                    "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+                })
+            };
+            let ret = serde_json::json!({
+                "statements": [], "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "Return"}
+            });
+            let unwind = serde_json::json!({
+                "statements": [], "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+            });
+            let malloc = serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta(&["lltype", "malloc_varsize_clear"]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": {"Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": [
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
+                                    "generics": empty_g
+                                }},
+                                "args": []
+                            },
+                            "dest": place(0),
+                            "target": 2,
+                            "on_unwind": 1
+                        }}}},
+                        unwind,
+                        ret
+                    ]
+                }}
+            });
+            let spec = serde_json::json!({
+                "def_id": 1,
+                "item_meta": item_meta(&[
+                    "pyre_object",
+                    "lltype",
+                    "malloc_varsize_clear#0=GcArrayType<ItemsBlock>"
+                ]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            });
+            let file = serde_json::json!({
+                "charon_version": "0.1.201",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [],
+                    "fun_decls": [malloc, spec],
+                    "global_decls": [],
+                    "trait_decls": [],
+                    "trait_impls": []
+                }
+            });
+            majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+                .expect("varsize-malloc fixture parses")
+        };
+        let cg = build(&llbc);
+        assert!(
+            !cg.indirect.contains(&0),
+            "varsize malloc helper must drop indirect: {:?}",
+            cg.indirect
+        );
+        let seeds = cg.collecting_seed_ids();
+        assert!(
+            seeds.contains(&0),
+            "template must be a collecting seed: {seeds:?}"
+        );
+        assert_eq!(
+            cg.names.get(&1).map(String::as_str),
+            Some("pyre_object::lltype::malloc_varsize_clear#0=GcArrayType<ItemsBlock>")
+        );
+        assert!(
+            seeds.contains(&1),
+            "spec node must be a collecting seed: {seeds:?}"
         );
     }
 

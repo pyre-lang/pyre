@@ -222,7 +222,7 @@ fn main() {
         // is worthless without the chain behind it.
         if let Ok(pat) = std::env::var("GC_PATH_FROM") {
             let (py0, _) = joined.graph.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
-            let (col0, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+            let col0 = joined.graph.collecting_seed_ids();
             let mut sd = py0;
             sd.extend(col0);
             let mut hits: Vec<(&u64, &String)> = joined
@@ -252,7 +252,7 @@ fn main() {
             joined.graph.seed_report(framework::SAFEPOINT_SEEDS)
         );
         let (jpy, _) = joined.graph.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
-        let (jcol, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+        let jcol = joined.graph.collecting_seed_ids();
         let mut joined_seeds = jpy;
         joined_seeds.extend(jcol);
         let reach = joined.project(0, &joined.graph.reaching(&joined_seeds));
@@ -267,7 +267,7 @@ fn main() {
         // a finding's `callee_id`, which is an id in this artefact, so it needs
         // the local set; the closure above needs the joined one.
         let (py, _) = cg.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
-        let (col, _) = cg.seeds_for(framework::COLLECTING_SEEDS);
+        let col = cg.collecting_seed_ids();
         let mut seeds = py;
         seeds.extend(col);
         println!(

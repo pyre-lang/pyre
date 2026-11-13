@@ -1654,9 +1654,9 @@ fn call_is_later_safepoint(
 /// True when a collecting call can run after the pin that produced the return.
 ///
 /// `collecting` is [`CallGraph::reaching`] of
-/// [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS), so a wrapper such
-/// as `w_weakref_new` is included. `helpers` are the summarized pin helpers:
-/// a nested one pins at a safepoint.
+/// [`CallGraph::collecting_seed_ids`](super::framework::CallGraph::collecting_seed_ids),
+/// so a wrapper such as `w_weakref_new` is included. `helpers` are the
+/// summarized pin helpers: a nested one pins at a safepoint.
 fn collects_after_pin(
     body: &HelperBodyFact,
     collecting: &HashSet<u64>,
@@ -2096,11 +2096,11 @@ fn pin_helper_summaries(
 /// Functions that can collect, for pin-return summaries.
 ///
 /// `CollectAnalyzer` is the transitive closure of operations that can malloc
-/// GC. `CallGraph::reaching` of [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS)
-/// is that set, so a wrapper such as `w_weakref_new` is included even though
-/// it is not itself a seed.
+/// GC. `CallGraph::reaching` of [`CallGraph::collecting_seed_ids`] is that
+/// set, so a wrapper such as `w_weakref_new` is included even though it is
+/// not itself a seed.
 fn collecting_for_pin_summaries(cg: &super::framework::CallGraph) -> HashSet<u64> {
-    let (seeds, _) = cg.seeds_for(super::framework::COLLECTING_SEEDS);
+    let seeds = cg.collecting_seed_ids();
     cg.reaching(&seeds)
 }
 

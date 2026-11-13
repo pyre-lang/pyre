@@ -1,4 +1,4 @@
-//! `usize::checked_{add,sub,mul}()` → native unsigned-overflow ops + a
+//! Unsigned `checked_{add,sub,mul}()` → native unsigned-overflow ops + a
 //! virtualized `Option`.
 //!
 //! ## Positioning
@@ -13,24 +13,27 @@
 //! signed `mul_ovf` would diverge for operands in `(i64::MAX, usize::MAX]`.
 //!
 //! The unsigned overflow tests have native, wrapping-safe forms:
-//!   - `checked_mul(x, y)` overflows iff the high word of the widening
+//!   - Bank `checked_mul(x, y)` overflows iff the high word of the widening
 //!     product is non-zero: `uint_mul_high(x, y) != 0`.
-//!   - `checked_add(x, y)` overflows iff the sum wrapped below an addend
+//!   - Bank `checked_add(x, y)` overflows iff the sum wrapped below an addend
 //!     (carry): `uint_lt(x + y, x)`.
 //!   - `checked_sub(x, y)` underflows iff the subtrahend is above the
 //!     minuend (borrow): `uint_lt(x, y)`.
+//!   - Narrow add/mul (`bits < JIT_BANK_BITS`) never wrap the 64-bit box, so
+//!     overflow is `uint_gt(result, atom_max)`.
 //!
 //! ## The rewrite (`rewire_one_checked_arith_uint_site`)
 //!
 //! Block A's last op is the residual `opt = checked_*(x, y)` call.  The
 //! rewrite drops that call and emits the native sequence followed by a
 //! Some/None construction diamond forwarding to the original continuation:
-//!   - `checked_mul`: `lo = mul(x, y)`, `hi = uint_mul_high(x, y)`,
+//!   - bank `checked_mul`: `lo = mul(x, y)`, `hi = uint_mul_high(x, y)`,
 //!     `disc = eq(hi, 0)`, value = `lo`.
-//!   - `checked_add`: `sum = add(x, y)`, `ovf = uint_lt(sum, x)`,
+//!   - bank `checked_add`: `sum = add(x, y)`, `ovf = uint_lt(sum, x)`,
 //!     `disc = eq(ovf, 0)`, value = `sum`.
 //!   - `checked_sub`: `diff = sub(x, y)`, `ovf = uint_lt(x, y)`,
 //!     `disc = eq(ovf, 0)`, value = `diff`.
+//!   - narrow add/mul: the same `add`/`mul` payload, `ovf = uint_gt(result, max)`.
 //!   - branch on `disc`; Some carries `value`, None carries no payload.
 //!
 //! Unlike [`crate::front::checked_arith`] this
@@ -66,6 +69,8 @@ pub(crate) struct CheckedArithUintSite {
     pub some_owner: String,
     /// The `Option` payload `T` — the `Some::__pos_0` field kind.
     pub payload_ty: ValueType,
+    /// Operand atom width; `< JIT_BANK_BITS` selects the narrow overflow test.
+    pub bits: u32,
 }
 
 /// Rewrite every recorded unsigned `checked_{add,sub,mul}` site into the native
@@ -318,14 +323,35 @@ pub(crate) fn is_word_sized_uint_atom(atom: &str) -> bool {
     )
 }
 
+/// Bit width of an unsigned `checked_{add,sub,mul}` operand the rewrite lowers:
+/// the 8-byte bank ([`is_word_sized_uint_atom_for`]) or any unsigned atom
+/// narrower than [`JIT_BANK_BITS`] (its zero-extended operands cannot wrap
+/// the box). `U128` and `U64` on a 4-byte `Signed` stay residual.
+pub(crate) fn checked_uint_atom_bits_for(
+    atom: &str,
+    signed_bytes: usize,
+    pointer_bytes: usize,
+) -> Option<u32> {
+    if is_word_sized_uint_atom_for(atom, signed_bytes, pointer_bytes) {
+        return Some(64);
+    }
+    if matches!(atom, "U8" | "U16" | "U32" | "Usize") {
+        let bits = literal_int_atom_bits(atom, pointer_bytes)?;
+        (bits < JIT_BANK_BITS).then_some(bits)
+    } else {
+        None
+    }
+}
+
 /// Destination `Option<Self>` payload first (covers both-const
-/// `1usize.checked_add(2)`), then either operand Place.  A readable
-/// narrow payload declines even if an operand atom looks word-sized.
-pub(crate) fn unsigned_word_atom<'a>(
+/// `1usize.checked_add(2)`), then either operand Place.  Returns the
+/// chosen atom's width, or `None` for a readable unsupported payload
+/// such as `U128`.
+pub(crate) fn checked_uint_atom<'a>(
     dest_payload_atom: Option<&'a str>,
     operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
-) -> Option<&'a str> {
-    unsigned_word_atom_for(
+) -> Option<u32> {
+    checked_uint_atom_for(
         dest_payload_atom,
         operand_atoms,
         crate::layout::target_signed_size(),
@@ -333,14 +359,14 @@ pub(crate) fn unsigned_word_atom<'a>(
     )
 }
 
-pub(crate) fn unsigned_word_atom_for<'a>(
+pub(crate) fn checked_uint_atom_for<'a>(
     dest_payload_atom: Option<&'a str>,
     operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
     signed_bytes: usize,
     pointer_bytes: usize,
-) -> Option<&'a str> {
+) -> Option<u32> {
     let atom = dest_payload_atom.or_else(|| operand_atoms.into_iter().flatten().next())?;
-    is_word_sized_uint_atom_for(atom, signed_bytes, pointer_bytes).then_some(atom)
+    checked_uint_atom_bits_for(atom, signed_bytes, pointer_bytes)
 }
 
 fn rewire_one_checked_arith_uint_site(
@@ -428,43 +454,15 @@ fn rewire_one_checked_arith_uint_site(
     // instantiated `Option<T>` ClassDef recorded at the call (`site.some_owner`).
     graph.blocks[a].operations.truncate(call_idx);
 
-    // The two operators differ only in the payload value and the overflow
+    // The operators differ only in the payload value and the overflow
     // test; build the `Option` once from the resulting `(value, disc)`.
-    let (value, disc) = match arith {
-        UintArith::Mul => {
-            let lo = push_binop(
-                graph,
-                a_id,
-                "mul",
-                lhs.clone(),
-                rhs.clone(),
-                ValueType::Unsigned,
-            );
-            let hi = push_binop(graph, a_id, "uint_mul_high", lhs, rhs, ValueType::Unsigned);
-            let disc = push_no_overflow_disc(graph, a_id, hi);
-            (lo, disc)
-        }
-        UintArith::Add => {
-            let sum = push_binop(
-                graph,
-                a_id,
-                "add",
-                lhs.clone(),
-                rhs.clone(),
-                ValueType::Unsigned,
-            );
-            // Unsigned carry: the wrapped sum is strictly below an addend.
-            let ovf = push_binop(
-                graph,
-                a_id,
-                "uint_lt",
-                sum.clone(),
-                lhs.clone(),
-                ValueType::Int,
-            );
-            let disc = push_no_overflow_disc(graph, a_id, ovf);
-            (sum, disc)
-        }
+    //
+    // A zero-extended narrow pair never wraps the 64-bit box for add/mul
+    // (`rarithmetic.r_uint` at `LONG_BIT`; `jtransform.py`
+    // `_int_to_int_cast` when `size2 < sizeof(Signed)`), so overflow is
+    // `result > atom max` and the payload needs no mask. Sub keeps the
+    // borrow test. Bank (`bits == JIT_BANK_BITS`) keeps the wrap tests.
+    let (value, ovf) = match arith {
         UintArith::Sub => {
             let diff = push_binop(
                 graph,
@@ -478,10 +476,39 @@ fn rewire_one_checked_arith_uint_site(
             // The difference is emitted either way and read only when the
             // discriminant says `Some`, as the wrapped sum above is.
             let ovf = push_binop(graph, a_id, "uint_lt", lhs, rhs, ValueType::Int);
-            let disc = push_no_overflow_disc(graph, a_id, ovf);
-            (diff, disc)
+            (diff, ovf)
+        }
+        UintArith::Mul | UintArith::Add => {
+            let is_mul = matches!(arith, UintArith::Mul);
+            let op = if is_mul { "mul" } else { "add" };
+            let value = push_binop(
+                graph,
+                a_id,
+                op,
+                lhs.clone(),
+                rhs.clone(),
+                ValueType::Unsigned,
+            );
+            let ovf = if site.bits < JIT_BANK_BITS {
+                let max = push_const_uint(graph, a_id, unsigned_word_max((site.bits / 8) as usize));
+                push_binop(graph, a_id, "uint_gt", value.clone(), max, ValueType::Int)
+            } else if is_mul {
+                push_binop(graph, a_id, "uint_mul_high", lhs, rhs, ValueType::Unsigned)
+            } else {
+                // Unsigned carry: the wrapped sum is strictly below an addend.
+                push_binop(
+                    graph,
+                    a_id,
+                    "uint_lt",
+                    value.clone(),
+                    lhs.clone(),
+                    ValueType::Int,
+                )
+            };
+            (value, ovf)
         }
     };
+    let disc = push_no_overflow_disc(graph, a_id, ovf);
 
     emit_option_variant_dynamic(
         graph,
@@ -539,10 +566,23 @@ pub(crate) fn push_const_int(
     res
 }
 
+pub(crate) fn push_const_uint(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    value: u64,
+) -> Variable {
+    let res = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::ConstUInt(value),
+    });
+    res
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
-    fn checked_unsigned_capture_rejects_narrow_integer_atoms() {
+    fn checked_unsigned_capture_widths() {
         for atom in ["U8", "U16", "U32", "U128"] {
             assert!(!is_word_sized_uint_atom(atom));
         }
@@ -551,6 +591,16 @@ mod tests {
             is_word_sized_uint_atom("U64"),
             crate::layout::target_signed_size() == 8
         );
+        assert_eq!(checked_uint_atom_bits_for("U8", 8, 8), Some(8));
+        assert_eq!(checked_uint_atom_bits_for("U16", 8, 8), Some(16));
+        assert_eq!(checked_uint_atom_bits_for("U32", 8, 8), Some(32));
+        assert_eq!(checked_uint_atom_bits_for("Usize", 8, 8), Some(64));
+        assert_eq!(checked_uint_atom_bits_for("U64", 8, 8), Some(64));
+        assert_eq!(checked_uint_atom_bits_for("Usize", 8, 4), Some(32));
+        assert_eq!(checked_uint_atom_bits_for("U64", 8, 4), Some(64));
+        assert_eq!(checked_uint_atom_bits_for("U64", 4, 4), None);
+        assert_eq!(checked_uint_atom_bits_for("U128", 8, 8), None);
+        assert_eq!(checked_uint_atom_bits_for("I32", 8, 8), None);
     }
 
     #[test]
@@ -866,17 +916,17 @@ mod tests {
     fn four_byte_usize_checked_add_is_not_an_unchecked_bank_op() {
         assert!(!is_word_sized_uint_atom_for("Usize", 8, 4));
         assert_eq!(
-            unsigned_word_atom_for(Some("Usize"), [None, None], 8, 4),
-            None,
-            "usize::checked_add on a 4-byte pointer must stay a residual call"
+            checked_uint_atom_for(Some("Usize"), [None, None], 8, 4),
+            Some(32),
+            "usize::checked_add on a 4-byte pointer is the narrow overflow test"
         );
         assert_eq!(
-            unsigned_word_atom_for(Some("Usize"), [None, None], 8, 8),
-            Some("Usize")
+            checked_uint_atom_for(Some("Usize"), [None, None], 8, 8),
+            Some(64)
         );
         assert_eq!(
-            unsigned_word_atom_for(Some("U64"), [None, None], 8, 4),
-            Some("U64"),
+            checked_uint_atom_for(Some("U64"), [None, None], 8, 4),
+            Some(64),
             "u64::checked_add on wasm32 (Signed 8, pointer 4) is a bank op"
         );
     }
@@ -901,6 +951,7 @@ mod tests {
             option_owner: "core::option::Option<usize>".to_string(),
             some_owner: "core::option::Option<usize>::Some".to_string(),
             payload_ty: ValueType::Unsigned,
+            bits: 64,
         }
     }
 
@@ -1010,6 +1061,46 @@ mod tests {
         }
         variants.sort();
         assert_eq!(variants, vec!["None", "Some"]);
+    }
+
+    #[test]
+    fn checked_mul_narrow_lowers_to_mul_and_uint_gt_max() {
+        let (mut g, opt, a) = build_checked_site("checked_mul");
+        let mut site = site_for(&opt);
+        site.bits = 32;
+        let rewritten = rewire_checked_arith_uint_sites(&mut g, &[site]);
+        assert_eq!(
+            rewritten, 1,
+            "the narrow unsigned checked_mul site must rewrite"
+        );
+        assert!(
+            g.blocks[a]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "narrow mul still emits the low-word product"
+        );
+        assert!(
+            g.blocks[a]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstUInt(4294967295))),
+            "narrow overflow test needs the u32 atom max"
+        );
+        assert!(
+            g.blocks[a]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "uint_gt")),
+            "narrow mul overflow is uint_gt(lo, max)"
+        );
+        assert!(
+            !g.blocks[a].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "uint_mul_high"
+            )),
+            "narrow mul must not use uint_mul_high"
+        );
     }
 
     #[test]
@@ -1134,25 +1225,22 @@ mod tests {
 
     #[test]
     fn both_const_and_const_rhs_reach_word_sized_unsigned() {
+        assert_eq!(checked_uint_atom(Some("Usize"), [None, None]), Some(64));
+        assert_eq!(checked_uint_atom(None, [Some("Usize"), None]), Some(64));
         assert_eq!(
-            unsigned_word_atom(Some("Usize"), [None, None]),
-            Some("Usize")
-        );
-        assert_eq!(
-            unsigned_word_atom(None, [Some("Usize"), None]),
-            Some("Usize")
-        );
-        assert_eq!(
-            unsigned_word_atom(Some("U64"), [None, None]).is_some(),
+            checked_uint_atom(Some("U64"), [None, None]).is_some(),
             crate::layout::target_signed_size() == 8
         );
     }
 
     #[test]
     fn narrow_unsigned_dest_payload_declines() {
-        assert_eq!(unsigned_word_atom(Some("U32"), [Some("U64"), None]), None);
-        assert_eq!(unsigned_word_atom(Some("U8"), [None, None]), None);
-        assert_eq!(unsigned_word_atom(None, [Some("U16"), None]), None);
-        assert_eq!(unsigned_word_atom(None, [None, None]), None);
+        assert_eq!(
+            checked_uint_atom(Some("U32"), [Some("U64"), None]),
+            Some(32)
+        );
+        assert_eq!(checked_uint_atom(Some("U8"), [None, None]), Some(8));
+        assert_eq!(checked_uint_atom(None, [Some("U16"), None]), Some(16));
+        assert_eq!(checked_uint_atom(None, [None, None]), None);
     }
 }

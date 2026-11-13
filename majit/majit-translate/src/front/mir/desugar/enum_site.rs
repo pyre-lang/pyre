@@ -971,18 +971,20 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve an unsigned `usize::checked_{add,mul}` call whose result is an
-    /// `Option<usize>` into a
+    /// Resolve an unsigned `checked_{add,sub,mul}` call whose result is an
+    /// `Option<T>` into a
     /// [`crate::front::checked_arith_uint::CheckedArithUintSite`] — the
-    /// `Option` enum root + `Some` variant owners and the payload type, keyed
-    /// off the destination `Option<usize>` type.  Mirrors
-    /// [`Self::resolve_option_consumer_owners`] so the virtualized `Option`
-    /// this pass builds shares field descrs with downstream `?` / match reads.
+    /// `Option` enum root + `Some` variant owners, the payload type, and the
+    /// operand atom width, keyed off the destination `Option<T>` type.
+    /// Mirrors [`Self::resolve_option_consumer_owners`] so the virtualized
+    /// `Option` this pass builds shares field descrs with downstream `?` /
+    /// match reads.
     pub(in crate::front::mir) fn recognize_checked_arith_uint_site(
         &self,
         dest_ty: &TyRef,
         result_var: &Variable,
         payload_hint: Option<&TyRef>,
+        bits: u32,
     ) -> Option<crate::front::checked_arith_uint::CheckedArithUintSite> {
         if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
             return None;
@@ -1004,6 +1006,7 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+            bits,
         })
     }
 
