@@ -1080,12 +1080,22 @@ fn snapshot_map_from_byte_recorder(
     let positions = recorder.captured_resume_positions();
     let n = positions.len();
     let frame_count = recorder.captured_frame_count_from_positions(&positions);
-    let mut box_map = Vec::with_capacity(n);
+    // `rd_resume_position` is a `_snapshot_data` byte offset
+    // (`opencoder.py` `TraceIterator.next`). Allocate the index
+    // space once to that buffer's span; a `with_capacity(n)` map
+    // still recopies on every growing insert at offset `pos`.
+    let span = positions.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut box_map = Vec::new();
+    box_map.resize_with(span, || None);
     let mut size_map = SnapshotFrameSizes::with_capacity(n, 0);
+    size_map.reserve_index(span);
     size_map.reserve_frames(frame_count);
-    let mut vable_map = Vec::with_capacity(n);
-    let mut vref_map = Vec::with_capacity(n);
+    let mut vable_map = Vec::new();
+    vable_map.resize_with(span, || None);
+    let mut vref_map = Vec::new();
+    vref_map.resize_with(span, || None);
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
+    frame_pcs_map.reserve_index(span);
     frame_pcs_map.reserve_frames(frame_count);
     let tagged_to_box =
         |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
@@ -3466,13 +3476,9 @@ struct InitializeVirtualizableState {
     virtualizable_ptr: *mut u8,
     index_of_virtualizable: usize,
     virtualizable_arg_index: Option<usize>,
-    num_green_args: usize,
     num_reds: usize,
-    num_static: usize,
     total_vable: usize,
     array_lengths: Vec<usize>,
-    box_ref_index: usize,
-    identity_index: Option<usize>,
     virtualizable_box: OpRef,
     virtualizable_value: Value,
     has_expanded_tail: bool,
@@ -6111,13 +6117,9 @@ impl<M: Clone> MetaInterp<M> {
             virtualizable_ptr,
             index_of_virtualizable,
             virtualizable_arg_index,
-            num_green_args,
             num_reds,
-            num_static,
             total_vable,
             array_lengths,
-            box_ref_index,
-            identity_index,
             virtualizable_box,
             virtualizable_value,
             has_expanded_tail,
@@ -6140,13 +6142,9 @@ impl<M: Clone> MetaInterp<M> {
             virtualizable_ptr,
             index_of_virtualizable,
             virtualizable_arg_index,
-            num_green_args,
             num_reds,
-            num_static,
             total_vable,
             array_lengths,
-            box_ref_index,
-            identity_index,
             virtualizable_box,
             virtualizable_value,
             has_expanded_tail,
@@ -8709,6 +8707,7 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
+                false,
             )
         });
         assert!(
@@ -8746,6 +8745,7 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
+                false,
             )
         });
         assert!(
@@ -8783,6 +8783,7 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
+                false,
             )
         });
         assert!(

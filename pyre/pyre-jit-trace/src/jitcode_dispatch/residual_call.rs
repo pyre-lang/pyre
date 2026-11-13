@@ -59,6 +59,29 @@ static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock
     )
 });
 
+/// `descroperation.py get_and_call_function`. The trampoline is the
+/// `getfunctionptr` word-ABI target (`__majit_call_target_*`).
+static GET_AND_CALL_FUNCTION_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    walker_published_fnaddr(
+        &["pyre_interpreter::baseobjspace::get_and_call_function"],
+        pyre_interpreter::residual_word_addr!(
+            4,
+            pyre_interpreter::__majit_call_target_get_and_call_function
+        ) as i64,
+    )
+});
+
+/// `_pure_issubtype` / `w_type_issubtype` (`typeobject.py`). Pure MRO
+/// membership; a rewind repeats the same test.
+static W_TYPE_ISSUBTYPE_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| name.ends_with("::w_type_issubtype") || name.contains("pure_issubtype"))
+    });
+
+pub(crate) fn is_pure_mro_issubtype_residual(fnaddr: i64) -> bool {
+    W_TYPE_ISSUBTYPE_FNADDRS.contains(&fnaddr)
+}
+
 /// Residuals whose registered path names a `bigint` helper: their Ref slots
 /// carry `*mut BigInt` payloads, not `PyObject`s.
 static BIGINT_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
@@ -1226,10 +1249,10 @@ fn capture_root_vable_stack_image<Sym: WalkSym>(
                 .first(),
             "innermost frame has no parent"
         );
-        // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
-        // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
-        // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
-        // A live inline still resolves `CallFallthrough` through that arm.
+        // `resume_pc` is `MIFrame.pc` (`setup_resume_at_op`, the pc half of
+        // `read_jitcode_pos_pc`). `call_jitcode_pc` stays the Rewind arm: a
+        // bridge root leaves it unset. A live inline still resolves
+        // `CallFallthrough` through that arm.
         if parent.call_jitcode_pc.is_none()
             && let Some(resume_pc) = parent.resume_pc
         {
@@ -5068,6 +5091,43 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
     }
 }
 
+/// `dont_look_inside_cannot_raise` helpers whose descr stays
+/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
+/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
+/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
+/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
+/// `default_importlib_import_word` are the same kind of lookup: a miss is
+/// null, and neither calls `_handle_fromlist`.
+fn records_inside_transparent_helper(addr: i64) -> bool {
+    if addr <= 0 {
+        return false;
+    }
+    pyre_interpreter::jit_trace_fnaddrs()
+        .iter()
+        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
+}
+
+fn transparent_helper_recordable_leaf(path: &str) -> bool {
+    path.rsplit("::").next().is_some_and(|leaf| {
+        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+        matches!(
+            leaf,
+            "tuple_from_exact_list"
+                | "dict_get_plain"
+                | "exc_init_one_positional"
+                | "value_error_one_arg"
+                | "extend_from_frame_locals_proxy"
+                | "proxy_list_new"
+                | "proxy_list_append"
+                | "append_extra_locals"
+                | "append_extra_locals_items"
+                | "module_spec_get_initializing"
+                | "bootstrap_handle_fromlist"
+                | "default_importlib_import_word"
+        )
+    })
+}
+
 /// `jit_portal_call_3` is `space.call_method` (`baseobjspace.py`) as five
 /// words. The codewriter leaves `runtime_helper` empty; the inliner enters
 /// only for `CallFn`. Other helpers keep their own tag, so a `store_subscr`
@@ -8346,6 +8406,7 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
                     adescr.clone(),
                     value,
                     concrete,
+                    false,
                 )
             } else {
                 ctx.trace_ctx.vable_setarrayitem_checked(
@@ -8358,6 +8419,7 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
                     adescr.clone(),
                     value,
                     concrete,
+                    false,
                 )
             };
             Ok(stored)
@@ -10532,15 +10594,14 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
 }
 
 /// Snapshot a residual-call guard.  The shared `dispatch_bytecode`
-/// residual sits out of line: `snapshot_pc` is the `goto L_shared` and
-/// `residual_pc` is the shared call.  `containing_py_pc` of the call is
-/// the last opcode, so a capture at `residual_pc` publishes RETURN's
-/// `last_instr`.  Capture at the goto with `after_residual_call=false`
-/// so `resume_marker(goto)` is a can_decode startpoint, and keep the
-/// `setfield_vable` last_instr (this opcode) instead of `py_pc - 1`.
+/// residual sits out of line: `snapshot_pc` is the `goto L_shared`.
+/// `containing_py_pc` of the shared call is the last opcode, so a
+/// capture at that call would publish RETURN's `last_instr`.  Capture at
+/// the goto with `after_residual_call=false` so `resume_marker(goto)` is
+/// a can_decode startpoint, and keep the `setfield_vable` last_instr
+/// (this opcode) instead of `py_pc - 1`.
 fn capture_residual_guard_at<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    residual_pc: usize,
     snapshot_pc: usize,
     residual_call_catch_resume: bool,
 ) -> Result<(), DispatchError> {
@@ -10689,6 +10750,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `descroperation.py get_and_call_function` Function fast path is
+    // `funccall(w_obj, *args_w)`. Residual because `look_inside_graph`
+    // sees the `args_w` loop; `_index` is that call with no extra args.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr)
+        && funcaddr == *GET_AND_CALL_FUNCTION_FNADDR
+        && let Some((result, _)) =
+            try_walker_inline_index_from_get_and_call(ctx, op, code, &r_args, dst)?
+    {
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // Offer the specific pop fold before generic builtin inlining. Now that
     // `list.pop` has a `__majit_wrap_*` gateway, the generic path finds its
     // jitcode and otherwise descends into the wrapper until `w_list_pop_end`'s
@@ -10740,19 +10815,44 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // Offer the `s.add` substitution before generic builtin inlining, the
+    // same seam as `try_walker_orthodox_list_pop`. `set.add` now has a
+    // `__majit_wrap_*` gateway (`interp2app` / `BuiltinCode.func`), so the
+    // generic path finds its jitcode and otherwise descends the wrapper.
+    // An abort-reachable helper pc inside that wrapper (`capture_resumedata`
+    // / `bhimpl_abort`) collapses to the CALL entry and consumes the CALL;
+    // the declared fold then never fires. `Elided` is done here;
+    // `Subst` still uses the generic residual tail below.
+    let mut early_set_add: Option<SetAddMethodSpec> = None;
+    let set_add_offered_before_wrap = ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn;
+    if set_add_offered_before_wrap {
+        match spec_gate(SpecFold::SetAddMethod, || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
+        })? {
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            other => early_set_add = other,
+        }
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        1,
-        &r_args,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
+    if !matches!(&early_set_add, Some(SetAddMethodSpec::Subst(_)))
+        && let Some(inlined) = try_walker_inline_builtin_call(
+            ctx,
+            op,
+            code,
+            1,
+            &r_args,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )?
+    {
         return Ok(inlined);
     }
 
@@ -10785,7 +10885,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         residual_callee_is_walk_self_recursive(ctx, &[funcptr, callable], foldable_runtime_helper)
             && residual_callable_has_closure_or_cells(ctx, callable)
     });
-    if !skip_cell_self_rec {
+    if !matches!(&early_set_add, Some(SetAddMethodSpec::Subst(_))) && !skip_cell_self_rec {
         if let Some(inlined) = try_walker_inline_user_call(
             ctx,
             op,
@@ -11610,8 +11710,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
 
     // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
     // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
+    // (`try_walker_specialize_set_add_method`).  Recognition ran before the
+    // wrap-gateway descent above.  This is a substitution, not a fold — the
+    // call is still a MayForce residual, still guarded and still
     // concrete-executed by the shared tail below, so the force/exception
     // guards, the heapcache invalidation and the `None` writeback are the ones
     // the generic path already emits.  A decline leaves every binding
@@ -11643,21 +11744,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
     // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
     // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
     // still counts that `Some` as the same row.
-    let direct_subst = if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
+    let direct_subst = if let Some(SetAddMethodSpec::Subst(subst)) = early_set_add {
+        Some(subst)
+    } else if set_add_offered_before_wrap {
+        spec_gate(SpecFold::BareSuperCall, || {
+            try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+        })?
     } else {
         None
     };
@@ -11841,7 +11933,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
                 // an uncovered residual keeps the generic fallthrough resume.
                 // See the scope field's doc.  Shared waj captures at the
                 // `goto`, whose py_pc is this opcode, not the residual.
-                capture_residual_guard_at(ctx, op.pc, snapshot_pc, true)?;
+                capture_residual_guard_at(ctx, snapshot_pc, true)?;
             }
         }
 

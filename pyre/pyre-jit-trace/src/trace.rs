@@ -1887,7 +1887,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // Portal snapshot the walk seeded. A reconstructed callee must not
     // keep `virtualizable_heap_ptr` after `popframe` (`resume.py`
     // `rebuild_from_resumedata`: the portal vable stays the root frame).
-    let saved_portal_heap_ptr = ctx.virtualizable_heap_ptr();
+    // Only the fact is kept: the walk below can collect, so the address is
+    // re-read from the rooted frame holder at the restore.
+    let portal_heap_was_seeded = ctx.virtualizable_heap_ptr().is_some();
     // The scope the guard left open, as `setup_bridge_sym` published it.  The
     // sub-walk enters and leaves frames on the live `topframeref`, so a drain
     // that hands the guard back to the blackhole restores this first: the
@@ -2031,11 +2033,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
         let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
         let local_concretes = &recipe.concrete_r[..nlocals];
-        let stack_end = recipe.valuestackdepth.min(recipe.registers_r.len());
-        let resumed_stack_oprefs = &recipe.registers_r[nlocals.min(stack_end)..stack_end];
-        let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
-        let resumed_stack_concretes =
-            &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
+        let (resumed_stack_oprefs, resumed_stack_concretes) =
+            crate::state::reconstructed_operand_stack_boxes(ctx, recipe, &argboxes_r);
         // `_prepare_exception_resumption` / `finishframe_exception`: on an
         // exception-guard bridge the deepest callee is the frame whose residual
         // call raised. `Restored` replays the already-recorded exception
@@ -2089,8 +2088,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             &recipe.registers_f,
             local_oprefs,
             local_concretes,
-            resumed_stack_oprefs,
-            resumed_stack_concretes,
+            &resumed_stack_oprefs,
+            &resumed_stack_concretes,
             pending_frame_ptr,
             pending.sym.frame(),
             pending.sym.execution_context(),
@@ -2131,8 +2130,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // popped via `finishframe(None, False)` + Leave after CALL_ASSEMBLER;
         // the depth/len guard then no-ops.
         crate::jitcode_dispatch::pop_reconstructed_portal_callee(ctx, true);
-        if let Some(ptr) = saved_portal_heap_ptr {
-            ctx.set_virtualizable_heap_ptr(ptr);
+        let portal_heap = sym.tracing_vable_frame_addr();
+        if portal_heap_was_seeded && portal_heap != 0 {
+            ctx.set_virtualizable_heap_ptr(portal_heap as *const u8);
         }
     }
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
@@ -2447,6 +2447,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
             root_pc,
             root_ec,
             root_ec_box,
+            root_frame_box,
             &middles[i],
             &middles[..i],
             result,
@@ -2823,12 +2824,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
-    let middle_stack_end = middle.valuestackdepth.min(middle.registers_r.len());
-    let middle_stack_oprefs =
-        &middle.registers_r[middle_nlocals.min(middle_stack_end)..middle_stack_end];
-    let middle_concrete_stack_end = middle.valuestackdepth.min(middle.concrete_r.len());
-    let middle_stack_concretes = &middle.concrete_r
-        [middle_nlocals.min(middle_concrete_stack_end)..middle_concrete_stack_end];
+    let (middle_stack_oprefs, middle_stack_concretes) =
+        crate::state::reconstructed_operand_stack_boxes(ctx, middle, &middle_argboxes_r);
     let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame_from_handler(
         ctx,
@@ -2844,8 +2841,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         &middle.registers_f,
         middle_local_oprefs,
         middle_local_concretes,
-        middle_stack_oprefs,
-        middle_stack_concretes,
+        &middle_stack_oprefs,
+        &middle_stack_concretes,
         pending_frame_ptr,
         pending.sym.frame(),
         pending.sym.execution_context(),
@@ -2886,6 +2883,12 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
             },
             _,
         ))) => Some(Ok(mid_result)),
+        // `finishframe` with no result box (`leave_portal_frame=False`
+        // records nothing). Same arm as
+        // `walk_transparent_helper_middle_from_handler`.
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
+            Some(Ok(majit_ir::OpRef::NONE))
+        }
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -2893,7 +2896,47 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
             },
             _,
         ))) => Some(Err((raised, raised_concrete))),
-        _ => None,
+        unmatched => {
+            crate::jitcode_dispatch::census_record(match &unmatched {
+                None => "P2Drain::MiddleCatchDriveFailed/WalkNone",
+                Some(Ok((
+                    crate::jitcode_dispatch::DispatchOutcome::SubLoopCalleeCallAssembler { .. },
+                    _,
+                ))) => "P2Drain::MiddleCatchDriveFailed/SubLoopCalleeCallAssembler",
+                Some(Ok((crate::jitcode_dispatch::DispatchOutcome::Continue, _))) => {
+                    "P2Drain::MiddleCatchDriveFailed/Continue"
+                }
+                Some(Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate { .. }, _))) => {
+                    "P2Drain::MiddleCatchDriveFailed/Terminate"
+                }
+                Some(Ok((crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. }, _))) => {
+                    "P2Drain::MiddleCatchDriveFailed/CloseLoop"
+                }
+                Some(Ok((
+                    crate::jitcode_dispatch::DispatchOutcome::SwitchToBlackhole { .. },
+                    _,
+                ))) => "P2Drain::MiddleCatchDriveFailed/SwitchToBlackhole",
+                Some(Ok((
+                    crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. },
+                    _,
+                ))) => "P2Drain::MiddleCatchDriveFailed/CompileTracePending",
+                Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. }, _))) => {
+                    "P2Drain::MiddleCatchDriveFailed/SegmentTrace"
+                }
+                Some(Err(error)) => {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[p2-drain] MiddleCatchDriveFailed/Err variant={} pc={}",
+                            error.variant_name(),
+                            error.stop_pc(),
+                        );
+                    }
+                    "P2Drain::MiddleCatchDriveFailed/Err"
+                }
+                Some(Ok(_)) => "P2Drain::MiddleCatchDriveFailed",
+            });
+            None
+        }
     }
 }
 
@@ -3258,6 +3301,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
+    root_frame_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
@@ -3338,12 +3382,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
-    let middle_stack_end = middle.valuestackdepth.min(middle.registers_r.len());
-    let middle_stack_oprefs =
-        &middle.registers_r[middle_nlocals.min(middle_stack_end)..middle_stack_end];
-    let middle_concrete_stack_end = middle.valuestackdepth.min(middle.concrete_r.len());
-    let middle_stack_concretes = &middle.concrete_r
-        [middle_nlocals.min(middle_concrete_stack_end)..middle_concrete_stack_end];
+    let (middle_stack_oprefs, middle_stack_concretes) =
+        crate::state::reconstructed_operand_stack_boxes(ctx, middle, &middle_argboxes_r);
     let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
@@ -3359,8 +3399,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         &middle.registers_f,
         middle_local_oprefs,
         middle_local_concretes,
-        middle_stack_oprefs,
-        middle_stack_concretes,
+        &middle_stack_oprefs,
+        &middle_stack_concretes,
         pending_frame_ptr,
         pending.sym.frame(),
         pending.sym.execution_context(),
@@ -6273,7 +6313,16 @@ fn run_perfn_walk<Sym: WalkSym>(
             // last_instr pin). The two constructions must agree.
             // `reached_loop_header` already recorded GUARD_FUTURE_CONDITION
             // before the compiled-target check. Reuse that guard.
-            crate::state::refill_vable_header_stack_from_concrete(ctx, cf_addr, loop_header_pc);
+            // pyjitpl.py `synchronize_virtualizable` /
+            // `load_fields_from_virtualizable` read the frame through
+            // `virtualizable_boxes[-1].getref_base()` after any collecting
+            // call. The walk just ran residual calls, so `cf_addr` is a
+            // pre-walk copy; `cf_addr_now` is the rooted slot.
+            crate::state::refill_vable_header_stack_from_concrete(
+                ctx,
+                cf_addr_now(),
+                loop_header_pc,
+            );
             let rebuilt = sym.close_loop_args_at(
                 ctx,
                 cf_addr_now(),
@@ -6326,7 +6375,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                 _ => None,
             };
             if let Some(header_pc) = header_pc {
-                crate::state::refill_vable_header_stack_from_concrete(ctx, cf_addr, header_pc);
+                crate::state::refill_vable_header_stack_from_concrete(
+                    ctx,
+                    cf_addr_now(),
+                    header_pc,
+                );
                 if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(

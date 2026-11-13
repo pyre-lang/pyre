@@ -961,6 +961,16 @@ impl<T> SnapshotRunTable<T> {
         }
     }
 
+    /// Index space is `_snapshot_data` byte offsets (`opencoder.py`
+    /// `TraceIterator.next` `rd_resume_position`). Size it once to the
+    /// buffer length; growing `spans` per captured guard recopies the
+    /// prefix.
+    pub fn reserve_index(&mut self, len: usize) {
+        if self.spans.len() < len {
+            self.spans.resize(len, (0, SNAP_RUN_ABSENT));
+        }
+    }
+
     pub fn get(&self, pos: i32) -> Option<&[T]> {
         if pos < 0 {
             return None;

@@ -2529,6 +2529,7 @@ fn ensure_enum_variant_instance_layout(
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         raw_alloc_flavor_structs,
+        &std::collections::HashMap::new(),
     );
     if let Some(host) = enum_layout
         .as_ref()
@@ -3700,11 +3701,13 @@ impl<'l> CrateLowering<'l> {
         let CrateLoweringState {
             struct_field_attrs,
             struct_fields,
+            struct_layouts,
             tombstoned_leaves,
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
             dont_look_inside,
+            func_hints,
             ..
         } = self.state;
         lower_fat_dyn_callee(
@@ -3714,11 +3717,13 @@ impl<'l> CrateLowering<'l> {
             self.jitdriver_receiver_roots,
             struct_field_attrs,
             struct_fields,
+            struct_layouts.clone(),
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            func_hints,
         )
     }
 
@@ -4990,7 +4995,8 @@ impl SemanticFunctionHeader {
             fun_decl_result_is_interior_ptr(fd, &signature.output, llbc, tombstoned_leaves);
         let return_type = if interior_ptr_result {
             Some("ref".to_string())
-        } else if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
+        } else if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc)
+        {
             Some("()".to_string())
         } else if stamp_return_token {
             signature_token
@@ -5033,8 +5039,16 @@ impl SemanticFunctionHeader {
         } else {
             residual_return_type
         };
+        // Gate A intern's the unsuffixed GcArray ITEM (`lltype.py` `Struct`
+        // in `GcArray`; `declared_return_annotation` of `Ptr(STRUCT)`).
+        // `RDict::entry_ptr` is Interior of index 0 (`InteriorPtrRepr`)
+        // and has no classdef.
         let return_class_root = if interior_ptr_result {
-            None
+            if path_is_rordereddict_entry_ptr(&fd.item_meta.name_path()) {
+                None
+            } else {
+                gcarray_item_ptr_return_class_root(&signature.output, llbc, gc_struct_ids)
+            }
         } else {
             dont_look_inside_return_class_root(
                 &signature.output,
@@ -5758,6 +5772,18 @@ fn published_struct_field_layout(
         // `*mut u8` stays on the Ref fallback for GCREF / STR producers
         // (`raw_thin_pointer_spelling`).
         "*const u8".to_string()
+    } else if owner_is_closure_env
+        && let Some(pointee) = tyref_shared_borrow_primitive_pointee(field_ty, llbc)
+        && let Some(spelling) = json_ty_scalar_element_spelling(&pointee, llbc)
+    {
+        // Shared `&P` capture aliases the local (`Rvalue::Ref`).
+        // `tyref_to_attr_value_type_for_struct_field` already peels to
+        // the primitive so the getfield is Int-banked; the layout row
+        // must match. `&usize` would intern FLAG_POINTER
+        // (`get_type_flag` `s.starts_with('&')`) and `do_setfield_gc`
+        // would refuse the Int store, leaving the New() field zero
+        // after RandomEffects `clean_caches`.
+        spelling
     } else {
         // `FloatArray.block` / `IntArray.block` stay `*mut TypedItemsBlock`.
         // That spelling projects as `SomePtr(GcArray(ITEM))` of the
@@ -5983,6 +6009,7 @@ fn intern_interior_ptr_size_descr() {
         cache_key,
         0,
         true,
+        false,
         false,
         &specs,
         &[],

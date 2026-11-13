@@ -4802,6 +4802,7 @@ mod portal_driver_tests {
                     size: 8,
                     align: 8,
                     gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![crate::call::StructFieldLayout {
                         name: field_name.to_string(),
                         offset: 0,
@@ -4853,8 +4854,7 @@ mod portal_driver_tests {
                     args: vec![receiver.clone()],
                     graphs: None,
                     family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
-                        trait_root,
-                        method,
+                        trait_root, method,
                     )),
                     result_ty: ValueType::Void,
                 },
@@ -4907,7 +4907,13 @@ mod portal_driver_tests {
             filled,
             vec![
                 (Some(vec![CallPath::from_segments(["A", "run"])]), None),
-                (None, Some(("Unregistered".to_string(), "go".to_string()))),
+                (
+                    None,
+                    Some(crate::model::IndirectFamilyKey::dyn_trait(
+                        "Unregistered",
+                        "go",
+                    )),
+                ),
             ],
             "Handler::run must keep A::run as its only candidate; Unregistered::go stays unresolved"
         );

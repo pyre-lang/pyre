@@ -150,7 +150,9 @@ fn find_all_graphs_does_not_follow_portal_recursive_edges() {
 /// site — `{vtable}.method_*` FieldRead plus `OpKind::IndirectCall` with
 /// `family_key`. BFS expands that key through `all_impls_for_indirect`.
 fn build_indirect_caller_graph(name: &str, trait_root: &str, method_name: &str) -> FunctionGraph {
-    use majit_translate::model::{FieldDescriptor, OpKind, SpaceOperation, ValueType};
+    use majit_translate::model::{
+        FieldDescriptor, IndirectFamilyKey, OpKind, SpaceOperation, ValueType,
+    };
 
     let mut graph = FunctionGraph::new(name);
     let receiver = graph.alloc_value_var();
@@ -180,10 +182,7 @@ fn build_indirect_caller_graph(name: &str, trait_root: &str, method_name: &str) 
                 funcptr,
                 args: vec![receiver],
                 graphs: None,
-                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
-                    trait_root,
-                    method_name,
-                )),
+                family_key: Some(IndirectFamilyKey::dyn_trait(trait_root, method_name)),
                 result_ty: ValueType::Int,
             },
         });

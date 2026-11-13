@@ -1414,7 +1414,10 @@ mod tests {
         method_name: &str,
     ) {
         let field_name = format!("method_{method_name}");
-        let expected_key = Some((trait_root.to_string(), method_name.to_string()));
+        let expected_key = Some(crate::model::IndirectFamilyKey::dyn_trait(
+            trait_root,
+            method_name,
+        ));
         let mut hits = 0usize;
         for block in &graph.blocks {
             for op in &block.operations {

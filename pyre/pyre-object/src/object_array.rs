@@ -1127,6 +1127,42 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
     crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock
 }
 
+/// Immortal exact-size `ItemsBlock` for a prebuilt `GcArray(OBJECTPTR)`.
+///
+/// Same header / type id / length layout as [`alloc_tuple_items_block_gc`]
+/// (`rlist.py` `ll_fixed_newlist` of a translation-time list). Allocation is
+/// `malloc_varsize` + `init_gc_object_immortal`
+/// (`alloc_varsize_with_gc_header_immortal_zeroed`): never nursery, never a
+/// collection point. Items must themselves be prebuilt; an immortal→immortal
+/// edge needs no write barrier (`incminimark.py` prebuilt objects).
+///
+/// # Safety
+/// `items` pointers must remain valid for the life of the process.
+pub unsafe fn alloc_tuple_items_block_immortal(items: &[PyObjectRef]) -> *mut ItemsBlock {
+    let cap = items.len();
+    let Some(layout) = try_items_block_layout(cap) else {
+        items_block_alloc_failed(cap);
+    };
+    let raw = majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(
+        layout.size(),
+        PY_OBJECT_ARRAY_GC_TYPE_ID,
+    );
+    if raw.is_null() {
+        items_block_alloc_failed(cap);
+    }
+    let block = raw as *mut ItemsBlock;
+    unsafe {
+        (*block).capacity = cap;
+        let base = items_block_items_base(block);
+        let mut i = 0usize;
+        while i < cap {
+            *base.add(i) = items[i];
+            i += 1;
+        }
+    }
+    block
+}
+
 /// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for
 /// the walker's recording-time materialization of a virtual
 /// `NEW_ARRAY_CLEAR` (BUILD_LIST / BUILD_TUPLE). Returns `None` when no
@@ -2086,21 +2122,23 @@ unsafe fn fill_mro_block(
     block
 }
 
-/// `_ll_prebuilt_empty_array` for `GcArray(OBJECTPTR)`: one old-gen
+/// Header-only empty `GcArray` (`rlist.py` `prepare_const(0)` malloc
+/// immortal). Empty payload holds no heap pointer, so
+/// `init_gc_object_immortal` applies. Never nursery, never moved.
+pub fn alloc_prebuilt_empty_gcarray() -> *mut FixedObjectArray {
+    majit_gc::header::alloc_with_gc_header_immortal(
+        FixedObjectArray { len: 0, _items: [] },
+        PY_OBJECT_ARRAY_GC_TYPE_ID,
+    )
+}
+
+/// `_ll_prebuilt_empty_array` for `GcArray(OBJECTPTR)`: one immortal
 /// zero-length [`FixedObjectArray`], shared by every empty object-array
 /// jitcode constant. `ListRepr.convert_const` / `prepare_const(0)` malloc
-/// immortal; this is that singleton. Never nursery, never moved — the same
-/// stable path as [`alloc_mro_block_gc`].
+/// immortal; this is that singleton.
 pub fn prebuilt_empty_object_array() -> *mut FixedObjectArray {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        // `rlist.py` `prepare_const(0)` malloc immortal. Empty payload holds
-        // no heap pointer, so `init_gc_object_immortal` applies.
-        majit_gc::header::alloc_with_gc_header_immortal(
-            FixedObjectArray { len: 0, _items: [] },
-            PY_OBJECT_ARRAY_GC_TYPE_ID,
-        ) as usize
-    }) as *mut FixedObjectArray
+    *CELL.get_or_init(|| alloc_prebuilt_empty_gcarray() as usize) as *mut FixedObjectArray
 }
 
 // ─── GcTypedArray: typed array helper for resume / blackhole ─────────

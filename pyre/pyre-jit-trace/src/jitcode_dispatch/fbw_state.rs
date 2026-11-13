@@ -3796,6 +3796,13 @@ pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
     )
 }
 
+/// Put the unjournaled flags back to a snapshot taken before a descent
+/// whose recorded-but-unexecuted residuals the cut has just dropped.
+pub(crate) fn fbw_restore_unjournaled_kinds(kinds: (bool, bool)) {
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(kinds.0));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(kinds.1));
+}
+
 pub(crate) fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
     let counter = if is_void {
         &FBW_EXECUTED_RESIDUAL_VOID
@@ -3982,9 +3989,6 @@ pub(crate) fn fbw_force_virtualizable_to_live_frame<Sym: WalkSym>(ctx: &WalkCont
         return;
     }
     fbw_arm_durable_frame_undo(frame);
-    if crate::state::flush_known_virtualizable_to_frame(ctx.trace_ctx, frame) {
-        return;
-    }
     // `write_boxes` declines the whole image when any slot is Void /
     // NO_CONCRETE. A portal Finish still owes the live frame every
     // known static Int (`valuestackdepth`, `last_instr`) and every

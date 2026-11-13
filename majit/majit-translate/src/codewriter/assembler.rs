@@ -6824,7 +6824,15 @@ fn bh_all_field_specs_for_struct_into(
                     .unwrap_or(std::mem::size_of::<usize>()),
             )
         } else {
-            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs)
+            let layout_size = cc
+                .struct_layout_for(field_type_str)
+                .map(|layout| layout.size)
+                .filter(|&s| s > 0);
+            super::call::get_type_flag_with_size(
+                field_type_str,
+                &cc.raw_alloc_flavor_structs,
+                layout_size,
+            )
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;

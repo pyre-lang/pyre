@@ -687,14 +687,7 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
     };
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected]);
-    walker_capture_snapshot_for_last_guard_scoped(
-        ctx,
-        op.pc,
-        GuardCaptureScope {
-            orgpc_resume: true,
-            ..Default::default()
-        },
-    )?;
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     super::vable_ops::walker_replace_box(ctx, value, expected);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }

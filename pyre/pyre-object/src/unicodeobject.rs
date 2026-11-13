@@ -49,10 +49,8 @@ const _: () = {
 /// `_utf8` payload — pointer to an [`Utf8Str`] / rstr `STR` allocation.
 pub type UnicodeValueStorage = Utf8Str;
 
-/// Allocate an rstr `STR` (`rstr.py mallocstr`) and copy `bytes` into `chars`.
-///
-/// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
-/// The copy below fills every byte the caller asked for.
+/// Copy `bytes` into an rstr `STR` whose `chars` the allocator left unfilled
+/// (`rstr.py` `mallocstr`, `malloc_zero_filled` false).
 ///
 /// A failed allocation is `MemoryError` upstream (`transform.py`
 /// `_ll_malloc_varsize_no_length`). The raw helper answers 0; a Failed request returns null
@@ -60,12 +58,7 @@ pub type UnicodeValueStorage = Utf8Str;
 /// pending exception still aborts (`handle_alloc_error`). `Layout::new` is
 /// the abort path's reported request (`items_block_alloc_failed` uses the
 /// same stand-in when the real layout cannot be named).
-pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStorage {
-    let p = if managed && lowlevel_str_gc_type_id() != 0 {
-        bh_alloc_str_nofill(bytes.len())
-    } else {
-        alloc_raw_utf8_payload(bytes.len())
-    };
+fn fill_utf8_payload_chars(p: i64, bytes: &[u8]) -> *mut UnicodeValueStorage {
     if p == 0 {
         if crate::gc_hook::gc_alloc_failed_pending() {
             return std::ptr::null_mut();
@@ -77,6 +70,30 @@ pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStora
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     }
     p as *mut UnicodeValueStorage
+}
+
+/// Immortal rstr `STR` (`rstr.py` `init_gc_object_immortal`,
+/// `BaseLLStringRepr.convert_const`). Host-allocated, never collected.
+/// No CFG edge to `bh_alloc_str_nofill`: `convert_const` does not collect.
+fn alloc_utf8_payload_immortal(bytes: &[u8]) -> *mut UnicodeValueStorage {
+    fill_utf8_payload_chars(alloc_raw_utf8_payload(bytes.len()), bytes)
+}
+
+/// Nursery rstr `STR` (`rstr.py` `mallocstr` with `flavor='gc'`).
+fn alloc_utf8_payload_nursery(bytes: &[u8]) -> *mut UnicodeValueStorage {
+    fill_utf8_payload_chars(bh_alloc_str_nofill(bytes.len()), bytes)
+}
+
+/// Allocate an rstr `STR` (`rstr.py mallocstr`) and copy `bytes` into `chars`.
+///
+/// `managed` selects the nursery `mallocstr` when the STR GC tid is
+/// registered; otherwise the immortal `convert_const` block.
+pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStorage {
+    if managed && lowlevel_str_gc_type_id() != 0 {
+        alloc_utf8_payload_nursery(bytes)
+    } else {
+        alloc_utf8_payload_immortal(bytes)
+    }
 }
 
 /// `rutf8.codepoints_in_utf8` over a whole buffer (`objspace.py` `newtext`).
@@ -1271,7 +1288,7 @@ pub fn prebuilt_str_storage_bytes(bytes: &[u8]) -> *mut UnicodeValueStorage {
     if let Some(&p) = cache.get(bytes) {
         return p as *mut UnicodeValueStorage;
     }
-    let p = alloc_utf8_payload(bytes, false);
+    let p = alloc_utf8_payload_immortal(bytes);
     let _ = crate::lowlevel_string::ll_strhash(p);
     cache.insert(bytes.to_vec(), p as usize);
     p

@@ -6180,7 +6180,7 @@ pub(in crate::front::mir) fn dest_reborrow_census(
         other: 0,
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6229,7 +6229,7 @@ pub(in crate::front::mir) fn dest_ptr_write_census(
         other: 0,
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6286,7 +6286,7 @@ pub(in crate::front::mir) fn unique_local_assign_rvalue(
     let mut found = None;
     let mut defs = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6318,7 +6318,7 @@ pub(in crate::front::mir) fn follow_operand_to_aggregate(
     for _ in 0..8 {
         match unique_local_assign_rvalue(body, llbc, local)? {
             Rvalue::Use(next, _) => local = operand_local(Some(&next))?,
-            Rvalue::Aggregate(kind, ops) => return Some((kind, ops)),
+            Rvalue::Aggregate(kind, ops) => return Some((kind.as_ref().clone(), ops)),
             _ => return None,
         }
     }
@@ -6335,7 +6335,7 @@ pub(in crate::front::mir) fn aggregate_adt_id(kind: &serde_json::Value) -> Optio
 fn unique_ptr_write_value(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<Operand> {
     let mut found = None;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6491,7 +6491,7 @@ pub(in crate::front::mir) fn callee_returns_interior_array_type_id(
     let body = fd.unstructured()?;
     let add_dest = follow_reborrow_to_add_dest(&body, llbc, 0)?;
     let (bb_idx, _) = ptr_add_def_site(llbc, &body, add_dest)?;
-    let TermKind::Call { call, .. } = body.body.get(bb_idx)?.term_ref(llbc).ok()? else {
+    let TermKind::Call { call, .. } = body.body().get(bb_idx)?.term_ref(llbc).ok()? else {
         return None;
     };
     let CallFunc::Regular(reg) = &call.func else {
@@ -6509,6 +6509,29 @@ pub(in crate::front::mir) fn callee_returns_interior_array_type_id(
         tombstoned,
     )
     .map(|traced| traced.array_type_id)
+}
+
+/// ARRAY identity of a Gate A InteriorPtr return at this call dest.
+///
+/// `rptr.py` `InteriorPtrRepr.lowleveltype` is `Ptr(Interior)` of ARRAY.
+/// `get_ll_dict` mints one `DICTENTRYARRAY` per `(DICTKEY, DICTVALUE)`.
+/// The FunDecl body of `entry_at` is generic: Gate A's add pointee is
+/// `Entry<K,V>`, and `type_arg_splits_per_instantiation` refuses TypeVar,
+/// so BODY would intern the one-word-key template. Instantiated dest
+/// (`&Entry<ObjectKey, V>`) is the ARRAY `InteriorPtrRepr.rtype_getattr`
+/// reads (`e.value`). `RDict::entry_ptr` is not Gate A; its dest stays
+/// unstamped so `entry_ptr().add(slot)` still recovers the `entries`
+/// header (`header_producer`).
+pub(in crate::front::mir) fn callee_returns_interior_array_type_id_at_dest(
+    fd: &FunDecl,
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let body_id = callee_returns_interior_array_type_id(fd, llbc, tombstoned)?;
+    struct_ref_pointee_array_type_id(dest_ty, llbc, tombstoned)
+        .or_else(|| struct_pointee_array_type_id(dest_ty, llbc, tombstoned))
+        .or(Some(body_id))
 }
 
 /// Array identity of a result the front end lowers as InteriorPtr.

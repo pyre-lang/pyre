@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=370
-# pyre-check: trace-shape=main:max=CallMayForceR:6
+# pyre-check: trace-shape=main:max=CallMayForceR:12
+# 6 slice residuals + 6 `isinstance` misses in `sum()`: `object_getattr_miss` (the `__class__` read of `p_recursive_isinstance_type_w`) is not walked.
 # The trip count stays below the 32-minor-collection counter-decay cycle
 # (counter.py JitCounter.invoke_after_minor_collection / decay_all_counters).
 # At N=50000 the run took about 60 minor collections and the decay at the

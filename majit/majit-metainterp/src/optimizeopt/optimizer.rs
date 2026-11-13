@@ -30,7 +30,7 @@ pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earl
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
 use majit_ir::operand::Operand;
-use majit_ir::{Descr, DescrRef, FailDescr, Op, OpCode, OpRc, OpRef, Type};
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -3382,21 +3382,56 @@ impl Optimizer {
         // positions already in `new_operations`; replacements from
         // `install_canonical_producer` / `mint_synthetic_resop` live in
         // `live_synthetics` below.
-        for op in ops {
-            let pos = op.pos().get();
-            if pos.is_none() || pos.is_constant() {
-                continue;
+        {
+            // optimizer.py `_emit_operation` appends once;
+            // opencoder.py `TraceIterator._cache` is the position → box
+            // map. "Already in `_newoperations`" is an O(1) cache probe,
+            // not a scan of the emit list per recorder op.
+            let mut max_raw = 0usize;
+            for e in &ctx.new_operations {
+                let p = e.pos().get();
+                if p.is_none()
+                    || p.is_constant()
+                    || matches!(
+                        p,
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+                    )
+                {
+                    continue;
+                }
+                max_raw = max_raw.max(p.raw() as usize);
             }
-            if matches!(
-                pos,
-                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-            ) {
-                continue;
+            let mut emitted_at = vec![false; max_raw.saturating_add(1)];
+            for e in &ctx.new_operations {
+                let p = e.pos().get();
+                if p.is_none()
+                    || p.is_constant()
+                    || matches!(
+                        p,
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+                    )
+                {
+                    continue;
+                }
+                emitted_at[p.raw() as usize] = true;
             }
-            if ctx.new_operations.iter().any(|e| e.pos().get() == pos) {
-                continue;
+            for op in ops {
+                let pos = op.pos().get();
+                if pos.is_none() || pos.is_constant() {
+                    continue;
+                }
+                if matches!(
+                    pos,
+                    OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+                ) {
+                    continue;
+                }
+                let idx = pos.raw() as usize;
+                if emitted_at.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                self.phase1_emit_ops.push(op.clone());
             }
-            self.phase1_emit_ops.push(op.clone());
         }
         // Remaining `mint_synthetic_resop` / extra-producer stand-ins
         // that were never superseded by an emit.

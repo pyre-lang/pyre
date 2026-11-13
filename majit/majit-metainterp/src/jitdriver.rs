@@ -9653,11 +9653,22 @@ impl<S: JitState> JitDriver<S> {
     /// A parked outer attempt keeps its own copy and restores it here.
     fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
         match saved {
-            Some(ptr) => {
-                if let Some(ctx) = self.meta.tracing.as_mut() {
-                    ctx.set_virtualizable_heap_ptr(ptr);
-                }
-                self.meta.set_vable_ptr(ptr);
+            Some(_) => {
+                // `warmstate.py execute_assembler` keeps `virtualizable` as
+                // `args[index_of_virtualizable]`, a traced local of that
+                // call. `sync_before` no longer retargets
+                // `TraceCtx.virtualizable_heap_ptr` (the recording context
+                // keeps its own vable box). A compiled entry can collect, so
+                // the snapshot taken before the entry is from-space. Re-read
+                // the owner root (`virtualizable_heap_ptr` prefers
+                // `virtualizable_heap_root`) and do not plant that snapshot.
+                let live = self
+                    .meta
+                    .tracing
+                    .as_ref()
+                    .and_then(|ctx| ctx.virtualizable_heap_ptr())
+                    .unwrap_or(std::ptr::null());
+                self.meta.set_vable_ptr(live);
             }
             None => {
                 self.meta.set_vable_ptr(std::ptr::null());

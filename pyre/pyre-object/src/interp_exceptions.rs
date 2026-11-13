@@ -13,7 +13,7 @@
 //! the assigned `subclassrange_{min,max}`.
 
 use crate::pyobject::*;
-use rustpython_wtf8::Wtf8;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 /// Per-kind class vtable. Instance allocation does not use this pointer
 /// unless `w_class` is exactly that kind's realbase (`exc_instance_pytype`).
@@ -135,7 +135,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
 
 /// Numeric tags for exception kinds — must stay in sync with PyErrorKind.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum ExcKind {
     BaseException = 0,
     Exception = 1,
@@ -1471,7 +1471,7 @@ fn allocate_exception(
     }
 }
 
-#[majit_macros::dont_look_inside]
+#[majit_macros::dont_look_inside(word_enums(ExcKind))]
 fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     allocate_exception(kind, canonical_exc_class(kind), immortal, false, None)
 }
@@ -1771,6 +1771,45 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     // Fill from the pinned slots, not a Vec snapshot — the block malloc
     // can collect.
     unsafe { crate::object_array::alloc_tuple_items_block_gc(items_base, n) as PyObjectRef }
+}
+
+/// [`rlist_new`] for the residual-call ABI: the vec is one Int word, the
+/// address of its `{ptr, len, cap}` header (`rrustvec.rs` `RustVecRepr`).
+/// Arguments and the result are descr words (`'r'`/`'i'` → i64;
+/// `descr.py` `CallDescr.create_call_stub`, `callbuilder.py` `emit_raw_call`).
+/// Conversion matches `helper_arg_from_i64` / `helper_return_to_i64` on the
+/// macro trampoline (`emit_helper_fnaddr_registration`). The graph moves that
+/// header into the residual (`w_exception_args_new`: `int_copy`,
+/// `residual_call_ir_r`, `live`, `ref_return` — no drop), so `ptr::read`
+/// takes ownership once.
+pub extern "C" fn rlist_new_jit_abi(items_header: i64) -> i64 {
+    let items = unsafe { std::ptr::read(items_header as usize as *const Vec<PyObjectRef>) };
+    rlist_new(items) as i64
+}
+
+// The traced call names `rlist_new`. `Vec<PyObjectRef>` is not a residual
+// argument word, so publish the word-returning entry under that path.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static RLIST_NEW_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::interp_exceptions::rlist_new",
+        rlist_new_jit_abi as *const (),
+        1,
+        "w>w",
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_rlist_new_jit_abi() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::interp_exceptions::rlist_new",
+        rlist_new_jit_abi as *const (),
+        1,
+        "w>w",
+    );
 }
 
 /// `ll_fixed_length` — `len` of the item array.
@@ -2994,9 +3033,14 @@ static PREBUILT_EXC_WITH_MESSAGE: std::sync::Mutex<Vec<(u8, String, usize)>> =
 /// Immortal exception instance with one text argument.
 ///
 /// Empty `message` is [`standard_exc_instance`]. A repeated `(kind, message)`
-/// returns the same object. The instance is visited by
-/// [`for_each_immortal_exception_singleton`] so its argument list stays
-/// reachable across collections.
+/// returns the same object. The instance (`w_exception_new_empty_immortal`),
+/// its `args_w` `GcArray(OBJECTPTR)` (`alloc_tuple_items_block_immortal`),
+/// and the message string (`w_str_from_wtf8_immortal`) are prebuilts:
+/// `rpython/rtyper/exceptiondata.py` `get_standard_ll_exc_instance` /
+/// `rpython/memory/gc/base.py` `init_gc_object_immortal` objects have no
+/// nursery life, so loading a jitcode constant does not collect.
+/// [`for_each_immortal_exception_singleton`] still visits the instance so a
+/// `w_traceback` / `w_context` a later raise attaches stays reachable.
 pub fn prebuilt_exception_with_message(kind: ExcKind, message: &str) -> PyObjectRef {
     if message.is_empty() {
         return standard_exc_instance(kind);
@@ -3010,11 +3054,9 @@ pub fn prebuilt_exception_with_message(kind: ExcKind, message: &str) -> PyObject
         return *raw as PyObjectRef;
     }
     let exc = w_exception_new_empty_immortal(kind);
-    let text = crate::unicodeobject::box_str_constant(
-        rustpython_wtf8::Wtf8::from_bytes(message.as_bytes())
-            .expect("prebuilt exception message is UTF-8"),
-    );
-    let args = w_exception_args_new(vec![text]);
+    let text = crate::unicodeobject::w_str_from_wtf8_immortal(Wtf8Buf::from(message));
+    let args =
+        unsafe { crate::object_array::alloc_tuple_items_block_immortal(&[text]) as PyObjectRef };
     unsafe { w_exception_set_args(exc, args) };
     PREBUILT_EXC_WITH_MESSAGE
         .lock()
@@ -3539,9 +3581,10 @@ mod tests {
             seen.contains(&(key as usize)),
             "per-kind singleton must be reported once created"
         );
+        let prebuilt_n = PREBUILT_EXC_WITH_MESSAGE.lock().unwrap().len();
         assert!(
-            seen.len() <= EXC_KIND_COUNT + 1,
-            "enumeration is bounded by the per-kind slots plus MemoryError"
+            seen.len() <= EXC_KIND_COUNT + 1 + prebuilt_n,
+            "enumeration is bounded by the per-kind slots, MemoryError, and interned (kind, message) prebuilts"
         );
 
         // Enumerating must not initialize a slot: a second pass still reports
@@ -3555,13 +3598,50 @@ mod tests {
         for raw in &seen {
             assert!(again.contains(raw), "enumeration must not drop a singleton");
         }
+        let prebuilt_n = PREBUILT_EXC_WITH_MESSAGE.lock().unwrap().len();
         assert!(
-            again.len() <= EXC_KIND_COUNT + 1,
-            "enumeration is bounded by the per-kind slots plus MemoryError"
+            again.len() <= EXC_KIND_COUNT + 1 + prebuilt_n,
+            "enumeration is bounded by the per-kind slots, MemoryError, and interned (kind, message) prebuilts"
         );
         for &raw in &again {
             assert!(unsafe { is_exception(raw as PyObjectRef) });
         }
+    }
+
+    #[test]
+    fn prebuilt_exception_with_message_instance_args_and_text_are_immortal() {
+        seed_subclass_ranges();
+        let exc = prebuilt_exception_with_message(ExcKind::ValueError, "some text");
+        let again = prebuilt_exception_with_message(ExcKind::ValueError, "some text");
+        assert_eq!(
+            exc as usize, again as usize,
+            "repeated (kind, message) must return the same object"
+        );
+        assert!(
+            !majit_gc::gc_is_nursery_object(exc as usize),
+            "prebuilt exception instance is not a nursery object"
+        );
+        let args = unsafe { w_exception_get_args_storage(exc) };
+        assert!(
+            majit_gc::header::is_immortal_header_payload(args as usize),
+            "prebuilt args_w GcArray is immortal"
+        );
+        assert_eq!(unsafe { rlist_len(args) }, 1);
+        let text = unsafe { rlist_getitem(args, 0) };
+        assert!(
+            majit_gc::header::is_immortal_header_payload(text as usize),
+            "prebuilt exception message string is immortal"
+        );
+        assert_eq!(
+            unsafe { crate::unicodeobject::w_str_get_wtf8(text) },
+            Wtf8::new("some text"),
+        );
+        let mut seen = Vec::new();
+        for_each_immortal_exception_singleton(|obj| seen.push(obj as usize));
+        assert!(
+            seen.contains(&(exc as usize)),
+            "for_each_immortal_exception_singleton must visit the prebuilt instance"
+        );
     }
 
     #[test]
@@ -3641,6 +3721,23 @@ mod tests {
             "ll_fixed_newlist mallocs a 0-length array"
         );
         assert_eq!(unsafe { rlist_len(empty) }, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn residual_exception_and_rlist_entries_are_published() {
+        let mut impl_row = None;
+        let mut rlist_row = None;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path == "pyre_object::interp_exceptions::w_exception_new_empty_impl" {
+                impl_row = Some((desc.get() != 0, desc.arity, desc.abi));
+            }
+            if desc.path == "pyre_object::interp_exceptions::rlist_new" {
+                rlist_row = Some((desc.get() != 0, desc.arity, desc.abi));
+            }
+        });
+        assert_eq!(impl_row, Some((true, 2, "ww>w")));
+        assert_eq!(rlist_row, Some((true, 1, "w>w")));
     }
 
     #[test]

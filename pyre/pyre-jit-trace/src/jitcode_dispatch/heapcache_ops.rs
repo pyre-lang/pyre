@@ -1379,6 +1379,25 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Whether this `getfield_gc_*` is an un-lowered GC-owner interior
+/// (`jtransform.py rewrite_op_getsubstruct`) rather than a scalar /
+/// GC-pointer value load.
+///
+/// Keyed on FieldDescr facts only: `GetfieldGcR && !is_pointer_field()`
+/// (`descr.py is_pointer_field`) remains reachable for a `FLAG_STRUCT`
+/// field whose IR type is still Ref (`bh_all_field_specs` known-struct
+/// path). `field_flag == FLAG_STRUCT` (`descr.py get_type_flag`
+/// `isinstance(TYPE, lltype.Struct)`) covers the non-Ref stamp.
+fn getfield_gc_is_unlowered_inline_aggregate(opcode: OpCode, descr: &DescrRef) -> bool {
+    let Some(fd) = descr.as_field_descr() else {
+        return false;
+    };
+    if matches!(opcode, OpCode::GetfieldGcR) && !fd.is_pointer_field() {
+        return true;
+    }
+    fd.field_flag() == majit_ir::descr::ArrayFlag::Struct
+}
+
 /// `getfield_gc_<i|r>/rd>X` handler: read a Ref-bank source register + descr operand, consult the heapcache, and either return the
 /// cached field box (no IR op recorded) or record the appropriate
 /// `OpCode::GetfieldGc<I|R>` op and update the cache.
@@ -1416,6 +1435,35 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     // Operand layout `rd>X`: 1B r-reg + 2B descr-index + 1B dst.
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
+    // `jtransform.py rewrite_op_getsubstruct` lowers only a raw-owner
+    // interior to `int_add`; a GC-owner interior stays a `getfield_gc_*`
+    // of the inline field. Executing that as a value load manufactures a
+    // Ref from the aggregate's first word. Decline inside a helper
+    // descent so the call residualizes (`OrthodoxSubWalkTraceUnsupported`).
+    if ctx.fbw_mode.inline_subwalk
+        && matches!(
+            opcode,
+            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
+        )
+        && getfield_gc_is_unlowered_inline_aggregate(opcode, &descr)
+    {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            if let Some(fd) = descr.as_field_descr() {
+                eprintln!(
+                    "[fbw-abort] UnloweredInlineGetfieldGc field={} offset={} size={} flag={:?} pc={}",
+                    fd.field_name(),
+                    fd.offset(),
+                    fd.field_size(),
+                    fd.field_flag(),
+                    op.pc,
+                );
+            }
+        }
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op.pc,
+            symbolic: 0,
+        });
+    }
     let descr_index = descr.index();
     let is_vable = ctx.trace_ctx.standard_virtualizable_box() == Some(obj);
     let vable_managed = is_vable
@@ -1685,7 +1733,7 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
         .profiler()
         .count_ops(OpCode::GuardClass, majit_metainterp::counters::OPS);
     if !obj.is_constant() {
-        walker_guard_class(ctx, op.pc, obj, cls, true)?;
+        walker_guard_class(ctx, op.pc, obj, cls)?;
     }
     match dst_bank {
         'i' => {

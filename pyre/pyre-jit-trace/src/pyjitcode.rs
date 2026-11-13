@@ -206,6 +206,12 @@ pub struct PyJitCodeMetadata {
     pub pcdep_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// Predecessor-op-start tier of the trivia-aware `pcdep_color_slots` twin.
     pub pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
+    /// Compact-slot → Ref color of each `emit_popvalue_ref` GET dest at that
+    /// Python pc. Opcode-entry `pcdep_color_slots` names the pre-pop
+    /// Variables; after the pops the call's `-live-` keeps those values in
+    /// the GET dests, and the call dest may have reused an entry color.
+    /// Indexed by py_pc. Empty for skeleton / fixture.
+    pub pop_slot_color_by_py_pc: Vec<Vec<(u16, u16)>>,
     /// Const Ref operand-stack slots after Python trivia, resolved with the
     /// same exact-marker and predecessor-op-start tiers as the trivia-aware
     /// depth twin. GCREF words live in [`ConstSlotR`] so
@@ -376,7 +382,7 @@ pub(crate) struct InlineBodyFacts {
 #[derive(Clone, Copy)]
 pub(crate) struct BlackholeResumeFacts {
     /// [`crate::jitcode_runtime::blackhole_resume_reachable_starts`] returned
-    /// `None` (`switch` or an undecodable instruction).
+    /// `None` (unresolved `switch` descr or an undecodable instruction).
     pub(crate) switch_or_undecodable: bool,
     /// Some reachable op's `bhimpl_*` may raise, or the scan failed.
     pub(crate) may_raise: bool,
@@ -528,6 +534,17 @@ pub struct PyJitCodePayload {
     /// Lazily-built [`LoopScanIndex`] of this body, dropped with it by
     /// `replace_with`.
     pub(crate) loop_scan: std::cell::OnceCell<LoopScanIndex>,
+    /// Lazily-decoded instruction list of `jitcode.code`, in ascending `pc`
+    /// order. Built on first use the same way `decoded_ops_before` used to
+    /// rescan from pc 0 (`decode_op_at`, stop on a failed or non-advancing
+    /// op, keep the prefix). The bytes are immutable after publication;
+    /// `replace_with` drops this together with the body.
+    pub(crate) decoded_ops: std::sync::OnceLock<Box<[crate::jitcode_runtime::DecodedOp]>>,
+    /// Per-op `-live-` / after-pops marker facts, one slot per entry of
+    /// [`Self::decoded_ops`]. Filled on first query of that fact at that
+    /// op start; a jit pc that is not an op boundary bypasses the table.
+    /// Dropped with the body by `replace_with`.
+    pub(crate) op_marker_facts: std::sync::OnceLock<Box<[OpMarkerFacts]>>,
     /// Lazily-built per-pc answers of
     /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`], dropped
     /// with the body by `replace_with`.
@@ -558,11 +575,93 @@ pub struct PyJitCodePayload {
     pub(crate) deleted_name_indexes: std::cell::OnceCell<Box<[u32]>>,
 }
 
+/// Decode every instruction of `code` from pc 0. Stops at the first op
+/// that fails to decode or does not advance, keeping the ops decoded so far.
+fn decode_jitcode_ops(code: &[u8]) -> Box<[crate::jitcode_runtime::DecodedOp]> {
+    let mut ops = Vec::new();
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            break;
+        };
+        let next_pc = op.next_pc;
+        if next_pc <= pc {
+            break;
+        }
+        ops.push(op);
+        pc = next_pc;
+    }
+    ops.into_boxed_slice()
+}
+
+/// Per-op answers of the after-pops / leftover marker queries.
+///
+/// Each field is a pure function of this payload and the op's jit pc
+/// (`assembler.py` `Assembler.assemble` → `jitcode._startpoints` /
+/// `all_liveness`, read by `jitcode.get_live_vars_info`). The first
+/// query at that op pays the scan; later queries read the slot.
+pub(crate) struct OpMarkerFacts {
+    pub(crate) opcode_owner_py_pc: std::cell::OnceCell<usize>,
+    pub(crate) after_pops_live_marker_in_opcode: std::cell::OnceCell<Option<usize>>,
+    pub(crate) after_pops_of_trailing_live: std::cell::OnceCell<Option<usize>>,
+    pub(crate) dest_owner_py_pc: std::cell::OnceCell<Option<usize>>,
+    pub(crate) leftover_pop_slot_colors: std::cell::OnceCell<Box<[(u16, u16)]>>,
+    pub(crate) resume_pc_is_after_pops: std::cell::OnceCell<bool>,
+    pub(crate) resume_pc_hides_pop_dests: std::cell::OnceCell<bool>,
+}
+
+impl OpMarkerFacts {
+    fn new() -> Self {
+        Self {
+            opcode_owner_py_pc: std::cell::OnceCell::new(),
+            after_pops_live_marker_in_opcode: std::cell::OnceCell::new(),
+            after_pops_of_trailing_live: std::cell::OnceCell::new(),
+            dest_owner_py_pc: std::cell::OnceCell::new(),
+            leftover_pop_slot_colors: std::cell::OnceCell::new(),
+            resume_pc_is_after_pops: std::cell::OnceCell::new(),
+            resume_pc_hides_pop_dests: std::cell::OnceCell::new(),
+        }
+    }
+}
+
 impl PyJitCodePayload {
     /// [`LoopScanIndex`] of this body, decoded on first use.
     pub(crate) fn loop_scan(&self) -> &LoopScanIndex {
         self.loop_scan
             .get_or_init(|| LoopScanIndex::build(self.jitcode.code.as_slice()))
+    }
+
+    /// Every decoded instruction of this body, in ascending `pc` order.
+    pub(crate) fn decoded_ops(&self) -> &[crate::jitcode_runtime::DecodedOp] {
+        self.decoded_ops
+            .get_or_init(|| decode_jitcode_ops(self.jitcode.code.as_slice()))
+    }
+
+    /// Prefix of [`Self::decoded_ops`] whose `pc < end`. An op that starts
+    /// before `end` is included even if it extends past it.
+    pub(crate) fn decoded_ops_before(&self, end: usize) -> &[crate::jitcode_runtime::DecodedOp] {
+        let ops = self.decoded_ops();
+        let i = ops.partition_point(|op| op.pc < end);
+        &ops[..i]
+    }
+
+    /// The instruction that starts at `pc`, if `pc` is an op boundary.
+    pub(crate) fn decoded_op_at(&self, pc: usize) -> Option<&crate::jitcode_runtime::DecodedOp> {
+        let ops = self.decoded_ops();
+        ops.binary_search_by_key(&pc, |op| op.pc)
+            .ok()
+            .map(|i| &ops[i])
+    }
+
+    /// Marker-fact slot for `pc` when `pc` is an op start of this body.
+    pub(crate) fn op_marker_facts_at(&self, pc: usize) -> Option<&OpMarkerFacts> {
+        let ops = self.decoded_ops();
+        let i = ops.binary_search_by_key(&pc, |op| op.pc).ok()?;
+        let n = ops.len();
+        let table = self
+            .op_marker_facts
+            .get_or_init(|| (0..n).map(|_| OpMarkerFacts::new()).collect());
+        Some(&table[i])
     }
 
     /// The `jit_merge_point` of the first loop header in code order.
@@ -658,8 +757,10 @@ pub struct PyJitCode {
 // the populated object is handed to runtime readers. Runtime-visible index
 // stamping uses atomics on the inner `RuntimeJitCode`. The lazily-built
 // `sub_descr_pool` / `helper_resume_blockers` / `blackhole_resume_scans`
-// `OnceCell`s are initialized only from the trace-side walker, which runs
-// on the single thread owning the thread-local `METAINTERP_SD` store.
+// `OnceCell`s and the `decoded_ops` / `op_marker_facts` `OnceLock`s are
+// initialized only from
+// the trace-side walker, which runs on the single thread owning the
+// thread-local `METAINTERP_SD` store.
 unsafe impl Sync for PyJitCode {}
 
 impl Deref for PyJitCode {
@@ -818,6 +919,8 @@ impl PyJitCode {
             sub_descr_pool: std::cell::OnceCell::new(),
             inline_body_facts: std::cell::OnceCell::new(),
             loop_scan: std::cell::OnceCell::new(),
+            decoded_ops: std::sync::OnceLock::new(),
+            op_marker_facts: std::sync::OnceLock::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
             blackhole_resume_scans: std::cell::OnceCell::new(),
             loop_body_abort_permanent: std::cell::OnceCell::new(),
@@ -862,6 +965,8 @@ impl PyJitCode {
             sub_descr_pool,
             inline_body_facts,
             loop_scan,
+            decoded_ops,
+            op_marker_facts,
             helper_resume_blockers,
             blackhole_resume_scans,
             loop_body_abort_permanent,
@@ -888,6 +993,8 @@ impl PyJitCode {
             // being replaced, so they go with it rather than outliving it.
             current.inline_body_facts = inline_body_facts;
             current.loop_scan = loop_scan;
+            current.decoded_ops = decoded_ops;
+            current.op_marker_facts = op_marker_facts;
             current.helper_resume_blockers = helper_resume_blockers;
             current.blackhole_resume_scans = blackhole_resume_scans;
             current.loop_body_abort_permanent = loop_body_abort_permanent;
@@ -1144,6 +1251,22 @@ impl PyJitCode {
         }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
         Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
+    }
+
+    /// GET dest colors `emit_popvalue_ref` recorded for the opcode that
+    /// owns `jit_pc`. Each pair is `(compact_slot, ref_color)`: the
+    /// opcode-entry valuestack slot and the live color after the pop.
+    pub fn pop_slot_colors_for_jitcode_pc(&self, jit_pc: usize) -> &[(u16, u16)] {
+        let py_pc = exact_py_pc_for_jitcode_pc(&self.metadata.py_exact_by_jit_pc, jit_pc)
+            .map(|pc| pc as usize)
+            .unwrap_or_else(|| {
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&self.metadata, jit_pc) as usize
+            });
+        self.metadata
+            .pop_slot_color_by_py_pc
+            .get(py_pc)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Trivia-aware const Ref slot list keyed by a JitCode byte offset,
@@ -1552,6 +1675,7 @@ impl PyJitCodeMetadata {
             depth_containing_by_jit_pc: Vec::new(),
             pcdep_trivia_marker_by_jit_pc: Vec::new(),
             pcdep_trivia_pred_by_jit_pc: Vec::new(),
+            pop_slot_color_by_py_pc: Vec::new(),
             const_ref_trivia_marker_by_jit_pc: Vec::new(),
             const_ref_trivia_pred_by_jit_pc: Vec::new(),
             result_color_trivia_marker_by_jit_pc: Vec::new(),

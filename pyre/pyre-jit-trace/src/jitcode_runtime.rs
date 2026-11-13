@@ -3510,12 +3510,28 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
     })
 }
 
+/// Listed arm targets of a `switch` op, from the SwitchDescr
+/// `bhimpl_switch` reads. `None` when the descr is missing or a listed
+/// key does not resolve — dropping an arm would report the remaining
+/// body clean.
+fn switch_resume_arm_targets(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {
+    let descr = descr_ref_at(decoded_op_descr_index(code, op)? as usize)?;
+    let switch = descr.as_switch_descr()?;
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
+}
+
 /// Instruction starts the blackhole can dispatch from `pc` on: the
 /// fallthrough of every instruction that does not end its block, plus every
 /// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
 /// next position). `catch_exception` `L` is followed like any other label.
-/// `None` when a reached instruction cannot be decoded or branches through a
-/// descr (`switch/id`), so the caller reads the whole body.
+/// A `switch` follows every listed SwitchDescr arm (`bhimpl_switch`) and
+/// the fallthrough (`KeyError`). `None` when a reached instruction cannot
+/// be decoded or a `switch` descr cannot be resolved, so the caller reads
+/// the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
     reachable_starts_from_catch(code, pc, |_, _| true)
 }
@@ -3542,7 +3558,14 @@ pub fn reachable_starts_from_catch(
             }
             let op = decode_op_at(code, pc)?;
             if op.opname == "switch" {
-                return None;
+                // `bhimpl_switch`: `switchdict.dict[switchvalue]`, or the
+                // next instruction on `KeyError`. An unresolved table would
+                // drop arms, so the scan refuses rather than report that
+                // remaining body clean.
+                match switch_resume_arm_targets(code, &op) {
+                    Some(targets) => work.extend(targets),
+                    None => return None,
+                }
             }
             let mut cursor = pc + 1;
             if op.opname != "live" {

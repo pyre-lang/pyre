@@ -41,6 +41,11 @@ fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
 
 /// Bind this walk's live banks onto the MIFrame that is about to pause
 /// for a child: the top inlined Python frame, or the portal.
+///
+/// Helper levels sit above that frame (`enter_helper`). Writing `last()`
+/// stores the caller's banks on the helper, and a nested helper's
+/// `live == None` then numbers the caller's `-live-` through the helper
+/// file (`portal_frame_reg` past `num_regs_r`).
 pub(super) fn bind_paused_caller_regs(
     session: &std::cell::RefCell<WalkSession>,
     registers_r: &RegisterBank,
@@ -54,8 +59,7 @@ pub(super) fn bind_paused_caller_regs(
         session.framestack.push(InlineFrame::portal());
     }
     let frame = session
-        .framestack
-        .last_mut()
+        .last_non_helper_mut()
         .expect("portal occupies framestack[0]");
     frame.live = Some(live);
 }
@@ -1429,34 +1433,6 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_by_descr(&descr));
-    let is_std = vable_is_standard_virtualizable(ctx, obj);
-    let has_box =
-        inline_field_index.is_some_and(|index| ctx.trace_ctx.virtualizable_box_at(index).is_some());
-    // Root portal walks have `fold_frame_reg == MAX` (no callee_shadow).
-    // `_opimpl_setfield_vable` still writes `virtualizable_boxes[index]
-    // = valuebox` for the standard virtualizable, including when the
-    // frame register is a copy of `virtualizable_boxes[-1]`.
-    if is_std {
-        if let Some(field_index) = inline_field_index
-            && has_box
-        {
-            let imm_box = ctx.trace_ctx.const_int(imm);
-            ctx.trace_ctx
-                .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
-            ctx.trace_ctx.synchronize_virtualizable_at(field_index);
-        }
-        if let (Some(frame), Some(field_index)) = (
-            current_inline_vable_target(ctx, obj)
-                .or_else(|| ctx.trace_ctx.standard_virtualizable_ptr()),
-            inline_field_index,
-        ) {
-            if let Some(frame) = durable_resume_frame(ctx, frame) {
-                fbw_arm_durable_frame_undo(frame);
-            }
-            crate::state::store_live_frame_static_int(frame, field_index, imm);
-        }
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
     let write = with_replace_frames(ctx, |ctx| {
         let nonstandard = walker_nonstandard_virtualizable(ctx, op.pc, obj, &descr)?;
         Ok(ctx.trace_ctx.vable_setfield_checked(
@@ -1678,6 +1654,41 @@ pub(crate) fn walker_nonstandard_virtualizable<Sym: WalkSym>(
     vable: OpRef,
     fielddescr: &majit_ir::DescrRef,
 ) -> Result<bool, DispatchError> {
+    walker_nonstandard_virtualizable_promote(ctx, pc, vable, fielddescr, true)
+}
+
+/// Handler-entry traceback writes `last_instr` before the reconstructed
+/// carrier walk has filled the CALL `-live-` window.
+///
+/// `resume.py rebuild_from_resumedata` rebuilt this MIFrame; it is not
+/// `virtualizable_boxes[-1]`. `pyjitpl.py implement_guard_value` would
+/// `generate_guard` then `capture_resumedata` at that CALL pc and abort
+/// the catching frame (`finishframe_exception` /
+/// `pytraceback.record_application_traceback`). A concrete `isstandard==0`
+/// is already the `heapcache.py nonstandard_virtualizables_now_known`
+/// result of the PTR_EQ, so commit without the promote.
+pub(crate) fn walker_nonstandard_virtualizable_handler_entry<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    vable: OpRef,
+    fielddescr: &majit_ir::DescrRef,
+) -> Result<bool, DispatchError> {
+    walker_nonstandard_virtualizable_promote(
+        ctx,
+        pc,
+        vable,
+        fielddescr,
+        !(ctx.fbw_mode.carrier_resume),
+    )
+}
+
+fn walker_nonstandard_virtualizable_promote<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    vable: OpRef,
+    fielddescr: &majit_ir::DescrRef,
+    promote: bool,
+) -> Result<bool, DispatchError> {
     match ctx
         .trace_ctx
         .begin_nonstandard_virtualizable(pc, vable, fielddescr)
@@ -1689,7 +1700,11 @@ pub(crate) fn walker_nonstandard_virtualizable<Sym: WalkSym>(
             vable_opref,
             standard_box,
         } => {
-            let promoted = walker_implement_guard_value(ctx, pc, eqbox, isstandard)?;
+            let promoted = if promote || isstandard != 0 {
+                walker_implement_guard_value(ctx, pc, eqbox, isstandard)?
+            } else {
+                eqbox
+            };
             Ok(ctx.trace_ctx.commit_nonstandard_virtualizable(
                 promoted,
                 vable_opref,
@@ -1881,37 +1896,6 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     } else {
         shadow_value
-    };
-    // Fold-frame slots live in `callee_shadow`, including `ConstPtr(0)`
-    // from `PyFrame.__init__` / `PUSH_NULL`. Portal `virtualizable_boxes`
-    // at the same numeric index is a different frame.
-    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
-    let names_callee_frame = fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg;
-    let (result, shadow_value) = if dst_bank == 'r' && names_callee_frame && index_value >= 0 {
-        let slot_opref = ctx
-            .frame_state
-            .borrow()
-            .callee_shadow
-            .as_ref()
-            .and_then(|shadow| shadow.opref.get(&index_value).copied());
-        match slot_opref {
-            Some(shadow_op) if shadow_op != OpRef::NONE => {
-                let conc = ctx
-                    .trace_ctx
-                    .concrete_of_opref(shadow_op)
-                    .unwrap_or_else(|| {
-                        if opref_is_null_const_ptr(shadow_op) {
-                            Value::Ref(majit_ir::GcRef(0))
-                        } else {
-                            shadow_value
-                        }
-                    });
-                (shadow_op, conc)
-            }
-            _ => (result, shadow_value),
-        }
-    } else {
-        (result, shadow_value)
     };
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value

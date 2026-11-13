@@ -9,17 +9,6 @@
 //! the only Python-coordinate sources; runtime consumers never project a
 //! JitCode PC through a Python-keyed map.
 
-pub(crate) fn first_floor_boundary_for_py(
-    metadata: &crate::PyJitCodeMetadata,
-    py_pc: u32,
-) -> Option<(usize, u32)> {
-    metadata
-        .py_floor_by_jit_pc
-        .iter()
-        .find(|&&(_, py)| py == py_pc)
-        .map(|&(off, py)| (off as usize, py))
-}
-
 /// Resolve a JitCode offset to the Python instruction coordinate containing it.
 ///
 /// Exact block-head marker matches win first. Otherwise the per-emission-run
@@ -90,6 +79,48 @@ pub(crate) fn py_op_name_for_jitcode_pc(
 pub fn containing_py_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Option<i32> {
     let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
     Some(containing_py_pc_for_jitcode_pc(&payload.metadata, offset as usize) as i32)
+}
+
+/// Python opcode that owns `jit_pc` for leftover / after-pops walks.
+///
+/// `pop_slot_colors_for_jitcode_pc` keys `pop_slot_color_by_py_pc` by
+/// exact-then-containing. Block-head precedence in
+/// [`containing_py_pc_for_jitcode_pc`] names CACHE at a CALL opcode-entry
+/// `-live-` (`cwr_bridge_jump_matches_label` py=466 vs exact_py=469).
+/// Trivia-skip the owner so CACHE / ExtendedArg do not hide CALL.
+pub fn opcode_owner_py_pc(
+    metadata: &crate::PyJitCodeMetadata,
+    code: Option<&pyre_interpreter::CodeObject>,
+    jit_pc: usize,
+) -> usize {
+    let raw = crate::pyjitcode::exact_py_pc_for_jitcode_pc(&metadata.py_exact_by_jit_pc, jit_pc)
+        .map(|py| py as usize)
+        .unwrap_or_else(|| containing_py_pc_for_jitcode_pc(metadata, jit_pc) as usize);
+    match code {
+        Some(code) => crate::jitcode_dispatch::skip_python_trivia_forward(code, raw),
+        None => raw,
+    }
+}
+
+/// [`opcode_owner_py_pc`] from a populated payload.
+pub fn opcode_owner_py_pc_for_payload(payload: &crate::PyJitCode, jit_pc: usize) -> usize {
+    if let Some(slot) = payload.op_marker_facts_at(jit_pc) {
+        return *slot
+            .opcode_owner_py_pc
+            .get_or_init(|| opcode_owner_py_pc_for_payload_uncached(payload, jit_pc));
+    }
+    opcode_owner_py_pc_for_payload_uncached(payload, jit_pc)
+}
+
+fn opcode_owner_py_pc_for_payload_uncached(payload: &crate::PyJitCode, jit_pc: usize) -> usize {
+    let code = if payload.code_ptr.is_null() {
+        None
+    } else {
+        // SAFETY: `code_ptr` is the CodeObject this jitcode was compiled from
+        // and lives as long as the payload.
+        Some(unsafe { &*payload.code_ptr })
+    };
+    opcode_owner_py_pc(&payload.metadata, code, jit_pc)
 }
 
 /// Return the per-emission-run Python owner of a stored JitCode offset.

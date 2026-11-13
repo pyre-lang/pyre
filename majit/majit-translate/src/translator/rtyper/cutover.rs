@@ -22386,10 +22386,13 @@ mod tests {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(
-                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "key")
-                ),
-            "IdentityKey get_slot must FieldRead key of the entry_at dest, ops {:?}",
+                .any(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. } => {
+                        field.name == "key"
+                    }
+                    _ => false,
+                }),
+            "IdentityKey get_slot must FieldRead/InteriorFieldRead key of the entry_at dest, ops {:?}",
             get_slot
                 .graph()
                 .blocks
@@ -22404,52 +22407,63 @@ mod tests {
         registry.set_struct_fields(Rc::new(program.struct_fields.clone()));
 
         let graph = entry_at.graph();
-        let declared = declared_return_annotation(&registry, graph).unwrap_or_else(|| {
-            panic!(
-                "IdentityKey entry_at dest intern is SomePtr of DICTENTRY, \
-                 return_type={:?} residual_return_type={:?} return_class_root={:?} \
-                 semantic_return_class_root={:?}",
-                graph.return_type,
-                graph.residual_return_type,
-                graph.return_class_root,
-                entry_at.return_class_root
-            )
-        });
-        let s_entry = match &declared {
-            SomeValue::Ptr(ptr) => {
-                match &ptr.ll_ptrtype.TO {
-                    PtrTarget::Struct(st) => {
-                        assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+        match declared_return_annotation(&registry, graph) {
+            Some(declared) => {
+                let s_entry = match &declared {
+                    SomeValue::Ptr(ptr) => {
+                        match &ptr.ll_ptrtype.TO {
+                            PtrTarget::Struct(st) => {
+                                assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+                            }
+                            other => panic!(
+                                "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
+                            ),
+                        }
+                        declared.clone()
                     }
+                    SomeValue::InteriorPtr(_) => declared.clone(),
                     other => panic!(
-                        "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
+                        "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
+                         got {other:?}, return_class_root={:?}",
+                        graph.return_class_root
                     ),
-                }
-                declared.clone()
-            }
-            SomeValue::InteriorPtr(_) => declared.clone(),
-            other => panic!(
-                "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
-                 got {other:?}, return_class_root={:?}",
-                graph.return_class_root
-            ),
-        };
+                };
 
-        let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
-        let s_key = match &s_entry {
-            SomeValue::Ptr(ptr) => ptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomePtr.getattr key of DICTENTRY"),
-            SomeValue::InteriorPtr(iptr) => iptr
-                .getattr(&SomeValue::String(s_attr))
-                .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
-            other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
-        };
-        assert!(
-            !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
-            "getattr key must not be classdef-less, got {s_key:?}"
-        );
+                let mut s_attr = SomeString::new(false, false);
+                s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
+                let s_key = match &s_entry {
+                    SomeValue::Ptr(ptr) => ptr
+                        .getattr(&SomeValue::String(s_attr))
+                        .expect("SomePtr.getattr key of DICTENTRY"),
+                    SomeValue::InteriorPtr(iptr) => iptr
+                        .getattr(&SomeValue::String(s_attr))
+                        .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
+                    other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
+                };
+                assert!(
+                    !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
+                    "getattr key must not be classdef-less, got {s_key:?}"
+                );
+            }
+            None => {
+                // InteriorPtr FUNC.RESULT is `'ref'` with no class root
+                // (`interior_ptr_return_stamps_func_result_ref`). Intern of
+                // that stamp is None; get_slot InteriorFieldRead of `key`
+                // is `InteriorPtrRepr.rtype_getattr`.
+                assert_eq!(
+                    graph.return_type.as_deref(),
+                    Some("ref"),
+                    "InteriorPtr FUNC.RESULT is ref, return_type={:?} residual={:?}",
+                    graph.return_type,
+                    graph.residual_return_type
+                );
+                assert!(
+                    graph.return_class_root.is_none(),
+                    "InteriorPtr has no interned class root, got {:?}",
+                    graph.return_class_root
+                );
+            }
+        }
     }
 
     #[test]

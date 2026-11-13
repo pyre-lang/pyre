@@ -862,6 +862,7 @@ fn enum_variant_vec_u8_payload_gets_two_field_layout_and_owner_id() {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
     );
     assert!(
         heuristic

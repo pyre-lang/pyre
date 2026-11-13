@@ -8262,11 +8262,11 @@ mod tests {
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
         finditem_str_named_word, handle_alloc_error_word_jit_abi, interned_residual_inst_path,
         is_abi_unsound_argument_residual, is_ascii_strategy_item_word, is_bytes_strategy_item_word,
-        is_exact_type_word, is_float_strategy_item_word,
-        is_list_write_barrier, is_plain_int1_word, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word,
-        ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        is_exact_type_word, is_float_strategy_item_word, is_list_write_barrier, is_plain_int1_word,
+        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
+        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
+        ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
@@ -9186,11 +9186,13 @@ mod tests {
     fn hash_str_hooked_str_is_registered() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected = pyre_object::dict_eq_hook::hash_str_hooked_str as *const () as usize as i64;
+        let published =
+            occupied_published_addr("pyre_object::dict_eq_hook::hash_str_hooked_str", expected);
         assert_eq!(
             bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"],
-            expected
+            published
         );
-        assert_eq!(bindings["pyre_object::hash_str_hooked_str"], expected);
+        assert_eq!(bindings["pyre_object::hash_str_hooked_str"], published);
 
         crate::test_hooks::install_hash_hook();
         let addr = bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"] as usize;

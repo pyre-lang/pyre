@@ -1220,7 +1220,6 @@ pub(in crate::front::mir) fn tyref_is_root_scope(ty: &TyRef, llbc: &Llbc) -> boo
         .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
 }
 
-
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 pub(in crate::front::mir) fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();

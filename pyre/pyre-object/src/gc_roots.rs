@@ -589,6 +589,44 @@ pub fn push_roots() -> RootScope {
     RootScope::new()
 }
 
+/// [`push_roots`] for the residual-call ABI: the guard's save-point word.
+/// Arguments and the result are descr words (`'r'`/`'i'` → i64;
+/// `descr.py` `CallDescr.create_call_stub`, `callbuilder.py` `emit_raw_call`).
+/// Conversion matches `helper_arg_from_i64` / `helper_return_to_i64` on the
+/// macro trampoline (`emit_helper_fnaddr_registration`). The jitcode's drop
+/// of the guard pops the roots through [`root_scope_close_word`].
+/// `ManuallyDrop` keeps that matching close for the caller that owns the word.
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    let scope = std::mem::ManuallyDrop::new(push_roots());
+    scope.base() as i64
+}
+
+// The traced call names `push_roots`. Its return is `RootScope`, which the
+// residual trampoline cannot project, so publish the word-returning entry
+// under that path.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static PUSH_ROOTS_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::gc_roots::push_roots",
+        push_roots_jit_abi as *const (),
+        0,
+        ">w",
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_push_roots_jit_abi() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::gc_roots::push_roots",
+        push_roots_jit_abi as *const (),
+        0,
+        ">w",
+    );
+}
+
 /// A set of freshly allocated items held as GC roots while the rest of the
 /// set is still being built.
 ///
@@ -1647,6 +1685,18 @@ mod tests {
             std::mem::size_of::<RootScope>(),
             std::mem::size_of::<usize>()
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn residual_push_roots_entry_is_published() {
+        let mut push_row = None;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path == "pyre_object::gc_roots::push_roots" {
+                push_row = Some((desc.get() != 0, desc.arity, desc.abi));
+            }
+        });
+        assert_eq!(push_row, Some((true, 0, ">w")));
     }
 
     /// The naive form costs one frame per bracket: each `with_roots!` pushes

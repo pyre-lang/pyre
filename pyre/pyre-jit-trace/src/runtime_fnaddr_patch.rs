@@ -719,8 +719,9 @@ const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
 /// Materialize one immortal string constant.
 ///
-/// [`StrConstKind::UnicodeObject`] is the `box_str_constant` result — a
-/// `W_UnicodeObject` the residual `w_name` ABI passes as one Ref.
+/// [`StrConstKind::UnicodeObject`] is a `W_UnicodeObject` the residual
+/// `w_name` ABI passes as one Ref (`w_str_from_wtf8_immortal`; intern
+/// insert is skipped so a jitcode load cannot collect).
 /// [`StrConstKind::Str`] is rstr `Ptr(STR)` (`StringRepr.convert_const`):
 /// `bh_strlen` / `bh_strgetitem` read that payload.
 /// [`StrConstKind::Unicode`] is rstr `Ptr(UNICODE)` (`UnicodeRepr.lowleveltype`):
@@ -749,11 +750,15 @@ fn materialize_prebuilt_str(desc: &StrConstDescriptor) -> i64 {
         StrConstKind::UnicodeObject => {
             let wtf8 = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
                 .expect("prebuilt UnicodeObject constant bytes are not valid WTF-8");
-            if desc.container_index.is_some() {
-                pyre_object::unicodeobject::w_str_from_wtf8_immortal(wtf8.to_owned()) as i64
-            } else {
-                pyre_object::unicodeobject::box_str_constant(wtf8) as i64
-            }
+            // `box_str_constant` is the interned convert_const result, but
+            // `intern_publish_const` → `intern_dict` → `ll_new_weakdict` /
+            // `alloc_entries` is a nursery collection
+            // (`rweakvaldict.py` `ll_new_weakdict` / `_ll_malloc_entries`).
+            // A jitcode load under a WalkSession borrow must not collect.
+            // Identity sharing is `BYTES_INTERNED` / `AssemblyConstIntern`;
+            // the wrapper is the immortal `w_str_from_wtf8_immortal` leaf
+            // (`rstr.py` `init_gc_object_immortal`).
+            pyre_object::unicodeobject::w_str_from_wtf8_immortal(wtf8.to_owned()) as i64
         }
     }
 }
@@ -866,10 +871,11 @@ struct StrConstBytesKey {
 /// Identical literals share one immortal block across the whole table, the
 /// runtime analog of the assembler's per-jitcode dedup. `StrConstKind::Str`
 /// without identity is `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`);
-/// `StrConstKind::UnicodeObject` without identity is `box_str_constant`'s
-/// process-wide `WEAK_INTERN`. Container-backed descriptors intern through
-/// `intern` (one table per assembly); bytes-only descriptors keep
-/// process-wide `(bytes, kind)` sharing.
+/// `StrConstKind::UnicodeObject` is `w_str_from_wtf8_immortal` (no
+/// `WEAK_INTERN` insert: that mallocs `_ll_malloc_entries` and can collect).
+/// Container-backed descriptors intern through `intern` (one table per
+/// assembly); bytes-only descriptors keep process-wide `(bytes, kind)`
+/// sharing.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
     let mut intern = AssemblyConstIntern::new();
     materialize_str_consts_in(jitcodes, &mut intern);
@@ -1309,11 +1315,13 @@ fn prebuilt_empty_array_addr(type_name: &str) -> i64 {
     if item_is_object_pointer(item) {
         pyre_object::prebuilt_empty_object_array() as i64
     } else {
-        // Header-only empty GcArray (`prepare_const(0)`), including
-        // `Array<u8;0>` (`_ll_prebuilt_empty_array` of `GcArray(Char)`, not
-        // a `STR`). Length is 0, so the item stride is unused; one block
-        // per `type_name` via the caller cache.
-        unsafe { pyre_object::alloc_mro_block_gc(&[]) as i64 }
+        // Header-only empty GcArray (`rlist.py` `prepare_const(0)` malloc
+        // immortal), including `Array<u8;0>` (`_ll_prebuilt_empty_array` of
+        // `GcArray(Char)`, not a `STR`). Length is 0, so the item stride is
+        // unused; one block per `type_name` via the caller cache. Never
+        // nursery: `alloc_mro_block_gc` is `malloc_fixedsize` and can bump
+        // the nursery.
+        pyre_object::alloc_prebuilt_empty_gcarray() as i64
     }
 }
 

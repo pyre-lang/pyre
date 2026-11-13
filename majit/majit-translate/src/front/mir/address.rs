@@ -3777,7 +3777,7 @@ impl<'a> Lowering<'a> {
             return false;
         }
         let mut saw = false;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }

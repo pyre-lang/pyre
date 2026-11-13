@@ -223,6 +223,97 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `RDict::entry_ptr` is `entries_item_ptr(self.entries)` (`rptr.py`
+    /// `InteriorPtrRepr` of index 0). FUNC.RESULT is `'ref'`; the callee
+    /// is `direct_arrayitems` (`history.py` `getkind` of a raw `Ptr` is
+    /// `'int'`).
+    pub(in crate::front::mir) fn try_lower_entry_ptr_as_interior(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let graph_leaf = self
+            .graph
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(self.graph.name.as_str());
+        let graph_bare = graph_leaf.split("__spec").next().unwrap_or(graph_leaf);
+        if graph_bare != "entry_ptr"
+            || !self.graph.name.split("::").any(|seg| seg == "rordereddict")
+        {
+            return Ok(false);
+        }
+        let path = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let callee_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        let callee_bare = callee_leaf.split("__spec").next().unwrap_or(callee_leaf);
+        if callee_bare != "entries_item_ptr" {
+            return Ok(false);
+        }
+        let Some(header) = args.first().cloned() else {
+            return Ok(false);
+        };
+        let Some(array_type_id) =
+            struct_pointee_array_type_id(dest_ty, self.llbc, self.tombstoned_leaves)
+        else {
+            return Ok(false);
+        };
+        let Some(ip_ty) = interior_ptr_lltype(&array_type_id) else {
+            return Ok(false);
+        };
+        // `FunctionDesc.cachedgraph` of `entries_item_ptr` still sees
+        // concrete `K, V` (`array_items_base`) when this call is inlined
+        // as InteriorPtr of index 0.
+        if let CallKind::Fun(FunId::Regular { id }) = &reg.kind {
+            if let Some(fd) = self.llbc.fn_by_id(*id) {
+                let _ = self.enqueue_spec(fd, &reg.generics);
+            }
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let index_var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(index_var.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let v_ip = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        v_ip.set_concretetype(Some(ip_ty));
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(v_ip.clone()),
+            kind: crate::model::malloc_opkind("Interior".to_string(), false),
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("ptr", Some("Interior".to_string())),
+                value: LinkArg::from(header),
+                ty: ValueType::Ref(None),
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: v_ip.clone(),
+                field: FieldDescriptor::new("index", Some("Interior".to_string())),
+                value: LinkArg::from(index_var),
+                ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(v_ip));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// Gate B add: record the GcArray header and skip the `ptr::add` Call.
     /// The matching `ptr::write` emits `setinteriorfield`s.
     #[allow(clippy::too_many_arguments)]

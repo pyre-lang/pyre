@@ -1736,6 +1736,17 @@ impl VirtualState {
             // gate (`info_type_matches`) above guarantees `incoming` is one of
             // these three for an IntBounded target.
             (VirtualStateInfo::IntBounded(b1), incoming_int) => {
+                // virtualstate.py NotVirtualStateInfoInt._generate_guards_unkown:
+                // `assert self.intbound._are_knownbits_implied()`.
+                // `NotVirtualStateInfoInt.__init__` runs `info.widen_update()`,
+                // which clears tnum (`TNUM_UNKNOWN`) before the bound is stored.
+                // make_guards therefore must not emit INT_AND from leftover
+                // parity bits.
+                assert!(
+                    b1.are_knownbits_implied(),
+                    "virtualstate.py NotVirtualStateInfoInt._generate_guards_unkown: \
+                     intbound._are_knownbits_implied(); bound={b1:?}"
+                );
                 let statically_within = match incoming_int {
                     VirtualStateInfo::IntBounded(b2) => b2.is_within_range(b1.lower, b1.upper),
                     VirtualStateInfo::Constant(Value::Int(v)) => b1.contains(*v),
@@ -2868,24 +2879,29 @@ fn export_single_value_inner(
     }
     // virtualstate.py NotVirtualStateInfoInt.__init__: an int leaf's
     // info is `getintbound(op)` (optimizer.py — always an IntBound for a
-    // non-constant int), and the constructor widens it (`info.widen_update()`)
-    // and stores it as `self.intbound`. Carry that here so the loop/bridge close
-    // can emit `IntBound.make_guards` (virtualstate.py): when a peeled
-    // loop's exit guard has been const-folded away (because the loop-variant
-    // bound proved it redundant), the bound on this leaf is what makes the bridge
-    // that re-enters the loop re-emit the bound check — without it the re-entered
-    // loop has no exit and runs forever. A widened-unbounded bound carries no
-    // information, so collapse it back to the always-match `Unknown` leaf
-    // (behaviorally identical to NotVirtualStateInfoInt with an unbounded
-    // `intbound`: `_generate_guards_unkown`'s `is_within_range(MININT, MAXINT)`
-    // is always true → no guard).
-    if tp == Type::Int
-        && let Some(widened) = ctx
-            .peek_intbound_box(box_)
-            .map(|b| b.widen())
-            .filter(|b| !b.is_unbounded())
-    {
-        return VirtualStateInfo::IntBounded(widened);
+    // non-constant int), and the constructor widens it in place
+    // (`info.widen_update()`) then stores that same object as
+    // `self.intbound`. `visit_not_virtual` feeds `optimizer.getinfo(box)`,
+    // so the mutation lands on the box's live `_forwarded` before
+    // `unroll.py OptUnroll.export_state` `_expand_info` / `create_short_boxes`.
+    // Cloning and widening a copy leaves leftover tnum on the live bound;
+    // `IntBound.make_guards` then plants INT_AND+GUARD into the short
+    // preamble, which `inline_short_preamble` copies as
+    // ResumeAtPositionDescr guards that fail on the other parity.
+    // A widened-unbounded bound carries no information, so collapse it
+    // back to the always-match `Unknown` leaf (behaviorally identical to
+    // NotVirtualStateInfoInt with an unbounded `intbound`:
+    // `_generate_guards_unkown`'s `is_within_range(MININT, MAXINT)` is
+    // always true → no guard).
+    if tp == Type::Int {
+        ctx.with_intbound_mut(box_, |info| {
+            info.widen_update();
+        });
+        if let Some(raw) = ctx.peek_intbound_box(box_)
+            && !raw.is_unbounded()
+        {
+            return VirtualStateInfo::IntBounded(raw);
+        }
     }
     VirtualStateInfo::Unknown(tp)
 }

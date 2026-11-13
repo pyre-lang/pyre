@@ -254,6 +254,7 @@ pub(crate) fn mirror_vable_static_to_boxes(
 /// copies, and do not write the live `PyFrame`. `pyjitpl.py`
 /// `capture_resumedata` overrides `frame.pc` for the snapshot and restores
 /// it; the heap `pushvalue`/`popvalue` depth stays the walk's.
+#[cfg(test)]
 pub(crate) fn mirror_vable_static_to_boxes_nosync(
     ctx: &mut TraceCtx,
     static_field_name: &str,

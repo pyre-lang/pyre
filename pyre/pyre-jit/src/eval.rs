@@ -7852,7 +7852,7 @@ impl PyPyJitDriver {
             // `execute_assembler` / blackhole CRN may have moved the frame
             // and rewritten `last_instr` / `valuestackdepth`. Reload before
             // the interpreter reads them on Fallthrough.
-            let _ = FrameView::reload(f);
+            let _ = frame_root.frame();
             return false;
         };
         set_pending_loop_exit(ec, loop_result);

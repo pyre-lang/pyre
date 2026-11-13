@@ -2312,6 +2312,16 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_entry_ptr_as_interior(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // Gate B add: `ptr::write(p.add(i), S{..})` records the
                 // GcArray header so the write emits `setinteriorfield`s
                 // (`rordereddict.py` `_ll_dict_setitem_lookup_done`).
@@ -4161,12 +4171,8 @@ impl<'a> Lowering<'a> {
                     } else if dest_is_ref
                         && let Some((base, offset)) =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
-                        && tyref_class_root_with(
-                            &call.dest.ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                        )
-                        .is_some()
+                        && let Some(root) =
+                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
                     {
                         // `addr_of_mut!((*header).items).cast()` is
                         // `direct_arrayitems` (`lltype.py`). The inlined
@@ -7353,7 +7359,8 @@ impl<'a> Lowering<'a> {
                                     if let Some(id) = fun_decl_id {
                                         target = target.with_fun_decl_id(id);
                                         if let Some(fd) = self.llbc.fn_by_id(id) {
-                                            target = stamp_call_target_fun_decl(target, self.llbc, fd);
+                                            target =
+                                                stamp_call_target_fun_decl(target, self.llbc, fd);
                                         }
                                     }
                                     target
@@ -7410,11 +7417,13 @@ impl<'a> Lowering<'a> {
                                         resolved_path: None,
                                         specialization: crate::parse::GraphSpecialization::Regular,
                                     };
-                                    if same_callee && let Some(id) = self.call_target_fun_decl_id(&reg)
+                                    if same_callee
+                                        && let Some(id) = self.call_target_fun_decl_id(&reg)
                                     {
                                         target = target.with_fun_decl_id(id);
                                         if let Some(fd) = self.llbc.fn_by_id(id) {
-                                            target = stamp_call_target_fun_decl(target, self.llbc, fd);
+                                            target =
+                                                stamp_call_target_fun_decl(target, self.llbc, fd);
                                         }
                                     }
                                     target
@@ -8587,10 +8596,13 @@ impl<'a> Lowering<'a> {
         }
         // Caller of `&*p.add(i)` (`entry_at`): FUNC.RESULT is
         // `Ptr(Interior)` so `e.f_hash` / `e.key` lower through
-        // `InteriorPtrRepr.rtype_getattr` (`rptr.py`). Decided by the
-        // callee body's Gate A shape, never by function name.
-        // `RDict::entry_ptr` is the items pointer at index 0: callers
-        // `entry_ptr().add(slot)` recover the `entries` header
+        // `InteriorPtrRepr.rtype_getattr` (`rptr.py`). Gate A on the
+        // callee body decides that this dest is InteriorPtr, never by
+        // function name. ARRAY identity is the instantiated dest
+        // (`get_ll_dict` `DICTENTRYARRAY`): the generic body's add
+        // pointee is `Entry<K,V>` and would intern the one-word-key
+        // template. `RDict::entry_ptr` is the items pointer at index 0:
+        // callers `entry_ptr().add(slot)` recover the `entries` header
         // (`header_producer` / `InteriorHeader::Entries`). Stamping
         // that dest InteriorPtr would hide the header from Gate A.
         // A method call is `CallKind::Trait` in MIR (`regular_call_fun_decl_id`
@@ -8602,8 +8614,12 @@ impl<'a> Lowering<'a> {
         if result_var.concretetype().is_none()
             && let Some(id) = interior_callee_id
             && let Some(fd) = self.llbc.fn_by_id(id)
-            && let Some(array_type_id) =
-                callee_returns_interior_array_type_id(fd, self.llbc, self.tombstoned_leaves)
+            && let Some(array_type_id) = callee_returns_interior_array_type_id_at_dest(
+                fd,
+                &call.dest.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+            )
             && let Some(ip_ty) = interior_ptr_lltype(&array_type_id)
         {
             result_var.set_concretetype(Some(ip_ty));

@@ -5588,7 +5588,7 @@ fn nongc_raw_ptr_return_class_root(
 /// Unsuffixed intern key of a non-GC `GcArray` ITEM behind one pointer
 /// word (`rordereddict.py` `get_ll_dict` `DICTENTRY` / `DICTENTRYARRAY`;
 /// `lltype.py` `InteriorPtr` of `Struct` in `GcArray`).
-fn gcarray_item_ptr_return_class_root(
+pub(in crate::front::mir) fn gcarray_item_ptr_return_class_root(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,

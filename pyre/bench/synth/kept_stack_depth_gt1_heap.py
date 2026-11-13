@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=6.8
-# Widest reading 5.9x; the ceiling is 15% over that.
+# pyre-check: max-pypy-ratio=5.2
+# macOS dynasm reads 1.4x; the floor, a fourth of the ceiling, sits under it.
 # pyre-check: skip-cpython
 # cpython 2.40s vs pyre 0.64s (3.8x on the ubuntu runner), and it is not
 # gated on — only pypy is.

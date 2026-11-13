@@ -5739,6 +5739,12 @@ fn is_known_by_value_struct(
     // `(A, B)`, `dyn`/`impl` — so reject on the leading token structurally
     // instead of enumerating each spelling; the by-name list below then only
     // has to cover nominal wrappers that are pointers underneath.
+    // `#[repr(transparent)]` dict keys (`celldict.py` `StrKey`,
+    // `BytesKey`, `identitydict.py` `IdentityKey`) are one `lltype.Ptr`
+    // word (`rstr.STR` / `GCREF`). Harvest still names the TypeDecl, but
+    // `all_interiorfielddescrs` would raise `array(struct(struct))`
+    // (`heaptracker.py`) if they flattened as an embedded STRUCT.
+    let leaf = outer_type_leaf(type_name);
     if !type_name.starts_with(|c: char| c.is_alphabetic() || c == '_')
         || type_name.starts_with("dyn ")
         || type_name.starts_with("impl ")
@@ -5748,6 +5754,7 @@ fn is_known_by_value_struct(
         || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
         || type_name == "String"
+        || matches!(leaf, "StrKey" | "BytesKey" | "IdentityKey")
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
     {
         return false;
@@ -6300,6 +6307,79 @@ impl StructLayout {
         self.fields.extend(synthesised);
         if let Some(size) = exact_size {
             self.size = size as usize;
+        }
+        restamp_unlowered_aggregate_fields(
+            &mut self.fields,
+            rows,
+            exact_offsets,
+            exact_size,
+            raw_alloc_flavor_structs,
+        );
+    }
+}
+
+/// Byte span of each named field in a Charon-exact STRUCT layout.
+///
+/// `symbolic.get_field_token` returns `(offset, size)`; Charon stores
+/// offsets and the STRUCT size, so the span to the next listed offset
+/// (or the STRUCT end) is `cfield.size` when the field TYPE itself has
+/// no TypeDecl size (an Opaque by-value aggregate).
+fn field_spans_from_exact(
+    exact_offsets: &std::collections::HashMap<String, u64>,
+    exact_size: Option<u64>,
+) -> std::collections::HashMap<String, usize> {
+    let Some(size) = exact_size else {
+        return std::collections::HashMap::new();
+    };
+    let mut ordered: Vec<(u64, &str)> = exact_offsets
+        .iter()
+        .map(|(name, offset)| (*offset, name.as_str()))
+        .collect();
+    ordered.sort_by_key(|(offset, _)| *offset);
+    let mut spans = std::collections::HashMap::new();
+    for (i, (offset, name)) in ordered.iter().enumerate() {
+        let next = ordered.get(i + 1).map(|(next, _)| *next).unwrap_or(size);
+        if next > *offset {
+            spans.insert((*name).to_string(), (next - *offset) as usize);
+        }
+    }
+    spans
+}
+
+/// Restamp a FLAG_POINTER unknown-type fallback that is actually a
+/// by-value aggregate (`descr.py get_type_flag` `FLAG_STRUCT`).
+///
+/// `get_type_flag_with_size` only consumes the span for an unknown
+/// non-pointer spelling, so a pointer field followed by alignment
+/// padding keeps `FLAG_POINTER` / word.
+fn restamp_unlowered_aggregate_fields(
+    fields: &mut [StructFieldLayout],
+    rows: &[(String, String)],
+    exact_offsets: &std::collections::HashMap<String, u64>,
+    exact_size: Option<u64>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) {
+    let spans = field_spans_from_exact(exact_offsets, exact_size);
+    let row_ty: std::collections::HashMap<&str, &str> = rows
+        .iter()
+        .map(|(name, ty)| (name.as_str(), ty.as_str()))
+        .collect();
+    for fl in fields {
+        if fl.flag != majit_ir::descr::ArrayFlag::Pointer {
+            continue;
+        }
+        let Some(ty) = row_ty.get(fl.name.as_str()).copied() else {
+            continue;
+        };
+        let Some(&span) = spans.get(fl.name.as_str()) else {
+            continue;
+        };
+        let (flag, field_type, field_size) =
+            get_type_flag_with_size(ty, raw_alloc_flavor_structs, Some(span));
+        fl.flag = flag;
+        fl.field_type = field_type;
+        if field_size > 0 {
+            fl.size = field_size;
         }
     }
 }
@@ -7765,7 +7845,12 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let layout_size = self
+                .struct_layout_for(fty)
+                .map(|layout| layout.size)
+                .filter(|&s| s > 0);
+            let (flag, ir_type, field_size) =
+                get_type_flag_with_size(fty, &self.raw_alloc_flavor_structs, layout_size);
             // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
             // open with `if FIELD is lltype.Void: continue`, so a zero-sized
             // field is in neither the descr list nor the positional census.
@@ -7921,6 +8006,20 @@ impl CallControl {
         self.field_footprint.borrow_mut().offset_source = Some(field_offset_source);
         majit_ir::descr::record_field_offset_source(field_offset_source);
         let field_offset = concrete_offset.or(template_offset).unwrap_or(offset);
+        let (flag, ir_type, field_size) = owner_id
+            .and_then(|sid| self.layout_of(sid, owner_root))
+            .or_else(|| self.struct_layout_for(owner_root))
+            .and_then(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .find(|fl| fl.name.as_str() == field_name)
+                    .map(|fl| {
+                        let size = if fl.size > 0 { fl.size } else { field_size };
+                        (fl.flag, fl.field_type, size)
+                    })
+            })
+            .unwrap_or((flag, ir_type, field_size));
         let rank = self.field_immutability(Some(owner_root), field_name);
         // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
         let is_immutable = rank.is_some();
@@ -8139,7 +8238,12 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let layout_size = self
+                .struct_layout_for(fty)
+                .map(|layout| layout.size)
+                .filter(|&s| s > 0);
+            let (flag, ir_type, field_size) =
+                get_type_flag_with_size(fty, &self.raw_alloc_flavor_structs, layout_size);
             if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
                 continue;
             }
@@ -8159,6 +8263,19 @@ impl CallControl {
                 continue;
             }
             if fname == path {
+                if let Some(fl) = sid
+                    .and_then(|id| self.layout_of(id, owner))
+                    .and_then(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|fl| fl.name.as_str() == fname)
+                            .cloned()
+                    })
+                {
+                    let size = if fl.size > 0 { fl.size } else { field_size };
+                    return Some((fl.flag, fl.field_type, size, at));
+                }
                 return Some((flag, ir_type, field_size, at));
             }
             offset = at.saturating_add(field_size);
@@ -8292,7 +8409,12 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let layout_size = self
+                .struct_layout_for(fty)
+                .map(|layout| layout.size)
+                .filter(|&s| s > 0);
+            let (flag, ir_type, field_size) =
+                get_type_flag_with_size(fty, &self.raw_alloc_flavor_structs, layout_size);
             // Same skip, same reason as `fielddescrof_concrete`: this walk
             // hands its match to `field_pos_in`, and `heaptracker.py
             // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
@@ -8303,12 +8425,12 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
-            if self.is_known_struct(fty) {
+            // heaptracker.py:108-110 / `all_interiorfielddescrs`: a nested
+            // STRUCT is not a leaf in the positional census. `get_field_descr`
+            // (`descr.py`) still mints `FLAG_STRUCT` when asked for that
+            // field by name (`getattr(STRUCT, fieldname)`). Skip only when
+            // walking past it toward a different name.
+            if self.is_known_struct(fty) && fname != field_name {
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
@@ -8317,7 +8439,9 @@ impl CallControl {
                 // registered layout (`symbolic.get_field_token`). The running
                 // total above does not insert `repr(C)` padding, so a `bool`
                 // before a pointer is one byte early. Prefer the layout field
-                // when it is present.
+                // when it is present. A nested STRUCT with no layout row
+                // still uses `FLAG_STRUCT` and `compute_struct_size` —
+                // `get_type_flag` would bank the TypeDecl as a pointer word.
                 let (offset, field_size, flag, ir_type) = self
                     .struct_layout_for(&elem_name)
                     .and_then(|layout| {
@@ -8327,7 +8451,18 @@ impl CallControl {
                             .find(|f| f.name == field_name)
                             .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
                     })
-                    .unwrap_or((offset, field_size, flag, ir_type));
+                    .unwrap_or_else(|| {
+                        if self.is_known_struct(fty) {
+                            (
+                                offset,
+                                compute_struct_size(self, fty),
+                                majit_ir::descr::ArrayFlag::Struct,
+                                majit_ir::value::Type::Ref,
+                            )
+                        } else {
+                            (offset, field_size, flag, ir_type)
+                        }
+                    });
                 // Use-import resolver: hash the canonical
                 // `defining_module::Bare` form so analyzer hits the
                 // same `_cache_size` slot the runtime's qualified
@@ -8382,7 +8517,17 @@ impl CallControl {
                     // `fielddescrof_concrete` uses, so the inner FieldDescr of
                     // an interior access and the direct field access agree
                     // (`descr.py`, one numberer per STRUCT).
-                    let index_in_parent = field_pos_in(self, &elem_name, field_name);
+                    // Nested STRUCT is not a leaf in `get_fielddescr_index_in`
+                    // (`heaptracker.py` recurses). `descr.py get_field_descr`
+                    // still mints; pyre's walker panics on a refused number.
+                    let index_in_parent = if self.is_known_struct(fty) {
+                        let walked = crate::codewriter::heaptracker::get_fielddescr_index_in(
+                            self, &elem_name, field_name, 0,
+                        );
+                        usize::try_from(walked).ok()
+                    } else {
+                        Some(field_pos_in(self, &elem_name, field_name))
+                    };
                     let load_is_acquire =
                         is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
                     let store_is_release =
@@ -8400,9 +8545,9 @@ impl CallControl {
                         flag,
                         u32::MAX,
                         false,
-                        // Always a claim: `field_pos_in` walks the owner's layout and
-                        // panics rather than hand back an unnumbered field.
-                        Some(index_in_parent),
+                        // Leaf fields always have a walker number. A nested
+                        // STRUCT field does not (`heaptracker.py`).
+                        index_in_parent,
                         load_is_acquire,
                         store_is_release,
                     );
@@ -10210,19 +10355,6 @@ impl CallControl {
                     target.resolved_path().cloned(),
                     None,
                 ),
-                OpKind::Call {
-                    target:
-                        CallTarget::Indirect {
-                            graphs: None,
-                            trait_root,
-                            method_name,
-                        },
-                    ..
-                } => (
-                    None,
-                    None,
-                    Some(ExpandFamily::Trait(trait_root.clone(), method_name.clone())),
-                ),
                 OpKind::IndirectCall {
                     graphs: None,
                     family_key:
@@ -10232,6 +10364,7 @@ impl CallControl {
                         }),
                     ..
                 } => (
+                    None,
                     None,
                     Some(ExpandFamily::Trait(trait_root.clone(), method_name.clone())),
                 ),
@@ -10574,9 +10707,12 @@ impl CallControl {
             } => match graphs {
                 Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
                 Some(graphs) => graphs.clone(),
-                None => match family_key {
-                    Some((trait_root, method_name)) => resolve_indirect(trait_root, method_name),
-                    None => Vec::new(),
+                None => match family_key.as_ref() {
+                    Some(IndirectFamilyKey::DynTrait {
+                        trait_root,
+                        method_name,
+                    }) => resolve_indirect(trait_root, method_name),
+                    Some(IndirectFamilyKey::FnPtrField { .. }) | None => Vec::new(),
                 },
             },
             OpKind::Call { target, .. } => resolve_direct(target).into_iter().collect(),
@@ -17487,7 +17623,11 @@ fn field_metadata(
             nested_size,
         )
     } else {
-        get_type_flag(type_str, raw_alloc_flavor_structs)
+        get_type_flag_with_size(
+            type_str,
+            raw_alloc_flavor_structs,
+            known_struct_sizes.get(type_str).copied(),
+        )
     }
 }
 
@@ -17558,6 +17698,21 @@ fn raw_thin_pointer_spelling(s: &str) -> bool {
 pub(crate) fn get_type_flag(
     type_str: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    get_type_flag_with_size(type_str, raw_alloc_flavor_structs, None)
+}
+
+/// `descr.py get_type_flag`. `layout_size` is `cfield.size` /
+/// `symbolic.get_field_token` when the caller has the STRUCT layout.
+///
+/// The unknown-name arm cannot see `isinstance(TYPE, lltype.Struct)`.
+/// A recorded size wider than a word that is not a pointer spelling is
+/// a by-value aggregate (`FLAG_STRUCT`, non-Ref). A one-word unknown
+/// stays a GC pointer (`StrKey` / `IdentityKey`).
+pub(crate) fn get_type_flag_with_size(
+    type_str: &str,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    layout_size: Option<usize>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
@@ -17728,13 +17883,29 @@ pub(crate) fn get_type_flag(
         s if let Some(flag) = crate::front::mir::type_flag_for_external_transparent_scalar(s) => {
             flag
         }
-        // Unknown type — treat as GC pointer (conservative)
-        _ => (
-            ArrayFlag::Pointer,
-            majit_ir::value::Type::Ref,
-            crate::layout::target_word_size(),
-        ),
+        // Unknown type — treat as GC pointer (conservative), unless the
+        // caller threaded a by-value aggregate's recorded size.
+        _ => unknown_type_flag(type_str, layout_size),
     }
+}
+
+fn unknown_type_flag(
+    type_str: &str,
+    layout_size: Option<usize>,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    use majit_ir::descr::ArrayFlag;
+    let word = crate::layout::target_word_size();
+    // `descr.py get_type_flag`: `isinstance(TYPE, lltype.Struct)` →
+    // `FLAG_STRUCT`. Pointer wrappers (`pointer_pointee`) stay
+    // `FLAG_POINTER` even when the next field's alignment leaves a
+    // hole after this slot.
+    if let Some(size) = layout_size
+        && size > word
+        && crate::fat_ptr_layout::pointer_pointee(type_str).is_none()
+    {
+        return (ArrayFlag::Struct, majit_ir::value::Type::Int, size);
+    }
+    (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
 }
 
 /// Byte alignment of a type string.
@@ -20481,6 +20652,69 @@ mod tests {
         assert_eq!(layout.fields[1].size, 0);
     }
 
+    /// An unknown by-value aggregate (Opaque Mutex) is FLAG_STRUCT of
+    /// the recorded span. A pointer field followed by padding stays
+    /// FLAG_POINTER / word (`descr.py get_type_flag`).
+    #[test]
+    fn apply_exact_layout_stamps_struct_flag_on_wide_unknown_field() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("head".into(), "*const PyObject".into()),
+                ("lock".into(), "Mutex<VecDeque<u8>>".into()),
+                ("wide".into(), "i64".into()),
+            ],
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        let mut layout = layout;
+        layout.apply_exact_layout(
+            &[
+                ("head".into(), "*const PyObject".into()),
+                ("lock".into(), "Mutex<VecDeque<u8>>".into()),
+                ("wide".into(), "i64".into()),
+            ],
+            &std::collections::HashMap::from([
+                ("head".to_string(), 8u64),
+                ("lock".to_string(), 16u64),
+                ("wide".to_string(), 48u64),
+            ]),
+            Some(56),
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let head = layout
+            .fields
+            .iter()
+            .find(|fl| fl.name == "head")
+            .expect("head");
+        assert_eq!(head.flag, ArrayFlag::Pointer);
+        assert_eq!(head.size, word);
+        let lock = layout
+            .fields
+            .iter()
+            .find(|fl| fl.name == "lock")
+            .expect("lock");
+        assert_eq!(lock.flag, ArrayFlag::Struct);
+        assert_ne!(lock.field_type, majit_ir::value::Type::Ref);
+        assert_eq!(lock.size, 32);
+        let wide = layout
+            .fields
+            .iter()
+            .find(|fl| fl.name == "wide")
+            .expect("wide");
+        assert_eq!(wide.flag, ArrayFlag::Signed);
+        assert_eq!(wide.size, 8);
+    }
+
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
     /// The unknown-name fallback would bank it as a word-sized Ref.
     #[test]
@@ -21317,6 +21551,17 @@ mod tests {
         let (flag, ty, _) = get_type_flag("NotALinkedScalar", &HashSet::new());
         assert_eq!(flag, ArrayFlag::Pointer);
         assert_eq!(ty, majit_ir::value::Type::Ref);
+        let word = crate::layout::target_word_size();
+        let (flag, ty, size) =
+            get_type_flag_with_size("NotALinkedScalar", &HashSet::new(), Some(word * 3));
+        assert_eq!(flag, ArrayFlag::Struct);
+        assert_eq!(ty, majit_ir::value::Type::Int);
+        assert_eq!(size, word * 3);
+        let (flag, ty, size) =
+            get_type_flag_with_size("*const PyObject", &HashSet::new(), Some(word * 2));
+        assert_eq!(flag, ArrayFlag::Pointer);
+        assert_eq!(ty, majit_ir::value::Type::Ref);
+        assert_eq!(size, word);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -26219,7 +26464,6 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
-        
             &std::collections::HashMap::new(),
         );
         let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
@@ -26231,7 +26475,6 @@ mod tests {
             &key_aligns,
             &std::collections::HashMap::new(),
             &HashSet::new(),
-        
             &std::collections::HashMap::new(),
         );
         let template_valid = template_layout
@@ -26317,7 +26560,6 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
-        
             &std::collections::HashMap::new(),
         );
         let key_sizes = std::collections::HashMap::from([(wide_key.to_string(), 16usize)]);
@@ -26329,7 +26571,6 @@ mod tests {
             &key_aligns,
             &std::collections::HashMap::new(),
             &HashSet::new(),
-        
             &std::collections::HashMap::new(),
         );
         let mut cc = CallControl::new();
@@ -26406,6 +26647,131 @@ mod tests {
             assert_eq!(narrow_ifd.array_descr().item_size(), 32);
             assert_eq!(wide_ifd.array_descr().item_size(), 40);
         }
+    }
+
+    /// `StrKey` is harvested as a TypeDecl but is one `Ptr` word
+    /// (`rstr.STR`). `interiorfielddescrof` of `Entry.key` must mint a
+    /// leaf (`heaptracker.py` `all_interiorfielddescrs`).
+    #[test]
+    fn interiorfielddescrof_strkey_entry_key_is_pointer_leaf() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "celldict::StrKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+            "StrKey".to_string(),
+        ]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        fields.fields.insert(
+            key_ty.to_string(),
+            vec![("__pos_0".into(), "*mut Utf8Str".into())],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(0, &Some(atid), &None, "key")
+            .expect("StrKey Entry.key is a pointer leaf");
+        assert!(descr.as_interior_field_descr().is_some());
+    }
+
+    /// `ObjectKey` is a 16-byte `{hash, obj}` STRUCT (`dictmultiobject.py`
+    /// object-dict keys store the hash on the entry as `f_hash` and the
+    /// key as GCREF; this pair is the Rust IndexMap key). `interiorfielddescrof`
+    /// of `Entry.key` mints `FLAG_STRUCT` (`descr.py get_field_descr`), not
+    /// a pointer leaf.
+    #[test]
+    fn interiorfielddescrof_objectkey_entry_key_is_nested_struct() {
+        use majit_ir::descr::ArrayFlag;
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "dictmultiobject::ObjectKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+            "ObjectKey".to_string(),
+        ]);
+        let nested_fields =
+            std::collections::HashMap::from([(key_ty.to_string(), key_rows.to_vec())]);
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+            &nested_fields,
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        fields.fields.insert(key_ty.to_string(), key_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(0, &Some(atid), &None, "key")
+            .expect("ObjectKey Entry.key is a nested STRUCT");
+        let field = descr
+            .as_interior_field_descr()
+            .expect("InteriorFieldDescr")
+            .field_descr();
+        assert_eq!(field.field_flag(), ArrayFlag::Struct);
+        assert_eq!(field.field_size(), 16);
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
@@ -26645,6 +27011,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "cell".to_string(),
                     offset: 0,

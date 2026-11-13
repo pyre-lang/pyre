@@ -1153,6 +1153,34 @@ impl WalkSession {
         self.framestack.iter().rev().find(|frame| !frame.is_portal)
     }
 
+    /// Innermost inlined Python frame, skipping portal and helper levels.
+    pub(crate) fn last_python_inline(&self) -> Option<&InlineFrame> {
+        self.framestack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_portal && !frame.is_helper_level())
+    }
+
+    /// Portal or inlined Python callee under any transparent helper levels.
+    ///
+    /// `enter_helper` pushes `w_code == 0` on top of `framestack`.
+    /// `bind_paused_caller_regs` stores the Python caller's banks on this
+    /// frame (`pyjitpl.py` keeps that `MIFrame` while the looked-inside
+    /// body runs). `framestack.last()` is the helper.
+    pub(crate) fn last_non_helper(&self) -> Option<&InlineFrame> {
+        self.framestack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_helper_level())
+    }
+
+    pub(crate) fn last_non_helper_mut(&mut self) -> Option<&mut InlineFrame> {
+        self.framestack
+            .iter_mut()
+            .rev()
+            .find(|frame| !frame.is_helper_level())
+    }
+
     /// [`HelperChain`] of the helper levels on top of `framestack`.
     pub(crate) fn helper_chain(&self) -> HelperChain {
         let levels = || {
@@ -2072,11 +2100,13 @@ fn emit_traceback_node<Sym: WalkSym>(
         .ok_or_else(unavailable)?;
     let last_instr_descr = vinfo.static_field_descr(last_instr_index);
     // A traceback node names an inlined callee's frame as often as the walk's
-    // own. Promote the `_nonstandard_virtualizable` `isstandard` PTR_EQ
-    // through the walker `implement_guard_value` so the snapshot is complete
-    // when recorded.
+    // own. `walker_nonstandard_virtualizable_handler_entry` still records the
+    // `isstandard` `PTR_EQ`; on a reconstructed carrier it commits the known
+    // `isstandard==0` without `implement_guard_value`, because that promote
+    // would `capture_resumedata` at the CALL pc before the `-live-` window is
+    // filled (`pytraceback.record_application_traceback`).
     let write = vable_ops::with_replace_frames(ctx, |ctx| {
-        let nonstandard = vable_ops::walker_nonstandard_virtualizable(
+        let nonstandard = vable_ops::walker_nonstandard_virtualizable_handler_entry(
             ctx,
             opcode_position,
             site.frame,
@@ -4881,6 +4911,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                         target_pc,
                         w_code,
                         is_being_profiled,
+                        None,
                         None,
                         None,
                         None,
@@ -8443,10 +8474,15 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                     0usize
                 } else {
                     match (entry_twin, entry_jitcode_pc >= 0) {
-                        (OuterActiveBoxesEntryTwin::Plain, true) => payload
-                            .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
-                            .unwrap_or(0)
-                            as usize,
+                        (OuterActiveBoxesEntryTwin::Plain, true) => {
+                            crate::state::stack_depth_at_resume_live(
+                                outer_jitcode_index as i32,
+                                entry_jitcode_pc,
+                                payload
+                                    .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
+                                    .unwrap_or(0) as usize,
+                            )
+                        }
                         (OuterActiveBoxesEntryTwin::Trivia, true) => payload
                             .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                             .unwrap_or(0)
@@ -8505,9 +8541,13 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
             } else if cjc >= 0 {
-                jc.payload
-                    .depth_for_jitcode_pc_pred(cjc as usize)
-                    .unwrap_or(0) as usize
+                crate::state::stack_depth_at_resume_live(
+                    outer_jitcode_index as i32,
+                    cjc,
+                    jc.payload
+                        .depth_for_jitcode_pc_pred(cjc as usize)
+                        .unwrap_or(0) as usize,
+                )
             } else {
                 0
             };
@@ -8535,6 +8575,20 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
+    // After-pops dest colors reuse opcode-entry local / stack colors.
+    // Predecessor / fallthrough pcdep still maps them onto those slots
+    // (`heap`/`pos`, or a live operand below the call); the walk register
+    // holds the GET dest. Hide every dest color so the inputarg-vs-shadow
+    // arm cannot publish that slot as the dest (`getitem_list`,
+    // `len(self._entries)`). Trailing after-call live of the same residual
+    // keeps those dests in leftover (`pop_slot_color_by_py_pc` keyed by
+    // the CALL exact py) and must hide them too: otherwise CONST_NULL
+    // dest walk loses to the local shadow (`InputArgRef` `self`).
+    let pop_dest_colors =
+        crate::state::pop_dest_ref_colors(outer_jitcode_index as i32, carried_jitcode_pc);
+    let hide_dest_locals =
+        crate::state::resume_pc_hides_pop_dests(outer_jitcode_index as i32, carried_jitcode_pc);
+
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -8599,10 +8653,12 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
             // Semantic slot this color owns at the carried coordinate's `-live-`.
             // Where it equals the sourced slot, `regs_r[color]` is
             // `registers_r[index]` (`pyjitpl.py get_list_of_active_boxes`).
-            let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
+            let carried_owned_slot = crate::state::snapshot_ref_slot_for_reg_color(
                 nlocals,
                 carried_stack_only,
                 carried_pcdep_entries,
+                &pop_dest_colors,
+                hide_dest_locals,
                 color,
             );
             let fallback = || {
@@ -8610,10 +8666,12 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                     .get_box(color)
                     .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
             };
-            let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
+            let semantic_idx = crate::state::snapshot_ref_slot_for_reg_color(
                 nlocals,
                 valid_stack_only,
                 pcdep_opt.unwrap_or(&[]),
+                &pop_dest_colors,
+                hide_dest_locals,
                 color,
             );
             // Portal-red routing applies only to the force-alived SCRATCH case
@@ -18209,7 +18267,7 @@ fn handle<Sym: WalkSym>(
                     code_ptr as usize,
                     next_instr,
                     is_being_profiled,
-                    ctx.fbw_mode.carrier_resume,
+                    carrier_resume_at(code_ptr as usize),
                     op.pc,
                     op.next_pc,
                     no_loop_header,

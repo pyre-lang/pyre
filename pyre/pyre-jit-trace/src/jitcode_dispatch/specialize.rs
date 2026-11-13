@@ -6395,13 +6395,15 @@ fn skip_compare_branch_trivia(code: &pyre_interpreter::CodeObject, mut pc: usize
 fn newbool_fail_resume_from_marker(
     payload: &crate::PyJitCode,
     containing_marker: usize,
-    nlocals: usize,
     observed: bool,
 ) -> Option<NewboolFailResume> {
     if payload.code_ptr.is_null() {
         return None;
     }
     let code = unsafe { &*payload.code_ptr };
+    // `PyFrame._stack_start` / `concrete_nlocals`: operand stack starts
+    // after varnames and cell/free slots. `code_varnames_len` omits cells.
+    let nlocals = crate::state::callee_layout_for_call_assembler(code).0;
     let containing = payload
         .forward_py_pc_for_jitcode_pc(containing_marker)
         .unwrap_or_else(|| {
@@ -6521,10 +6523,8 @@ fn newbool_fail_resume_target<Sym: WalkSym>(
             ctx.outer_resume_marker_jit_pc.unwrap_or(usize::MAX)
         };
         if marker != usize::MAX {
-            let nlocals =
-                pyre_interpreter::pyopcode::code_varnames_len(unsafe { &*jc.payload.code_ptr });
             if let Some(retarget) =
-                newbool_fail_resume_from_marker(jc.payload.as_ref(), marker, nlocals, observed)
+                newbool_fail_resume_from_marker(jc.payload.as_ref(), marker, observed)
             {
                 return Some(retarget);
             }
@@ -6533,10 +6533,9 @@ fn newbool_fail_resume_target<Sym: WalkSym>(
     // `space.newbool` is a transparent helper: `live_before` is a helper
     // offset, not COMPARE. The producer is the portal opcode named by
     // `outer_resume_marker_jit_pc`.
-    let snapshot_sym = unsafe { ctx.fbw_mode.snapshot_sym.as_ref()? };
     let payload = crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)?;
     let marker = ctx.outer_resume_marker_jit_pc?;
-    newbool_fail_resume_from_marker(payload.as_ref(), marker, snapshot_sym.nlocals(), observed)
+    newbool_fail_resume_from_marker(payload.as_ref(), marker, observed)
 }
 
 fn overlay_stack0_fail_box(
@@ -6544,6 +6543,7 @@ fn overlay_stack0_fail_box(
     outer_jitcode_index: u32,
     marker: usize,
     nlocals: usize,
+    stack_only: usize,
     semantic_slot: usize,
     fail: OpRef,
 ) {
@@ -6558,8 +6558,15 @@ fn overlay_stack0_fail_box(
     let pcdep = payload.pcdep_for_jitcode_pc(marker).unwrap_or_default();
     let ref_start = banks.int.len();
     for (i, &color) in banks.ref_.iter().enumerate() {
-        if crate::state::semantic_ref_slot_for_reg_color(nlocals, 1, &pcdep, color as usize)
-            == Some(semantic_slot)
+        // `semantic_ref_slot_for_reg_color` counts a stack slot only while
+        // `s - nlocals < stack_only`. The live operand depth at this resume
+        // is `NewboolFailResume.stack_depth` (`pyframe.py peekvalue`).
+        if crate::state::semantic_ref_slot_for_reg_color(
+            nlocals,
+            stack_only,
+            &pcdep,
+            color as usize,
+        ) == Some(semantic_slot)
         {
             if let Some(slot) = active.get_mut(ref_start + i) {
                 *slot = fail;
@@ -6583,10 +6590,10 @@ fn restore_vable_stack_entry(ctx: &mut TraceCtx, idx: usize, old: (OpRef, Value)
 ///
 /// `get_list_of_active_boxes` (`pyjitpl.py`) reads **that** frame's
 /// `registers_*` at **that** frame's pc. A helper sub-walk has installed
-/// the helper banks on `ctx`; the paused portal banks sit on
-/// `framestack[-1].live` (`bind_paused_caller_regs`). Numbering the
-/// portal LIVE set `[portal_frame_reg, portal_ec_reg]` through the helper
-/// file would publish `is_w` `type_static_consts` as the PyFrame / EC.
+/// the helper banks on `ctx`; the paused portal banks sit on the last
+/// non-helper frame (`bind_paused_caller_regs`). Numbering the portal
+/// LIVE set `[portal_frame_reg, portal_ec_reg]` through the helper file
+/// would publish `is_w` `type_static_consts` as the PyFrame / EC.
 pub(crate) fn collect_newbool_portal_active_boxes<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     sym: &Sym,
@@ -6598,7 +6605,7 @@ pub(crate) fn collect_newbool_portal_active_boxes<Sym: WalkSym>(
         None => (ctx.registers_i, ctx.registers_r, ctx.registers_f),
     };
     let word = marker as i32;
-    collect_outer_active_boxes(
+    Ok(collect_outer_active_boxes(
         sym,
         ctx.trace_ctx,
         regs_i,
@@ -6608,7 +6615,7 @@ pub(crate) fn collect_newbool_portal_active_boxes<Sym: WalkSym>(
         word,
         word,
         OuterActiveBoxesEntryTwin::Plain,
-    )
+    ))
 }
 
 /// Snapshot the fail arm of `space.newbool` as the completed bool.
@@ -6706,6 +6713,7 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
                         ctx.outer_jitcode_index,
                         retarget.marker,
                         retarget.nlocals,
+                        retarget.stack_depth,
                         retarget.nlocals + i,
                         slot_box,
                     );
@@ -7464,6 +7472,15 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         }
         Ok(None)
     };
+    // A live SubWalkDriver treats every nested `run_sub_jitcode_walk_from`
+    // as the current opcode's CALL callee (`ChangeFrame` dest-write into
+    // that opcode's dest). `unwrap_cell` / `write_cell` are folds
+    // (`typeobject.py unwrap_cell`), not that callee: dest-writing their
+    // Ref into an `inline_call_r_i` Int dest aborts the portal. Residualize
+    // the cell access (`do_residual_call` / the LOAD_GLOBAL residual).
+    if super::inline_call::subwalk_driver_is_active() {
+        return decline("NESTED-DRIVER");
+    }
     let Some(sub_body) = sub_jitcode_body_by_index(jc_index) else {
         return decline("NO-SUB-BODY");
     };
@@ -7513,6 +7530,21 @@ fn descend_named_cell_helper<Sym: WalkSym>(
             }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] {} pc={pc}", descent.decline_tag);
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
+            super::inline_call::drop_unpublished_pending_subwalk::<Sym>(ctx.session);
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[decline-why] {}-ERR pc={op_pc} error=SubWalkSuspended",
+                    descent.decline_tag
+                );
             }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -7851,6 +7883,7 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     rb: i64,
     lhs_obj: pyre_object::PyObjectRef,
     rhs_obj: pyre_object::PyObjectRef,
+    dst: usize,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     use pyre_interpreter::objspace::descroperation as desc;
@@ -7927,9 +7960,6 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         .unwrap_or(raw_concrete as usize);
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete)));
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
     let boxed = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
@@ -7944,6 +7974,15 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_obj as usize)),
     );
+    // `do_residual_call` / `make_result_of_lastop` write the result
+    // register before `generate_guard(GUARD_NO_EXCEPTION)`. The
+    // after-residual `-live-` names this dest; a multi-frame snapshot
+    // that finds `OpRef::NONE` there raises
+    // `LoopBearingCalleeInlineUnsupported`.
+    write_ref_reg(ctx, op_pc, dst, boxed, ConcreteValue::Ref(boxed_obj))?;
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
     }))
@@ -8089,7 +8128,7 @@ fn try_emit_exact_int_binop_after_overlay<Sym: WalkSym>(
                 .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
                 .unwrap_or(rhs_obj);
             return emit_int_ovf_to_long(
-                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
+                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj, dst,
             );
         }
         if !raw.is_constant() {
@@ -10927,9 +10966,14 @@ fn decline_frame_locals_setitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     exc_before: (Option<OpRef>, ConcreteValue),
+    unjournaled_kinds_before: (bool, bool),
 ) -> Result<Option<()>, DispatchError> {
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
+    // The cut dropped residuals this descent recorded without executing
+    // (`fbw_mark_unjournaled_effect`). Restore the flags the enclosing
+    // walk had, so `do_residual_call` of STORE_SUBSCR is not poisoned.
+    fbw_restore_unjournaled_kinds(unjournaled_kinds_before);
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     let _ = pyre_interpreter::call::take_call_error();
     Ok(None)
@@ -10986,10 +11030,11 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let unjournaled_kinds_before = fbw_unjournaled_kinds();
     let rewind = super::inline_call::SubWalkRewind::new(
         pre_fold_pos,
         fbw_executed_effect_count(),
-        fbw_has_unjournaled_effect(),
+        unjournaled_kinds_before,
     );
     let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
     let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
@@ -11031,12 +11076,26 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         &[],
     );
     // pyopcode.py STORE_SUBSCR runs space.setitem once. Decline to the
-    // generic residual only when the descent applied nothing, matching
-    // SubWalkRewind::nothing_applied.
+    // generic residual (`pyjitpl.py` `do_residual_call`) when the cut
+    // undoes every effect the descent applied
+    // (`SubWalkRewind::nothing_unrewindable_applied`): journaled stores
+    // and recorded-but-unexecuted residuals. A real executed write still
+    // refuses, so the residual cannot apply it a second time.
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
-            return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
+            if rewind.nothing_unrewindable_applied() {
+                return decline_frame_locals_setitem(
+                    ctx,
+                    pre_fold_pos,
+                    exc_before,
+                    unjournaled_kinds_before,
+                );
+            }
+            return Err(error);
         }
         Err(error) => return Err(error),
     };
@@ -11045,8 +11104,13 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
             let _ = finish_inline_callee_return(ctx, result);
         }
         DispatchOutcome::Continue => {}
-        _ if rewind.nothing_applied() => {
-            return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
+        _ if rewind.nothing_unrewindable_applied() && !abort_blackhole_latched() => {
+            return decline_frame_locals_setitem(
+                ctx,
+                pre_fold_pos,
+                exc_before,
+                unjournaled_kinds_before,
+            );
         }
         _ => return Err(DispatchError::callee_inline_abort(op_pc, true)),
     }
@@ -11115,7 +11179,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
     let seq_pin = residual_call::owner_root_if_gc(seq_before as usize);
     let iter_type_addr = &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, iter_op, iter_type_addr, false)?;
+    walker_guard_class(ctx, op_pc, iter_op, iter_type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     ctx.trace_ctx.set_opref_concrete(
         iter_op,
@@ -13780,7 +13844,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
         }
-        walker_guard_class(ctx, op.pc, code_op, code_type_addr, false)?;
+        walker_guard_class(ctx, op.pc, code_op, code_type_addr)?;
         let hidden_op = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             code_op,
@@ -14164,7 +14228,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     }
 
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[exc])?;
-    walker_guard_class(ctx, op.pc, exc, concrete_layout, false)?;
+    walker_guard_class(ctx, op.pc, exc, concrete_layout)?;
 
     let concrete_class = live_at(class_off, concrete_class);
     // Intern before `walker_guard_exact_w_class`: that records and can
@@ -14729,7 +14793,7 @@ fn walker_guard_exact_instance<Sym: WalkSym>(
     type_addr: i64,
     w_class: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    walker_guard_class(ctx, pc, op, type_addr, false)?;
+    walker_guard_class(ctx, pc, op, type_addr)?;
     walker_guard_exact_w_class(ctx, pc, op, w_class)
 }
 
@@ -15196,7 +15260,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
         }
         Plan::Index(candidate) => {
             let Some((result, ConcreteValue::Ref(concrete))) =
-                try_walker_inline_index(ctx, op, code, dst, candidate)?
+                try_walker_inline_index(ctx, op, code, dst, candidate, None)?
             else {
                 return walker_complex_decline(ctx, pre);
             };
@@ -16627,15 +16691,27 @@ pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker
     if code.get(marker) != Some(&op_live) {
         return marker;
     }
-    let Some(preamble) = crate::jitcode_runtime::decode_op_at(code, marker) else {
+    let Some(preamble) = payload
+        .decoded_op_at(marker)
+        .cloned()
+        .or_else(|| crate::jitcode_runtime::decode_op_at(code, marker))
+    else {
         return marker;
     };
     if preamble.opname != "live" {
         return marker;
     }
-    if let Some(merge) = crate::jitcode_runtime::decode_op_at(code, preamble.next_pc) {
+    if let Some(merge) = payload
+        .decoded_op_at(preamble.next_pc)
+        .cloned()
+        .or_else(|| crate::jitcode_runtime::decode_op_at(code, preamble.next_pc))
+    {
         if merge.opname == "jit_merge_point" {
-            let Some(resume) = crate::jitcode_runtime::decode_op_at(code, merge.next_pc) else {
+            let Some(resume) = payload
+                .decoded_op_at(merge.next_pc)
+                .cloned()
+                .or_else(|| crate::jitcode_runtime::decode_op_at(code, merge.next_pc))
+            else {
                 return marker;
             };
             return if resume.opname == "live" && jitcode.can_decode_live_vars(resume.pc, op_live) {
@@ -16695,6 +16771,46 @@ pub(crate) fn collapsed_call_result_resume_marker(
         .or_else(|| collapsed_parent_resume_marker(payload, call_jit_pc))
 }
 
+/// True when the parent opcode at `call_jit_pc` has already popped its
+/// operand stack (`jtransform.py` `handle_regular_call` /
+/// `emit_popvalue_ref`).
+///
+/// Those pops write NULL into `locals_cells_stack_w`. Resuming at the
+/// opcode-start twin (`collapsed_parent_resume_marker`) would re-pop the
+/// NULLs (`#124` / `#281`). Any opcode that planted an after-pops `-live-`
+/// therefore resumes there, where the dests are still in registers.
+/// Converted helpers with no CodeObject keep the opcode-start twin.
+pub(crate) fn helper_parent_call_already_popped(
+    payload: &crate::PyJitCode,
+    call_jit_pc: usize,
+) -> bool {
+    if payload.code_ptr.is_null() {
+        return false;
+    }
+    super::resume_snapshot::after_pops_live_marker_in_opcode(payload, call_jit_pc)
+        .is_some_and(|m| call_jit_pc >= m)
+}
+
+/// Parent resume coordinate for a collapsed helper of return kind `ret`.
+///
+/// [`HelperReturn::CallResult`] always uses the after-pops `-live-`.
+/// Converted / CalleePrologue of an opcode that already popped (the
+/// after-pops `-live-` exists and `call_jit_pc` is at or past it) do too:
+/// the operand slots are already NULL. Other Converted helpers keep the
+/// opcode-start twin so they re-pop.
+pub(crate) fn collapsed_resume_marker_for_helper(
+    payload: &crate::PyJitCode,
+    call_jit_pc: usize,
+    ret: HelperReturn,
+) -> Option<usize> {
+    if ret == HelperReturn::CallResult || helper_parent_call_already_popped(payload, call_jit_pc) {
+        super::resume_snapshot::after_pops_live_marker_in_opcode(payload, call_jit_pc)
+            .or_else(|| collapsed_call_result_resume_marker(payload, call_jit_pc))
+    } else {
+        collapsed_parent_resume_marker(payload, call_jit_pc)
+    }
+}
+
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
 ///
 /// Publishes the call-site resume coordinate the enclosing full-body walk needs
@@ -16738,11 +16854,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     } else {
         unsafe {
             let jc = &*sym.jitcode();
-            let marker = if nested_entry.ret == HelperReturn::CallResult {
-                collapsed_call_result_resume_marker(&jc.payload, op_pc)
-            } else {
-                collapsed_parent_resume_marker(&jc.payload, op_pc)
-            };
+            let marker = collapsed_resume_marker_for_helper(&jc.payload, op_pc, nested_entry.ret);
             (jc.index as u32, marker)
         }
     };
@@ -16763,7 +16875,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             call_site_word,
             call_site_word,
             OuterActiveBoxesEntryTwin::Plain,
-        )?
+        )
     };
 
     let saved_entry = ctx.entry_py_pc;
@@ -16846,7 +16958,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
 /// the enclosing walk residualizes the helper. Parked (already-finished)
 /// results take this conversion too — they skip the walk-time setup/teardown
 /// in `run_orthodox_helper_subwalk`.
-fn orthodox_helper_subwalk_result(
+pub(crate) fn orthodox_helper_subwalk_result(
     walk_result: Result<DispatchOutcome, DispatchError>,
 ) -> Result<DispatchOutcome, DispatchError> {
     match walk_result {

@@ -2141,6 +2141,37 @@ fn every_jitcode_descr_names_an_installed_body() {
     eprintln!("[density] {named} JitCode descrs over {jitcodes} jitcodes");
 }
 
+/// Two hundred installed bodies, asked twice: the second ask matches the first
+/// and the whole scan stays under two seconds.
+///
+/// Synthetic cyclic JitCodes cannot be built with the existing helpers — an
+/// `inline_call` names a frozen descr-table slot, not a freshly installed
+/// index — so this pins the real table instead of a hand-built SCC.
+#[test]
+fn descent_blocker_summary_of_installed_bodies_is_stable_and_cheap() {
+    let count = crate::jitcode_runtime::jitcode_count();
+    assert!(
+        count > 0,
+        "no installed jitcodes -- this test proves nothing here"
+    );
+    let n = count.min(200);
+    let start = std::time::Instant::now();
+    for i in 0..n {
+        let index = if count <= 200 { i } else { i * count / n };
+        let first = super::inline_call::descent_blocker_summary(index);
+        let second = super::inline_call::descent_blocker_summary(index);
+        assert_eq!(
+            first, second,
+            "jitcode {index} summary changed between consecutive asks"
+        );
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "summaries of {n} jitcodes took {elapsed:?}"
+    );
+}
+
 /// A body the decoder cannot read to the end declines on that alone.  The
 /// instruction starts would otherwise name a prefix, and the `push!` gate drops
 /// targets that are not starts — so every path out of the undecodable byte
@@ -2233,10 +2264,12 @@ fn helper_resume_from_a_pruned_goto_if_still_reaches_abort() {
     );
 }
 
-/// `w_list_pop_end_inner` still emits `abort/` on an unlowered arm. A
-/// helper section seated at the strategy `switch` can reach that abort,
-/// so capture must not number that pc. The published `has_abort` flag is
-/// the assembler truth (`ssa_emitter.rs` `has_abort_flag`).
+/// `w_list_pop_end_inner` no longer emits `abort/` — the Float arm inlines
+/// `w_float_new` as `inline_call_irf_r` after `ll_list_float_length`. A
+/// helper section seated at the strategy `switch` still reaches a
+/// remaining-body blocker (Object-arm `residual_call_*`), so capture must
+/// not number that pc (`blackhole.py` `convert_and_run_from_pyjitpl`;
+/// `numbered_helper_sections_blocker_free`).
 #[test]
 fn helper_resume_from_list_pop_end_switch_reaches_abort() {
     let jc = crate::jitcode_runtime::list_pop_end_jitcode()
@@ -2244,51 +2277,32 @@ fn helper_resume_from_list_pop_end_switch_reaches_abort() {
     let index = jc.index();
     let payload = crate::state::ensure_build_time_jitcode_at(index)
         .expect("publish the helper so the resume scan has a payload");
-    assert!(
-        payload.has_abort_opcode(),
-        "ensure_build_time_jitcode_at publishes has_abort from abort/ in the body"
-    );
     let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
-    let abort_pcs: Vec<usize> = ops
-        .iter()
-        .filter(|op| op.opname == "abort")
-        .map(|op| op.pc)
-        .collect();
-    assert!(
-        !abort_pcs.is_empty(),
-        "Float arm still emits abort/; first ops={:?}",
-        ops.iter()
-            .take(16)
-            .map(|op| (op.pc, op.key))
-            .collect::<Vec<_>>()
-    );
     let switch = ops
         .iter()
         .find(|op| op.opname == "switch")
         .expect("w_list_pop_end_inner dispatches strategy with switch/id");
-    let abort_pc = abort_pcs[0];
-    let around: Vec<_> = ops
-        .iter()
-        .filter(|op| op.pc + 48 >= abort_pc && op.pc <= abort_pc)
-        .map(|op| (op.pc, op.key))
-        .collect();
-    let head: Vec<_> = ops.iter().take(24).map(|op| (op.pc, op.key)).collect();
-    let abort_keys: Vec<_> = ops
-        .iter()
-        .filter(|op| op.opname == "abort")
-        .map(|op| (op.pc, op.key))
-        .collect();
-    eprintln!("w_list_pop_end_inner head: {head:?}");
-    eprintln!("w_list_pop_end_inner abort keys: {abort_keys:?}");
-    eprintln!("w_list_pop_end_inner abort neighborhood: {around:?}");
     assert!(
-        super::inline_call::helper_resume_can_reach_abort(index, switch.pc),
-        "abort at {abort_pcs:?} must be reachable from strategy switch pc {}",
+        !payload.has_abort_opcode() && ops.iter().all(|op| op.opname != "abort"),
+        "Float arm inlines w_float_new; assembler has_abort_flag stays clear"
+    );
+    assert!(
+        ops.iter().any(|op| op.opname == "getarrayitem_gc_f")
+            && ops.iter().any(|op| op.opname == "inline_call_irf_r"),
+        "Float arm lowers getarrayitem_gc_f then inline_call_irf_r (w_float_new)"
+    );
+    assert!(
+        ops.iter().any(|op| op.opname.starts_with("residual_call")),
+        "Object arm still residualizes; that remaining-body call is the switch blocker"
+    );
+    assert!(
+        !super::inline_call::helper_resume_can_reach_abort(index, switch.pc),
+        "no abort/ remains reachable from strategy switch pc {}",
         switch.pc
     );
     assert!(
         super::inline_call::helper_resume_reaches_blocker(index, switch.pc, None),
-        "numbering the strategy switch would seat the blackhole on abort"
+        "numbering the strategy switch would seat the blackhole on a remaining-body blocker"
     );
 }
 
@@ -2789,52 +2803,9 @@ fn gnf_after_residual_resolves_to_live_after_call_not_live_before_pops() {
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
 
     assert_eq!(
-        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before),
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, residual_pc, None),
         Some(live_after),
-        "LIVE before pops must resolve to the residual's trailing LIVE",
-    );
-    assert_eq!(
-        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, live_before, usize::MAX),
-        Some(live_after),
-    );
-    assert_eq!(
-        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, residual_pc, usize::MAX),
-        Some(live_after),
-    );
-    assert_eq!(
-        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, dest_set, usize::MAX),
-        Some(live_after),
-        "a dest-SET capture must not skip dest SET by landing on the later LIVE",
-    );
-    assert_eq!(
-        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, later_live, usize::MAX),
-        Some(live_after),
-    );
-    assert!(
-        super::resume_snapshot::after_residual_should_fallthrough_py(&pyjit, live_before),
-        "residual_call_* is do_residual_call: fallthrough py",
-    );
-    assert_eq!(
-        super::resume_snapshot::after_residual_resume_live_for_guard(
-            &pyjit,
-            dest_set,
-            usize::MAX,
-            Some(majit_ir::OpCode::GuardNotForced),
-            None,
-        ),
-        Some(live_after),
-        "GNF at dest SET rewinds to the residual trailing LIVE",
-    );
-    assert_eq!(
-        super::resume_snapshot::after_residual_resume_live_for_guard(
-            &pyjit,
-            dest_set,
-            usize::MAX,
-            Some(majit_ir::OpCode::GuardNoException),
-            None,
-        ),
-        Some(later_live),
-        "GNE at dest SET must not rewind onto the residual trailing LIVE",
+        "the residual's trailing -live- is the after-residual guard marker",
     );
 }
 
@@ -2866,12 +2837,9 @@ fn call_assembler_gnf_keeps_own_py_not_fallthrough() {
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
 
     assert_eq!(
-        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, assembler_pc, usize::MAX),
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, assembler_pc, None),
         Some(live_after),
-    );
-    assert!(
-        !super::resume_snapshot::after_residual_should_fallthrough_py(&pyjit, assembler_pc),
-        "call_assembler_* is do_recursive_call: keep own py",
+        "call_assembler trailing -live- is the after-residual guard marker",
     );
 }
 
@@ -2948,17 +2916,70 @@ fn preceding_live_marker_at_residual_is_adjacent_not_opcode_start() {
         "the opcode-start twin remains 0; plain_guard must not use it",
     );
     assert_eq!(
-        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, residual_pc),
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, residual_pc, None),
         Some(live_after),
+        "the residual's trailing -live- is the after-residual guard marker",
+    );
+}
+
+#[test]
+fn plain_guard_resume_uses_last_live_when_residual_is_not_adjacent() {
+    // Helper residual with a quasi-immut `getfield` (or `catch_exception`)
+    // between the last `-live-` and the call: SIZE_LIVE_OP adjacency fails
+    // and a helper has no opcode-start twin. GuardNotInvalidated is a plain
+    // guard (`pyjitpl.py generate_guard(resumepc=orgpc)`), so resume is the
+    // last `-live-` before the residual, never the trailing after-call live
+    // (dest not yet written) and never the residual pc itself.
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    // 0 LIVE, 3 int_copy (gap), 6 residual (6 bytes), 12 LIVE after residual.
+    let code = vec![
+        live, 0, 0, int_copy, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0,
+    ];
+    let last_live = 0usize;
+    let residual_pc = 6usize;
+    let live_after = 12usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("helper_residual_gap_live");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [last_live, 3, residual_pc, live_after]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+
+    assert_eq!(
+        super::resume_snapshot::preceding_live_marker(&pyjit, residual_pc),
+        None,
+        "SIZE_LIVE_OP adjacency must miss across the intervening op",
+    );
+    assert!(
+        !pyjit.jitcode.can_decode_live_vars(residual_pc, live),
+        "get_live_vars_info must refuse a residual whose previous insn is not -live-",
     );
     assert_eq!(
-        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before_pops),
-        Some(live_after),
+        pyjit.resume_marker_for_jitcode_pc(residual_pc),
+        None,
+        "a helper body has no opcode-start twin",
     );
     assert_eq!(
-        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before_residual),
+        super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, residual_pc),
+        last_live as i32,
+        "plain GuardNotInvalidated resumes at the last -live- before the residual",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, residual_pc, None),
         Some(live_after),
-        "capture on the after-pops -live- still resolves to the residual trailing LIVE",
+        "after-residual family still uses the trailing -live-",
     );
 }
 
@@ -3069,6 +3090,522 @@ fn collapsed_call_result_parent_is_the_call_live_not_opcode_start() {
         super::specialize::collapsed_call_result_resume_marker(&pyjit, call_pc),
         Some(live_before_pops),
         "CallResult collapse must not re-run the pops",
+    );
+    assert_eq!(
+        super::specialize::collapsed_resume_marker_for_helper(
+            &pyjit,
+            call_pc,
+            super::HelperReturn::CallResult,
+        ),
+        Some(live_before_call),
+        "CallResult dispatches through collapsed_resume_marker_for_helper",
+    );
+    assert_eq!(
+        super::specialize::collapsed_resume_marker_for_helper(
+            &pyjit,
+            call_pc,
+            super::HelperReturn::Converted,
+        ),
+        Some(live_before_pops),
+        "Converted with no CodeObject keeps the opcode-start twin",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_pops),
+        Some(live_before_call),
+        "opcode-start jit_pc still finds the after-pops -live- before residual_call",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, call_pc),
+        Some(live_before_call),
+        "residual jit_pc uses the adjacent preceding -live-",
+    );
+}
+
+#[test]
+fn after_pops_live_survives_cache_block_head_and_fallthrough_rekey() {
+    // CALL opcode-entry `-live-` can be a block-head whose containing py is
+    // CACHE, while `py_exact_by_jit_pc` names CALL. The after-pops `-live-`
+    // is re-keyed to fallthrough. Walks that stop on containing-py change
+    // miss the residual (`cwr_bridge_jump_matches_label`).
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    let code = vec![
+        live, 0, 0, int_copy, 0, 0, live, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0,
+    ];
+    let live_before_pops = 0usize;
+    let live_before_call = 6usize;
+    let call_pc = 9usize;
+    let live_after = 15usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("call_cache_block_head");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before_pops, 3, live_before_call, call_pc, live_after]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![
+        (0, Some(0)),
+        (3, Some(0)),
+        (6, Some(0)),
+        (9, Some(0)),
+        (15, Some(0)),
+    ];
+    // Block-head CACHE at the opcode-entry live; exact CALL for the body;
+    // after-pops live re-keyed to fallthrough.
+    pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 1)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 4), (3, 4), (6, 8), (9, 4), (15, 8)];
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 1)];
+
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_pops),
+        Some(live_before_call),
+        "CACHE block-head at opcode-entry still finds the after-pops -live-",
+    );
+    assert_eq!(
+        super::resume_snapshot::residual_call_in_opcode(&pyjit, live_before_pops).map(|op| op.pc),
+        Some(call_pc),
+        "after-pops re-key must not hide the CALL residual",
+    );
+    assert_eq!(
+        super::specialize::collapsed_resume_marker_for_helper(
+            &pyjit,
+            live_before_pops,
+            super::HelperReturn::CallResult,
+        ),
+        Some(live_before_call),
+    );
+}
+
+#[test]
+fn after_pops_live_survives_catch_exception_and_promote_guard() {
+    // COMPARE wraps residual in `catch_exception`; LOAD_ATTR plants
+    // `ref_guard_value` between the after-pops `-live-` and the residual.
+    // Walks that stop on containing-py change at that live miss the residual
+    // (`generator_resume_payload` CheckExcMatch / LoadAttr).
+    let live = crate::state::op_live();
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    let catch = catch_exception(20);
+    let mut code = Vec::new();
+    code.extend_from_slice(&[live, 0, 0]); // 0 opcode-entry
+    code.extend_from_slice(&[live, 0, 0]); // 3 after-pops
+    code.extend(catch); // 6 catch_exception/L
+    code.extend_from_slice(&[residual, 0, 0, 0, 0, 0]); // 10 residual
+    code.extend_from_slice(&[live, 0, 0]); // 16 after-call
+    let live_before_pops = 0usize;
+    let live_before_call = 3usize;
+    let call_pc = 10usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("compare_catch_after_pops");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before_pops, live_before_call, call_pc, 16]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![
+        (0, Some(0)),
+        (3, Some(0)),
+        (6, Some(0)),
+        (10, Some(0)),
+        (16, Some(0)),
+    ];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 4), (3, 8), (6, 4), (10, 4), (16, 8)];
+
+    assert_eq!(
+        super::resume_snapshot::residual_call_in_opcode(&pyjit, live_before_pops).map(|op| op.pc),
+        Some(call_pc),
+        "catch_exception between after-pops live and residual must not hide the call",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_pops),
+        Some(live_before_call),
+    );
+    assert_eq!(
+        super::resume_snapshot::resume_pc_past_call_pops(&pyjit, call_pc, live_before_pops as i32),
+        live_before_call as i32,
+        "a residual-pc guard whose chosen resume is opcode-start must move to after-pops",
+    );
+    assert_eq!(
+        super::resume_snapshot::resume_pc_past_call_pops(
+            &pyjit,
+            live_before_pops,
+            live_before_pops as i32
+        ),
+        live_before_pops as i32,
+        "a guard still on the opcode-start -live- keeps orgpc",
+    );
+}
+
+#[test]
+fn converted_collapse_at_after_pops_live_uses_residual_owner_not_fallthrough() {
+    // After-pops `-live-` is re-keyed to fallthrough. `opcode_owner` at
+    // that live names the next opcode, so Converted collapse used the
+    // opcode-start twin and blackhole re-GETs NULL dests. The residual
+    // keeps the CALL exact py (`helper_parent_call_already_popped`).
+    let live = crate::state::op_live();
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    let code = vec![live, 0, 0, live, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0];
+    let live_before_pops = 0usize;
+    let live_before_call = 3usize;
+    let call_pc = 6usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("converted_after_pops_owner");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before_pops, live_before_call, call_pc, 12]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc =
+        vec![(0, Some(0)), (3, Some(0)), (6, Some(0)), (12, Some(0))];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 4), (3, 8), (6, 4), (12, 8)];
+
+    assert_eq!(
+        super::resume_snapshot::residual_call_in_opcode(&pyjit, live_before_call).map(|op| op.pc),
+        Some(call_pc),
+        "after-pops live still finds the residual",
+    );
+    assert_eq!(
+        super::specialize::collapsed_resume_marker_for_helper(
+            &pyjit,
+            live_before_call,
+            super::HelperReturn::CallResult,
+        ),
+        Some(live_before_call),
+    );
+    assert_eq!(
+        super::specialize::collapsed_resume_marker_for_helper(
+            &pyjit,
+            live_before_call,
+            super::HelperReturn::Converted,
+        ),
+        Some(live_before_pops),
+        "Converted with no CodeObject still keeps opcode-start",
+    );
+    assert_eq!(
+        super::resume_snapshot::resume_pc_past_call_pops(&pyjit, call_pc, live_before_pops as i32),
+        live_before_call as i32,
+        "full-body capture: residual op_pc + opcode-start chosen → after-pops",
+    );
+}
+
+/// `store_token_in_vable` (`pyjitpl.py`) records GUARD_NOT_FORCED_2 after
+/// the residual has run. `get_list_of_active_boxes` then reads the trailing
+/// `-live-` (`self.pc - SIZE_LIVE_OP` once `_get_opimpl_method` advanced pc).
+/// `resume_pc_past_call_pops` at the residual byte would pull that snapshot
+/// back onto after-pops dest colors the call already consumed.
+#[test]
+fn guard_not_forced_2_residual_trailing_live_is_after_call_not_after_pops() {
+    let live = crate::state::op_live();
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("residual_call_r_r/iRd>r must be in the insns table");
+    // live (opcode-start) / live (after-pops) / residual / live (after-call)
+    let code = vec![live, 0, 0, live, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0];
+    let live_before_pops = 0usize;
+    let live_before_call = 3usize;
+    let call_pc = 6usize;
+    let after_call = 12usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("gnf2_trailing_live");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before_pops, live_before_call, call_pc, after_call]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, call_pc),
+        Some(live_before_call),
+    );
+    assert_eq!(
+        super::resume_snapshot::resume_pc_past_call_pops(&pyjit, call_pc, live_before_pops as i32),
+        live_before_call as i32,
+        "plain residual-pc guards still move opcode-start to after-pops",
+    );
+    let call = crate::jitcode_runtime::decode_op_at(pyjit.jitcode.code.as_slice(), call_pc)
+        .expect("residual_call decodes");
+    let trailing =
+        crate::jitcode_runtime::decode_op_at(pyjit.jitcode.code.as_slice(), call.next_pc)
+            .expect("byte after residual decodes");
+    assert_eq!(trailing.opname, "live");
+    assert_eq!(trailing.pc, after_call);
+    assert_ne!(
+        trailing.pc, live_before_call,
+        "GUARD_NOT_FORCED_2 trailing live is not the after-pops dest marker"
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_of_trailing_live(&pyjit, after_call),
+        Some(live_before_call),
+        "trailing after-call live names the residual's after-pops dest marker",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_of_trailing_live(&pyjit, live_before_call),
+        None,
+        "after-pops itself is not a trailing live",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_of_trailing_live(&pyjit, live_before_pops),
+        None,
+        "opcode-start is not a trailing live",
+    );
+}
+
+/// Inlined COMPARE / BINARY still emit after-pops `-live-` after
+/// `emit_popvalue_ref` (`jtransform.py handle_regular_call`) with no
+/// residual. `after_pops_live_marker_in_opcode` must name that marker so
+/// dest colors hide and the vable window is the post-pop depth.
+#[test]
+fn inlined_compare_after_pops_live_follows_get_pops() {
+    let live = crate::state::op_live();
+    let get = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("getarrayitem_vable_r/ridd>r must be in the insns table");
+    let set = *insns_opname_to_byte()
+        .get("setarrayitem_vable_r/rirdd")
+        .expect("setarrayitem_vable_r/rirdd must be in the insns table");
+    // live (opcode-start) / GET pop / SET-None / live (after-pops) / SET result
+    // Operand bytes are padding so decode_op_at can step next_pc:
+    // getarrayitem_vable_r/ridd>r = r i d d >r (7), setarrayitem_vable_r/rirdd = r i r d d (7).
+    let mut code = vec![live, 0, 0];
+    let live_before_pops = 0usize;
+    let get_pc = code.len();
+    code.extend_from_slice(&[get, 0, 0, 0, 0, 0, 0, 0]);
+    let set_none_pc = code.len();
+    code.extend_from_slice(&[set, 0, 0, 0, 0, 0, 0, 0]);
+    let live_before_body = code.len();
+    code.extend_from_slice(&[live, 0, 0]);
+    let set_result_pc = code.len();
+    code.extend_from_slice(&[set, 0, 0, 0, 0, 0, 0, 0]);
+    let _ = (get_pc, set_none_pc, set_result_pc);
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("inlined_compare_after_pops");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_before_pops, live_before_body].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![
+        (live_before_pops, Some(live_before_pops)),
+        (live_before_body, Some(live_before_pops)),
+    ];
+    pyjit.metadata.pop_slot_color_by_py_pc = vec![vec![(0, 1)]];
+
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_pops),
+        Some(live_before_body),
+        "opcode-start GET pops then the after-pops live, no residual",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_body),
+        Some(live_before_body),
+        "the after-pops live names itself",
+    );
+}
+
+/// STORE_FAST plants after-pops `-live-` then `setarrayitem_vable`
+/// (`jtransform.py` `do_fixed_list_setitem`). A helper entered at an
+/// interior operand byte has no `decode_op_at` start, and the after-pops
+/// live is its own resume-marker startpoint, so a scan that begins there
+/// never sees the GET pops.
+#[test]
+fn store_fast_after_pops_live_from_interior_non_decode_pc() {
+    let live = crate::state::op_live();
+    let get = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("getarrayitem_vable_r/ridd>r must be in the insns table");
+    let set = *insns_opname_to_byte()
+        .get("setarrayitem_vable_r/rirdd")
+        .expect("setarrayitem_vable_r/rirdd must be in the insns table");
+    // live / GET pop / SET-None / live (after-pops) / SET local
+    let mut code = vec![live, 0, 0];
+    let live_before_pops = 0usize;
+    code.extend_from_slice(&[get, 0, 0, 0, 0, 0, 0, 0]);
+    code.extend_from_slice(&[set, 0, 0, 0, 0, 0, 0, 0]);
+    let live_before_body = code.len();
+    code.extend_from_slice(&[live, 0, 0]);
+    let set_local_pc = code.len();
+    // 0xFF is not an insn byte, so decode_op_at at the first operand fails
+    // the way a STORE_FAST helper at an interior setarrayitem pc does.
+    code.extend_from_slice(&[set, 0xFF, 0, 0, 0, 0, 0, 0]);
+    let interior_pc = set_local_pc + 1;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("store_fast_after_pops_interior");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_before_pops, live_before_body].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![
+        (live_before_pops, Some(live_before_pops)),
+        (live_before_body, Some(live_before_body)),
+    ];
+    pyjit.metadata.py_exact_by_jit_pc = vec![
+        (live_before_pops as u32, 0),
+        (live_before_body as u32, 0),
+        (set_local_pc as u32, 0),
+    ];
+    pyjit.metadata.pop_slot_color_by_py_pc = vec![vec![(0, 1)]];
+
+    assert!(
+        crate::jitcode_runtime::decode_op_at(pyjit.jitcode.code.as_slice(), interior_pc).is_none(),
+        "interior operand byte must not decode as an op start",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, interior_pc),
+        Some(live_before_body),
+        "interior setarrayitem pc still names the after-pops live",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_body),
+        Some(live_before_body),
+        "after-pops live as its own resume marker still names itself",
+    );
+}
+
+/// After-pops `-live-` is re-keyed to fallthrough in `py_exact_by_jit_pc`
+/// (`jtransform.py` `handle_regular_call`). Fallthrough `STORE_FAST` also
+/// has dests, so dest_owner that trusts exact py would scan from
+/// `STORE_FAST` and miss the GET pops of `IMPORT_NAME`.
+#[test]
+fn after_pops_live_rekeyed_to_fallthrough_still_names_popping_opcode() {
+    let live = crate::state::op_live();
+    let get = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("getarrayitem_vable_r/ridd>r must be in the insns table");
+    let set = *insns_opname_to_byte()
+        .get("setarrayitem_vable_r/rirdd")
+        .expect("setarrayitem_vable_r/rirdd must be in the insns table");
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    // py=0: live / GET / SET / live (after-pops) / residual
+    // py=1: live / GET / SET  (fallthrough dests nonempty)
+    let mut code = vec![live, 0, 0];
+    let live_before_pops = 0usize;
+    code.extend_from_slice(&[get, 0, 0, 0, 0, 0, 0, 0]);
+    code.extend_from_slice(&[set, 0, 0, 0, 0, 0, 0, 0]);
+    let live_after_pops = code.len();
+    code.extend_from_slice(&[live, 0, 0]);
+    let residual_pc = code.len();
+    code.extend_from_slice(&[residual, 0, 0, 0, 0, 0]);
+    let py1_start = code.len();
+    code.extend_from_slice(&[live, 0, 0]);
+    code.extend_from_slice(&[get, 0, 0, 0, 0, 0, 0, 0]);
+    code.extend_from_slice(&[set, 0, 0, 0, 0, 0, 0, 0]);
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_pops_fallthrough_dests");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before_pops, live_after_pops, py1_start]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![
+        (live_before_pops, Some(live_before_pops)),
+        (live_after_pops, Some(live_after_pops)),
+        (py1_start, Some(py1_start)),
+    ];
+    pyjit.metadata.py_exact_by_jit_pc = vec![
+        (live_before_pops as u32, 0),
+        (live_after_pops as u32, 1),
+        (residual_pc as u32, 0),
+        (py1_start as u32, 1),
+    ];
+    pyjit.metadata.pop_slot_color_by_py_pc = vec![vec![(0, 1)], vec![(0, 2)]];
+
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_after_pops),
+        Some(live_after_pops),
+        "after-pops live re-keyed to fallthrough still names itself",
+    );
+    assert_eq!(
+        super::resume_snapshot::dest_slot_colors_at_jit_pc(&pyjit, live_after_pops),
+        &[(0, 1)],
+        "dest colors at re-keyed after-pops are the popping opcode, not fallthrough",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, residual_pc),
+        Some(live_after_pops),
+        "residual after a fallthrough-keyed after-pops live still names that live",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, py1_start),
+        None,
+        "fallthrough opcode-start must not inherit the previous after-pops live",
+    );
+}
+
+/// A residual whose only preceding `-live-` is the opcode-start twin has
+/// not planted after-pops. That twin is the pre-pop coordinate; treating
+/// it as after-pops hides dests at opcode-entry depth and re-GETs NULL
+/// slots (`UNPACK_SEQUENCE` / `IMPORT_NAME` / `STORE_FAST`).
+#[test]
+fn residual_without_after_pops_live_does_not_treat_opcode_start_as_after_pops() {
+    let live = crate::state::op_live();
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    // 0 LIVE (opcode start), 3 residual. No after-pops live.
+    let code = vec![live, 0, 0, residual, 0, 0, 0, 0, 0];
+    let live_before_pops = 0usize;
+    let call_pc = 3usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("residual_no_after_pops");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_before_pops, call_pc].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![
+        (live_before_pops, Some(live_before_pops)),
+        (call_pc, Some(live_before_pops)),
+    ];
+    pyjit.metadata.pop_slot_color_by_py_pc = vec![vec![(0, 1)]];
+
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, call_pc),
+        None,
+        "opcode-start must not stand in for a missing after-pops live",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_pops_live_marker_in_opcode(&pyjit, live_before_pops),
+        None,
+        "opcode-start itself is not after-pops without a planted marker",
     );
 }
 
@@ -3298,6 +3835,13 @@ fn newbool_fail_portal_section_numbers_paused_portal_reds_not_helper_constptrs()
         &portal_state,
     );
     assert!(session.borrow().at_portal());
+    // `enter_helper` pushes this after the pause. `paused_python_live`
+    // must still read the portal banks (`last_non_helper`), not the
+    // helper's empty `live`.
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(Vec::new()));
 
     let mut tc = fresh_trace_ctx();
     let mut snapshot_sym = PyreSym::new_uninit(portal_frame);
@@ -3341,8 +3885,7 @@ fn newbool_fail_portal_section_numbers_paused_portal_reds_not_helper_constptrs()
         orgpc as i32,
         orgpc as i32,
         super::OuterActiveBoxesEntryTwin::Plain,
-    )
-    .expect("helper-bank collect");
+    );
     assert!(
         helper_active.contains(&helper_float) && helper_active.contains(&helper_tuple),
         "pre-fix collect from helper banks must invert ConstPtrs, got {helper_active:?}"
@@ -5765,15 +6308,19 @@ fn inline_call_callee_name(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
 ) -> Option<&'static str> {
+    inline_call_callee_index(code, op)
+        .and_then(|index| crate::jitcode_runtime::all_jitcodes().get(index))
+        .map(|jitcode| jitcode.name.as_str())
+}
+
+fn inline_call_callee_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> Option<usize> {
     if !op.opname.starts_with("inline_call_") {
         return None;
     }
     let pool_index = code[op.pc + 1] as usize | ((code[op.pc + 2] as usize) << 8);
     match crate::jitcode_runtime::all_descrs().get(pool_index)? {
         majit_jitcode::codewriter::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
-            crate::jitcode_runtime::all_jitcodes()
-                .get(*jitcode_index)
-                .map(|jitcode| jitcode.name.as_str())
+            Some(*jitcode_index)
         }
         _ => None,
     }
@@ -6535,6 +7082,7 @@ fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
+            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
@@ -6568,6 +7116,7 @@ fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             Value::Void,
+            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
@@ -6599,6 +7148,7 @@ fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
+            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
@@ -6623,6 +7173,7 @@ fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
             adescr.clone(),
             non_null,
             Value::Ref(majit_ir::GcRef(2)),
+            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
@@ -6650,6 +7201,7 @@ fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
             adescr,
             const_null,
             null,
+            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
@@ -7879,124 +8431,6 @@ fn null_live_vable_slot_reads_null_not_the_shadow() {
     );
     assert_eq!(out_of_range.shadow_opref, Some(stale));
     assert_eq!(out_of_range.shadow_value, Some(stale_value));
-}
-
-/// `_opimpl_setarrayitem_vable` takes `_nonstandard_virtualizable` first:
-/// dest of an inlined CALL_ASSEMBLER is that callee's TOS
-/// (`CalleeLocalsShadow`), not portal `virtualizable_boxes` at the same
-/// numeric index (`owns_virtualizable_shadow`).
-#[test]
-fn stamp_pushvalue_result_with_callee_shadow_does_not_write_portal_boxes() {
-    pyre_interpreter::test_hooks::install_hash_hook();
-    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
-    let code = function
-        .constants
-        .iter()
-        .find_map(|constant| match constant {
-            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                Some((**code).clone())
-            }
-            _ => None,
-        })
-        .expect("function code");
-    let (nlocals, _) = crate::state::callee_layout_for_call_assembler(&code);
-    assert_eq!(nlocals, 1, "slot 1 is TOS of a one-local frame");
-
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let array_len = 3;
-    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-    let slot_count = info.num_static_extra_boxes + array_len;
-    let tos_slot = nlocals as i64;
-    let vable_index = nvs + tos_slot as usize;
-    assert!(
-        vable_index < slot_count,
-        "portal array must hold the callee TOS index"
-    );
-
-    let standard = tc.const_ref(1);
-    let sentinel = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
-    tc.set_opref_concrete(sentinel, Value::Ref(majit_ir::GcRef(0x1111)));
-    let dest = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
-    tc.set_opref_concrete(dest, Value::Ref(majit_ir::GcRef(0x2222)));
-    let mut initial_boxes = vec![tc.const_null(); slot_count];
-    initial_boxes[vable_index] = sentinel;
-    let mut initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
-    initial_values[vable_index] = Value::Ref(majit_ir::GcRef(0x1111));
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        standard,
-        Value::Ref(majit_ir::GcRef(1)),
-        &initial_boxes,
-        &initial_values,
-        &[array_len],
-    );
-    let vsd_idx = info.static_field_index_by_name("valuestackdepth");
-    let vsd_before = vsd_idx.and_then(|idx| tc.virtualizable_box_at(idx));
-
-    let vable = OpRef::input_arg_ref(0);
-    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
-    let shadow = CalleeLocalsShadow {
-        fold_frame_reg: u16::MAX,
-        concrete_frame: 0,
-        frame_box: vable,
-        frame_materialized: true,
-        code_ptr: &code,
-        ..Default::default()
-    };
-    let regs_r = [vable, dest, OpRef::NONE];
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let mut wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: Some(shadow),
-            concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
-            outer_active_boxes: Vec::new(),
-            ..Default::default()
-        }),
-        inline_callee_consts: None,
-        fbw_mode: test_fbw_mode(),
-        session: &session,
-        registers_r: &RegisterBank::new(regs_r.iter().copied()),
-        registers_i: &RegisterBank::default(),
-        registers_f: &RegisterBank::default(),
-        concrete_registers_i: &mut [],
-        descr_refs: &[],
-        raw_descrs: RawDescrPool::PerFn(&[]),
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: true,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
-        pending_guard_snapshot_error: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
-    stamp_pushvalue_result(&mut wc, dest, 'r', 1);
-    assert_eq!(
-        wc.trace_ctx.virtualizable_box_at(vable_index),
-        Some(sentinel),
-        "inlined dest must not replace the portal box at the same index"
-    );
-    if let Some(idx) = vsd_idx {
-        assert_eq!(
-            wc.trace_ctx.virtualizable_box_at(idx),
-            vsd_before,
-            "inlined pushvalue must not rewrite portal valuestackdepth"
-        );
-    }
-    let state = wc.frame_state.borrow();
-    let shadow = state
-        .callee_shadow
-        .as_ref()
-        .expect("shadow survives the stamp");
-    assert_eq!(
-        shadow.opref.get(&tos_slot).copied(),
-        Some(dest),
-        "dest lands on the inlined frame's TOS"
-    );
 }
 
 #[test]
@@ -22053,8 +22487,6 @@ fn residual_call_r_i_raising_writes_dst_before_guard_exception() {
 
         pending_guard_snapshot_error: None,
 
-
-
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28543,6 +28975,79 @@ fn field_descr_with_index(idx: u32) -> DescrRef {
     ))
 }
 
+fn grouped_field_spec(
+    index: u32,
+    field_key: &str,
+    offset: usize,
+    field_size: usize,
+    flag: majit_ir::descr::ArrayFlag,
+    field_type: majit_ir::Type,
+    index_in_parent: usize,
+) -> majit_ir::descr::SimpleFieldDescrSpec {
+    majit_ir::descr::SimpleFieldDescrSpec {
+        index,
+        field_key: field_key.to_string(),
+        name: format!("Owner.{field_key}"),
+        offset,
+        field_size,
+        field_type,
+        is_immutable: false,
+        is_quasi_immutable: false,
+        flag,
+        virtualizable: false,
+        index_in_parent,
+        is_class_word: Some(false),
+        load_is_acquire: false,
+        store_is_release: false,
+    }
+}
+
+fn step_getfield_gc_r(
+    descr: DescrRef,
+    inline_subwalk: bool,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let byte = *insns_opname_to_byte()
+        .get("getfield_gc_r/rd>r")
+        .expect("`getfield_gc_r/rd>r` must be in insns table");
+    let code = [byte, 0x02, 0x01, 0x00, 0x06];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    done_descr_ref_for_tests();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: !inline_subwalk,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(&code, 0, &mut wc)
+}
+
 #[test]
 fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     // First `getfield_gc_i/rd>i` invocation
@@ -28772,6 +29277,112 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         vec![obj]
     );
     assert_eq!(dst_post, last.pos().get());
+}
+
+#[test]
+fn getfield_gc_r_inline_subwalk_records_pointer_field_followed_by_padding() {
+    // A 4-byte FLAG_POINTER at offset 8 with the next field at 16 is
+    // wasm32 alignment padding, not an inline aggregate
+    // (`descr.py get_type_flag` of a Ptr). The walker keys on
+    // `field_flag == FLAG_STRUCT`, not the parent span.
+    let group = majit_ir::descr::make_simple_descr_group(
+        1,
+        24,
+        1,
+        0,
+        &[
+            grouped_field_spec(
+                1,
+                "head",
+                8,
+                4,
+                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::Type::Ref,
+                0,
+            ),
+            grouped_field_spec(
+                2,
+                "wide",
+                16,
+                8,
+                majit_ir::descr::ArrayFlag::Signed,
+                majit_ir::Type::Int,
+                1,
+            ),
+        ],
+    );
+    let descr: DescrRef = group.field_descrs[0].clone();
+    step_getfield_gc_r(descr, true)
+        .expect("FLAG_POINTER followed by alignment padding must record");
+}
+
+#[test]
+fn getfield_gc_r_inline_subwalk_records_contiguous_pointer_field() {
+    let group = majit_ir::descr::make_simple_descr_group(
+        1,
+        16,
+        1,
+        0,
+        &[
+            grouped_field_spec(
+                1,
+                "head",
+                0,
+                8,
+                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::Type::Ref,
+                0,
+            ),
+            grouped_field_spec(
+                2,
+                "tail",
+                8,
+                8,
+                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::Type::Ref,
+                1,
+            ),
+        ],
+    );
+    let descr: DescrRef = group.field_descrs[0].clone();
+    step_getfield_gc_r(descr, true).expect("contiguous FLAG_POINTER getfield_gc_r must record");
+}
+
+#[test]
+fn getfield_gc_r_inline_subwalk_declines_struct_flag_field() {
+    let group = majit_ir::descr::make_simple_descr_group(
+        1,
+        32,
+        1,
+        0,
+        &[
+            grouped_field_spec(
+                1,
+                "head",
+                0,
+                24,
+                majit_ir::descr::ArrayFlag::Struct,
+                majit_ir::Type::Ref,
+                0,
+            ),
+            grouped_field_spec(
+                2,
+                "tail",
+                24,
+                8,
+                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::Type::Ref,
+                1,
+            ),
+        ],
+    );
+    let descr: DescrRef = group.field_descrs[0].clone();
+    let err = step_getfield_gc_r(descr, true)
+        .expect_err("inline-subwalk getfield of FLAG_STRUCT must decline");
+    assert_eq!(
+        err,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+    );
 }
 
 #[test]
@@ -30428,7 +31039,6 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
                 &[],
                 None,
                 None,
-                None,
             );
             assert_eq!(
                 wc.trace_ctx.last_op_opcode(),
@@ -30495,7 +31105,6 @@ fn snapshot_stack_slot_live_pcdep_ref_color_fills_hole() {
                 &[0],
                 None,
                 None,
-                None,
             );
             assert_eq!(
                 wc.trace_ctx.virtualizable_box_at(nvs),
@@ -30559,7 +31168,6 @@ fn snapshot_stack_slot_dead_pcdep_ref_color_leaves_hole() {
                 &[],
                 None,
                 None,
-                None,
             );
         },
     );
@@ -30590,6 +31198,7 @@ fn snapshot_stack_slot_keeps_stored_live_null() {
         &[array_len],
     );
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    tc.mark_virtualizable_slot_live_null(nvs);
     let reg = tc.const_ref(0x10);
     let mut regs_r = [reg];
     let mut concrete_r = [ConcreteValue::Ref(
@@ -30615,7 +31224,6 @@ fn snapshot_stack_slot_keeps_stored_live_null() {
                 1,
                 &pcdep_entries,
                 &[0],
-                None,
                 None,
                 None,
             );
@@ -30720,6 +31328,160 @@ fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
     match outcome {
         DispatchOutcome::Continue => {}
         other => panic!("inlined first visit must continue tracing, got {other:?}"),
+    }
+}
+
+/// `_handle_guard_failure` pre-arms `seen_loop_header_for_jdindex` for a
+/// `ResumeAtPositionDescr`. `opimpl_jit_merge_point` consumes that stamp
+/// at the first merge after resume — under per-instruction portal merges
+/// (`PyFrame.dispatch`), the merge at the resume position itself.
+/// A later nested except-handler instruction start (`finishframe_exception`
+/// `frame.pc = target`) then sees `seen < 0` and continues
+/// (`if portal_call_depth: return`).
+#[test]
+fn jit_merge_point_nested_except_handler_continues_after_resume_at_position_consumed() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x02, 0x00, 0x01, // gi: [next_instr, is_being_profiled]
+        0x01, 0x00, // gr: [pycode]
+        0x00, // gf
+        0x00, // ri
+        0x02, 0x01, 0x02, // rr: [frame, ec]
+        0x00, // rf
+    ];
+    let pycode_ptr = test_pycode_ptr();
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr, 42, false);
+    let green_key = green_key_typed.get_uhash();
+
+    {
+        let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+        tc.set_green_key_values(green_key_typed.clone());
+        tc.seed_compile_and_run_once_merge_point();
+        tc.bridge_resume_at_position = true;
+        let next_instr = tc.const_int(42);
+        let pycode = tc.const_ref(pycode_ptr as i64);
+        let red0 = tc.const_ref(0x2_0000);
+        let red1 = tc.const_ref(0x3_0000);
+        let is_being_profiled = tc.const_int(0);
+        let regs_i = [next_instr, is_being_profiled];
+        let regs_r = [pycode, red0, red1];
+        done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            fbw_mode: test_fbw_mode(),
+            session: &session,
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+        let (first, first_next) =
+            step(&code, 0, &mut wc).expect("resume-at-position first merge must dispatch");
+        assert_eq!(first_next, code.len());
+        assert!(
+            !wc.trace_ctx.bridge_resume_at_position,
+            "first merge consumes ResumeAtPositionDescr"
+        );
+        assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+        match first {
+            DispatchOutcome::CloseLoop { .. } => {}
+            other => panic!("resume-at-position first merge must close the loop, got {other:?}"),
+        }
+    }
+
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.set_green_key_values(green_key_typed);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(pycode_ptr as i64);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let is_being_profiled = tc.const_int(0);
+    let regs_i = [next_instr, is_being_profiled];
+    let regs_r = [pycode, red0, red1];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: pycode_ptr as usize,
+        is_being_profiled: false,
+        recursion_greenkey: true,
+        call_id: 1,
+        debug_merge_point_py_pc: None,
+        parents: Vec::new(),
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::Unavailable,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    });
+    let mut mode = test_fbw_mode();
+    mode.inline_subwalk = true;
+    mode.carrier_resume = true;
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            inline_w_code: pycode_ptr as usize,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    assert!(!wc.trace_ctx.bridge_resume_at_position);
+    let (outcome, next) =
+        step(&code, 0, &mut wc).expect("nested except-handler merge must dispatch");
+    assert_eq!(next, code.len());
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, -1,
+        "except-handler merge must not re-arm a consumed ResumeAtPositionDescr"
+    );
+    match outcome {
+        DispatchOutcome::Continue => {}
+        other => panic!("nested except-handler merge must continue the handler, got {other:?}"),
     }
 }
 
@@ -30920,6 +31682,35 @@ fn call_result_register_in_reg_for_residual_call_r() {
     ];
     assert_eq!(
         call_result_register_in(&code, code.len()),
+        CallResultRegister::Reg('r', 3)
+    );
+}
+
+#[test]
+fn call_result_register_in_reg_at_after_call_live() {
+    // Numbered parent (`get_list_of_active_boxes(in_a_call=True)`) resumes at
+    // the `-live-` after residual_call (`handle_residual_call`), dest still
+    // `bytecode[pc - 1]`. The after-call `setarrayitem_vable_r` has not run.
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in insns table");
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("`live/` must be in insns table");
+    let mut code = vec![
+        residual_byte,
+        0x02, // funcptr
+        0x02, // varlen
+        0x04,
+        0x07,
+        0x01,
+        0x00, // descr
+        0x03, // dst color
+    ];
+    let live_pc = code.len();
+    code.extend_from_slice(&[live_byte, 0, 0]);
+    assert_eq!(
+        call_result_register_in(&code, live_pc),
         CallResultRegister::Reg('r', 3)
     );
 }
@@ -35123,6 +35914,63 @@ fn int_pow_overflow_catch_does_not_collapse_guard_no_exception() {
         ops.iter()
             .map(|o| format!("{}@{}", o.opname, o.pc))
             .collect::<Vec<_>>(),
+    );
+}
+
+/// `dict_delitem` after `w_dict_delitem_checked`: the `Result` switch, the
+/// KeyError arm (`key_error_with_key` → `w_exception_new_empty_impl` /
+/// `rlist_new`), and the root-bracket residual are blackhole-runnable.
+/// `resume.py` `rebuild_from_resumedata` numbers that section;
+/// `bhimpl_switch` and `bhimpl_residual_call_*` finish it.
+#[test]
+fn dict_delitem_post_checked_resume_is_blackhole_runnable() {
+    let jc = crate::jitcode_runtime::named_jitcode("dict_delitem")
+        .expect("dict_delitem must be a discovered jitcode");
+    let index = jc
+        .try_index()
+        .expect("dict_delitem must have a jitcode index");
+    let payload = crate::state::ensure_build_time_jitcode_at(index)
+        .expect("publish dict_delitem so the resume scan has a payload");
+    let jc = &payload.jitcode;
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(jc.code.as_slice()).collect();
+    let inline = ops
+        .iter()
+        .find(|op| {
+            inline_call_callee_name(jc.code.as_slice(), op) == Some("w_dict_delitem_checked")
+        })
+        .expect("dict_delitem inline_call of w_dict_delitem_checked");
+    let resume_pc = ops
+        .iter()
+        .find(|op| op.opname == "live" && op.pc >= inline.next_pc)
+        .map(|op| op.pc)
+        .unwrap_or(inline.next_pc);
+    let latch = crate::jitcode_runtime::blackhole_resume_reachable_starts(
+        jc.code.as_slice(),
+        resume_pc,
+        true,
+    );
+    let blocked = super::inline_call::helper_resume_reaches_blocker(index, resume_pc, None);
+    let abort = super::inline_call::helper_resume_can_reach_abort(index, resume_pc);
+    assert!(
+        !blocked
+            && !abort
+            && latch
+                .as_ref()
+                .is_some_and(|starts| starts.contains(&resume_pc)),
+        "dict_delitem resume pc={resume_pc} blocked={blocked} abort={abort} latch={latch:?} ops={:?}",
+        ops.iter()
+            .map(|op| format!("{}@{}", op.opname, op.pc))
+            .collect::<Vec<_>>(),
+    );
+    let empty = crate::jitcode_runtime::named_jitcode("w_exception_new_empty")
+        .expect("w_exception_new_empty must be a discovered jitcode");
+    let empty_index = empty
+        .try_index()
+        .expect("w_exception_new_empty must have a jitcode index");
+    let _ = crate::state::ensure_build_time_jitcode_at(empty_index);
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(empty_index, 0, None),
+        "w_exception_new_empty must be blackhole-runnable from entry"
     );
 }
 

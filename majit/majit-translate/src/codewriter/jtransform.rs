@@ -22645,7 +22645,6 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        
             &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1, "GCREF is not a nested struct");
@@ -27579,7 +27578,10 @@ mod tests {
                 graph.startblock,
                 OpKind::FieldRead {
                     base: alias_var,
-                    field: FieldDescriptor::new("method_run", Some("Handler::{vtable}".to_string())),
+                    field: FieldDescriptor::new(
+                        "method_run",
+                        Some("Handler::{vtable}".to_string()),
+                    ),
                     ty: ValueType::Int,
                     pure: true,
                 },
@@ -48585,6 +48587,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "__pos_0".to_string(),
                     offset: 0,
@@ -48657,6 +48660,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "word".to_string(),
                     offset: 0,

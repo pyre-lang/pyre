@@ -68,26 +68,11 @@ class AbstractCachedEntry(object):
         """returns MUST_ALIAS, CANNOT_ALIAS, UNKNOWN_ALIAS """
         if opinfo1.same_info(opinfo2):
             return MUST_ALIAS
-        if self._cannot_alias_via_constants(opinfo1, opinfo2) == CANNOT_ALIAS:
-            return CANNOT_ALIAS
         if self._cannot_alias_via_classes_or_lengths(optheap, opinfo1, opinfo2) == CANNOT_ALIAS:
             return CANNOT_ALIAS
         if self._cannot_alias_via_content(optheap, opinfo1, opinfo2) == CANNOT_ALIAS:
             return CANNOT_ALIAS
         return UNKNOWN_ALIAS
-
-    def _cannot_alias_via_constants(self, opinfo1, opinfo2):
-        # Two constant pointers are two addresses fixed at trace time, so
-        # unless they are the same constant they are different objects.
-        # same_info() has already answered MUST_ALIAS for the equal case by
-        # the time we get here, so being constant on both sides is enough.
-        # Unlike the two helpers below this one does not depend on what is
-        # cached, so it is shared by fields and array items alike.
-        if not isinstance(opinfo1, info.ConstPtrInfo):
-            return UNKNOWN_ALIAS
-        if not isinstance(opinfo2, info.ConstPtrInfo):
-            return UNKNOWN_ALIAS
-        return CANNOT_ALIAS
 
     def do_setfield(self, optheap, op):
         # Update the state with the SETFIELD_GC/SETARRAYITEM_GC operation 'op'.

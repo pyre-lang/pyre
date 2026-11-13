@@ -1585,7 +1585,7 @@ pub fn rlist_size_descr() -> DescrRef {
 /// before `register_unresolved_struct_tids` (`descr.py` `get_size_descr` /
 /// `gc.py` `init_size_descr`). The mint tid is the truncated cache key
 /// (`struct_tid_is_unresolved`); the census stamps a dense collector tid
-/// whose `TypeInfo` is size 16 with gc-pointer offset `[0]`.
+/// whose `TypeInfo` is two words with gc-pointer offset `[0]`.
 static INTERIOR_PTR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let cache_key = majit_ir::descr::path_hash("Interior");
     build_bare_gcstruct_descr_group(
@@ -1593,7 +1593,7 @@ static INTERIOR_PTR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         cache_key as u32,
         &[
             ("ptr", 0, WORD, Type::Ref, false, false, false),
-            ("index", WORD, 8, Type::Int, true, false, false),
+            ("index", WORD, WORD, Type::Int, true, false, false),
         ],
         "Interior",
     )
@@ -15999,6 +15999,7 @@ mod tests {
                     owner: owner.to_string(),
                     is_gc_managed: size.is_gc_managed(),
                     headerless: size.headerless(),
+                    is_immutable: size.is_immutable(),
                     all_fielddescrs: bh_field_specs_from_size_descr(size),
                 })
             })

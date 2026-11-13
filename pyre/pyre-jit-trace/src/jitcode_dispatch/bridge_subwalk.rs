@@ -946,8 +946,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         root_liveness_word,
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
-    )
-    .ok()?;
+    );
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to
     // the guard. Each bank skips the call-result color for the same reason it
@@ -990,7 +989,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // `setup_bridge_sym` decoded. Null refs and unboxed boxes stay. The
     // result slot is still overwritten when the stack image is captured.
     // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
-    // re-running the root CALL is not a resume of this frame.
+    // re-running the root CALL is not a resume of this frame. `resume_pc`
+    // is `MIFrame.pc`.
     let stack_regs = root_sym.registers_r();
     let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
     let call_stack_overrides = (root_sym.nlocals()..stack_end)
@@ -1050,7 +1050,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         } else {
             return None;
         };
-    // The recipe word is the post-call resume pc.
     // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
     // pc (`setup_resume_at_op`) whichever call op it paused after.
     let resume_marker_jit_pc = pjc
@@ -1058,6 +1057,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         .can_decode_live_vars(entry, crate::state::op_live())
         .then_some(entry);
 
+    // The recipe word is the post-call resume pc.
     // Bind this paused parent's frame and ec, recorded while the framestack
     // was rebuilt, so the paused-frame snapshot resolves the portal reds
     // [frame, ec] (`interp_jit.py`) to those boxes rather than reading the
@@ -1721,6 +1721,12 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_f[num_regs_f + i] = ctx.const_float(v);
     }
     if argboxes_r.len() > num_regs_r {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[bridge-setup] InlineCallArityMismatch entry={entry} provided={} callee_num_regs_r={num_regs_r}",
+                argboxes_r.len(),
+            );
+        }
         return Some(Err(DispatchError::InlineCallArityMismatch {
             pc: entry,
             provided: argboxes_r.len(),
@@ -1821,17 +1827,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // carrier aborts every descr operand (`DescrIndexOutOfRange { len: 0 }`).
     let uses_global_descr_pool =
         callee_pjc.jitcode.uses_global_descr_pool() || callee_pjc.code_ptr.is_null();
-    let global_descrs = crate::jitcode_runtime::descr_ref_table();
-    let descr_refs: &dyn DescrRefTable = if uses_global_descr_pool {
-        global_descrs
-    } else {
-        &perfn_descr_refs
-    };
-    let raw_descrs = if uses_global_descr_pool {
-        RawDescrPool::Global
-    } else {
-        RawDescrPool::PerFn(perfn_descrs)
-    };
     let lookup_ref: &SubJitCodeLookup = if uses_global_descr_pool {
         &GLOBAL_SUB_JITCODE_LOOKUP_FN
     } else {
@@ -1855,7 +1850,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     if callee_w_code == 0 && !callee_pjc.code_ptr.is_null() {
         return None;
     }
-    let is_helper = callee_w_code == 0 && callee_pjc.code_ptr.is_null();
 
     // Deepest recipe only (`child_result` is the middle `finishframe`
     // path; `handler_entry` is an already-routed ChangeFrame). A paused
@@ -2237,6 +2231,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 if let Err(error) =
                     record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
                 {
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[bridge-setup] handler traceback variant={} pc={} entry={entry} catch_target={catch_target}",
+                            error.variant_name(),
+                            error.stop_pc(),
+                        );
+                    }
                     drop(bank_guard);
                     return Some(Err(error));
                 }

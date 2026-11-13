@@ -8476,7 +8476,7 @@ x = 7
         crate::typedef::init_typeobjects();
         let _ = crate::baseobjspace::ensure_space_builtin();
         let code = crate::compile_exec("x = 1\n").expect("compile");
-        let w_code = crate::pycode::box_code_constant(&code);
+        let w_code = crate::pycode::box_code_constant(&code).expect("code constant");
         let globals = pyre_object::w_dict_new();
         let frame = super::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
             .expect("frame");

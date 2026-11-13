@@ -413,7 +413,26 @@ fn lower_substituted_entries_item_ptr() -> crate::model::FunctionGraph {
     )
     .expect("substituted entries_item_ptr body");
     let context = super::LowerContext::new(&llbc);
-    let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+    // Rows alone leave `gc_struct_ids` empty, so the header is not a
+    // declared `GcArray` and the item arm never runs. `*mut PyObject` is
+    // `OBJECTPTR` only when `class_identity` names the pointee
+    // (`field_row_lltype`); without it the item `Struct` is not built
+    // and the cast stays the 1-arg form.
+    let mut struct_fields = context.struct_field_registry();
+    let pointee_root = "pyobject::PyObject";
+    let identity = crate::front::semantic::ClassIdentity {
+        id: majit_ir::descr::StructId::from_canonical(pointee_root),
+        spelling: pointee_root.to_string(),
+    };
+    for key in [
+        "PyObject",
+        "pyobject::PyObject",
+        "pyre_object::pyobject::PyObject",
+    ] {
+        struct_fields
+            .class_identity
+            .insert(key.to_string(), Some(identity.clone()));
+    }
     let accum = super::AccumulatorFacts::build(&llbc, &body);
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -426,6 +445,7 @@ fn lower_substituted_entries_item_ptr() -> crate::model::FunctionGraph {
         None,
         &context.struct_field_attrs,
         &struct_fields,
+        Default::default(),
         &context.dont_look_inside,
         &std::collections::HashSet::new(),
         &context.tombstoned_leaves,
@@ -440,6 +460,8 @@ fn lower_substituted_entries_item_ptr() -> crate::model::FunctionGraph {
         None,
         None,
         None,
+        None,
+        &context.func_hints,
     )
     .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"))
 }
@@ -8611,7 +8633,10 @@ fn set_strategy_add_dynamic_does_not_rewrite_the_trampoline_to_itself() {
         .collect();
     assert_eq!(
         trampoline_indirect,
-        vec![("SetStrategy".to_string(), "add".to_string())],
+        vec![crate::model::IndirectFamilyKey::dyn_trait(
+            "SetStrategy",
+            "add"
+        )],
         "trampoline body keeps unknown-graph IndirectCall: {trampoline_indirect:?}"
     );
     let trampoline_self_calls: Vec<_> = trampoline
@@ -21606,7 +21631,6 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         &HashMap::new(),
         &HashMap::new(),
         &HashSet::new(),
-    
         &std::collections::HashMap::new(),
     );
     let word = crate::layout::target_word_size();
@@ -39748,7 +39772,7 @@ fn array_tail_item_ptr_cast_returns_int_kind() {
     let impl_row = serde_json::json!({
         "impl_trait": {
             "id": 0,
-            "generics": {"types": [{"Value": [0, e_adt]}]}
+            "generics": {"types": [{"Value": [0, arr_adt]}]}
         }
     });
     let llbc = llbc_with_types_traits(
@@ -42483,6 +42507,74 @@ fn closure_env_cell_address_field_descr_is_int_kinded() {
             "cell-address field layout {layout} must be FLAG_UNSIGNED"
         );
     }
+}
+
+/// Shared `&usize` capture: FORCE-attr already peels to Unsigned
+/// (`adt_field_read_peels_shared_borrow_of_usize_to_unsigned`). The
+/// published layout must intern Int too, or `get_type_flag("&usize")`
+/// is FLAG_POINTER and `do_setfield_gc` skips the store.
+#[test]
+fn closure_env_shared_usize_capture_layout_is_int_kinded() {
+    use majit_ir::descr::ArrayFlag;
+    use majit_ir::value::Type;
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let ref_usize = serde_json::json!({"Ref": [null, usize_ty, "Shared"]});
+    let env = interior_closure_env(0, "EnvUsize", &[("n", ref_usize.clone())], 1);
+    let ordinary = interior_struct(
+        1,
+        &["fixture", "Holder"],
+        &[("n", ref_usize.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![env, ordinary], vec![]);
+    let empty_ids = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let empty_names = std::collections::HashSet::<String>::new();
+    let env_td = llbc.type_by_id(0).expect("closure env");
+    let env_fields = super::type_decl_struct_fields(env_td, &llbc).expect("env fields");
+    let env_field = env_fields.first().expect("env field");
+    let env_layout = super::published_struct_field_layout(
+        env_td.item_meta.name_path_str(),
+        env_field.name.as_deref().unwrap_or("n"),
+        &env_field.ty,
+        true,
+        &llbc,
+        &empty_ids,
+        &empty_names,
+        &empty_names,
+    );
+    let (env_flag, env_ty, _) = crate::codewriter::call::get_type_flag(&env_layout, &empty_names);
+    assert_eq!(env_layout, "usize", "closure-env &usize layout is the word");
+    assert_eq!(env_ty, Type::Int, "closure-env &usize intern is Int");
+    assert_eq!(
+        env_flag,
+        ArrayFlag::Unsigned,
+        "closure-env &usize intern is FLAG_UNSIGNED"
+    );
+    let holder_td = llbc.type_by_id(1).expect("ordinary holder");
+    let holder_fields = super::type_decl_struct_fields(holder_td, &llbc).expect("holder fields");
+    let holder_field = holder_fields.first().expect("holder field");
+    let holder_layout = super::published_struct_field_layout(
+        holder_td.item_meta.name_path_str(),
+        holder_field.name.as_deref().unwrap_or("n"),
+        &holder_field.ty,
+        false,
+        &llbc,
+        &empty_ids,
+        &empty_names,
+        &empty_names,
+    );
+    let (_, holder_ty, _) = crate::codewriter::call::get_type_flag(&holder_layout, &empty_names);
+    assert!(
+        holder_layout.starts_with('&'),
+        "ordinary struct &usize stays a pointer spelling, got {holder_layout}"
+    );
+    assert_eq!(
+        holder_ty,
+        Type::Ref,
+        "ordinary struct &usize intern stays Ref"
+    );
 }
 
 /// Nested closure capturing `&mut *(*outer_env).flag`. The reborrow is
@@ -49270,6 +49362,66 @@ fn interior_ptr_real_entry_at_and_lookup() {
         interior_reads.contains(&"f_hash") && interior_reads.contains(&"key"),
         "lookup must getinteriorfield f_hash/key; interior={interior_reads:?}"
     );
+}
+
+/// `dict_entries_value_at` is `ll_dict_getitem`'s `d.entries[i].value`.
+/// ObjectKey `get_slot` getattr of `value` is InteriorPtr of the
+/// instantiated `DICTENTRYARRAY` (`get_ll_dict`), not the one-word-key
+/// template. Template value offset 16 is `f_valid` on the 40-byte Entry.
+#[test]
+fn objectkey_get_slot_value_uses_instantiated_entry_array() {
+    let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&object),
+        crate::HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict", "rordereddict_entries"],
+        &["dict_entries_value_at"],
+    )
+    .expect("lower dict_entries_value_at");
+    let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let slots: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("get_slot__spec_ObjectKey"))
+        .collect();
+    assert!(
+        !slots.is_empty(),
+        "expected ObjectKey get_slot spec, got {names:?}"
+    );
+    for spec in &slots {
+        let value_arrays: Vec<_> = spec
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead {
+                    field,
+                    array_type_id,
+                    ..
+                } if field.name == "value" => array_type_id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !value_arrays.is_empty(),
+            "{} must getinteriorfield value, ops {:?}",
+            spec.name,
+            spec.graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .map(|op| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        for atid in &value_arrays {
+            assert!(
+                atid.contains("ObjectKey") && atid.contains("Entry<"),
+                "{} value ARRAY is DICTENTRYARRAY of ObjectKey, got {atid}",
+                spec.name
+            );
+        }
+    }
 }
 
 /// `&mut *p.add(i)` then a field store is `InteriorPtrRepr.rtype_setattr`
