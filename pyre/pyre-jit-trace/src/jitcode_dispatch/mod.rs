@@ -8978,6 +8978,18 @@ pub(crate) struct GuardCaptureScope {
     /// `_invoke_execute_frame`). The pending slot is the portal return.
     pub send_ex_assembler: Option<(OpRef, OpRef)>,
 
+    /// Operator-tail residual after the inlined dunder has returned: snapshot
+    /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` at the tail's after-call
+    /// `-live-` (empty live) so a raise of the tail helper
+    /// (`descroperation.py` `len` after `_len`: `index` then
+    /// `_check_len_result`) resumes there instead of at the caller's CALL,
+    /// which would re-enter the dunder. The caller is the rooted
+    /// `InlineParentFrame` taken before `InlineFrameGuard` dropped.
+    pub operator_tail_after_call: Option<(
+        crate::operator_continuation::OperatorTail,
+        InlineParentFrame,
+    )>,
+
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
     /// `_nonstandard_virtualizable` (pyjitpl.py) emits its promote

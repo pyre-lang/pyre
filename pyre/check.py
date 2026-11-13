@@ -3945,16 +3945,30 @@ def _jitstats_specific_path(source, backend):
     return source.with_name(f"{source.stem}.{backend}.jitstats")
 
 
-def _jitstats_texts_match(a, b):
+def _jitstats_texts_match(a, b, bands=None):
     """True when two baselines are the same snapshot under the gate.
 
     `_jit_stats_change` reads a field missing from either side as 0, so a
-    printed zero and an omitted key record one baseline. Merging keeps a
-    single file for that case.
+    printed zero and an omitted key record one baseline. A move the gate
+    would band is the same snapshot. Merging keeps a single file for that
+    case.
     """
+    bands = bands or {}
     left, right = _parse_jit_stats(a), _parse_jit_stats(b)
     keys = set(left) | set(right)
-    return all(left.get(key, "0") == right.get(key, "0") for key in keys)
+    for key in keys:
+        old, new = left.get(key, "0"), right.get(key, "0")
+        if old == new:
+            continue
+        if key not in bands:
+            return False
+        try:
+            old_int, new_int = int(old), int(new)
+        except ValueError:
+            return False
+        if abs(old_int - new_int) > bands[key]:
+            return False
+    return True
 
 
 def _jitstats_overlay_path(source, backend):
@@ -4019,16 +4033,22 @@ def rewrite_jitstats_baselines(script, contents):
     backend has no baseline. Callers omit backends they are not placing.
     At least two backends whose texts gate as equal share
     `<stem>.jitstats`. A backend that disagrees keeps
-    `<stem>.<backend>.jitstats`. Platform overlays are left alone.
+    `<stem>.<backend>.jitstats`. Texts that differ only by a move the
+    fixture's jitstats-band would absorb still gate as equal. Platform
+    overlays are left alone.
     """
     source = Path(script)
     shared_path = _jitstats_shared_path(source)
+    try:
+        bands = synth_jitstats_bands(script)
+    except FileNotFoundError:
+        bands = {}
     clusters = []
     for backend, text in contents.items():
         if text is None:
             continue
         for cluster in clusters:
-            if _jitstats_texts_match(cluster[0][1], text):
+            if _jitstats_texts_match(cluster[0][1], text, bands):
                 cluster.append((backend, text))
                 break
         else:

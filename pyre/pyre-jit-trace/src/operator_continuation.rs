@@ -323,15 +323,18 @@ pub extern "C" fn bh_binop_last_tail(
 }
 
 thread_local! {
-    static LEVELS: std::cell::RefCell<[Option<Option<(i32, usize)>>; OperatorTail::ALL.len()]> =
+    static LEVELS: std::cell::RefCell<[Option<Option<(i32, usize, usize)>>; OperatorTail::ALL.len()]> =
         const { std::cell::RefCell::new([None; OperatorTail::ALL.len()]) };
 }
 
-/// `(jitcode index, resume pc)` of `tail`'s shared level, built on first use.
+/// `(jitcode index, resume pc, after-call live pc)` of `tail`'s shared level,
+/// built on first use.
 ///
 /// Thread-local because `MetaInterpStaticData` is: the index it hands back
-/// names a slot in this thread's `jitcodes`.
-fn level(tail: OperatorTail) -> Option<(i32, usize)> {
+/// names a slot in this thread's `jitcodes`. The third word is the residual's
+/// exception-guard `-live-` (empty live), the coordinate a raising
+/// `bh_len_tail` resumes at.
+fn level(tail: OperatorTail) -> Option<(i32, usize, usize)> {
     if let Some(cached) = LEVELS.with(|cell| cell.borrow()[tail.slot()]) {
         return cached;
     }
@@ -345,12 +348,17 @@ fn level(tail: OperatorTail) -> Option<(i32, usize)> {
 
 /// The jitcode index of `tail`'s level, or `None` when it could not be built.
 pub(crate) fn jitcode_index(tail: OperatorTail) -> Option<i32> {
-    level(tail).map(|(index, _)| index)
+    level(tail).map(|(index, _, _)| index)
 }
 
 /// The byte offset `tail`'s resume section must name.
 pub(crate) fn resume_pc(tail: OperatorTail) -> Option<usize> {
-    level(tail).map(|(_, pc)| pc)
+    level(tail).map(|(_, pc, _)| pc)
+}
+
+/// The residual's exception-guard `-live-`, immediately after the tail helper.
+pub(crate) fn after_call_pc(tail: OperatorTail) -> Option<usize> {
+    level(tail).map(|(_, _, pc)| pc)
 }
 
 /// Whether `index` names an installed level, WITHOUT building one.
@@ -364,11 +372,11 @@ pub(crate) fn is_installed_level(index: i32) -> bool {
     LEVELS.with(|cell| {
         cell.borrow()
             .iter()
-            .any(|slot| matches!(slot, Some(Some((installed, _))) if *installed == index))
+            .any(|slot| matches!(slot, Some(Some((installed, _, _))) if *installed == index))
     })
 }
 
-fn build(tail: OperatorTail) -> Option<(i32, usize)> {
+fn build(tail: OperatorTail) -> Option<(i32, usize, usize)> {
     let mut builder = JitCodeBuilder::new();
     builder.set_name(tail.name());
 
@@ -439,21 +447,25 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
         result_type,
         ..Default::default()
     };
-    match result_type {
+    let after_call_pc = match result_type {
         'r' => {
             builder.residual_call_ref_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
+            let after_call_pc = builder.current_pos();
             let after_call = builder.live_placeholder();
             builder.patch_live_offset(after_call, live_empty);
             builder.ref_return(ANSWER_REG);
+            after_call_pc
         }
         'i' => {
             builder.residual_call_int_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
+            let after_call_pc = builder.current_pos();
             let after_call = builder.live_placeholder();
             builder.patch_live_offset(after_call, live_empty);
             builder.int_return(ANSWER_REG);
+            after_call_pc
         }
         _ => return None,
-    }
+    };
 
     // `try_finish` carries the builder's own `startpoints`, which every emit
     // helper above has already populated through `start_instr`.  The set is
@@ -469,7 +481,7 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
         /* has_abort */ false,
     ));
     let index = crate::state::install_codeless_jitcode(payload);
-    Some((index, resume_pc))
+    Some((index, resume_pc, after_call_pc))
 }
 
 #[cfg(test)]
@@ -481,7 +493,7 @@ mod tests {
     #[test]
     fn every_anchor_sits_behind_its_inline_call_return_tail() {
         for tail in OperatorTail::ALL {
-            let Some((index, resume_pc)) = level(tail) else {
+            let Some((index, resume_pc, after_call_pc)) = level(tail) else {
                 continue;
             };
             let payload = crate::state::pyjitcode_for_jitcode_index(index)
@@ -501,6 +513,15 @@ mod tests {
                 crate::state::op_live(),
                 "{tail:?}: the resume position must be the `-live-` anchor itself",
             );
+            assert!(
+                after_call_pc > resume_pc,
+                "{tail:?}: the residual's exception-guard `-live-` follows resume",
+            );
+            assert_eq!(
+                code[after_call_pc],
+                crate::state::op_live(),
+                "{tail:?}: the after-call position must be the residual's `-live-`",
+            );
             let startpoints = payload
                 .jitcode
                 .startpoints
@@ -509,6 +530,10 @@ mod tests {
             assert!(
                 startpoints.contains(&resume_pc),
                 "{tail:?}: the anchor must be addressable as a resume coordinate",
+            );
+            assert!(
+                startpoints.contains(&after_call_pc),
+                "{tail:?}: the after-call `-live-` must be addressable as a resume coordinate",
             );
             // `run_inner` asserts membership on every dispatched position,
             // not only the entry one: `inline_call`, `-live-`,
@@ -528,7 +553,7 @@ mod tests {
     #[test]
     fn every_anchor_resolves_as_an_ordinary_parent_resume_coordinate() {
         for tail in OperatorTail::ALL {
-            let Some((index, resume_pc)) = level(tail) else {
+            let Some((index, resume_pc, after_call_pc)) = level(tail) else {
                 continue;
             };
             let payload = crate::state::pyjitcode_for_jitcode_index(index)
@@ -545,6 +570,20 @@ mod tests {
                 Some(resume_pc),
                 "{tail:?}: the parent loop must resolve the anchor to itself",
             );
+            assert!(
+                payload
+                    .jitcode
+                    .can_decode_live_vars(after_call_pc, crate::state::op_live()),
+                "{tail:?}: the after-call `-live-` must decode its live vars",
+            );
+            assert_eq!(
+                payload.resolve_resume_pc_with_jitcode_pc(
+                    after_call_pc as i32,
+                    crate::state::op_live()
+                ),
+                Some(after_call_pc),
+                "{tail:?}: the parent loop must resolve the after-call `-live-` to itself",
+            );
         }
     }
 
@@ -558,7 +597,7 @@ mod tests {
         for tail in OperatorTail::ALL {
             let expected = crate::state::intern_liveness(&[], resume_live_r(tail), &[])
                 .expect("resume liveness interned") as usize;
-            let Some((index, resume_pc)) = level(tail) else {
+            let Some((index, resume_pc, _)) = level(tail) else {
                 continue;
             };
             let payload = crate::state::pyjitcode_for_jitcode_index(index)

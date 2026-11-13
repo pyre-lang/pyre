@@ -9499,34 +9499,61 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     value: OpRef,
     receiver: OpRef,
 ) -> Result<OperatorTailResidual, DispatchError> {
-    let _value_pin = match ctx.trace_ctx.concrete_of_opref(value) {
-        Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
-        _ => None,
-    };
-    let _receiver_pin = match ctx.trace_ctx.concrete_of_opref(receiver) {
-        Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
-        _ => None,
-    };
+    record_operator_tail_residual_inner(ctx, op, dst, dst_bank, tail, &[value, receiver], None)
+}
+
+/// One-arg sibling of [`record_operator_tail_residual`]: `bh_len_tail` on the
+/// dunder result (`descroperation.py` `len` after `_len`: `index` then
+/// `_check_len_result`). Exception guards resume at the tail's after-call
+/// `-live-`.
+pub(crate) fn record_operator_tail_residual_r<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    tail: crate::operator_continuation::OperatorTail,
+    value: OpRef,
+    caller: &InlineParentFrame,
+) -> Result<OperatorTailResidual, DispatchError> {
+    record_operator_tail_residual_inner(ctx, op, dst, dst_bank, tail, &[value], Some(caller))
+}
+
+fn record_operator_tail_residual_inner<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    tail: crate::operator_continuation::OperatorTail,
+    args: &[OpRef],
+    after_call: Option<&InlineParentFrame>,
+) -> Result<OperatorTailResidual, DispatchError> {
+    let _pins: Vec<_> = args
+        .iter()
+        .filter_map(|&arg| match ctx.trace_ctx.concrete_of_opref(arg) {
+            Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
+            _ => None,
+        })
+        .collect();
     let funcptr = ctx.trace_ctx.const_int(tail.tail_call().0);
     // `call.py getcalldescr`: an initializer is an arbitrary Python call,
     // so the TypeCallNew tail gets the most general effects (it may force
     // frames, write any field and invalidate quasi-immutables). The
-    // BinopLast tail only raises the unsupported-operand TypeError.
+    // BinopLast tail only raises the unsupported-operand TypeError. Len
+    // is the same CanRaise as BinopLast: `index` / `_check_len_result`.
     let ei = match tail {
         crate::operator_continuation::OperatorTail::TypeCallNew => {
             majit_ir::EffectInfo::MOST_GENERAL
         }
         _ => majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
     };
-    let descr = majit_metainterp::make_call_descr_with_effect(
-        &[Type::Ref, Type::Ref],
-        Type::Ref,
-        ei.clone(),
-    );
+    let arg_types: Vec<Type> = vec![Type::Ref; args.len()];
+    let descr = majit_metainterp::make_call_descr_with_effect(&arg_types, Type::Ref, ei.clone());
     let call_descr = descr
         .as_call_descr()
         .expect("make_call_descr_with_effect returns a CallDescr");
-    let allboxes = [funcptr, value, receiver];
+    let mut allboxes = Vec::with_capacity(1 + args.len());
+    allboxes.push(funcptr);
+    allboxes.extend_from_slice(args);
     let (call_opcode, can_raise, emit_guard_not_forced) =
         select_residual_call_opcode(&ei, dst_bank, "record_operator_tail_residual");
     // A call the executor refuses up front never runs; leave the tail to the
@@ -9553,7 +9580,7 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         &ei,
         dst,
         dst_bank,
-        &[value, receiver],
+        args,
         false,
     )?;
     ctx.live_after_jit_pc = op.next_pc;
@@ -9561,8 +9588,16 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
+    let after_call_scope = after_call.map(|caller| GuardCaptureScope {
+        operator_tail_after_call: Some((tail, caller.clone())),
+        ..GuardCaptureScope::default()
+    });
     if recorded_residual.raised {
-        walker_record_guard_exception(ctx, op.pc)?;
+        if let Some(scope) = after_call_scope {
+            walker_record_guard_exception_scoped(ctx, op.pc, scope)?;
+        } else {
+            walker_record_guard_exception(ctx, op.pc)?;
+        }
         let exc = ctx
             .last_exc_value()
             .expect("resid_raised implies last_exc_value seeded by the Err branch");
@@ -9577,10 +9612,10 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard_scoped(
             ctx,
             op.pc,
-            GuardCaptureScope {
+            after_call_scope.unwrap_or(GuardCaptureScope {
                 residual_call_catch_resume: true,
                 ..GuardCaptureScope::default()
-            },
+            }),
         )?;
     }
     Ok(OperatorTailResidual::Returned(recorded_residual.recorded))

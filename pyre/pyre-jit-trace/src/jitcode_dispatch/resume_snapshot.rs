@@ -625,6 +625,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if let Some((generator, pending)) = scope.send_ex_assembler {
         return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
     }
+    if let Some((tail, caller)) = scope.operator_tail_after_call {
+        return walker_capture_operator_tail_after_call_guard(ctx, op_pc, tail, caller);
+    }
     let ops_at_guard = ctx.trace_ctx.num_recorded_ops();
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py generate_guard` + `capture_resumedata`):
@@ -2011,6 +2014,8 @@ fn caller_operand_slots<Sym: WalkSym>(
         pyre_interpreter::Instruction::MapAdd { .. } => 2,
         // `[a, b]`. `is_op` pops b then a.
         pyre_interpreter::Instruction::IsOp { .. } => 2,
+        // `[needle, haystack]`. `contains_op` pops the haystack then the needle.
+        pyre_interpreter::Instruction::ContainsOp { .. } => 2,
         // `[obj, index]`. `delete_subscript` pops index then obj.
         pyre_interpreter::Instruction::DeleteSubscr => 2,
         // `[value]`. `opcode_unary_negative` / `unary_not` / `unary_invert`
@@ -3755,6 +3760,41 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
     let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
     walker_capture_assembler_continuation_guard(ctx, op_pc, tail, caller)
+}
+
+/// Operator-tail residual after the inlined dunder has returned: the tail's
+/// after-call `-live-` is empty, so a failing `GUARD_NO_EXCEPTION` /
+/// `GUARD_EXCEPTION` carries the exception and the blackhole continues from
+/// that coordinate (`descroperation.py` `len` after `_len`: `index` then
+/// `_check_len_result`). Resume at the first `-live-` would re-run the tail
+/// helper; resume at the caller's CALL would re-enter the dunder.
+fn walker_capture_operator_tail_after_call_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    tail: crate::operator_continuation::OperatorTail,
+    mut caller: InlineParentFrame,
+) -> Result<(), DispatchError> {
+    let after_call = crate::operator_continuation::after_call_pc(tail)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    let mut tail_frame = super::operator_continuation_parent_frame(tail, None)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    tail_frame.resume_pc = Some(after_call);
+    tail_frame.resume_coord = ParentResumeCoord::Backxlat(after_call);
+    tail_frame.resume_marker_jit_pc = Some(after_call);
+    tail_frame.boxes.clear();
+    tail_frame.result_slot = call_result_slot(tail_frame.jitcode_index, after_call, 0);
+    refresh_paused_parent_blackhole(&mut caller);
+    let mut parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    parent_frames.push(caller);
+    parent_frames.push(tail_frame);
+    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
 }
 
 /// `generator.py GeneratorOrCoroutine._send_ex` after `_invoke_execute_frame`:

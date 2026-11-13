@@ -10035,27 +10035,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fresh_debugdata,
         );
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
-    // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
-    // A seeded frame already exists here, and a walk abort converts through
-    // `convert_and_run_from_pyjitpl` (`blackhole.py`). A callee's own
-    // FOR_ITER items are keyed by its frame (`InflightForiterOwner`), so a
-    // callee that loops, or re-enters the caller's code, keeps them apart
-    // from the caller's. The remaining term is unported OTHER: the
-    // constant-callable screen. That screen pins `Function.code`
-    // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
-    // unwraps — not function identity, so a fresh lambda with one code
-    // object is admitted the same way a closure is.
+    // `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) pushes an MIFrame
+    // for every callee that admits; `_opimpl_recursive_call` does the same
+    // for a recursive one. An in-flight FOR_ITER of the caller is a live box
+    // in that caller's frame. A seeded frame already exists here, and a walk
+    // abort converts through `convert_and_run_from_pyjitpl` (`blackhole.py`).
+    // A callee's own FOR_ITER items are keyed by its frame
+    // (`InflightForiterOwner`), so a callee that loops, or re-enters the
+    // caller's code, keeps them apart from the caller's. Admission while a
+    // FOR_ITER item is in flight is the same seeded-inline test as any other
+    // call (`try_multiframe || strict_seed`). The callee pin the ordinary
+    // path records — `callable_guard_op` `GuardValue`,
+    // `walker_pin_function_code`, or the type-call class pin — is recorded
+    // below, unchanged.
     if fbw_foriter_inflight_active() && !instance_next_route {
-        let foriter_seeded_admit = (try_multiframe || strict_seed)
-            && (callable_guard_op.is_constant()
-                || receiver_pinned_by_class
-                || guards_the_callee_function);
+        let foriter_seeded_admit = try_multiframe || strict_seed;
         if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} const_callable={} mf={try_multiframe} \
-                 strict={strict_inlinable} guards_fn={guards_the_callee_function}",
+                "[inline-foriter-gate] pc={} mf={try_multiframe} strict={strict_inlinable}",
                 op.pc,
-                callable_guard_op.is_constant(),
             );
         }
         if !foriter_seeded_admit {
@@ -12863,37 +12861,27 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         }
                     }
                 }
-                if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
-                    // `len` runs `space.index` on what `__len__` returned,
-                    // then `_check_len_result` on that, and boxes the machine
-                    // length it checked out to (`builtins.rs builtin_len`).
-                    // An exact machine int makes the index the identity,
-                    // reduces the check to its nonnegative test, and makes the
-                    // box an int of the same value, so admit that one shape
-                    // and guard it at runtime below.  Every other box — a
-                    // long, a bool, an int subclass, something carrying
-                    // `__index__`, and a negative — hands the call back to the
-                    // interpreter, which runs the whole operator and produces
-                    // the faithful conversion, TypeError, ValueError or
-                    // OverflowError.
+                let (value, concrete_for_shadow) = if operator_tail
+                    == Some(crate::operator_continuation::OperatorTail::Len)
+                {
+                    // `descroperation.py` `len` after `_len`: `space.index` on
+                    // what `__len__` returned, then `_check_len_result` on
+                    // that, then `space.newint` of the machine length
+                    // (`baseobjspace::len_result_tail` / `bh_len_tail`). An
+                    // exact nonnegative machine int makes `index` the identity
+                    // and reduces the check to its nonnegative test, so that
+                    // shape is the two guards below. Every other box — a long,
+                    // a bool, an int subclass, something carrying `__index__`,
+                    // a negative, a float — records the tail residual
+                    // `bh_len_tail` on the dunder result, with the exception
+                    // guard resuming at the tail's after-call `-live-`.
+                    // Decline and cut only when that residual refuses up front.
                     let len_value = match concrete_for_shadow {
                         ConcreteValue::Ref(obj) if walker_is_exact_machine_int_concrete(obj) => {
                             walker_machine_int_value(obj)
                         }
                         _ => None,
                     };
-                    // A length this route cannot answer — a long, a bool, an
-                    // int subclass, something carrying `__index__`, a
-                    // negative — owes the interpreter its faithful conversion
-                    // or error. No effect has run, so the residual is free.
-                    // A body that already ran an effect cannot decline: the
-                    // residual would re-run `__len__`. Convert in place
-                    // through `OperatorTail::Len` so `_setup_return_value_r`
-                    // (`blackhole.py`) lands in the tail. A valid nonnegative
-                    // machine int is the traced path itself (`_check_len_result`
-                    // as the guard below); aborting it after `_inline_frame`
-                    // drops would replay the CALL (`LoopBearingCalleeInlineUnsupported`
-                    // with no latch) and run `__len__` twice.
                     let Some(caller) = operator_tail_caller.as_ref() else {
                         if fbw_executed_effect_count() != executed_effects_before {
                             return abort_operator_tail_after_return(
@@ -12908,67 +12896,89 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     if !len_value.is_some_and(|value| value >= 0) {
-                        if fbw_executed_effect_count() != executed_effects_before {
-                            return abort_operator_tail_after_return(
-                                ctx,
-                                op.pc,
-                                Some(caller),
-                                crate::operator_continuation::OperatorTail::Len,
-                                value,
-                                format_receiver,
-                            );
+                        match super::residual_call::record_operator_tail_residual_r(
+                            ctx,
+                            op,
+                            dst,
+                            dst_bank,
+                            crate::operator_continuation::OperatorTail::Len,
+                            value,
+                            caller,
+                        )? {
+                            super::residual_call::OperatorTailResidual::Raised(raised) => {
+                                return Ok(Some(raised));
+                            }
+                            super::residual_call::OperatorTailResidual::Returned(result) => {
+                                (result, concrete_from_recorded_opref(ctx, result))
+                            }
+                            super::residual_call::OperatorTailResidual::NotRun => {
+                                if fbw_executed_effect_count() != executed_effects_before {
+                                    return abort_operator_tail_after_return(
+                                        ctx,
+                                        op.pc,
+                                        Some(caller),
+                                        crate::operator_continuation::OperatorTail::Len,
+                                        value,
+                                        format_receiver,
+                                    );
+                                }
+                                return resolved_inline_decline(op.pc, line!());
+                            }
                         }
-                        return resolved_inline_decline(op.pc, line!());
+                    } else {
+                        // Both checks as guards, before the destination write, so a
+                        // later iteration whose `__len__` answers differently
+                        // resumes in `OperatorTail::Len` with the result pending
+                        // rather than carrying a length the operator would have
+                        // refused — and rather than re-entering `__len__`.
+                        let concrete = match concrete_for_shadow {
+                            ConcreteValue::Ref(obj) => obj,
+                            _ => pyre_object::PY_NULL,
+                        };
+                        // Tag test then `GuardClass`, both with the tail-resume
+                        // snapshot: a prior `walker_emit_operator_tail_result_guard`
+                        // `GuardClass` used to mark the class known first and
+                        // suppress `walker_unbox_int_typed`'s tagged-pointer test.
+                        let (int_type, intval_descr) =
+                            crate::state::int_or_bool_unbox_type_descr(concrete);
+                        let raw = walker_unbox_int_typed_with_guard(
+                            ctx,
+                            op.pc,
+                            value,
+                            int_type,
+                            intval_descr,
+                            |ctx, op_pc, opcode, args| {
+                                walker_emit_operator_tail_result_guard(
+                                    ctx,
+                                    op_pc,
+                                    crate::operator_continuation::OperatorTail::Len,
+                                    caller,
+                                    value,
+                                    opcode,
+                                    args,
+                                    format_receiver,
+                                )
+                            },
+                        )?;
+                        let zero = ctx.trace_ctx.const_int(0);
+                        let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
+                        ctx.trace_ctx
+                            .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
+                        walker_emit_operator_tail_result_guard(
+                            ctx,
+                            op.pc,
+                            crate::operator_continuation::OperatorTail::Len,
+                            caller,
+                            value,
+                            OpCode::GuardTrue,
+                            &[nonnegative],
+                            format_receiver,
+                        )?;
+                        (value, concrete_for_shadow)
                     }
-                    // Both checks as guards, before the destination write, so a
-                    // later iteration whose `__len__` answers differently
-                    // resumes in `OperatorTail::Len` with the result pending
-                    // rather than carrying a length the operator would have
-                    // refused — and rather than re-entering `__len__`.
-                    let concrete = match concrete_for_shadow {
-                        ConcreteValue::Ref(obj) => obj,
-                        _ => pyre_object::PY_NULL,
-                    };
-                    // Tag test then `GuardClass`, both with the tail-resume
-                    // snapshot: a prior `walker_emit_operator_tail_result_guard`
-                    // `GuardClass` used to mark the class known first and
-                    // suppress `walker_unbox_int_typed`'s tagged-pointer test.
-                    let (int_type, intval_descr) =
-                        crate::state::int_or_bool_unbox_type_descr(concrete);
-                    let raw = walker_unbox_int_typed_with_guard(
-                        ctx,
-                        op.pc,
-                        value,
-                        int_type,
-                        intval_descr,
-                        |ctx, op_pc, opcode, args| {
-                            walker_emit_operator_tail_result_guard(
-                                ctx,
-                                op_pc,
-                                crate::operator_continuation::OperatorTail::Len,
-                                caller,
-                                value,
-                                opcode,
-                                args,
-                                format_receiver,
-                            )
-                        },
-                    )?;
-                    let zero = ctx.trace_ctx.const_int(0);
-                    let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
-                    ctx.trace_ctx
-                        .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
-                    walker_emit_operator_tail_result_guard(
-                        ctx,
-                        op.pc,
-                        crate::operator_continuation::OperatorTail::Len,
-                        caller,
-                        value,
-                        OpCode::GuardTrue,
-                        &[nonnegative],
-                        format_receiver,
-                    )?;
-                }
+                } else {
+                    (value, concrete_for_shadow)
+                };
                 // `descr_call` discards `__init__`'s result after checking it is
                 // None and returns the instance instead (`check_init_returned_none`).
                 // A non-None result is a TypeError the inlined body cannot raise, so
@@ -16447,9 +16457,11 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
 /// guards the way the subscript route does.
 ///
 /// Neither check around the call is dropped, on EITHER exit.  On the traced
-/// path `OperatorTail::Len` admits only the box that makes `space.index` the
-/// identity and emits `_check_len_result`'s nonnegative test as a guard; on
-/// the deopt path the same `OperatorTail::Len` is the resume level that runs
+/// path an exact nonnegative machine int makes `space.index` the identity and
+/// `_check_len_result`'s nonnegative test is a guard; every other box records
+/// the tail residual `bh_len_tail` (`descroperation.py` `len` after `_len`:
+/// `index` then `_check_len_result`). On the deopt path the same
+/// `OperatorTail::Len` is the resume level that runs
 /// `baseobjspace::len_result_tail` for real.  Without the second half the
 /// first is decoration: a guard inside the inlined body returns the callee's
 /// raw box straight into `len`'s result register
@@ -16553,9 +16565,9 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
     )?;
-    // A refused result — `__len__` answering a non-int or a negative — declines
-    // from inside the call above after the body has been walked.  Cut that
-    // emission back so the caller's residual runs the operator itself.
+    // A residual the tail recorder refused declines from inside the call
+    // above after the body has been walked. Cut that emission back so the
+    // caller's residual runs the operator itself.
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
     }

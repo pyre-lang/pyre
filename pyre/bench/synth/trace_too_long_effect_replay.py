@@ -44,15 +44,18 @@ while i < N:
     i = i + 1
 
 # Whether one abort's cutoff lands inside a descended helper's frame (a
-# multi-frame blackhole adoption) moves by one step between targets: at 98
-# native adopts it single-frame and wasm multi-frame. 95..97 take the same
-# adoptions on all three backends; use 96 within that shared interval.
+# multi-frame blackhole adoption) moves by one step between targets. The wasm
+# guest has Signed = 8 bytes and isize/usize = 4, so `_int_to_int_cast`
+# records `int_signext`/`int_and` that are the identity on 64-bit native;
+# traces are a few ops longer on wasm and a tiny `trace_limit` cuts one frame
+# earlier or later. 77..82 take the same snapshot on dynasm, cranelift and
+# wasm; use 80 within that shared interval.
 # Phase B — the same shape with the limit raised past the body's own length,
 # so the check lands mid-body, and with one effect per rollback class: a list
 # slot store is journaled, a dict store and a list append historically were
 # not. Each counter must read exactly N; a replayed iteration shows up as
 # N + 1.
-set_trace_limit(96)
+set_trace_limit(80)
 
 box = [0]
 d = {"k": 0}

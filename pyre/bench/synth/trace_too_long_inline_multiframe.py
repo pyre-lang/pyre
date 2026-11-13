@@ -4,8 +4,12 @@
 # from the caller's CALL applies an iteration twice, while collapsing the
 # callee onto the caller loses its locals/operand stack.
 # The limit is chosen so the cut lands inside leaf after its three mutations,
-# past the zero-effect call_trace prologue walk; counters are flat for
-# limits 134-146.
+# past the zero-effect call_trace prologue walk. The wasm guest has Signed =
+# 8 bytes and isize/usize = 4, so `_int_to_int_cast` records `int_signext` /
+# `int_and` that are the identity on 64-bit native; traces are a few ops
+# longer on wasm and a tiny `trace_limit` cuts one frame earlier or later.
+# 134..138 take the same snapshot on dynasm, cranelift and wasm; use 136
+# within that shared interval.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The
@@ -20,7 +24,7 @@ except ImportError:
 
 
 if pypyjit is not None:
-    pypyjit.set_param("trace_limit=140,threshold=1,function_threshold=1")
+    pypyjit.set_param("trace_limit=136,threshold=1,function_threshold=1")
 
 
 def leaf(box, mapping, values, x):
