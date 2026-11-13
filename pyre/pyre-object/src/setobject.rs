@@ -3103,27 +3103,20 @@ pub unsafe fn w_set_insert_key_checked(
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_insert_key_checked_locked(obj, key);
+        // A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
+        let key_slot = obj_slot + 1;
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let key = crate::dictmultiobject::ObjectKey {
+            hash: key.hash,
+            obj: crate::gc_roots::shadow_stack_get(key_slot),
+        };
+        return w_set_insert_key_checked_unlocked(crate::gc_roots::shadow_stack_get(obj_slot), key);
     }
     w_set_insert_key_checked_unlocked(obj, key)
-}
-
-/// A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
-unsafe fn w_set_insert_key_checked_locked(
-    obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
-) -> Result<(), SetUpdateError> {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
-    let key_slot = obj_slot + 1;
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(obj_slot),
-    ));
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    w_set_insert_key_checked_unlocked(crate::gc_roots::shadow_stack_get(obj_slot), key)
 }
 
 unsafe fn w_set_insert_key_checked_unlocked(
@@ -3278,27 +3271,23 @@ pub unsafe fn w_set_contains_key_checked(
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_contains_key_checked_locked(obj, key);
+        // A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
+        let key_slot = obj_slot + 1;
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let key = crate::dictmultiobject::ObjectKey {
+            hash: key.hash,
+            obj: crate::gc_roots::shadow_stack_get(key_slot),
+        };
+        return w_set_contains_key_checked_unlocked(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+            key,
+        );
     }
     w_set_contains_key_checked_unlocked(obj, key)
-}
-
-/// A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
-unsafe fn w_set_contains_key_checked_locked(
-    obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
-) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
-    let key_slot = obj_slot + 1;
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(obj_slot),
-    ));
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    w_set_contains_key_checked_unlocked(crate::gc_roots::shadow_stack_get(obj_slot), key)
 }
 
 unsafe fn w_set_contains_key_checked_unlocked(
@@ -3320,27 +3309,23 @@ pub unsafe fn w_set_discard_key_checked(
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_discard_key_checked_locked(obj, key);
+        // A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
+        let key_slot = obj_slot + 1;
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let key = crate::dictmultiobject::ObjectKey {
+            hash: key.hash,
+            obj: crate::gc_roots::shadow_stack_get(key_slot),
+        };
+        return w_set_discard_key_checked_unlocked(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+            key,
+        );
     }
     w_set_discard_key_checked_unlocked(obj, key)
-}
-
-/// A contended stripe wait may collect: pin the set and the key before the wait and reload after it.
-unsafe fn w_set_discard_key_checked_locked(
-    obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
-) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::pin_roots(&[obj, key.obj]);
-    let key_slot = obj_slot + 1;
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(obj_slot),
-    ));
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    w_set_discard_key_checked_unlocked(crate::gc_roots::shadow_stack_get(obj_slot), key)
 }
 
 unsafe fn w_set_discard_key_checked_unlocked(
@@ -3431,19 +3416,16 @@ pub unsafe fn w_set_discard_checked(
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_clear(obj: PyObjectRef) {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_clear_locked(obj);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        w_set_clear_unlocked(crate::gc_roots::shadow_stack_get(slot));
+        return;
     }
     w_set_clear_unlocked(obj)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_clear_locked(obj: PyObjectRef) {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_clear_unlocked(crate::gc_roots::shadow_stack_get(slot))
 }
 
 unsafe fn w_set_clear_unlocked(obj: PyObjectRef) {
@@ -3461,19 +3443,15 @@ unsafe fn w_set_clear_unlocked(obj: PyObjectRef) {
 /// `obj` must point to a valid mutable `W_SetObject`.
 pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_popitem_locked(obj);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_set_popitem_unlocked(crate::gc_roots::shadow_stack_get(slot));
     }
     w_set_popitem_unlocked(obj)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_popitem_locked(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_popitem_unlocked(crate::gc_roots::shadow_stack_get(slot))
 }
 
 unsafe fn w_set_popitem_unlocked(obj: PyObjectRef) -> Option<PyObjectRef> {
@@ -4075,19 +4053,15 @@ pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_frozenset_cached_hash(obj: PyObjectRef) -> Option<i64> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_frozenset_cached_hash_locked(obj);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_frozenset_cached_hash_unlocked(crate::gc_roots::shadow_stack_get(slot));
     }
     w_frozenset_cached_hash_unlocked(obj)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_frozenset_cached_hash_locked(obj: PyObjectRef) -> Option<i64> {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_frozenset_cached_hash_unlocked(crate::gc_roots::shadow_stack_get(slot))
 }
 
 unsafe fn w_frozenset_cached_hash_unlocked(obj: PyObjectRef) -> Option<i64> {
@@ -4101,19 +4075,16 @@ unsafe fn w_frozenset_cached_hash_unlocked(obj: PyObjectRef) -> Option<i64> {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_frozenset_set_cached_hash(obj: PyObjectRef, hash: i64) {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_frozenset_set_cached_hash_locked(obj, hash);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        w_frozenset_set_cached_hash_unlocked(crate::gc_roots::shadow_stack_get(slot), hash);
+        return;
     }
     w_frozenset_set_cached_hash_unlocked(obj, hash)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_frozenset_set_cached_hash_locked(obj: PyObjectRef, hash: i64) {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_frozenset_set_cached_hash_unlocked(crate::gc_roots::shadow_stack_get(slot), hash)
 }
 
 unsafe fn w_frozenset_set_cached_hash_unlocked(obj: PyObjectRef, hash: i64) {
@@ -4127,19 +4098,15 @@ unsafe fn w_frozenset_set_cached_hash_unlocked(obj: PyObjectRef, hash: i64) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_stored_hashes_locked(obj);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_set_stored_hashes_unlocked(crate::gc_roots::shadow_stack_get(slot));
     }
     w_set_stored_hashes_unlocked(obj)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_stored_hashes_locked(obj: PyObjectRef) -> Vec<i64> {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_stored_hashes_unlocked(crate::gc_roots::shadow_stack_get(slot))
 }
 
 unsafe fn w_set_stored_hashes_unlocked(obj: PyObjectRef) -> Vec<i64> {
@@ -4193,19 +4160,15 @@ pub unsafe fn w_set_key_at(
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_num_ever_used_items(obj: *mut PyObject) -> usize {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_num_ever_used_items_locked(obj);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_set_num_ever_used_items_unlocked(crate::gc_roots::shadow_stack_get(slot));
     }
     w_set_num_ever_used_items_unlocked(obj)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_num_ever_used_items_locked(obj: *mut PyObject) -> usize {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_num_ever_used_items_unlocked(crate::gc_roots::shadow_stack_get(slot))
 }
 
 unsafe fn w_set_num_ever_used_items_unlocked(obj: *mut PyObject) -> usize {
@@ -4228,19 +4191,15 @@ unsafe fn w_set_num_ever_used_items_unlocked(obj: *mut PyObject) -> usize {
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_iterkey_at(obj: *mut PyObject, index: usize) -> *mut PyObject {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_iterkey_at_locked(obj, index);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_set_iterkey_at_unlocked(crate::gc_roots::shadow_stack_get(slot), index);
     }
     w_set_iterkey_at_unlocked(obj, index)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_iterkey_at_locked(obj: *mut PyObject, index: usize) -> *mut PyObject {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_iterkey_at_unlocked(crate::gc_roots::shadow_stack_get(slot), index)
 }
 
 unsafe fn w_set_iterkey_at_unlocked(obj: *mut PyObject, index: usize) -> *mut PyObject {
@@ -4257,19 +4216,15 @@ unsafe fn w_set_iterkey_at_unlocked(obj: *mut PyObject, index: usize) -> *mut Py
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_iterkey_hash_at(obj: *mut PyObject, index: usize) -> i64 {
     if crate::gil_ready::gil_ready_word() != 0 {
-        return w_set_iterkey_hash_at_locked(obj, index);
+        // A contended stripe wait may collect: pin the set before the wait and reload after it.
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::pin_roots(&[obj]);
+        let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
+            crate::gc_roots::shadow_stack_get(slot),
+        ));
+        return w_set_iterkey_hash_at_unlocked(crate::gc_roots::shadow_stack_get(slot), index);
     }
     w_set_iterkey_hash_at_unlocked(obj, index)
-}
-
-/// A contended stripe wait may collect: pin the set before the wait and reload after it.
-unsafe fn w_set_iterkey_hash_at_locked(obj: *mut PyObject, index: usize) -> i64 {
-    let _roots = crate::gc_roots::push_roots();
-    let slot = crate::gc_roots::pin_roots(&[obj]);
-    let _set_guard = crate::objlock::ObjectLockGuard::from_word(w_set_lock_acquire(
-        crate::gc_roots::shadow_stack_get(slot),
-    ));
-    w_set_iterkey_hash_at_unlocked(crate::gc_roots::shadow_stack_get(slot), index)
 }
 
 unsafe fn w_set_iterkey_hash_at_unlocked(obj: *mut PyObject, index: usize) -> i64 {
