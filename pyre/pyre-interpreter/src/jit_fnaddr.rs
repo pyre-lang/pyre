@@ -82,13 +82,15 @@ impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
 
-/// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
-/// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
-/// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
+/// Word-ABI bridges for `majit_gc::shadow_stack::{push,get,try_pop_to}`.
+/// `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so each of
+/// the raw functions is `(usize) -> usize`, `(usize) -> usize` and
 /// `(usize) -> ()` — and `usize` is 32-bit on wasm32.  A residual call whose
 /// descr types are all words lowers to an in-module `(i64xn) -> i64` (or
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
 /// call, so the raw functions are a different table type there.
+/// `FrameAnchor` ops are identities at the MIR front (`front::frame_anchor`)
+/// and must not bind a host push here.
 extern "C" fn shadow_stack_push_word(gcref: i64) -> i64 {
     majit_ir::icf_identity!("jit_fnaddr::shadow_stack_push_word");
     majit_gc::shadow_stack::push(majit_ir::GcRef(gcref as usize)) as i64
@@ -5687,8 +5689,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // word on wasm32, where `call_indirect` type-checks its callee. The two
     // `-> ()` polls keep their plain rows because they take no arguments:
     // `() -> ()` is the type the void residual family declares. A void
-    // residual that takes arguments needs a bridge like any other, which is
-    // why `frame_anchor_release` has one.
+    // residual that takes arguments needs a bridge like any other.
     cp0!(
         &mut entries,
         "majit_ir::eval_breaker_word::load",
@@ -5730,43 +5731,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "majit_rlib::rsignal::pypysig_getaddr_occurred",
         majit_rlib::rsignal::pypysig_getaddr_occurred_jit_abi,
-    );
-    // The `anchor` handler graph residualizes `FrameAnchor::new` itself
-    // (its aggregate return keeps it out of inlining), and `push_anchored`
-    // reads back through `FrameAnchor::live`; bind both under the exact
-    // path spellings the codewriter hashes for method targets.  They carry
-    // their own bridges rather than sharing the free slot ops': one address
-    // must name one function here.  `new` is `from_raw` handed back without a
-    // `Drop`, and `front::mir` aliases an `Rvalue::Ref` over a bare local to
-    // that local's own Variable without emitting an address-of, so `live`'s
-    // `&self` arrives as the one-word anchor's value — the depth — rather
-    // than a pointer to it.
-    cpa1!(
-        &mut entries,
-        "eval::FrameAnchor::new",
-        "pyre_interpreter::eval::FrameAnchor::new",
-        crate::eval::frame_anchor_new_jit_abi,
-    );
-    cpa1!(
-        &mut entries,
-        "eval::FrameAnchor::live",
-        "pyre_interpreter::eval::FrameAnchor::live",
-        crate::eval::frame_anchor_live_method_jit_abi,
-    );
-    cp1!(
-        &mut entries,
-        "pyre_interpreter::eval::frame_anchor_push",
-        crate::eval::frame_anchor_push_jit_abi,
-    );
-    cp1!(
-        &mut entries,
-        "pyre_interpreter::eval::frame_anchor_live",
-        crate::eval::frame_anchor_live_jit_abi,
-    );
-    cp1!(
-        &mut entries,
-        "pyre_interpreter::eval::frame_anchor_release",
-        crate::eval::frame_anchor_release_jit_abi,
     );
     // `call.py CallControl.get_jitcode` stores `getfunctionptr(graph)` as
     // `JitCode.fnaddr`. These three look-inside graphs are Rust `Result`

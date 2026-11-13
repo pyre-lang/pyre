@@ -8121,9 +8121,8 @@ fn closure_capturing_fieldless_enum_annotates() {
 }
 
 /// A rustc closure env that captures `&TransparentWrapper` of a scalar
-/// (`eval::FrameAnchor` / `_trace` closure `__pos_5`) must annotate: the
-/// stored word is Integer and the env field must be that same Integer
-/// (`rclass.py` field reprs; `annotator/model.py` `unionof`).
+/// must annotate: the stored word is Integer and the env field must be
+/// that same Integer (`rclass.py` field reprs; `annotator/model.py` `unionof`).
 #[test]
 fn closure_capturing_borrowed_transparent_scalar_annotates() {
     use crate::annotator::annrpython::RPythonAnnotator;
@@ -8175,9 +8174,9 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
                 {
                     "def_id": 2,
                     "item_meta": {
-                        "name": [{"Ident": ["eval", 0]}, {"Ident": ["FrameAnchor", 0]}],
+                        "name": [{"Ident": ["eval", 0]}, {"Ident": ["ScalarWrapper", 0]}],
                         "span": span,
-                        "source_text": "pub struct FrameAnchor { depth: usize, _not_send: PhantomData<*const ()> }",
+                        "source_text": "pub struct ScalarWrapper { depth: usize, _not_send: PhantomData<*const ()> }",
                         "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                         "is_local": true
                     },

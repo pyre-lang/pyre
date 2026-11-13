@@ -17816,6 +17816,43 @@ fn intern_map_caller(
     map_id: u64,
     type_args: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    intern_call_caller(
+        def_id,
+        name,
+        serde_json::json!({"Fun": map_id}),
+        serde_json::json!({
+            "regions": [],
+            "types": type_args,
+            "const_generics": [],
+            "trait_refs": []
+        }),
+    )
+}
+
+fn intern_trait_map_caller(
+    def_id: u64,
+    name: &str,
+    trait_ref: serde_json::Value,
+) -> serde_json::Value {
+    intern_call_caller(
+        def_id,
+        name,
+        serde_json::json!({"Trait": [trait_ref, 0]}),
+        serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        }),
+    )
+}
+
+fn intern_call_caller(
+    def_id: u64,
+    name: &str,
+    kind: serde_json::Value,
+    call_generics: serde_json::Value,
+) -> serde_json::Value {
     let unit = serde_json::json!({
         "Adt": {
             "id": 0,
@@ -17827,12 +17864,6 @@ fn intern_map_caller(
                 "trait_refs": []
             }
         }
-    });
-    let call_generics = serde_json::json!({
-        "regions": [],
-        "types": type_args,
-        "const_generics": [],
-        "trait_refs": []
     });
     serde_json::json!({
         "def_id": def_id,
@@ -17855,7 +17886,7 @@ fn intern_map_caller(
                                     "call": {
                                         "func": {
                                             "Regular": {
-                                                "kind": {"Fun": map_id},
+                                                "kind": kind,
                                                 "generics": call_generics
                                             }
                                         },
@@ -17887,6 +17918,42 @@ fn intern_option_from_map_call_llbc(
             intern_map_caller(0, "call_map", 1, type_args),
             generic_option_map_decl(1, 0),
         ],
+    )
+}
+
+fn intern_option_from_trait_call_llbc(type_args: Vec<serde_json::Value>) -> Llbc {
+    let trait_ref = serde_json::json!({
+        "kind": {"TraitImpl": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": type_args,
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }}
+    });
+    llbc_with_types_impls(
+        "fixture",
+        vec![option_enum(0)],
+        vec![
+            intern_trait_map_caller(0, "call_map", trait_ref),
+            generic_option_map_decl(1, 0),
+        ],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 1}}],
+            "impl_trait": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            },
+            "implied_trait_refs": []
+        })],
     )
 }
 
@@ -18037,54 +18104,66 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
 }
 
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
-/// RegularCall's substituted callee signature. The caller has no Option local.
+/// substituted callee signature. The caller has no Option local. A Fun
+/// RegularCall and a `CallKind::Trait` that `trait_impl_method` resolves
+/// to the same generic impl method intern the same rows.
 #[test]
-fn intern_tagged_option_from_regular_call_substituted_signature() {
+fn intern_tagged_option_from_call_substituted_signature() {
     let char_ty = serde_json::json!({"Scalar": "Char"});
     let i64_ty = interior_i64();
-    let llbc = intern_option_from_map_call_llbc(vec![char_ty, i64_ty], vec![]);
-    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
-        .expect("build semantic program for interned Option<char>");
-    let disc = program
-        .struct_fields
-        .fields
-        .get("core::option::Option<char>");
-    let disc_names: Vec<&str> = disc
-        .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
-        .unwrap_or_default();
-    assert_eq!(
-        disc_names,
-        vec!["__discriminant"],
-        "suffixed Option<char> BASE intern; keys={:?}",
-        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    let assert_interned = |llbc: &Llbc, kind: &str| {
+        let program =
+            crate::test_support::build_semantic_program_from_llbc(llbc).unwrap_or_else(|err| {
+                panic!("build semantic program for interned Option<char> ({kind}): {err}")
+            });
+        let keys = program.struct_fields.fields.keys().collect::<Vec<_>>();
+        let disc = program
+            .struct_fields
+            .fields
+            .get("core::option::Option<char>");
+        let disc_names: Vec<&str> = disc
+            .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            disc_names,
+            vec!["__discriminant"],
+            "{kind}: suffixed Option<char> BASE intern; keys={keys:?}"
+        );
+        assert_eq!(
+            field_row_ty(
+                &program.struct_fields,
+                "core::option::Option<char>::Some",
+                "__pos_0"
+            ),
+            Some("char"),
+            "{kind}: Option<char>::Some payload; keys={keys:?}"
+        );
+        assert_eq!(
+            field_row_ty(
+                &program.struct_fields,
+                "option::Option<char>::Some",
+                "__pos_0"
+            ),
+            Some("char"),
+            "{kind}: crate-stripped intern key FieldRead looks up; keys={keys:?}"
+        );
+        let stripped_disc = program.struct_fields.fields.get("option::Option<char>");
+        let stripped_disc_names: Vec<&str> = stripped_disc
+            .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            stripped_disc_names,
+            vec!["__discriminant"],
+            "{kind}: crate-stripped Option<char> BASE intern; keys={keys:?}"
+        );
+    };
+    assert_interned(
+        &intern_option_from_map_call_llbc(vec![char_ty.clone(), i64_ty.clone()], vec![]),
+        "Fun",
     );
-    assert_eq!(
-        field_row_ty(
-            &program.struct_fields,
-            "core::option::Option<char>::Some",
-            "__pos_0"
-        ),
-        Some("char")
-    );
-    assert_eq!(
-        field_row_ty(
-            &program.struct_fields,
-            "option::Option<char>::Some",
-            "__pos_0"
-        ),
-        Some("char"),
-        "crate-stripped intern key FieldRead looks up; keys={:?}",
-        program.struct_fields.fields.keys().collect::<Vec<_>>()
-    );
-    let stripped_disc = program.struct_fields.fields.get("option::Option<char>");
-    let stripped_disc_names: Vec<&str> = stripped_disc
-        .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
-        .unwrap_or_default();
-    assert_eq!(
-        stripped_disc_names,
-        vec!["__discriminant"],
-        "crate-stripped Option<char> BASE intern; keys={:?}",
-        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    assert_interned(
+        &intern_option_from_trait_call_llbc(vec![char_ty, i64_ty]),
+        "Trait",
     );
 }
 

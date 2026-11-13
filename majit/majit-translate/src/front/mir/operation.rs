@@ -6345,6 +6345,8 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn place_borrow_takes_address(&self, place: &Place) -> bool {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
+            || frame_anchor::tyref_is_anchor(&place.ty, self.llbc)
+            || frame_anchor::tyref_is_option_of_anchor(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_root(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_option_of_root(&place.ty, self.llbc)
         {
@@ -7336,6 +7338,8 @@ impl<'a> Lowering<'a> {
                     // has to return this read, not an integer cast of it.
                     if owner_root_guard::tyref_is_guard(&place_ty, self.llbc)
                         || owner_root_guard::tyref_is_option_of_guard(&place_ty, self.llbc)
+                        || frame_anchor::tyref_is_anchor(&place_ty, self.llbc)
+                        || frame_anchor::tyref_is_option_of_anchor(&place_ty, self.llbc)
                     {
                         self.guard_word_vars.insert(res.clone());
                     }

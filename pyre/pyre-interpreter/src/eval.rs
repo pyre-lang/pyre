@@ -251,9 +251,8 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 /// place during the collection; `live()` reads the forwarded pointer back.
 /// This mirrors the JIT eval layer's `FrameRoot`.
 ///
-/// The JIT models the anchor as its depth word. `#[repr(transparent)]` is
-/// that declaration: the only sized field is `depth`, and a borrow of the
-/// anchor is that word.
+/// Native rustc runs a transparent depth word on the thread shadow stack.
+/// JIT graphs paint the same value as the frame reference.
 #[repr(transparent)]
 pub struct FrameAnchor {
     depth: usize,
@@ -306,11 +305,9 @@ impl Drop for FrameAnchor {
     }
 }
 
-/// Shadow-stack slot publication behind [`FrameAnchor`].  The slot ops live
-/// in `majit_gc`, which has no jitcode graphs, so a walked handler graph
-/// reaching them found only a symbolic path hash.  First-party
-/// `dont_look_inside` wrappers with word-sized signatures keep each op a
-/// bound residual the tracer can execute (`jit_trace_fnaddrs()` rows).
+/// Shadow-stack slot publication behind [`FrameAnchor`]. Native rustc
+/// runs these `dont_look_inside` wrappers; JIT graphs erase the calls
+/// to identity of the frame.
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
     majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize))
@@ -327,67 +324,6 @@ pub fn frame_anchor_live(depth: usize) -> *mut PyFrame {
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_release(depth: usize) {
     majit_gc::shadow_stack::try_pop_to(depth);
-}
-
-/// One-word residual-call ABI for the three slot ops, and — as separate
-/// functions below — for the two [`FrameAnchor`] methods a walked handler
-/// graph reaches.
-///
-/// A value-returning residual is lowered as `(i64 x n) -> i64`; a raw
-/// `*mut PyFrame` / `usize` signature is narrower than a word on wasm32,
-/// where `call_indirect` type-checks its callee.
-///
-/// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
-/// address back as one function: two unrelated paths sharing an address is
-/// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
-/// [`majit_ir::icf_identity`] keeps LLVM MergeFunctions from folding these
-/// bridges onto `shadow_stack_*_word` (`drain_list_append`).
-pub extern "C" fn frame_anchor_push_jit_abi(frame: *mut PyFrame) -> i64 {
-    majit_ir::icf_identity!("eval::frame_anchor_push_jit_abi");
-    frame_anchor_push(frame) as i64
-}
-
-/// One-word residual-call ABI for [`frame_anchor_live`].
-pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
-    majit_ir::icf_identity!("eval::frame_anchor_live_jit_abi");
-    frame_anchor_live(depth as usize) as i64
-}
-
-/// One-word residual-call ABI for [`frame_anchor_release`].
-pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
-    majit_ir::icf_identity!("eval::frame_anchor_release_jit_abi");
-    frame_anchor_release(depth as usize);
-}
-
-/// One-word residual-call ABI for [`FrameAnchor::new`], which the `anchor`
-/// handler graph residualizes rather than inlining.
-///
-/// The anchor is one word, and the trace keeps that word: the construction is
-/// handed back without running `Drop`, exactly as the aggregate return did
-/// when the method itself was the registered target.
-pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
-    majit_ir::icf_identity!("eval::frame_anchor_new_jit_abi");
-    // SAFETY: the residual's slot holds the frame the walked graph read it
-    // from, or null, which `from_raw` anticipates.
-    let anchor = unsafe { FrameAnchor::from_raw(frame) };
-    let depth = anchor.depth;
-    std::mem::forget(anchor);
-    depth as i64
-}
-
-/// One-word residual-call ABI for [`FrameAnchor::live`].
-///
-/// `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's own
-/// Variable without emitting an address-of, so the method's `&self` reaches
-/// the residual as the one-word anchor's value — the depth — rather than a
-/// pointer to it.
-pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
-    majit_ir::icf_identity!("eval::frame_anchor_live_method_jit_abi");
-    let anchor = std::mem::ManuallyDrop::new(FrameAnchor {
-        depth: anchor as usize,
-        _not_send: std::marker::PhantomData,
-    });
-    anchor.live() as i64
 }
 
 /// Forward one reference field, skipping the unset ones.
@@ -3074,18 +3010,22 @@ impl SharedOpcodeHandler for PyFrame {
         // only thing keeping it reachable while `getattr_str` runs arbitrary
         // Python — and the failing branch below still has to read its type.
         let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
+        let base = roots.base();
         let obj = roots.pin_root(obj);
         let anchor = FrameAnchor::new(self);
-        getattr_str(obj, name).inspect_err(|error| {
-            if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                // Keep this write on the live virtualizable red frame.  The
-                // opaque helper only answers the semantic type question;
-                // writing `frame.flags` inside it would race the JIT's
-                // register-resident copy of the same field.
-                unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+        match getattr_str(obj, name) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if finalize_failed_attr_receiver_now(roots.get(base)) {
+                    // Keep this write on the live virtualizable red frame.  The
+                    // opaque helper only answers the semantic type question;
+                    // writing `frame.flags` inside it would race the JIT's
+                    // register-resident copy of the same field.
+                    unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+                }
+                Err(err)
             }
-        })
+        }
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {

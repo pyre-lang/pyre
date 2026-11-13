@@ -4585,50 +4585,76 @@ pub fn funccall_valuestack(
         // live across dropvalues() and the gateway call.  The Python frame
         // slots cease to be roots when dropvalues() clears them, so publish
         // the same live-variable set on pyre's shadow stack before doing so.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        match nargs {
-            0 => {}
+        let result = match nargs {
+            0 => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe { crate::builtin_code_call(roots.get(base), &[]) }
+            }
             1 => {
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe { crate::builtin_code_call(roots.get(base), &[roots.get(base + 1)]) }
             }
             2 => {
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[roots.get(base + 1), roots.get(base + 2)],
+                    )
+                }
             }
             3 => {
-                let _ = _roots.pin_root(frame.peekvalue(2));
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(2));
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[
+                            roots.get(base + 1),
+                            roots.get(base + 2),
+                            roots.get(base + 3),
+                        ],
+                    )
+                }
             }
             4 => {
-                let _ = _roots.pin_root(frame.peekvalue(3));
-                let _ = _roots.pin_root(frame.peekvalue(2));
-                let _ = _roots.pin_root(frame.peekvalue(1));
-                let _ = _roots.pin_root(frame.peekvalue(0));
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(code as PyObjectRef);
+                let _ = roots.pin_root(frame.peekvalue(3));
+                let _ = roots.pin_root(frame.peekvalue(2));
+                let _ = roots.pin_root(frame.peekvalue(1));
+                let _ = roots.pin_root(frame.peekvalue(0));
+                unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+                unsafe {
+                    crate::builtin_code_call(
+                        roots.get(base),
+                        &[
+                            roots.get(base + 1),
+                            roots.get(base + 2),
+                            roots.get(base + 3),
+                            roots.get(base + 4),
+                        ],
+                    )
+                }
             }
-            _ => unreachable!(),
-        }
-        unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-
-        let code = _roots.get(root_base);
-        let rooted_arg = |index| _roots.get(root_base + 1 + index);
-        // Pyre builtins share a single fn(&[PyObjectRef]) signature, so use
-        // fixed-size stack arrays instead of heap-allocating a Vec.
-        let result = match nargs {
-            0 => unsafe { crate::builtin_code_call(code, &[]) },
-            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
-            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
-            3 => unsafe {
-                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
-            },
-            4 => unsafe {
-                crate::builtin_code_call(
-                    code,
-                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
-                )
-            },
             _ => unreachable!(),
         };
         return match result {
@@ -4644,7 +4670,13 @@ pub fn funccall_valuestack(
     if !natural_arity_call
         && (nargs | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity
     {
-        return _flat_pycall(func, code, nargs, &caller, dropvalues);
+        return _flat_pycall(
+            func,
+            code,
+            nargs,
+            unsafe { &mut *caller.live() },
+            dropvalues,
+        );
     }
 
     // function.py:188-193 — FLATPYCALL bit set + nargs within defaults range
@@ -4665,7 +4697,7 @@ pub fn funccall_valuestack(
                     func,
                     code,
                     nargs,
-                    &caller,
+                    unsafe { &mut *caller.live() },
                     defs,
                     natural_arity - nargs,
                     dropvalues,
@@ -4685,22 +4717,14 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
-        // Same live-variable set as the fixed-arity arm above, for the same
-        // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and the native Vec is not a root walker target.
-        // `builtin_code_call` roots nothing of its own, so pin `code` first,
-        // then read the `[w_obj, ...rest]` window from the live frame and
-        // publish it in one `pin_roots`.
+        // `make_arguments` and `dropvalues` do not allocate, and
+        // `builtin_code_call` publishes the slice it is handed before its
+        // first collecting call, so the peeked values need no bracket here.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
         let _ = _roots.pin_root(code as PyObjectRef);
-        let mut args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
-        let _ = _roots.pin_roots(&args.arguments_w);
+        let args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-        pyre_object::gc_roots::shadow_stack_copy_range_into_vec(
-            root_base + 1,
-            &mut args.arguments_w,
-        );
         return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args.arguments_w) } {
             Ok(v) => v,
             Err(e) => {
@@ -4714,29 +4738,19 @@ pub fn funccall_valuestack(
     // (carries methodcall + w_function for diagnostics) and dispatch through
     // Function.call_args (`getcode().funcrun`).
     //
-    // `dropvalues` retires the frame slots, so pin `func` and the
-    // `peekvalues` slice on the shadow stack (`framework.py push_roots`)
-    // before dropping, and reload them (`shadow_stack_copy_range_into_vec`,
-    // `framework.py pop_roots`) for `call_args`.  HOPELESS builtins
-    // (`make_builtin_function`, arity 0x400) always land here because
-    // `nargs == 0x400` never matches `fastcall_N`.
-    //
-    // `pyframe.py peekvalues` allocates first (`[None] * n`) then copies
-    // from still-live frame slots with no further allocation, so the slice
-    // is already forwarded when it returns; `pin_roots` is the next call
-    // and does not allocate.  The per-argument loop lives in `pin_roots` /
-    // `shadow_stack_copy_range_into_vec`, not here — `function.py
-    // funccall_valuestack` has no loop.
+    // `make_arguments` and `dropvalues` do not allocate, and every
+    // `function_call_args` branch publishes the positional slice before its
+    // first collecting call (`call_function_impl_result`,
+    // `fill_user_function_args`, `user_function_too_many_error`), so only
+    // `func` is kept in a slot.  HOPELESS builtins (`make_builtin_function`,
+    // arity 0x400) always land here because `nargs == 0x400` never matches
+    // `fastcall_N`.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
-    let mut args =
-        unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
-    let _ = _roots.pin_roots(&args.arguments_w);
+    let args = unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-    let func_now = _roots.get(root_base);
-    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args.arguments_w);
-    match crate::call::function_call_args(func_now, &args) {
+    match crate::call::function_call_args(_roots.get(root_base), &args) {
         Ok(v) => v,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -4756,13 +4770,13 @@ fn _flat_pycall(
     mut func: PyObjectRef,
     code: PyObjectRef,
     nargs: usize,
-    caller: &crate::eval::FrameAnchor,
+    frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // `function.py _flat_pycall` copies positional arguments off the caller
-    // value stack after `space.createframe`. The caller is the executing
-    // frame (`FrameAnchor`, execution-context chain); its trace reaches the
-    // stack, so the copy sees forwarded operands.
+    let caller = crate::eval::FrameAnchor::new(frame);
+    // The frame is re-anchored here so reads after `createframe` go through
+    // `caller.live()`. `function.py _flat_pycall` copies positional arguments
+    // off the caller value stack after `space.createframe`.
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -4851,14 +4865,15 @@ fn _flat_pycall_defaults(
     func: PyObjectRef,
     code: PyObjectRef,
     nargs: usize,
-    caller: &crate::eval::FrameAnchor,
+    frame: &mut crate::pyframe::PyFrame,
     defs: PyObjectRef,
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
-    // Same live caller frame as `_flat_pycall`: positional stack entries are
-    // copied only after the callee allocation returns, and the executing
-    // frame's trace keeps them. Normalizing a published root is a safepoint,
+    let caller = crate::eval::FrameAnchor::new(frame);
+    // The frame is re-anchored here so reads after `createframe` go through
+    // `caller.live()`. Positional stack entries are copied only after the
+    // callee allocation returns. Normalizing a published root is a safepoint,
     // so every call input goes out in one publish and is read back from its
     // slot before use.
     let _roots = pyre_object::gc_roots::push_roots();
