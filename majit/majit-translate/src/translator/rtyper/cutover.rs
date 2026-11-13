@@ -50,6 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::annotator::model::SomeObjectTrait;
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
@@ -440,12 +441,14 @@ pub(crate) fn dual_gate_check_with_registry(
     // (`jtransform.py add_in_correct_list`, `call.py getcalldescr`
     // NON_VOID_ARGS). A followed Variable typed Void still diverges
     // above and skips.
+    let rtyper = call_registry.session_if_started().map(|(_, rtyper)| rtyper);
     let const_results = collect_specialize_const_results(
         &graph,
         legacy_graph,
         &real_value_to_var,
         Some(&candidates),
         Some(&block_map),
+        rtyper.as_ref(),
     );
     Ok(DualGateOutcome::Match {
         real_value_to_var,
@@ -708,12 +711,15 @@ fn project_value_to_var(
 
 /// Hops whose rtyper result is a Constant (`rtyper.py specialize_block`
 /// `block.operations[:] = newops`, `translate_hl_to_ll` emitting
-/// `same_as(Constant, op.result)` for `rtype_const_result`).
+/// `same_as(Constant, op.result)` for `rtype_const_result`), plus twins
+/// whose annotator result is constant when `FunctionRepr.call` left a
+/// `direct_call` (`rpbc.py`).
 ///
 /// The adapter's `value_to_var` / candidates name the FunctionGraph
 /// result's flowspace twin; after specialize that twin is defined by
-/// `same_as` of the Constant. Lift-time const-defines never become
-/// hops, so they do not appear here.
+/// `same_as` of the Constant, or by a constant `SomeInstance` that
+/// `InstanceRepr.convert_const_exact` folds. Lift-time const-defines
+/// never become hops, so they do not appear here.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -733,12 +739,33 @@ fn collect_same_as_const_results(block: &BlockRef, twin_const: &mut HashMap<Vari
     }
 }
 
+/// `hop.inputconst(hop.r_result, hop.s_result.const)` for a twin whose
+/// annotator result is constant (`SomeObjectTrait.is_constant`) even
+/// when `FunctionRepr.call` still emitted `direct_call` (`rpbc.py`).
+/// `InstanceRepr.convert_const_exact` of a live-addr HostObject is the
+/// `ConstRefAddr` the dual-gate publishes.
+fn ll_const_from_constant_annotation(
+    typed: &Variable,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+) -> Option<Constant> {
+    let rtyper = rtyper?;
+    let ann = typed.annotation.borrow();
+    let s = ann.as_ref()?.as_ref();
+    if !s.is_constant() {
+        return None;
+    }
+    let cv = s.const_()?.clone();
+    let repr = rtyper.getrepr(s).ok()?;
+    crate::translator::rtyper::rmodel::inputconst(repr.as_ref(), &cv).ok()
+}
+
 fn collect_specialize_const_results(
     flow: &GraphRef,
     legacy: &LegacyGraph,
     value_to_var: &LegacyToTyped,
     candidates: Option<&LegacyToTypedCandidates>,
     block_map: Option<&HashMap<crate::model::BlockId, BlockRef>>,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
 ) -> HashMap<Variable, Constant> {
     let mut twin_const: HashMap<Variable, Constant> = HashMap::new();
     for block in flow.borrow().iterblocks() {
@@ -749,15 +776,14 @@ fn collect_specialize_const_results(
             collect_same_as_const_results(block, &mut twin_const);
         }
     }
-    if twin_const.is_empty() {
-        return HashMap::new();
-    }
     let mut out: HashMap<Variable, Constant> = HashMap::new();
     let mut consider = |legacy_var: &Variable| {
-        if let Some(typed) = value_to_var.get(legacy_var)
-            && let Some(c) = twin_const.get(typed)
-        {
-            out.insert(legacy_var.clone(), c.clone());
+        if let Some(typed) = value_to_var.get(legacy_var) {
+            if let Some(c) = twin_const.get(typed) {
+                out.insert(legacy_var.clone(), c.clone());
+            } else if let Some(c) = ll_const_from_constant_annotation(typed, rtyper) {
+                out.insert(legacy_var.clone(), c);
+            }
         }
         if let Some(candidates) = candidates
             && let Some(vars) = candidates.get(legacy_var)
@@ -765,6 +791,8 @@ fn collect_specialize_const_results(
             for typed in vars {
                 if let Some(c) = twin_const.get(typed) {
                     out.entry(legacy_var.clone()).or_insert_with(|| c.clone());
+                } else if let Some(c) = ll_const_from_constant_annotation(typed, rtyper) {
+                    out.entry(legacy_var.clone()).or_insert(c);
                 }
             }
         }
@@ -854,8 +882,28 @@ fn opkind_from_rtyper_constant(c: &Constant) -> Option<OpKind> {
             Some(crate::model::ConcreteType::GcRef) => Some(OpKind::ConstRefNull),
             _ => Some(OpKind::ConstNone),
         },
-        ConstValue::ByteStr(s) => Some(OpKind::ConstStr(s.clone())),
-        ConstValue::UniStr(s) => Some(OpKind::ConstInternedStr(s.as_bytes().to_vec())),
+        ConstValue::ByteStr(s) => match kind {
+            Some(crate::model::ConcreteType::GcRef) | None => Some(OpKind::ConstStr(s.clone())),
+            _ => None,
+        },
+        // `rstr.py AbstractUniCharRepr.convert_const` stores a one-character
+        // unicode scalar as UniStr whose type is UniChar. `history.py getkind`
+        // of UniChar is `'int'`; `jtransform` maps UniChar to ConstInt.
+        // Emitting ConstInternedStr (GC unicode, kind `'r'`) onto that dest
+        // trips assembler.rs "ConstInternedStr dest must be Ref".
+        ConstValue::UniStr(s) => match kind {
+            Some(crate::model::ConcreteType::GcRef) | None => {
+                Some(OpKind::ConstInternedStr(s.as_bytes().to_vec()))
+            }
+            Some(crate::model::ConcreteType::Signed) => {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(ch), None) => Some(OpKind::ConstInt(ch as i64)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
         ConstValue::HostObject(obj) => Some(OpKind::ConstRef(obj.clone())),
         ConstValue::LLPtr(p) if llptr_is_null(p) => match kind {
             Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
@@ -897,6 +945,31 @@ pub(crate) fn op_is_null_fn_call(kind: &OpKind) -> bool {
     )
 }
 
+/// `rpbc.py` `FunctionReprBase.call` always emits `direct_call` even
+/// when `hop.s_result` is constant, then returns the fresh Variable
+/// (or `None` when `hop.r_result is impossible_repr`).
+/// `rtyper.py` `translate_hl_to_ll` renames that Variable onto
+/// `op.result`, so the Call stays. Replacing it is correct only when
+/// the constant *is* the call: a memo live-addr (`ConstRefAddr`,
+/// `InstanceRepr.convert_const_exact`) or a null function pointer
+/// (`ConstInt` / `ConstFnAddr`, `history.py` getkind of `Ptr(FuncType)`
+/// is `'int'`).
+///
+/// A constant unit / `()` / `SomeNone` dest is the Void RESULT of a
+/// real callee (`rtuple.py` `TUPLE_TYPE([])` is Void). Dropping that
+/// Call hides the callee from `enum_pending_graphs`.
+fn rtyper_const_replaces_call(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::ConstRefAddr(_)
+            | OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstInt128(_)
+            | OpKind::ConstUInt128(_)
+            | OpKind::ConstFnAddr { .. }
+    )
+}
+
 /// Replace FunctionGraph ops whose flowspace twin `specialize_block`
 /// rewrote to a Constant, so jtransform sees a `Const*` the way
 /// `jtransform.py` sees the rtyper's `Constant`.
@@ -925,6 +998,12 @@ pub(crate) fn apply_rtyper_const_results(
             let Some(new_kind) = opkind_from_rtyper_constant(c) else {
                 continue;
             };
+            if matches!(op.kind, OpKind::Call { .. } | OpKind::IndirectCall { .. })
+                && (matches!(c.concretetype.as_ref(), Some(LowLevelType::Void))
+                    || !rtyper_const_replaces_call(&new_kind))
+            {
+                continue;
+            }
             if let Some(ct) = c.concretetype.clone() {
                 result.set_concretetype(Some(ct));
             }
@@ -1215,6 +1294,83 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
         }
     }
     operands
+}
+
+/// Block inputargs whose coloring is only as a `direct_call` /
+/// `indirect_call` argument. `GraphFlattener.insert_renamings` drops
+/// Void from those links, `CallControl.getcalldescr` `NON_VOID_ARGS`
+/// and `Transformer.make_three_lists` drop them from the call, and
+/// `GraphFlattener.enforce_input_args` skips a Void startblock arg, so
+/// `GraphFlattener.getcolor` never sees them.
+///
+/// A raise evalue, exitswitch, comparison, or field operand still
+/// hits `getcolor` and must reject `GcRef`→`Void`. A same-block op
+/// *result* used as a Call arg (the Family C `is_null` on an
+/// unfollowed `Result::Ok` extract) is not an inputarg, so it stays
+/// rejected until TDC drops the arm.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn flatten_drops_void_call_arg_phis(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut call_arg_phis = std::collections::HashSet::new();
+    let mut strict = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        // pyre MIR may reuse one Variable as a predecessor result and as a
+        // successor inputarg (`checkgraph` forbids that in RPython). Only
+        // an inputarg of the *Call's* block is the FrozenPBC phi flatten
+        // drops; a Family C Ok-extract that is also the returnblock's
+        // inputarg must not qualify.
+        let block_inputargs: std::collections::HashSet<Variable> =
+            block.inputargs.iter().cloned().collect();
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call { args, .. } => {
+                    for v in crate::model::call_arg_vars(args) {
+                        if block_inputargs.contains(&v) {
+                            call_arg_phis.insert(v);
+                        }
+                    }
+                }
+                OpKind::IndirectCall { funcptr, args, .. } => {
+                    strict.insert(funcptr.clone());
+                    for v in args {
+                        if block_inputargs.contains(v) {
+                            call_arg_phis.insert(v.clone());
+                        }
+                    }
+                }
+                other => {
+                    for v in crate::front::result_exc::op_operand_vars(other) {
+                        strict.insert(v);
+                    }
+                }
+            }
+        }
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                strict.insert(v.clone());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    strict.insert(v.clone());
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            if link.target != graph.exceptblock {
+                continue;
+            }
+            if let Some(crate::model::LinkArg::Value(v)) = link.args.get(1) {
+                strict.insert(v.clone());
+            }
+        }
+    }
+    call_arg_phis
+        .into_iter()
+        .filter(|v| !strict.contains(v))
+        .collect()
 }
 
 /// Variables that appear more than once within a single block's
@@ -1743,6 +1899,7 @@ fn collect_divergences_on(
 ) -> Vec<String> {
     let reachable_vars = reachable_defined_vars(legacy_graph);
     let colored_operands = colored_operand_vars(legacy_graph);
+    let void_dropped_call_arg_phis = flatten_drops_void_call_arg_phis(legacy_graph);
     let duplicate_inputargs = duplicate_inputarg_vars(legacy_graph);
     let dead_op_results = dead_op_result_vars(legacy_graph);
     let switch_discriminant_reads = switch_discriminant_read_vars(legacy_graph);
@@ -1811,9 +1968,18 @@ fn collect_divergences_on(
         // forwarded solely into the `returnblock`, emitted as
         // `void_return` without coloring).  Keep the colored case a
         // divergence → Skip to legacy.
+        //
+        // Exception: a FrozenPBC (`SingleFrozenPBCRepr.lowleveltype` is
+        // Void) forwarded as a Call argument through a phi. Flatten
+        // drops Void link args (`GraphFlattener.insert_renamings`) and
+        // the codewriter drops Void call args (`CallControl.getcalldescr`
+        // `NON_VOID_ARGS`, `Transformer.make_three_lists`). That phi is
+        // colored as a Call arg here, but getcolor never sees it. See
+        // [`flatten_drops_void_call_arg_phis`]. Raise evalue, switch,
+        // and comparison stay rejected.
         let real_refines_gcref_to_void = legacy_kind == ConcreteType::GcRef
             && real_kind == ConcreteType::Void
-            && !colored_operands.contains(var);
+            && (!colored_operands.contains(var) || void_dropped_call_arg_phis.contains(var));
         // A `legacy=GcRef, real=Signed` pair is accepted: the real
         // (annotate→rtype) path is authoritative and it refined a genuine
         // integer.  The hitters are oparg-decoded values — a `LOAD_FAST`
@@ -5771,23 +5937,31 @@ fn drive_lifted_subject(
     // `graph.startblock` and writes `Variable.annotation` for each
     // op result.  Mirrors upstream `RPythonAnnotator.complete()`
     // (`annrpython.py`), which loops `complete_pending_blocks`
-    // → policy hook → exit-on-empty.  Without this drain, the
-    // `addpendingblock(startblock, inputcells)` queued just above
-    // stays in `genpendingblocks`, `annotated[block]` remains the
-    // `None` sentinel, and `specialize_block` (`rtyper.rs:1656`)
-    // panics on "annotator.annotated[block] is False sentinel".
+    // → `AnnotatorPolicy.no_more_blocks_to_annotate` → exit-on-empty.
+    // Without this drain, the `addpendingblock(startblock, inputcells)`
+    // queued just above stays in `genpendingblocks`, `annotated[block]`
+    // remains the `None` sentinel, and `specialize_block`
+    // (`rtyper.rs`) panics on "annotator.annotated[block] is False
+    // sentinel". The policy hook is `MemoTable.finish`
+    // (`specialize.py`): it synthesises the memo dispatch graph so
+    // `compute_at_fixpoint` → `build_calltable_row` sees a
+    // `FunctionGraph` rather than the annotation `memo()` returns
+    // before finish. Dual-gate still omits `complete()`'s return-var
+    // / blocked-graph tail (replicated as `raise_if_subject_blocked`
+    // below, plus the Phase-A `seed_all_annotated_return_vars`
+    // barrier).
     annotator
-        .complete_pending_blocks()
+        .complete_pending_blocks_and_specializations()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
     // Orthodox `complete()` blocked-annotation guard
     // (annrpython.py): a block that stayed in the `None` (False)
     // sentinel state after the fixpoint drain is permanently
     // `BlockedInference`. Upstream `complete()` raises here, before
-    // `simplify`/`compute_at_fixpoint`. The dual-gate calls
-    // `complete_pending_blocks` (the bare drain) instead of
-    // `complete()`, so the guard is replicated here; the error reuses
-    // the "complete_pending_blocks failed" prefix already recognised by
-    // `is_known_unported`, routing the subject to the legacy walker.
+    // `simplify`/`compute_at_fixpoint`. Dual-gate keeps that tail off
+    // `complete()` so a blocked subject can Skip to the legacy walker
+    // without aborting the shared session; the error reuses the
+    // "complete_pending_blocks failed" prefix already recognised by
+    // `is_known_unported`.
     annotator
         .raise_if_subject_blocked()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
@@ -9654,12 +9828,14 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
+    let rtyper = call_registry.session_if_started().map(|(_, rtyper)| rtyper);
     let const_results = collect_specialize_const_results(
         &graph,
         legacy,
         &value_to_var,
         Some(&value_to_var_candidates),
         Some(&block_map),
+        rtyper.as_ref(),
     );
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
@@ -9674,6 +9850,68 @@ mod tests {
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+    #[test]
+    fn unistr_unichar_constant_is_const_int_not_interned_str() {
+        let c = Constant::with_concretetype(ConstValue::UniStr("z".into()), LowLevelType::UniChar);
+        assert_eq!(
+            opkind_from_rtyper_constant(&c),
+            Some(OpKind::ConstInt(b'z' as i64))
+        );
+    }
+
+    #[test]
+    fn unistr_without_type_stays_interned_str() {
+        let c = Constant::new(ConstValue::UniStr("hello".into()));
+        assert_eq!(
+            opkind_from_rtyper_constant(&c),
+            Some(OpKind::ConstInternedStr(b"hello".to_vec()))
+        );
+    }
+
+    /// `rtuple.py` `TUPLE_TYPE([])` is Void; a leftover `direct_call`
+    /// whose dest harvested as that unit constant must stay a Call
+    /// (`rpbc.py` `FunctionReprBase.call`).
+    #[test]
+    fn apply_rtyper_const_results_keeps_void_unit_call() {
+        let mut graph = LegacyGraph::new("void_unit_call");
+        let entry = graph.startblock;
+        let dest = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "pyre_object",
+                        "listobject",
+                        "w_list_append_inner",
+                    ]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+        dest.set_concretetype(Some(LowLevelType::Void));
+        graph.set_return(entry, None);
+        let mut const_results = std::collections::HashMap::new();
+        const_results.insert(
+            dest.clone(),
+            Constant::with_concretetype(ConstValue::None, LowLevelType::Void),
+        );
+        apply_rtyper_const_results(&mut graph, &const_results);
+        let op = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&dest))
+            .expect("void Call dest must remain");
+        assert!(
+            matches!(op.kind, OpKind::Call { .. }),
+            "void unit Call must stay, got {:?}",
+            op.kind
+        );
+    }
 
     #[test]
     fn std_alloc_raw_is_declined_and_unregistered() {
@@ -17138,6 +17376,127 @@ mod tests {
             1,
             "legacy=GcRef, real=Void on a colored raise evalue is a divergence, \
              not the accepted returnblock unit drop"
+        );
+    }
+
+    /// `start(v1) -> mid(v1)` with `mid` calling through `v1`. `v1` is a
+    /// phi colored only as a Call argument — `SingleFrozenPBCRepr` Void
+    /// that `GraphFlattener.insert_renamings` / `CallControl.getcalldescr`
+    /// drop.
+    fn diff_call_arg_phi(legacy_kind: ConcreteType, real_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_call_arg_phi");
+        let vars = mint_vars(&mut graph, 3);
+        let v1 = vars[1].clone();
+        let v2 = vars[2].clone();
+        let mid_id = BlockId(7);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(v1.clone())],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(v2.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["callee"]),
+                    args: crate::model::call_args(vec![v1.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v2.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1, legacy_kind);
+        let mut real_state = HashMap::new();
+        real_state.insert(v1, real_kind);
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_accepts_gcref_to_void_on_call_arg_phi() {
+        assert!(
+            diff_call_arg_phi(ConcreteType::GcRef, ConcreteType::Void).is_empty(),
+            "legacy=GcRef, real=Void on a Call-arg FrozenPBC phi is a dropped \
+             Void, not a divergence"
+        );
+    }
+
+    /// Same-block op result used as a Call arg is Family C: flatten still
+    /// serializes the call until TDC drops the arm, so Void stays rejected.
+    fn diff_same_block_call_arg(legacy_kind: ConcreteType, real_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_same_block_call_arg");
+        let vars = mint_vars(&mut graph, 2);
+        let v1 = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: vec![],
+            operations: vec![
+                crate::model::SpaceOperation {
+                    result: Some(v1.clone()),
+                    kind: crate::model::OpKind::ConstRefNull,
+                },
+                crate::model::SpaceOperation {
+                    result: None,
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::function_path(["is_null"]),
+                        args: crate::model::call_args(vec![v1.clone()]),
+                        result_ty: ValueType::Bool,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1, legacy_kind);
+        let mut real_state = HashMap::new();
+        real_state.insert(v1, real_kind);
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_rejects_gcref_to_void_on_same_block_call_arg() {
+        assert_eq!(
+            diff_same_block_call_arg(ConcreteType::GcRef, ConcreteType::Void).len(),
+            1,
+            "legacy=GcRef, real=Void on a same-block Call-arg op result is a \
+             divergence until TDC drops the arm"
         );
     }
 

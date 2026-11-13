@@ -239,6 +239,28 @@ pub(crate) fn lower_function_with_static_addrs(
     }
 }
 
+/// Lower the FunDecl at `fun_decl_id`. Charon's `name_path()` is
+/// `{module}::<Impl>::{leaf}` for every inherent impl in a module, so
+/// [`lower_function_with_static_addrs`] via `local_fn` binds the first
+/// match (`InternalSpaceCache::getorbuild` vs `SpaceCache::getorbuild`).
+pub(crate) fn lower_fun_decl_id_with_static_addrs(
+    llbc: &Llbc,
+    fun_decl_id: u64,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<FunctionGraph, LowerError> {
+    let missing = || LowerError::FunctionNotFound(format!("def_id {fun_decl_id}"));
+    if let Some(shared) = as_production_llbc(llbc) {
+        with_shared_lowering(shared, |ctx| {
+            let fd = shared.fn_by_id(fun_decl_id).ok_or_else(missing)?;
+            lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
+        })
+    } else {
+        let fd = llbc.fn_by_id(fun_decl_id).ok_or_else(missing)?;
+        let context = LowerContext::new(llbc);
+        lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+    }
+}
+
 pub(crate) fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {

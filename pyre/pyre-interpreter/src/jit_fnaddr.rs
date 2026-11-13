@@ -7527,7 +7527,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         // These are the concrete prebuilt GC instances corresponding to
         // PyPy's `space.fromcache(StrategyClass)` results (`w_none` shape:
         // OnceLock accessor, `malloc_typed_immortal`). The registered
-        // address is the GC object, not the lock.
+        // address is the GC object, not the lock. ClassDictStrategy's
+        // row is the PREBUILT space's fromcache holder
+        // (`typeobject.py W_TypeObject.getdict`, `classdict.py
+        // ClassDictStrategy`); `Cache.getorbuild` specialize:memo folds
+        // `space.fromcache(X)` for that space to this constant.
         (
             "dictmultiobject::OBJECT_DICT_STRATEGY_REF",
             pyre_object::dictmultiobject::object_dict_strategy_ref() as *const _ as i64,

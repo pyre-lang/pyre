@@ -106,6 +106,36 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
     Some((owner_qualified, leaf))
 }
 
+/// Classes whose inherent `_freeze_` returns True
+/// (`bookkeeper.py` `immutablevalue` `hasattr(x, '_freeze_')`).
+///
+/// The owner is [`impl_method_owner_for_fundecl`] of each FunDecl whose
+/// impl leaf is `_freeze_` (`Cache._freeze_`, `ObjSpace._freeze_`,
+/// `InternalSpaceCache._freeze_`). Both the crate-stripped owner path
+/// and its leaf are inserted so intern-key lookup matches either
+/// spelling (`lookup_immutable_fields_entries`).
+pub(crate) fn harvest_freeze_classes_from_llbcs<L: std::borrow::Borrow<Llbc>>(
+    llbcs: &[L],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for llbc in llbcs {
+        let llbc = llbc.borrow();
+        for fd in llbc.iter_local_fns() {
+            let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+                continue;
+            };
+            if leaf != "_freeze_" || owner.is_empty() {
+                continue;
+            }
+            if let Some((_, ty_leaf)) = owner.rsplit_once("::") {
+                out.insert(ty_leaf.to_string());
+            }
+            out.insert(owner);
+        }
+    }
+    out
+}
+
 /// The call path of a provided trait method (`src: {"TraitDefault": ..}`)
 /// called at a concrete `Self`: `[owner(Self), leaf]`, qualified like an
 /// impl owner.  The default body is generic over `Self`, so the call site's

@@ -72,9 +72,8 @@ use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::flowspace_adapter::const_ref_gcref_constant;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, GCREF, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
+    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -3377,24 +3376,38 @@ impl InstanceRepr {
         host_obj: &HostObject,
     ) -> Result<Constant, TyperError> {
         // Live refs-registered immortal (`bookkeeper.py
-        // Bookkeeper.immutablevalue`, `rclass.py
-        // InstanceRepr.convert_const_exact`). Emit the GCREF `_ptr`
-        // `IntCast` of that row (`const_ref_gcref_constant`); never a
-        // translation-time malloc copy.
+        // Bookkeeper.immutablevalue`). RPython `convert_const_exact`
+        // returns `create_instance()` whose type is `self.lowleveltype`
+        // (the instance struct ptr). Skip the translation-time malloc
+        // copy and emit an `_ptr` `IntCast` of the live address with
+        // that same type (`lltype.py` `_ptr._cast_to` of an `int` obj
+        // rebuilds `_ptr(PTRTYPE, n, solid=True)`). A GCREF-typed
+        // IntCast here makes `rtype_getattr` of a constant payload
+        // (`hop.r_result` is this InstanceRepr) fail the rtyper.py
+        // type-consistency check. `Ptr(GcStruct)` is still `'ref'`
+        // (`history.py getkind`), so `opkind_from_rtyper_constant`
+        // folds the IntCast to `ConstRefAddr`.
         if let Some(addr) = host_obj.live_ref_addr() {
             if let Some(cached) = self.iprebuiltinstances.borrow().get(host_obj).cloned() {
                 return Ok(Constant::with_concretetype(
                     ConstValue::LLPtr(Box::new(cached)),
-                    GCREF.clone(),
+                    self.lowleveltype.clone(),
                 ));
             }
-            let constant = const_ref_gcref_constant(Some(addr));
-            if let ConstValue::LLPtr(ptr) = &constant.value {
-                self.iprebuiltinstances
-                    .borrow_mut()
-                    .insert(host_obj.clone(), ptr.as_ref().clone());
-            }
-            return Ok(constant);
+            Repr::setup(self.as_ref() as &dyn Repr)?;
+            let LowLevelType::Ptr(ptr_t) = self.lowleveltype.clone() else {
+                return Err(TyperError::message(
+                    "InstanceRepr.convert_const_exact: live_addr repr is not a Ptr",
+                ));
+            };
+            let p = _ptr::new_with_solid(*ptr_t, Ok(Some(lltype::_ptr_obj::IntCast(addr))), true);
+            self.iprebuiltinstances
+                .borrow_mut()
+                .insert(host_obj.clone(), p.clone());
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(p)),
+                self.lowleveltype.clone(),
+            ));
         }
         // upstream `try: return self.iprebuiltinstances[value]`.
         if let Some(cached) = self.iprebuiltinstances.borrow().get(host_obj).cloned() {
@@ -3861,28 +3874,30 @@ impl Repr for InstanceRepr {
                 .to_string()
         };
 
+        // Ptr bound method on a pointer-carrying instance: the
+        // annotator answers `getattr(p, "is_null")` / `"deref"` with a
+        // `SomeBuiltinMethod` the way `SomePtr.getattr` would
+        // (unaryop.rs `ptr_method_is_null` / `ptr_method_as_ref`;
+        // receivers that upstream keeps as `SomePtr` are carried as
+        // `SomeInstance` by pyre's pointer erasure). Mirror
+        // `PtrRepr.rtype_getattr`'s ADT-method pass-through (rptr.py
+        // `if isinstance(hop.s_result, SomeLLADTMeth): return
+        // hop.inputarg(hop.r_result, arg=0)`): the bound method is
+        // represented as its receiver (`BuiltinMethodRepr.lowleveltype
+        // == self_repr.lowleveltype`, rbuiltin.py). `inputargs(self)`
+        // would `convert_const` the live-addr constant while
+        // `hop.r_result` is already the instance struct ptr; the
+        // producing op rtyped the receiver, so forward that value.
+        // `BuiltinMethodRepr.rtype_simple_call` then dispatches
+        // through `rtype_method`.
+        if matches!(s_result_clone.as_ref(), Some(SomeValue::BuiltinMethod(_))) {
+            return Ok(Some(hop.args_v.borrow()[0].clone()));
+        }
+
         // upstream: `vinst, vattr = hop.inputargs(self, Void)` (rclass.py).
         let void = LowLevelType::Void;
         let vlist = hop.inputargs(vec![ConvertedTo::Repr(self), ConvertedTo::from(&void)])?;
         let vinst = vlist[0].clone();
-
-        // Ptr bound method on a pointer-carrying instance: the
-        // annotator answers `getattr(p, "is_null")` with a
-        // `SomeBuiltinMethod` the way `SomePtr.getattr` would
-        // (unaryop.rs `ptr_method_is_null`; receivers that upstream
-        // keeps as `SomePtr` are carried as `SomeInstance` by pyre's
-        // pointer erasure). Mirror `PtrRepr.rtype_getattr`'s
-        // ADT-method pass-through (rptr.py `if isinstance(
-        // hop.s_result, SomeLLADTMeth): return hop.inputarg(
-        // hop.r_result, arg=0)`): the bound method is represented as
-        // its receiver (`BuiltinMethodRepr.lowleveltype ==
-        // self_repr.lowleveltype`, rbuiltin.py), so getattr
-        // forwards the receiver value unchanged and
-        // `BuiltinMethodRepr.rtype_simple_call` dispatches the call
-        // back through `rtype_method` below.
-        if matches!(s_result_clone.as_ref(), Some(SomeValue::BuiltinMethod(_))) {
-            return Ok(Some(vinst));
-        }
 
         // upstream rclass.py:843-846:
         //     if attr == '__class__' and hop.r_result.lowleveltype is Void:
@@ -4221,11 +4236,20 @@ impl Repr for InstanceRepr {
             let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
             return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
         }
-        // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref` on a
-        // pointer-carrying instance: the receiver is already the
+        // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref` / `Deref::deref`
+        // on a pointer-carrying instance: the receiver is already the
         // nullable pointer word (`ptr_method_as_ref`). Identity.
-        if method_name == "as_ref" || method_name == "as_mut" {
-            return hop.inputarg(self, 0).map(Some);
+        // `inputarg(self)` would `convert_const` the live-addr constant
+        // while `hop.r_result` is already the instance struct ptr;
+        // `rtype_simple_call` already rebound arg0 to the producing
+        // op's rtyped receiver (rbuiltin.py
+        // `BuiltinMethodRepr.rtype_simple_call`).
+        if method_name == "as_ref"
+            || method_name == "as_mut"
+            || method_name == "deref"
+            || method_name == "deref_mut"
+        {
+            return Ok(Some(hop.args_v.borrow()[0].clone()));
         }
         if method_name == "to_exc_object" {
             let is_pyerror = self.classdef.as_ref().is_some_and(|classdef| {
@@ -4472,6 +4496,14 @@ impl Repr for InstanceRepr {
             None => false,
         };
         if !exact_match {
+            // rustc `Result::Ok` annotation stores the payload V in
+            // `const_box` (`wrap_memo_v_as_result_ok` / `try_wrap_constant_enum_cast`).
+            // The HostObject is V, not an instance of `Result::Ok`; convert
+            // it as this variant (`convert_const_exact` live_addr recast).
+            if classdef_is_result_ok(&self.classdef) {
+                let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+                return arc_self.convert_const_exact(&host_obj);
+            }
             // upstream: `if classdef.commonbase(self.classdef) !=
             //              self.classdef: raise TyperError(...)`.
             //   Subclass-relationship check; self must be a base of the
@@ -5067,7 +5099,34 @@ pub(super) fn pair_instance_instance_convert_from_to(
             )
             .map(Hlvalue::Variable));
     }
+    // rustc `Cache.getorbuild` is `Result<V, E>`; memo's host_call and
+    // `MemoTable.finish` graph return `V`. `pycall_memo` annotates the
+    // call as `Result::Ok` wrapping that V (`unaryop.rs` `__pos_0`).
+    // RPython has no Result ADT; recast the payload the way a successful
+    // isinstance downcast does (`cast_pointer`).
+    if classdef_is_result_ok(&r_ins2.classdef) {
+        return Ok(llops
+            .genop(
+                "cast_pointer",
+                vec![v.clone()],
+                GenopResult::LLType(r_ins2.lowleveltype.clone()),
+            )
+            .map(Hlvalue::Variable));
+    }
     Ok(None)
+}
+
+fn classdef_is_result_ok(classdef: &Option<Rc<RefCell<ClassDef>>>) -> bool {
+    let Some(cd) = classdef else {
+        return false;
+    };
+    let name = cd.borrow().name.clone();
+    let Some((parent, leaf)) = name.rsplit_once("::") else {
+        return false;
+    };
+    let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
+    let parent_leaf = majit_ir::descr::strip_generic_args(parent_leaf);
+    leaf.split('<').next() == Some("Ok") && parent_leaf.as_ref() == "Result"
 }
 
 /// The low-level side of the annotator's `union(SomeInstance(None),
@@ -6734,10 +6793,11 @@ mod tests {
     }
 
     #[test]
-    fn convert_const_exact_live_addr_is_gcref_intcast_not_struct() {
+    fn convert_const_exact_live_addr_is_intcast_not_struct() {
         // `rclass.py InstanceRepr.convert_const_exact` of a live
-        // refs-registered immortal is the GCREF `_ptr` IntCast of that
-        // row (`const_ref_gcref_constant`), never a translation-time
+        // refs-registered immortal is an `_ptr` IntCast of that address
+        // whose type is `self.lowleveltype` (the instance struct ptr
+        // `create_instance` would return), never a translation-time
         // malloc copy.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{HostGetAttrError, HostObject, NativeInstanceDict};
@@ -6777,7 +6837,7 @@ mod tests {
         let c2 = (inst.as_ref() as &dyn Repr)
             .convert_const(&value)
             .expect("convert_const(live)#2");
-        assert_eq!(c1.concretetype.as_ref(), Some(&*GCREF));
+        assert_eq!(c1.concretetype.as_ref(), Some(inst.lowleveltype()));
         let (ConstValue::LLPtr(p1), ConstValue::LLPtr(p2)) = (&c1.value, &c2.value) else {
             panic!(
                 "convert_const must produce LLPtr, got {:?} / {:?}",
@@ -6791,7 +6851,7 @@ mod tests {
         assert_eq!(
             p1._hashable_identity(),
             p2._hashable_identity(),
-            "iprebuiltinstances cache must return the same live GCREF"
+            "iprebuiltinstances cache must return the same live ptr"
         );
         assert!(
             !matches!(p1._obj0_value(), Ok(Some(lltype::_ptr_obj::Struct(_)))),

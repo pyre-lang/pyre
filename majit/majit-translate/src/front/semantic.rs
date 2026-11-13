@@ -1265,6 +1265,10 @@ pub struct SemanticProgram {
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
+    /// Classes whose inherent `_freeze_` returns True
+    /// (`bookkeeper.py` `immutablevalue` `hasattr(x, '_freeze_')`).
+    /// Harvested from FunDecls whose impl leaf is `_freeze_`.
+    pub freeze_classes: std::collections::HashSet<String>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// `rclass.py getgcflavor` / `getinstancerepr` build a raw
     /// `InstanceRepr` for those classdefs. Each key is the class intern

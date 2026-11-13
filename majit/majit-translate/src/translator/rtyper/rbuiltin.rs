@@ -5628,6 +5628,14 @@ pub fn rtype_cast_instance_intrinsic(
     use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::GenopResult;
 
+    // Dead Result::Err CAST of a constant Ok payload
+    // (`try_wrap_constant_enum_cast`). `translate_no_return_value`
+    // (`rtyper.py`) sets Void when the typer returns None.
+    if matches!(hop.s_result.borrow().as_ref(), Some(SomeValue::Impossible)) {
+        hop.exception_cannot_occur()?;
+        return Ok(None);
+    }
+
     let r_result =
         hop.r_result.borrow().as_ref().cloned().ok_or_else(|| {
             TyperError::message("rtype_cast_instance_intrinsic: missing r_result")
@@ -10158,6 +10166,25 @@ mod tests {
         hop.args_s.borrow_mut().push(s_fat);
         hop.args_r.borrow_mut().push(Some(r_fat.clone()));
         (hop, r_fat, v_h)
+    }
+
+    #[test]
+    fn rtype_cast_instance_intrinsic_impossible_result_is_none() {
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+        let out =
+            rtype_cast_instance_intrinsic(&hop, &HashMap::new()).expect("Impossible s_result");
+        assert!(
+            out.is_none(),
+            "Impossible s_result yields no value, got {out:?}"
+        );
+        assert!(
+            hop.llops.borrow()._called_exception_is_here_or_cannot_occur,
+            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
+        );
     }
 
     #[test]

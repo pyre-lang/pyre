@@ -500,6 +500,7 @@ pub(crate) fn absorb_semantic_program(
             }
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
+            acc.freeze_classes.extend(prog.freeze_classes);
             for hint in prog.exception_class_hints {
                 crate::front::llbc_hints::push_program_exception_class_hint(
                     &mut acc.exception_class_hints,
@@ -711,6 +712,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
+            freeze_classes: std::collections::HashSet::new(),
             raw_alloc_flavor_structs: std::collections::HashSet::new(),
             exception_class_hints: Vec::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
@@ -3361,6 +3363,7 @@ impl CrateLoweringState {
             // (the `attributes` array carries DocComment / Outer but not our
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
+            freeze_classes: std::collections::HashSet::new(),
             raw_alloc_flavor_structs: self.raw_alloc_flavor_structs.clone(),
             exception_class_hints: self.exception_class_hints.clone(),
             enum_variant_by_discriminant,
@@ -7397,6 +7400,11 @@ pub struct LowerContext<'a> {
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
     /// `_immutable_fields_<Struct>` for this artefact, harvested once.
     immutable_fields: ImmutableFieldsTable,
+    /// Enum `discriminant → variant` tables from this artefact
+    /// (`derive_program_metadata`). Dual-gate tests seed the bookkeeper
+    /// with the same map production `CallControl` carries.
+    enum_variant_by_discriminant:
+        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
 }
 
 impl<'a> LowerContext<'a> {
@@ -7430,13 +7438,14 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
-            llbc,
-            &gc_struct_ids,
-            &immutable_fields,
-            &raw_alloc_flavor_structs,
-            llbc_exception_class_hints(llbc),
-        );
+        let (_, _, struct_fields, enum_variant_by_discriminant, _, struct_field_attrs, _, _) =
+            derive_program_metadata(
+                llbc,
+                &gc_struct_ids,
+                &immutable_fields,
+                &raw_alloc_flavor_structs,
+                llbc_exception_class_hints(llbc),
+            );
         Self {
             llbc,
             struct_field_attrs,
@@ -7446,6 +7455,7 @@ impl<'a> LowerContext<'a> {
             gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,
+            enum_variant_by_discriminant,
         }
     }
 
@@ -7457,6 +7467,30 @@ impl<'a> LowerContext<'a> {
         let mut registry = struct_field_registry_from_rows(&self.struct_fields);
         registry.gc_struct_ids = self.gc_struct_ids.clone();
         registry
+    }
+
+    /// `FORCE_ATTRIBUTES_INTO_CLASSES` from this artefact's field tables
+    /// (`classdesc.py`, `analyze_pipeline` Tier-3). Dual-gate tests that
+    /// look inside a lowered body need the same seed as the production
+    /// annotator so `getattr` of a struct field is not blocked.
+    pub fn seed_force_attributes(&self) {
+        let mut entries: Vec<_> = self.struct_field_attrs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (qualified, fields) in entries {
+            let layout_pairs = self.struct_fields.get(qualified).cloned();
+            crate::annotator::classdesc::register_struct_fields_with_layout(
+                qualified,
+                fields,
+                layout_pairs.as_deref(),
+            );
+        }
+    }
+
+    /// Harvested enum `discriminant → variant` table for this artefact.
+    pub fn enum_variant_by_discriminant(
+        &self,
+    ) -> &std::collections::HashMap<String, std::collections::HashMap<i64, String>> {
+        &self.enum_variant_by_discriminant
     }
 }
 
@@ -7809,16 +7843,17 @@ pub(crate) use self::lltype::{
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    fixed_array_index_identity, fnptr_indirect_enabled, harvest_freeze_classes_from_llbcs,
+    host_rthread_threadlocalref_llop, is_cow_str_family_class_root, is_flattened_storage_leaf,
+    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr,
+    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
+    stamp_fn_ptr_spelling, strip_crate_prefix, struct_item_flexible_gcarray_block_annotation,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

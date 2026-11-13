@@ -488,11 +488,15 @@ impl<F: SpaceCallable<S>, S> InternalSpaceCache<F, S> {
         }
     }
 
-    pub fn getorbuild(
-        &self,
-        callable: F,
-    ) -> Result<F::Value, majit_rlib::cache::CacheError<F::Error>> {
-        self.base.getorbuild(callable, self)
+    #[inline(always)]
+    pub fn getorbuild(&self, callable: F) -> F::Value {
+        // `cache.py` `Cache.getorbuild` raises RuntimeError on recursive
+        // construction. `unwrap_or_else` mints a rustc `FnOnce` closure
+        // (`call_once`) in the Err arm; a `match` is the raise.
+        match self.base.getorbuild(callable, self) {
+            Ok(v) => v,
+            Err(_) => panic!("recursive object-space cache construction"),
+        }
     }
 
     pub fn _freeze_(&self) -> bool {
@@ -558,6 +562,17 @@ mod space_cache_tests {
     }
 
     #[test]
+    fn space_cache_class_from_discriminant_tracks_all() {
+        for cls in super::SpaceCacheClass::ALL {
+            assert!(super::SpaceCacheClass::from_discriminant(cls as i64) == Some(cls));
+        }
+        assert!(
+            super::SpaceCacheClass::from_discriminant(super::SpaceCacheClass::ALL.len() as i64)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn space_cache_delegates_and_keeps_per_space_identity() {
         let a = Owner::new(11);
         let b = Owner::new(22);
@@ -603,11 +618,11 @@ mod space_cache_tests {
     fn internal_space_cache_keys_the_callable_and_passes_its_space() {
         let a = InternalSpaceCache::<Callable, _>::new(11);
         let b = InternalSpaceCache::<Callable, _>::new(22);
-        let first = a.getorbuild(Callable(1)).unwrap();
+        let first = a.getorbuild(Callable(1));
         assert_eq!(*first, (11, 1));
-        assert!(Arc::ptr_eq(&first, &a.getorbuild(Callable(1)).unwrap()));
-        assert_eq!(*a.getorbuild(Callable(2)).unwrap(), (11, 2));
-        let other = b.getorbuild(Callable(1)).unwrap();
+        assert!(Arc::ptr_eq(&first, &a.getorbuild(Callable(1))));
+        assert_eq!(*a.getorbuild(Callable(2)), (11, 2));
+        let other = b.getorbuild(Callable(1));
         assert_eq!(*other, (22, 1));
         assert!(!Arc::ptr_eq(&first, &other));
         assert!(a._freeze_());
@@ -661,12 +676,18 @@ impl SpaceCacheClass {
         }
     }
 
+    /// Reverse of the fieldless enum discriminant (`cls as i64`).
+    /// Derived from [`Self::ALL`] so a new variant cannot desync.
     pub fn from_discriminant(d: i64) -> Option<Self> {
-        match d {
-            0 => Some(Self::ClassDictStrategy),
-            1 => Some(Self::SysState),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|&cls| cls as i64 == d)
+    }
+
+    /// Last path segment of [`Self::jit_ref_name`].
+    pub fn type_leaf(self) -> &'static str {
+        self.jit_ref_name()
+            .rsplit("::")
+            .next()
+            .unwrap_or(self.jit_ref_name())
     }
 }
 
@@ -695,6 +716,7 @@ impl<T> RetainedSpaceCache<T> {
         }
     }
 
+    #[inline(always)]
     fn retain_owner(self) -> Self {
         Self {
             keep_alive: self.keep_alive.retain(),
@@ -714,6 +736,7 @@ impl<T> RetainedSpaceCache<T> {
 impl<T> std::ops::Deref for RetainedSpaceCache<T> {
     type Target = T;
 
+    #[inline(always)]
     fn deref(&self) -> &T {
         &self.inner
     }
@@ -735,9 +758,21 @@ impl SpaceCacheInstance {
         }
     }
 
+    /// Immortal pointer fields `InstanceSource.all_instance_attributes`
+    /// enumerates on the live fromcache object (`classdesc.py`).
+    pub fn immortal_ptr_fields(&self) -> Vec<(&'static str, i64)> {
+        match self {
+            Self::ClassDictStrategy(cache) => {
+                vec![("holder", cache.strategy_ref() as *const _ as i64)]
+            }
+            Self::SysState(_) => Vec::new(),
+        }
+    }
+
     /// Attach IsolatedStrong to a cloned cache so an escaped result keeps
     /// its isolated space alive. The stored clone is left untouched.
-    fn retain_owner(self) -> Self {
+    #[inline(always)]
+    pub(crate) fn retain_owner(self) -> Self {
         match self {
             Self::ClassDictStrategy(cache) => Self::ClassDictStrategy(cache.retain_owner()),
             Self::SysState(cache) => Self::SysState(cache.retain_owner()),
@@ -809,8 +844,8 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
         &self,
         space: &SpaceHandle,
     ) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>> {
-        // Store Isolated(Weak). IsolatedStrong is attached only to the
-        // clone `fromcache` returns (`SpaceCacheInstance::retain_owner`).
+        // Store Isolated(Weak). IsolatedStrong is attached only by
+        // `SpaceCacheInstance::retain_owner` on an escaped clone.
         Ok(match self {
             Self::ClassDictStrategy => {
                 SpaceCacheInstance::ClassDictStrategy(RetainedSpaceCache::stored(
@@ -873,7 +908,6 @@ impl Default for SpaceAttr {
 pub struct ObjSpace {
     fromcache: InternalSpaceCache<SpaceCacheClass, SpaceHandle>,
     sys_state: crate::module::sys::state::SysState,
-    class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy,
     gateway_cache: crate::gateway::GatewayCache,
     type_cache: crate::objspace::std::typeobject::TypeCache,
     /// `space.w_object` and `space.w_type`: `StdObjSpace.initialize` does
@@ -901,7 +935,6 @@ impl ObjSpace {
             base: majit_rlib::cache::Cache::EMPTY,
         },
         sys_state: crate::module::sys::state::SysState::new(),
-        class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(),
         gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::ProcessWide),
         type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::ProcessWide),
         w_object: SpaceAttr::new(),
@@ -928,10 +961,6 @@ impl ObjSpace {
         if self.w_default_lazy_import.get().is_null() {
             self.w_default_lazy_import.set(w_func);
         }
-    }
-
-    pub fn class_dict_strategy(&self) -> &crate::objspace::std::classdict::ClassDictStrategy {
-        &self.class_dict_strategy
     }
 
     pub fn gateway_cache(&self) -> &crate::gateway::GatewayCache {
@@ -993,7 +1022,6 @@ impl ObjSpace {
         let space = std::sync::Arc::new_cyclic(|space| Self {
             fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
             sys_state: crate::module::sys::state::SysState::new(),
-            class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(),
             gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::Isolated(space.clone())),
             type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::Isolated(
                 space.clone(),
@@ -1012,11 +1040,18 @@ impl ObjSpace {
         space
     }
 
+    /// `baseobjspace.py ObjSpace._freeze_`. The translated space is a
+    /// prebuilt PBC (`bookkeeper.py immutablevalue`).
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+
+    /// `baseobjspace.py` `self.fromcache = InternalSpaceCache(self).getorbuild`.
+    /// Isolated callers that need the result to outlive the space Arc
+    /// attach IsolatedStrong with [`SpaceCacheInstance::retain_owner`].
+    #[inline(always)]
     pub fn fromcache(&self, cls: SpaceCacheClass) -> SpaceCacheInstance {
-        self.fromcache
-            .getorbuild(cls)
-            .unwrap_or_else(|_| panic!("recursive object-space cache construction"))
-            .retain_owner()
+        self.fromcache.getorbuild(cls)
     }
 
     /// Address of this space's `fromcache` `Cache` (`cache.py Cache`).
@@ -1061,6 +1096,7 @@ static OBJECT_SPACE_ROOTS: parking_lot::Mutex<Vec<std::sync::Weak<ObjSpace>>> =
     parking_lot::Mutex::new(Vec::new());
 
 /// The process-wide object-space owner, shared by threads.
+#[inline(always)]
 pub fn object_space() -> &'static ObjSpace {
     &OBJECT_SPACE
 }

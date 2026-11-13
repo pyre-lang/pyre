@@ -4713,6 +4713,11 @@ pub struct CallControl {
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
     /// `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    /// Classes whose inherent `_freeze_` returns True
+    /// (`bookkeeper.py` `immutablevalue`). Threaded onto the dual-gate
+    /// bookkeeper so interned classdescs receive NativeCallable
+    /// `_freeze_` returning True.
+    pub freeze_classes: HashSet<String>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// Threaded onto the dual-gate bookkeeper so interned classdescs
     /// receive `class_set("_alloc_flavor_", "raw")` (`rclass.py
@@ -5434,6 +5439,7 @@ impl CallControl {
             array_header_size: crate::layout::target_word_size(),
             struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
+            freeze_classes: HashSet::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
             immutable_array_types: HashSet::new(),

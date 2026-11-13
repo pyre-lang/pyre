@@ -204,6 +204,9 @@ impl CodeWriter {
         registry
             .bookkeeper()
             .set_immutable_fields_structs(callcontrol.immutable_fields_by_struct.clone());
+        registry
+            .bookkeeper()
+            .set_freeze_classes(callcontrol.freeze_classes.clone());
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.

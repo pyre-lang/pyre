@@ -1323,6 +1323,23 @@ impl RPythonTyper {
         hop: &HighLevelOp,
         varmapping: &mut HashMap<Variable, Hlvalue>,
     ) -> Result<(), TyperError> {
+        // rtyper.py `translate_hl_to_ll` always `hop.dispatch()` first.
+        // Void analysers bind Impossible (`consider_op` of None); the
+        // call typer still emits `direct_call` and then returns None
+        // (`rpbc.py` FunctionReprBase.call, `r_result is
+        // impossible_repr`). Skipping dispatch here dropped those
+        // calls, so look-inside callees were never pending graphs.
+        // Dead Result::Err CASTs are also Impossible; they are
+        // `simple_call` of `__cast_instance_intrinsic` and
+        // `rtype_cast_instance_intrinsic` returns None. Other
+        // Impossible ops (getattr of an unfollowed arm) have no
+        // side effects — skip dispatch, then `translate_no_return_value`.
+        if matches!(hop.s_result.borrow().as_ref(), Some(SomeValue::Impossible))
+            && !matches!(hop.spaceop.opname.as_str(), "simple_call" | "call_args")
+        {
+            hop.exception_cannot_occur()?;
+            return self.translate_no_return_value(hop);
+        }
         let resultvar = hop.dispatch()?;
 
         // rtyper.py:437-441 exception-catch audit.
@@ -2987,13 +3004,26 @@ impl HighLevelOp {
     pub fn setup(&self) -> Result<(), TyperError> {
         let rtyper = &self.rtyper;
         *self.args_v.borrow_mut() = self.spaceop.args.clone();
+        // `rtyper.py` `binding` raises KeyError; `specialize_block`
+        // wraps that as `gottypererror` with the spaceop. A panic here
+        // skips that wrapper (`dual_gate` catch_unwind sees only the
+        // Variable). Route the same KeyError text through `TyperError`
+        // so the failing op is in the Skip reason.
+        let bind = |a: &Hlvalue| -> Result<SomeValue, TyperError> {
+            let ann = rtyper
+                .annotator
+                .upgrade()
+                .expect("RPythonTyper.annotator weak reference dropped");
+            ann.annotation(a)
+                .ok_or_else(|| TyperError::message(format!("KeyError: no binding for arg {a:?}")))
+        };
         let args_s: Vec<SomeValue> = self
             .spaceop
             .args
             .iter()
-            .map(|a| rtyper.binding(a))
-            .collect();
-        *self.s_result.borrow_mut() = Some(rtyper.binding(&self.spaceop.result));
+            .map(bind)
+            .collect::<Result<Vec<_>, _>>()?;
+        *self.s_result.borrow_mut() = Some(bind(&self.spaceop.result)?);
         let mut args_r: Vec<Option<Arc<dyn Repr>>> = Vec::with_capacity(args_s.len());
         for s_a in &args_s {
             args_r.push(Some(rtyper.getrepr(s_a)?));
@@ -8479,6 +8509,60 @@ mod tests {
         assert!(
             err.to_string().contains("annotator doesn't agree"),
             "error message did not mention annotator disagreement: {err}",
+        );
+    }
+
+    #[test]
+    fn translate_hl_to_ll_impossible_getattr_skips_dispatch() {
+        // getattr of an unfollowed arm is Impossible and has no side
+        // effects: skip dispatch, then `translate_no_return_value`.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let result_var = Variable::new();
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
+        let observer = result_var.clone();
+        let spaceop =
+            SpaceOperation::new("getattr".to_string(), vec![], Hlvalue::Variable(result_var));
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+        rtyper
+            .translate_hl_to_ll(&hop, &mut HashMap::new())
+            .unwrap();
+        assert_eq!(observer.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn translate_hl_to_ll_impossible_simple_call_reaches_dispatch() {
+        // rtyper.py always dispatches `simple_call`. An empty hop has
+        // no rtype_simple_call binding, so dispatch errors — the
+        // getattr-style skip would have returned Ok(Void) instead.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let result_var = Variable::new();
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+        *hop.r_result.borrow_mut() =
+            Some(crate::translator::rtyper::rmodel::impossible_repr() as std::sync::Arc<dyn Repr>);
+        let err = rtyper
+            .translate_hl_to_ll(&hop, &mut HashMap::new())
+            .expect_err("empty simple_call must dispatch");
+        assert!(
+            !err.to_string().contains("annotator doesn't agree"),
+            "dispatch must run before translate_no_return_value: {err}"
         );
         assert!(
             err.to_string().contains("simple_call"),

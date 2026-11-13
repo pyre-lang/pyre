@@ -1299,12 +1299,30 @@ dict_storage_gc_type_id!(
     "Runtime-assigned GC type id for a `DictStrategyRef` holder."
 );
 
+/// Allocate one immortal `DictStrategyRef` (`malloc_typed_immortal`).
+///
+/// `define_prebuilt_dict_strategy_ref!` interns one process-wide result;
+/// a fromcache `_build` (`baseobjspace.py InternalSpaceCache._build`,
+/// `classdict.py ClassDictStrategy`) calls this once per space.
+pub fn alloc_prebuilt_dict_strategy_ref(
+    kind: StrategyKind,
+    imp: &'static dyn DictStrategy,
+) -> &'static DictStrategyRef {
+    unsafe {
+        &*crate::lltype::malloc_typed_immortal(DictStrategyRef {
+            kind,
+            imp,
+            owner: std::ptr::null_mut(),
+        })
+    }
+}
+
 /// Rewrite a prebuilt holder's GC header type id, keeping its immortal flags.
 ///
-/// `define_prebuilt_dict_strategy_ref!` accessors allocate through
-/// `malloc_typed_immortal`, which stamps tid 0 when no collector has
-/// registered `DictStrategyRef` yet. `build_gc` restamps the live tid
-/// after `register_leaf_storage_box` publishes it, the way
+/// `alloc_prebuilt_dict_strategy_ref` / `define_prebuilt_dict_strategy_ref!`
+/// allocate through `malloc_typed_immortal`, which stamps tid 0 when no
+/// collector has registered `DictStrategyRef` yet. `build_gc` restamps the
+/// live tid after `register_leaf_storage_box` publishes it, the way
 /// `GCTypeLayoutBuilder.consider_constant` visits prebuilts after type
 /// ids are assigned.
 pub fn stamp_prebuilt_dict_strategy_ref(holder: &'static DictStrategyRef, tid: u32) {
@@ -7439,11 +7457,8 @@ macro_rules! define_prebuilt_dict_strategy_ref {
         #[inline]
         pub fn $accessor() -> &'static $crate::dictmultiobject::DictStrategyRef {
             let addr = *$cell.get_or_init(|| {
-                $crate::lltype::malloc_typed_immortal($crate::dictmultiobject::DictStrategyRef {
-                    kind: $kind,
-                    imp: $imp,
-                    owner: ::std::ptr::null_mut(),
-                }) as usize
+                $crate::dictmultiobject::alloc_prebuilt_dict_strategy_ref($kind, $imp) as *const _
+                    as usize
             });
             unsafe { &*(addr as *const $crate::dictmultiobject::DictStrategyRef) }
         }

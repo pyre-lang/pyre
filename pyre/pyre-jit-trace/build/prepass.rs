@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v26";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v29";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -264,23 +264,59 @@ fn specialize_memo_host_call() -> majit_translate::flowspace::model::HostCall {
 
     struct LiveRef {
         addr: i64,
+        fields: HashMap<String, ConstValue>,
     }
     impl NativeInstanceDict for LiveRef {
-        fn get(&self, _name: &str) -> Result<ConstValue, HostGetAttrError> {
-            Err(HostGetAttrError::Missing)
+        fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
+            self.fields
+                .get(name)
+                .cloned()
+                .ok_or(HostGetAttrError::Missing)
         }
         fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
-            Ok(Vec::new())
+            Ok(self.fields.keys().cloned().collect())
         }
         fn live_addr(&self) -> Option<i64> {
             Some(self.addr)
         }
     }
 
+    fn intern_live(
+        intern: &Mutex<HashMap<i64, HostObject>>,
+        classes: &Mutex<HashMap<String, HostObject>>,
+        addr: i64,
+        qualname: &str,
+        fields: HashMap<String, ConstValue>,
+    ) -> HostObject {
+        {
+            let intern = intern.lock().expect("memo intern");
+            if let Some(existing) = intern.get(&addr) {
+                return existing.clone();
+            }
+        }
+        let class = {
+            let mut classes = classes.lock().expect("memo classes");
+            classes
+                .entry(qualname.to_string())
+                .or_insert_with(|| HostObject::new_class(qualname, Vec::new()))
+                .clone()
+        };
+        let host = HostObject::new_native_instance(class, Arc::new(LiveRef { addr, fields }));
+        intern
+            .lock()
+            .expect("memo intern")
+            .entry(addr)
+            .or_insert(host)
+            .clone()
+    }
+
     let space = pyre_interpreter::object_space();
     let mut prebuilt = vec![space as *const _ as i64, space.fromcache_cache_addr()];
     for cls in SpaceCacheClass::ALL {
         prebuilt.push(space.fromcache(cls).live_addr());
+        for (_, addr) in space.fromcache(cls).immortal_ptr_fields() {
+            prebuilt.push(addr);
+        }
     }
     let intern = Mutex::new(HashMap::<i64, HostObject>::new());
     let classes = Mutex::new(HashMap::<String, HostObject>::new());
@@ -303,9 +339,7 @@ fn specialize_memo_host_call() -> majit_translate::flowspace::model::HostCall {
         let key = args.iter().find_map(|arg| match arg {
             ConstValue::Int(n) => SpaceCacheClass::from_discriminant(*n),
             ConstValue::HostObject(h) => SpaceCacheClass::ALL.into_iter().find(|cls| {
-                let name = cls.jit_ref_name();
-                let leaf = name.rsplit("::").next().unwrap_or(name);
-                h.simple_name() == leaf || h.qualname().contains(name)
+                h.qualname() == cls.jit_ref_name() || h.simple_name() == cls.type_leaf()
             }),
             _ => None,
         });
@@ -315,20 +349,16 @@ fn specialize_memo_host_call() -> majit_translate::flowspace::model::HostCall {
         let inst = pyre_interpreter::object_space().fromcache(key);
         let addr = inst.live_addr();
         let qualname = key.jit_ref_name();
-        let mut intern = intern.lock().expect("memo intern");
-        if let Some(existing) = intern.get(&addr) {
-            return Ok(ConstValue::HostObject(existing.clone()));
+        let mut fields = HashMap::new();
+        for (name, field_addr) in inst.immortal_ptr_fields() {
+            let field_qual = format!("{qualname}::{name}");
+            let field_host =
+                intern_live(&intern, &classes, field_addr, &field_qual, HashMap::new());
+            fields.insert(name.to_string(), ConstValue::HostObject(field_host));
         }
-        let class = {
-            let mut classes = classes.lock().expect("memo classes");
-            classes
-                .entry(qualname.to_string())
-                .or_insert_with(|| HostObject::new_class(qualname, Vec::new()))
-                .clone()
-        };
-        let host = HostObject::new_native_instance(class, Arc::new(LiveRef { addr }));
-        intern.insert(addr, host.clone());
-        Ok(ConstValue::HostObject(host))
+        Ok(ConstValue::HostObject(intern_live(
+            &intern, &classes, addr, qualname, fields,
+        )))
     }))
 }
 

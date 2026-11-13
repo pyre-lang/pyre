@@ -241,6 +241,7 @@ fn build_semantic_program_via_active_frontend(
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
+            let mut freeze_classes = std::collections::HashSet::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
@@ -365,6 +366,9 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                freeze_classes.extend(front::mir::harvest_freeze_classes_from_llbcs(
+                    std::slice::from_ref(&llbc),
+                ));
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -479,6 +483,7 @@ fn build_semantic_program_via_active_frontend(
                 known_trait_names: std::collections::HashSet::new(),
                 struct_fields: front::semantic::StructFieldRegistry::default(),
                 immutable_fields: std::collections::HashMap::new(),
+                freeze_classes: std::collections::HashSet::new(),
                 raw_alloc_flavor_structs: std::collections::HashSet::new(),
                 exception_class_hints: Vec::new(),
                 enum_variant_by_discriminant: std::collections::HashMap::new(),
@@ -498,6 +503,7 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.freeze_classes = freeze_classes;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             return (program, gc_struct_ids);
@@ -1977,6 +1983,7 @@ fn analyze_pipeline_from_module_paths(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
+    call_control.freeze_classes = program.freeze_classes.clone();
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.

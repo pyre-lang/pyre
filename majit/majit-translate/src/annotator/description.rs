@@ -2319,6 +2319,13 @@ impl FunctionDesc {
             // `memo` returns the union-of-results annotation directly.
             SpecializeResult::Annotation(s) => *s,
         };
+        // RPython `Cache.getorbuild` returns `V`. The rustc body is
+        // `Result<V, E>` and callers match `__discriminant`. Memo's
+        // host_call yields `V`; wrap a constant success as `Result::Ok`
+        // so the existing variant getattr (`unaryop.rs` `__discriminant`
+        // / `__pos_0`) unwraps it. `try_wrap_constant_enum_cast` is the
+        // same wrap the `__cast_instance_intrinsic` path uses.
+        let s_result = wrap_memo_v_as_result_ok(&self.base.bookkeeper, s_result)?;
         // upstream: `s_result = unionof(s_result, s_previous_result)`.
         super::model::unionof([&s_result, s_previous_result])
             .map_err(|e| AnnotatorError::new(format!("MemoDesc.pycall unionof: {}", e)))
@@ -2537,6 +2544,45 @@ impl FunctionDesc {
         }
         Ok(s_sigs)
     }
+}
+
+/// RPython `Cache.getorbuild` returns `V`. rustc's body is `Result<V, E>`
+/// and callers match `__discriminant` / `__pos_0`. Memo `host_call` yields
+/// `V`; wrap a constant instance as `Result::Ok` so the existing variant
+/// getattr (`unaryop.rs`) unwraps it. Integers stay integers — a memo
+/// unit test returns `Int`. Already-`Result::Ok` is identity. Keyed on
+/// `specialize:memo` (`pycall_memo` only), not function names.
+fn wrap_memo_v_as_result_ok(
+    bk: &Rc<Bookkeeper>,
+    s: SomeValue,
+) -> Result<SomeValue, AnnotatorError> {
+    if !s.is_constant() {
+        return Ok(s);
+    }
+    if let SomeValue::Instance(inst) = &s {
+        if let Some(cd) = &inst.classdef {
+            let name = cd.borrow().name.clone();
+            if let Some((parent, leaf)) = name.rsplit_once("::") {
+                let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
+                let parent_leaf = majit_ir::descr::strip_generic_args(parent_leaf);
+                if leaf.split('<').next() == Some("Ok") && parent_leaf.as_ref() == "Result" {
+                    return Ok(s);
+                }
+            }
+        }
+    } else {
+        return Ok(s);
+    }
+    let Some(payload) = s.const_().cloned() else {
+        return Ok(s);
+    };
+    let classdef = match bk.getuniqueclassdef_for_enum_variant("Result", "Ok") {
+        Ok(cd) => cd,
+        Err(_) => return Ok(s),
+    };
+    let mut inst = SomeInstance::new(Some(classdef), false, std::collections::BTreeMap::new());
+    inst.base.const_box = Some(Constant::new(payload));
+    Ok(SomeValue::Instance(inst))
 }
 
 /// RPython `class MemoDesc(FunctionDesc)` (description.py).
@@ -4908,6 +4954,71 @@ mod tests {
             !s.is_constant(),
             "two distinct results must not be constant"
         );
+    }
+
+    /// rustc `Cache.getorbuild` is `Result<V, E>`; a memo that returns a
+    /// primitive stays a primitive so `pycall` of int-returning memos
+    /// (`getdesc_routes_memo_function_to_memodesc_pycall`) is unchanged.
+    #[test]
+    fn wrap_memo_v_as_result_ok_keeps_constant_int() {
+        let (_ann, bk) = ann_bk();
+        let mut s_int = super::super::model::SomeInteger::new(true, false);
+        s_int.base.const_box = Some(Constant::new(ConstValue::Int(10)));
+        let s = wrap_memo_v_as_result_ok(&bk, SomeValue::Integer(s_int)).expect("wrap");
+        assert!(matches!(s, SomeValue::Integer(_)), "got {s:?}");
+        assert_eq!(s.const_(), Some(&ConstValue::Int(10)));
+    }
+
+    /// `build_calltable_row` asserts `isinstance(graph, FunctionGraph)`
+    /// (`description.py`). `memo()` returns an annotation until
+    /// `MemoTable.finish` (`specialize.py`) synthesises the dispatch
+    /// graph; `AnnotatorPolicy.no_more_blocks_to_annotate` is what
+    /// drains `pending_specializations`.
+    #[test]
+    fn consider_call_site_of_memo_needs_pending_specialization_finish() {
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let (ann, bk) = ann_bk();
+        let mut func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        func.annspecialcase = Some("specialize:memo".to_string());
+        func.host_call = Some(HostCall(Arc::new(|args: &[ConstValue]| {
+            match args.first() {
+                Some(ConstValue::Bool(true)) => Ok(ConstValue::Int(10)),
+                other => Err(format!("unexpected memo arg: {other:?}")),
+            }
+        })));
+        let host = HostObject::new_user_function(func);
+        let entry = bk.getdesc(&host).expect("getdesc");
+        let fd = entry.as_function().expect("function");
+        let mut s_true = super::super::model::SomeBool::new();
+        s_true.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+        let args = ArgumentsForTranslation::new(vec![Some(SomeValue::Bool(s_true))], None, None);
+        entry
+            .as_func_entry()
+            .and_then(|fe| fe.as_memo())
+            .expect("memo")
+            .borrow()
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .expect("memo pycall");
+        assert!(
+            !ann.bookkeeper.pending_specializations.borrow().is_empty(),
+            "MemoTable.register_finish must queue finish"
+        );
+        let err =
+            FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
+                .expect_err("get_graph must reject the annotation until finish");
+        assert!(
+            err.to_string()
+                .contains("annotation where a FunctionGraph was expected"),
+            "got {err}"
+        );
+        ann.policy
+            .borrow()
+            .no_more_blocks_to_annotate(&ann)
+            .expect("MemoTable.finish");
+        FunctionDesc::consider_call_site(&[fd], &args, &SomeValue::Impossible, None)
+            .expect("finish synthesises the dispatch graph for get_graph");
     }
 
     /// A plain function and a memo desc are the one [`DescEntry::Func`]
