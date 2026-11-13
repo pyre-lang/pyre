@@ -430,7 +430,7 @@ fn run_startup_file(
     // is renamed afterwards the way `compile_source_named_by_bytes` does.
     let (source_path, filename_bytes) =
         pyre_interpreter::split_code_filename_bytes(filename_bytes, None);
-    let compiled = pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
+    let compiled = pyre_interpreter::syntax_warnings::compile_with_codegen_warnings_and_module(
         &source,
         Mode::Exec,
         &display,
@@ -441,6 +441,7 @@ fn run_startup_file(
                 as usize,
             ..Default::default()
         },
+        crate::main_name_for_warnings(canonical),
     );
     let outcome = match compiled {
         Ok(code) => {

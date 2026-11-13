@@ -1974,6 +1974,18 @@ enum MainProgram<'a> {
     Bytecode(Box<dyn FnOnce() -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> + 'a>),
 }
 
+/// `pythonrun.c run_mod` / `_PyRun_StringFlagsWithName`: the module a
+/// top-level compile reports its syntax warnings under is `globals['__name__']`,
+/// so `-W action:::__main__` filters the script, `-c` and the startup file.
+/// A namespace without `__name__` leaves it unset (`PY_NULL`), and the filter
+/// falls back to matching the filename.
+pub(crate) fn main_name_for_warnings(
+    w_globals: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::w_dict_getitem_str(w_globals, "__name__") }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
 fn eval_program_in_main(
     program: MainProgram<'_>,
     filename: &str,
@@ -2037,35 +2049,43 @@ fn eval_program_in_main(
         }
         MainProgram::Source(read_source, mode) => {
             let text = read_source();
-            let code = match pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
-                &text,
-                mode,
-                rustpython_wtf8::Wtf8::new(filename),
-                CompileOpts {
-                    optimize: importing::optimize_flag(),
-                    debug_ranges: importing::code_debug_ranges_flag(),
-                    int_max_str_digits: pyre_interpreter::module::sys::state::int_max_str_digits()
-                        .max(0) as usize,
-                    ..Default::default()
-                },
-            ) {
-                Ok(code) => code,
-                Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(e)) => {
-                    let mut err = pyre_interpreter::compile_err_to_syntax_error(e, &text, mode);
-                    if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
-                        pyre_interpreter::eprint_syntax_error(&err);
+            let code =
+                match pyre_interpreter::syntax_warnings::compile_with_codegen_warnings_and_module(
+                    &text,
+                    mode,
+                    rustpython_wtf8::Wtf8::new(filename),
+                    CompileOpts {
+                        optimize: importing::optimize_flag(),
+                        debug_ranges: importing::code_debug_ranges_flag(),
+                        int_max_str_digits:
+                            pyre_interpreter::module::sys::state::int_max_str_digits().max(0)
+                                as usize,
+                        ..Default::default()
+                    },
+                    main_name_for_warnings(canonical),
+                ) {
+                    Ok(code) => code,
+                    Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(e)) => {
+                        let mut err = pyre_interpreter::compile_err_to_syntax_error(e, &text, mode);
+                        if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+                            pyre_interpreter::eprint_syntax_error(&err);
+                        }
+                        if prompt_requested(run_code) {
+                            return finish_or_inspect(
+                                true,
+                                session_context,
+                                canonical,
+                                main_module,
+                            );
+                        }
+                        end_after_startup_failure(canonical, ec_ptr, 1);
                     }
-                    if prompt_requested(run_code) {
-                        return finish_or_inspect(true, session_context, canonical, main_module);
+                    Err(pyre_interpreter::syntax_warnings::SourceCompileError::Warning(error)) => {
+                        let inspect = prompt_requested(run_code);
+                        report_or_end_on_main_error(error, inspect, canonical, ec_ptr);
+                        return finish_or_inspect(inspect, session_context, canonical, main_module);
                     }
-                    end_after_startup_failure(canonical, ec_ptr, 1);
-                }
-                Err(pyre_interpreter::syntax_warnings::SourceCompileError::Warning(error)) => {
-                    let inspect = prompt_requested(run_code);
-                    report_or_end_on_main_error(error, inspect, canonical, ec_ptr);
-                    return finish_or_inspect(inspect, session_context, canonical, main_module);
-                }
-            };
+                };
             source = Some(text);
             PyFrame::new_with_context_and_globals(code, execution_context, canonical)
         }
