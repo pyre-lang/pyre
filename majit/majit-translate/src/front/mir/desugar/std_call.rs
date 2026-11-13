@@ -65,11 +65,23 @@ pub(in crate::front::mir) struct AtomicReceiverSources {
     pub address: bool,
 }
 
-/// `core::mem::replace` / `swap` / `take` (and the `std::mem` re-exports).
-/// [`Lowering::try_lower_mem_exchange`] inlines these as `old = place; place = new`.
+/// `Option::take` is `mem::replace(self, None)`; [`Lowering::try_lower_mem_exchange`] inlines it as `old = place; place = None`.
+pub(in crate::front::mir) fn is_option_take_path(name: &str) -> bool {
+    matches!(
+        name,
+        "core::option::<Impl>::take" | "std::option::<Impl>::take"
+    )
+}
+
+/// `core::mem::replace` / `swap` / `take` (and the `std::mem` re-exports),
+/// and inherent `Option::take` (`core::option::<Impl>::take` /
+/// `std::option::<Impl>::take`).
+/// [`Lowering::try_lower_mem_exchange`] inlines these as `old = place; place = new`
+/// (`Option::take` stores `None`).
 pub(in crate::front::mir) fn is_inlined_mem_exchange_path(name: &str) -> bool {
-    (name.starts_with("core::mem::") || name.starts_with("std::mem::"))
-        && matches!(name.rsplit("::").next(), Some("replace" | "swap" | "take"))
+    ((name.starts_with("core::mem::") || name.starts_with("std::mem::"))
+        && matches!(name.rsplit("::").next(), Some("replace" | "swap" | "take")))
+        || is_option_take_path(name)
 }
 
 /// Matched in full. `std::array::from_fn` is this `core::` item in LLBC.
@@ -986,6 +998,7 @@ impl<'a> Lowering<'a> {
         if !is_inlined_mem_exchange_path(&name) {
             return Ok(false);
         }
+        let option_take = is_option_take_path(&name);
         let leaf = name.rsplit("::").next();
         let arg_address = |this: &Self, index: usize| -> Option<Variable> {
             let local = arg_locals.get(index).copied().flatten()?;
@@ -1064,8 +1077,9 @@ impl<'a> Lowering<'a> {
                 self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
             }
             Some("take") if args.len() == 1 => {
-                if let Some(acc) =
-                    self.string_accumulator_of_take_arg(arg_locals.first().copied().flatten())
+                if !option_take
+                    && let Some(acc) =
+                        self.string_accumulator_of_take_arg(arg_locals.first().copied().flatten())
                 {
                     // `std::mem::take(&mut acc)` on a String / Wtf8Buf
                     // accumulator is `old = place; place = empty`
@@ -1119,25 +1133,37 @@ impl<'a> Lowering<'a> {
                     if let Some(place) = self.bare_deref_place(&slot)
                         && self.move_plan(&place.ty).is_some()
                     {
-                        // `mem::take` is `replace(dest, <T as Default>::default())`.
-                        // Resolve that call before any read: a missing impl
-                        // leaves the whole `take` residual and emits nothing.
-                        let Some(target) = self.default_call_for_take(reg, &place.ty) else {
-                            return Ok(false);
+                        let fresh = if option_take {
+                            // `Option::take` is `replace(self, None)`: no
+                            // `Default` bound. The new value is the same
+                            // `Rvalue::Aggregate` of the `None` variant
+                            // `build_rvalue` emits for a fieldless Adt None.
+                            let Some(fresh) = self.emit_option_none(mir_bb, &place.ty)? else {
+                                return Ok(false);
+                            };
+                            fresh
+                        } else {
+                            // `mem::take` is `replace(dest, <T as Default>::default())`.
+                            // Resolve that call before any read: a missing impl
+                            // leaves the whole `take` residual and emits nothing.
+                            let Some(target) = self.default_call_for_take(reg, &place.ty) else {
+                                return Ok(false);
+                            };
+                            let result_ty = self.value_type_of(&place.ty);
+                            let bb_id = self.emit_bb(mir_bb);
+                            let fresh = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(fresh.clone()),
+                                kind: OpKind::Call {
+                                    target,
+                                    args: Vec::new(),
+                                    result_ty,
+                                },
+                            });
+                            fresh
                         };
-                        let result_ty = self.value_type_of(&place.ty);
-                        let bb_id = self.emit_bb(mir_bb);
-                        let fresh = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(fresh.clone()),
-                            kind: OpKind::Call {
-                                target,
-                                args: Vec::new(),
-                                result_ty,
-                            },
-                        });
                         let Some(old) =
                             self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
                         else {
@@ -1145,11 +1171,28 @@ impl<'a> Lowering<'a> {
                         };
                         self.local_var[dest_local] = Some(LocalValue::One(old));
                     } else {
-                        let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
-                            return Ok(false);
+                        let fresh = if option_take {
+                            // `Option::take` is `replace(self, None)`: no
+                            // `Default` bound. The new value is the same
+                            // `Rvalue::Aggregate` of the `None` variant
+                            // `build_rvalue` emits for a fieldless Adt None.
+                            // A scalar `zero_for_mem_slot` would store
+                            // integer 0 into a pointer niche.
+                            let MemSlot::Place(place) = &slot else {
+                                return Ok(false);
+                            };
+                            let Some(fresh) = self.emit_option_none(mir_bb, &place.ty)? else {
+                                return Ok(false);
+                            };
+                            fresh
+                        } else {
+                            let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                                return Ok(false);
+                            };
+                            zero
                         };
                         let old = self.read_mem_slot(mir_bb, &slot)?;
-                        self.write_mem_slot(mir_bb, slot, zero)?;
+                        self.write_mem_slot(mir_bb, slot, fresh)?;
                         self.local_var[dest_local] = Some(LocalValue::One(old));
                     }
                 }
@@ -1161,6 +1204,53 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `None` of `dest_ty` as `Lowering::build_rvalue` builds an MIR
+    /// `Rvalue::Aggregate` of the Adt `None` variant with no fields.
+    pub(in crate::front::mir) fn emit_option_none(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(kind) = self.option_none_aggregate_kind(dest_ty) else {
+            return Ok(None);
+        };
+        let (op, var) = self.build_rvalue(mir_bb, Rvalue::Aggregate(kind, Vec::new()), dest_ty)?;
+        if let Some(op) = op {
+            let bb_id = self.emit_bb(mir_bb);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: op,
+            });
+        }
+        Ok(Some(var))
+    }
+
+    /// Charon `AggregateKind::Adt` head for `dest_ty`'s `None` variant.
+    /// Same encoding `constructor_fn_item_shape` feeds `aggregate_shape`.
+    pub(in crate::front::mir) fn option_none_aggregate_kind(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<serde_json::Value> {
+        let dest = self
+            .tyref_peel_ref_to_pointee(dest_ty)
+            .unwrap_or_else(|| dest_ty.clone());
+        if !crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+            return None;
+        }
+        let node = strip_ty_indirections(tyref_node(&dest, self.llbc)?, self.llbc)?;
+        let head = node.as_object()?.get("Adt")?.clone();
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => type_decl_ref_adt_id(head.as_object()?)?,
+        };
+        let td = self.llbc.type_by_id(type_id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        let variant_idx = variants.iter().position(|v| v.name == "None")?;
+        Some(serde_json::json!({ "Adt": [head, variant_idx, null] }))
     }
 
     /// `<T as Default>::default` bound by `take`'s trait obligation.
