@@ -5281,9 +5281,14 @@ fn lookup_or_create_shared_unwind(
                     args.push(old_lasti.into());
                 }
             }
-            old.block().recloseblock(vec![
-                super::flow::Link::new(args, Some(landing.block()), None).into_ref(),
-            ]);
+            let forward = super::flow::Link::new(args, Some(landing.block()), None).into_ref();
+            old.block().recloseblock(vec![forward.clone()]);
+            // The new landing is not emitted yet, so a later edge can still
+            // widen its FrameState in place (`update_catch_landing_state`),
+            // and a local that one edge leaves unbound drops out of the
+            // union.  The retired landing's forwarding link is rewritten
+            // with the exception edges, or it keeps the old arity.
+            landing.add_incoming_exception_link(forward);
         }
         let entry = &mut memo[index];
         entry.landing = landing.clone();
@@ -19922,6 +19927,22 @@ mod tests {
                 .any(|op| op.opname == "loop_header"),
             "callee JUMP_BACKWARD must emit loop_header"
         );
+    }
+
+    #[test]
+    fn generator_kw_call_between_handlers_flattens() {
+        // FOR_ITER's StopIteration landing names the registered class.
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
+        let code = nested_function_code_named(
+            "def mk(t, k):\n    return t\n\
+             def g(it):\n    try:\n        first = next(it)\n    except StopIteration:\n        return\n    \
+             w = mk(first, k=3)\n    try:\n        for x in it:\n            yield x\n    finally:\n        pass\n",
+            "g",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
+        let writer = CodeWriter::new();
+        writer.transform_graph_to_jitcode(code).unwrap();
     }
 
     #[test]

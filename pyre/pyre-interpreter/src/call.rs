@@ -3537,10 +3537,16 @@ fn signature_method_self(sig: &crate::Signature) -> bool {
 /// descriptor is `Type.function` and for a module builtin is `mod.fn`.
 fn clinic_method_bind_name<'a>(sig: &crate::Signature, fname: &'a str) -> &'a str {
     if signature_accepts_keywords(sig) {
-        fname
-            .rsplit_once('.')
-            .map(|(_, name)| name)
-            .unwrap_or(fname)
+        match fname.rsplit_once('.') {
+            // Clinic displays an `__init__` under its class
+            // (`BufferedReader() takes at most 2 arguments (4 given)`).
+            Some((owner, "__init__")) => owner
+                .rsplit_once('.')
+                .map(|(_, name)| name)
+                .unwrap_or(owner),
+            Some((_, name)) => name,
+            None => fname,
+        }
     } else {
         fname
     }
