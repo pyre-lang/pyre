@@ -608,9 +608,15 @@ pub fn pcseq_enabled() -> bool {
 /// Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode).
 /// Diagnostic for pinpointing the op that faults a hardware-signal crash
 /// (SIGBUS/SIGSEGV) which `catch_unwind` cannot capture.
+///
+/// Same load shape as `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`.
+static OPTRACE_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline(always)]
 pub fn optrace_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_OPTRACE").is_some())
+    env_presence_flag(&OPTRACE_FLAG, || {
+        std::env::var_os("MAJIT_OPTRACE").is_some()
+    })
 }
 
 pub fn diag_enabled() -> bool {

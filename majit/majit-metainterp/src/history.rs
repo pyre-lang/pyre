@@ -12,21 +12,59 @@ use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-/// `[funcbox] + argboxes` for residual-call recording. Eight OpRefs stay
-/// inline; `MAX_HOST_CALL_ARITY` is 16, and the common helper arity is 0–3.
-fn call_arg_boxes(func_ref: OpRef, args: &[OpRef]) -> SmallVec<[OpRef; 8]> {
-    let mut call_args = SmallVec::with_capacity(1 + args.len());
-    call_args.push(func_ref);
-    call_args.extend_from_slice(args);
-    call_args
+/// `_build_allboxes` builds `[funcbox] + argboxes`. `_record_helper` then
+/// records with `record0`/`record1`/`record2`/`record3` for those arities,
+/// so the concat is a stack tuple rather than a heap list. Residual calls
+/// still go through `_record_helper_varargs` (`history.record(argboxes)`);
+/// the slice passed to `f` is that `argboxes`.
+fn with_call_arg_boxes<R>(func_ref: OpRef, args: &[OpRef], f: impl FnOnce(&[OpRef]) -> R) -> R {
+    match args.len() {
+        0 => f(&[func_ref]),
+        1 => f(&[func_ref, args[0]]),
+        2 => f(&[func_ref, args[0], args[1]]),
+        3 => f(&[func_ref, args[0], args[1], args[2]]),
+        4 => f(&[func_ref, args[0], args[1], args[2], args[3]]),
+        5 => f(&[func_ref, args[0], args[1], args[2], args[3], args[4]]),
+        6 => f(&[
+            func_ref, args[0], args[1], args[2], args[3], args[4], args[5],
+        ]),
+        7 => f(&[
+            func_ref, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+        ]),
+        _ => {
+            let mut call_args = SmallVec::<[OpRef; 8]>::with_capacity(1 + args.len());
+            call_args.push(func_ref);
+            call_args.extend_from_slice(args);
+            f(&call_args)
+        }
+    }
 }
 
-fn call_arg_boxes_prefixed(first: OpRef, func_ref: OpRef, args: &[OpRef]) -> SmallVec<[OpRef; 8]> {
-    let mut call_args = SmallVec::with_capacity(2 + args.len());
-    call_args.push(first);
-    call_args.push(func_ref);
-    call_args.extend_from_slice(args);
-    call_args
+/// `_build_allboxes(..., prepend_box=first)`: `[prepend, funcbox] + argboxes`.
+fn with_call_arg_boxes_prefixed<R>(
+    first: OpRef,
+    func_ref: OpRef,
+    args: &[OpRef],
+    f: impl FnOnce(&[OpRef]) -> R,
+) -> R {
+    match args.len() {
+        0 => f(&[first, func_ref]),
+        1 => f(&[first, func_ref, args[0]]),
+        2 => f(&[first, func_ref, args[0], args[1]]),
+        3 => f(&[first, func_ref, args[0], args[1], args[2]]),
+        4 => f(&[first, func_ref, args[0], args[1], args[2], args[3]]),
+        5 => f(&[first, func_ref, args[0], args[1], args[2], args[3], args[4]]),
+        6 => f(&[
+            first, func_ref, args[0], args[1], args[2], args[3], args[4], args[5],
+        ]),
+        _ => {
+            let mut call_args = SmallVec::<[OpRef; 8]>::with_capacity(2 + args.len());
+            call_args.push(first);
+            call_args.push(func_ref);
+            call_args.extend_from_slice(args);
+            f(&call_args)
+        }
+    }
 }
 
 /// history.py get_const_ptr_for_string(s)
@@ -3623,24 +3661,25 @@ impl TraceCtx {
         value: Option<Value>,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let call_args = call_arg_boxes(func_ref, args);
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        self.recorder
-            .record_op_with_descr_value(opcode, &call_args, descr.clone(), value)
+        with_call_arg_boxes(func_ref, args, |call_args| {
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            self.recorder
+                .record_op_with_descr_value(opcode, call_args, descr.clone(), value)
+        })
     }
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
@@ -3978,9 +4017,10 @@ impl TraceCtx {
         // `pyjitpl.py opimpl_conditional_call_ir_v` records `condbox`
         // itself, not a ConstInt snapshot of this iteration's value.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let call_args = call_arg_boxes_prefixed(condition, func_ref, args);
-        self.recorder
-            .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
+        with_call_arg_boxes_prefixed(condition, func_ref, args, |call_args| {
+            self.recorder
+                .record_op_with_descr(OpCode::CondCallN, call_args, descr);
+        })
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_i: emit CondCallValueI.
@@ -4015,13 +4055,14 @@ impl TraceCtx {
         resvalue: i64,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let call_args = call_arg_boxes_prefixed(value, func_ref, args);
-        self.recorder.record_op_with_descr_value(
-            OpCode::CondCallValueI,
-            &call_args,
-            descr,
-            Some(Value::Int(resvalue)),
-        )
+        with_call_arg_boxes_prefixed(value, func_ref, args, |call_args| {
+            self.recorder.record_op_with_descr_value(
+                OpCode::CondCallValueI,
+                call_args,
+                descr,
+                Some(Value::Int(resvalue)),
+            )
+        })
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_r: emit CondCallValueR.
@@ -4066,13 +4107,14 @@ impl TraceCtx {
         resvalue: i64,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let call_args = call_arg_boxes_prefixed(value, func_ref, args);
-        self.recorder.record_op_with_descr_value(
-            OpCode::CondCallValueR,
-            &call_args,
-            descr,
-            Some(Value::Ref(majit_ir::GcRef(resvalue as usize))),
-        )
+        with_call_arg_boxes_prefixed(value, func_ref, args, |call_args| {
+            self.recorder.record_op_with_descr_value(
+                OpCode::CondCallValueR,
+                call_args,
+                descr,
+                Some(Value::Ref(majit_ir::GcRef(resvalue as usize))),
+            )
+        })
     }
 
     /// RPython pyjitpl.py opimpl_record_known_result_i / _r: emit RecordKnownResult.
@@ -4120,9 +4162,10 @@ impl TraceCtx {
         // `op.args[0]`'s concretetype).
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_with_effect(arg_types, result_type, extra_info);
-        let call_args = call_arg_boxes_prefixed(result, func_ref, args);
-        self.recorder
-            .record_op_with_descr(OpCode::RecordKnownResult, &call_args, descr);
+        with_call_arg_boxes_prefixed(result, func_ref, args, |call_args| {
+            self.recorder
+                .record_op_with_descr(OpCode::RecordKnownResult, call_args, descr);
+        })
     }
 
     pub fn call_int_typed(
@@ -4290,35 +4333,36 @@ impl TraceCtx {
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_may_force_descr(arg_types, ret_type);
-        let call_args = call_arg_boxes(func_ref, args);
-        // pyjitpl.py `do_residual_call` may-force branch:
-        // `direct_call_may_force` RECORDS first, then
-        // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
-        // runs "based on the CALL_MAY_FORCE operation executed above
-        // in step 2".  This is the inverse of
-        // `_record_helper_varargs`'s invalidate-before-record;
-        // CALL_MAY_FORCE_* / CALL_RELEASE_GIL_* / CALL_ASSEMBLER_* go
-        // through this branch and must keep the record-then-invalidate
-        // order. `execute_and_record_varargs` → `history.record(..., resvalue)`.
-        let result =
-            self.recorder
-                .record_op_with_descr_value(opcode, &call_args, descr.clone(), value);
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        result
+        with_call_arg_boxes(func_ref, args, |call_args| {
+            // pyjitpl.py `do_residual_call` may-force branch:
+            // `direct_call_may_force` RECORDS first, then
+            // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
+            // runs "based on the CALL_MAY_FORCE operation executed above
+            // in step 2".  This is the inverse of
+            // `_record_helper_varargs`'s invalidate-before-record;
+            // CALL_MAY_FORCE_* / CALL_RELEASE_GIL_* / CALL_ASSEMBLER_* go
+            // through this branch and must keep the record-then-invalidate
+            // order. `execute_and_record_varargs` → `history.record(..., resvalue)`.
+            let result =
+                self.recorder
+                    .record_op_with_descr_value(opcode, call_args, descr.clone(), value);
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            result
+        })
     }
 
     pub fn call_may_force_void_typed(
@@ -4361,29 +4405,30 @@ impl TraceCtx {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
-        let call_args = call_arg_boxes(func_ref, args);
-        // pyjitpl.py:2053-2072 (see `call_family_typed` for rationale):
-        // record before invalidate.
-        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
-        let result =
-            self.recorder
-                .record_op_with_descr_value(opcode, &call_args, descr.clone(), value);
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        result
+        with_call_arg_boxes(func_ref, args, |call_args| {
+            // pyjitpl.py:2053-2072 (see `call_family_typed` for rationale):
+            // record before invalidate.
+            // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+            let result =
+                self.recorder
+                    .record_op_with_descr_value(opcode, call_args, descr.clone(), value);
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            result
+        })
     }
 
     pub fn call_may_force_void_typed_with_effect(
@@ -4580,29 +4625,30 @@ impl TraceCtx {
             crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
         let descr_index = descr.index();
         let arg0_int = func_ptr as usize as i64;
-        let call_args = call_arg_boxes(func_ref, args);
-        // pyjitpl.py `_record_helper_varargs` parity (see
-        // `call_typed`): every CALL family record routes through the
-        // canonical heap_cache.invalidate_caches_varargs BEFORE the
-        // history record.
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        let _ = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        with_call_arg_boxes(func_ref, args, |call_args| {
+            // pyjitpl.py `_record_helper_varargs` parity (see
+            // `call_typed`): every CALL family record routes through the
+            // canonical heap_cache.invalidate_caches_varargs BEFORE the
+            // history record.
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            let _ = self
+                .recorder
+                .record_op_with_descr(opcode, call_args, descr.clone());
+        });
         // pyjitpl.py `call_loopinvariant_now_known(allboxes, descr, res)`
         // with `res = None` for void.  Evicts any prior typed entry sharing
         // this (descr, arg0) key so subsequent typed loop-invariant lookups
@@ -4836,30 +4882,30 @@ impl TraceCtx {
             // is enough for the consumers of this method.
             return cached;
         }
-        let call_args = call_arg_boxes(func_ref, args);
-        // pyjitpl.py `_record_helper_varargs` parity (mirror
-        // `call_typed` in trace_ctx.rs). Routes
-        // heapcache.invalidate_caches_varargs BEFORE the history record
-        // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
-        // paths run exactly once per recorded op (heapcache.py).
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        let result = with_call_arg_boxes(func_ref, args, |call_args| {
+            // pyjitpl.py `_record_helper_varargs` parity (mirror
+            // `call_typed` in trace_ctx.rs). Routes
+            // heapcache.invalidate_caches_varargs BEFORE the history record
+            // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
+            // paths run exactly once per recorded op (heapcache.py).
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            self.recorder
+                .record_op_with_descr(opcode, call_args, descr.clone())
+        });
         // Concrete resvalue is unknown to this legacy helper; pass 0.
         self.heap_cache
             .call_loopinvariant_cache(descr_index, arg0_int, result, 0);
@@ -5086,37 +5132,37 @@ impl TraceCtx {
         {
             return cached;
         }
-        let call_args = call_arg_boxes(func_ref, args);
-        // pyjitpl.py `_record_helper_varargs` parity (mirror
-        // `call_typed_with_effect` in trace_ctx.rs). Routes
-        // heapcache.invalidate_caches_varargs BEFORE the history record
-        // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
-        // paths run exactly once per recorded op (heapcache.py).
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
+        let result = with_call_arg_boxes(func_ref, args, |call_args| {
+            // pyjitpl.py `_record_helper_varargs` parity (mirror
+            // `call_typed_with_effect` in trace_ctx.rs). Routes
+            // heapcache.invalidate_caches_varargs BEFORE the history record
+            // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
+            // paths run exactly once per recorded op (heapcache.py).
+            if let Some(call_descr) = descr.as_call_descr() {
+                let oracle: &dyn crate::heapcache::SameConstantOracle =
+                    &crate::history::ConstOprefOracle;
+                let const_value = |opref: OpRef| match opref.inline_const_to_value() {
+                    Some(majit_ir::Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                self.heap_cache_mut().invalidate_caches_varargs(
+                    opcode,
+                    Some(call_descr.get_extra_info()),
+                    call_args,
+                    oracle,
+                    const_value,
+                );
+            }
+            // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+            let resvalue = match ret_type {
+                Type::Int => Some(Value::Int(concrete_resvalue)),
+                Type::Ref => Some(Value::Ref(majit_ir::GcRef(concrete_resvalue as usize))),
+                Type::Float => Some(Value::Float(f64::from_bits(concrete_resvalue as u64))),
+                Type::Void => None,
             };
-            self.heap_cache_mut().invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
-        let resvalue = match ret_type {
-            Type::Int => Some(Value::Int(concrete_resvalue)),
-            Type::Ref => Some(Value::Ref(majit_ir::GcRef(concrete_resvalue as usize))),
-            Type::Float => Some(Value::Float(f64::from_bits(concrete_resvalue as u64))),
-            Type::Void => None,
-        };
-        let result =
             self.recorder
-                .record_op_with_descr_value(opcode, &call_args, descr.clone(), resvalue);
+                .record_op_with_descr_value(opcode, call_args, descr.clone(), resvalue)
+        });
         // pyjitpl.py:2109 call_loopinvariant_now_known(allboxes, descr, res):
         // store the concrete result so the next iteration's
         // `call_loopinvariant_known_result` returns it without re-executing
@@ -5260,14 +5306,15 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
-        let allboxes = call_arg_boxes(func_ref, args);
-        self.heap_cache_mut().invalidate_caches_varargs(
-            OpCode::call_may_force_for_type(result_type),
-            None,
-            &allboxes,
-            oracle,
-            const_value,
-        );
+        with_call_arg_boxes(func_ref, args, |allboxes| {
+            self.heap_cache_mut().invalidate_caches_varargs(
+                OpCode::call_may_force_for_type(result_type),
+                None,
+                allboxes,
+                oracle,
+                const_value,
+            );
+        });
         result
     }
 
