@@ -3369,9 +3369,7 @@ fn graph_has_live_assertion_branch(graph: &crate::model::FunctionGraph) -> bool 
 fn random_rnd_keeps_regular_call_to_core_body() {
     // `_random` lives in `pyre-module`, so its graphs are in that artefact.
     let path = crate::runtime_names::artifacts::MODULE_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "pyre_module::module::_random::<Impl>::rnd")
@@ -6501,9 +6499,7 @@ fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
     );
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
         llbc,
         &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
@@ -7361,9 +7357,7 @@ fn w_module_dict_get_strategy_call_result_is_interned() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -7418,9 +7412,7 @@ fn mallocfn_from_raw_parts_dest_is_interned_as_list() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::mallocfn"))
@@ -7473,9 +7465,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -10243,9 +10233,7 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
 fn result_as_ref_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     let as_ref_calls = caller
@@ -10311,9 +10299,7 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
 #[test]
 fn combine_starstarargs_keeps_regular_call_to_core_expect() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "combine_starstarargs_wrapped")
         .expect("lower combine_starstarargs_wrapped");
     assert_eq!(
@@ -10376,9 +10362,7 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
 #[test]
 fn complex_add_keeps_regular_call_to_core_unwrap() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "complex_add").expect("lower complex_add");
     assert_eq!(
@@ -10411,9 +10395,7 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
 #[test]
 fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     assert_eq!(
@@ -10444,9 +10426,7 @@ fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
 #[test]
 fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "range_list_length")
         .expect("lower range_list_length");
     assert_eq!(
@@ -10479,9 +10459,7 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
 fn result_map_err_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "read_code_units")
         .expect("lower read_code_units");
     let map_err_calls = caller
@@ -10568,9 +10546,7 @@ fn result_map_err_keeps_regular_call_to_core_body() {
 fn result_map_err_unit_ok_caller_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "dict_store_checked")
         .expect("lower dict_store_checked");
     let map_err_calls = caller

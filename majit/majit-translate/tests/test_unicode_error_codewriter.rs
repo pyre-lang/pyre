@@ -16,10 +16,6 @@ fn leaf_is(name: &str, prefix: &str) -> bool {
 #[test]
 fn unicode_translate_error_borrow_chain_is_value_lowered() {
     let path = INTERPRETER_LLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
-        return;
-    }
     let llbc = load_llbc(path);
     let declaration = llbc
         .iter_local_fns()

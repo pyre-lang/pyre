@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{MODULE_LLBC, load_llbc_if_present, lower_named_with_static_addrs};
+use common::{MODULE_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
 use majit_translate::{ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 
@@ -68,13 +68,11 @@ fn binop_count(graph: &FunctionGraph, name: &str) -> usize {
         .count()
 }
 
-fn lower_ctypefunc(leaf: &str) -> Option<FunctionGraph> {
-    let llbc = load_llbc_if_present(MODULE_LLBC)?;
+fn lower_ctypefunc(leaf: &str) -> FunctionGraph {
+    let llbc = load_llbc(MODULE_LLBC);
     let name = format!("pyre_module::module::_cffi_backend::ctypefunc::{leaf}");
-    Some(
-        lower_named_with_static_addrs(llbc, &name, production_addrs())
-            .unwrap_or_else(|e| panic!("lower {leaf}: {e}")),
-    )
+    lower_named_with_static_addrs(llbc, &name, production_addrs())
+        .unwrap_or_else(|e| panic!("lower {leaf}: {e}"))
 }
 
 fn has_int_lt(graph: &FunctionGraph) -> bool {
@@ -113,9 +111,7 @@ fn assert_range_scalarised(graph: &FunctionGraph, leaf: &str) {
 /// here; keep the scalarisation as a regression.
 #[test]
 fn release_arguments_range_scalarises_like_ll_rangenext_up() {
-    let Some(graph) = lower_ctypefunc("release_arguments") else {
-        return;
-    };
+    let graph = lower_ctypefunc("release_arguments");
     let (range, _, _) = count_markers(&graph);
     assert!(
         range > 0,
@@ -135,9 +131,7 @@ fn release_arguments_range_scalarises_like_ll_rangenext_up() {
 /// `__majit_range` in the jitcode.
 #[test]
 fn do_call_range_scalarises_like_ll_rangenext_up_with_error_carrier() {
-    let Some(graph) = lower_ctypefunc("do_call") else {
-        return;
-    };
+    let graph = lower_ctypefunc("do_call");
     let (range, slice_iter, iter_next) = count_markers(&graph);
     assert!(
         range > 0 && slice_iter > 0 && iter_next > 0,

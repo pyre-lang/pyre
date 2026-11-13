@@ -78,17 +78,11 @@ fn context_slot(path: &str) -> &'static OnceLock<LowerContext<'static>> {
 
 /// Parse `path` once per test binary and share the artefact.
 pub(crate) fn load_ullbc(path: &'static str) -> &'static Llbc {
-    llbc_slot(path)
-        .get_or_init(|| Llbc::load(path).unwrap_or_else(|err| panic!("load {path}: {err}")))
-}
-
-/// `None` when the artefact has not been extracted, so the caller can skip.
-pub(crate) fn load_ullbc_if_present(path: &'static str) -> Option<&'static Llbc> {
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
-        return None;
-    }
-    Some(load_ullbc(path))
+    llbc_slot(path).get_or_init(|| {
+        Llbc::load(path).unwrap_or_else(|err| {
+            panic!("{path} is missing or unreadable; run `python3 scripts/extract-llbc.py`: {err}")
+        })
+    })
 }
 
 const PRODUCTION_ULLBC_PATHS: &[&str] = &[

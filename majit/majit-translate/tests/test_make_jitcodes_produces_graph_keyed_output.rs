@@ -57,13 +57,7 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
     ignore = "release-only: runs full LLBC translation; use `cargo test --release --test test_make_jitcodes_produces_graph_keyed_output`"
 )]
 fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
-    if !ensure_workspace_llbc_env() {
-        eprintln!(
-            "skipping: target/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
-             run `scripts/extract-llbc.py` to enable this test"
-        );
-        return;
-    }
+    ensure_workspace_llbc_env();
 
     // The runtime artifact stays graph-keyed, but the acceptance test must
     // still prove that lowering preserved the complete interpreter dispatch.
@@ -400,13 +394,12 @@ fn assert_no_instruction_keyed_output_map() {
     );
 }
 
-/// Resolve workspace LLBC artefacts and export `MAJIT_MIR_FRONTEND_LLBC`
-/// when they exist. The compact `JIT_GRAPH_MODULES` fixture cannot rely on
-/// production auto-discovery, so this release-only test opts in explicitly.
-/// Returns `false` when the artefacts are absent so the caller can skip.
-fn ensure_workspace_llbc_env() -> bool {
+/// Resolve workspace LLBC artefacts and export `MAJIT_MIR_FRONTEND_LLBC`.
+/// The compact `JIT_GRAPH_MODULES` fixture cannot rely on production
+/// auto-discovery, so this release-only test opts in explicitly.
+fn ensure_workspace_llbc_env() {
     if std::env::var_os("MAJIT_MIR_FRONTEND_LLBC").is_some() {
-        return true;
+        return;
     }
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -421,7 +414,10 @@ fn ensure_workspace_llbc_env() -> bool {
     for name in required {
         let p = llbc_dir.join(name);
         if !p.exists() {
-            return false;
+            panic!(
+                "{} is missing or unreadable; run `python3 scripts/extract-llbc.py`",
+                p.display()
+            );
         }
         paths.push(p.to_string_lossy().into_owned());
     }
@@ -433,7 +429,6 @@ fn ensure_workspace_llbc_env() -> bool {
     // mutation races. This release-only integration test configures the
     // process before the thread-local generated registry is initialized.
     unsafe { std::env::set_var("MAJIT_MIR_FRONTEND_LLBC", joined) };
-    true
 }
 
 fn walk_rs_files<F: FnMut(&std::path::Path, &str)>(dir: &std::path::Path, f: &mut F) {

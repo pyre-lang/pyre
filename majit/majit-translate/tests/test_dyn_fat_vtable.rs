@@ -6,8 +6,8 @@ mod common;
 use std::collections::HashSet;
 
 use common::{
-    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    load_llbc_if_present, lower_function, with_shared_lowering,
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    lower_function, with_shared_lowering,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
@@ -19,10 +19,8 @@ use majit_translate::model::{
     ValueType, VecFieldPart,
 };
 
-/// `None` means the artefact is absent. A checkout that has not extracted
-/// LLBC skips these tests instead of panicking on the missing file.
-fn object_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(OBJECT_LLBC)
+fn object_llbc() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
 fn assert_vtable_reads(graph: &FunctionGraph, method_name: &str) {
@@ -94,9 +92,7 @@ fn is_cast_int_to_ptr(kind: &OpKind) -> bool {
 
 #[test]
 fn w_dict_lookup_reads_getitem_from_the_vtable_word() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "w_dict_lookup").expect("lower w_dict_lookup");
     assert_vtable_reads(&graph, "method_getitem");
 }
@@ -174,9 +170,7 @@ fn reaches_imp_fat_len(
 
 #[test]
 fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph =
         lower_function(llbc, "w_dict_getitem_str_hashed").expect("lower w_dict_getitem_str_hashed");
     assert_vtable_reads(&graph, "method_getitem_str_hashed");
@@ -217,9 +211,7 @@ fn has_cast_int_to_ptr(graph: &FunctionGraph) -> bool {
 
 #[test]
 fn w_dict_store_has_no_cast_int_to_ptr_of_vtable_word() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "w_dict_store").expect("lower w_dict_store");
     assert_vtable_reads(&graph, "method_setitem");
     assert!(
@@ -240,9 +232,7 @@ fn call_leaf_is(target: &CallTarget, leaf: &str) -> bool {
 
 #[test]
 fn eq_w_compares_utf8_fields_with_ll_streq() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "eq_w").expect("lower eq_w");
     assert!(
         graph.blocks.iter().any(|block| {
@@ -391,9 +381,7 @@ fn first_indirect_call(
 /// first inputarg so the `indirect_call` family is one FUNC type.
 #[test]
 fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let caller = lower_function(llbc, "w_dict_len").expect("lower w_dict_len");
     let callee = lower_function(llbc, "kwargsdict::<Impl>::length")
         .expect("lower kwargsdict::<Impl>::length");
@@ -648,9 +636,7 @@ fn indirect_gcref_trait_method_residual_stays_ref() {
 /// `_v` with `result_size` 0.
 #[test]
 fn mir_identity_dict_setitem_declares_void_and_indirect_residual_is_void() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         HostStaticAddrs::default(),

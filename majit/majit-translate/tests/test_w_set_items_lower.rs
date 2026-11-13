@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{OBJECT_LLBC, load_llbc_if_present, lower_named_with_static_addrs};
+use common::{OBJECT_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_translate::model::{FunctionGraph, LinkArg, OpKind};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::collections::HashSet;
@@ -73,9 +73,7 @@ fn op_vars(kind: &OpKind) -> Vec<&majit_translate::flowspace::model::Variable> {
 
 #[test]
 fn w_set_items_fieldread_bases_are_defined() {
-    let Some(llbc) = load_llbc_if_present(OBJECT_LLBC) else {
-        return;
-    };
+    let llbc = load_llbc(OBJECT_LLBC);
     let graph = match lower_named_with_static_addrs(llbc, "w_set_items", production_addrs()) {
         Ok(graph) => graph,
         Err(err) => panic!("w_set_items lower failed: {err}"),

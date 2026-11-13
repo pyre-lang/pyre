@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc_if_present};
+use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::ullbc::{Operand, PlaceKind, Rvalue, StmtKind};
 use majit_charon_reader::{GlobalDecl, Llbc};
 use serde_json::Value;
@@ -165,12 +165,8 @@ fn type_decl_name_paths(llbc: &Llbc) -> Vec<String> {
 
 #[test]
 fn translator_seen_dict_and_set_strategy_impls_are_registered() {
-    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
-        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-    });
-    let interpreter = load_llbc_if_present(INTERPRETER_LLBC).unwrap_or_else(|| {
-        panic!("{INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-    });
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
     let mut impls = strategy_impls(object);
     impls.extend(strategy_impls(interpreter));
     impls.sort();
@@ -192,12 +188,8 @@ fn translator_seen_dict_and_set_strategy_impls_are_registered() {
 /// (`rclass.py` `getvtable` is type-directed).
 #[test]
 fn registered_dyn_impl_keys_equal_charon_name_path_of_their_type() {
-    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
-        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-    });
-    let interpreter = load_llbc_if_present(INTERPRETER_LLBC).unwrap_or_else(|| {
-        panic!("{INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-    });
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
     let mut registered = registered_dyn_impls(object);
     registered.extend(registered_dyn_impls(interpreter));
     registered.sort();

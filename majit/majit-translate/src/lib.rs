@@ -5862,9 +5862,6 @@ mod harvested_funcobj_hints_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-object.ullbc"
         );
-        if !std::path::Path::new(path).is_file() {
-            return;
-        }
         let llbc = crate::test_support::load_ullbc(path);
         let harvested =
             crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));

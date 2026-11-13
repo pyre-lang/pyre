@@ -10,8 +10,8 @@ mod common;
 use common::{
     INTERPRETER_LLBC, MODULE_LLBC,
     build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, load_llbc,
-    load_llbc_if_present, lower_named, rbigint_llbcs,
+    build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, load_llbc, lower_named,
+    rbigint_llbcs,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::{
@@ -33,9 +33,7 @@ const RBIGINT_RS: &str = concat!(
 /// matching upstream, which mints no residual for them either.
 #[test]
 fn as_double_effect_graph_keeps_upstream_bit_length_call() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let graph = lower_named(llbcs[0], "rbigint::_AsDouble")
         .or_else(|_| lower_named(llbcs[0], "_AsDouble"))
         .expect("lower rbigint::_AsDouble");
@@ -74,9 +72,7 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
 /// (`integer_divmod_pair`) keep the pair residual.
 #[test]
 fn floordiv_keeps_divmod_result_for_try_branch() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let call_leaves = |graph: &majit_translate::model::FunctionGraph| -> Vec<String> {
         graph
             .blocks
@@ -160,13 +156,6 @@ fn floordiv_keeps_divmod_result_for_try_branch() {
 /// that kept the mapping sound.
 #[test]
 fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-interpreter`"
-        );
-        return;
-    }
     let llbc = load_llbc(INTERPRETER_LLBC);
     let graph =
         lower_named(llbc, "rbigint_to_compiler_bigint").expect("lower rbigint_to_compiler_bigint");
@@ -195,9 +184,7 @@ fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
 /// unary `abs` and no residual `core::num::<Impl>::abs`.
 #[test]
 fn numdigits_lowers_i64_abs_to_the_abs_op() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let graph = lower_named(llbcs[0], "rbigint::<Impl>::numdigits")
         .or_else(|_| lower_named(llbcs[0], "numdigits"))
         .expect("lower RBigInt::numdigits");
@@ -479,9 +466,7 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
 
 #[test]
 fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let hints = harvest_hints_from_llbcs(llbcs);
     // Exhaustive mapping of every `@jit.elidable` method in the pinned
     // rpython/rlib/rbigint.py.  This is a performance contract, not just
@@ -710,9 +695,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
 
 #[test]
 fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         llbcs,
         HostStaticAddrs::default(),
@@ -1422,19 +1405,8 @@ fn asserted_graph_names() -> Vec<&'static str> {
 
 #[test]
 fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-interpreter`"
-        );
-        return;
-    }
-
     let interpreter = load_llbc(INTERPRETER_LLBC);
-    let mut llbcs: Vec<&Llbc> = vec![interpreter];
-    if let Some(module) = load_llbc_if_present(MODULE_LLBC) {
-        llbcs.push(module);
-    }
+    let llbcs: Vec<&Llbc> = vec![interpreter, load_llbc(MODULE_LLBC)];
     let hints = harvest_hints_from_llbcs(&llbcs);
     for path in [
         "objspace::descroperation::jit_bigint_add",
@@ -2006,9 +1978,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 
 #[test]
 fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
-    let Some(llbcs) = rbigint_llbcs() else {
-        return;
-    };
+    let llbcs = rbigint_llbcs();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         llbcs,
         HostStaticAddrs::default(),
@@ -2099,38 +2069,36 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
     // `long_pow`'s zero-exponent arm is `BigInt::from(1)`, an `Operand::Const`
     // of `I32`. The place-only constructor gate used to leave that call as
     // `rbigint::RBigInt::from`.
-    if std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        let interpreter = load_llbc(INTERPRETER_LLBC);
-        let long_pow = lower_named(interpreter, "long_pow").expect("lower long_pow");
-        let long_pow_calls: Vec<Vec<String>> = long_pow
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .filter_map(|operation| match &operation.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => Some(segments.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            long_pow_calls.iter().any(|segments| {
-                segments
-                    .last()
-                    .is_some_and(|leaf| leaf == "jit_bigint_from_i64")
-            }),
-            "long_pow constant word constructors must retarget: {long_pow_calls:?}"
-        );
-        assert!(
-            !long_pow_calls.iter().any(|segments| {
-                segments.len() >= 2
-                    && segments[segments.len() - 2] == "RBigInt"
-                    && segments.last().is_some_and(|leaf| leaf == "from")
-            }),
-            "long_pow must not residualize rbigint::RBigInt::from: {long_pow_calls:?}"
-        );
-    }
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let long_pow = lower_named(interpreter, "long_pow").expect("lower long_pow");
+    let long_pow_calls: Vec<Vec<String>> = long_pow
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        long_pow_calls.iter().any(|segments| {
+            segments
+                .last()
+                .is_some_and(|leaf| leaf == "jit_bigint_from_i64")
+        }),
+        "long_pow constant word constructors must retarget: {long_pow_calls:?}"
+    );
+    assert!(
+        !long_pow_calls.iter().any(|segments| {
+            segments.len() >= 2
+                && segments[segments.len() - 2] == "RBigInt"
+                && segments.last().is_some_and(|leaf| leaf == "from")
+        }),
+        "long_pow must not residualize rbigint::RBigInt::from: {long_pow_calls:?}"
+    );
 
     let clone_caller = program
         .functions
