@@ -2770,6 +2770,15 @@ impl<'l> CrateLowering<'l> {
         if fd.is_global_initializer().is_some() {
             return false;
         }
+        // `llop.threadlocalref_addr` is projected at every call site by
+        // path (`host_rthread_threadlocalref_llop` Addr) before the
+        // callee body is walked.  An `--include`d Unstructured body
+        // (`THREADLOCALS.with`) is not a graph.
+        if host_rthread_threadlocalref_llop(&fd.item_meta.name_path())
+            == Some(ThreadLocalRefLlop::Addr)
+        {
+            return false;
+        }
         let (module_path, name) = decl_module_path_and_name(fd);
         if !should_lower_module(module_filter, &module_path) {
             return false;

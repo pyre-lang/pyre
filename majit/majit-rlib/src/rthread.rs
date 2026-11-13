@@ -27,7 +27,12 @@ pub fn threadlocalref_get_int(ofs: usize, loop_invariant: bool) -> i64 {
 }
 
 /// `llop.threadlocalref_store` (`rthread.py ThreadLocalField.setraw`).
+///
+/// `llop.threadlocalref_get/store` take a constant offset (`jtransform.py`
+/// `rewrite_op_threadlocalref_get`); a call with a runtime offset stays a
+/// residual call.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn threadlocalref_store_int(ofs: usize, value: i64) {
     assert!(ofs < THREADLOCAL_WORDS * WORD && ofs.is_multiple_of(WORD));
     unsafe { *threadlocalref_addr().byte_add(ofs) = value };
@@ -81,12 +86,22 @@ pub fn tlfield_p_errno() -> *mut i32 {
 }
 
 /// The word at byte offset `ofs`, as `llop.threadlocalref_get` reads it.
+///
+/// `llop.threadlocalref_get/store` take a constant offset (`jtransform.py`
+/// `rewrite_op_threadlocalref_get`); a call with a runtime offset stays a
+/// residual call.
+#[majit_macros::dont_look_inside]
 pub fn threadlocalref_get(ofs: usize) -> i64 {
     assert!(ofs < THREADLOCAL_WORDS * WORD && ofs.is_multiple_of(WORD));
     unsafe { *threadlocalref_addr().byte_add(ofs) }
 }
 
 /// Write the `ThreadLocalReference` slot at byte offset `ofs`.
+///
+/// `llop.threadlocalref_get/store` take a constant offset (`jtransform.py`
+/// `rewrite_op_threadlocalref_get`); a call with a runtime offset stays a
+/// residual call.
+#[majit_macros::dont_look_inside]
 pub fn threadlocalref_set(ofs: usize, value: i64) {
     assert!(ofs < FIRST_TLFIELD_OFS && ofs.is_multiple_of(WORD));
     unsafe { *threadlocalref_addr().byte_add(ofs) = value };
