@@ -8056,6 +8056,14 @@ fn type_node_is_rustc_pointer_niche(node: &serde_json::Value, llbc: &Llbc) -> bo
     }
 }
 
+/// Declared-field form of [`type_node_is_rustc_pointer_niche`]: true when
+/// `ty` is a rustc pointer niche after alias peel. Harvest records this on
+/// the FieldRow before it re-spells a transparent GC handle as
+/// `*mut {Deref::Target}`.
+pub(in crate::front::mir) fn tyref_is_rustc_pointer_niche(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_is_rustc_pointer_niche(node, llbc))
+}
+
 /// Unique sized field of a one-word std handle that is not
 /// `#[repr(transparent)]`.
 ///

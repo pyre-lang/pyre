@@ -199,6 +199,12 @@ pub struct RawOwnedField {
 /// `tyref_is_fieldless_enum_free` sees before harvest spells the field
 /// as its discriminant scalar (`u8`). The layout row stays that
 /// scalar; SomePtr setattr/getattr of the field is Signed (`s_int`).
+/// `is_rustc_pointer_niche` is whether the declared field type is a rustc
+/// pointer niche (`&T`, `NonNull<T>`, `Box<T>`, `Arc<T>`, `Rc<T>`) before
+/// harvest re-spells it (a transparent GC handle's `NonNull<PyObject>` row
+/// is `*mut {Deref::Target}`). `Option` of a one-field owner of such a
+/// row is the null-niche word (`rclass.py` `InstanceRepr.convert_const(None)`
+/// is `null_instance`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldRow {
     pub name: String,
@@ -211,6 +217,8 @@ pub struct FieldRow {
     pub raw_owned: Option<RawOwnedField>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_fieldless_enum: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_rustc_pointer_niche: bool,
 }
 
 impl FieldRow {
@@ -222,6 +230,7 @@ impl FieldRow {
             is_atomic: false,
             raw_owned: None,
             is_fieldless_enum: false,
+            is_rustc_pointer_niche: false,
         }
     }
 
@@ -233,6 +242,7 @@ impl FieldRow {
             is_atomic: false,
             raw_owned: None,
             is_fieldless_enum: false,
+            is_rustc_pointer_niche: false,
         }
     }
 
@@ -248,6 +258,11 @@ impl FieldRow {
 
     pub fn with_fieldless_enum(mut self, is_fieldless_enum: bool) -> Self {
         self.is_fieldless_enum = is_fieldless_enum;
+        self
+    }
+
+    pub fn with_rustc_pointer_niche(mut self, v: bool) -> Self {
+        self.is_rustc_pointer_niche = v;
         self
     }
 }
@@ -281,6 +296,8 @@ impl<'de> Deserialize<'de> for FieldRow {
                 raw_owned: Option<RawOwnedField>,
                 #[serde(default)]
                 is_fieldless_enum: bool,
+                #[serde(default)]
+                is_rustc_pointer_niche: bool,
             },
         }
         match De::deserialize(deserializer)? {
@@ -292,6 +309,7 @@ impl<'de> Deserialize<'de> for FieldRow {
                 is_atomic,
                 raw_owned,
                 is_fieldless_enum,
+                is_rustc_pointer_niche,
             } => Ok(Self {
                 name,
                 ty,
@@ -299,6 +317,7 @@ impl<'de> Deserialize<'de> for FieldRow {
                 is_atomic,
                 raw_owned,
                 is_fieldless_enum,
+                is_rustc_pointer_niche,
             }),
         }
     }
