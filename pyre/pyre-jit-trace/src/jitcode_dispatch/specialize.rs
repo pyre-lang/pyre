@@ -6772,6 +6772,14 @@ const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "KWARGS-DICT-SETITEM-SUBWALK",
 };
 
+/// `argument.py` `_match_signature` `space.finditem_str(w_kw_defs, name)` —
+/// `objspace.py StdObjSpace.finditem_str` / `baseobjspace::finditem_str_named`.
+const FINDITEM_STR_NAMED_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::baseobjspace::finditem_str_named",
+    commit_label: "finditem_str_named_commit",
+    decline_tag: "FINDITEM-STR-NAMED-SUBWALK",
+};
+
 /// The `BINARY_OP` helper itself: the operator tag is a trace-time constant,
 /// so its `match` folds and only the selected operator's body is traced.
 const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
@@ -8254,6 +8262,41 @@ pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
     )? {
         Some(_) => Ok(Some(())),
         None => Ok(None),
+    }
+}
+
+/// Walk `finditem_str_named` (`objspace.py` `StdObjSpace.finditem_str`,
+/// `argument.py` `_match_signature` `space.finditem_str(w_kw_defs, name)`).
+///
+/// Returns the nullable hit box; a decline leaves the trace cut back to the
+/// call site. The translated `&str` is an rstr STR, passed as a `Ref` the
+/// same way `try_load_global_descent` passes `w_str_storage(name)`.
+pub(crate) fn try_walker_orthodox_finditem_str_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    dict_obj: pyre_object::PyObjectRef,
+    key_storage_op: OpRef,
+    key_storage: pyre_object::PyObjectRef,
+    pycode_op: OpRef,
+    pycode: pyre_object::PyObjectRef,
+    nameindex_op: OpRef,
+    nameindex: i64,
+) -> Result<Option<OpRef>, DispatchError> {
+    match orthodox_helper_boxed(
+        ctx,
+        op_pc,
+        &[(nameindex_op, nameindex)],
+        &[
+            (dict_op, dict_obj),
+            (key_storage_op, key_storage),
+            (pycode_op, pycode),
+        ],
+        &FINDITEM_STR_NAMED_DESCENT,
+        false,
+    )? {
+        Some(Some(hit_op)) => Ok(Some(hit_op)),
+        Some(None) | None => Ok(None),
     }
 }
 
