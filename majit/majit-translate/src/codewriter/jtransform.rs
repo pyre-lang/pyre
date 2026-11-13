@@ -44831,7 +44831,38 @@ mod tests {
         let mut transformer = Transformer::new(&config);
         assert!(
             transformer
-                ._handle_list_call("list.append", &op, &[l], &mut graph, "list_unhandled")
+                ._handle_list_call(
+                    "list.append",
+                    &op,
+                    &[l.clone()],
+                    &mut graph,
+                    "list_unhandled"
+                )
+                .is_none()
+        );
+        // `rlist.py` `ll_listdelslice_startonly` / `ll_listdelslice_startstop`
+        // oopspecs: jtransform.py has no `do_resizable_list_delslice_*`,
+        // so `_handle_list_call` residualizes (`NotSupported` → residual call).
+        assert!(
+            transformer
+                ._handle_list_call(
+                    "list.delslice_startonly",
+                    &op,
+                    &[l.clone()],
+                    &mut graph,
+                    "list_unhandled"
+                )
+                .is_none()
+        );
+        assert!(
+            transformer
+                ._handle_list_call(
+                    "list.delslice_startstop",
+                    &op,
+                    &[l],
+                    &mut graph,
+                    "list_unhandled"
+                )
                 .is_none()
         );
     }

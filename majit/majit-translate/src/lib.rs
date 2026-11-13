@@ -3065,6 +3065,20 @@ fn analyze_pipeline_from_module_paths(
         parse::CallPath::from_segments(["ll_arraycopy"]),
         "list.ll_arraycopy(source, dest, source_start, dest_start, length)".to_string(),
     );
+    // `rlist.py` `@jit.oopspec('list.delslice_startonly(l, start)')` on
+    // `ll_listdelslice_startonly`. `look_inside_iff` moves the spec onto
+    // the trampoline (`rlib/jit.py`). `_handle_list_call` has no
+    // `do_resizable_list_delslice_*`; a marked oopspec residualizes.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_listdelslice_startonly_trampoline"]),
+        "list.delslice_startonly(l, start)".to_string(),
+    );
+    // `rlist.py` `ll_listdelslice_startstop.oopspec =
+    // 'list.delslice_startstop(l, start, stop)'`. Same residual path.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_listdelslice_startstop"]),
+        "list.delslice_startstop(l, start, stop)".to_string(),
+    );
 
     // `collectanalyze.py analyze_simple_operation` answers True for the
     // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,

@@ -23,6 +23,7 @@ use crate::flowspace::model::{
     SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::rlib::jit::{LookInsidePred, mint_look_inside_iff};
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory::{itemoffsetof, sizeof};
@@ -1756,6 +1757,7 @@ impl Repr for ListRepr {
         let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
         rtype_delslice_via_ll_listdelslice(
             hop,
+            ListLayout::Resized,
             self.lltype.clone(),
             self.item_repr.lowleveltype().clone(),
             v_lst,
@@ -2798,6 +2800,39 @@ fn rust_vec_newhint_funcptr(
     inputconst_from_lltype(&fptr_type, &ConstValue::LLPtr(Box::new(fptr)))
 }
 
+/// `VecOp::SetItem` / `ll_vec_setitem_fast_*` — named residual, the same
+/// helper `RustVecRepr.rtype_setitem` calls. Ptr-item delslice nulling
+/// uses this instead of minting `ll_setitem_fast`
+/// (`rustvec_does_not_mint_list_setitem_fast`).
+fn rust_vec_setitem_fast_funcptr(
+    item_lltype: &LowLevelType,
+    ptr_lltype: &LowLevelType,
+) -> Result<Constant, TyperError> {
+    use majit_ir::rvec::{VecOp, vec_helper_path};
+    let kind = vec_item_kind_of(item_lltype).ok_or_else(|| {
+        TyperError::message(format!(
+            "ListLayout::RustVec setitem_fast: item lltype {} is not one word",
+            item_lltype.short_name()
+        ))
+    })?;
+    let path = vec_helper_path(VecOp::SetItem, kind);
+    let fptr = functionptr(
+        FuncType {
+            args: vec![
+                ptr_lltype.clone(),
+                LowLevelType::Signed,
+                item_lltype.clone(),
+            ],
+            result: LowLevelType::Void,
+        },
+        path,
+        None,
+        Some(path.to_string()),
+    );
+    let fptr_type = LowLevelType::Ptr(Box::new(fptr._TYPE.clone()));
+    inputconst_from_lltype(&fptr_type, &ConstValue::LLPtr(Box::new(fptr)))
+}
+
 /// `NewHint` leaves `len = 0`; store the copied length on a RustVec result.
 fn emit_rustvec_len_store(block: &BlockRef, layout: ListLayout, l: &Variable, length: &Variable) {
     if layout != ListLayout::RustVec {
@@ -3398,7 +3433,18 @@ pub(crate) fn build_ll_arraymove_helper_graph(
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
     let items_ptr = items_array_ptr_lltype(&item_lltype);
+    build_ll_arraymove_helper_graph_with_items_ptr(name, item_lltype, items_ptr)
+}
 
+/// `rgc.ll_arraymove` over `items_ptr`. A resized list's items array is
+/// `Ptr(GcArray(ITEM))`; a RustVec header's `ptr` is a nolength
+/// `Ptr(Array(ITEM))` (`rust_vec_items_array_ptr_lltype`). The helper
+/// cache keys on `(name, args, result)`, so the two layouts stay disjoint.
+pub(crate) fn build_ll_arraymove_helper_graph_with_items_ptr(
+    name: &str,
+    item_lltype: LowLevelType,
+    items_ptr: LowLevelType,
+) -> Result<PyGraph, TyperError> {
     let array = variable_with_lltype("array", items_ptr.clone());
     let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
     let dst_start = variable_with_lltype("dest_start", LowLevelType::Signed);
@@ -4872,8 +4918,14 @@ fn list_item_is_ptr(item_lltype: &LowLevelType) -> bool {
 
 /// `ll_assert` of `ll_listdelslice_startonly`: `start >= 0` and
 /// `start <= l.ll_length()`. Returns the `ll_length` read used by the
-/// second assert (and by the Ptr nulling loop).
-fn emit_listdelslice_start_asserts(block: &BlockRef, l: &Variable, start: &Variable) -> Variable {
+/// second assert (and by the Ptr nulling loop). Length is
+/// `getfield(l, "length")` (Resized) or `getfield(l, "len")` (RustVec).
+fn emit_listdelslice_start_asserts(
+    block: &BlockRef,
+    layout: ListLayout,
+    l: &Variable,
+    start: &Variable,
+) -> Variable {
     let ge0 = variable_with_lltype("ge0", LowLevelType::Bool);
     block.borrow_mut().operations.push(SpaceOperation::new(
         "int_ge",
@@ -4881,12 +4933,7 @@ fn emit_listdelslice_start_asserts(block: &BlockRef, l: &Variable, start: &Varia
         Hlvalue::Variable(ge0.clone()),
     ));
     emit_debug_assert(block, ge0, "del l[start:] with unexpectedly negative start");
-    let length = variable_with_lltype("length", LowLevelType::Signed);
-    block.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![Hlvalue::Variable(l.clone()), void_field_const("length")],
-        Hlvalue::Variable(length.clone()),
-    ));
+    let length = emit_list_length_read(block, layout, l);
     let le = variable_with_lltype("le", LowLevelType::Bool);
     block.borrow_mut().operations.push(SpaceOperation::new(
         "int_le",
@@ -4898,6 +4945,45 @@ fn emit_listdelslice_start_asserts(block: &BlockRef, l: &Variable, start: &Varia
     ));
     emit_debug_assert(block, le, "del l[start:] with start > len(l)");
     length
+}
+
+/// `l._ll_resize_le(newlength)` (`rlist.py`). Resized lists call the
+/// minted `_ll_list_resize_le`. RustVec has no resize analog — the
+/// shrink is `setfield(l, "len", newlength)`, the same header-word
+/// store `emit_rustvec_len_store` uses after `ll_vec_newlist_hint_*`.
+fn emit_delslice_resize(
+    block: &BlockRef,
+    layout: ListLayout,
+    l: &Variable,
+    newlength: &Variable,
+    resize_le: Option<&Constant>,
+) -> Result<(), TyperError> {
+    match layout {
+        ListLayout::RustVec => {
+            emit_rustvec_len_store(block, layout, l, newlength);
+            Ok(())
+        }
+        ListLayout::Resized => {
+            let Some(resize_const) = resize_le else {
+                return Err(TyperError::message(
+                    "ll_listdelslice Resized layout requires _ll_list_resize_le",
+                ));
+            };
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "direct_call",
+                vec![
+                    Hlvalue::Constant(resize_const.clone()),
+                    Hlvalue::Variable(l.clone()),
+                    Hlvalue::Variable(newlength.clone()),
+                ],
+                Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+            ));
+            Ok(())
+        }
+        ListLayout::Fixed => Err(TyperError::message(
+            "ll_listdelslice: FixedSizeList has no delslice",
+        )),
+    }
 }
 
 fn emit_debug_assert(block: &BlockRef, cond: Variable, msg: &'static str) {
@@ -4941,15 +5027,16 @@ fn list_item_null_const(item_lltype: &LowLevelType) -> Result<Hlvalue, TyperErro
 ///
 /// CHAR / non-Ptr items skip the nulling loop (`ll_null_item` is None).
 /// `ll_assert` is the rtyper `debug_assert` op (`ll_newlist_hint`).
+/// `@jit.oopspec('list.delslice_startonly(l, start)')` is stamped here;
+/// `mint_look_inside_iff` moves it onto the trampoline (`rlib/jit.py`).
 pub(crate) fn build_ll_listdelslice_startonly_helper_graph(
-    rtyper: &RPythonTyper,
     name: &str,
+    layout: ListLayout,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
-    resize_le: &LowLevelFunction,
-    setitem_fast: Option<&LowLevelFunction>,
+    resize_le: Option<Constant>,
+    setitem_fast: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
-    let resize_const = sub_helper_funcptr_constant(rtyper, resize_le)?;
     let l_arg = variable_with_lltype("l", ptr_lltype.clone());
     let start_arg = variable_with_lltype("start", LowLevelType::Signed);
     let startblock = Block::shared(vec![
@@ -4969,18 +5056,13 @@ pub(crate) fn build_ll_listdelslice_startonly_helper_graph(
         Hlvalue::Variable(l_resize.clone()),
         Hlvalue::Variable(start_resize.clone()),
     ]);
-    block_resize
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "direct_call",
-            vec![
-                Hlvalue::Constant(resize_const),
-                Hlvalue::Variable(l_resize),
-                Hlvalue::Variable(start_resize),
-            ],
-            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
-        ));
+    emit_delslice_resize(
+        &block_resize,
+        layout,
+        &l_resize,
+        &start_resize,
+        resize_le.as_ref(),
+    )?;
     block_resize.closeblock(vec![
         Link::new(
             vec![none_void_const()],
@@ -4990,10 +5072,9 @@ pub(crate) fn build_ll_listdelslice_startonly_helper_graph(
         .into_ref(),
     ]);
 
-    let length = emit_listdelslice_start_asserts(&startblock, &l_arg, &start_arg);
+    let length = emit_listdelslice_start_asserts(&startblock, layout, &l_arg, &start_arg);
 
-    if let Some(setitem_fast) = setitem_fast {
-        let setitem_const = sub_helper_funcptr_constant(rtyper, setitem_fast)?;
+    if let Some(setitem_const) = setitem_fast {
         let null = list_item_null_const(&item_lltype)?;
 
         let l_cond = variable_with_lltype("l", ptr_lltype.clone());
@@ -5112,10 +5193,12 @@ pub(crate) fn build_ll_listdelslice_startonly_helper_graph(
         ]);
     }
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.oopspec('list.delslice_startonly(l, start)')` (`rlist.py`).
+    func.oopspec = Some("list.delslice_startonly(l, start)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -5146,17 +5229,16 @@ pub(crate) fn build_ll_listdelslice_startonly_helper_graph(
 /// ```
 ///
 /// `ll_arraymove` is `rgc.ll_arraymove(l.ll_items(), ...)` (`rlist.py`).
+/// `ll_listdelslice_startstop.oopspec = 'list.delslice_startstop(l, start, stop)'`.
 pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
-    rtyper: &RPythonTyper,
     name: &str,
+    layout: ListLayout,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
-    resize_le: &LowLevelFunction,
-    arraymove: &LowLevelFunction,
-    setitem_fast: Option<&LowLevelFunction>,
+    resize_le: Option<Constant>,
+    arraymove: Constant,
+    setitem_fast: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
-    let resize_const = sub_helper_funcptr_constant(rtyper, resize_le)?;
-    let arraymove_const = sub_helper_funcptr_constant(rtyper, arraymove)?;
     let l_arg = variable_with_lltype("l", ptr_lltype.clone());
     let start_arg = variable_with_lltype("start", LowLevelType::Signed);
     let stop_arg = variable_with_lltype("stop", LowLevelType::Signed);
@@ -5178,18 +5260,13 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
         Hlvalue::Variable(l_resize.clone()),
         Hlvalue::Variable(newlength_resize.clone()),
     ]);
-    block_resize
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "direct_call",
-            vec![
-                Hlvalue::Constant(resize_const),
-                Hlvalue::Variable(l_resize),
-                Hlvalue::Variable(newlength_resize),
-            ],
-            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
-        ));
+    emit_delslice_resize(
+        &block_resize,
+        layout,
+        &l_resize,
+        &newlength_resize,
+        resize_le.as_ref(),
+    )?;
     block_resize.closeblock(vec![
         Link::new(
             vec![none_void_const()],
@@ -5220,12 +5297,7 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
     ]);
 
     // length = l.ll_length()
-    let length = variable_with_lltype("length", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![Hlvalue::Variable(l_arg.clone()), void_field_const("length")],
-        Hlvalue::Variable(length.clone()),
-    ));
+    let length = emit_list_length_read(&startblock, layout, &l_arg);
     let ge0 = variable_with_lltype("ge0", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_ge",
@@ -5307,7 +5379,7 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
     ]);
 
     // ll_arraymove(l, stop, start, length - stop)
-    let items = emit_list_items_read(&block_move, ListLayout::Resized, &item_lltype, &l_move);
+    let items = emit_list_items_read(&block_move, layout, &item_lltype, &l_move);
     let nmove = variable_with_lltype("nmove", LowLevelType::Signed);
     block_move.borrow_mut().operations.push(SpaceOperation::new(
         "int_sub",
@@ -5320,7 +5392,7 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
     block_move.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            Hlvalue::Constant(arraymove_const),
+            Hlvalue::Constant(arraymove),
             items,
             Hlvalue::Variable(stop_move.clone()),
             Hlvalue::Variable(start_move.clone()),
@@ -5347,8 +5419,7 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
         Hlvalue::Variable(newlength.clone()),
     ));
 
-    if let Some(setitem_fast) = setitem_fast {
-        let setitem_const = sub_helper_funcptr_constant(rtyper, setitem_fast)?;
+    if let Some(setitem_const) = setitem_fast {
         let null = list_item_null_const(&item_lltype)?;
 
         let l_cond = variable_with_lltype("l", ptr_lltype.clone());
@@ -5465,10 +5536,13 @@ pub(crate) fn build_ll_listdelslice_startstop_helper_graph(
         ]);
     }
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `ll_listdelslice_startstop.oopspec = 'list.delslice_startstop(l, start, stop)'`
+    // (`rlist.py`). No `look_inside_iff`.
+    func.oopspec = Some("list.delslice_startstop(l, start, stop)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -8094,8 +8168,14 @@ pub(crate) fn rtype_getslice_via_ll_listslice(
 ///
 /// `Vec::truncate(n)` is `del l[n:]` (`SliceKind::StartOnly`).
 /// Dropped `Vec::drain(a..b)` is `del l[a:b]` (`SliceKind::StartStop`).
+///
+/// Same `ListLayout` split as `rtype_getslice_via_ll_listslice`. Resized
+/// lists mint `_ll_list_resize_le`. RustVec has no resize analog: the
+/// shrink is `setfield(l, "len", newlength)` (`emit_rustvec_len_store`,
+/// the `ll_vec_newlist_hint_*` length store).
 pub(crate) fn rtype_delslice_via_ll_listdelslice(
     hop: &HighLevelOp,
+    layout: ListLayout,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
     v_lst: Hlvalue,
@@ -8106,52 +8186,76 @@ pub(crate) fn rtype_delslice_via_ll_listdelslice(
             "list.delslice: minusone slices have no ll_listdelslice helper".to_string(),
         ));
     }
+    if matches!(layout, ListLayout::Fixed) {
+        return Err(TyperError::message(
+            "list.delslice: FixedSizeList has no ll_listdelslice helper".to_string(),
+        ));
+    }
 
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
-    let arraycopy = {
-        let item = item_lltype.clone();
-        hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_arraycopy".to_string(),
-            vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
-            LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
-            },
-        )?
-    };
-    let resize_le = {
-        let ptr = ptr_lltype.clone();
-        let item = item_lltype.clone();
-        hop.rtyper.lowlevel_helper_function_with_builder(
-            "_ll_list_resize_le".to_string(),
-            vec![ptr_lltype.clone(), LowLevelType::Signed],
-            LowLevelType::Void,
-            move |rtyper, _args, _result| {
-                build_ll_list_resize_le_helper_graph(
-                    rtyper,
-                    "_ll_list_resize_le",
-                    ptr.clone(),
-                    item.clone(),
-                    &arraycopy,
-                )
-            },
-        )?
+    let items_ptr = items_array_ptr_lltype_for_layout(layout, &item_lltype);
+    let resize_le = match layout {
+        ListLayout::Resized => {
+            let arraycopy = {
+                let item = item_lltype.clone();
+                hop.rtyper.lowlevel_helper_function_with_builder(
+                    "ll_arraycopy".to_string(),
+                    vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
+                    LowLevelType::Void,
+                    move |_rtyper, _args, _result| {
+                        build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+                    },
+                )?
+            };
+            let ptr = ptr_lltype.clone();
+            let item = item_lltype.clone();
+            let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                "_ll_list_resize_le".to_string(),
+                vec![ptr_lltype.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |rtyper, _args, _result| {
+                    build_ll_list_resize_le_helper_graph(
+                        rtyper,
+                        "_ll_list_resize_le",
+                        ptr.clone(),
+                        item.clone(),
+                        &arraycopy,
+                    )
+                },
+            )?;
+            Some(sub_helper_funcptr_constant(hop.rtyper.as_ref(), &helper)?)
+        }
+        ListLayout::RustVec | ListLayout::Fixed => None,
     };
     let setitem_fast = if list_item_is_ptr(&item_lltype) {
-        let ptr = ptr_lltype.clone();
-        let item = item_lltype.clone();
-        Some(hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_setitem_fast".to_string(),
-            vec![
-                ptr_lltype.clone(),
-                LowLevelType::Signed,
-                item_lltype.clone(),
-            ],
-            LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_setitem_fast_helper_graph("ll_setitem_fast", ptr.clone(), item.clone())
-            },
-        )?)
+        Some(match layout {
+            ListLayout::Resized => {
+                let ptr = ptr_lltype.clone();
+                let item = item_lltype.clone();
+                let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                    "ll_setitem_fast".to_string(),
+                    vec![
+                        ptr_lltype.clone(),
+                        LowLevelType::Signed,
+                        item_lltype.clone(),
+                    ],
+                    LowLevelType::Void,
+                    move |_rtyper, _args, _result| {
+                        build_ll_setitem_fast_helper_graph(
+                            "ll_setitem_fast",
+                            ptr.clone(),
+                            item.clone(),
+                        )
+                    },
+                )?;
+                sub_helper_funcptr_constant(hop.rtyper.as_ref(), &helper)?
+            }
+            ListLayout::RustVec => rust_vec_setitem_fast_funcptr(&item_lltype, &ptr_lltype)?,
+            ListLayout::Fixed => {
+                return Err(TyperError::message(
+                    "list.delslice: FixedSizeList has no ll_listdelslice helper".to_string(),
+                ));
+            }
+        })
     } else {
         None
     };
@@ -8159,25 +8263,34 @@ pub(crate) fn rtype_delslice_via_ll_listdelslice(
         SliceKind::StartOnly => {
             let ptr = ptr_lltype.clone();
             let item = item_lltype.clone();
-            hop.rtyper.lowlevel_helper_function_with_builder(
-                "ll_listdelslice_startonly".to_string(),
+            let resize_le = resize_le.clone();
+            let setitem_fast = setitem_fast.clone();
+            // `@jit.look_inside_iff(lambda l, start: jit.isconstant(start) and jit.isvirtual(l))`
+            // (`rlist.py` `ll_listdelslice_startonly`). The public identifier
+            // is the wrapper; oopspec moves onto the trampoline.
+            mint_look_inside_iff(
+                hop.rtyper.as_ref(),
+                "ll_listdelslice_startonly",
+                &["l", "start"],
                 vec![ptr_lltype.clone(), LowLevelType::Signed],
                 LowLevelType::Void,
-                move |rtyper, _args, _result| {
+                move |name| {
                     build_ll_listdelslice_startonly_helper_graph(
-                        rtyper,
-                        "ll_listdelslice_startonly",
+                        name,
+                        layout,
                         ptr.clone(),
                         item.clone(),
-                        &resize_le,
-                        setitem_fast.as_ref(),
+                        resize_le.clone(),
+                        setitem_fast.clone(),
                     )
                 },
+                &[LookInsidePred::IsConstant(1), LookInsidePred::IsVirtual(0)],
             )?
         }
         SliceKind::StartStop => {
             let arraymove = {
                 let item = item_lltype.clone();
+                let items = items_ptr.clone();
                 hop.rtyper.lowlevel_helper_function_with_builder(
                     "ll_arraymove".to_string(),
                     vec![
@@ -8188,10 +8301,15 @@ pub(crate) fn rtype_delslice_via_ll_listdelslice(
                     ],
                     LowLevelType::Void,
                     move |_rtyper, _args, _result| {
-                        build_ll_arraymove_helper_graph("ll_arraymove", item.clone())
+                        build_ll_arraymove_helper_graph_with_items_ptr(
+                            "ll_arraymove",
+                            item.clone(),
+                            items.clone(),
+                        )
                     },
                 )?
             };
+            let arraymove_const = sub_helper_funcptr_constant(hop.rtyper.as_ref(), &arraymove)?;
             let ptr = ptr_lltype.clone();
             let item = item_lltype.clone();
             hop.rtyper.lowlevel_helper_function_with_builder(
@@ -8202,15 +8320,15 @@ pub(crate) fn rtype_delslice_via_ll_listdelslice(
                     LowLevelType::Signed,
                 ],
                 LowLevelType::Void,
-                move |rtyper, _args, _result| {
+                move |_rtyper, _args, _result| {
                     build_ll_listdelslice_startstop_helper_graph(
-                        rtyper,
                         "ll_listdelslice_startstop",
+                        layout,
                         ptr.clone(),
                         item.clone(),
-                        &resize_le,
-                        &arraymove,
-                        setitem_fast.as_ref(),
+                        resize_le.clone(),
+                        arraymove_const.clone(),
+                        setitem_fast.clone(),
                     )
                 },
             )?
@@ -15773,11 +15891,11 @@ mod tests {
             )
             .expect("_ll_list_resize_le");
         let helper = build_ll_listdelslice_startonly_helper_graph(
-            &rtyper,
             "ll_listdelslice_startonly",
+            ListLayout::Resized,
             ptr,
             item,
-            &resize_le,
+            Some(sub_helper_funcptr_constant(&rtyper, &resize_le).expect("resize")),
             None,
         )
         .expect("ll_listdelslice_startonly CHAR");
@@ -15810,6 +15928,11 @@ mod tests {
         assert!(
             !callees.iter().any(|(_, name)| name == "ll_setitem_fast"),
             "CHAR items skip the nulling loop, got {callees:?}"
+        );
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("list.delslice_startonly(l, start)"),
+            "builder stamps `@jit.oopspec` (`rlist.py` ll_listdelslice_startonly)"
         );
         let _keep = ann;
     }
@@ -15882,12 +16005,12 @@ mod tests {
             )
             .expect("ll_setitem_fast");
         let helper = build_ll_listdelslice_startonly_helper_graph(
-            &rtyper,
             "ll_listdelslice_startonly",
+            ListLayout::Resized,
             ptr,
             item_ll,
-            &resize_le,
-            Some(&setitem_fast),
+            Some(sub_helper_funcptr_constant(&rtyper, &resize_le).expect("resize")),
+            Some(sub_helper_funcptr_constant(&rtyper, &setitem_fast).expect("setitem")),
         )
         .expect("ll_listdelslice_startonly Ptr");
         let inner = helper.graph.borrow();
@@ -15993,12 +16116,12 @@ mod tests {
             )
             .expect("ll_arraymove");
         let helper = build_ll_listdelslice_startstop_helper_graph(
-            &rtyper,
             "ll_listdelslice_startstop",
+            ListLayout::Resized,
             ptr,
             item,
-            &resize_le,
-            &arraymove,
+            Some(sub_helper_funcptr_constant(&rtyper, &resize_le).expect("resize")),
+            sub_helper_funcptr_constant(&rtyper, &arraymove).expect("arraymove"),
             None,
         )
         .expect("ll_listdelslice_startstop CHAR");
@@ -16028,6 +16151,11 @@ mod tests {
             ]
         );
         drop(start);
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("list.delslice_startstop(l, start, stop)"),
+            "builder stamps `ll_listdelslice_startstop.oopspec` (`rlist.py`)"
+        );
         let callees = direct_call_callees(&inner);
         assert!(
             callees.iter().any(|(_, name)| name == "ll_arraymove"),
@@ -16125,13 +16253,13 @@ mod tests {
             )
             .expect("ll_setitem_fast");
         let helper = build_ll_listdelslice_startstop_helper_graph(
-            &rtyper,
             "ll_listdelslice_startstop",
+            ListLayout::Resized,
             ptr,
             item_ll,
-            &resize_le,
-            &arraymove,
-            Some(&setitem_fast),
+            Some(sub_helper_funcptr_constant(&rtyper, &resize_le).expect("resize")),
+            sub_helper_funcptr_constant(&rtyper, &arraymove).expect("arraymove"),
+            Some(sub_helper_funcptr_constant(&rtyper, &setitem_fast).expect("setitem")),
         )
         .expect("ll_listdelslice_startstop Ptr");
         let inner = helper.graph.borrow();
@@ -16237,12 +16365,64 @@ mod tests {
             "delslice [start:] must mint ll_listdelslice_startonly, got {names:?}"
         );
         assert!(
+            names
+                .iter()
+                .any(|n| n == "ll_listdelslice_startonly_look_inside_iff"),
+            "delslice [start:] must mint the look_inside_iff wrapper, got {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "ll_listdelslice_startonly_trampoline"),
+            "delslice [start:] must mint the look_inside_iff trampoline, got {names:?}"
+        );
+        assert!(
             names.iter().any(|n| n == "_ll_list_resize_le"),
             "delslice [start:] must mint _ll_list_resize_le, got {names:?}"
         );
         assert!(
             !names.iter().any(|n| n == "ll_setitem_fast"),
             "Signed items skip nulling, got {names:?}"
+        );
+        let direct = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("delslice startonly emits one direct_call");
+        let dbg = format!("{:?}", direct.args[0]);
+        assert!(
+            dbg.contains("ll_listdelslice_startonly_look_inside_iff"),
+            "gendirectcall is the look_inside_iff wrapper, got {dbg}"
+        );
+        let find = |name: &str| {
+            translator
+                .graphs
+                .borrow()
+                .iter()
+                .find(|g| g.borrow().name == name)
+                .unwrap_or_else(|| panic!("missing graph {name}"))
+                .clone()
+        };
+        let orig_func = find("ll_listdelslice_startonly")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("orig GraphFunc");
+        assert_eq!(
+            orig_func.oopspec, None,
+            "look_inside_iff deletes orig oopspec (`rlib/jit.py look_inside_iff`)"
+        );
+        let tramp_func = find("ll_listdelslice_startonly_trampoline")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("trampoline GraphFunc");
+        assert_eq!(
+            tramp_func.oopspec.as_deref(),
+            Some("list.delslice_startonly(l, start)"),
+            "look_inside_iff moves oopspec onto the trampoline"
         );
     }
 
@@ -16336,6 +16516,162 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "ll_setitem_fast"),
             "Signed items skip nulling, got {names:?}"
+        );
+        let startstop = translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|g| g.borrow().name == "ll_listdelslice_startstop")
+            .expect("ll_listdelslice_startstop graph")
+            .clone();
+        assert_eq!(
+            startstop
+                .borrow()
+                .func
+                .as_ref()
+                .and_then(|f| f.oopspec.clone())
+                .as_deref(),
+            Some("list.delslice_startstop(l, start, stop)"),
+            "startstop graph carries `ll_listdelslice_startstop.oopspec`"
+        );
+    }
+
+    /// `Vec<u8>` (bytearray `_delitem_slice_helper` receiver) is not
+    /// `RustVecRepr`: `u8` is not a one-word Vec item, so
+    /// `project_rust_vec` is None and `project_struct_field_type` yields
+    /// `SomeList`. After `SomeList.delslice` → `listdef.resize()`,
+    /// `getrepr` is `ListRepr` and `rtype_delslice` already exists.
+    #[test]
+    fn vec_u8_delslice_receiver_is_listrepr() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::s_none;
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use std::cell::RefCell as StdRef;
+
+        assert_eq!(
+            majit_ir::rvec::rust_vec_item_kind_for_spelling(
+                "Vec<u8>",
+                crate::layout::target_word_size()
+            ),
+            None,
+            "u8 is not a one-word Vec item"
+        );
+        let bk = Rc::new(Bookkeeper::new());
+        assert!(
+            bk.project_rust_vec("Vec<u8>").is_none(),
+            "project_rust_vec is None for Vec<u8>"
+        );
+        let s = bk.project_struct_field_type("Vec<u8>");
+        let SomeValue::List(list) = &s else {
+            panic!("Vec<u8> annotates as SomeList, got {s:?}");
+        };
+        assert!(
+            !list.listdef.listitem_rc().borrow().resized,
+            "fresh Vec<u8> ListDef is not resized"
+        );
+        list.listdef
+            .resize()
+            .expect("SomeList.delslice calls listdef.resize()");
+        assert!(
+            list.listdef.listitem_rc().borrow().resized,
+            "delslice marks the ListDef resized"
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_list = rtyper.getrepr(&s).expect("getrepr Vec<u8> after resize");
+        assert_eq!(
+            r_list.class_name(),
+            "ListRepr",
+            "resized Vec<u8> is ListRepr, not RustVecRepr"
+        );
+
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(r_list.lowleveltype().clone()));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Void));
+        let spaceop = SpaceOperation::new(
+            "delslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(s.clone());
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("ListRepr rtype_delslice completes for the Vec<u8> receiver");
+        let _keep = (ann, bk);
+    }
+
+    /// `ListLayout::RustVec` startonly: length is `getfield(l, "len")`,
+    /// the shrink is `setfield(l, "len", start)` (`emit_rustvec_len_store`),
+    /// no `_ll_list_resize_le`.
+    #[test]
+    fn ll_listdelslice_startonly_rustvec_stores_len() {
+        let helper = build_ll_listdelslice_startonly_helper_graph(
+            "ll_listdelslice_startonly",
+            ListLayout::RustVec,
+            crate::translator::rtyper::rrustvec::rust_vec_lltype(&LowLevelType::Signed),
+            LowLevelType::Signed,
+            None,
+            None,
+        )
+        .expect("ll_listdelslice_startonly RustVec");
+        let inner = helper.graph.borrow();
+        let start = inner.startblock.borrow();
+        let start_ops: Vec<&str> = start.operations.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(
+            start_ops,
+            vec![
+                "int_ge",
+                "debug_assert",
+                "getfield",
+                "int_le",
+                "debug_assert"
+            ]
+        );
+        match &start.operations[2].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(b) => assert_eq!(b.as_slice(), b"len"),
+                other => panic!("length field const, got {other:?}"),
+            },
+            other => panic!("getfield field name, got {other:?}"),
+        }
+        drop(start);
+        let callees = direct_call_callees(&inner);
+        assert!(
+            !callees.iter().any(|(_, name)| name == "_ll_list_resize_le"),
+            "RustVec has no _ll_list_resize_le analog, got {callees:?}"
+        );
+        let (_, all_ops) = walk_ops(&inner.startblock);
+        assert!(
+            all_ops.iter().any(|o| o == "setfield"),
+            "RustVec shrink is setfield(l, \"len\", start), got {all_ops:?}"
+        );
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("list.delslice_startonly(l, start)")
         );
     }
 
