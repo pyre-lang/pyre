@@ -675,6 +675,67 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
     Some((fn_id, generics))
 }
 
+/// The provided default body of a trait method the impl does not override,
+/// instantiated at that impl's `Self`.
+///
+/// `specialize.py` `default_specialize` / `FunctionDesc.cachedgraph`: a
+/// resolved impl that inherits a default is still one graph per `Self`.
+/// `None` when the ref is a `Clause`, the impl supplies its own method, the
+/// trait has no default at this index, or `Self` is not a concrete type.
+pub(crate) fn trait_default_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Value)> {
+    let arr = payload.as_array()?;
+    let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
+    let impl_id = trait_impl_id(&resolved, llbc, 0)?;
+    let method_idx = arr.get(1)?.as_u64()?;
+    if impl_method_fn_id(llbc, impl_id, method_idx).is_some() {
+        return None;
+    }
+    let fn_id = trait_default_fn_id(llbc, impl_id, method_idx)?;
+    let generics = default_instantiation_generics(llbc, impl_id, &resolved)?;
+    Some((fn_id, generics))
+}
+
+fn trait_default_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
+    let row = trait_impl_row(llbc, impl_id)?;
+    let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
+    llbc.trait_by_id(trait_id)?
+        .methods
+        .get(method_idx as usize)?
+        .default_id
+}
+
+fn default_instantiation_generics(llbc: &Llbc, impl_id: u64, resolved: &Value) -> Option<Value> {
+    let row = trait_impl_row(llbc, impl_id)?;
+    let types = resolved
+        .pointer("/trait_decl_ref/skip_binder/generics/types")
+        .cloned()
+        .or_else(|| row.pointer("/impl_trait/generics/types").cloned())
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    if types.as_array().is_none_or(|items| items.is_empty()) {
+        return None;
+    }
+    let const_generics = resolved
+        .pointer("/trait_decl_ref/skip_binder/generics/const_generics")
+        .cloned()
+        .or_else(|| row.pointer("/impl_trait/generics/const_generics").cloned())
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let mut trait_refs = vec![resolved.clone()];
+    if let Some(implied) = row.get("implied_trait_refs").and_then(Value::as_array) {
+        trait_refs.extend(implied.iter().cloned());
+    }
+    Some(serde_json::json!({
+        "regions": [],
+        "types": types,
+        "const_generics": const_generics,
+        "trait_refs": trait_refs,
+    }))
+}
+
+fn trait_impl_row(llbc: &Llbc, impl_id: u64) -> Option<&Value> {
+    llbc.trait_impl_by_id(impl_id)
+        .or_else(|| llbc.trait_impls_raw().get(impl_id as usize))
+}
+
 /// The impl's own body for the trait's `method_idx`-th method. Each impl
 /// method is tagged `{"TraitMethod": [trait_id, method_idx]}`; a method the
 /// impl does not override is absent and answers `None`.
@@ -1026,7 +1087,7 @@ fn subst_vars(
 
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
-fn type_var_index(v: &Value) -> Option<usize> {
+pub(crate) fn type_var_index(v: &Value) -> Option<usize> {
     type_var_index_at(v, 0)
 }
 
@@ -1406,6 +1467,21 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliase
     }
     if let Some(fnptr) = obj.get("FnPtr") {
         return spec_fn_ptr(fnptr, llbc, depth, expand_aliases);
+    }
+    // Associated-type projection. `charon_type_value_to_ast_string` resolves
+    // a unique impl to the bound type and otherwise keeps `??TraitType`.
+    // Dumping the Charon JSON here is not a Rust path: residual shims
+    // turbofish it into generated source.
+    if let Some(arr) = obj.get("TraitType").and_then(Value::as_array)
+        && arr.len() == 3
+    {
+        if let Some(rendered) =
+            crate::front::mir::resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
+            && !rendered.starts_with('?')
+        {
+            return rendered;
+        }
+        return "?TraitType".to_string();
     }
     canonical_type_json(v, llbc, depth)
 }
@@ -1897,6 +1973,14 @@ mod tests {
             {"Integer": {"Unsigned": ["Usize", n]}},
             {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
         ])
+    }
+
+    #[test]
+    fn switch_data_branches_are_read_from_the_const_table() {
+        // `Switch.data.branches[i][0]` is a ConstantExpr. Its Deduplicated
+        // id is a const-table id, not a type-table id.
+        assert_eq!(Space::Ty.element(Some("branches"), 0), Space::Const);
+        assert_eq!(Space::Ty.element(Some("branches"), 3), Space::Const);
     }
 
     /// `fn f<const N: usize>()` at `N = 4` and `N = 8` is two graphs.
@@ -2837,6 +2921,51 @@ mod tests {
         assert!(!queue.enqueue(req));
         assert_eq!(queue.pop().expect("first").fn_id, 1);
         assert!(queue.pop().is_none());
+    }
+
+    /// An unresolved associated-type projection is not Charon JSON.
+    /// Residual shims turbofish `spec_type_name`; `{ "TraitType": … }`
+    /// is not a Rust type.
+    #[test]
+    fn spec_type_name_of_an_unresolved_trait_type_is_not_json() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [],
+                "type_decls": [],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let projection = json!({
+            "TraitType": [
+                {
+                    "kind": {"Clause": {"Bound": [0, 0]}},
+                    "trait_decl_ref": {
+                        "regions": [],
+                        "skip_binder": {
+                            "generics": {
+                                "const_generics": [],
+                                "regions": [],
+                                "trait_refs": [],
+                                "types": [{"TypeVar": {"Bound": [1, 0]}}]
+                            },
+                            "id": "pyre_object::setobject::AbstractUnwrappedSetStrategy"
+                        }
+                    }
+                },
+                0,
+                {"const_generics": [], "regions": [], "trait_refs": [], "types": []}
+            ]
+        });
+        let name = spec_type_name(&projection, &llbc, 0, false);
+        assert_eq!(name, "?TraitType");
+        assert!(
+            !name.contains('{'),
+            "Charon JSON is not a Rust path: {name}"
+        );
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {

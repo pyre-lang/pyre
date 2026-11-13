@@ -30,9 +30,11 @@ pub struct FunDecl {
     pub signature: Signature,
     /// Generic-parameter context of the declaration. Keeps only the
     /// paths the translator reads: nonempty `types` / `const_generics`;
+    /// `types` length (`types_len`);
     /// `trait_clauses[].trait_.skip_binder.id`,
     /// `trait_clauses[].trait_.skip_binder.generics.types`.
     /// `decl_is_generic` tests those nonempty flags;
+    /// `generic_args_from_arg_ty` tests `types_len == 1`;
     /// `tyref_generic_trait_bound_root` projects the bound. A new reader
     /// of another path must add it to `FunGenericsRow`.
     #[serde(default, deserialize_with = "fun_generics")]
@@ -99,10 +101,13 @@ fn fun_src<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<FunSrc>, D::
 }
 
 /// Generic-parameter context of a [`FunDecl`]: nonempty type / const
-/// parameters, and each trait-clause bound the translator projects.
+/// parameters, the `types` array length, and each trait-clause bound
+/// the translator projects.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FunGenerics {
     pub has_types: bool,
+    /// Length of Charon's `generics.types` array (`0` when absent).
+    pub types_len: usize,
     pub has_const_generics: bool,
     pub trait_clauses: Vec<TraitClauseBound>,
 }
@@ -129,8 +134,8 @@ pub enum FunSrc {
 /// A `FunDecl.generics` object reduced to the paths the translator reads.
 #[derive(Deserialize)]
 struct FunGenericsRow {
-    #[serde(default, deserialize_with = "nonempty_json_array")]
-    types: bool,
+    #[serde(default, deserialize_with = "json_array_len")]
+    types: usize,
     #[serde(default, deserialize_with = "nonempty_json_array")]
     const_generics: bool,
     #[serde(default, deserialize_with = "crate::schema::present_nullable")]
@@ -147,11 +152,68 @@ impl FunGenericsRow {
             _ => Vec::new(),
         };
         FunGenerics {
-            has_types: self.types,
+            has_types: self.types > 0,
+            types_len: self.types,
             has_const_generics: self.const_generics,
             trait_clauses,
         }
     }
+}
+
+fn json_array_len<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    struct ArrayLen;
+    impl<'de> serde::de::Visitor<'de> for ArrayLen {
+        type Value = usize;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<usize, A::Error> {
+            let mut len = 0;
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                len += 1;
+            }
+            Ok(len)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<usize, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(0)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<usize, E> {
+            Ok(0)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<usize, E> {
+            Ok(0)
+        }
+    }
+    d.deserialize_any(ArrayLen)
 }
 
 fn nonempty_json_array<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -764,6 +826,9 @@ pub struct GlobalDecl {
     pub item_meta: ItemMeta,
     pub global_kind: GlobalKind,
     pub ty: Option<GlobalTy>,
+    /// Declared type as a [`TyRef`], for walks that need the whole type
+    /// (ADT generics, interior mutability).
+    pub tyref: Option<TyRef>,
     pub value: Option<GlobalValue>,
 }
 
@@ -774,7 +839,11 @@ pub enum GlobalKind {
     NamedConst,
     AnonConst,
     ThreadLocal,
-    Static,
+    /// Charon `Static { is_mut, is_thread_local }`.
+    Static {
+        is_mut: bool,
+        is_thread_local: bool,
+    },
     #[default]
     Other,
 }
@@ -823,6 +892,10 @@ impl From<GlobalDeclFields> for GlobalDecl {
                 .map(project_global_kind)
                 .unwrap_or(GlobalKind::Other),
             ty: fields.ty.as_ref().and_then(project_global_ty),
+            tyref: fields
+                .ty
+                .as_ref()
+                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok()),
             value: fields.value.and_then(project_global_value),
         }
     }
@@ -837,13 +910,15 @@ fn project_global_kind(kind: Value) -> GlobalKind {
             _ => GlobalKind::Other,
         };
     }
-    if kind
-        .as_object()
-        .is_some_and(|map| map.contains_key("Static"))
-    {
-        GlobalKind::Static
-    } else {
-        GlobalKind::Other
+    let Some(st) = kind.get("Static") else {
+        return GlobalKind::Other;
+    };
+    GlobalKind::Static {
+        is_mut: st.get("is_mut").and_then(Value::as_bool).unwrap_or(false),
+        is_thread_local: st
+            .get("is_thread_local")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -924,7 +999,7 @@ impl GlobalDecl {
             GlobalKind::NamedConst => Some("NamedConst"),
             GlobalKind::AnonConst => Some("AnonConst"),
             GlobalKind::ThreadLocal => Some("ThreadLocal"),
-            GlobalKind::Static | GlobalKind::Other => None,
+            GlobalKind::Static { .. } | GlobalKind::Other => None,
         }
     }
 
@@ -954,6 +1029,23 @@ impl GlobalDecl {
             Some(GlobalValue::ConstExpr(value)) => Some(value),
             _ => None,
         }
+    }
+
+    /// An immutable `static` (not `static mut`, not TLS).
+    ///
+    /// Charon records this as `global_kind: { Static: { is_mut: false,
+    /// is_thread_local: false } }`. That object is the declaration
+    /// RPython would read as a prebuilt constant
+    /// (`bookkeeper.py immutablevalue`); the interpreter never assigns
+    /// the binding after init.
+    pub fn is_immutable_static(&self) -> bool {
+        matches!(
+            self.global_kind,
+            GlobalKind::Static {
+                is_mut: false,
+                is_thread_local: false
+            }
+        )
     }
 }
 
@@ -2070,6 +2162,13 @@ impl ItemMeta {
     /// belongs to the innermost one.
     pub fn trait_impl_id(&self) -> Option<u64> {
         self.name.iter().rev().find_map(NameSeg::impl_trait_id)
+    }
+
+    /// True when a name segment is a Charon `PathElem::Impl` (inherent or
+    /// trait). The rendered `name_path` spells that segment `"<Impl>"`;
+    /// consumers that must not scan the rendering read this instead.
+    pub fn has_impl_path_elem(&self) -> bool {
+        self.name.iter().any(NameSeg::is_impl)
     }
 
     /// `"crate::module::item"`-style flattened name. Trait-impl
@@ -4450,6 +4549,47 @@ mod tests {
         assert!(!is_const_initializer_leaf("getindex_w_index"));
     }
 
+    /// Charon's `Static { is_mut: false }` is the prebuilt-constant
+    /// declaration (`bookkeeper.py immutablevalue`). `static mut` and
+    /// TLS are not.
+    #[test]
+    fn immutable_static_kind_is_the_declaration() {
+        let decl = |kind: Value| {
+            serde_json::from_value::<GlobalDecl>(serde_json::json!({
+                "def_id": 1,
+                "item_meta": {
+                    "name": [{"Ident": ["fixture", 0]}, {"Ident": ["TABLE", 0]}],
+                    "span": {"Deduplicated": 0},
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "global_kind": kind
+            }))
+            .unwrap()
+        };
+        assert!(
+            decl(serde_json::json!({
+                "Static": {"is_mut": false, "is_safe": true, "is_thread_local": false}
+            }))
+            .is_immutable_static()
+        );
+        assert!(
+            !decl(serde_json::json!({
+                "Static": {"is_mut": true, "is_safe": true, "is_thread_local": false}
+            }))
+            .is_immutable_static()
+        );
+        assert!(
+            !decl(serde_json::json!({
+                "Static": {"is_mut": false, "is_safe": true, "is_thread_local": true}
+            }))
+            .is_immutable_static()
+        );
+        assert!(!decl(serde_json::json!("NamedConst")).is_immutable_static());
+        assert!(!decl(serde_json::json!("Static")).is_immutable_static());
+    }
+
     /// A call to a monomorphized copy reads the copy's instance arguments
     /// as its `generics`; a call that carries its own keeps them.
     #[test]
@@ -4931,6 +5071,7 @@ mod tests {
         }));
         let g = fd.generics.as_ref().expect("generics");
         assert!(g.has_types);
+        assert_eq!(g.types_len, 1);
         assert!(g.has_const_generics);
         assert_eq!(g.trait_clauses.len(), 1);
         assert_eq!(g.trait_clauses[0].trait_id, Some(7));
@@ -5113,7 +5254,13 @@ mod tests {
             "value": {"Deduplicated": 8}
         }));
         assert_eq!(static_gd.global_kind_str(), None);
-        assert_eq!(static_gd.global_kind, GlobalKind::Static);
+        assert_eq!(
+            static_gd.global_kind,
+            GlobalKind::Static {
+                is_mut: false,
+                is_thread_local: false
+            }
+        );
         assert_eq!(static_gd.ty, Some(GlobalTy::Dedup(4)));
         assert_eq!(
             static_gd.const_expr(),

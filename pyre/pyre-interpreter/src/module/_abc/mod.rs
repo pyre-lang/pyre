@@ -10,6 +10,7 @@
 //! `__subclasses__` walk, all recursively, on every single call.
 
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // `abc_invalidation_counter` (`app_abc.py`): bumped by every successful

@@ -383,9 +383,8 @@ fn socket_writebuf(
     // `PyObject_GetBuffer` with `PyBUF_WRITABLE` (`w*` / `acquire_writebuf`):
     // a Python `__buffer__` exporter receives the writable flag.
     const PYBUF_WRITABLE: i32 = 0x0001;
-    let writable_required = || {
-        pyre_interpreter::PyError::type_error("a writable bytes-like object is required")
-    };
+    let writable_required =
+        || pyre_interpreter::PyError::type_error("a writable bytes-like object is required");
     match pyre_interpreter::builtins::w_memoryview_new_with_flags(obj, PYBUF_WRITABLE) {
         Ok(view) => {
             let _ = pyre_object::gc_roots::pin_root(view);
@@ -1574,84 +1573,91 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             ns,
             "getservbyname",
             pyre_interpreter::function_set_null_positional_defaults(
-            pyre_interpreter::make_builtin_function_with_signature("getservbyname", |args| {
-                // Bound scope: `name`, optional `proto` (`PY_NULL` omitted).
-                // `@unwrap_spec(name='text', w_proto=WrappedDefault(None))`.
-                let w_name = args[0];
-                let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let name = pyre_object::with_roots!(w_proto =>
-                    pyre_interpreter::baseobjspace::text_w(w_name)
-                )?
-                .to_string();
-                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
-                // string stops at an embedded NUL, so PyPy looks up the prefix;
-                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
-                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
-                // `s` converter raises ValueError "embedded null character"
-                // before the body's range check and audit; a 3.15.0 run reports
-                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
-                // these wrappers.
-                let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-                    pyre_interpreter::PyError::value_error("embedded null character")
-                })?;
-                // `w_proto` is read again by the audit below, after `text_w`
-                // can collect, so it is rooted first.
-                let w_proto_or_none = if w_proto.is_null() {
-                    pyre_object::w_none()
-                } else {
-                    w_proto
-                };
-                let roots = pyre_object::gc_roots::push_roots();
-                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
-                // `interp_func.py`: only `None` (or an omitted argument) means
-                // "any protocol"; anything else goes through `space.text_w`.
-                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
-                    && !unsafe { pyre_object::is_none(w_proto) }
-                {
-                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
+                pyre_interpreter::make_builtin_function_with_signature(
+                    "getservbyname",
+                    |args| {
+                        // Bound scope: `name`, optional `proto` (`PY_NULL` omitted).
+                        // `@unwrap_spec(name='text', w_proto=WrappedDefault(None))`.
+                        let w_name = args[0];
+                        let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                        let name = pyre_object::with_roots!(w_proto =>
+                            pyre_interpreter::baseobjspace::text_w(w_name)
+                        )?
                         .to_string();
-                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
-                        pyre_interpreter::PyError::value_error("embedded null character")
-                    })?)
-                } else {
-                    None
-                };
-                // `space.audit('socket.getservbyname', [space.newtext(name), w_proto])`.
-                let w_name_text = pyre_object::w_str_new_managed(&name);
-                pyre_interpreter::module::sys::vm::audit(
-                    "socket.getservbyname",
-                    &[w_name_text, roots.get(proto_slot)],
-                )?;
-                drop(roots);
-                #[cfg(unix)]
-                {
-                    let port = majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
-                        .map_err(|error| socket_converted_error("error", None, error.message))?;
-                    Ok(pyre_object::w_int_new(port))
-                }
-                #[cfg(windows)]
-                {
-                    let p = unsafe {
-                        rffi::serv_by_name(
-                            c_name.as_ptr(),
-                            proto_c
-                                .as_ref()
-                                .map(|c| c.as_ptr())
-                                .unwrap_or(std::ptr::null()),
-                        )
-                    };
-                    if p.is_null() {
-                        return Err(socket_converted_error(
-                            "error",
-                            None,
-                            "service/proto not found",
-                        ));
-                    }
-                    let port = unsafe { u16::from_be(rffi::servent_port(p)) };
-                    Ok(pyre_object::w_int_new(port as i64))
-                }
-            }, pyre_interpreter::Signature::new(vec!["name", "proto"], None, None, 0, 0)),
-            1,
+                        // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                        // string stops at an embedded NUL, so PyPy looks up the prefix;
+                        // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                        // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                        // `s` converter raises ValueError "embedded null character"
+                        // before the body's range check and audit; a 3.15.0 run reports
+                        // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
+                        // these wrappers.
+                        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                            pyre_interpreter::PyError::value_error("embedded null character")
+                        })?;
+                        // `w_proto` is read again by the audit below, after `text_w`
+                        // can collect, so it is rooted first.
+                        let w_proto_or_none = if w_proto.is_null() {
+                            pyre_object::w_none()
+                        } else {
+                            w_proto
+                        };
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let proto_slot = roots.pin_roots(&[w_proto_or_none]);
+                        // `interp_func.py`: only `None` (or an omitted argument) means
+                        // "any protocol"; anything else goes through `space.text_w`.
+                        let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
+                            && !unsafe { pyre_object::is_none(w_proto) }
+                        {
+                            let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
+                                .to_string();
+                            Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                                pyre_interpreter::PyError::value_error("embedded null character")
+                            })?)
+                        } else {
+                            None
+                        };
+                        // `space.audit('socket.getservbyname', [space.newtext(name), w_proto])`.
+                        let w_name_text = pyre_object::w_str_new_managed(&name);
+                        pyre_interpreter::module::sys::vm::audit(
+                            "socket.getservbyname",
+                            &[w_name_text, roots.get(proto_slot)],
+                        )?;
+                        drop(roots);
+                        #[cfg(unix)]
+                        {
+                            let port =
+                                majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
+                                    .map_err(|error| {
+                                        socket_converted_error("error", None, error.message)
+                                    })?;
+                            Ok(pyre_object::w_int_new(port))
+                        }
+                        #[cfg(windows)]
+                        {
+                            let p = unsafe {
+                                rffi::serv_by_name(
+                                    c_name.as_ptr(),
+                                    proto_c
+                                        .as_ref()
+                                        .map(|c| c.as_ptr())
+                                        .unwrap_or(std::ptr::null()),
+                                )
+                            };
+                            if p.is_null() {
+                                return Err(socket_converted_error(
+                                    "error",
+                                    None,
+                                    "service/proto not found",
+                                ));
+                            }
+                            let port = unsafe { u16::from_be(rffi::servent_port(p)) };
+                            Ok(pyre_object::w_int_new(port as i64))
+                        }
+                    },
+                    pyre_interpreter::Signature::new(vec!["name", "proto"], None, None, 0, 0)
+                ),
+                1,
             )
         );
 
@@ -1660,97 +1666,103 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             ns,
             "getservbyport",
             pyre_interpreter::function_set_null_positional_defaults(
-            pyre_interpreter::make_builtin_function_with_signature("getservbyport", |args| {
-                // Bound scope: `port`, optional `proto` (`PY_NULL` omitted).
-                // `getservbyport` rejects a port outside the range before it
-                // narrows: taking the low sixteen bits of 70000 would look up
-                // 4464 and answer for it.  The clinic spells the parameter
-                // `int port`, so an argument that is not one owes a TypeError
-                // rather than reading its first word as the port.
-                let w_port = args[0];
-                let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let port = pyre_object::with_roots!(w_proto =>
-                    pyre_interpreter::baseobjspace::gateway_int_w(w_port)
-                )?;
-                // `w_proto` is read again by the audit below, after `text_w`
-                // can collect, so it is rooted first.
-                let w_proto_or_none = if w_proto.is_null() {
-                    pyre_object::w_none()
-                } else {
-                    w_proto
-                };
-                let roots = pyre_object::gc_roots::push_roots();
-                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
-                // `interp_func.py`: only `None` (or an omitted argument) means
-                // "any protocol"; anything else goes through `space.text_w`,
-                // which accepts an embedded NUL.
-                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
-                    && !unsafe { pyre_object::is_none(w_proto) }
-                {
-                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?;
-                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
-                // string stops at an embedded NUL, so PyPy looks up the prefix;
-                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
-                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
-                // `s` converter raises ValueError "embedded null character"
-                // before the body's range check and audit; a 3.15.0 run reports
-                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
-                // these wrappers.
-                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
-                        pyre_interpreter::PyError::value_error("embedded null character")
-                    })?)
-                } else {
-                    None
-                };
-                if !(0..=0xffff).contains(&port) {
-                    return Err(pyre_interpreter::PyError::overflow_error(
-                        "getservbyport: port must be 0-65535.",
-                    ));
-                }
-                let port = port as u16;
-                // `space.audit('socket.getservbyport', [space.newint(port), w_proto])`.
-                let w_port_int = pyre_object::w_int_new(i64::from(port));
-                pyre_interpreter::module::sys::vm::audit(
-                    "socket.getservbyport",
-                    &[w_port_int, roots.get(proto_slot)],
-                )?;
-                drop(roots);
-                #[cfg(unix)]
-                {
-                    let name =
-                        majit_rlib::rsocket::getservbyport(i32::from(port), proto_c.as_deref())
+                pyre_interpreter::make_builtin_function_with_signature(
+                    "getservbyport",
+                    |args| {
+                        // Bound scope: `port`, optional `proto` (`PY_NULL` omitted).
+                        // `getservbyport` rejects a port outside the range before it
+                        // narrows: taking the low sixteen bits of 70000 would look up
+                        // 4464 and answer for it.  The clinic spells the parameter
+                        // `int port`, so an argument that is not one owes a TypeError
+                        // rather than reading its first word as the port.
+                        let w_port = args[0];
+                        let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                        let port = pyre_object::with_roots!(w_proto =>
+                            pyre_interpreter::baseobjspace::gateway_int_w(w_port)
+                        )?;
+                        // `w_proto` is read again by the audit below, after `text_w`
+                        // can collect, so it is rooted first.
+                        let w_proto_or_none = if w_proto.is_null() {
+                            pyre_object::w_none()
+                        } else {
+                            w_proto
+                        };
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let proto_slot = roots.pin_roots(&[w_proto_or_none]);
+                        // `interp_func.py`: only `None` (or an omitted argument) means
+                        // "any protocol"; anything else goes through `space.text_w`,
+                        // which accepts an embedded NUL.
+                        let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
+                            && !unsafe { pyre_object::is_none(w_proto) }
+                        {
+                            let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?;
+                            // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                            // string stops at an embedded NUL, so PyPy looks up the prefix;
+                            // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                            // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                            // `s` converter raises ValueError "embedded null character"
+                            // before the body's range check and audit; a 3.15.0 run reports
+                            // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
+                            // these wrappers.
+                            Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                                pyre_interpreter::PyError::value_error("embedded null character")
+                            })?)
+                        } else {
+                            None
+                        };
+                        if !(0..=0xffff).contains(&port) {
+                            return Err(pyre_interpreter::PyError::overflow_error(
+                                "getservbyport: port must be 0-65535.",
+                            ));
+                        }
+                        let port = port as u16;
+                        // `space.audit('socket.getservbyport', [space.newint(port), w_proto])`.
+                        let w_port_int = pyre_object::w_int_new(i64::from(port));
+                        pyre_interpreter::module::sys::vm::audit(
+                            "socket.getservbyport",
+                            &[w_port_int, roots.get(proto_slot)],
+                        )?;
+                        drop(roots);
+                        #[cfg(unix)]
+                        {
+                            let name = majit_rlib::rsocket::getservbyport(
+                                i32::from(port),
+                                proto_c.as_deref(),
+                            )
                             .map_err(|error| {
                                 socket_converted_error("error", None, error.message)
                             })?;
-                    Ok(pyre_object::w_str_new_managed(&name))
-                }
-                #[cfg(windows)]
-                {
-                    let p = unsafe {
-                        rffi::serv_by_port(
-                            port.to_be() as libc::c_int,
-                            proto_c
-                                .as_ref()
-                                .map(|c| c.as_ptr())
-                                .unwrap_or(std::ptr::null()),
-                        )
-                    };
-                    if p.is_null() {
-                        return Err(socket_converted_error(
-                            "error",
-                            None,
-                            "port/proto not found",
-                        ));
-                    }
-                    let name = unsafe {
-                        std::ffi::CStr::from_ptr(rffi::servent_name(p))
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    Ok(pyre_object::w_str_new_managed(&name))
-                }
-            }, pyre_interpreter::Signature::new(vec!["port", "proto"], None, None, 0, 0)),
-            1,
+                            Ok(pyre_object::w_str_new_managed(&name))
+                        }
+                        #[cfg(windows)]
+                        {
+                            let p = unsafe {
+                                rffi::serv_by_port(
+                                    port.to_be() as libc::c_int,
+                                    proto_c
+                                        .as_ref()
+                                        .map(|c| c.as_ptr())
+                                        .unwrap_or(std::ptr::null()),
+                                )
+                            };
+                            if p.is_null() {
+                                return Err(socket_converted_error(
+                                    "error",
+                                    None,
+                                    "port/proto not found",
+                                ));
+                            }
+                            let name = unsafe {
+                                std::ffi::CStr::from_ptr(rffi::servent_name(p))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            };
+                            Ok(pyre_object::w_str_new_managed(&name))
+                        }
+                    },
+                    pyre_interpreter::Signature::new(vec!["port", "proto"], None, None, 0, 0)
+                ),
+                1,
             )
         );
     }
@@ -3251,7 +3263,9 @@ fn socket_set_attr(mut obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_obj
 /// A 3.15.0 run reports each of these, `settimeout(1e-10)` reading back
 /// `1e-09` and `-1e300` raising OverflowError.  No JIT hint covers either
 /// wrapper.
-fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
+fn socket_timeout_w(
+    mut w_timeout: pyre_object::PyObjectRef,
+) -> Result<f64, pyre_interpreter::PyError> {
     const SEC_TO_NS: i64 = 1_000_000_000;
     let pytime_overflow =
         || pyre_interpreter::PyError::overflow_error("timestamp out of range for C PyTime_t");
@@ -3280,14 +3294,22 @@ fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_int
     };
     let ns: i64 = if let Some(sec) = index_sec(w_timeout) {
         ns_from_sec(sec)?
-    } else if unsafe { pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__") }
-        .is_some()
+    } else if unsafe {
+        pyre_object::with_roots!(w_timeout => {
+            pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__")
+        })
+    }
+    .is_some()
     {
         // `space.index` returns an `int`; `w_timeout` is not read again.
-        let w_index = pyre_interpreter::baseobjspace::space_index(w_timeout)?;
+        let w_index = pyre_object::with_roots!(w_timeout => {
+            pyre_interpreter::baseobjspace::space_index(w_timeout)
+        })?;
         ns_from_sec(index_sec(w_index).unwrap_or(None))?
     } else {
-        let d = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
+        let d = pyre_object::with_roots!(w_timeout => {
+            pyre_interpreter::baseobjspace::float_w(w_timeout)
+        })?;
         if d.is_nan() {
             return Err(pyre_interpreter::PyError::value_error(
                 "Invalid value NaN (not a number)",
@@ -4863,17 +4885,17 @@ pub fn __majit_wrap_socket_setsockopt(
                 // `space.bufferstr_w(args_w[2])`.  Only the
                 // `BufferInterfaceNotFound` diagnostic is respelled; an
                 // exporter's own error propagates.
-                let optval = match pyre_interpreter::baseobjspace::simple_buffer_bytes(
-                    roots.get(base + 3),
-                )? {
-                    Some(buf) => buf.into_bytes(),
-                    None => {
-                        return Err(pyre_interpreter::PyError::type_error(format!(
-                            "socket option should be int, bytes-like object or None (got {})",
-                            pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
-                        )));
-                    }
-                };
+                let optval =
+                    match pyre_interpreter::baseobjspace::simple_buffer_bytes(roots.get(base + 3))?
+                    {
+                        Some(buf) => buf.into_bytes(),
+                        None => {
+                            return Err(pyre_interpreter::PyError::type_error(format!(
+                                "socket option should be int, bytes-like object or None (got {})",
+                                pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
+                            )));
+                        }
+                    };
                 // `RSocket.setsockopt`.  `optval` is a copy: `setsockopt`
                 // releases the interpreter, and the buffer's owner can move.
                 // The descriptor is read after the conversions, which can run
@@ -7120,8 +7142,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     let mut obj = args[0];
                     let mut w_t = args[1];
-                    let timeout =
-                        pyre_object::with_roots!(obj, w_t => socket_timeout_w(w_t))?;
+                    let timeout = pyre_object::with_roots!(obj, w_t => socket_timeout_w(w_t))?;
                     let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
                     pyre_object::with_roots!(obj, w_t => socket_apply_timeout(fd, timeout))?;
                     // `gettimeout()` reports a float, and the timeout readers below

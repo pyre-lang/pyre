@@ -789,6 +789,7 @@ pub(crate) fn remap_op_kind(
             nolength,
             gckind,
             pure,
+            taken_by_address,
         } => OpKind::ArrayRead {
             base: remap_var(base),
             index: remap_var(index),
@@ -801,6 +802,7 @@ pub(crate) fn remap_op_kind(
             // inline clone — never hardcode it (rlist.py:724
             // ll_getitem_foldable_nonneg).
             pure: *pure,
+            taken_by_address: *taken_by_address,
         },
         OpKind::ArrayLen {
             base,
@@ -2027,6 +2029,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );

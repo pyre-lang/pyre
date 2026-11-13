@@ -235,9 +235,29 @@ fn std_extern_path_predicates_match_exact_full_paths_only() {
         "core::ptr::mut_ptr::<Impl>::add"
     ));
 
+    assert!(super::is_core_ptr_offset_from_path(
+        "core::ptr::mut_ptr::<Impl>::offset_from"
+    ));
+    assert!(super::is_core_ptr_offset_from_path(
+        "core::ptr::const_ptr::<Impl>::offset_from"
+    ));
+    assert!(super::is_core_ptr_offset_from_path(
+        "core::ptr::mut_ptr::<Impl>::offset_from::<*mut u8>"
+    ));
+    assert!(!super::is_core_ptr_offset_from_path(
+        "core::ptr::mut_ptr::<Impl>::offset"
+    ));
+    assert!(!super::is_core_ptr_add_path(
+        "core::ptr::mut_ptr::<Impl>::offset_from"
+    ));
+
     assert!(super::is_core_ptr_write_path("core::ptr::write"));
+    assert!(super::is_core_ptr_write_path("core::ptr::write::<usize>"));
     assert!(super::is_core_ptr_write_path(
         "core::ptr::mut_ptr::<Impl>::write"
+    ));
+    assert!(super::is_core_ptr_write_path(
+        "core::ptr::mut_ptr::<Impl>::write::<usize>"
     ));
     assert!(!super::is_core_ptr_write_path("core::ptr::write_unaligned"));
     assert!(!super::is_core_ptr_write_path("core::ptr::write_bytes"));

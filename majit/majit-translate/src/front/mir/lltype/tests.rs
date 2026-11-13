@@ -1,21 +1,24 @@
 use super::{
     adt_def_is_raw_storage, adt_field_read_value_type, adt_node_class_root_identity,
-    charon_type_value_to_ast_string, charon_type_value_to_enum_arg, dont_look_inside_return_token,
-    field_ty_is_raw_word, is_cow_str_family_class_root, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
-    json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
-    json_ty_packed_copy_struct_byte_size, json_ty_scalar_element_spelling, no_immutable_fields,
-    no_raw_alloc_flavor, no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
-    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
-    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
-    tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
+    charon_type_value_to_ast_string, charon_type_value_to_enum_arg, container_declared_gc,
+    dont_look_inside_return_token, field_ty_is_raw_word, is_cow_str_family_class_root,
+    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, json_ty_is_by_value_copy_aggregate,
+    json_ty_is_thin_pointer_element, json_ty_packed_copy_struct_byte_size,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_raw_alloc_flavor,
+    no_tombstoned_leaves, payload_tuple_suffix, positional_aggregate_field_rows,
+    raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts,
+    type_decl_is_closure_env, tyref_aggregate_field_value_type, tyref_array_suffix,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
     tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
-    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family, tyref_is_void_zst,
-    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_raw_struct_value,
+    tyref_is_string_family, tyref_is_void_zst, tyref_niche_option_gc_payload_spelling,
+    tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+    tyref_raw_ptr_to_classed_instance_spelling, tyref_ref_param_class_root,
+    tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+    tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -3582,7 +3585,7 @@ fn constants_accessor_fun_decl_id(kind: &OpKind, leaf: &str) -> Option<u64> {
 /// Anchor compiler-core's exact
 /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
 /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-/// (a `co_consts_w` field read on the promoted code); it must not
+/// (`self.getcode().co_consts_w[index]`); it must not
 /// FieldRead the compiler `Constants` wrapper.  `code_getdocstring`
 /// still projects that wrapper, through the translated `deref` body.
 ///
@@ -6622,6 +6625,137 @@ fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
         Some("Tuple<usize,usize>")
     );
     assert_eq!(tyref_positional_aggregate_root(&scalar, &llbc), None);
+}
+
+#[test]
+fn positional_tuple_field_rows_take_kind_from_dest_ty() {
+    let llbc = llbc_with_trait_impls(serde_json::json!([]));
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let pair = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0, "builtin": "Tuple",
+            "generics": {"types": [i64_ty.clone(), i64_ty]}
+        }
+    }));
+    let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+    assert_eq!(
+        rows.iter()
+            .map(|(name, spelling, ty)| {
+                (
+                    name.as_str(),
+                    spelling.as_str(),
+                    ty.as_ref().map(|t| tyref_to_value_type(t, &llbc)),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("__pos_0", "i64", Some(ValueType::Int)),
+            ("__pos_1", "i64", Some(ValueType::Int)),
+        ]
+    );
+}
+
+#[test]
+fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
+    // `mapdict::<Impl>::slots` returns `(*mut usize, *mut *mut ItemsBlock)`.
+    // `*mut usize` is a raw `Ptr` (`history.py` `getkind` `'int'`).
+    // `*mut *mut ItemsBlock` is a pointer to a GCREF slot
+    // (`Ptr(GcArray)` interior), getkind `'ref'`.
+    let llbc = llbc_with_trait_impls(serde_json::json!([]));
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let raw_usize = serde_json::json!({"RawPtr": [usize_ty, "Mut"]});
+    let items = serde_json::json!({"Adt": {"id": 1, "generics": {"types": []}}});
+    let raw_items = serde_json::json!({"RawPtr": [items, "Mut"]});
+    let raw_slot = serde_json::json!({"RawPtr": [raw_items, "Mut"]});
+    let pair = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0, "builtin": "Tuple",
+            "generics": {"types": [raw_usize.clone(), raw_slot.clone()]}
+        }
+    }));
+    let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+    assert_eq!(
+        rows.iter()
+            .map(|(name, spelling, ty)| {
+                (
+                    name.as_str(),
+                    ty.as_ref()
+                        .map(|t| tyref_aggregate_field_value_type(t, &llbc, spelling)),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("__pos_0", Some(ValueType::Int)),
+            ("__pos_1", Some(ValueType::Ref(None))),
+        ]
+    );
+    let byte = TyRef::Other(serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    }));
+    assert_eq!(
+        tyref_aggregate_field_value_type(&byte, &llbc, ""),
+        ValueType::Ref(None),
+        "*mut u8 stays the GC-erasure Ref"
+    );
+}
+
+/// `eprintln!("{a} {b} {c}")` builds `Tuple<&usize, &usize, &usize>`.
+/// The renderer strips `&`, so the owner is `Tuple<usize,usize,usize>`
+/// while the item TyRef is the shared borrow. `Ptr.__new__` refuses
+/// `Ptr(Signed)`; the stored locals are the usizes (`stale_array_abort`).
+#[test]
+fn positional_tuple_shared_borrow_of_usize_is_the_integer() {
+    let llbc = llbc_with_trait_impls(serde_json::json!([]));
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let ref_usize = serde_json::json!({"Ref": ["Erased", usize_ty.clone(), "Shared"]});
+    let triple = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0, "builtin": "Tuple",
+            "generics": {"types": [ref_usize.clone(), ref_usize.clone(), ref_usize.clone()]}
+        }
+    }));
+    assert_eq!(
+        tyref_positional_aggregate_root(&triple, &llbc).as_deref(),
+        Some("Tuple<usize,usize,usize>")
+    );
+    let rows = positional_aggregate_field_rows(&triple, 3, &llbc);
+    assert_eq!(
+        rows.iter()
+            .map(|(name, spelling, ty)| {
+                (
+                    name.as_str(),
+                    ty.as_ref()
+                        .map(|t| tyref_aggregate_field_value_type(t, &llbc, spelling)),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("__pos_0", Some(ValueType::Unsigned)),
+            ("__pos_1", Some(ValueType::Unsigned)),
+            ("__pos_2", Some(ValueType::Unsigned)),
+        ]
+    );
+    let by_value = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0, "builtin": "Tuple",
+            "generics": {"types": [usize_ty.clone(), usize_ty.clone(), usize_ty]}
+        }
+    }));
+    let value_rows = positional_aggregate_field_rows(&by_value, 3, &llbc);
+    assert_eq!(
+        value_rows
+            .iter()
+            .map(|(_, spelling, ty)| {
+                ty.as_ref()
+                    .map(|t| tyref_aggregate_field_value_type(t, &llbc, spelling))
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            Some(ValueType::Unsigned),
+            Some(ValueType::Unsigned),
+            Some(ValueType::Unsigned),
+        ]
+    );
 }
 
 #[test]
@@ -10075,6 +10209,121 @@ fn load_handle_with_width(
     (llbc, ty)
 }
 
+/// A container that stores a RootScope is an instance (`Ref`). The
+/// guard is not raw storage, so `RootedItems { scope, base, len }`
+/// does not inherit Int (`rtyper` `getrepr` → `lowleveltype`;
+/// `getkind`).
+#[test]
+fn rooted_items_containing_root_scope_is_ref() {
+    let decls = vec![
+        (
+            1,
+            struct_decl(
+                1,
+                ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                serde_json::json!([{
+                    "name": "save_point",
+                    "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    "attr_info": null
+                }]),
+                false,
+            ),
+        ),
+        (
+            2,
+            struct_decl(
+                2,
+                ident_path(&["pyre_object", "gc_roots", "RootedItems"]),
+                serde_json::json!([
+                    {
+                        "name": "scope",
+                        "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+                        "attr_info": null
+                    },
+                    {
+                        "name": "base",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    },
+                    {
+                        "name": "len",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    }
+                ]),
+                false,
+            ),
+        ),
+    ];
+    let (llbc, scope) = load_handle(decls.clone(), serde_json::json!([]), 1);
+    assert!(
+        matches!(super::tyref_to_value_type(&scope, &llbc), ValueType::Ref(_)),
+        "RootScope getkind is ref"
+    );
+    let (llbc, items) = load_handle(decls, serde_json::json!([]), 2);
+    assert!(
+        matches!(super::tyref_to_value_type(&items, &llbc), ValueType::Ref(_)),
+        "RootedItems stores a RootScope instance; getkind is ref"
+    );
+}
+
+/// A Ref-item `Vec` is `Vec<*mut GCREFOpaque>` (`rlist.py` item kind `'r'`).
+/// GcType-seeded GCREFOpaque is Ref; the Vec item kind follows.
+#[test]
+fn rust_vec_ref_item_is_gcref_not_ccharp() {
+    use majit_ir::rvec::VecItemKind;
+    let gcref = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 1, "generics": {"types": []}}},
+            "Mut"
+        ]
+    });
+    let decls = vec![
+        (
+            1,
+            struct_decl(
+                1,
+                ident_path(&["majit_gc", "header", "GCREFOpaque"]),
+                empty_fields(),
+                false,
+            ),
+        ),
+        (
+            3,
+            struct_decl(
+                3,
+                ident_path(&["alloc", "vec", "Vec"]),
+                empty_fields(),
+                false,
+            ),
+        ),
+    ];
+    let (llbc, _) = load_handle(decls, serde_json::json!([gctype_impl_for_adt(1)]), 1);
+    let gcref_ty = TyRef::Other(gcref.clone());
+    assert!(
+        matches!(
+            super::tyref_to_value_type(&gcref_ty, &llbc),
+            ValueType::Ref(_)
+        ),
+        "GcType-seeded Opaque GCREFOpaque getkind is ref"
+    );
+    let vec_of = |item: serde_json::Value| {
+        TyRef::Other(serde_json::json!({
+            "Adt": {"id": 3, "generics": {"types": [item]}}
+        }))
+    };
+    assert_eq!(
+        super::tyref_rust_vec_item_kind(&vec_of(gcref), &llbc),
+        Some(VecItemKind::Ref),
+        "Vec<*mut GCREFOpaque> is the Ref-item list"
+    );
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert!(
+        !gc_struct_ids.is_empty(),
+        "GcType impl for GCREFOpaque seeds DeclaredGcFacts"
+    );
+}
+
 /// An external `repr(transparent)` handle is `Opaque`. The wrapper
 /// keeps its own class; the payload row is a pointer to `Deref::Target`.
 #[test]
@@ -10650,6 +10899,95 @@ fn type_decl_is_closure_env_reads_src_not_the_name() {
     assert!(tyref_is_closure_env(&adt_ty(1), &llbc));
 }
 
+fn llbc_with_nested_closure_envs() -> Llbc {
+    // def_id 0: capture-free env (`too_large`). def_id 1: env that
+    // stores that callable (` |_| too_large()`).
+    let file = serde_json::json!({
+        "charon_version": "0.1.201", "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": type_decl_meta(&["fixture", "index_c_int_w", "closure"]),
+                    "kind": {"Struct": []},
+                    "src": {"Closure": {"info": {"kind": "FnOnce"}}},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": type_decl_meta(&["fixture", "index_c_int_w", "closure#1"]),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"Adt": {"id": 0, "generics": {"types": []}}},
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]},
+                    "src": {"Closure": {"info": {"kind": "FnOnce"}}},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }]
+                }
+            ],
+            "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+/// A closure env is the callable, not a raw struct. Capturing one
+/// must not make the outer env `getfield_raw_r`
+/// (`jtransform.py` `rewrite_op_getfield`; `rtyper.py` `getrepr` →
+/// `lowleveltype`; `getkind`).
+#[test]
+fn closure_env_capturing_callable_is_ref_not_raw() {
+    let llbc = llbc_with_nested_closure_envs();
+    let empty = std::collections::HashSet::new();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let free = adt_ty(0);
+    let capturing = adt_ty(1);
+    assert!(
+        matches!(tyref_to_value_type(&free, &llbc), ValueType::Ref(_)),
+        "capture-free closure env is a callable, getkind ref"
+    );
+    assert!(
+        matches!(tyref_to_value_type(&capturing, &llbc), ValueType::Ref(_)),
+        "closure env storing a callable is a class instance, getkind ref"
+    );
+    assert!(
+        !tyref_is_raw_struct_value(&free, &llbc, &empty),
+        "capture-free closure env is not raw storage"
+    );
+    assert!(
+        !tyref_is_raw_struct_value(&capturing, &llbc, &empty),
+        "closure env storing a callable is not raw storage"
+    );
+    assert_eq!(
+        container_declared_gc(
+            &capturing,
+            &llbc,
+            &gc_struct_ids,
+            super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
+        ),
+        Some(true),
+        "owner of a callable field is a GC instance"
+    );
+}
+
 #[test]
 fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
     // `try_dispatch_binary_special::closure::call` captures `operands:
@@ -11084,6 +11422,313 @@ fn ptr_to_int_cast_origin_is_fn_ptr_or_ptr_to_vec() {
     ));
 }
 
+/// `type T = Vec<U>` and `*mut T` are the same `RustVec` header as
+/// `Vec<U>` (`TypeDeclKind::Alias`; Charon names the alias at the field).
+#[test]
+fn rust_vec_type_alias_header_is_int() {
+    let alias_meta = {
+        let name: Vec<serde_json::Value> = ["fixture", "Utf8IndexStorage"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {
+                "attributes": [], "inline": null, "rename": null, "public": true
+            },
+            "is_local": true
+        })
+    };
+    let alias_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": alias_meta,
+        "kind": {"Alias": vec_usize_ty_json()}
+    });
+    let llbc = {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [vec_decl_json(), alias_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    };
+    let alias_adt = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let by_value = TyRef::Other(alias_adt.clone());
+    let ptr = TyRef::Other(serde_json::json!({"RawPtr": [alias_adt, "Mut"]}));
+    for ty in [&by_value, &ptr] {
+        assert!(
+            super::tyref_is_rust_vec_header(ty, &llbc),
+            "alias of Vec is the RustVec header"
+        );
+        assert_eq!(tyref_to_value_type(ty, &llbc), ValueType::Int);
+    }
+}
+
+fn vec_len_autoderef_fixture(raw_ptr_receiver: bool) -> (Llbc, &'static str) {
+    let span = serde_json::json!({
+        "data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }
+    });
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path.iter().map(|segment| {
+                if *segment == "<Impl>" {
+                    serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                } else {
+                    serde_json::json!({"Ident": [segment, 0]})
+                }
+            }).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let vec_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let usize_ty = usize_ty();
+    let src_ty = if raw_ptr_receiver {
+        serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]})
+    } else {
+        vec_ty.clone()
+    };
+    let ref_ty = serde_json::json!({"Ref": ["_", vec_ty.clone(), "Shared"]});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let local = |index: u64, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": null,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let deref_place = serde_json::json!({
+        "kind": {"Projection": [place(1, &src_ty), "Deref"]},
+        "ty": vec_ty
+    });
+    let borrow_place = if raw_ptr_receiver {
+        deref_place
+    } else {
+        place(1, &src_ty)
+    };
+    let name = if raw_ptr_receiver {
+        "raw_ptr_vec_len"
+    } else {
+        "header_vec_len"
+    };
+    let subject = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", name], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [src_ty.clone()],
+            "output": usize_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, &usize_ty),
+                    local(1, &src_ty),
+                    local(2, &ref_ty)
+                ]
+            },
+            "body": [
+                {
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(2, &ref_ty),
+                            {"Ref": {
+                                "place": borrow_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "terminator": {
+                        "span": span,
+                        "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 1},
+                                    "generics": {
+                                        "regions": [],
+                                        "types": [],
+                                        "const_generics": [],
+                                        "trait_refs": []
+                                    }
+                                }},
+                                "args": [{"Move": place(2, &ref_ty)}]}, "dest": place(0, &usize_ty),
+                            "target": 1,
+                            "on_unwind": 2
+                        }}
+                    }
+                },
+                {
+                    "statements": [],
+                    "terminator": {"span": span, "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let vec_len = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["alloc", "vec", "<Impl>", "len"], false),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [ref_ty],
+            "output": usize_ty
+        },
+        "body": "Opaque"
+    });
+    let vec_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["alloc", "vec", "Vec"], false),
+        "kind": {"Struct": []}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [vec_decl],
+            "fun_decls": [subject, vec_len],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    (
+        Llbc::from_slice(file.to_string().as_bytes()).expect("vec len fixture parses"),
+        name,
+    )
+}
+
+/// `(*p).len()` on a stored `*mut Vec<T>` autoderefs to `&Vec`; the
+/// receiver is the `RustVecRepr` header, so the length is
+/// `ll_vec_length`.
+#[test]
+fn rust_vec_raw_ptr_autoderef_len_is_ll_vec_length() {
+    use crate::model::OpKind;
+    let (llbc, name) = vec_len_autoderef_fixture(true);
+    let graph = super::lower_function(&llbc, name).expect("lower raw-ptr vec len");
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.iter().any(|s| s.starts_with("ll_vec_length"))
+        )),
+        "stored *mut Vec len is ll_vec_length, ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+        "stored *mut Vec len is not arraylen_gc, ops={ops:?}"
+    );
+}
+
+/// `v.len()` on a by-value `Vec<T>` autoderefs to `&Vec`; the receiver
+/// is the `RustVecRepr` header, so the length is `ll_vec_length`.
+#[test]
+fn rust_vec_header_autoderef_len_is_ll_vec_length() {
+    use crate::model::OpKind;
+    let (llbc, name) = vec_len_autoderef_fixture(false);
+    let graph = super::lower_function(&llbc, name).expect("lower header vec len");
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.iter().any(|s| s.starts_with("ll_vec_length"))
+        )),
+        "by-value Vec len is ll_vec_length, ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+        "by-value Vec len is not arraylen_gc, ops={ops:?}"
+    );
+}
+
+/// A closure that captures `fn(PyObjectRef)` stores the address
+/// (`Ptr(FuncType)`). The env field is `&fn(…)`; that borrow is still
+/// the int-banked pointer (`history.py` `getkind`).
+#[test]
+fn shared_borrow_of_fn_ptr_is_int() {
+    let llbc = llbc_with_trait_impls(serde_json::json!([]));
+    let fn_ptr = serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": {
+                    "Adt": {
+                        "id": 0,
+                        "builtin": "Tuple",
+                        "generics": {"types": []}
+                    }
+                },
+                "is_unsafe": false
+            }
+        }
+    });
+    let borrowed = TyRef::Other(serde_json::json!({
+        "Ref": ["_", fn_ptr, "Shared"]
+    }));
+    assert_eq!(tyref_to_value_type(&borrowed, &llbc), ValueType::Int);
+    assert_eq!(tyref_to_attr_value_type(&borrowed, &llbc), ValueType::Int);
+}
+
 /// Only a byte pointee spells the type-erased address; a pointee-typed
 /// raw pointer and a wider primitive array head must stay narrows /
 /// aliases, since erasing those would drop a pointee class the
@@ -11201,6 +11846,7 @@ fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
     }));
     let generics = majit_charon_reader::FunGenerics {
         has_types: false,
+        types_len: 0,
         has_const_generics: false,
         trait_clauses: vec![majit_charon_reader::TraitClauseBound {
             trait_id: Some(1),
@@ -12325,6 +12971,7 @@ fn stamp_option_method_inputs(
         &gc_struct_ids,
         false,
         &empty_s,
+        false,
     );
     graph
         .block(graph.startblock)
@@ -14042,93 +14689,6 @@ fn option_of_bare_object_pointer_slice_is_nullable_list() {
         assert!(
             lowering.tyref_is_niche_option_ptr(&option_ty),
             "Charon Option<[PyObject]> is the nullable-list niche"
-        );
-    });
-}
-
-fn vec_struct(def_id: u64) -> serde_json::Value {
-    let span = serde_json::json!({"data": {
-        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
-    }});
-    serde_json::json!({
-        "def_id": def_id,
-        "item_meta": {
-            "name": [
-                {"Ident": ["alloc", 0]},
-                {"Ident": ["vec", 0]},
-                {"Ident": ["Vec", 0]}
-            ],
-            "span": span,
-            "source_text": null,
-            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
-            "is_local": false
-        },
-        "kind": {"Struct": [{
-            "name": "buf",
-            "ty": {"TypeVar": {"Bound": [0, 0]}},
-            "attr_info": null
-        }]}
-    })
-}
-
-fn vec_adt_node(def_id: u64, arg: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "Adt": {
-            "id": def_id,
-            "generics": {
-                "regions": [],
-                "types": [arg],
-                "const_generics": [],
-                "trait_refs": []
-            }
-        }
-    })
-}
-
-/// `Option<Vec<Vec<u8>>>` is the nullable list. `Discriminant` is a
-/// null test; the param seeds `SomeList` of `Vec<u8>`.
-#[test]
-fn option_of_vec_of_vec_u8_is_nullable_list() {
-    use crate::model::ValueType;
-    let llbc = llbc_with_types("fixture", vec![option_enum(0), vec_struct(1)], vec![]);
-    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
-    let vec_vec_u8 = vec_adt_node(1, vec_adt_node(1, u8_ty));
-    let option_ty = TyRef::Other(option_adt_node(0, vec_vec_u8.clone()));
-    let list_root = Some("Vec<Vec<u8>>".to_string());
-    assert_eq!(
-        super::tyref_to_value_type(&option_ty, &llbc),
-        ValueType::Ref(list_root.clone()),
-        "Option<Vec<Vec<u8>>> paints as the nullable list"
-    );
-    let tomb = super::no_tombstoned_leaves();
-    assert_eq!(
-        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None),
-        list_root,
-        "Option<Vec<Vec<u8>>> param seeds SomeList"
-    );
-    let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, vec_vec_u8)));
-    assert_eq!(
-        super::tyref_to_value_type(&borrowed, &llbc),
-        ValueType::Ref(list_root.clone()),
-        "&Option<Vec<Vec<u8>>> value paint is the nullable list"
-    );
-    assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
-        list_root,
-        "&Option<Vec<Vec<u8>>> param seeds SomeList"
-    );
-    with_fixture_lowering(&llbc, |lowering| {
-        assert!(
-            lowering.tyref_is_niche_option_ptr(&option_ty),
-            "Option<Vec<Vec<u8>>> is the nullable-list niche"
-        );
-        assert_eq!(
-            lowering.option_niche_null_cast(&option_ty),
-            Some((
-                "Vec<Vec<u8>>".to_string(),
-                ValueType::Ref(Some("Vec<Vec<u8>>".into()))
-            )),
-            "None is convert_const(None) on that ListRepr"
         );
     });
 }

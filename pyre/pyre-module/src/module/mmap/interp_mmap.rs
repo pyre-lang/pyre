@@ -1493,9 +1493,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     let args_base = roots.pin_roots(args);
                     mmap_check_valid(roots.get(args_base))?;
                     let buf = pyre_interpreter::baseobjspace::charbuf_w(roots.get(args_base + 1))?;
+                    mmap_check_writeable(roots.get(args_base))?;
                     let mut obj = roots.get(args_base);
                     drop(roots);
-                    mmap_check_writeable(obj)?;
                     let (p, len) = mmap_ptr(obj)?;
                     let pos =
                         pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_pos")) as usize;

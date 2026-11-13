@@ -30,6 +30,7 @@ pub(crate) use interp_posix::reinit_fork_tables_after_fork;
 crate::pyre_module_init!(interp_posix_wasm);
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 /// `interp_posix.urandom`, which `_random.W_Random.seed` calls directly.
 #[cfg(not(target_arch = "wasm32"))]

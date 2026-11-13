@@ -1052,6 +1052,15 @@ impl CodeWriter {
                 cfg_kind,
                 returnblock_predecessor_count(rewritten_graph),
             );
+            if declared_kind.is_some_and(|kind| kind != cfg_kind) {
+                eprintln!(
+                    "FUNC.RESULT mismatch after jtransform:\n{}",
+                    rewritten_graph.dump()
+                );
+                for var in rewritten_graph.iter_variables() {
+                    eprintln!("  {var:?}: {:?}", var.concretetype());
+                }
+            }
             let result_type =
                 func_result_kind(rewritten_graph.name.as_str(), declared_kind, cfg_kind);
             // `map_type_to_argclass(SingleFloat) == 'S'` while `getkind` is

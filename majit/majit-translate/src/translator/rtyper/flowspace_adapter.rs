@@ -4859,6 +4859,41 @@ pub fn translate_op(
                             fmt_op_result(op),
                         )));
                     }
+                    // A storage-raw aggregate is an lltype Struct, not an
+                    // RPython class. `lltype.py ann_malloc` must see its
+                    // container type so the result stays SomePtr through
+                    // rtyping (`history.py getkind` then reports int).
+                    if let Some(crate::annotator::model::SomeValue::Ptr(ptr)) = call_registry
+                        .bookkeeper()
+                        .raw_struct_ptr_annotation(class_host.qualname())
+                        && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(
+                            st,
+                        ) = ptr.ll_ptrtype.TO
+                    {
+                        let malloc = HOST_ENV
+                            .import_module("rpython.rtyper.lltypesystem.lltype")
+                            .and_then(|module| module.module_get("malloc"))
+                            .ok_or_else(|| {
+                                TyperError::message("lltype.malloc missing from HOST_ENV")
+                            })?;
+                        let shape = ConstValue::Tuple(vec![
+                            ConstValue::Int(1),
+                            ConstValue::Tuple(vec![ConstValue::byte_str("flavor")]),
+                            ConstValue::Bool(false),
+                        ]);
+                        return Ok(vec![FlowspaceOp::new(
+                            "call_args",
+                            vec![
+                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(malloc))),
+                                Hlvalue::Constant(Constant::new(shape)),
+                                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
+                                    Box::new(LowLevelType::Struct(Box::new(st))),
+                                ))),
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str("raw"))),
+                            ],
+                            result,
+                        )]);
+                    }
                     Ok(vec![instantiate_op(class_host, result)?])
                 }
                 // The untranslated marker body is a no-op. The codewriter
@@ -6437,7 +6472,12 @@ pub(crate) fn derive_subject_inputcells(
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root));
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root))
+                        // A graph that getattr/setattr's this owner FORCE's those
+                        // attrs (`SomeInstance.getattr`). Template rows are the
+                        // harvest; a standalone CodeWriter still has the FieldRead
+                        // owner on the op.
+                        || graph_accesses_struct_fields(legacy, &root);
                     let resolved_root = if known {
                         Some(root)
                     } else {
@@ -6578,6 +6618,26 @@ pub(crate) fn derive_subject_inputcells(
         }
     }
     Ok(cells)
+}
+
+/// True when this graph getattr/setattr's `root`. Those ops FORCE the
+/// attr onto the classdef (`SomeInstance.getattr`); intern the class
+/// even when harvest has not yet published template rows.
+fn graph_accesses_struct_fields(legacy: &FunctionGraph, root: &str) -> bool {
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            let owner = match &op.kind {
+                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. } => {
+                    field.owner_root.as_deref()
+                }
+                _ => None,
+            };
+            if owner == Some(root) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Exact registry key, or template rows of a split struct whose harvest
@@ -9416,6 +9476,32 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+
+        // The same struct constructed inside a graph must select PtrRepr,
+        // just like a caller-supplied pointer (`lltype.py ann_malloc`).
+        let mut ctor_graph = LegacyGraph::new("scope_new");
+        let value = ctor_graph
+            .push_op_var(
+                ctor_graph.startblock,
+                OpKind::Call {
+                    target: crate::model::CallTarget::synthetic_transparent_ctor(owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        ctor_graph.set_return(ctor_graph.startblock, Some(value.clone()));
+        let registry = CallRegistry::new(bk);
+        let (typed, _) = crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var(
+            &ctor_graph, &registry,
+        ).expect("raw struct constructor must annotate and rtype");
+        let lltype = typed[&value].concretetype().expect("typed constructor");
+        assert_eq!(
+            crate::model::getkind(&lltype),
+            crate::model::ConcreteType::Signed
+        );
+        assert!(matches!(lltype, LowLevelType::Ptr(ref ptr) if ptr.TO._gckind() == GcKind::Raw));
     }
 
     #[test]
@@ -9829,6 +9915,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![obj.clone()]),
@@ -9922,6 +10009,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
@@ -9944,6 +10032,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
@@ -10149,6 +10238,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![dest.clone()]),
@@ -10320,6 +10410,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![view]),
@@ -10427,6 +10518,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![view]),
@@ -11263,6 +11355,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -11304,6 +11397,7 @@ mod tests {
                         "jit_force_virtualizable".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -11514,6 +11608,7 @@ mod tests {
                         "reload_top_root".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -11545,15 +11640,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -11586,15 +11677,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "user".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "user",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -11618,11 +11705,10 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["pyre_object".into(), "try_gc_current_object_address".into()],
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -11659,6 +11745,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
@@ -11695,6 +11782,7 @@ mod tests {
                         "try_pyobject_vec_with_capacity".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -11773,6 +11861,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
@@ -11828,6 +11917,7 @@ mod tests {
                         segments,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -11863,6 +11953,7 @@ mod tests {
                     segments: vec!["__delslice_range".into()],
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![
                     vars[0].clone(),
@@ -11934,6 +12025,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
@@ -11991,11 +12083,7 @@ mod tests {
             .push_op_var(
                 entry,
                 OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
+                    target: crate::model::CallTarget::function_path(["vec", "Vec", "index"]),
                     args: crate::model::call_args(vec![v_var, i_var]),
                     result_ty: ValueType::Int,
                 },
@@ -12792,6 +12880,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -12831,6 +12920,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
@@ -12867,6 +12957,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
@@ -12922,6 +13013,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -13000,6 +13092,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: vec![
@@ -13050,6 +13143,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__dyn_call".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
@@ -13092,6 +13186,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -13146,6 +13241,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -13197,6 +13293,7 @@ mod tests {
                         "cast_ptr_to_int".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -13245,6 +13342,7 @@ mod tests {
                         "path".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -13829,6 +13927,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: path.split("::").map(String::from).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vars[2..2 + nargs].to_vec()),
@@ -13953,6 +14052,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -14000,6 +14100,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
@@ -14049,6 +14150,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -14093,6 +14195,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UTF8_ITER.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -14136,6 +14239,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -14177,6 +14281,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -14220,6 +14325,7 @@ mod tests {
                         crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST.into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
@@ -14263,6 +14369,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -14296,6 +14403,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
@@ -14330,6 +14438,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
@@ -14376,16 +14485,12 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[4].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "rordereddict".into(),
-                        "RDict".into(),
-                        "insert".into(),
-                    ],
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "rordereddict",
+                    "RDict",
+                    "insert",
+                ]),
                 args: crate::model::call_args(vec![
                     vars[1].clone(),
                     vars[2].clone(),
@@ -14459,6 +14564,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -14562,6 +14668,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vars[..arity].iter().cloned()),
@@ -14641,11 +14748,9 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: segments.clone(),
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                // HOST_ENV builtin fixture: no FunDecl/generics.types.
+                // Production constructs this path with `function_path`.
+                target: crate::model::CallTarget::function_path(segments.clone()),
                 args: crate::model::call_args(vars[..3].iter().cloned()),
                 result_ty: ValueType::Ref(None),
             },
@@ -14711,6 +14816,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vars[..5].iter().cloned()),
@@ -16023,6 +16129,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
@@ -16075,6 +16182,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -16207,6 +16315,7 @@ mod tests {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args((0..argc).map(|_| Variable::new())),
@@ -18143,6 +18252,7 @@ mod tests {
                     "-3".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
@@ -18186,6 +18296,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "hi".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
@@ -18206,6 +18317,7 @@ mod tests {
                     "re.IGNORECASE".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
@@ -18294,6 +18406,7 @@ mod tests {
                     "function".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
@@ -18431,6 +18544,7 @@ mod tests {
                     "hook_a".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),

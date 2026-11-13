@@ -534,6 +534,7 @@ pub fn init_subclass_ranges() {
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
     crate::runtime_ops::register_sandbox_stub_publisher();
+    crate::objspace::descroperation::init_interned_binop_names();
     // The object-space store site can see that a `locals_cells_stack_w` array
     // has already moved, but not who still points at it; this crate owns the
     // frame chain, so it supplies the holder scan.
@@ -25900,16 +25901,36 @@ fn object_descr_new_from(
         }
         crate::call::check_type_instantiable(cls)?;
         if positional.len() > 1 || has_keywords {
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+            let tp_new = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    "__new__",
+                )
+            };
+            let obj_new = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    w_object,
+                    "__new__",
+                )
+            };
             if !same_inherited_slot(tp_new, obj_new) {
                 return Err(crate::PyError::type_error(
                     "object.__new__() takes exactly one argument (the type to instantiate)"
                         .to_string(),
                 ));
             }
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+            let tp_init = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    "__init__",
+                )
+            };
+            let obj_init = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    w_object,
+                    "__init__",
+                )
+            };
             if same_inherited_slot(tp_init, obj_init) {
                 let name = unsafe { pyre_object::w_type_get_name(cls) };
                 return Err(crate::PyError::type_error(format!(

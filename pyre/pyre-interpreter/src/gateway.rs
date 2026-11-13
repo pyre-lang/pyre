@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use pyre_object::pyobject::*;
+use rustpython_wtf8::Wtf8;
 
 /// pypy/interpreter/gateway.py `class SignatureBuilder`.
 ///
@@ -460,6 +461,36 @@ pub struct BuiltinCodePassThroughArguments0 {
 #[derive(Debug, Clone)]
 pub struct BuiltinCodePassThroughArguments1 {
     pub code: PyObjectRef,
+}
+
+impl BuiltinCodePassThroughArguments1 {
+    /// gateway.py `BuiltinCodePassThroughArguments1.funcrun_obj`: call the
+    /// builtin with `[w_obj] + args_w`.
+    ///
+    /// `args` is a native Vec no root walker updates and `builtin_code_call`
+    /// roots nothing of its own, so `[code, w_obj, ...args]` is published
+    /// before anything can collect and read back for the call.
+    pub fn funcrun_obj(
+        code: PyObjectRef,
+        w_obj: PyObjectRef,
+        args: Vec<PyObjectRef>,
+    ) -> PyObjectRef {
+        let nargs = 1 + args.len();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut live = Vec::with_capacity(1 + nargs);
+        live.push(code);
+        live.push(w_obj);
+        live.extend_from_slice(&args);
+        let root_base = _roots.pin_roots(&live);
+        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+        match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1330,6 +1361,13 @@ pub(crate) unsafe fn builtin_code_check_receiver(
 /// is current at entry.  `dropvalues()` retires the frame slots that would
 /// otherwise root a peeked argument, so a frame dispatch has to publish before
 /// it drops, not after.
+///
+/// Residual in the JIT: its body hands `args` to the builtin's Rust-ABI
+/// `func` / `wrapper.call` through an indirect call, and a slice argument
+/// through an indirect call has no word-ABI lowering. `gateway.py
+/// BuiltinCode.funcrun` is traced upstream and only the fastcall itself is
+/// a residual call; that shape needs the builtin bodies to expose word-ABI
+/// entry points.
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.

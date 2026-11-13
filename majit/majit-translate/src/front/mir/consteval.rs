@@ -69,6 +69,39 @@ impl<'a> Lowering<'a> {
         res
     }
 
+    /// Inner `Place::Global` of an `AnonConst` whose initializer only copies
+    /// that global (`FunDecl::is_global_initializer` / PromotedConst).
+    pub(in crate::front::mir) fn anon_const_copied_global(&self, def_id: u64) -> Option<Place> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd.global_kind_str() != Some("AnonConst") {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let inner = promoted_const_copied_global(&body)?;
+        if inner_global_id(&inner) == def_id {
+            return None;
+        }
+        Some(inner)
+    }
+
+    /// Fold an `AnonConst` whose initializer is pure constant construction
+    /// (`_1 = const C; _0 = &_1`, a fieldless-enum `Aggregate`, a literal).
+    pub(in crate::front::mir) fn anon_const_literal_op(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd.global_kind_str() != Some("AnonConst") {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        if let Some(value) = promoted_const_copied_const(&body)
+            && let Ok(decoded) = decode_constant(self.llbc, &value)
+        {
+            return Some(decoded_const_to_op(decoded));
+        }
+        const_eval_init_body(self.llbc, &body)
+    }
+
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
     /// single literal assignment to its `ConstInt` / `ConstBool` /
     /// `ConstFloat` value.  `None` for statics (`global_kind` ≠
@@ -379,6 +412,75 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// An immutable `static` is a prebuilt constant
+    /// (`bookkeeper.py immutablevalue`). Host-registered addresses
+    /// already won via [`Self::static_addr_op`]; this lane is the
+    /// identity of the declaration itself, never a residual
+    /// `FunctionPath` of the static's symbolic path.
+    pub(in crate::front::mir) fn immutable_static_prebuilt_op(
+        &self,
+        def_id: u64,
+    ) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !immutable_static_is_prebuilt_table(self.llbc, g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Address of an immutable `static`, including interior-mut
+    /// `Cell` / `UnsafeCell` / atomic bindings. The value is not a
+    /// prebuilt constant (`immutable_static_is_prebuilt_table`); the
+    /// address is still the place to load or store through.
+    pub(in crate::front::mir) fn immutable_static_addr_op(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !global_is_immutable_static(g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Peel `Deref` projections to an immutable `static` Global.
+    pub(in crate::front::mir) fn place_peels_to_immutable_static_id(
+        &self,
+        place: &Place,
+    ) -> Option<u64> {
+        self.place_peels_to_any_immutable_static(place)
+            .filter(|&id| {
+                self.llbc
+                    .global_by_id(id)
+                    .is_some_and(|g| immutable_static_is_prebuilt_table(self.llbc, g))
+            })
+    }
+
+    /// Peel `Deref` projections to any immutable `static`, including
+    /// interior-mut `Cell` / `UnsafeCell` / atomic bindings. The value
+    /// is not a prebuilt constant; the address is still the place.
+    pub(in crate::front::mir) fn place_peels_to_any_immutable_static(
+        &self,
+        place: &Place,
+    ) -> Option<u64> {
+        let mut current = place;
+        for _ in 0..8 {
+            match &current.kind {
+                PlaceKind::Global { id, .. } => {
+                    let g = self.llbc.global_by_id(*id)?;
+                    return global_is_immutable_static(g).then_some(*id);
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Atom(s)) if s == "Deref" => {
+                    current = inner;
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                    if v.as_str() == Some("Deref") =>
+                {
+                    current = inner;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Whether `def_id` is an immutable prebuilt instance of a configured
     /// JIT-driver receiver type.
     ///
@@ -596,9 +698,10 @@ impl<'a> Lowering<'a> {
     ///     `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
     ///     do *not* write `_0`, are permitted: none of them define the const
     ///     value, so with no `Switch` the single `size_of` call is its
-    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …)
-    ///     fold through the same lane as an inline `size_of`/`align_of` call;
-    ///     a pointer / tuple / unresolved layout stays residual.
+    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …),
+    ///     thin pointers, tuples, and structs whose Charon offsets did not
+    ///     resolve fold through the same lane as an inline `size_of` /
+    ///     `align_of` call (`llmemory.sizeof`).
     pub(in crate::front::mir) fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd.global_kind_str() != Some("NamedConst") {
@@ -651,9 +754,10 @@ impl<'a> Lowering<'a> {
                     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
                         return None;
                     };
-                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-                        "core::mem::size_of" => false,
-                        "core::mem::align_of" => true,
+                    let fd = self.llbc.fn_by_id(*id)?;
+                    let want_align = match fd.item_meta.name_path().as_str() {
+                        "core::mem::size_of" | "std::mem::size_of" => false,
+                        "core::mem::align_of" | "std::mem::align_of" => true,
                         // `_0` defined by some other function: not a bare
                         // size_of/align_of const.
                         _ => return None,
@@ -663,7 +767,7 @@ impl<'a> Lowering<'a> {
                     if found.is_some() {
                         return None;
                     }
-                    let ty = reg.generics.get("types")?.as_array()?.first()?.clone();
+                    let ty = size_align_call_type_arg(fd, &reg.generics)?.clone();
                     found = Some((want_align, ty));
                 }
                 // `Goto` / `Abort` / `UnwindResume` / `Drop` / `Assert`, and
@@ -708,60 +812,34 @@ impl<'a> Lowering<'a> {
     /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
     /// fold in [`Self::lower_call`].
     ///
-    /// ADT arguments read Charon's `layout_for_target` (wasm32 folds the
-    /// wasm32 width, not the host's). Primitive widths (`usize`, `u64`,
-    /// …) reuse [`primitive_size_align`], the same lane a NamedConst
-    /// initializer already uses, so an inline `align_of::<usize>()`
-    /// folds too.  A pointer to a sized pointee is one address word.
-    /// `None` for a fat pointer / tuple / unresolved layout.
+    /// Mirrors `llmemory.sizeof` (`llmemory.py`): a symbolic constant the
+    /// codewriter folds from the type, not a residual call. Delegates to
+    /// [`size_align_of_tyexpr`].
     pub(in crate::front::mir) fn size_align_const_from_tyexpr(
         &self,
         want_align: bool,
         ty: &serde_json::Value,
     ) -> Option<i64> {
-        if let Some(adt) = self.resolve_tyexpr_to_adt_def_id(ty) {
-            // Read the layout for the build's `TARGET` (empty for the host
-            // extraction target), matching the target-aware field-offset lookup
-            // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
-            // size, not the host's.
-            let target = std::env::var("TARGET").unwrap_or_default();
-            let decl = self.llbc.type_by_id(adt)?;
-            if let Some((size, align)) = decl.size_align_for_target(self.llbc, &target) {
-                let value = if want_align { align } else { size };
-                if let Some(value) = value {
-                    return Some(value as i64);
-                }
-            }
-            // `bytecode::CodeObject` is a foreign struct. Charon records
-            // only an `AtLeast` guarantee, no chosen align. Its fields are
-            // pointers, boxes and `u32`s, so the alignment is the target
-            // word (`CARGO_CFG_TARGET_POINTER_WIDTH`).
-            if want_align && decl.item_meta.name_path().ends_with("bytecode::CodeObject") {
-                return Some(crate::layout::target_word_size() as i64);
-            }
-            // Charon leaves a generic struct's `chosen` layout null. The
-            // declaration-order walk still yields a concrete size once the
-            // type arguments are instantiated, when the recorded repr keeps
-            // that order (`repr(C)` or `repr(transparent)`).
-            if let Some((size, align)) = mem_size_align(self.llbc, ty, &[], 0) {
-                return i64::try_from(if want_align { align } else { size }).ok();
-            }
-            return None;
-        }
-        let body = tyexpr_body(self.llbc, ty)?;
-        // `{"RawPtr": [ty, kind]}` / `{"Ref": [region, ty, kind]}`.
-        let pointee = match (body.get("RawPtr"), body.get("Ref")) {
-            (Some(raw), _) => raw.get(0),
-            (_, Some(reference)) => reference.get(1),
-            _ => None,
+        // A `cachedgraph` copy (`specialize.py`) is a separate graph whose
+        // types are the call's concrete arguments. A generic helper body
+        // still spells `align_of::<GcEntries<K, V>>()` with depth-0
+        // `TypeVar`s; substitute those so `llmemory.sizeof` folds.
+        let substituted = if self.spec_body
+            && !(self.spec_types.is_empty() && self.spec_const_generics.is_empty())
+        {
+            let mut value = ty.clone();
+            crate::front::clause_spec::substitute_type_vars(
+                &mut value,
+                self.llbc,
+                self.spec_types,
+                self.spec_const_generics,
+            );
+            Some(value)
+        } else {
+            None
         };
-        if let Some(pointee) = pointee {
-            // A pointer to a sized pointee is one address word.
-            let pointee = tyexpr_body(self.llbc, pointee)?;
-            let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(self.llbc, pointee);
-            return sized.then(|| crate::layout::target_word_size() as i64);
-        }
-        i64::try_from(primitive_size_align(want_align, body.get("Scalar")?)?).ok()
+        let ty = substituted.as_ref().unwrap_or(ty);
+        i64::try_from(size_align_of_tyexpr(self.llbc, want_align, ty)?).ok()
     }
 }
 
@@ -794,7 +872,697 @@ pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> 
 }
 
 pub(in crate::front::mir) fn global_is_thread_local(g: &GlobalDecl) -> bool {
-    g.global_kind_str() == Some("ThreadLocal")
+    match g.global_kind {
+        majit_charon_reader::GlobalKind::ThreadLocal => true,
+        majit_charon_reader::GlobalKind::Static {
+            is_thread_local, ..
+        } => is_thread_local,
+        _ => false,
+    }
+}
+
+/// An immutable `static` binding: Charon's `Static { is_mut: false }`,
+/// not TLS, not a `static mut` source spelling. The interpreter never
+/// assigns the binding after init, so a read is a prebuilt constant
+/// (`bookkeeper.py immutablevalue`).
+pub(in crate::front::mir) fn global_is_immutable_static(g: &GlobalDecl) -> bool {
+    g.is_immutable_static() && !global_source_text_is_static_mut(g)
+}
+
+/// An immutable `static` whose type is a prebuilt table: every field is
+/// a fnptr / `Option<fnptr>` / integer / fieldless enum /
+/// `Option<fieldless enum>`, and the type tree has no interior
+/// mutability (`UnsafeCell` / `Cell` / `sync::atomic`). `INT_BINOP_SHORTCUTS`
+/// is this shape (`bookkeeper.py immutablevalue`). A `static AtomicBool`
+/// is still `Static { is_mut: false }` in Charon, so the binding is not
+/// the fact; the declared type is.
+pub(in crate::front::mir) fn immutable_static_is_prebuilt_table(
+    llbc: &Llbc,
+    g: &GlobalDecl,
+) -> bool {
+    if !global_is_immutable_static(g) {
+        return false;
+    }
+    if global_tyref(g).is_some_and(|ty| tyref_has_interior_mutability(&ty, llbc)) {
+        return false;
+    }
+    let Some(type_id) = global_decl_adt_id(llbc, g) else {
+        return false;
+    };
+    type_is_prebuilt_table(llbc, type_id)
+}
+
+pub(in crate::front::mir) fn type_is_prebuilt_table(llbc: &Llbc, type_id: u64) -> bool {
+    if type_has_interior_mutability(llbc, type_id) {
+        return false;
+    }
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|field| field_ty_is_prebuilt_immutable(&field.ty, llbc))
+}
+
+pub(in crate::front::mir) fn projection_elem_is_deref(elem: &ProjectionElem) -> bool {
+    matches!(elem, ProjectionElem::Atom(s) if s == "Deref")
+        || matches!(elem, ProjectionElem::Tagged(v) if v.as_str() == Some("Deref"))
+}
+
+/// Non-null sentinel for an immutable `static` that has no host-registered
+/// address. Distinct from [`JITDRIVER_NAMEDCONST_SENTINEL_ADDR`]. The
+/// identity is the global's `def_id`; a later `HostStaticAddrs.refs` row
+/// still wins via [`Lowering::static_addr_op`].
+pub(in crate::front::mir) fn immutable_static_sentinel_addr(def_id: u64) -> i64 {
+    0x0700_0000_0000 + (def_id as i64 + 1) * 16
+}
+
+/// Fold a struct-field read of an immutable static to the initializer
+/// value of that field. Function-pointer slots become `__fn_const`
+/// (`decoded_const_to_op`); `Option<fn>` `None` is the null function
+/// pointer (`ConstInt(0)`). Anything the initializer does not name as a
+/// translation-time constant stays a pure getfield of the prebuilt.
+pub(in crate::front::mir) fn fold_immutable_static_field(
+    llbc: &Llbc,
+    def_id: u64,
+    field_idx: usize,
+) -> Option<OpKind> {
+    let fields = immutable_static_struct_fields(llbc, def_id)?;
+    fields.into_iter().nth(field_idx).flatten()
+}
+
+pub(in crate::front::mir) fn immutable_static_struct_fields(
+    llbc: &Llbc,
+    def_id: u64,
+) -> Option<Vec<Option<OpKind>>> {
+    immutable_static_init_tables(llbc, def_id).map(|(fields, _)| fields)
+}
+
+pub(in crate::front::mir) fn immutable_static_field_fun_id(
+    llbc: &Llbc,
+    def_id: u64,
+    field_idx: usize,
+) -> Option<u64> {
+    let (_, funs) = immutable_static_init_tables(llbc, def_id)?;
+    funs.into_iter().nth(field_idx).flatten()
+}
+
+pub(in crate::front::mir) fn immutable_static_init_tables(
+    llbc: &Llbc,
+    def_id: u64,
+) -> Option<(Vec<Option<OpKind>>, Vec<Option<u64>>)> {
+    let g = llbc.global_by_id(def_id)?;
+    if !immutable_static_is_prebuilt_table(llbc, g) {
+        return None;
+    }
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut locals: std::collections::HashMap<u64, OpKind> = std::collections::HashMap::new();
+    let mut local_funs: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut struct_fields: Option<Vec<Option<OpKind>>> = None;
+    let mut struct_funs: Option<Vec<Option<u64>>> = None;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dst) = place.kind else {
+                continue;
+            };
+            if let Some(fun_id) = eval_static_init_fun_id(llbc, &rvalue, &local_funs) {
+                local_funs.insert(dst, fun_id);
+            }
+            if let Rvalue::Aggregate(kind, operands) = &rvalue
+                && aggregate_kind_is_struct(kind)
+            {
+                struct_fields = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand(llbc, operand, &locals))
+                        .collect(),
+                );
+                struct_funs = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand_fun_id(llbc, operand, &local_funs))
+                        .collect(),
+                );
+            }
+            if let Some(op) = eval_static_init_rvalue(llbc, &rvalue, &locals) {
+                locals.insert(dst, op);
+            }
+        }
+    }
+    Some((struct_fields?, struct_funs.unwrap_or_default()))
+}
+
+pub(in crate::front::mir) fn aggregate_adt_parts(
+    kind: &serde_json::Value,
+) -> Option<(u64, Option<u64>)> {
+    let adt = kind.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = head
+        .as_u64()
+        .or_else(|| head.get("id").and_then(serde_json::Value::as_u64))?;
+    let variant = match adt.get(1) {
+        Some(v) if v.is_null() => None,
+        Some(v) => v.as_u64(),
+        None => None,
+    };
+    Some((type_id, variant))
+}
+
+pub(in crate::front::mir) fn type_decl_is_option(llbc: &Llbc, type_id: u64) -> bool {
+    llbc.type_by_id(type_id)
+        .is_some_and(|td| td.item_meta.name_path() == "core::option::Option")
+}
+
+pub(in crate::front::mir) fn aggregate_kind_is_struct(kind: &serde_json::Value) -> bool {
+    matches!(aggregate_adt_parts(kind), Some((_, None)))
+}
+
+pub(in crate::front::mir) fn eval_static_init_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand(llbc, operand, locals)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+            {
+                return match (variant, operands.len()) {
+                    (Some(0), 0) => Some(OpKind::ConstInt(0)),
+                    (Some(1), 1) => eval_static_init_operand(llbc, &operands[0], locals),
+                    _ => None,
+                };
+            }
+            None
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn eval_prebuilt_static_ref(llbc: &Llbc, id: u64) -> Option<OpKind> {
+    let g = llbc.global_by_id(id)?;
+    immutable_static_is_prebuilt_table(llbc, g)
+        .then_some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(id)))
+}
+
+pub(in crate::front::mir) fn eval_static_init_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match operand {
+        Operand::Const(value) => {
+            if let Some(fun_id) = const_fn_def_regular_id(llbc, value)
+                && let Some(fd) = llbc.fn_by_id(fun_id)
+            {
+                let path = registered_path_for_fun_decl(llbc, fd);
+                return Some(decoded_const_to_op(DecodedConst::FnPath(path.segments)));
+            }
+            decode_constant(llbc, value).ok().map(decoded_const_to_op)
+        }
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+    }
+}
+
+pub(in crate::front::mir) fn eval_static_init_fun_id(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand_fun_id(llbc, operand, local_funs)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+                && variant == Some(1)
+                && operands.len() == 1
+            {
+                return eval_static_init_operand_fun_id(llbc, &operands[0], local_funs);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn eval_static_init_operand_fun_id(
+    llbc: &Llbc,
+    operand: &Operand,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match operand {
+        Operand::Const(value) => const_fn_def_regular_id(llbc, value),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => local_funs.get(id).copied(),
+            _ => None,
+        },
+    }
+}
+
+/// `FnDef` stored in an immutable static field this operand names.
+pub(in crate::front::mir) fn folded_fun_id_from_immutable_static(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<u64> {
+    let (gid, field_idx) = operand_immutable_static_field(llbc, body, operand, 0)?;
+    immutable_static_field_fun_id(llbc, gid, field_idx)
+}
+
+/// Closed PBC family for a call through a field of a type that only
+/// exists as immutable statics: every `FnDef` those initializers store.
+pub(in crate::front::mir) fn closed_fnptr_graphs_for(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let type_id = operand_fnptr_table_adt(llbc, body, operand, 0)?;
+    let mut graphs = Vec::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        if global_decl_adt_id(llbc, g) != Some(type_id) {
+            continue;
+        }
+        let Some((_, funs)) = immutable_static_init_tables(llbc, g.def_id) else {
+            continue;
+        };
+        for fun_id in funs.into_iter().flatten() {
+            let Some(fd) = llbc.fn_by_id(fun_id) else {
+                continue;
+            };
+            let path = registered_path_for_fun_decl(llbc, fd);
+            if !graphs.contains(&path) {
+                graphs.push(path);
+            }
+        }
+    }
+    (!graphs.is_empty()).then_some(graphs)
+}
+
+pub(in crate::front::mir) fn global_tyref(g: &GlobalDecl) -> Option<TyRef> {
+    g.tyref.clone()
+}
+
+pub(in crate::front::mir) fn global_decl_adt_id(llbc: &Llbc, g: &GlobalDecl) -> Option<u64> {
+    let tyref = global_tyref(g)?;
+    let node = tyref_node(&tyref, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    adt_node_def_id(node)
+}
+
+pub(in crate::front::mir) fn operand_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_immutable_static_field(llbc, body, place, depth)
+}
+
+pub(in crate::front::mir) fn place_global_id(place: &Place) -> Option<u64> {
+    match &place.kind {
+        PlaceKind::Global { id, .. } => Some(*id),
+        PlaceKind::Projection(inner, elem) if projection_elem_is_deref(elem) => {
+            place_global_id(inner)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn place_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_immutable_static_field(llbc, body, inner, depth + 1);
+            }
+            if let Some(payload) = elem.field_payload() {
+                let (_, field_idx) = indexed_field_parts(payload)?;
+                if let Some(gid) = place_global_id(inner) {
+                    let g = llbc.global_by_id(gid)?;
+                    return immutable_static_is_prebuilt_table(llbc, g).then_some((gid, field_idx));
+                }
+                // Option payload field: peel to the Option place.
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                    && type_decl_is_option(llbc, head)
+                {
+                    return place_immutable_static_field(llbc, body, inner, depth + 1);
+                }
+            }
+            None
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_immutable_static_field(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn operand_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_fnptr_table_adt(llbc, body, place, depth)
+}
+
+pub(in crate::front::mir) fn place_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+            }
+            if elem.field_payload().is_some() {
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                {
+                    if type_decl_is_option(llbc, head) {
+                        return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+                    }
+                    if immutable_static_exists_for_adt(llbc, head) {
+                        return Some(head);
+                    }
+                }
+            }
+            None
+        }
+        PlaceKind::Global { id, .. } => {
+            let g = llbc.global_by_id(*id)?;
+            if !immutable_static_is_prebuilt_table(llbc, g) {
+                return None;
+            }
+            global_decl_adt_id(llbc, g)
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_fnptr_table_adt(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn immutable_static_exists_for_adt(llbc: &Llbc, type_id: u64) -> bool {
+    type_is_prebuilt_table(llbc, type_id)
+        && llbc.iter_global_decls().any(|g| {
+            immutable_static_is_prebuilt_table(llbc, g)
+                && global_decl_adt_id(llbc, g) == Some(type_id)
+        })
+}
+
+pub(in crate::front::mir) fn local_assigned_operand(
+    body: &Unstructured,
+    local: u64,
+) -> Option<Operand> {
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if !matches!(&place.kind, PlaceKind::Local(dst) if *dst == local) {
+                continue;
+            }
+            return match rvalue {
+                Rvalue::Use(operand, _)
+                | Rvalue::Cast(_, operand, _)
+                | Rvalue::UnaryOp(_, operand) => Some(operand.clone()),
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                    Some(Operand::Copy(place.clone()))
+                }
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Fields of a type that only materialises as immutable statics, and whose
+/// every field is a prebuilt scalar (fnptr / `Option<fnptr>` / integer /
+/// fieldless enum / `Option<fieldless enum>`), are class-level
+/// `_immutable_fields_` (`rclass.py _parse_field_list`). A type tree that
+/// contains `UnsafeCell` / `Cell` / `sync::atomic` is interior-mutable and
+/// stays off this harvest.
+pub(crate) fn harvest_immutable_fields_from_immutable_statics(
+    llbc: &Llbc,
+) -> std::collections::HashMap<String, Vec<(String, crate::model::ImmutableRank)>> {
+    let mut out = std::collections::HashMap::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        let Some(type_id) = global_decl_adt_id(llbc, g) else {
+            continue;
+        };
+        let Some(td) = llbc.type_by_id(type_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        let entries: Vec<(String, crate::model::ImmutableRank)> = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let name = field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+                (name, crate::model::ImmutableRank::Immutable)
+            })
+            .collect();
+        let path = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&path);
+        let leaf = stripped
+            .rsplit("::")
+            .next()
+            .unwrap_or(stripped.as_str())
+            .to_string();
+        out.entry(leaf).or_insert_with(|| entries.clone());
+        out.entry(stripped).or_insert(entries);
+    }
+    out
+}
+
+pub(in crate::front::mir) fn field_ty_is_prebuilt_immutable(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_option_payload_is_fn_ptr(ty, llbc) || tyref_option_fieldless_niche(ty, llbc).is_some()
+    {
+        return true;
+    }
+    if tyref_fieldless_enum_def(ty, llbc).is_some() {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_is_fn_ptr(node, llbc) {
+        return true;
+    }
+    node.get("Scalar")
+        .is_some_and(|scalar| scalar_value_type(scalar).is_some())
+}
+
+/// The type *is* `Cell` / `UnsafeCell` / `Atomic*`, after peeling `Ref`
+/// / `RawPtr`. A class that merely *contains* one of those
+/// (`PyType` with an atomic field) is not this.
+pub(in crate::front::mir) fn tyref_is_interior_mut_constructor(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if let Some(arr) = node
+        .as_object()
+        .and_then(|obj| obj.get("RawPtr"))
+        .and_then(serde_json::Value::as_array)
+        && let Some(inner) = arr.first().and_then(|n| strip_ty_wrappers(n, llbc))
+    {
+        node = inner;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    adt_path_is_interior_mut_constructor(&td.item_meta.name_path(), &td.kind)
+}
+
+/// Declared interior mutability of a type: `UnsafeCell`, `Cell`, or a
+/// `sync::atomic` struct appears in the type tree. The static's binding
+/// name is not consulted.
+pub(in crate::front::mir) fn tyref_has_interior_mutability(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut seen = Vec::new();
+    tyref_node(ty, llbc)
+        .is_some_and(|node| type_node_has_interior_mutability(node, llbc, &mut seen))
+}
+
+pub(in crate::front::mir) fn type_has_interior_mutability(llbc: &Llbc, type_id: u64) -> bool {
+    let mut seen = Vec::new();
+    type_id_has_interior_mutability(llbc, type_id, &mut seen)
+}
+
+pub(in crate::front::mir) fn type_node_has_interior_mutability(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    seen: &mut Vec<u64>,
+) -> bool {
+    if seen.len() > 64 {
+        return false;
+    }
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Slice").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
+        return arr
+            .iter()
+            .any(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(adt) = obj.get("Adt") {
+        if let Some(types) = adt
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            && types
+                .iter()
+                .any(|inner| type_node_has_interior_mutability(inner, llbc, seen))
+        {
+            return true;
+        }
+        if let Some(id) = adt_node_def_id(node) {
+            return type_id_has_interior_mutability(llbc, id, seen);
+        }
+    }
+    false
+}
+
+pub(in crate::front::mir) fn type_id_has_interior_mutability(
+    llbc: &Llbc,
+    type_id: u64,
+    seen: &mut Vec<u64>,
+) -> bool {
+    if seen.contains(&type_id) {
+        return false;
+    }
+    seen.push(type_id);
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    if adt_path_is_interior_mut_constructor(&td.item_meta.name_path(), &td.kind) {
+        return true;
+    }
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+            .iter()
+            .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen)),
+        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen))
+        }),
+        TypeDeclKind::Alias(aliased) => type_node_has_interior_mutability(aliased, llbc, seen),
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+    }
+}
+
+pub(in crate::front::mir) fn tyref_node_interior_mut(
+    ty: &TyRef,
+    llbc: &Llbc,
+    seen: &mut Vec<u64>,
+) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_has_interior_mutability(node, llbc, seen))
+}
+
+/// Type constructors that *are* interior mutability, identified by the
+/// declaration path. `AtomicBool` is a struct in `sync::atomic`;
+/// `Ordering` in the same module is a fieldless enum and is not.
+pub(in crate::front::mir) fn adt_path_is_interior_mut_constructor(
+    path: &str,
+    kind: &TypeDeclKind,
+) -> bool {
+    if path == "core::cell::UnsafeCell" || path.ends_with("::UnsafeCell") {
+        return true;
+    }
+    if path == "core::cell::Cell" || path == "std::cell::Cell" || path.ends_with("::cell::Cell") {
+        return true;
+    }
+    if path.contains("::sync::atomic::") {
+        return matches!(
+            kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown
+        );
+    }
+    false
 }
 
 pub(in crate::front::mir) fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
@@ -969,7 +1737,11 @@ pub(crate) fn discover_transparent_scalar_kinds(
         let Some(field) = fields.get(index) else {
             continue;
         };
-        let kind = match tyref_to_value_type(&field.ty, llbc) {
+        let inner = tyref_to_value_type(&field.ty, llbc);
+        // A transparent scalar retains the inner repr, including unsigned
+        // machine words (`rint.py IntegerRepr`). Sharing the JIT's int kind
+        // with Address does not make a stored usize a signed integer.
+        let kind = match inner {
             ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
             ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
             ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
@@ -1009,6 +1781,47 @@ fn transparent_scalar_name_keys(path: &str) -> Vec<String> {
     }
 }
 
+/// By-value raw structs in this artefact. An `Opaque` dependent has no
+/// field list; the path is that missing layout so `getkind` of the raw
+/// `Ptr` stays `'int'` after [`link_transparent_scalar_types`].
+///
+/// `gc_struct_ids` is the linked `DeclaredGcFacts` field-0 fixpoint
+/// (`GcType` impl / first-field ancestor). `adt_def_is_raw_storage`
+/// is the rest of that pointee-decl rule: a type absent from the set
+/// is raw when every field is a raw word. Evaluate against the whole
+/// linked input so a GC owner in a dependent crate is not published
+/// as an address.
+pub(crate) fn discover_raw_struct_paths(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for decl in llbc.iter_type_decls() {
+        if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        // One-field wrappers peel through `transparent_scalar_kind`.
+        // This set is the multi-field all-raw remainder.
+        if decl.is_repr_transparent() {
+            continue;
+        }
+        let mut stack = Vec::new();
+        if adt_def_is_raw_storage(
+            decl.def_id,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            &mut stack,
+        ) {
+            paths.push(decl.item_meta.name_path());
+        }
+    }
+    paths
+}
+
 /// Transparent scalars whose defining crate is not in the extraction set.
 ///
 /// `rustpython_compiler_core::bytecode::CodeFlags` is the `bitflags!`
@@ -1021,16 +1834,40 @@ pub(in crate::front::mir) fn external_transparent_scalar_kinds()
     )]
 }
 
-pub(in crate::front::mir) fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(
-    llbcs: &[L],
-) {
+pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
     let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
     let llbcs: &[&Llbc] = &llbc_refs;
+    let mut declared_gc = DeclaredGcFacts::default();
+    for llbc in llbcs {
+        declared_gc.absorb(harvest_declared_gc_facts(llbc));
+    }
+    let gc_struct_ids = declared_gc.gc_struct_ids();
     let mut discovered = Vec::new();
+    let mut raw_structs = Vec::new();
+    let mut raw_alloc = Vec::new();
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
+        raw_alloc.extend(
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                *llbc,
+            )),
+        );
+    }
+    raw_alloc.sort();
+    raw_alloc.dedup();
+    let raw_alloc_set: std::collections::HashSet<String> = raw_alloc.iter().cloned().collect();
+    for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
+        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(*llbc),
+        );
+        raw_structs.extend(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &ranks,
+            &raw_alloc_set,
+        ));
         let mut impl_folds = Vec::new();
         for (path, op) in discover_foldable_const_lits(llbc) {
             if path.contains('<') {
@@ -1043,9 +1880,15 @@ pub(in crate::front::mir) fn link_transparent_scalar_types<L: std::borrow::Borro
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
+    raw_structs.sort();
+    raw_structs.dedup();
+    raw_alloc.sort();
+    raw_alloc.dedup();
     let foldable_cross = register_foldable_const_lits(foldable_cross);
     for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+        llbc.register_raw_struct_paths(raw_structs.iter().cloned());
+        llbc.register_raw_alloc_flavor_paths(raw_alloc.iter().cloned());
         attach_foldable_const_lits(llbc, &foldable_cross);
         attach_foldable_const_lits(llbc, &impl_folds);
     }
@@ -1304,6 +2147,7 @@ pub(in crate::front::mir) fn encoding_name_const(segments: &[String]) -> Option<
         target: CallTarget::FunctionPath {
             segments: vec!["__str_const".to_string(), text.to_string()],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![]),
@@ -1428,6 +2272,81 @@ pub(in crate::front::mir) enum DecodedConst {
     FnPath(Vec<String>),
 }
 
+/// Unresolved `Opaque` / `VTableRef` / `TraitConst` share the
+/// `__str_const` path with a real string literal. `getkind` of that
+/// word is `'r'`, so `CallControl.getcalldescr` rejects a `usize`
+/// parameter and the template stays `dont_look_inside`. A real rstr
+/// piece stays `Str` (`emit_str_const` / `rstr.py` `StringRepr`).
+pub(in crate::front::mir) fn is_unresolved_const_sentinel(text: &str) -> bool {
+    text == "__trait_const" || text == "__vtable_ref" || text.starts_with("opaque:")
+}
+
+pub(in crate::front::mir) fn str_const_call_result_ty(text: &str) -> ValueType {
+    if is_unresolved_const_sentinel(text) {
+        ValueType::Ref(None)
+    } else {
+        ValueType::Str
+    }
+}
+
+/// The op `build_rvalue` emits for an `Operand::Const`. A PromotedConst
+/// body that copies that constant and returns a borrow of it folds to
+/// the same op (`flowspace` `Constant`). A Unicode scalar in a const
+/// initializer is the code-point int (`getkind` of UniChar); the rvalue
+/// path emits `unichr` in [`Lowering::emit_decoded_const`].
+pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
+    match decoded {
+        DecodedConst::Int(n) => OpKind::ConstInt(n),
+        DecodedConst::UInt(n) => OpKind::ConstUInt(n),
+        DecodedConst::Int128(n) => OpKind::ConstInt128(n),
+        DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
+        DecodedConst::Bool(b) => OpKind::ConstBool(b),
+        DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
+        DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
+        DecodedConst::UniChar(code) => OpKind::ConstInt(i64::from(code)),
+        // String / byte-string constants — no ConstStr opkind exists;
+        // synthesise a 0-arg `Call` whose path encodes the literal text
+        // so the IR stays stable. A `&str` / `&[u8]` literal lowers to
+        // `Ptr(STR)` (getkind `r`). The `__str_const` path is never
+        // registered: the flowspace adapter pre-folds it to
+        // `Constant('text')` (`flowspace_adapter.rs::is_str_const_define`).
+        // A real rstr piece stamps `ValueType::Str` / `STRPTR`; an
+        // unresolved sentinel stamps `Ref` (`CallControl.getcalldescr`).
+        DecodedConst::Str(s) => {
+            let result_ty = str_const_call_result_ty(&s);
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), s],
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty,
+            }
+        }
+        // A function item used as a *value* rather than called. Upstream
+        // materialises `Constant(funcptr)` of lltype `Ptr(FuncType)`
+        // (`rtyper.getcallable`); `FuncType._gckind` is `raw`, so
+        // `getkind` maps that pointer to `int`.
+        DecodedConst::FnPath(segments) => {
+            let mut synthetic = Vec::with_capacity(segments.len() + 1);
+            synthetic.push(crate::model::FN_CONST_HEAD.to_string());
+            synthetic.extend(segments);
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: synthetic,
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            }
+        }
+    }
+}
+
 /// Literal value tracked by [`const_eval_init_body`].
 #[derive(Clone, Copy)]
 pub(in crate::front::mir) enum ConstLit {
@@ -1445,8 +2364,10 @@ pub(in crate::front::mir) enum ConstLit {
     /// `Field[Tuple 2, 0|1]` projections.
     Checked(i64, bool),
     CheckedUInt(u64, bool),
-    /// Fieldless enum discriminant. Not a folded constant by itself:
-    /// `bitflagset`'s `from_element` shifts by this value (`element as u8`).
+    /// Fieldless enum discriminant. Intermediate for `bitflagset`'s
+    /// `from_element` (`element as u8`). As a const's result it is the
+    /// by-value fieldless-enum constant: `tyref_to_value_type` colors
+    /// that type `Int`, and the constructor folds to `ConstInt`.
     EnumDisc(u64),
     /// `1 << disc` from an opaque `from_element`. `bits` reads the word back.
     BitflagBits(u64),
@@ -1749,31 +2670,9 @@ pub(in crate::front::mir) fn decoded_named_const_on_llbc(
 }
 
 pub(in crate::front::mir) fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
-    match decoded_named_const_on_llbc(llbc, def_id)? {
-        DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
-        DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
-        DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
-        DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
-        DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
-        DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
-        DecodedConst::UniChar(code) => Some(OpKind::ConstInt(i64::from(code))),
-        // A `const NAME: &str = "..."` global reads as a named-const
-        // fold, not a static address; without this arm the read falls
-        // through to a residual `FunctionPath` Call on the const path
-        // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
-        // same synthetic `__str_const` the `build_rvalue` const path
-        // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
-        DecodedConst::Str(s) => Some(OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-                specialization: crate::parse::GraphSpecialization::Regular,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
-        }),
-        _ => None,
-    }
+    Some(decoded_const_to_op(decoded_named_const_on_llbc(
+        llbc, def_id,
+    )?))
 }
 
 /// Discriminant of a fieldless enum variant aggregate.
@@ -2921,12 +3820,13 @@ pub(in crate::front::mir) fn const_eval_size_align_call(
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-        "core::mem::size_of" => false,
-        "core::mem::align_of" => true,
+    let fd = llbc.fn_by_id(*id)?;
+    let want_align = match fd.item_meta.name_path().as_str() {
+        "core::mem::size_of" | "std::mem::size_of" => false,
+        "core::mem::align_of" | "std::mem::align_of" => true,
         _ => return None,
     };
-    let ty = reg.generics.get("types")?.as_array()?.first()?;
+    let ty = size_align_call_type_arg(fd, &reg.generics)?;
     let bytes = size_align_of_tyexpr(llbc, want_align, ty)?;
     Some(const_narrow_to_target(
         const_literal_ty(llbc, &call.dest.ty),
@@ -2948,37 +3848,238 @@ pub(in crate::front::mir) fn const_eval_size_align_call(
 /// back to the host width when that cfg is unset (the host *is* the
 /// target). A wasm32 prepass therefore harvests 4, not the host's 8.
 ///
-/// ADT arguments reuse the same Charon `layout_for_target` lane
-/// [`Lowering::fold_size_const_global`] uses. Anything else (tuple,
-/// slice, an unresolved layout) stays unharvested.
+/// This is `llmemory.sizeof` (`llmemory.py`): a thin pointer, `Box` of a
+/// sized pointee, or `fn` pointer is one address word; a fat pointer is
+/// two. A tuple or a struct whose Charon field offsets did not resolve
+/// still folds from its field types — alignment is the max of the
+/// fields (`ItemOffset` of a `lltype.Struct`).
 pub(in crate::front::mir) fn size_align_of_tyexpr(
     llbc: &Llbc,
     want_align: bool,
     ty: &serde_json::Value,
 ) -> Option<u64> {
-    let body = tyexpr_body(llbc, ty)?;
+    size_align_of_tyexpr_depth(llbc, want_align, ty, 0)
+}
+
+/// Type argument of a `size_of` / `align_of` call.
+///
+/// A generic call carries `T` in `Call.generics.types`. A monomorphized
+/// FunDecl (`name_path` still `core::mem::align_of`) stores `T` on the
+/// `Instantiated` name segment (`ItemMeta::instantiation`); the call
+/// site generics are then empty.
+pub(in crate::front::mir) fn size_align_call_type_arg<'a>(
+    fd: &'a FunDecl,
+    call_generics: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    call_generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .or_else(|| {
+            fd.item_meta
+                .instantiation()?
+                .get("types")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+        })
+}
+
+pub(in crate::front::mir) fn size_align_of_tyexpr_depth(
+    llbc: &Llbc,
+    want_align: bool,
+    ty: &serde_json::Value,
+    depth: u8,
+) -> Option<u64> {
+    if depth > 24 {
+        return None;
+    }
+    let body = strip_ty_indirections(ty, llbc)?;
     if let Some(lit) = body.get("Scalar") {
         return primitive_size_align(want_align, lit);
     }
-    // `size_align_const_from_tyexpr`: a thin `RawPtr` / `Ref` to a sized
-    // pointee is one address word. A slice or trait object stays unharvested.
-    let pointee = match (body.get("RawPtr"), body.get("Ref")) {
-        (Some(raw), _) => raw.get(0),
-        (_, Some(reference)) => reference.get(1),
-        _ => None,
-    };
-    if let Some(pointee) = pointee {
-        let pointee = tyexpr_body(llbc, pointee)?;
-        let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(llbc, pointee);
-        return sized.then(|| crate::layout::target_word_size() as u64);
+    if matches!(body.as_str(), Some("Never")) {
+        return Some(if want_align { 1 } else { 0 });
     }
-    let adt = inline_adt_def_id(body).or_else(|| resolve_tyexpr_to_adt_def_id_free(llbc, ty))?;
+    let word = crate::layout::target_word_size() as u64;
+    if body.get("FnPtr").is_some() {
+        return Some(word);
+    }
+    if let Some(pointee) = type_node_box_pointee(body, llbc) {
+        // `Box<T>` of a sized `T` is one word; `Box<[T]>` / `Box<str>` /
+        // `Box<dyn Trait>` is a fat pointer (two words, word aligned).
+        if json_ty_is_statically_sized(pointee, llbc) {
+            return Some(word);
+        }
+        return Some(if want_align {
+            word
+        } else {
+            word.checked_mul(2)?
+        });
+    }
+    if let Some(pointee) = raw_ptr_or_ref_pointee(body) {
+        let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+        // A nominal ADT is thin only with ptr_metadata "None"
+        // (`lltypelayout.py` `get_fixed_size`). Length / VTable /
+        // InheritFrom stays unharvested so `size_of` remains a Call.
+        if let Some(adt) = pointee.get("Adt")
+            && adt.get("builtin").is_none_or(serde_json::Value::is_null)
+        {
+            if !nominal_adt_pointee(llbc, pointee) {
+                return None;
+            }
+            return Some(word);
+        }
+        // Unsized pointee: a fat pointer is two words, word aligned.
+        if !json_ty_is_statically_sized(pointee, llbc) {
+            return Some(if want_align {
+                word
+            } else {
+                word.checked_mul(2)?
+            });
+        }
+        return Some(word);
+    }
+    if let Some(array) = body.get("Array").and_then(serde_json::Value::as_array)
+        && array.len() >= 2
+    {
+        let elem_align = size_align_of_tyexpr_depth(llbc, true, &array[0], depth + 1)?;
+        if want_align {
+            return Some(elem_align);
+        }
+        let len = charon_array_len_to_string(&array[1], llbc)
+            .parse::<u64>()
+            .ok()?;
+        let elem_size = size_align_of_tyexpr_depth(llbc, false, &array[0], depth + 1)?;
+        return elem_size.checked_mul(len);
+    }
+    if let Some(slice) = body.get("Slice").and_then(serde_json::Value::as_array)
+        && let Some(elem) = slice.first()
+    {
+        // `[T]` is unsized. Alignment is the element's (`ItemOffset` of
+        // an array); size is not a translation-time constant.
+        if want_align {
+            return size_align_of_tyexpr_depth(llbc, true, elem, depth + 1);
+        }
+        return None;
+    }
+    // `C::Name` on `CodeObject<C>` (`w_code_const`'s
+    // `align_of::<CodeObject<ConstantData>>()`). The unique impl binds
+    // the projection (`llmemory.sizeof` after specialize).
+    if let Some(arr) = body.get("TraitType").and_then(serde_json::Value::as_array)
+        && arr.len() >= 2
+        && let Some(resolved) = resolve_trait_assoc_type_value(&arr[0], &arr[1], llbc)
+    {
+        return size_align_of_tyexpr_depth(llbc, want_align, resolved, depth + 1);
+    }
+    // A leftover TypeVar is not a layout. Spec copies substitute first
+    // (`size_align_const_from_tyexpr`).
+    if body.get("TypeVar").is_some() {
+        return None;
+    }
+    let adt = body.get("Adt")?.as_object()?;
+    if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Str") {
+        // `str` is unsized; `align_of::<str>()` is 1.
+        return want_align.then_some(1);
+    }
+    let id = adt.get("id")?.as_u64()?;
+    let decl = llbc.type_by_id(id)?;
+    if let TypeDeclKind::Alias(aliased) = &decl.kind {
+        return size_align_of_tyexpr_depth(llbc, want_align, aliased, depth + 1);
+    }
     let target = std::env::var("TARGET").unwrap_or_default();
-    let layout = llbc.type_by_id(adt)?.layout_for_target(llbc, &target)?;
+    if let Some((size, align)) = decl.size_align_for_target(llbc, &target) {
+        let value = if want_align { align } else { size };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    // Charon leaves `bytecode::CodeObject` offsets unresolved (`chosen`
+    // null). `llmemory.sizeof` still has the host/wasm probe.
+    let canonical = strip_crate_prefix(&decl.item_meta.name_path());
+    if let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical) {
+        let value = if want_align { exact.align } else { exact.size };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    if let Some(layout) = decl.layout_for_target(llbc, &target) {
+        let value = if want_align {
+            layout.align
+        } else {
+            layout.size
+        };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    adt_size_align_from_fields(llbc, decl, body, want_align, depth + 1)
+}
+
+pub(in crate::front::mir) fn raw_ptr_or_ref_pointee(
+    body: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    let obj = body.as_object()?;
+    if let Some(raw) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return raw.first();
+    }
+    obj.get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.get(1))
+}
+
+pub(in crate::front::mir) fn adt_size_align_from_fields(
+    llbc: &Llbc,
+    decl: &TypeDecl,
+    owner: &serde_json::Value,
+    want_align: bool,
+    depth: u8,
+) -> Option<u64> {
+    let mut field_tys: Vec<TyRef> = Vec::new();
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            for field in fields {
+                field_tys.push(size_align_subst_field(field, owner, llbc)?);
+            }
+        }
+        TypeDeclKind::Enum(variants) => {
+            for variant in variants {
+                for field in &variant.fields {
+                    field_tys.push(size_align_subst_field(field, owner, llbc)?);
+                }
+            }
+        }
+        TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => return None,
+    }
+    let mut align = 1u64;
+    let mut off = 0u64;
+    let mut size_known = true;
+    for field_ty in &field_tys {
+        let field_node = tyref_node(field_ty, llbc)?;
+        let stripped = strip_ty_indirections(field_node, llbc)?;
+        let field_node = if let Some(arr) = stripped
+            .get("TraitType")
+            .and_then(serde_json::Value::as_array)
+        {
+            size_align_trait_type_from_owner(llbc, arr, owner).unwrap_or(stripped)
+        } else {
+            stripped
+        };
+        let field_align = size_align_of_tyexpr_depth(llbc, true, field_node, depth)?;
+        align = align.max(field_align);
+        if size_known {
+            if let Some(field_size) = size_align_of_tyexpr_depth(llbc, false, field_node, depth) {
+                off = align_up(off, field_align)?.checked_add(field_size)?;
+            } else {
+                size_known = false;
+            }
+        }
+    }
     if want_align {
-        layout.align
+        Some(align)
+    } else if size_known {
+        align_up(off, align)
     } else {
-        layout.size
+        None
     }
 }
 
@@ -3001,17 +4102,116 @@ pub(in crate::front::mir) fn nominal_adt_pointee(llbc: &Llbc, pointee: &serde_js
         .is_some_and(|decl| decl.ptr_metadata.as_str() == Some("None"))
 }
 
-pub(in crate::front::mir) fn tyexpr_body<'a>(
+/// Field type with the owner's generic arguments substituted.
+///
+/// `substitute_spill_typevars` walks every Deduplicated id through the
+/// type table, so a `[T; 0]` field whose length lives in the const table
+/// declines. Size/align only need the element type (`llmemory.sizeof` of
+/// an array is `n * sizeof(T)` / `alignof(T)`), so a Deduplicated id that
+/// is not a type body is left in place.
+pub(in crate::front::mir) fn size_align_subst_field(
+    field: &majit_charon_reader::ullbc::FieldDecl,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let node = tyref_node(&field.ty, llbc)?;
+    let value = size_align_subst_value(node, owner, llbc, 0)?;
+    Some(TyRef::Other(value))
+}
+
+pub(in crate::front::mir) fn size_align_subst_value(
+    node: &serde_json::Value,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    depth: u8,
+) -> Option<serde_json::Value> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => size_align_subst_value(body, owner, llbc, depth + 1),
+            None => Some(node.clone()),
+        };
+    }
+    if node.get("TypeVar").is_some() {
+        // `clause_spec::type_var_index`: depth-0 `Bound[0, i]` or `Free i`.
+        // Charon type_decls spell the struct's own parameters both ways;
+        // `llmemory.sizeof` of an instantiated `GcEntries<K, V>` must
+        // read the owner's `generics.types[i]` for either spelling.
+        let index = crate::front::clause_spec::type_var_index(node)?;
+        let arg = type_decl_ref_generics(owner.get("Adt")?.as_object()?, llbc)?
+            .get("types")?
+            .as_array()?
+            .get(index)?;
+        return Some(arg.clone());
+    }
+    if let Some(items) = node.as_array() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(size_align_subst_value(item, owner, llbc, depth + 1)?);
+        }
+        return Some(serde_json::Value::Array(out));
+    }
+    if let Some(obj) = node.as_object() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in obj {
+            out.insert(
+                key.clone(),
+                size_align_subst_value(value, owner, llbc, depth + 1)?,
+            );
+        }
+        return Some(serde_json::Value::Object(out));
+    }
+    Some(node.clone())
+}
+
+/// `C::Name` on an instantiated ADT: a `Clause Bound[0, i]` is that
+/// Adt's `trait_refs[i]` (`specialize.py` cachedgraph). The unique impl
+/// is the fallback when the owner has no binding.
+pub(in crate::front::mir) fn size_align_trait_type_from_owner<'a>(
     llbc: &'a Llbc,
-    ty: &'a serde_json::Value,
+    projection: &'a [serde_json::Value],
+    owner: &'a serde_json::Value,
 ) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
-        return arr.get(1);
+    if projection.len() < 2 {
+        return None;
     }
-    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return llbc.dedup_body(id);
+    if let Some(index) = traitref_clause_bound0_index(&projection[0], llbc)
+        && let Some(tr) = type_decl_ref_generics(owner.get("Adt")?.as_object()?, llbc)?
+            .get("trait_refs")?
+            .as_array()?
+            .get(index)
+        && let Some(impl_id) = traitref_impl_id(tr, llbc, 0)
+        && let Some(value) = trait_impl_assoc_value(llbc, impl_id, &projection[1])
+    {
+        return Some(value);
     }
-    Some(ty)
+    resolve_trait_assoc_type_value(&projection[0], &projection[1], llbc)
+}
+
+pub(in crate::front::mir) fn traitref_clause_bound0_index(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let obj = traitref_unwrap(v, llbc, 0)?;
+    let bound = obj.get("kind")?.get("Clause")?.get("Bound")?.as_array()?;
+    if bound.first()?.as_u64()? != 0 {
+        return None;
+    }
+    Some(bound.get(1)?.as_u64()? as usize)
+}
+
+pub(in crate::front::mir) fn align_up(offset: u64, align: u64) -> Option<u64> {
+    if align == 0 {
+        return Some(offset);
+    }
+    let rem = offset % align;
+    if rem == 0 {
+        Some(offset)
+    } else {
+        offset.checked_add(align - rem)
+    }
 }
 
 pub(in crate::front::mir) fn primitive_size_align(
@@ -3745,7 +4945,7 @@ pub(in crate::front::mir) fn mem_size_align(
     if depth > 32 {
         return None;
     }
-    let body = tyexpr_body(llbc, ty)?;
+    let body = strip_ty_indirections(ty, llbc)?;
     if let Some(slot) = typevar_slot(body) {
         let repl = subst.get(slot)?;
         return mem_size_align(llbc, repl, &[], depth + 1);
@@ -3821,7 +5021,7 @@ pub(in crate::front::mir) fn subst_type_args(
     ty: &serde_json::Value,
     subst: &[serde_json::Value],
 ) -> serde_json::Value {
-    let Some(body) = tyexpr_body(llbc, ty) else {
+    let Some(body) = strip_ty_indirections(ty, llbc) else {
         return ty.clone();
     };
     if let Some(slot) = typevar_slot(body) {
@@ -3914,7 +5114,7 @@ pub(in crate::front::mir) fn instantiated_field_size_align(
         return Some(sa);
     }
     let substituted = subst_type_args(llbc, ty, subst);
-    let body = tyexpr_body(llbc, &substituted)?;
+    let body = strip_ty_indirections(&substituted, llbc)?;
     if let Some(slot) = typevar_slot(body) {
         let repl = subst.get(slot)?;
         return instantiated_field_size_align(llbc, repl, &[], clauses, depth + 1);
@@ -4060,7 +5260,7 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
         return subst;
     };
     let field_ty = tyref_json(&field.ty);
-    let Some(body) = tyexpr_body(llbc, &field_ty) else {
+    let Some(body) = strip_ty_indirections(&field_ty, llbc) else {
         return subst;
     };
     let Some(slot) = typevar_slot(body) else {
@@ -4071,7 +5271,9 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
     }
     let slot_is_open = match subst.get(slot) {
         None => true,
-        Some(ty) => tyexpr_body(llbc, ty).is_some_and(|body| typevar_slot(body).is_some()),
+        Some(ty) => {
+            strip_ty_indirections(ty, llbc).is_some_and(|body| typevar_slot(body).is_some())
+        }
     };
     if slot_is_open {
         if subst.len() <= slot {

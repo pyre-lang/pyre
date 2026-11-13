@@ -182,7 +182,7 @@ mod imp {
         if pyre_object::with_roots!(at => funcptr::argtype_is_pointer_kind(at)) {
             return Ok(callproc::ffi_pointer_type());
         }
-        if let Some(tc) = cdata::type_code_of(at)
+        if let Some(tc) = pyre_object::with_roots!(at => cdata::type_code_of(at))
             && let Some(ty) = callproc::ffi_type_from_code(&tc)
         {
             return Ok(ty);

@@ -245,8 +245,51 @@ pub fn _get_empty_instance_of_struct_variety() -> Result<(), TyperError> {
     Err(deferred("_get_empty_instance_of_struct_variety"))
 }
 
-pub fn ann_malloc() -> Result<(), TyperError> {
-    Err(deferred("ann_malloc"))
+/// `lltype.py ann_malloc`: the annotation comes from the constant
+/// container type, independently of the allocation flavor.
+pub fn ann_malloc(
+    _bk: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
+    args_s: &[Option<crate::annotator::model::SomeValue>],
+    kwds: &HashMap<String, Option<crate::annotator::model::SomeValue>>,
+) -> Result<crate::annotator::model::SomeValue, crate::annotator::model::AnnotatorError> {
+    use crate::annotator::model::AnnotatorError;
+    use crate::annotator::model::{SomeObjectTrait, SomeValue};
+    if !(1..=2).contains(&args_s.len()) {
+        return Err(AnnotatorError::new(
+            "malloc() expects a type and optional length",
+        ));
+    }
+    let n = match args_s.get(1).and_then(Option::as_ref) {
+        None => None,
+        Some(SomeValue::Integer(_)) => Some(1),
+        _ => return Err(AnnotatorError::new("malloc() length must be an integer")),
+    };
+    let Some(ConstValue::LowLevelType(T)) = args_s[0].as_ref().and_then(|s| s.const_()) else {
+        return Err(AnnotatorError::new("malloc() type must be constant"));
+    };
+    for name in [
+        "s_zero",
+        "s_flavor",
+        "s_track_allocation",
+        "s_add_memory_pressure",
+        "s_nonmovable",
+    ] {
+        if let Some(Some(value)) = kwds.get(name)
+            && !value.is_constant()
+        {
+            return Err(AnnotatorError::new(format!(
+                "malloc() {name} must be constant"
+            )));
+        }
+    }
+    let ptr = if kwds.get("s_flavor").and_then(Option::as_ref).is_some() {
+        Ptr::from_container_type((**T).clone()).map_err(AnnotatorError::new)?
+    } else {
+        malloc((**T).clone(), n, MallocFlavor::Gc, false)
+            .map_err(AnnotatorError::new)?
+            ._TYPE
+    };
+    Ok(SomeValue::Ptr(SomePtr::new(ptr)))
 }
 
 pub fn ann_free() -> Result<(), TyperError> {

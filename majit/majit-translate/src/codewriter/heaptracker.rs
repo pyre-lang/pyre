@@ -56,12 +56,83 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
 /// the class word of the object header.  Upstream keys on `typeptr` and
 /// the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
 /// w_class }`, and only `ob_type` is the class the tracer guards on.
+///
+/// This is the leaf fact [`is_typeptr_getset`] reconstructs after walking
+/// an inlined header chain. Bare `FieldDescriptor`s already at that leaf
+/// (`owner` `PyObject`, name the typeptr word) match here directly.
 pub fn is_typeptr_field(field: &crate::model::FieldDescriptor) -> bool {
     let owner_leaf = field
         .owner_root
         .as_deref()
         .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
     field.name == "ob_type" && owner_leaf == Some("PyObject")
+}
+
+/// `jtransform.py is_typeptr_getset`.
+///
+/// Upstream matches fieldname `'typeptr'` on a STRUCT whose
+/// `_hints['typeptr']` is true (`rclass.OBJECT`). Inherited access is
+/// `InstanceRepr.setfield` `force_cast` to `OBJECTPTR`, so the name stays
+/// `'typeptr'`. Pyre spells the same access as a dotted path through
+/// inlined header structs (`nest_inline_leaf` concatenates a nonzero hop
+/// onto the offset-0 `_first_struct` / `super` chain). Walk each hop
+/// through declared `FieldRow`s (`CallControl.field_type` /
+/// `is_known_struct`); the leaf is the typeptr iff [`is_typeptr_field`]
+/// says so on the reconstructed `(leaf, nested owner)`.
+pub fn is_typeptr_getset(field: &crate::model::FieldDescriptor, cc: Option<&CallControl>) -> bool {
+    if is_typeptr_field(field) {
+        return true;
+    }
+    let Some(cc) = cc else {
+        return false;
+    };
+    let Some(owner) = field.owner_root.as_deref() else {
+        return false;
+    };
+    typeptr_leaf_of_inlined_chain(cc, owner, &field.name)
+}
+
+/// Declared type of `hop` on `owner`: `CallControl.field_type`
+/// (`StructFieldRegistry.lookup_fields`) then `struct_field_entries`.
+fn declared_field_type<'a>(cc: &'a CallControl, owner: &str, hop: &str) -> Option<&'a str> {
+    cc.field_type(owner, hop).or_else(|| {
+        cc.struct_field_entries(owner).and_then(|rows| {
+            rows.iter()
+                .find(|row| row.name == hop)
+                .map(|row| row.ty.as_str())
+        })
+    })
+}
+
+/// Walk `path` through inlined by-value structs (`is_known_struct`), the
+/// analog of `lltype.Struct._first_struct` / `super` for a named chain.
+/// The last hop is the typeptr leaf on its nested owner.
+fn typeptr_leaf_of_inlined_chain(cc: &CallControl, owner: &str, path: &str) -> bool {
+    let mut hops = path.split('.');
+    let Some(mut hop) = hops.next() else {
+        return false;
+    };
+    let mut cursor = owner.to_string();
+    let mut saw_nest = false;
+    loop {
+        let Some(ty) = declared_field_type(cc, &cursor, hop) else {
+            return false;
+        };
+        match hops.next() {
+            None => {
+                return saw_nest
+                    && is_typeptr_field(&crate::model::FieldDescriptor::new(hop, Some(cursor)));
+            }
+            Some(next) => {
+                if !cc.is_known_struct(ty) {
+                    return false;
+                }
+                saw_nest = true;
+                cursor = ty.to_string();
+                hop = next;
+            }
+        }
+    }
 }
 
 /// `has_gcstruct_a_vtable` over ordered field entries (`STRUCT._names`).
@@ -602,5 +673,94 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "y", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 3);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -5);
+    }
+
+    fn header_chain_callcontrol() -> CallControl {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let object_ty = majit_ir::descr::canonical_struct_name("PyObject");
+        let frame_ty = majit_ir::descr::canonical_struct_name("PyFrame");
+        let prefix_ty = majit_ir::descr::canonical_struct_name("GcFramePrefix");
+        let boxed_ty = majit_ir::descr::canonical_struct_name("Boxed");
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(
+            [
+                object_ty.clone(),
+                frame_ty.clone(),
+                prefix_ty.clone(),
+                boxed_ty.clone(),
+                "PyObject".to_string(),
+                "PyFrame".to_string(),
+                "GcFramePrefix".to_string(),
+                "pyframe::GcFramePrefix".to_string(),
+                "Boxed".to_string(),
+            ]
+            .into(),
+        );
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let object_rows = vec![
+            ("ob_type".to_string(), "usize".to_string()),
+            ("w_class".to_string(), "usize".to_string()),
+        ];
+        let frame_rows = vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("payload".to_string(), "i64".to_string()),
+        ];
+        let prefix_rows = vec![
+            ("gc_header".to_string(), "u64".to_string()),
+            ("frame".to_string(), "PyFrame".to_string()),
+        ];
+        let boxed_rows = vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("payload".to_string(), "i64".to_string()),
+        ];
+        for (key, rows) in [
+            (object_ty, object_rows.clone()),
+            ("PyObject".to_string(), object_rows),
+            (frame_ty, frame_rows.clone()),
+            ("PyFrame".to_string(), frame_rows),
+            (prefix_ty, prefix_rows.clone()),
+            ("GcFramePrefix".to_string(), prefix_rows.clone()),
+            ("pyframe::GcFramePrefix".to_string(), prefix_rows),
+            (boxed_ty, boxed_rows.clone()),
+            ("Boxed".to_string(), boxed_rows),
+        ] {
+            fields.fields.insert(key, rows);
+        }
+        cc.set_struct_fields(fields);
+        cc
+    }
+
+    #[test]
+    fn is_typeptr_getset_matches_object_header_leaf() {
+        let field = crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into()));
+        assert!(is_typeptr_getset(&field, None));
+        let w_class = crate::model::FieldDescriptor::new("w_class", Some("PyObject".into()));
+        assert!(!is_typeptr_getset(&w_class, None));
+    }
+
+    #[test]
+    fn is_typeptr_getset_walks_inlined_header_chain() {
+        let cc = header_chain_callcontrol();
+        let boxed = crate::model::FieldDescriptor::new("ob_header.ob_type", Some("Boxed".into()));
+        assert!(is_typeptr_getset(&boxed, Some(&cc)));
+        let prefix = crate::model::FieldDescriptor::new(
+            "frame.ob_header.ob_type",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(is_typeptr_getset(&prefix, Some(&cc)));
+        let w_class = crate::model::FieldDescriptor::new(
+            "frame.ob_header.w_class",
+            Some("GcFramePrefix".into()),
+        );
+        assert!(!is_typeptr_getset(&w_class, Some(&cc)));
+        let payload =
+            crate::model::FieldDescriptor::new("frame.payload", Some("GcFramePrefix".into()));
+        assert!(!is_typeptr_getset(&payload, Some(&cc)));
+        assert!(
+            !is_typeptr_getset(&prefix, None),
+            "dotted path needs declared FieldRows"
+        );
     }
 }

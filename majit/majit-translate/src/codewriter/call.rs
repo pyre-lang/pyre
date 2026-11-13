@@ -24,8 +24,8 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
-    LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
+    CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
+    InstanceFlags, LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
@@ -138,6 +138,7 @@ fn call_is_access_directly_identity(kind: &OpKind) -> bool {
         target: CallTarget::FunctionPath {
             segments: segments.clone(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: GraphSpecialization::Regular,
         },
         args: Vec::new(),
@@ -2190,6 +2191,9 @@ pub struct JitDriverStaticData {
     /// recursive portal entry.  It is deliberately distinct from both the
     /// split portal graph and the graph containing the original merge point.
     pub portal_runner: Option<CallPath>,
+    /// Interpreter-side portal entry inlined from `eval_current_frame_raw`.
+    /// `call.py jitdriver_sd_from_portal_runner_ptr` matches this too.
+    pub portal_enter: Option<CallPath>,
     /// `warmspot.py split_graph_and_record_jitdriver`: graph containing the
     /// marker before the split portal copy was made.
     pub jit_merge_point_in: CallPath,
@@ -4430,6 +4434,11 @@ pub struct CallControl {
     /// look_inside_graph` delegates to it). Captured because
     /// `BfsPolicyView` cannot hold the original trait object.
     bfs_look_inside_function: Box<dyn Fn(&FunctionGraph) -> bool>,
+    /// Callees `look_inside_graph` declined during `find_all_graphs`.
+    /// Residual calls to these still need a callable address (`getfunctionptr`).
+    policy_declined_callees: HashSet<CallPath>,
+    /// Calldescr recorded at `handle_residual_call` for each residual target.
+    residual_call_descrs: HashMap<CallPath, CallDescriptor>,
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
@@ -4702,6 +4711,11 @@ pub struct CallControl {
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
     /// raw object from a JIT-GC object.
     struct_storage: HashMap<majit_ir::descr::StructId, (bool, bool)>,
+    /// `DeclaredGcFacts::gc_struct_ids` from the program harvest.
+    /// `None` on a `CallControl` that did not run that harvest (unit
+    /// fixtures). `Some` means the harvest ran; a struct absent from the
+    /// set has no `GcType` declaration.
+    declared_gc_struct_ids: Option<HashSet<majit_ir::descr::StructId>>,
     /// Build-time `HostStaticAddrs.pytypes` rows. An exception-class
     /// constant is emitted as the address of its `interp_exceptions`
     /// `PyType` static, which the load-time patch rewrites.
@@ -4820,10 +4834,11 @@ pub struct StructLayout {
     /// Alignment of the struct: Charon `TypeLayout.align` when the
     /// layout was registered, otherwise the max of the fields' alignments.
     pub align: usize,
-    /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
-    /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
-    /// `Gc` (`Struct._note_inlined_into`). The three clauses are a fixpoint
-    /// on the field-0 chain. `Raw` otherwise. Set when the layout is
+    /// `Struct._gckind` / `GcStruct._gckind`. For an LLBC TypeDecl, `Gc`
+    /// when the type implements majit-gc `GcType` or is on that field-0
+    /// chain (`DeclaredGcFacts`); otherwise `Raw`. A synthetic rtyper
+    /// identity with no TypeDecl carries the gckind of its repr
+    /// (`TupleRepr` is `Ptr(GcStruct)`). Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
@@ -4916,6 +4931,21 @@ fn is_known_by_value_struct(
     known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
 }
 
+/// Path before a generic argument list. `bookkeeper.rs` `generic_owner_lookup`.
+fn layout_struct_key(type_name: &str) -> &str {
+    type_name
+        .split_once('<')
+        .map(|(bare, _)| bare)
+        .unwrap_or(type_name)
+}
+
+fn layout_metric<'a, T>(map: &'a HashMap<String, T>, type_str: &str) -> Option<&'a T> {
+    map.get(type_str).or_else(|| {
+        let key = layout_struct_key(type_str);
+        (key != type_str).then(|| map.get(key)).flatten()
+    })
+}
+
 /// Pointee spelling of an `AtomicPtr<T>`.
 fn atomic_ptr_pointee(type_name: &str) -> Option<&str> {
     let (base, args) = type_name.split_once('<')?;
@@ -5000,8 +5030,7 @@ impl StructLayout {
                 // heaptracker.py:64-67
                 // typeptr is still counted for offset calculation below.
                 let sz = if is_known_by_value_struct(known_structs, type_str) {
-                    known_struct_sizes
-                        .get(type_str.as_str())
+                    layout_metric(known_struct_sizes, type_str)
                         .copied()
                         .unwrap_or(crate::layout::target_word_size())
                 } else {
@@ -5014,12 +5043,15 @@ impl StructLayout {
                 }
                 continue;
             }
-            let (flag, field_type, field_size) = field_metadata(
-                type_str,
-                known_structs,
-                known_struct_sizes,
-                raw_alloc_flavor_structs,
-            );
+            let (flag, field_type, field_size) =
+                quasi_immut_mutate_slot_layout(name, immutable_field_ranks).unwrap_or_else(|| {
+                    field_metadata(
+                        type_str,
+                        known_structs,
+                        known_struct_sizes,
+                        raw_alloc_flavor_structs,
+                    )
+                });
             let rank = immutable_field_ranks.get(name).copied();
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 // `lltype.Void` still occupies a `_names` slot
@@ -5053,10 +5085,10 @@ impl StructLayout {
             .iter()
             .map(|(_, ty)| {
                 if is_known_by_value_struct(known_structs, ty) {
-                    if let Some(&align) = known_struct_aligns.get(ty.as_str()) {
+                    if let Some(&align) = layout_metric(known_struct_aligns, ty) {
                         align
                     } else {
-                        match known_struct_sizes.get(ty.as_str()).copied() {
+                        match layout_metric(known_struct_sizes, ty).copied() {
                             Some(size) if size == 0 || size.is_power_of_two() => size,
                             Some(size) => {
                                 panic!("type `{ty}` has size {size} but no field alignment")
@@ -5131,6 +5163,13 @@ impl StructLayout {
             if let Some(&offset) = exact_offsets.get(&fl.name) {
                 fl.offset = offset as usize;
             }
+            if let Some((flag, field_type, field_size)) =
+                quasi_immut_mutate_slot_layout(&fl.name, immutable_field_ranks)
+            {
+                fl.flag = flag;
+                fl.field_type = field_type;
+                fl.size = field_size;
+            }
         }
         let present: std::collections::HashSet<&str> =
             self.fields.iter().map(|f| f.name.as_str()).collect();
@@ -5146,12 +5185,15 @@ impl StructLayout {
             let Some(&offset) = exact_offsets.get(name) else {
                 continue;
             };
-            let (flag, field_type, field_size) = field_metadata(
-                type_str,
-                known_structs,
-                known_struct_sizes,
-                raw_alloc_flavor_structs,
-            );
+            let (flag, field_type, field_size) =
+                quasi_immut_mutate_slot_layout(name, immutable_field_ranks).unwrap_or_else(|| {
+                    field_metadata(
+                        type_str,
+                        known_structs,
+                        known_struct_sizes,
+                        raw_alloc_flavor_structs,
+                    )
+                });
             let rank = immutable_field_ranks.get(name).copied();
             let size = if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 0
@@ -5377,6 +5419,25 @@ pub(crate) fn array_items_base(header_end: usize, elem_align: usize) -> usize {
     header_end.next_multiple_of(elem_align)
 }
 
+/// `funcptr is jd.portal_runner_ptr`: exact path, or the same GraphKey
+/// when both spellings name one registered funcobj.
+fn portal_runner_ptr_is(
+    graphs: &GraphStore,
+    path: &CallPath,
+    registered: Option<&CallPath>,
+) -> bool {
+    let Some(registered) = registered else {
+        return false;
+    };
+    if registered == path {
+        return true;
+    }
+    match (graphs.key_for(path), graphs.key_for(registered)) {
+        (Some(path_key), Some(registered_key)) => path_key == registered_key,
+        _ => false,
+    }
+}
+
 impl CallControl {
     /// RPython: `CallControl.__init__`.
     pub fn new() -> Self {
@@ -5389,6 +5450,8 @@ impl CallControl {
             candidate_graphs: HashSet::new(),
             bfs_policy_state: crate::policy::JitPolicyState::new(),
             bfs_look_inside_function: Box::new(|_| true),
+            policy_declined_callees: HashSet::new(),
+            residual_call_descrs: HashMap::new(),
             helper_seed_graphs: Vec::new(),
             bfs_entry_roots: Vec::new(),
             jitdrivers_sd: Vec::new(),
@@ -5423,6 +5486,7 @@ impl CallControl {
             trait_unique_impls: HashMap::new(),
             trait_family_registrations: Vec::new(),
             struct_storage: HashMap::new(),
+            declared_gc_struct_ids: None,
             exc_pytype_rows: Vec::new(),
             // `symbolic.get_array_token(GcArray(T))[0]`: items sit past the
             // length prefix. Rust's prefix is `usize` (pointer word).
@@ -5657,6 +5721,17 @@ impl CallControl {
         self.struct_storage.get(&struct_id).copied()
     }
 
+    /// Install the program-wide `GcType` harvest (`harvest_declared_gc_facts`
+    /// / `DeclaredGcFacts::gc_struct_ids`).
+    pub fn set_declared_gc_struct_ids(&mut self, ids: HashSet<majit_ir::descr::StructId>) {
+        self.declared_gc_struct_ids = Some(ids);
+    }
+
+    /// The harvest set when this session ran `harvest_declared_gc_facts`.
+    pub fn declared_gc_struct_ids(&self) -> Option<&HashSet<majit_ir::descr::StructId>> {
+        self.declared_gc_struct_ids.as_ref()
+    }
+
     /// Resolve a registered [`StructLayout`] by a struct / enum-variant
     /// name in any spelling, through the name → StructId resolver.
     /// `None` for an unknown or cross-module-ambiguous name — the layout
@@ -5695,14 +5770,33 @@ impl CallControl {
             .iter()
             .map(|row| (row.name.clone(), row.ty.clone()))
             .collect();
-        let layout = std::rc::Rc::new(StructLayout::from_type_strings(
+        // A `MutRef<T>` cell is one GC-pointer field (`mut_ref_cell_root_of`
+        // already required `T` to be a thin GC ref). Passing the cell's
+        // pointee through `known_struct_names` treats a handle ADT as a
+        // nested by-value struct, `from_type_strings` then clears the
+        // field list, and `struct_ctor_alloc_owner` refuses the `New`
+        // rewrite — leaving the synthetic ctor as an unbound residual.
+        let empty_structs = HashSet::new();
+        let known_structs = if mut_ref {
+            &empty_structs
+        } else {
+            &self.known_struct_names
+        };
+        // `rtuple.py TupleRepr`: a non-empty tuple is `malloc(GcStruct)`,
+        // so `_gckind` is gc by construction. `MutRef<T>` is the one-field
+        // GC cell. A shaped `Array<T;N>` is the same on-demand positional
+        // identity (`positional_shape_rows`). None of these has a TypeDecl;
+        // the fact lives on this layout for SizeDescr to read.
+        let mut layout = StructLayout::from_type_strings(
             &pairs,
-            &self.known_struct_names,
+            known_structs,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &self.raw_alloc_flavor_structs,
-        ));
+        );
+        layout.gckind = crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc;
+        let layout = std::rc::Rc::new(layout);
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
     }
@@ -5713,7 +5807,21 @@ impl CallControl {
         &self,
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-        Some(self.struct_layout_for(name)?.gckind)
+        if let Some(layout) = self.struct_layout_for(name) {
+            return Some(layout.gckind);
+        }
+        // A generic TypeDecl instantiation may have no harvested layout
+        // of its own; the template TypeDecl still carries the declared
+        // gckind (`lib.rs` layout.gckind).
+        let sid = majit_ir::descr::struct_id_for_name(name)?;
+        let template = majit_ir::descr::struct_template_id_for_name(name)?;
+        if template == sid {
+            return None;
+        }
+        self.struct_layouts
+            .borrow()
+            .get(&template)
+            .map(|layout| layout.gckind)
     }
 
     /// Host layout of `owner`, when Charon recorded one.
@@ -7887,6 +7995,7 @@ impl CallControl {
             red_types,
             portal_graph,
             portal_runner: None,
+            portal_enter: None,
             jit_merge_point_in,
             mainjitcode: None,
             index_of_virtualizable: -1,
@@ -7912,6 +8021,13 @@ impl CallControl {
     /// prevents graph identity from standing in for runner identity.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
         self.jitdrivers_sd[index].portal_runner = runner;
+    }
+
+    /// Interpreter-side portal entry (`eval_current_frame_raw` inlines to
+    /// this). `jitdriver_sd_from_portal_runner_ptr` matches it like
+    /// `portal_runner_ptr`, including GraphKey aliases of that funcobj.
+    pub fn set_jitdriver_portal_enter(&mut self, index: usize, enter: Option<CallPath>) {
+        self.jitdrivers_sd[index].portal_enter = enter;
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -8160,13 +8276,18 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
+    /// `funcptr is jd.portal_runner_ptr` is funcobj identity. Alias
+    /// spellings of one funcobj share a [`GraphKey`]; a path with no
+    /// registration still matches by exact [`CallPath`].
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        let graphs = &self.function_graphs;
+        self.jitdrivers_sd.iter().find(|sd| {
+            portal_runner_ptr_is(graphs, path, sd.portal_runner.as_ref())
+                || portal_runner_ptr_is(graphs, path, sd.portal_enter.as_ref())
+        })
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -9833,6 +9954,7 @@ impl CallControl {
                                 "callee-policy-declined",
                                 format_args!("{callee_path} in {path}"),
                             );
+                            self.policy_declined_callees.insert(callee_path);
                         }
                     }
                 }
@@ -9844,6 +9966,25 @@ impl CallControl {
     /// Used only after `find_all_graphs()`.
     pub fn is_candidate(&self, path: &CallPath) -> bool {
         self.candidate_graphs.contains(path)
+    }
+
+    /// Record the calldescr `handle_residual_call` computed for `path`.
+    pub fn note_residual_call_descr(&mut self, path: CallPath, descriptor: CallDescriptor) {
+        self.residual_call_descrs.entry(path).or_insert(descriptor);
+    }
+
+    /// Residual shim targets: policy-declined residual callees with an LLBC
+    /// declaration and no bound fnaddr. genc `FunctionCodeGenerator` analogue.
+    pub fn residual_shim_targets(
+        &self,
+        catalog: &[crate::residual_shim::LlbcFnCatalogEntry],
+    ) -> Vec<crate::residual_shim::ResidualShimTarget> {
+        crate::residual_shim::collect_residual_shim_targets(
+            &self.policy_declined_callees,
+            &self.residual_call_descrs,
+            &self.function_fnaddrs,
+            catalog,
+        )
     }
 
     /// Size of the post-`find_all_graphs` candidate set — the graphs the
@@ -10107,14 +10248,52 @@ impl CallControl {
         self.declared_graph_result_type(&graph)
     }
 
-    /// Raw ADT returns have a coarse `ref` frontend token but an int-bank
-    /// `FUNC.RESULT`. Recover that declared repr for untyped call sites too.
+    /// Raw ADT / scalar returns have a coarse `ref` frontend token but an
+    /// int-bank `FUNC.RESULT`. Recover that declared repr for untyped call
+    /// sites too, including residual tokens other than the literal `"ref"`
+    /// (`i64`, `raw:<owner>`).
     pub(crate) fn declared_raw_result_for_target(&self, target: &CallTarget) -> bool {
-        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
-            return false;
-        };
-        graph.return_type.as_deref() == Some("ref")
-            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+        self.declared_result_type_for_target(target) == Some(Type::Int)
+    }
+
+    /// `call.py get_jitcode_calldescr` `FUNC.RESULT` kind for a direct
+    /// target. `None` when the graph has no `return_type` stamp
+    /// (`mir.rs` ordinary fns keep it empty so TyRef labels cannot
+    /// disagree with the CFG).
+    pub(crate) fn declared_return_kind_for_target(&self, target: &CallTarget) -> Option<char> {
+        let (path, _) = self.target_to_path_and_graph(target)?;
+        self.declared_return_kind(&path)
+    }
+
+    /// `flatten.py make_return` colour of a registered callee:
+    /// `getkind(returnblock.inputargs[0].concretetype)`. `None` when
+    /// the cell is still Unknown (isolated / pre-rtyper graphs).
+    pub(crate) fn cfg_result_kind_for_target(&self, target: &CallTarget) -> Option<char> {
+        let (_, graph) = self.target_to_path_and_graph(target)?;
+        let arg = graph.block(graph.returnblock).inputargs.first()?;
+        match FunctionGraph::concretetype_of(arg) {
+            ConcreteType::Signed => Some('i'),
+            ConcreteType::GcRef => Some('r'),
+            ConcreteType::Float => Some('f'),
+            ConcreteType::Void => Some('v'),
+            ConcreteType::Unknown => None,
+        }
+    }
+
+    /// CFG colour as `FUNC.RESULT` only when the graph has no declared
+    /// stamp (`func_result_kind` falls back to the returnblock). A
+    /// present declared type is `call.py getcalldescr` `FUNC.RESULT`;
+    /// `dont_look_inside` residuals can carry a Signed returnblock that
+    /// never went through finalize.
+    pub(crate) fn undeclared_cfg_result_kind_for_target(
+        &self,
+        target: &CallTarget,
+    ) -> Option<char> {
+        if self.declared_result_type_for_target(target).is_some() {
+            None
+        } else {
+            self.cfg_result_kind_for_target(target)
+        }
     }
 
     /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's
@@ -10961,22 +11140,7 @@ impl CallControl {
     /// the constant so the runtime patcher rewrites the slot by name
     /// rather than by matching integer bits.
     pub fn fnaddr_binding_for_target(&self, target: &CallTarget) -> FnAddrBinding {
-        let binding = |path: CallPath, addr: i64, symbolic: bool| FnAddrBinding {
-            path: self
-                .fnaddr_registry_keys
-                .get(&path)
-                .cloned()
-                .unwrap_or_else(|| path.canonical_key()),
-            addr,
-            symbolic,
-        };
-        let from_table = |path: CallPath| match self.concrete_fnaddr_binding(&path) {
-            Some((resolved, addr)) => binding(resolved, addr, false),
-            None => {
-                let addr = symbolic_fnaddr_for_path(&path);
-                binding(path, addr, true)
-            }
-        };
+        let from_table = |path: CallPath| self.fnaddr_binding_for_path(&path);
 
         // A `__majit_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
         // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
@@ -11000,7 +11164,7 @@ impl CallControl {
                 .is_some_and(|leaf| leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX))
         {
             let addr = symbolic_fnaddr_for_path(path);
-            return binding(path.clone(), addr, true);
+            return self.bind_fnaddr(path.clone(), addr, true);
         }
 
         if let Some(segments) = crate::model::fn_const_segments(target) {
@@ -11043,7 +11207,7 @@ impl CallControl {
                     && let Some(addr) =
                         self.concrete_fnaddr_if_abi_ok(&qualified, bound.addr, bound.abi)
                 {
-                    return binding(qualified, addr, false);
+                    return self.bind_fnaddr(qualified, addr, false);
                 }
             }
         }
@@ -11059,8 +11223,45 @@ impl CallControl {
     /// trace-call address when one has been registered for the resolved
     /// `CallPath`; otherwise it falls back to the stable symbolic address
     /// shim for source-only analysis.
+    pub fn fnaddr_for_path(&self, path: &CallPath) -> i64 {
+        self.function_fnaddrs
+            .get(path)
+            .copied()
+            .map(|bound| bound.addr)
+            .unwrap_or_else(|| symbolic_fnaddr_for_path(path))
+    }
+
+    /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
+    /// integer funcptr identity for a call site. majit prefers a host-bound
+    /// trace-call address when one has been registered for the resolved
+    /// `CallPath`; otherwise it falls back to the stable symbolic address
+    /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
         self.fnaddr_binding_for_target(target).addr
+    }
+
+    /// `assembler.py emit_const` object for a residual funcptr named by path.
+    ///
+    /// Same table as [`Self::fnaddr_binding_for_target`]: a bound address
+    /// when the host published one, otherwise the symbolic hash, with the
+    /// registry key the patcher rebinds by.
+    pub fn fnaddr_binding_for_path(&self, path: &CallPath) -> FnAddrBinding {
+        match self.concrete_fnaddr_binding(path) {
+            Some((resolved, addr)) => self.bind_fnaddr(resolved, addr, false),
+            None => self.bind_fnaddr(path.clone(), symbolic_fnaddr_for_path(path), true),
+        }
+    }
+
+    fn bind_fnaddr(&self, path: CallPath, addr: i64, symbolic: bool) -> FnAddrBinding {
+        FnAddrBinding {
+            path: self
+                .fnaddr_registry_keys
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| path.canonical_key()),
+            addr,
+            symbolic,
+        }
     }
 
     /// Strict lookup variant of [`fnaddr_for_target`].
@@ -13234,6 +13435,7 @@ impl CallControl {
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
         extradescrs: Option<Vec<DescrRef>>,
+        calling_graph: Option<&str>,
     ) -> CallDescriptor {
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
@@ -13317,7 +13519,8 @@ impl CallControl {
                     // (voids dropped) raises. Kinds, not only arity.
                     if arg_types != expected_arg_types {
                         panic!(
-                            "operation calling {target}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                            "operation {op:?} in {}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                            calling_graph.unwrap_or("None"),
                         );
                     }
                     // call.py `getcalldescr`: RESULT != FUNC.RESULT raises.
@@ -13332,7 +13535,8 @@ impl CallControl {
                         && result_type != expected_result
                     {
                         panic!(
-                            "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
+                            "{op:?} in {}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
+                            calling_graph.unwrap_or("None"),
                         );
                     }
                 }
@@ -13723,9 +13927,9 @@ pub struct FnAddrBinding {
 /// args/result, so `getcalldescr(op)` and the pointer cannot disagree.
 /// pyre compiles the trampoline separately, so the binding checks it.
 #[derive(Clone, Copy, Debug)]
-struct BoundFnAddr {
-    addr: i64,
-    abi: &'static str,
+pub(crate) struct BoundFnAddr {
+    pub(crate) addr: i64,
+    pub(crate) abi: &'static str,
 }
 
 impl Default for CallControl {
@@ -15726,6 +15930,26 @@ fn trace_field_ei_descr_mint(
     }
 }
 
+/// `rclass.py InstanceRepr._setup_repr` appends
+/// `('mutate_' + name, OBJECTPTR)` for each quasi-immutable field.
+/// A mutate slot holds a `QuasiImmut` instance (`quasiimmut.py`); the
+/// JIT fielddescr is a Ref field of the same STRUCT.
+fn quasi_immut_mutate_slot_layout(
+    name: &str,
+    immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
+    let watched = name.strip_prefix("mutate_")?;
+    let rank = immutable_field_ranks.get(watched)?;
+    if !rank.is_quasi_immutable() {
+        return None;
+    }
+    Some((
+        majit_ir::descr::ArrayFlag::Pointer,
+        majit_ir::value::Type::Ref,
+        crate::layout::target_word_size(),
+    ))
+}
+
 /// RPython: `get_type_flag(TYPE)` (descr.py).
 ///
 /// Returns (ArrayFlag, IR type, size in bytes).
@@ -15746,8 +15970,7 @@ fn field_metadata(
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     if is_known_by_value_struct(known_structs, type_str) {
-        let nested_size = known_struct_sizes
-            .get(type_str)
+        let nested_size = layout_metric(known_struct_sizes, type_str)
             .copied()
             .unwrap_or(crate::layout::target_word_size());
         (
@@ -15866,23 +16089,27 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
-        // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
-        // is FLAG_UNSIGNED. A one-word-item Vec is
-        // `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs rust_vec_lltype`);
-        // `Bookkeeper::project_rust_vec` names that header with the same
-        // recognizer (`rust_vec_item_kind_for_spelling`).
-        s if majit_ir::rvec::rust_vec_item_kind_for_spelling(
-            s,
+        // `{cap, ptr, len}`. A by-value `Vec<T>` field is the three-word
+        // inline substruct (`lltype._note_inlined_into`); loading one word
+        // at the field offset reads `cap`. The field *value* is the
+        // interior address (`direct_fieldptr`).
+        // `alloc::string::String { vec: Vec<u8> }` is that header.
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
+            ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            3 * crate::layout::target_word_size(),
+        ),
+        // Stored `*mut Vec<T>` / `&Vec<T>`: one-word raw header pointer
+        // (`rrustvec.rs rust_vec_lltype`, `descr.py get_type_flag` of a
+        // raw Ptr is FLAG_UNSIGNED). Broader than
+        // `rust_vec_item_kind_for_spelling` (any item type, not only
+        // one-word items); after the inline-vec arm every spelling that
+        // narrower arm classified is still classified here.
+        s if majit_ir::rvec::vec_item_spelling(s).is_some() => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
-        )
-        .is_some() =>
-        {
-            (
-                ArrayFlag::Unsigned,
-                majit_ir::value::Type::Int,
-                crate::layout::target_word_size(),
-            )
-        }
+        ),
         // A `&dyn Trait` / `Box<dyn Trait>` field is two words: the data
         // pointer and the vtable (metadata) pointer. A one-word descr would
         // keep only the data word, and `ptr_metadata` would then load a
@@ -15916,8 +16143,7 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Option<")
-            || s == "String" =>
+            || s.starts_with("Option<") =>
         {
             (
                 ArrayFlag::Pointer,
@@ -17450,6 +17676,7 @@ fn effect_transduce_op(
                     nolength,
                     gckind,
                     pure: false,
+                    taken_by_address: false,
                 },
                 result,
             );
@@ -18441,6 +18668,53 @@ mod tests {
         assert_eq!(by_value.fields[0].size, 200);
     }
 
+    /// `rclass.py InstanceRepr._setup_repr` seats `mutate_<name>` as
+    /// OBJECTPTR even when harvest spells `AtomicPtr<QuasiImmut>`.
+    #[test]
+    fn from_type_strings_classifies_quasi_mutate_slot_as_ref() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert(
+            "value".to_string(),
+            crate::model::ImmutableRank::QuasiImmutable,
+        );
+        let raw: HashSet<String> = ["QuasiImmut".to_string(), "QuasiImmutLock".to_string()]
+            .into_iter()
+            .collect();
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("value".into(), "*mut PyObject".into()),
+                ("mutate_value".into(), "AtomicPtr<QuasiImmut>".into()),
+                (
+                    "mutate_value_lock".into(),
+                    "AtomicPtr<QuasiImmutLock>".into(),
+                ),
+            ],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ranks,
+            &raw,
+        );
+        let mutate = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "mutate_value")
+            .expect("mutate_value row");
+        assert_eq!(mutate.flag, ArrayFlag::Pointer);
+        assert_eq!(mutate.field_type, Type::Ref);
+        assert_eq!(mutate.size, crate::layout::target_word_size());
+        let lock = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "mutate_value_lock")
+            .expect("mutate_value_lock row");
+        assert_eq!(lock.flag, ArrayFlag::Unsigned);
+        assert_eq!(lock.field_type, Type::Int);
+    }
+
     /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential
     /// layout then places `must_advance` at 41 for an 8-byte `string`.
     #[test]
@@ -18971,6 +19245,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -19312,6 +19587,38 @@ mod tests {
         assert_eq!(get_type_flag("*mut u8", &empty), fallback);
         assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
         assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
+    }
+
+    /// A by-value `String` field is the inline `Vec<u8>` header
+    /// (`alloc::string::String { vec: Vec<u8> }`).
+    #[test]
+    fn field_metadata_string_is_inline_vec_u8_header() {
+        let word = crate::layout::target_word_size();
+        let empty_known = HashSet::new();
+        let empty_sizes = HashMap::new();
+        let empty_raw = HashSet::new();
+        let string = field_metadata("String", &empty_known, &empty_sizes, &empty_raw);
+        let vec_u8 = field_metadata("Vec<u8>", &empty_known, &empty_sizes, &empty_raw);
+        assert_eq!(string.0, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(string.1, majit_ir::value::Type::Ref);
+        assert_eq!(string.2, 3 * word);
+        assert_eq!(string, vec_u8);
+        let alloc = field_metadata(
+            "alloc::string::String",
+            &empty_known,
+            &empty_sizes,
+            &empty_raw,
+        );
+        assert_eq!(alloc, string);
+        let mut known = HashSet::new();
+        known.insert("String".to_string());
+        let mut sizes = HashMap::new();
+        sizes.insert("String".to_string(), word);
+        let still = field_metadata("String", &known, &sizes, &empty_raw);
+        assert_eq!(still, string);
+        let borrowed = field_metadata("&String", &empty_known, &empty_sizes, &empty_raw);
+        assert_eq!(borrowed.0, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(borrowed.2, word);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -23931,6 +24238,26 @@ mod tests {
     /// early — every read then returns two packed 32-bit halves. A pointer
     /// item, being word-wide, stays at the word.
     #[test]
+    fn mut_ref_cell_layout_keeps_the_pointer_field() {
+        // A handle ADT in `known_struct_names` must not clear the cell's
+        // one pointer field (`from_type_strings` nested-struct rule).
+        let mut cc = CallControl::new();
+        cc.known_struct_names
+            .insert("pyre_interpreter::error::PyError".into());
+        cc.known_struct_names.insert("PyError".into());
+        let layout = cc
+            .struct_layout_for("MutRef<PyError>")
+            .expect("MutRef cell has a spelling layout");
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "value");
+        assert!(layout.fields[0].size > 0);
+        let layout_path = cc
+            .struct_layout_for("MutRef<pyre_interpreter::error::PyError>")
+            .expect("qualified MutRef cell has a spelling layout");
+        assert_eq!(layout_path.fields.len(), 1);
+    }
+
+    #[test]
     fn array_items_base_rounds_up_to_the_element_alignment() {
         let cc = CallControl::new();
         let word = crate::layout::target_word_size();
@@ -24589,6 +24916,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -24606,6 +24934,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
     }
@@ -24655,6 +24984,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Int);
@@ -24740,6 +25070,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Int);
@@ -24865,6 +25196,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descr.result_ir_type(), Type::Ref);
     }
@@ -24985,6 +25317,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -25031,6 +25364,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
     }
@@ -25556,7 +25890,11 @@ mod tests {
             ))),
             CallKind::Recursive
         );
-        for non_runner in [portal, original] {
+        for non_runner in [
+            portal,
+            original,
+            CallPath::from_segments(["call", "recursive_portal_enter"]),
+        ] {
             assert_ne!(
                 cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                     non_runner.segments
@@ -25565,6 +25903,71 @@ mod tests {
                 "portal graph identities must not stand in for portal_runner_ptr"
             );
         }
+    }
+
+    #[test]
+    fn interpreter_portal_enter_classifies_as_recursive() {
+        // `eval_current_frame_raw` inlines to `recursive_portal_enter`.
+        // `guess_call_kind` answers `recursive` so the five portal words
+        // become `recursive_call`, not a residual of the `EvalFn` pointer
+        // (`call.py jitdriver_sd_from_portal_runner_ptr`).
+        let mut cc = CallControl::new();
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner));
+        cc.set_jitdriver_portal_enter(
+            0,
+            Some(CallPath::from_segments(["call", "recursive_portal_enter"])),
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path([
+                "call",
+                "recursive_portal_enter",
+            ]))),
+            CallKind::Recursive
+        );
+    }
+
+    #[test]
+    fn portal_enter_alias_spelling_classifies_as_recursive() {
+        // `unspecialized_fun_segments` emits the crate-prefixed FunctionPath;
+        // `free_function_alias_paths` registers both spellings on one
+        // GraphKey (`funcptr is jd.portal_runner_ptr`).
+        let mut cc = CallControl::new();
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        let enter = CallPath::from_segments(["call", "recursive_portal_enter"]);
+        let aliased =
+            CallPath::from_segments(["pyre_interpreter", "call", "recursive_portal_enter"]);
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner));
+        cc.set_jitdriver_portal_enter(0, Some(enter.clone()));
+        let graph = FunctionGraph::new("recursive_portal_enter");
+        cc.register_function_graph(enter, graph.clone());
+        cc.register_function_graph(aliased.clone(), graph);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(aliased.segments))),
+            CallKind::Recursive
+        );
     }
 
     #[test]
@@ -26060,6 +26463,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.extra_info.can_invalidate);
@@ -26082,6 +26486,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -26110,6 +26515,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
@@ -26132,6 +26538,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -26158,6 +26565,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -26220,6 +26628,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         assert!(!descriptor.extra_info.has_random_effects());
@@ -26256,6 +26665,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -26300,6 +26710,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -26329,6 +26740,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -26351,6 +26763,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -26372,6 +26785,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -26417,6 +26831,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             hook_descr.extra_info.extraeffect,
@@ -26430,6 +26845,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert!(
@@ -26472,6 +26888,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -26657,6 +27074,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert!(
             !descriptor
@@ -26760,6 +27178,7 @@ mod tests {
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -26802,6 +27221,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -26822,6 +27242,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -26871,6 +27292,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         // Should have non-empty bitsets for field reads and writes.
@@ -26922,6 +27344,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(
@@ -26955,6 +27378,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         });
@@ -26982,6 +27406,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -27031,6 +27456,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -27069,6 +27495,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
@@ -27096,6 +27523,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -27136,6 +27564,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         // `effectinfo.py` `effectinfo_from_writeanalyze`: a top read/write
         // set is `EF_RANDOM_EFFECTS` with `None` descr lists. A cannot-raise
@@ -27168,6 +27597,7 @@ mod tests {
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -27183,6 +27613,7 @@ mod tests {
             OopSpecIndex::IntPyDiv,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -27222,6 +27653,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -27292,6 +27724,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -27695,6 +28128,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         // Write is set, but readonly should NOT have the same bit set.
         // RPython: readonly = reads & ~writes
@@ -28057,9 +28491,10 @@ mod tests {
         assert_eq!(ptr_ty, Type::Ref);
     }
 
-    /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`
+    /// A `Vec<T>` header is `Ptr(Struct(raw) "RustVec")`
     /// (`rrustvec.rs rust_vec_lltype`). `descr.py get_type_flag` of a raw
-    /// Ptr is FLAG_UNSIGNED; the header address is int-banked, one word.
+    /// Ptr is FLAG_UNSIGNED; a stored `*mut Vec<T>` is that one-word
+    /// address. A by-value `Vec<T>` field is the inline three-word value.
     #[test]
     fn rust_vec_header_pointer_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
@@ -28069,7 +28504,14 @@ mod tests {
         let expected = (ArrayFlag::Unsigned, Type::Int, word);
         let known = std::collections::HashSet::new();
         let sizes = std::collections::HashMap::new();
-        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+        for spelling in [
+            "*mut Vec<usize>",
+            "*mut Vec<*mut u8>",
+            "*mut Vec<f64>",
+            "*mut Vec<Utf8LocElem>",
+            "&Vec<usize>",
+            "&mut Vec<f64>",
+        ] {
             assert_eq!(get_type_flag(spelling, &known), expected, "{spelling}");
             assert_eq!(
                 super::field_metadata(spelling, &known, &sizes, &known),
@@ -29036,6 +29478,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -29062,6 +29505,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             )
         };
@@ -29116,6 +29560,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -29152,6 +29597,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             )
         };
@@ -29440,6 +29886,7 @@ mod tests {
             None,
             &mut cache,
             extras,
+            None,
         );
         let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
         assert_eq!(got.len(), 2);
@@ -29480,6 +29927,7 @@ mod tests {
             Some(ExtraEffect::RandomEffects),
             &mut cache,
             extras,
+            None,
         );
         let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
         assert_eq!(got.len(), 1);
@@ -29667,6 +30115,81 @@ mod tests {
         assert_eq!(field_pos_in(&cc, "Method", "ob.ob_type"), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Method", "ob.w_class", 0), 0);
         assert_eq!(field_pos_in(&cc, "Method", "ob.w_class"), 0);
+    }
+
+    /// An inlined raw STRUCT (`QuasiImmutField`) is two leaves
+    /// (`heaptracker.py all_fielddescrs` recursion). `get_fielddescr_index_in`
+    /// numbers them before the next payload field, so `jit_shape`'s minted
+    /// index is its listed position.
+    #[test]
+    fn inlined_quasiimmut_field_is_two_leaves_in_parent_index() {
+        use crate::codewriter::heaptracker::get_fielddescr_index_in;
+        let mut cc = CallControl::new();
+        cc.struct_fields.fields.insert(
+            "PyObject".to_string(),
+            vec![
+                ("ob_type".to_string(), "*const PyType".to_string()),
+                ("w_class".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.struct_fields.fields.insert(
+            "QuasiImmutField".to_string(),
+            vec![
+                ("ptr".to_string(), "*mut u8".to_string()),
+                ("lock".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        cc.struct_fields.fields.insert(
+            "PyCode".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("code_ptr".to_string(), "*const u8".to_string()),
+                (
+                    "w_globals_watchers".to_string(),
+                    "QuasiImmutField".to_string(),
+                ),
+                ("jit_shape".to_string(), "u8".to_string()),
+            ],
+        );
+        cc.set_known_struct_names(
+            ["PyObject", "QuasiImmutField"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+
+        // `ob_header.w_class`=0, `code_ptr`=1, `watchers.ptr`=2,
+        // `watchers.lock`=3, `jit_shape`=4.
+        assert_eq!(get_fielddescr_index_in(&cc, "PyCode", "code_ptr", 0), 1);
+        assert_eq!(
+            get_fielddescr_index_in(&cc, "PyCode", "w_globals_watchers.ptr", 0),
+            2
+        );
+        assert_eq!(
+            get_fielddescr_index_in(&cc, "PyCode", "w_globals_watchers.lock", 0),
+            3
+        );
+        assert_eq!(get_fielddescr_index_in(&cc, "PyCode", "jit_shape", 0), 4);
+        assert_eq!(field_pos_in(&cc, "PyCode", "jit_shape"), 4);
+        let names = [
+            "w_class",
+            "code_ptr",
+            "w_globals_watchers.ptr",
+            "w_globals_watchers.lock",
+            "jit_shape",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let owner = if *name == "w_class" {
+                "PyObject"
+            } else {
+                "PyCode"
+            };
+            let walked = get_fielddescr_index_in(&cc, owner, name, 0);
+            assert_eq!(
+                walked, i as isize,
+                "{owner}.{name} index_in_parent {walked} at listed position {i}"
+            );
+        }
     }
 
     /// A `()`-payload enum variant is what makes a mint site's own field
@@ -30212,6 +30735,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             matching.extra_info.extraeffect,
@@ -30228,6 +30752,7 @@ mod tests {
                     OopSpecIndex::None,
                     None,
                     &mut cache,
+                    None,
                     None,
                 );
             })) else {
@@ -31084,6 +31609,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_ne!(

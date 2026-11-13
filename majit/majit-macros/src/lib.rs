@@ -1987,20 +1987,28 @@ fn helper_return_to_i64(
             __majit_header as usize as i64
         }});
     }
-    if is_gc_ref_type(ty) {
-        return Some(quote! { (#value).0 as i64 });
-    }
-    if is_raw_pointer_type(ty) {
-        return Some(quote! { (#value) as usize as i64 });
-    }
-    // Same word as a plain `PyObjectRef` return: `Some(p)` is that pointer,
-    // `None` is the null word.
-    if nullable_pointer_option(ty) {
+    if is_gc_ref_type(ty)
+        || is_raw_pointer_type(ty)
+        || nullable_pointer_option(ty)
+        || primitive_type_ident(ty).is_some_and(|ident| {
+            matches!(
+                ident.to_string().as_str(),
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "isize"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "usize"
+                    | "bool"
+                    | "f64"
+            )
+        })
+    {
         return Some(quote! {
-            match #value {
-                ::core::option::Option::Some(__majit_ptr) => (__majit_ptr as usize) as i64,
-                ::core::option::Option::None => 0,
-            }
+            <#ty as ::majit_ir::helper_fnaddr::ResidualIntoI64>::into_residual_i64(#value)
         });
     }
     if is_version_tag_type(ty) {
@@ -2009,16 +2017,7 @@ fn helper_return_to_i64(
             __majit_tag.0 as i64
         }});
     }
-    let ty_ident = primitive_type_ident(ty)?;
-    match ty_ident.to_string().as_str() {
-        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => {
-            Some(quote! { (#value) as i64 })
-        }
-        "i64" => Some(quote! { #value }),
-        "isize" => Some(quote! { (#value) as i64 }),
-        "f64" => Some(quote! { f64::to_bits(#value) as i64 }),
-        _ => None,
-    }
+    None
 }
 
 fn is_word_enum_arg(ty: &Type, word_enums: &[Path]) -> bool {
@@ -5749,6 +5748,10 @@ mod tests {
             Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(
+            skip("fn f(x: PyError) -> PyError { x }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
             skip("fn f(x: (i64, i64)) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::Other)
         );
@@ -6015,6 +6018,51 @@ mod tests {
             "{str_text}"
         );
         assert!(str_text.contains("as * const () , 1"), "{str_text}");
+    }
+
+    #[test]
+    fn object_pointer_slice_trampoline_is_one_ref_word() {
+        let func = parse_fn("fn f(xs: &[PyObjectRef]) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("fn __majit_call_target_f (__majit_arg_0 : i64) -> i64"),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 1"), "{text}");
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{text}"
+        );
+        assert!(!text.contains("__majit_arg_0_len"), "{text}");
+
+        let words: WordEnumsArg = syn::parse_str("word_enums(CallMode)").unwrap();
+        let call_func = parse_fn(
+            "fn call_non_function_callable_with_mode(\
+             execution_context: *const u8, \
+             callable: PyObjectRef, \
+             args: &[PyObjectRef], \
+             mode: CallMode, \
+             profile_frame: *mut u8) -> PyResult { loop {} }",
+        );
+        assert_eq!(
+            trampoline_skip_reason(&call_func, "dont_look_inside", &words.0),
+            None
+        );
+        let (_, _, call_tokens) =
+            emit_helper_call_target_fn(&call_func, true, None, "dont_look_inside", &words.0, false)
+                .expect("emit")
+                .expect("trampoline");
+        let call_text = call_tokens.to_string();
+        assert!(call_text.contains("as * const () , 5"), "{call_text}");
+        assert!(
+            call_text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{call_text}"
+        );
+        assert!(call_text.contains("from_discriminant"), "{call_text}");
     }
 
     #[test]
@@ -6550,6 +6598,19 @@ mod tests {
             ),
             "body-local _jit_llop_<NAME>, got {:?}",
             fn_const_names(expanded)
+        );
+    }
+
+    #[test]
+    fn icf_identity_lives_on_elidable_trampoline() {
+        let func = parse_fn("fn leaf(x: i64) -> i64 { x }");
+        let (_, _, tokens) = emit_helper_call_target_fn(&func, true, None, "elidable", &[], false)
+            .expect("emit")
+            .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("icf_identity"),
+            "elidable trampoline must keep the host ICF token: {text}"
         );
     }
 }

@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=16
 # pyre-check: spec-folds=format_with_spec_int
+# pyre-check: trace-shape=fstring_simple__main:absent=CallMayForceR,convert_value__main:absent=CallMayForceR,fstring_spec__main:present=Copystrcontent,string_ops__main:absent=CallMayForceR
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept from its former standalone file with module-level names prefixed by the
 # source name. Bug-repro / resume / kept-stack tests are NOT merged (they stay

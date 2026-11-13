@@ -1654,10 +1654,10 @@ pub(crate) fn exception_string_override_straight_line(
 /// `jit_metadata.json` carries.
 ///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
-/// (body, entry argument-array length) rather than once per call site.  Only
-/// this entry point memoizes: the summary a cycle produces belongs to the
-/// occurrence that opened it, not to the body, so
-/// [`summarize_descent_blockers`] caches nothing, and a body entered with more
+/// (body, entry argument-array length) rather than once per call site.  A
+/// cycle's placeholder still belongs to that occurrence, so it does not fill
+/// the jitcode slot; the current analysis stack keeps a local memo so a
+/// shared callee is still walked once per scan.  A body entered with more
 /// than [`DESCENT_ENTRY_LEN_SLOTS`] arguments recomputes.
 fn descent_decline(
     jitcode_index: usize,
@@ -2624,12 +2624,31 @@ fn known_goto_if_taken(
 
 /// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
 /// jitcode indices currently being scanned.
+/// Unique fact-free bodies one analysis stack will walk. A gateway whose
+/// `inline_call_*` graph is larger answers `body_not_walked` rather than
+/// expanding every remaining path.
+const DESCENT_SCAN_UNIQUE_BUDGET: usize = 256;
+/// Path depth of the current analysis stack, including the body about to
+/// be entered. Interpreter helpers can form long chains; past this the
+/// unread remainder is `body_not_walked`.
+const DESCENT_SCAN_DEPTH_BUDGET: usize = 64;
+
 fn summarize_descent_blockers(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
 ) -> DescentBlockerSummary {
     let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_hits)
+    let mut local_memo = std::collections::HashMap::new();
+    // The caller (`descent_blocker_summary`) is already inside this body's
+    // OnceLock `get_or_init`. Routing the root through `cached` would
+    // reenter that same slot. Callees still go through `cached`.
+    summarize_descent_blockers_with_entry_inner(
+        jitcode_index,
+        seen,
+        &[],
+        &mut cycle_hits,
+        &mut local_memo,
+    )
 }
 
 /// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
@@ -2640,25 +2659,53 @@ fn summarize_descent_blockers(
 /// where a body already on the stack answers "executes an effect, names no
 /// blocker" for the occurrence that opened the cycle rather than for the body.
 /// A subtree that took that arm nowhere did not read the stack at all and its
-/// answer is a property of the body alone.  Without the memo a callee shared by
-/// several paths is re-walked once per path, and the walk is transitive, so the
-/// scan a single gateway pays grows with the shape of the graph beneath it.
+/// answer is a property of the body alone.  The jitcode slot stores only that
+/// body-property answer.  The current analysis stack also memos every finished
+/// body, cycle-tainted included, so a callee shared by several paths is not
+/// re-walked once per path.
 fn summarize_descent_blockers_cached(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
     cycle_hits: &mut u64,
+    local_memo: &mut std::collections::HashMap<usize, DescentBlockerSummary>,
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
+        return summarize_descent_blockers_with_entry_inner(
+            jitcode_index,
+            seen,
+            &[],
+            cycle_hits,
+            local_memo,
+        );
     }
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    };
-    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
+    if let Some(&cached) = local_memo.get(&jitcode_index) {
         return cached;
     }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return summarize_descent_blockers_with_entry_inner(
+            jitcode_index,
+            seen,
+            &[],
+            cycle_hits,
+            local_memo,
+        );
+    };
+    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
+        local_memo.insert(jitcode_index, cached);
+        return cached;
+    }
+    if local_memo.len() >= DESCENT_SCAN_UNIQUE_BUDGET {
+        return body_not_walked();
+    }
     let cycles_before = *cycle_hits;
-    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
+    let summary = summarize_descent_blockers_with_entry_inner(
+        jitcode_index,
+        seen,
+        &[],
+        cycle_hits,
+        local_memo,
+    );
+    local_memo.insert(jitcode_index, summary);
     if *cycle_hits == cycles_before {
         jitcode.descent_blocker_summary(|| summary);
     }
@@ -2678,11 +2725,13 @@ fn summarize_descent_blockers_with_entry(
     // executing thread. Every recursive callee shares it; an independent
     // analysis (including a reentrant one) must not change its value.
     let mut cycle_hits = 0;
+    let mut local_memo = std::collections::HashMap::new();
     summarize_descent_blockers_with_entry_inner(
         jitcode_index,
         seen,
         entry_array_lengths,
         &mut cycle_hits,
+        &mut local_memo,
     )
 }
 
@@ -2691,6 +2740,7 @@ fn summarize_descent_blockers_with_entry_inner(
     seen: &mut Vec<usize>,
     entry_array_lengths: &[(usize, usize)],
     cycle_hits: &mut u64,
+    local_memo: &mut std::collections::HashMap<usize, DescentBlockerSummary>,
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
         *cycle_hits += 1;
@@ -2698,6 +2748,9 @@ fn summarize_descent_blockers_with_entry_inner(
             may_execute_effect: true,
             ..DescentBlockerSummary::default()
         };
+    }
+    if seen.len() >= DESCENT_SCAN_DEPTH_BUDGET {
+        return body_not_walked();
     }
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
         // A body the scan cannot obtain is a callee it holds nothing about, so
@@ -2728,12 +2781,14 @@ fn summarize_descent_blockers_with_entry_inner(
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
             match entry_lens {
-                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
+                [] => Some(summarize_descent_blockers_cached(
+                    callee, seen, cycle_hits, local_memo,
+                )),
                 // Nested identity-trampoline facts stay on this `seen` path.
                 // The entry-length OnceLock starts an empty `seen`, so an
                 // A → B → A trampoline would reenter A's in-progress slot.
                 other => Some(summarize_descent_blockers_with_entry_inner(
-                    callee, seen, other, cycle_hits,
+                    callee, seen, other, cycle_hits, local_memo,
                 )),
             }
         },
@@ -4666,7 +4721,7 @@ fn loop_bearing_header_call_assembler(
 ///
 /// `finishframe(..., leave_portal_frame=False)` already popped the callee.
 /// The op is recorded only once the assembler or residual call is in the trace.
-fn record_deferred_portal_leave(jd_no: Option<usize>) {
+pub(crate) fn record_deferred_portal_leave(jd_no: Option<usize>) {
     let Some(jd_no) = jd_no else {
         return;
     };
@@ -11501,6 +11556,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_frame,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
         );
+        crate::helpers::stamp_inline_frame_locals_array(
+            ctx.trace_ctx,
+            callee_frame,
+            concrete_frame_ptr,
+        );
         // The emitted cells above are the trace's objects; the sub-walk runs
         // the callee's residuals for real, and one that reads a cell
         // (`bh_load_deref_value_fn`) must reach the object the constructor
@@ -18054,6 +18114,22 @@ fn descend_generatorentry<Sym: WalkSym>(
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // `_send_ex` after `_invoke_execute_frame`. CALL_ASSEMBLER dest is the
+    // portal result; a RETURN is `w_none` (a real object). `bh_send_ex_tail`
+    // collapses a finished frame to null so FOR_ITER's GuardNonnull is the
+    // loop exit. The 1-yield arm records the same check via
+    // `bind_generator_resume_foriter_item`; this several-yields token skipped
+    // it and stored the implicit None as an item.
+    let answer = ctx.trace_ctx.call_ref_typed_with_effect(
+        pyre_interpreter::residual_word_addr!(2, bh_send_ex_tail) as *const (),
+        &[ca_result, iter_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_metainterp::default_effect_info(),
+    );
+    let tail = bh_send_ex_tail(concrete as pyre_object::PyObjectRef, iter_obj);
+    ctx.trace_ctx
+        .set_opref_concrete(answer, majit_ir::Value::Ref(majit_ir::GcRef(tail as usize)));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', answer)?;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
@@ -19257,6 +19333,9 @@ fn walk_generator_resume<Sym: WalkSym>(
             let deferred_portal_leave = if let Some(jd_no) = subwalk_jd_no {
                 match &result {
                     Err(DispatchError::TraceTooLong { .. }) => None,
+                    // `ChangeFrame`: keep the child MIFrame until the driver
+                    // finishes it (`pyjitpl.py` `perform_call`).
+                    Err(DispatchError::SubWalkSuspended { .. }) => None,
                     Ok(DispatchOutcome::SubLoopCalleeCallAssembler { .. }) => {
                         if let Some((driver, _)) = crate::driver::try_driver_pair() {
                             let meta = driver.meta_interp_mut();
@@ -23427,7 +23506,7 @@ pub(crate) enum SubwalkFrameKind {
 /// child (`try_walker_inline_user_call`). A generator-resume portal uses
 /// the same stamps for the FOR_ITER that entered it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PythonPortalSubwalkSite {
+pub(crate) struct PythonPortalSubwalkSite {
     entry_py_pc: EntryPyPc,
     outer_resume_marker_jit_pc: Option<usize>,
     outer_jitcode_index: u32,
@@ -23436,7 +23515,7 @@ struct PythonPortalSubwalkSite {
     outer_active_boxes: Vec<OpRef>,
 }
 
-fn python_portal_subwalk_site<Sym: WalkSym>(
+pub(crate) fn python_portal_subwalk_site<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_pc: usize,
     parent_inline_subwalk: bool,
@@ -23531,6 +23610,33 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
     }
 }
 
+/// Replay a nested portal CALL whose child already finished
+/// (`SubWalkDriver` `completed`). `perform_call` / `ChangeFrame` left
+/// the child MIFrame on `framestack`; the replay pops it instead of
+/// pushing another (`_opimpl_recursive_call`).
+pub(crate) fn take_replayed_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Option<Result<DispatchOutcome, DispatchError>> {
+    let driver_pointer = SUBWALK_DRIVER.with(|slot| slot.get());
+    if driver_pointer.is_null() {
+        return None;
+    }
+    // SAFETY: installed by `SubWalkDriverGuard` of this `Sym`.
+    let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'_, Sym>) };
+    let idx = exchange.completed_cursor;
+    let completed = exchange.completed.get(idx)?;
+    if completed.parent_id != exchange.active_frame_id || completed.caller_pc != pc {
+        return None;
+    }
+    exchange.completed_cursor = idx + 1;
+    if completed.result.is_ok() {
+        ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
+    }
+    ctx.session.borrow_mut().pending_helper_level = None;
+    Some(completed.result.clone())
+}
+
 /// Same as [`run_sub_jitcode_walk`], but enter the callee body at
 /// `start_pc` and seed extra Ref-bank registers after the call args.
 ///
@@ -23545,9 +23651,9 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
 /// other caller passes 0: a Python callee already stores its own code on
 /// its `WalkFrameStateData`, and a helper has none.
 ///
-/// `frame_kind` is [`SubwalkFrameKind::Helper`] for every caller except
-/// `walk_generator_resume`, which opens the generator body as
-/// [`SubwalkFrameKind::PythonPortal`].
+/// `frame_kind` is [`SubwalkFrameKind::Helper`] for helper jitcodes.
+/// `walk_generator_resume` and `_opimpl_recursive_call` `perform_call`
+/// open the portal body as [`SubwalkFrameKind::PythonPortal`].
 pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     ctx: &mut WalkContext<'frame, 'a, Sym>,
     pc: usize,

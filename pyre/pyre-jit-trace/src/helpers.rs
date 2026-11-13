@@ -840,6 +840,35 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO
+/// `prev = GETFIELD_GC_R(ec, sys_exc_value)`.
+pub fn portal_emit_get_current_exception(ctx: &mut TraceCtx, ec: OpRef) -> (OpRef, i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let boxed = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[ec], descr);
+    let concrete = pyre_interpreter::eval::get_current_exception() as i64;
+    ctx.set_opref_concrete(boxed, Value::Ref(GcRef(concrete as usize)));
+    (boxed, concrete)
+}
+
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO /
+/// POP_EXCEPT `SETFIELD_GC(ec, exc, sys_exc_value)`.
+pub fn portal_emit_set_current_exception(ctx: &mut TraceCtx, ec: OpRef, exc: OpRef, exc_ptr: i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[ec, exc], descr);
+    ctx.heapcache_setfield_cached(ec, idx, exc);
+    pyre_interpreter::eval::set_current_exception(exc_ptr as pyre_object::PyObjectRef);
+}
+
+/// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell, so the
+/// opcode is not a residual whose result this can fold.
+pub fn portal_try_fold_load_global_exc_class(
+    _ctx: &mut TraceCtx,
+    _raw_i: &[i64],
+) -> Option<(OpRef, i64)> {
+    None
+}
+
 /// Emit inline `Method` creation (NewWithVtable + SetfieldGc for
 /// `w_function` / `w_self` / `w_class` and the inherited header
 /// `PyObject.w_class`), mirroring `function.rs w_method_new`.
@@ -1965,6 +1994,29 @@ pub fn emit_new_pyframe_inline_with_params(
     Some(new_frame)
 }
 
+/// Pair the constructor `NewArrayClear` locals array with the recording-time
+/// `PyFrame.locals_cells_stack_w`. The heapcache forwards that array box for
+/// every later `setarrayitem_vable`, and `execute_setarrayitem_gc` stores
+/// through its concrete pointer; an unstamped virtual array is address 0.
+pub fn stamp_inline_frame_locals_array(
+    ctx: &mut TraceCtx,
+    frame: OpRef,
+    concrete_frame: *mut pyre_interpreter::pyframe::PyFrame,
+) {
+    if concrete_frame.is_null() {
+        return;
+    }
+    let array_ptr = unsafe { (*concrete_frame).locals_cells_stack_w as usize };
+    if array_ptr == 0 {
+        return;
+    }
+    let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+    let Some(array_op) = ctx.heapcache_getfield_cached(frame, locals_descr.index()) else {
+        return;
+    };
+    ctx.set_opref_concrete(array_op, Value::Ref(GcRef(array_ptr)));
+}
+
 /// Store the constructor `debugdata` pointer on `new_frame` and cache it.
 fn store_inline_frame_debugdata(
     ctx: &mut TraceCtx,
@@ -2240,7 +2292,7 @@ pub fn jit_int_in_small_cache_range(value: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::PyExecutionContext;
+    use pyre_interpreter::alloc_execution_context;
     use pyre_interpreter::{ConstantData, compile_exec};
 
     /// Verifies that `#[elidable_cannot_raise]` emits the
@@ -2287,7 +2339,7 @@ mod tests {
         // that path instead of the legacy raw storage pointer so the
         // test exercises the same dispatch the JIT trace helpers will
         // see once the remaining caller cutover lands.
-        let ctx = PyExecutionContext::default();
+        let ctx = alloc_execution_context();
         let w_builtin = ctx.get_builtin();
         let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
         let abs = unsafe { pyre_object::w_dict_getitem_str(w_builtin_dict, "abs") }

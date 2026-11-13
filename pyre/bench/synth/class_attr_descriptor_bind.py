@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=load_type_attr,load_bound_method_attr
 # pyre-check: trace-shape=class_function_read:absent=CallMayForceR,instance_method_read:absent=CallMayForceR
 # `typeobject.py:822 space.get(w_value, w_None, self)` and the instance twin
 # `object.__getattribute__` performs, for the three values whose binding is

@@ -1118,6 +1118,18 @@ pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: u
     }
 }
 
+/// `llmemory.raw_memcopy`. Not a jitcode op (`misc.py _raw_memcopy_opaque`):
+/// the body stays residual so look-inside graphs do not emit `raw_memcopy/iii`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn jit_raw_memcopy(src: i64, dst: i64, nbytes: i64) {
+    if nbytes <= 0 {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, nbytes as usize);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

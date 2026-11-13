@@ -71,6 +71,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: vec![],

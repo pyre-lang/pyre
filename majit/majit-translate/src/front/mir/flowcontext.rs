@@ -442,6 +442,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// enqueues its spec on the crate that holds the body.
     pub(in crate::front::mir) cross_crate:
         Option<&'a dyn crate::front::clause_spec::CrossCrateLookup>,
+    /// Concrete `generics.types` / `const_generics` of this `cachedgraph`
+    /// copy. Empty outside a spec body. `size_align_const_from_tyexpr`
+    /// substitutes leftover depth-0 `TypeVar`s with these.
+    pub(in crate::front::mir) spec_types: &'a [serde_json::Value],
+    pub(in crate::front::mir) spec_const_generics: &'a [serde_json::Value],
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -492,6 +497,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// rust-heap `String` ABI. `finish` rejects the graph when that
     /// call is still a `Call` after format collapse.
     pub(in crate::front::mir) rust_heap_string_attr_call_results: Vec<u64>,
+    /// Nesting of Field/Index projections whose inner place is being
+    /// resolved. FieldRead further-projected is
+    /// `field_read_result_is_later_base` at jtransform (the result is a
+    /// later FieldRead/FieldWrite base). ArrayRead `taken_by_address`
+    /// is `ITEM_TYPE` being a ContainerType (`rptr.py` `rtype_getitem`)
+    /// at any depth.
+    pub(in crate::front::mir) projection_base_depth: u32,
     /// Results of calls whose declared type is a fat `&dyn` or `Box<dyn>`.
     /// `FunctionGraph::set_return` carries one word, so
     /// [`crate::front::dyn_fat`] splices these callees and reads `method_*`
@@ -725,6 +737,35 @@ pub(in crate::front::mir) struct Lowering<'a> {
     pub(in crate::front::mir) refcell_payload_vars: Vec<Variable>,
 }
 
+/// `rtyper.py` `setconcretetype` of a parameter from `FUNC.ARGS`.
+/// Parameters are minted `Unknown`; `getcalldescr` maps that cell to
+/// `'r'` (`resolve_non_void_arg_types_from_vars`). Stamp the Input bank
+/// here so a skipped-rtyper graph still matches, except `Ref`: a missing
+/// cell is the by-value struct (`operand_is_already_raw_pointer`). A
+/// `GcRef`/`Ptr` stamp would skip the raw-owned box rewrite of a moved
+/// raw-flavor attr. A raw `Ptr` (`&CodeObject`, `*const CellFamily`)
+/// stays a pointer in the dual-gate; `history.getkind` `'int'` is the
+/// JIT kind (`get_type_flag` FLAG_UNSIGNED), not this bank.
+///
+/// `ValueType::Str` is rstr `STR` (`history.py` `getkind` `'ref'`).
+/// Keep the `STRPTR` lltype so `<[u8]>::as_ptr` emits `cast_ptr_to_int`
+/// of the string (`slice_as_ptr_word`) and `strgetitem` takes that
+/// GCREF (`/ri>i`), not the chars pointer. Canonical `GcRef` is
+/// `OBJECTPTR`; `stamp_as_rstr_str` writes `STRPTR` after it.
+pub(in crate::front::mir) fn paint_str_param_gcref(var: &Variable, ty: &ValueType) {
+    if matches!(ty, ValueType::Str) {
+        stamp_as_rstr_str(var);
+        return;
+    }
+    if matches!(ty, ValueType::Ref(_) | ValueType::StringBuilder) {
+        return;
+    }
+    let want = concretetype_for_field(ty);
+    if want != crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(var, want);
+    }
+}
+
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
 /// declared function, one named inputarg per formal parameter, built from
 /// the code object's locals alone. Returns the local-to-Variable table
@@ -741,12 +782,18 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    residual_raw_addr: bool,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[], &[]);
+    // Same STR-view marks as the body (`pair_len_shadows`): dict keys and
+    // a `dont_look_inside` residual's shared `&[u8]` (`rstr.py` `STR`).
+    // `pygraph.py` has no flowed body, so owner-view locals stay empty.
+    let mut str_views = vec![false; n_locals];
+    mark_param_str_views(&graph.name, locals, llbc, residual_raw_addr, &mut str_views);
+    let len_shadow = pair_len_shadows_of(&graph.name, locals, llbc, &[], &str_views, &[], &[], &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
@@ -823,11 +870,10 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
         // and `history.py` `getkind` banks it as `int`. Recording
         // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
-        // A raw pointer to a wider scalar is `int` (`getkind` of a raw
-        // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
-        // reference to `*mut u8`. A nested `Ref` of a primitive (`&&i64`,
-        // `PartialOrd<&B> for &A`) is the same scalar. See
-        // [`tyref_scalar_pointee_value_type`] /
+        // A raw pointer to a scalar is `int` (`getkind` of a raw
+        // `Ptr`), including `*mut u8` (`rffi.CCHARP`). A nested `Ref`
+        // of a primitive (`&&i64`, `PartialOrd<&B> for &A`) is the same
+        // scalar. See [`tyref_scalar_pointee_value_type`] /
         // [`tyref_nested_ref_to_scalar_value_type`].
         //
         // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
@@ -842,6 +888,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             i == 1,
             tombstoned_leaves,
         );
+        if residual_raw_addr && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc) {
+            ty = kind;
+        }
         // Same membership as [`gc_mut_ref_param_locals`] /
         // [`gc_mut_ref_option_param_locals`], including the residual
         // exclusion: a cell parameter is the `MutRef<T>` the caller
@@ -986,8 +1035,17 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // Same bank as a window data word (`getkind` of a raw Ptr).
                 (ValueType::Unsigned, Some("CCHARP".to_string()))
             }
+            None if str_views.get(i).copied().unwrap_or(false)
+                && tyref_is_u8_window(&local.ty, llbc) =>
+            {
+                (ValueType::Str, None)
+            }
             None => (ty, class_root),
         };
+        paint_str_param_gcref(&var, &ty);
+        if class_root.as_deref() == Some("CCHARP") {
+            stamp_as_ccharp(&var);
+        }
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -1001,6 +1059,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             let len_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             let len_name = format!("{name}_len");
             graph.name_value_var(&len_var, len_name.clone());
+            paint_str_param_gcref(&len_var, &ValueType::Unsigned);
             input_ops.push(SpaceOperation {
                 result: Some(len_var.clone()),
                 kind: OpKind::Input {
@@ -1016,6 +1075,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         let name = "ret_len_slot".to_string();
         graph.name_value_var(&var, name.clone());
+        paint_str_param_gcref(&var, &ValueType::Unsigned);
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -1057,12 +1117,11 @@ fn copy_agreed_concretetypes(prev: &FrameState, ex: &FrameState, merged: &FrameS
         if dst.id() == a.id() || dst.id() == b.id() {
             continue;
         }
-        let (Some(ct_a), Some(ct_b)) = (a.concretetype(), b.concretetype()) else {
-            continue;
+        let agreed = match (a.concretetype(), b.concretetype()) {
+            (Some(ct_a), Some(ct_b)) if ct_a == ct_b => Some(ct_a),
+            _ => None,
         };
-        if ct_a == ct_b {
-            dst.set_concretetype(Some(ct_a));
-        }
+        dst.set_concretetype(agreed);
     }
 }
 
@@ -1488,7 +1547,7 @@ impl<'a> Lowering<'a> {
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
-            pair_len_shadows(body, llbc, &name, accum);
+            pair_len_shadows(body, llbc, &name, accum, self_dont_look_inside);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -1598,8 +1657,8 @@ impl<'a> Lowering<'a> {
             // `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`).
             // Same banks as [`pygraph_initial_block`]: a reference to a
             // primitive is the scalar word (`history.py` `getkind` of
-            // `&i64` is `int`), and a raw pointer to a wider scalar is
-            // `int`. A byte pointer stays `Ref`.
+            // `&i64` is `int`), and a raw pointer to a scalar is
+            // `int`, including `*mut u8` (`rffi.CCHARP`).
             //
             // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
             // (the same kind as a GC impl in the family). See
@@ -1612,6 +1671,11 @@ impl<'a> Lowering<'a> {
                 i == 1,
                 tombstoned_leaves,
             );
+            if self_dont_look_inside
+                && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc)
+            {
+                ty = kind;
+            }
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -1733,18 +1797,22 @@ impl<'a> Lowering<'a> {
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }
                 Some(_) => (ValueType::Unsigned, None),
-                None if str_view_locals.get(i).copied().unwrap_or(false)
-                    && tyref_is_u8_window(&local.ty, llbc) =>
-                {
-                    (ValueType::Str, None)
-                }
                 None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, llbc) => {
                     // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
                     // Same bank as a window data word (`getkind` of a raw Ptr).
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }
+                None if str_view_locals.get(i).copied().unwrap_or(false)
+                    && tyref_is_u8_window(&local.ty, llbc) =>
+                {
+                    (ValueType::Str, None)
+                }
                 None => (ty, class_root),
             };
+            paint_str_param_gcref(&var, &ty);
+            if class_root.as_deref() == Some("CCHARP") {
+                stamp_as_ccharp(&var);
+            }
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
@@ -1758,6 +1826,7 @@ impl<'a> Lowering<'a> {
                 let len_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 let len_name = format!("{name}_len");
                 graph.name_value_var(&len_var, len_name.clone());
+                paint_str_param_gcref(&len_var, &ValueType::Unsigned);
                 input_ops.push(SpaceOperation {
                     result: Some(len_var.clone()),
                     kind: OpKind::Input {
@@ -1774,6 +1843,7 @@ impl<'a> Lowering<'a> {
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             let name = "ret_len_slot".to_string();
             graph.name_value_var(&var, name.clone());
+            paint_str_param_gcref(&var, &ValueType::Unsigned);
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
@@ -2023,6 +2093,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![length]),
@@ -2177,6 +2248,8 @@ impl<'a> Lowering<'a> {
             spec: None,
             spec_body: false,
             cross_crate: None,
+            spec_types: &[],
+            spec_const_generics: &[],
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
@@ -2194,6 +2267,7 @@ impl<'a> Lowering<'a> {
             fat_box_vars: Vec::new(),
             exception_rstr_attr_vars: Vec::new(),
             rust_heap_string_attr_call_results: Vec::new(),
+            projection_base_depth: 0,
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
@@ -2508,13 +2582,37 @@ impl<'a> Lowering<'a> {
                 continue;
             };
             if src.id() != dst.id() {
-                self.input_copied_from.insert(dst.id(), src.id());
-                // `Variable.copy` (`flowspace/model.py`) keeps `concretetype`.
                 copy_concretetype(src, dst);
             }
-            if self.var_is_object_vec_header(src) {
-                self.object_vec_headers.insert(dst.id());
-            }
+            self.inherit_copied_var(src, dst);
+        }
+    }
+
+    /// `FrameState.copy` / `union` mint a fresh Variable per slot
+    /// (`framestate.py` `_copy`). Provenance that lives on the source
+    /// Variable has to follow that rename: the successor body reads the
+    /// copy, not the predecessor's identity.
+    pub(in crate::front::mir) fn inherit_copied_var(&mut self, src: &Variable, dst: &Variable) {
+        if src.id() != dst.id() {
+            self.input_copied_from.insert(dst.id(), src.id());
+        }
+        if let Some(orig) = self.cast_ptr_to_int_src.get(src).cloned() {
+            self.cast_ptr_to_int_src.insert(dst.clone(), orig);
+        }
+        if let Some(orig) = self.raw_address_uint_src.get(src).cloned() {
+            self.raw_address_uint_src.insert(dst.clone(), orig);
+        }
+        if self.var_is_object_vec_header(src) {
+            self.object_vec_headers.insert(dst.id());
+        }
+        // Same set the `owner_root` FieldRead and erased `get` insert
+        // (`tyref_is_erased_drop` / guard PATH). The Get dest aliases
+        // that word; the successor's inputarg is this copy.
+        if self.guard_word_vars.contains(src) {
+            self.guard_word_vars.insert(dst.clone());
+        }
+        for site in &mut self.range_iter_new_sites {
+            site.note_alias(src, dst);
         }
     }
 
@@ -2548,6 +2646,60 @@ impl<'a> Lowering<'a> {
             .and_then(|slot| slot.as_ref())
             .and_then(|value| value.one().ok())
             .is_some_and(|var| self.var_is_object_vec_header(&var))
+    }
+
+    /// The `Vec` header a pair-slice local was derived from (`deref` /
+    /// `as_mut_slice`). Used to retarget `shadow_stack_copy_range` onto
+    /// `shadow_stack_copy_range_into_vec` when the dest is the pair view
+    /// (`rlist.py` `GcArray` write of the vec's item buffer).
+    pub(in crate::front::mir) fn vec_header_var_of_slice_local(
+        &self,
+        local: usize,
+    ) -> Option<Variable> {
+        let mut cur = local;
+        let mut seen = bit_set::BitSet::new();
+        loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let from_call = self.body.body.iter().find_map(|bb| {
+                let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
+                    return None;
+                };
+                if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur) {
+                    return None;
+                }
+                let CallFunc::Regular(reg) = &call.func else {
+                    return None;
+                };
+                if !(is_rust_vec_slice_view_call(reg, self.llbc)
+                    || is_deref_call(reg, self.llbc)
+                    || vec_index_regular_unchecked_leaf(reg, self.llbc).is_some())
+                {
+                    return None;
+                }
+                tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, self.llbc)?;
+                let vec_local = operand_local(call.args.first())?;
+                self.local_var
+                    .get(vec_local)?
+                    .as_ref()
+                    .map(LocalValue::link_word)
+            });
+            if from_call.is_some() {
+                return from_call;
+            }
+            cur = self.body.body.iter().find_map(|bb| {
+                bb.statements.iter().find_map(|stmt| {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        return None;
+                    };
+                    if place_base_local(place) != Some(cur) {
+                        return None;
+                    }
+                    assign_copy_source(rvalue)
+                })
+            })?;
+        }
     }
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
@@ -2957,7 +3109,7 @@ impl<'a> Lowering<'a> {
                     .map(PackedFrameState::unpack)
                 {
                     // First edge to reach `tmir` — `flowcontext.py`
-                    // `make_next_block`, whose whole body is `newstate =
+                    // make_next_block`, whose whole body is `newstate =
                     // state.copy()` before `SpamBlock(newstate)`.
                     // `FrameState.copy` is "make a copy of this state in
                     // which all Variables are fresh" (framestate.py), and
@@ -2988,6 +3140,13 @@ impl<'a> Lowering<'a> {
                             ))
                         })?;
                         copy_agreed_concretetypes(&prev, &ex, &merged);
+                        for source in [&prev, &ex] {
+                            for (src, dst) in source.entries.iter().zip(&merged.entries) {
+                                if let (Some(src), Some(dst)) = (src, dst) {
+                                    self.inherit_copied_var(src, dst);
+                                }
+                            }
+                        }
                         merged
                     }
                 };
@@ -3868,6 +4027,7 @@ impl<'a> Lowering<'a> {
                         ))
                     })?
                     .one()?;
+                self.stamp_declared_return(&ret);
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
@@ -4679,19 +4839,12 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
-                        *slot == Some(local_idx)
-                            && (self.local_holds_str_view(owner)
-                                || self
-                                    .local_var
-                                    .get(owner)
-                                    .and_then(|entry| entry.as_ref())
-                                    .and_then(|value| value.one().ok())
-                                    .is_some())
+                        *slot == Some(local_idx) && self.local_holds_str_view(owner)
                     });
                     if owner_is_str {
-                        return Err(LowerError::Unsupported(
-                            "STR view joins a window".to_string(),
-                        ));
+                        return Err(LowerError::Unsupported(format!(
+                            "STR view joins a window (bb{from_bb} → bb{target_bb} local {local_idx})"
+                        )));
                     }
                     let n_locals = self.body.locals.locals.len();
                     let ty = if local_idx < n_locals {

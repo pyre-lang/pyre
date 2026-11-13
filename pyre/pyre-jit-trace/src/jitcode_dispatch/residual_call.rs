@@ -1237,6 +1237,276 @@ fn paused_parent_vable_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Op
     (addr != 0).then_some(addr)
 }
 
+/// After an inlined Python CALL that skipped remaining CALL jitcode
+/// (`emit_popvalue_ref!` / `emit_pushvalue_ref!`), apply the CALL net
+/// operand-stack effect.
+///
+/// The vstack mirror still holds CALL-entry extra at the residual
+/// (`reconcile_vstack_at_boundary` runs at the next opcode). Inlining
+/// returns `Continue` at `op.next_pc`, which can skip the trailing push
+/// and leave CloseLoop extra high. Advance the mirror to the fallthrough
+/// so the next opcode does not apply CALL's effect a second time.
+/// Code object and Python pc of the CALL that owns residual `op_pc`.
+///
+/// An inline sub-walk's `op.pc` indexes the callee jitcode. The portal
+/// `snapshot_sym` tables do not name that offset.
+fn executing_call_site<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Option<(*const pyre_interpreter::CodeObject, usize)> {
+    if ctx.fbw_mode.inline_subwalk {
+        let call_pc = inline_callee_py_pc(ctx, op_pc)?;
+        let consts = ctx.inline_callee_consts?;
+        let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+        if pjc.code_ptr.is_null() {
+            return None;
+        }
+        return Some((pjc.code_ptr, call_pc as usize));
+    }
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let jc = unsafe { &*sym.jitcode() };
+    if jc.payload.code_ptr.is_null() {
+        return None;
+    }
+    let call_pc = executing_py_pc(&jc.payload, op_pc) as usize;
+    Some((jc.payload.code_ptr, call_pc))
+}
+
+fn apply_inlined_call_stack_effect_after_success<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+    outcome: &DispatchOutcome,
+    op_pc: usize,
+) {
+    if !matches!(outcome, DispatchOutcome::Continue) {
+        return;
+    }
+    let Some((code_ptr, call_pc)) = executing_call_site(ctx, op_pc) else {
+        return;
+    };
+    let code = unsafe { &*code_ptr };
+    if r_args.len() < 2 {
+        return;
+    }
+    // Residual sits mid-CALL. Bytecode liveness at the CALL pc is the
+    // CALL-entry extra (`stack_effects`). The walk mirror can sit below
+    // that when an inlined LOAD_ATTR method form or LOAD_GLOBAL NULL
+    // sentinel did not step; using the smaller extra under-applies and
+    // leaves valuestackdepth at entry. An unseeded sub-walk starts at
+    // extra 0 — then only the callee liveness table is usable.
+    let mirror_extra = ctx.vstack_depth;
+    let live_extra = crate::liveness::liveness_for(code_ptr)
+        .depth_at_py_pc()
+        .get(call_pc)
+        .copied()
+        .unwrap_or(0) as usize;
+    let extra = match (
+        ctx.vstack_valid && mirror_extra >= r_args.len(),
+        live_extra >= r_args.len(),
+    ) {
+        (true, true) => mirror_extra.max(live_extra),
+        (true, false) => mirror_extra,
+        (false, _) => live_extra,
+    };
+    if extra < r_args.len() {
+        return;
+    }
+    let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, call_pc) else {
+        return;
+    };
+    if !matches!(
+        instr,
+        pyre_interpreter::bytecode::Instruction::Call { .. }
+            | pyre_interpreter::bytecode::Instruction::CallKw { .. }
+            | pyre_interpreter::bytecode::Instruction::CallFunctionEx
+    ) {
+        return;
+    }
+    let after_extra = extra - r_args.len() + 1;
+    let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_pc);
+    let result = if dst_bank == 'r' {
+        ctx.registers_r.get(dst)
+    } else {
+        let last = ctx.frame_state.borrow().vstack_last_ref;
+        (last != OpRef::NONE).then_some(last)
+    };
+    if ctx.vstack_valid {
+        ctx.vstack_depth = after_extra;
+        ctx.vstack_cur_pypc = fallthrough as u32;
+        let mut state = ctx.frame_state.borrow_mut();
+        state.vstack_boxes.truncate(after_extra);
+        if state.vstack_boxes.len() < after_extra {
+            state.vstack_boxes.resize(after_extra, OpRef::NONE);
+        }
+        if after_extra > 0 {
+            if let Some(res) = result {
+                state.vstack_boxes[after_extra - 1] = res;
+                state.vstack_last_ref = res;
+            }
+        }
+    }
+    // Concrete / vable vsd belong to the portal frame. An inlined
+    // callee's residual must not write the outer frame's depth.
+    if ctx.fbw_mode.inline_subwalk {
+        return;
+    }
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return;
+    }
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    let nlocals = sym.nlocals();
+    let frame = sym.tracing_vable_frame_addr();
+    let entry_vsd = nlocals + extra;
+    let after_vsd = nlocals + after_extra;
+    let after_pops_vsd = nlocals + extra.saturating_sub(r_args.len());
+    let concrete = crate::state::concrete_stack_depth(frame);
+    // Jitcode pops update the virtualizable (`_opimpl_setarrayitem_vable`)
+    // before residual; Continue at `op.next_pc` can still skip the
+    // trailing push. Stamp after-call valuestackdepth when the frame
+    // is still at CALL-entry extra or at the post-pop extra.
+    let write_vsd = concrete == Some(entry_vsd) || concrete == Some(after_pops_vsd);
+    if write_vsd {
+        crate::state::set_concrete_stack_depth(frame, after_vsd);
+        let opref = ctx.trace_ctx.const_int(after_vsd as i64);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            opref,
+            majit_ir::Value::Int(after_vsd as i64),
+        );
+        crate::trace_opcode::null_vable_dead_array_tail(ctx.trace_ctx, after_vsd);
+        let sym = unsafe { &mut *(ctx.fbw_mode.snapshot_sym as *mut Sym) };
+        sym.set_valuestackdepth(after_vsd);
+    }
+}
+
+/// CALL-entry extra at residual `op_pc`, from the walk mirror and the
+/// bytecode liveness table. Same selection as
+/// [`apply_inlined_call_stack_effect_after_success`].
+fn call_site_entry_extra<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+    op_pc: usize,
+) -> Option<(*const pyre_interpreter::CodeObject, usize, usize)> {
+    if r_args.len() < 2 {
+        return None;
+    }
+    let (code_ptr, call_pc) = executing_call_site(ctx, op_pc)?;
+    let code = unsafe { &*code_ptr };
+    let (instr, _) = pyre_interpreter::decode_instruction_at(code, call_pc)?;
+    if !matches!(
+        instr,
+        pyre_interpreter::bytecode::Instruction::Call { .. }
+            | pyre_interpreter::bytecode::Instruction::CallKw { .. }
+            | pyre_interpreter::bytecode::Instruction::CallFunctionEx
+    ) {
+        return None;
+    }
+    let mirror_extra = ctx.vstack_depth;
+    let live_extra = crate::liveness::liveness_for(code_ptr)
+        .depth_at_py_pc()
+        .get(call_pc)
+        .copied()
+        .unwrap_or(0) as usize;
+    let extra = match (
+        ctx.vstack_valid && mirror_extra >= r_args.len(),
+        live_extra >= r_args.len(),
+    ) {
+        (true, true) => mirror_extra.max(live_extra),
+        (true, false) => mirror_extra,
+        (false, _) => live_extra,
+    };
+    if extra < r_args.len() {
+        return None;
+    }
+    Some((code_ptr, call_pc, extra))
+}
+
+/// Stamp after-pop CALL extra and remaining operand-stack slots onto the
+/// virtualizable before residual flush/capture.
+///
+/// Jitcode pops update the live frame (`setarrayitem_vable`); `emit_vsd!`
+/// is graph-only, so `virtualizable_boxes` `valuestackdepth` can stay the
+/// loop-header extra. `flush_live_virtualizable_before_residual_call`
+/// would then write that header extra over the live after-pop depth.
+/// Guard capture reads those boxes, so a compiled CRN at the CALL CACHE
+/// would resume with extra 0 plus the residual result (extra 1) instead
+/// of remaining `[callable-setup...]` plus the result.
+///
+/// Remaining slots are the CALL-entry stack below `r_args`. Do not write
+/// valuestackdepth without those slots.
+fn restore_call_stack_before_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+    op_pc: usize,
+) {
+    if ctx.fbw_mode.inline_subwalk {
+        return;
+    }
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return;
+    }
+    let Some((_, _, extra)) = call_site_entry_extra(ctx, r_args, op_pc) else {
+        return;
+    };
+    let after_pops = extra - r_args.len();
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    let nlocals = sym.nlocals();
+    let frame = sym.tracing_vable_frame_addr();
+    let after_pops_vsd = nlocals + after_pops;
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    for s in 0..after_pops {
+        let idx = nvs + nlocals + s;
+        let boxed = {
+            let vstack = ctx.frame_state.borrow();
+            vstack
+                .vstack_boxes
+                .get(s)
+                .copied()
+                .filter(|&v| v != OpRef::NONE)
+        }
+        .or_else(|| {
+            ctx.trace_ctx
+                .virtualizable_box_at(idx)
+                .filter(|&v| v != OpRef::NONE)
+        });
+        let Some(boxed) = boxed else {
+            return;
+        };
+        if let Some(val) = ctx.trace_ctx.concrete_of_opref(boxed).or_else(|| {
+            ctx.trace_ctx
+                .virtualizable_entry_at(idx)
+                .map(|(_, value)| value)
+        }) {
+            ctx.trace_ctx.set_virtualizable_entry_at(idx, boxed, val);
+            ctx.trace_ctx.synchronize_virtualizable_at(idx);
+        } else {
+            ctx.trace_ctx.set_virtualizable_box_at(idx, boxed);
+        }
+    }
+    let opref = ctx.trace_ctx.const_int(after_pops_vsd as i64);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "valuestackdepth",
+        opref,
+        majit_ir::Value::Int(after_pops_vsd as i64),
+    );
+    crate::trace_opcode::null_vable_dead_array_tail(ctx.trace_ctx, after_pops_vsd);
+    if frame != 0 {
+        crate::state::set_concrete_stack_depth(frame, after_pops_vsd);
+    }
+    let sym = unsafe { &mut *(ctx.fbw_mode.snapshot_sym as *mut Sym) };
+    sym.set_valuestackdepth(after_pops_vsd);
+}
+
 /// Operand-stack slots `nlocals..valuestackdepth` of the standard
 /// virtualizable (`_opimpl_setarrayitem_vable` stores into
 /// `metainterp.virtualizable_boxes`).
@@ -10588,6 +10858,12 @@ pub(crate) fn residual_arg_concretes<Sym: WalkSym>(
 /// `setup_call` splits by type into the callee banks. A miss, a symbolic
 /// hash, a recursive helper, or an un-lowered callee body with nothing
 /// applied falls through to `do_residual_call`.
+///
+/// `policy.py _reject_function` keeps `_elidable_function_` graphs out of
+/// `indirectcalltargets`, and `call.py getcalldescr` forbids them in an
+/// indirect-call family, so upstream never `perform_call`s an elidable.
+/// A pyre fnaddr collision that still maps one onto a jitcode must
+/// residualize as `CALL_PURE_*` (`do_residual_call` `check_is_elidable`).
 fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10598,6 +10874,7 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     f_args: &[OpRef],
     dst: usize,
     dst_bank: char,
+    ei: &majit_ir::EffectInfo,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `MIFrame.do_residual_or_indirect_call`: Const funcbox +
     // `bytecode_for_address` hit => `perform_call`. Remaining
@@ -10605,6 +10882,9 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || !funcptr.is_constant() {
         // Tracing only: this method lives on `MIFrame`. The blackhole
         // interpreter (`BlackholeInterpreter`) residualizes.
+        return Ok(None);
+    }
+    if ei.check_is_elidable() {
         return Ok(None);
     }
     let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
@@ -10766,6 +11046,16 @@ fn try_perform_call<Sym: WalkSym>(
     if ctx.fbw_mode.transparent_helper_jitcode_index == Some(jitcode.index()) {
         // Already walking this jitcode. `perform_call` would push
         // another `MIFrame`; the walker is one walk with a reentry flag.
+        return Ok(None);
+    }
+    // Identical-code folding can map two graphs onto one runtime address
+    // (`jitcode_runtime` ICT insert). The colliding jitcode may be a
+    // different index with the same leaf name; walking it re-enters the
+    // helper already on the framestack.
+    if let Some(cur) = ctx.fbw_mode.transparent_helper_jitcode_index
+        && let Some(cur_jc) = crate::jitcode_runtime::get_jitcode_by_index(cur)
+        && cur_jc.name == jitcode.name
+    {
         return Ok(None);
     }
     let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
@@ -11065,6 +11355,10 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     r_args: &[OpRef],
     list_write_barrier: bool,
 ) -> Result<RecordedResidual, DispatchError> {
+    // After-pop extra and remaining CALL slots must sit on the
+    // virtualizable before flush/capture. Header extra in the vsd box
+    // would overwrite the live after-pop depth.
+    restore_call_stack_before_residual(ctx, r_args, op_pc);
     // Step 1. Token stores and the proxy write-back the callee must see.
     if emit_guard_not_forced {
         maybe_walker_vable_and_vrefs_before_residual_call(ctx, op_pc);
@@ -11465,6 +11759,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         dst_bank,
         dst,
     )? {
+        apply_inlined_call_stack_effect_after_success(
+            ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+        );
         return Ok(inlined);
     }
 
@@ -11473,9 +11770,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // walk.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
         if let Some(inlined) = try_walker_inline_float_slot(ctx, op, &r_args, dst_bank, dst)? {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
         if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
     }
@@ -11510,6 +11813,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
         )? {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
     }
@@ -11533,6 +11839,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
         {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
@@ -12043,6 +12352,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
     {
+        apply_inlined_call_stack_effect_after_success(
+            ctx,
+            &r_args,
+            dst_bank,
+            dst,
+            &DispatchOutcome::Continue,
+            op.pc,
+        );
         return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
     }
 
@@ -12424,6 +12741,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             &[],
             dst,
             dst_bank,
+            ei,
         )?
     {
         return Ok(outcome);
@@ -12593,6 +12911,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    apply_inlined_call_stack_effect_after_success(
+        ctx,
+        &r_args,
+        dst_bank,
+        dst,
+        &DispatchOutcome::Continue,
+        op.pc,
+    );
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -12901,6 +13227,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         dst_bank,
         dst,
     )? {
+        apply_inlined_call_stack_effect_after_success(
+            ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+        );
         return Ok(inlined);
     }
 
@@ -12909,9 +13238,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // walk.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
         if let Some(inlined) = try_walker_inline_float_slot(ctx, op, &r_args, dst_bank, dst)? {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
         if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
     }
@@ -12928,6 +13263,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         dst_bank,
         dst,
     )? {
+        apply_inlined_call_stack_effect_after_success(
+            ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+        );
         return Ok(inlined);
     }
 
@@ -12936,6 +13274,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
         {
+            apply_inlined_call_stack_effect_after_success(
+                ctx, &r_args, dst_bank, dst, &inlined.0, op.pc,
+            );
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
@@ -13074,9 +13415,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(ns_opref),
                 ctx.trace_ctx.box_value(code_opref),
             ) {
-                if try_walker_load_global_cell_fold(
+                let folded = try_walker_load_global_cell_fold(
                     ctx, op.pc, dst, dst_bank, ns_ptr, w_code_ptr, frame_ptr, namei,
-                )? {
+                )?;
+                if folded {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -13871,6 +14213,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         &[],
         dst,
         dst_bank,
+        ei,
     )? {
         return Ok(outcome);
     }
@@ -13992,6 +14335,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
+    apply_inlined_call_stack_effect_after_success(
+        ctx,
+        &r_args,
+        dst_bank,
+        dst,
+        &DispatchOutcome::Continue,
+        op.pc,
+    );
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -14086,7 +14437,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     }
     // `do_residual_or_indirect_call` (`pyjitpl.py`) before `do_residual_call`.
     if let Some(outcome) = try_do_residual_or_indirect_call(
-        ctx, op.pc, op.next_pc, funcptr, &i_args, &r_args, &f_args, dst, dst_bank,
+        ctx, op.pc, op.next_pc, funcptr, &i_args, &r_args, &f_args, dst, dst_bank, ei,
     )? {
         return Ok(outcome);
     }
@@ -14189,6 +14540,14 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         }
     }
 
+    apply_inlined_call_stack_effect_after_success(
+        ctx,
+        &r_args,
+        dst_bank,
+        dst,
+        &DispatchOutcome::Continue,
+        op.pc,
+    );
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 

@@ -14784,9 +14784,9 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__float__") }
         {
             let mut result = unsafe {
-                pyre_object::with_roots!(obj =>
+                pyre_object::with_roots!(obj => {
                     crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])
-                )?
+                })?
             };
             unsafe {
                 if is_float(result) {
@@ -15255,6 +15255,9 @@ pub(crate) fn builtin_set_add_items_intersection(
     builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
+/// The per-item `add` loop of `pyopcode.py BUILD_SET`, which is
+/// `@jit.unroll_safe`: the item count is the opcode's constant argument.
+#[majit_macros::unroll_safe]
 fn builtin_set_add_items_impl(
     set: Option<PyObjectRef>,
     items: &[PyObjectRef],
