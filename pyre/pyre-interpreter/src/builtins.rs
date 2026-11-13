@@ -23658,7 +23658,16 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
     unsafe {
-        if pyre_object::listobject::w_list_sort_range(list, reverse) {
+        // `w_list_sort_range` can collect (`switch_range_to_integer_strategy`
+        // → `publish_physical_capacity`), so the list sits on the shadow
+        // stack across that call (`gc_push_roots` / `gc_pop_roots` in
+        // `framework.py` / `shadowstack.py`) and is re-read afterwards.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let list_slot = pyre_object::gc_roots::pin_roots(&[list]);
+        if pyre_object::listobject::w_list_sort_range(
+            pyre_object::gc_roots::shadow_stack_get(list_slot),
+            reverse,
+        ) {
             return true;
         }
         // `BaseRangeListStrategy.sort`: materialisation failure stays pending
@@ -23667,6 +23676,7 @@ pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             return false;
         }
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
             return true;
         }
@@ -23715,12 +23725,18 @@ pub fn sort_list_in_place(
     // is not object-strategy and no key was given: the storage is already
     // unwrapped, so there is no boxing, no comparison dunder, and no need to
     // empty the receiver first — no user code can run to observe it.
-    if key_fn.is_none() {
+    //
+    // `w_list_sort_range` can collect (`publish_physical_capacity`). The list
+    // is re-read from its shadow-stack slot after each call, and this arm
+    // answers the rebound `key_fn` with None, so no GC local outside the
+    // shadow stack is live across a collecting call (`framework.py`
+    // `gc_push_roots` / `gc_pop_roots`).
+    let key_fn = if key_fn.is_none() {
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
-        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe {
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
             if pyre_object::listobject::w_list_sort_range(list, reverse) {
                 return Ok(());
             }
@@ -23744,7 +23760,10 @@ pub fn sort_list_in_place(
                 return Ok(());
             }
         }
-    }
+        None
+    } else {
+        key_fn
+    };
     unsafe {
         // Hold the detached values in shadow-stack slots, not a bare Rust Vec,
         // while key and comparison calls can collect.  The receiver is empty
