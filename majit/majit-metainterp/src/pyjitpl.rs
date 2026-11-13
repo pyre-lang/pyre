@@ -15144,8 +15144,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         if fired && crate::majit_log_enabled() {
             eprintln!(
-                "[jit] must_compile FIRED: key={} descr=0x{:x}",
-                owning_key, descr_addr
+                "[jit] must_compile FIRED: key={} descr=0x{:x} jitdriver_sd={}",
+                owning_key, descr_addr, jitdriver_sd
             );
         }
         (fired, owning_key)
@@ -15195,8 +15195,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         if fired && crate::majit_log_enabled() {
             eprintln!(
-                "[jit] must_compile FIRED: key={} descr=0x{:x}",
-                owning_key, descr_addr
+                "[jit] must_compile FIRED: key={} descr=0x{:x} jitdriver_sd={}",
+                owning_key, descr_addr, jitdriver_sd
             );
         }
         (fired, owning_key)

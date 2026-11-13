@@ -4595,10 +4595,29 @@ fn trace_and_compile_from_bridge_body(
         jd_index.and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
     };
     if has_vinfo == Some(false) {
-        if jd_index != Some(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX) {
-            return BridgeResolution::ResumeBlackhole;
+        // compile.py `_trace_and_compile_from_bridge`: `jitdriver_sd` is the
+        // failing loop's `rd_loop_token.outermost_jitdriver_sd`. A driver
+        // with `virtualizable_info is None` has no PyFrame at failarg 0
+        // (`resume.py consume_vref_and_vable_boxes`); `handle_guard_failure`
+        // rebuilds that driver's frames and `interpret` walks
+        // `jd.mainjitcode`. The pypyjit path below needs the virtualizable
+        // `PyFrame`; novable drivers take `trace_*_via_interpret`.
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] novable jd={jd_index:?} key={green_key} descr=0x{descr_id:x}"
+            );
         }
-        return trace_bridge_via_interpret(descr_arc, green_key, raw_values, guard_exc);
+        match jd_index {
+            Some(idx) if idx == pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX => {
+                return trace_bridge_via_interpret(descr_arc, green_key, raw_values, guard_exc);
+            }
+            Some(idx) if idx == pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX => {
+                return trace_tuple_hash_bridge_via_interpret(
+                    descr_arc, green_key, raw_values, guard_exc,
+                );
+            }
+            _ => return BridgeResolution::ResumeBlackhole,
+        }
     }
     if bridge_bail_stage() == 1 {
         return BridgeResolution::ResumeBlackhole;
@@ -5584,16 +5603,27 @@ fn abort_active_bridge_trace() {
     }
 }
 
-/// `compile.py _trace_and_compile_from_bridge` + `pyjitpl.py
-/// MetaInterp.handle_guard_failure` for a driver whose
-/// `virtualizable_info is None`. Frames come from resume data;
-/// `interpret` runs `GenEntrySym` on `jd.mainjitcode`.
-fn trace_bridge_via_interpret(
+/// Shared preamble of a novable `_trace_and_compile_from_bridge`.
+///
+/// `cpu.grab_exc_value(deadframe)` is parked so
+/// `_prepare_exception_resumption` / `prepare_resume_from_failure` read
+/// `GUARD_EXC_VALUE`. Frames come from resume data
+/// (`resume.py consume_vref_and_vable_boxes`: vinfo is None). The
+/// caller's `interpret` walks `jd.mainjitcode`.
+struct NovableBridgeSession {
+    _guard_exc_root: Option<majit_metainterp::blackhole::GuardExcRoot>,
+    _plain: pyre_interpreter::call::ForcePlainEvalGuard,
+    mainjitcode: std::sync::Arc<majit_metainterp::JitCode>,
+    fail_types: Vec<majit_ir::Type>,
+}
+
+fn start_novable_bridge_session(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     green_key: u64,
     raw_values: &[i64],
     guard_exc: i64,
-) -> BridgeResolution {
+    jd_index: usize,
+) -> Option<NovableBridgeSession> {
     // `cpu.grab_exc_value(deadframe)` parked so `_prepare_exception_resumption`
     // / `prepare_resume_from_failure` read `GUARD_EXC_VALUE` the way the
     // pypyjit path does (`handle_fail` / `jit_ca_handle_guard_failure`).
@@ -5611,23 +5641,16 @@ fn trace_bridge_via_interpret(
             .as_fail_descr()
             .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
         {
-            return BridgeResolution::ResumeBlackhole;
+            return None;
         }
     }
 
     let _plain = pyre_interpreter::call::force_plain_eval();
-    let jd_index = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
     use majit_ir::FailDescr;
-    let Some(descr_fd) = descr_arc.as_fail_descr() else {
-        return BridgeResolution::ResumeBlackhole;
-    };
-    let Some(source_jct) = majit_backend::descr_owning_jct(descr_fd) else {
-        return BridgeResolution::ResumeBlackhole;
-    };
+    let descr_fd = descr_arc.as_fail_descr()?;
+    let source_jct = majit_backend::descr_owning_jct(descr_fd)?;
     let fail_arg_count = descr_fd.fail_arg_types().len();
-    let Some(frontend_fail_values) = raw_values.get(..fail_arg_count) else {
-        return BridgeResolution::ResumeBlackhole;
-    };
+    let frontend_fail_values = raw_values.get(..fail_arg_count)?;
 
     let retrace = {
         let (driver, _) = crate::eval::driver_pair();
@@ -5639,23 +5662,18 @@ fn trace_bridge_via_interpret(
             frontend_fail_values,
         )
     };
-    let Some(retrace) = retrace else {
-        return BridgeResolution::ResumeBlackhole;
-    };
+    let retrace = retrace?;
 
-    let Some(storage) = retrace.storage.clone() else {
-        abort_active_bridge_trace();
-        return BridgeResolution::ResumeBlackhole;
-    };
+    let storage = retrace.storage.clone()?;
     let Some(rd_numb) = storage.rd_numb() else {
         abort_active_bridge_trace();
-        return BridgeResolution::ResumeBlackhole;
+        return None;
     };
     let rd_consts = storage.rd_consts().unwrap_or(&[]);
     let cb = pyre_jit_trace::state::frame_value_count_at;
     // resume.py consume_vref_and_vable_boxes: vinfo is None →
     // virtualizable_boxes = None. rebuild_from_numbering still consumes the
-    // vable_len word (0 for generatorentry).
+    // vable_len word (0 for a novable driver).
     let (num_failargs, _vable_values, vref_values, frames) =
         majit_ir::resumedata::rebuild_from_numbering(
             rd_numb,
@@ -5678,7 +5696,7 @@ fn trace_bridge_via_interpret(
         driver.meta_interp().mainjitcode_of(jd_index).cloned()
     }) else {
         abort_active_bridge_trace();
-        return BridgeResolution::ResumeBlackhole;
+        return None;
     };
 
     let materialized: Vec<Option<std::sync::Arc<majit_metainterp::JitCode>>> = {
@@ -5709,7 +5727,7 @@ fn trace_bridge_via_interpret(
                 ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
             }
         }
-        // jd2 is an entry with no direct reader in front
+        // Novable drivers have no direct reader in front
         // (`start_bridge_tracing(..., execute_replay = true)`).
         driver.resume_bridge_from_executing_reader(
             descr_arc,
@@ -5721,7 +5739,7 @@ fn trace_bridge_via_interpret(
     };
     if !rebuilt {
         abort_active_bridge_trace();
-        return BridgeResolution::ResumeBlackhole;
+        return None;
     }
     {
         let (driver, _) = crate::eval::driver_pair();
@@ -5733,9 +5751,37 @@ fn trace_bridge_via_interpret(
         // never reaches this.
         if !meta.wire_rebuilt_inline_framestack() {
             abort_active_bridge_trace();
-            return BridgeResolution::ResumeBlackhole;
+            return None;
         }
     }
+    Some(NovableBridgeSession {
+        _guard_exc_root,
+        _plain,
+        mainjitcode,
+        fail_types: retrace.fail_types,
+    })
+}
+
+/// `compile.py _trace_and_compile_from_bridge` + `pyjitpl.py
+/// MetaInterp.handle_guard_failure` for a driver whose
+/// `virtualizable_info is None`. Frames come from resume data;
+/// `interpret` runs `GenEntrySym` on `jd.mainjitcode`.
+fn trace_bridge_via_interpret(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    green_key: u64,
+    raw_values: &[i64],
+    guard_exc: i64,
+) -> BridgeResolution {
+    let Some(session) = start_novable_bridge_session(
+        descr_arc,
+        green_key,
+        raw_values,
+        guard_exc,
+        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+    ) else {
+        return BridgeResolution::ResumeBlackhole;
+    };
+    let mainjitcode = &session.mainjitcode;
 
     let portal_pc = {
         use majit_metainterp::JitCodeSym;
@@ -5746,7 +5792,7 @@ fn trace_bridge_via_interpret(
         }
         .loop_header_pc()
     };
-    let Some(boxes) = genentry_boxes_from_rebuilt_portal(&mainjitcode, portal_pc) else {
+    let Some(boxes) = genentry_boxes_from_rebuilt_portal(mainjitcode, portal_pc) else {
         abort_active_bridge_trace();
         return BridgeResolution::ResumeBlackhole;
     };
@@ -5766,7 +5812,7 @@ fn trace_bridge_via_interpret(
         .and_then(concrete_ref_of)
         .filter(|&p| is_live_code(p));
     let pycode_from_failargs =
-        generator_from_failargs(raw_values, &retrace.fail_types).and_then(pycode_of_generator);
+        generator_from_failargs(raw_values, &session.fail_types).and_then(pycode_of_generator);
     let pycode = pycode_from_gen
         .or(pycode_from_green)
         .or(pycode_from_failargs);
@@ -5805,6 +5851,302 @@ fn trace_bridge_via_interpret(
         driver.meta_interp_mut().interpret(&mut sym, portal_pc)
     };
     apply_bridge_interpret_action(action, green_key, &sym, &mainjitcode, portal_pc)
+}
+
+/// `compile.py _trace_and_compile_from_bridge` + `pyjitpl.py
+/// MetaInterp.handle_guard_failure` for `hash_driver`.
+///
+/// `jitdriver_sd` is `TUPLEHASH_JD_INDEX`. The loop-exit guard (`i == len`)
+/// walks the remaining portal body to `int_return`; `compile_done_with_this_frame`
+/// records FINISH with `done_with_this_frame_descr_int` and
+/// `compile.compile_trace` attaches the bridge.
+fn trace_tuple_hash_bridge_via_interpret(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    green_key: u64,
+    raw_values: &[i64],
+    guard_exc: i64,
+) -> BridgeResolution {
+    let Some(session) = start_novable_bridge_session(
+        descr_arc,
+        green_key,
+        raw_values,
+        guard_exc,
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX,
+    ) else {
+        return BridgeResolution::ResumeBlackhole;
+    };
+    let mainjitcode = &session.mainjitcode;
+    let portal_pc = {
+        use majit_metainterp::JitCodeSym;
+        pyre_jit_trace::tuplehash_state::TupleHashSym {
+            w_type: PY_NULL,
+            len: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+            acc: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+            i: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            obj: majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
+        }
+        .loop_header_pc()
+    };
+    let mut sym = tuple_hash_sym_from_rebuilt_portal(mainjitcode, portal_pc);
+    {
+        use majit_metainterp::JitState;
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp_mut();
+        let trace_meta = pyre_jit_trace::tuplehash_state::TupleHashJitState { w_type: sym.w_type }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        meta.begin_trace_session(trace_meta);
+    }
+
+    let resume = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().prepare_resume_from_failure()
+    };
+    if let majit_metainterp::PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) = resume {
+        abort_active_bridge_trace();
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            exc.0 as PyObjectRef,
+        ));
+    }
+
+    let action = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().interpret(&mut sym, portal_pc)
+    };
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[tuple.hash] bridge interpret action={action:?} key={green_key} descr=0x{:x}",
+            majit_ir::descr_identity(descr_arc)
+        );
+    }
+    apply_tuple_hash_bridge_action(action, green_key, &sym)
+}
+
+fn tuple_hash_sym_from_rebuilt_portal(
+    mainjitcode: &majit_metainterp::JitCode,
+    portal_pc: usize,
+) -> pyre_jit_trace::tuplehash_state::TupleHashSym {
+    use pyre_jit_trace::tuplehash_state::TupleHashSym;
+    let mut sym = TupleHashSym {
+        w_type: PY_NULL,
+        len: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        acc: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        i: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+        obj: majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
+    };
+    if portal_pc + 2 >= mainjitcode.code.len() {
+        return sym;
+    }
+    let banks = majit_metainterp::decode_jit_merge_point_banks(&mainjitcode.code, portal_pc);
+    let (w_type_op, len_op, acc_op, i_op, obj_op) = {
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp();
+        let Some(frame) = meta
+            .framestack
+            .frames
+            .iter()
+            .find(|frame| frame.jitcode.try_index() == mainjitcode.try_index())
+        else {
+            return sym;
+        };
+        (
+            banks
+                .green_r
+                .first()
+                .and_then(|&reg| frame.ref_regs.get(reg).copied().flatten()),
+            banks
+                .red_i
+                .first()
+                .and_then(|&reg| frame.int_regs.get(reg).copied().flatten()),
+            banks
+                .red_i
+                .get(1)
+                .and_then(|&reg| frame.int_regs.get(reg).copied().flatten()),
+            banks
+                .red_i
+                .get(2)
+                .and_then(|&reg| frame.int_regs.get(reg).copied().flatten()),
+            banks
+                .red_r
+                .first()
+                .and_then(|&reg| frame.ref_regs.get(reg).copied().flatten()),
+        )
+    };
+    if let Some(op) = w_type_op
+        && let Some(ptr) = concrete_ref_of(op)
+    {
+        sym.w_type = ptr;
+    }
+    if let Some(op) = len_op {
+        sym.len = op;
+    }
+    if let Some(op) = acc_op {
+        sym.acc = op;
+    }
+    if let Some(op) = i_op {
+        sym.i = op;
+    }
+    if let Some(op) = obj_op {
+        sym.obj = op;
+    }
+    sym
+}
+
+fn apply_tuple_hash_bridge_action(
+    action: majit_metainterp::TraceAction,
+    green_key: u64,
+    sym: &pyre_jit_trace::tuplehash_state::TupleHashSym,
+) -> BridgeResolution {
+    use majit_metainterp::JitState;
+    let jump_args_from_sym =
+        || pyre_jit_trace::tuplehash_state::TupleHashJitState::collect_jump_args(sym);
+    match action {
+        majit_metainterp::TraceAction::CompileTrace => {
+            let jump_args = jump_args_from_sym();
+            let live_args = live_tuple_hash_args(&jump_args);
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().finish_trace_live();
+            driver.meta_interp_mut().clear_pending_abort();
+            driver.meta_interp_mut().clear_trace_session();
+            match live_args {
+                Some(args) => BridgeResolution::CompiledContinueLive(args),
+                None => BridgeResolution::ResumeBlackhole,
+            }
+        }
+        majit_metainterp::TraceAction::Finish {
+            finish_args,
+            finish_arg_types,
+            exit_with_exception,
+            exc_value,
+        } => {
+            // pyjitpl.py `compile_done_with_this_frame`: FINISH with
+            // `done_with_this_frame_descr_int`, then `compile.compile_trace`.
+            if exit_with_exception {
+                drain_backend_jit_exc();
+            }
+            let result_int = if exit_with_exception {
+                0
+            } else {
+                tuple_hash_finish_int(&finish_args)
+            };
+            let compile_result = {
+                let (driver, _) = crate::eval::driver_pair();
+                driver.meta_interp_mut().compile_finish_from_active_session(
+                    &finish_args,
+                    finish_arg_types,
+                    exit_with_exception,
+                )
+            };
+            if let Err(stb) = compile_result {
+                let (driver, _) = crate::eval::driver_pair();
+                driver.meta_interp_mut().aborted_tracing(stb.reason);
+            }
+            if exit_with_exception {
+                BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+                    exc_value as PyObjectRef,
+                ))
+            } else {
+                BridgeResolution::Finished(pyre_jit_trace::state::ConcreteValue::Int(result_int))
+            }
+        }
+        majit_metainterp::TraceAction::CloseLoop => {
+            compile_tuple_hash_bridge_jump(green_key, &jump_args_from_sym())
+        }
+        majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
+            compile_tuple_hash_bridge_jump(green_key, &jump_args)
+        }
+        majit_metainterp::TraceAction::SegmentedLoop
+        | majit_metainterp::TraceAction::SegmentedBridge { .. } => {
+            cancel_tuple_hash_bridge_walk(majit_metainterp::SwitchToBlackhole {
+                reason: majit_metainterp::counters::ABORT_SEGMENTED_TRACE,
+                raising_exception: false,
+            })
+        }
+        majit_metainterp::TraceAction::SwitchToBlackhole(stb) => cancel_tuple_hash_bridge_walk(stb),
+        _ => {
+            let stb = {
+                let (driver, _) = crate::eval::driver_pair();
+                crate::eval::interpret_abort_switch_to_blackhole(driver.meta_interp())
+            };
+            cancel_tuple_hash_bridge_walk(stb)
+        }
+    }
+}
+
+fn tuple_hash_finish_int(finish_args: &[majit_ir::OpRef]) -> i64 {
+    let (driver, _) = crate::eval::driver_pair();
+    finish_args
+        .first()
+        .and_then(|op| {
+            driver
+                .meta_interp_mut()
+                .trace_ctx()
+                .and_then(|ctx| ctx.concrete_of_opref(*op))
+        })
+        .and_then(|value| match value {
+            majit_ir::Value::Int(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn live_tuple_hash_args(jump_args: &[majit_ir::OpRef]) -> Option<Vec<majit_ir::Value>> {
+    if jump_args.len() < 4 {
+        return None;
+    }
+    let (driver, _) = crate::eval::driver_pair();
+    let ctx = driver.meta_interp_mut().trace_ctx()?;
+    let len = match ctx.concrete_of_opref(jump_args[0]) {
+        Some(majit_ir::Value::Int(v)) => v,
+        _ => return None,
+    };
+    let acc = match ctx.concrete_of_opref(jump_args[1]) {
+        Some(majit_ir::Value::Int(v)) => v,
+        _ => return None,
+    };
+    let i = match ctx.concrete_of_opref(jump_args[2]) {
+        Some(majit_ir::Value::Int(v)) => v,
+        _ => return None,
+    };
+    let obj = match ctx.concrete_of_opref(jump_args[3]) {
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if ptr != 0 => ptr as PyObjectRef,
+        _ => return None,
+    };
+    Some(pyre_jit_trace::tuplehash_state::tuple_hash_live_values(len, acc, i, obj).to_vec())
+}
+
+fn compile_tuple_hash_bridge_jump(
+    green_key: u64,
+    jump_args: &[majit_ir::OpRef],
+) -> BridgeResolution {
+    let outcome = {
+        let (driver, _) = crate::eval::driver_pair();
+        let boxes: Vec<Operand> = {
+            let meta = driver.meta_interp_mut();
+            let ctx = meta.trace_ctx().expect("compile_trace: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
+        driver
+            .meta_interp_mut()
+            .compile_trace(green_key, &boxes, true)
+    };
+    match outcome {
+        majit_metainterp::CompileOutcome::Compiled { .. } => {
+            let live_args = live_tuple_hash_args(jump_args);
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().finish_trace_live();
+            driver.meta_interp_mut().clear_pending_abort();
+            driver.meta_interp_mut().clear_trace_session();
+            match live_args {
+                Some(args) => BridgeResolution::CompiledContinueLive(args),
+                None => BridgeResolution::ResumeBlackhole,
+            }
+        }
+        _ => cancel_tuple_hash_bridge_walk(majit_metainterp::SwitchToBlackhole::giveup()),
+    }
 }
 
 fn apply_bridge_interpret_action(
@@ -5934,6 +6276,52 @@ fn apply_bridge_interpret_action(
 /// (`blackhole.py convert_and_run_from_pyjitpl`) and runs them on. It does
 /// not resume from the guard again, which would repeat what the walk ran.
 fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> BridgeResolution {
+    cancel_novable_bridge_walk_with(stb, |args| {
+        // `warmspot.py handle_jitexception`: `generatorentry_driver` restarts
+        // `portal_ptr(pycode, gen, w_arg)` from the merge point the blackhole
+        // reached.
+        let w_gen = args.red_ref.first().copied().unwrap_or(0) as PyObjectRef;
+        let w_arg = args.red_ref.get(1).copied().unwrap_or(0) as PyObjectRef;
+        let pycode = args
+            .green_ref
+            .first()
+            .copied()
+            .map(|p| p as PyObjectRef)
+            .filter(|&p| is_live_code(p))
+            .or_else(|| pycode_of_generator(w_gen))
+            .unwrap_or(PY_NULL);
+        let w_arg = if w_arg.is_null() {
+            pyre_object::w_none()
+        } else {
+            w_arg
+        };
+        BridgeResolution::CompiledContinueLive(vec![
+            majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(w_gen as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
+        ])
+    })
+}
+
+fn cancel_tuple_hash_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> BridgeResolution {
+    cancel_novable_bridge_walk_with(stb, |args| {
+        // `warmspot.py handle_jitexception`: `hash_driver` restarts
+        // `portal_ptr(w_type, len, acc, i, obj)` from the merge point the
+        // blackhole reached.
+        let len = args.red_int.first().copied().unwrap_or(0);
+        let acc = args.red_int.get(1).copied().unwrap_or(0);
+        let i = args.red_int.get(2).copied().unwrap_or(0);
+        let obj = args.red_ref.first().copied().unwrap_or(0) as PyObjectRef;
+        BridgeResolution::CompiledContinueLive(
+            pyre_jit_trace::tuplehash_state::tuple_hash_live_values(len, acc, i, obj).to_vec(),
+        )
+    })
+}
+
+fn cancel_novable_bridge_walk_with(
+    stb: majit_metainterp::SwitchToBlackhole,
+    map_crn: impl FnOnce(majit_metainterp::jitexc::ContinueRunningNormallyArgs) -> BridgeResolution,
+) -> BridgeResolution {
     use majit_metainterp::jitexc::JitException;
     use pyre_jit_trace::state::ConcreteValue;
 
@@ -5968,31 +6356,7 @@ fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> Bridg
         JitException::ExitFrameWithExceptionRef(exc) => {
             BridgeResolution::FinishedException(ConcreteValue::Ref(exc.as_usize() as PyObjectRef))
         }
-        // `warmspot.py handle_jitexception`: `generatorentry_driver` restarts
-        // `portal_ptr(pycode, gen, w_arg)` from the merge point the blackhole
-        // reached.
-        JitException::ContinueRunningNormally(args) => {
-            let w_gen = args.red_ref.first().copied().unwrap_or(0) as PyObjectRef;
-            let w_arg = args.red_ref.get(1).copied().unwrap_or(0) as PyObjectRef;
-            let pycode = args
-                .green_ref
-                .first()
-                .copied()
-                .map(|p| p as PyObjectRef)
-                .filter(|&p| is_live_code(p))
-                .or_else(|| pycode_of_generator(w_gen))
-                .unwrap_or(PY_NULL);
-            let w_arg = if w_arg.is_null() {
-                pyre_object::w_none()
-            } else {
-                w_arg
-            };
-            BridgeResolution::CompiledContinueLive(vec![
-                majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)),
-                majit_ir::Value::Ref(majit_ir::GcRef(w_gen as usize)),
-                majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
-            ])
-        }
+        JitException::ContinueRunningNormally(args) => map_crn(*args),
         JitException::BailToInterpreter => BridgeResolution::ResumeBlackhole,
     }
 }
