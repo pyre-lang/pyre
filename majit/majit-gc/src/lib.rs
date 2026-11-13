@@ -377,7 +377,7 @@ fn assert_stamped_ref_is_live_object_slow(addr: usize, location: &'static std::p
     if addr == 0 {
         return;
     }
-    if !gc_sync::is_initialized() || !rgil::am_i_holding_the_gil() {
+    if !gc_sync::is_initialized() || !rgil::mutator_may_run() {
         return;
     }
     gc_sync::gc_query_reentrant(|gc| gc.assert_stamped_ref_is_live_object(addr, location));
@@ -3034,7 +3034,8 @@ unsafe fn malloc_fast_bump(
     let large = PUBLISHED_BUMP
         .large
         .load(std::sync::atomic::Ordering::Relaxed);
-    if free_addr == 0 || raw >= large || gc_stress_trace_alloc_enabled() {
+    // 0 = disarmed; 1 = GIL-disabled sentinel (each thread's own pair).
+    if free_addr <= PUBLISHED_BUMP_GIL_DISABLED || raw >= large || gc_stress_trace_alloc_enabled() {
         return unsafe {
             malloc_fast_slow(
                 type_id,
@@ -3070,6 +3071,38 @@ unsafe fn malloc_fast_bump(
     GcRef((result as usize) + header::GcHeader::SIZE)
 }
 
+/// GIL-disabled bump through this thread's `tlfield_nursery_*` pair.
+///
+/// `PUBLISHED_BUMP.free_addr` is the sentinel, so the mode-off fast path
+/// still loads one published address and takes one predictable `<= 1`
+/// branch. This cold arm is the per-thread chunk bump; a miss falls through
+/// to `collect_and_reserve` under the GC lock.
+#[inline]
+unsafe fn malloc_fast_bump_threadlocal(type_id: u32, payload_size: usize) -> Option<GcRef> {
+    let Some(raw) = header::GcHeader::SIZE.checked_add(payload_size) else {
+        return Some(GcRef(0));
+    };
+    let large = PUBLISHED_BUMP
+        .large
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if raw >= large {
+        return None;
+    }
+    let total = raw.max(header::GcHeader::MIN_NURSERY_OBJ_SIZE);
+    let total = (total + header::MEMORY_ALIGNMENT - 1) & !(header::MEMORY_ALIGNMENT - 1);
+    let ptrs = crate::threadlocal::threadlocal_nursery_ptrs();
+    let result = unsafe { (*ptrs).free };
+    let new_free = result.wrapping_add(total);
+    if (new_free as usize) > (unsafe { (*ptrs).top } as usize) {
+        return None;
+    }
+    unsafe {
+        (*ptrs).free = new_free;
+        (result as *mut u64).write(u64::from(type_id));
+    }
+    Some(GcRef((result as usize) + header::GcHeader::SIZE))
+}
+
 /// Overflow, large object, unpublished bump, box, or `MAJIT_GC_STRESS_TRACE_ALLOC`.
 ///
 /// `framework.py` `push_roots` / `pop_roots` only wrap this arm:
@@ -3084,7 +3117,19 @@ unsafe fn malloc_fast_slow(
     root_count: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
+    let free_addr = PUBLISHED_BUMP
+        .free_addr
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if free_addr == PUBLISHED_BUMP_GIL_DISABLED
+        && !gc_sync::stw_requested()
+        && let Some(obj) = unsafe { malloc_fast_bump_threadlocal(type_id, payload_size) }
+    {
+        return obj;
+    }
     let _live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
+    if rgil::gil_disabled() {
+        gc_sync::safepoint_poll();
+    }
     if gc_box_installed() {
         if let Some(f) = ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
             return unsafe {
@@ -4503,8 +4548,13 @@ static PUBLISHED_BUMP: PublishedBump = PublishedBump {
     large: std::sync::atomic::AtomicUsize::new(0),
 };
 
+/// `PUBLISHED_BUMP.free_addr` when the GIL is disabled. Distinct from 0
+/// (disarmed) so the existing unpublished test falls to the cold path.
+const PUBLISHED_BUMP_GIL_DISABLED: usize = 1;
+
 /// Live addresses of the published bump cursor words, or `(0, 0)` when
-/// the bump path is disarmed.
+/// the bump path is disarmed. With the GIL disabled this is the sentinel
+/// pair, not a thread's chunk; use [`live_bump_cursor_addrs`].
 #[inline]
 pub fn published_bump_cursor_addrs() -> (usize, usize) {
     (
@@ -4517,6 +4567,33 @@ pub fn published_bump_cursor_addrs() -> (usize, usize) {
     )
 }
 
+/// Addresses of the calling thread's live `nursery_free` / `nursery_top`
+/// words. With the GIL on this is the published pair; with the GIL off it
+/// is this thread's chunk pair.
+#[inline]
+pub fn live_bump_cursor_addrs() -> (usize, usize) {
+    if rgil::gil_disabled() {
+        let ptrs = crate::threadlocal::threadlocal_nursery_ptrs();
+        unsafe {
+            (
+                std::ptr::addr_of!((*ptrs).free) as usize,
+                std::ptr::addr_of!((*ptrs).top) as usize,
+            )
+        }
+    } else {
+        published_bump_cursor_addrs()
+    }
+}
+
+/// Pin `PUBLISHED_BUMP.free_addr` at the GIL-disabled sentinel so the
+/// mode-off fast path's unpublished test falls to the per-thread bump.
+pub(crate) fn arm_gil_disabled_published_bump() {
+    PUBLISHED_BUMP.free_addr.store(
+        PUBLISHED_BUMP_GIL_DISABLED,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 /// Refresh `PUBLISHED_BUMP` from `gc` after a cursor hand-off. Skips a
 /// refused (box) publish so a per-thread allocator does not re-arm the
 /// singleton bump.
@@ -4524,6 +4601,13 @@ pub fn republish_singleton_bump(gc: &dyn GcAllocator) {
     if PUBLISHED_NURSERY
         .refused
         .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    if PUBLISHED_BUMP
+        .free_addr
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == PUBLISHED_BUMP_GIL_DISABLED
     {
         return;
     }
@@ -4553,6 +4637,26 @@ pub fn publish_singleton_nursery(gc: &dyn GcAllocator) {
     let n = &PUBLISHED_NURSERY;
     n.armed.store(false, std::sync::atomic::Ordering::Release);
     if n.refused.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if PUBLISHED_BUMP
+        .free_addr
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == PUBLISHED_BUMP_GIL_DISABLED
+    {
+        if let Some((_, _, large)) = gc.malloc_fast_bump_addrs() {
+            PUBLISHED_BUMP
+                .large
+                .store(large, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some((start, end)) = gc.nursery_bounds() else {
+            return;
+        };
+        n.start.store(start, std::sync::atomic::Ordering::Relaxed);
+        n.end.store(end, std::sync::atomic::Ordering::Relaxed);
+        n.tagged
+            .store(gc.taggedpointers(), std::sync::atomic::Ordering::Relaxed);
+        n.armed.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
     if let Some((free, top, large)) = gc.malloc_fast_bump_addrs() {
@@ -4656,7 +4760,7 @@ fn gc_is_young_object(addr: usize) -> bool {
     if let Some(f) = ACTIVE_GC_IS_YOUNG_OBJECT.get() {
         return f(addr);
     }
-    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() {
+    if gc_sync::is_initialized() && rgil::mutator_may_run() {
         return gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr));
     }
     false
@@ -5213,7 +5317,7 @@ pub fn gc_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) 
         f(pool);
         return;
     }
-    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() && !gc_sync::in_gc_op() {
+    if gc_sync::is_initialized() && rgil::mutator_may_run() && !gc_sync::in_gc_op() {
         gc_sync::gc_op(|gc| gc.remember_const_pool(pool));
     }
 }

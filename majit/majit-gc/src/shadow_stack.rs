@@ -359,6 +359,10 @@ thread_local! {
 struct MutatorEntry {
     thread_id: std::thread::ThreadId,
     generation: u64,
+    /// This mutator's `tlfield_nursery_free` / `tlfield_nursery_top` pair.
+    /// The collector writes [`NurseryPtrs::empty`] into it at the end of a
+    /// minor and whenever the arena cursor is rewritten wholesale.
+    nursery_ptrs: *mut crate::nursery::NurseryPtrs,
     shadow_stack: *const ShadowStack,
     owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
@@ -514,6 +518,7 @@ pub fn register_mutator() {
     registry.push(MutatorEntry {
         thread_id,
         generation: NEXT_MUTATOR_GENERATION.fetch_add(1, AtomicOrdering::Relaxed),
+        nursery_ptrs: crate::threadlocal::threadlocal_nursery_ptrs(),
         shadow_stack,
         owner_roots,
         jf_root_stack,
@@ -524,6 +529,26 @@ pub fn register_mutator() {
         pruners: Vec::new(),
         young_reconcilers: Vec::new(),
     });
+}
+
+/// Set every registered mutator's nursery pair to empty.
+///
+/// The world is stopped, or only one mutator is registered. Called after a
+/// minor resets the arena cursor and whenever that cursor is rewritten
+/// wholesale.
+pub fn clear_all_mutator_nursery_chunks() {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced() || crate::gc_sync::registered_threads() <= 1,
+        "clearing mutator chunks requires STW or a single registered mutator"
+    );
+    let registry = lock_mutator_registry();
+    for entry in registry.iter() {
+        if !entry.nursery_ptrs.is_null() {
+            unsafe {
+                *entry.nursery_ptrs = crate::nursery::NurseryPtrs::empty();
+            }
+        }
+    }
 }
 
 /// Whether this thread has a [`register_mutator`] entry.

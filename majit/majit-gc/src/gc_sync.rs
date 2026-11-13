@@ -8,18 +8,28 @@
 //!
 //! # The operation gate is the GIL
 //!
-//! GC operations (alloc, collect, barrier, query) take no lock of their own.
-//! Exclusion comes from [`crate::rgil`]: a thread holds the GIL for as long as
-//! it runs pyre code, so between two external calls arbitrarily many
-//! allocations run with no synchronisation, and [`gc_op`] is a bare borrow of
-//! the singleton — `malloc_fixedsize` bumps `nursery_free` under exactly the
-//! same terms (incminimark.py, framework.py:361-402).
+//! GC operations (alloc, collect, barrier, query) take no lock of their own
+//! while the GIL is on. Exclusion comes from [`crate::rgil`]: a thread holds
+//! the GIL for as long as it runs pyre code, so between two external calls
+//! arbitrarily many allocations run with no synchronisation, and [`gc_op`] is
+//! a bare borrow of the singleton plus one Relaxed load of the mode word —
+//! `malloc_fixedsize` bumps `nursery_free` under exactly the same terms
+//! (incminimark.py, framework.py:361-402).
 //!
 //! The GIL is therefore the safepoint too. A thread that does not hold it is
 //! either waiting for it in `RPyGilAcquireSlowPath` or blocked in an external
 //! call, and both leave the RUNNING census — so a collector, which by
 //! definition holds the GIL, never waits for a thread that is running pyre
 //! code.
+//!
+//! # GIL disabled
+//!
+//! [`crate::rgil::disable_gil`] turns on a second process mode. [`gc_op`]
+//! then takes a process-wide leaf lock ([`GcSync::gc_lock`]). A collector
+//! never waits for quiescence while holding that lock: [`quiesce_mutators`]
+//! releases it across the `quiesced` wait. Two concurrent collection
+//! requests: the loser parks as an ordinary mutator and the returned
+//! [`StwGuard`] reports [`StwGuard::superseded`].
 //!
 //! # Design
 //!
@@ -38,6 +48,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 // process-global userspace waiter queue, and waking that queue in the child
 // deadlocks before the rest of the after-fork hooks can rebuild thread state.
 use std::sync::{Arc, Condvar, Mutex};
+
+use parking_lot::RawMutex;
+use parking_lot::lock_api::RawMutex as RawMutexTrait;
 
 use crate::collector::{FinalizerQueueTable, MiniMarkGC};
 // The singleton is concrete, but its `GcAllocator` methods still need the
@@ -88,6 +101,11 @@ pub struct GcSync {
     /// Generation counter incremented after each STW. Prevents spurious
     /// wake: a thread checks that generation changed before proceeding.
     stw_generation: AtomicUsize,
+    /// Leaf lock for [`gc_op`] when the GIL is disabled. Ordinary operations
+    /// take it, run, and release. The stop-the-world owner already has
+    /// exclusive access and takes nothing. Released across the quiescence
+    /// wait: a thread blocked on this lock is not at a safepoint.
+    gc_lock: RawMutex,
 }
 
 struct QuiesceState {
@@ -101,6 +119,7 @@ static GC_SYNC: GcSync = GcSync {
     quiesced: Condvar::new(),
     resumed: Condvar::new(),
     stw_generation: AtomicUsize::new(0),
+    gc_lock: RawMutex::INIT,
 };
 
 // ──────────────────────────────────────────────────────────────
@@ -128,7 +147,9 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     unsafe {
         *GC_STORE.0.get() = Some(gc);
         let installed = (*GC_STORE.0.get()).as_mut().unwrap();
-        if !crate::rgil::gil_is_initialized() || crate::rgil::am_i_holding_the_gil() {
+        if !crate::rgil::gil_disabled()
+            && (!crate::rgil::gil_is_initialized() || crate::rgil::am_i_holding_the_gil())
+        {
             installed.claim_this_thread_cursor();
         }
         crate::publish_singleton_nursery(&**installed);
@@ -183,11 +204,21 @@ struct GcThreadState {
     /// entering an external block, and dispatch safepoint parks flip this to
     /// false.
     running: Cell<bool>,
+    /// This thread currently holds [`GcSync::gc_lock`].
+    holds_gc_lock: Cell<bool>,
+    /// This thread is inside [`gc_op`]. GIL-disabled per-thread truth for
+    /// [`in_gc_op`]; the process flag [`IN_GC_OP`] covers GIL mode.
+    in_gc_op: Cell<bool>,
 }
 
 thread_local! {
     static GC_THREAD: GcThreadState = const {
-        GcThreadState { registered: Cell::new(false), running: Cell::new(false) }
+        GcThreadState {
+            registered: Cell::new(false),
+            running: Cell::new(false),
+            holds_gc_lock: Cell::new(false),
+            in_gc_op: Cell::new(false),
+        }
     };
 }
 
@@ -230,11 +261,14 @@ unsafe fn singleton_ref() -> &'static MiniMarkGC {
 #[inline]
 pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     debug_assert!(
-        crate::rgil::am_i_holding_the_gil(),
-        "a GC query needs the GIL"
+        crate::rgil::mutator_may_run(),
+        "a GC query needs the GIL or GIL-disabled mode"
     );
-    // SAFETY: the GIL is held, so no other mutator is running pyre code;
-    // read-only and bounded to `f`.
+    if crate::rgil::gil_disabled() && !mutators_quiesced() && !in_gc_op() {
+        return gc_op(|gc| f(gc));
+    }
+    // SAFETY: the GIL is held, this thread already owns gc_op, or the
+    // world is stopped; read-only and bounded to `f`.
     f(unsafe { singleton_ref() })
 }
 
@@ -332,9 +366,12 @@ pub(crate) fn claim_nursery_cursor_for_current_thread() {
     if !is_initialized() {
         return;
     }
+    if crate::rgil::gil_disabled() {
+        return;
+    }
     if crate::rgil::gil_is_initialized() {
         debug_assert!(
-            crate::rgil::am_i_holding_the_gil(),
+            crate::rgil::mutator_may_run(),
             "gc_thread_run needs the GIL once it is initialized"
         );
     }
@@ -365,6 +402,12 @@ pub(crate) fn release_nursery_cursor_to_fallback() {
 /// installed the GC, or ran `gc_thread_run`, can still own it here.
 pub(crate) fn release_nursery_cursor_owned_by(owner: *mut crate::nursery::NurseryPtrs) {
     if !is_initialized() {
+        return;
+    }
+    // `disable_gil` moved the cursor to the fallback pair and no thread
+    // claims it afterwards, so no dying thread can own it; reading the
+    // singleton here would race with the GC-lock holder.
+    if crate::rgil::gil_disabled() {
         return;
     }
     // SAFETY: the dying thread owns the cursor, so it is the GIL holder or
@@ -478,7 +521,7 @@ pub fn before_external_block() -> BlockingGuard {
     // `rffi.aroundstate.before()` drops the GIL before a `releasegil=True`
     // call (`_RPyGilRelease`, threadlocal.h:162-166), so that a thread asleep
     // in the external call holds nothing another mutator needs.
-    let held_gil = crate::rgil::am_i_holding_the_gil();
+    let held_gil = !crate::rgil::gil_disabled() && crate::rgil::am_i_holding_the_gil();
     if held_gil {
         crate::rgil::release();
     }
@@ -527,7 +570,7 @@ impl Drop for CallbackGuard {
 
 #[inline]
 pub fn enter_external_callback() -> CallbackGuard {
-    let took_gil = !crate::rgil::am_i_holding_the_gil();
+    let took_gil = !crate::rgil::gil_disabled() && !crate::rgil::am_i_holding_the_gil();
     if took_gil {
         crate::rgil::acquire();
     }
@@ -622,6 +665,15 @@ pub fn after_fork_child() {
     crate::rgil::after_fork_child();
     STW_OWNER.store(0, Ordering::SeqCst);
     STW_DEPTH.store(0, Ordering::SeqCst);
+    // The child inherits a userspace lock word. Re-init, then re-take if
+    // this thread was inside gc_op across the fork.
+    unsafe {
+        let lock = &GC_SYNC.gc_lock as *const RawMutex as *mut RawMutex;
+        std::ptr::write(lock, RawMutex::INIT);
+        if GC_THREAD.with(|t| t.holds_gc_lock.get()) {
+            GC_SYNC.gc_lock.lock();
+        }
+    }
     GC_SYNC.stw_requested.store(false, Ordering::Release);
     majit_ir::eval_breaker_word::clear_stw();
     // Same reason, for the other deferred bit: a `MemoryError` owed to a thread
@@ -660,22 +712,69 @@ pub fn stw_required() -> bool {
 
 /// Execute a closure with exclusive `&mut MiniMarkGC` access.
 ///
-/// The caller holds the GIL — it has held it since it started running pyre
-/// code — so this is a bare borrow of the singleton with no atomic and no
-/// thread-ident read. `malloc_fixedsize` is unsynchronised for the same
-/// reason: framework.py's `malloc_fast` (:361-402) bumps `nursery_free` with
-/// nothing but the GIL behind it.
+/// With the GIL on this is a bare borrow of the singleton plus one Relaxed
+/// load of the mode word. With the GIL off it takes [`GcSync::gc_lock`], a
+/// leaf lock released across a quiescence wait. The stop-the-world owner
+/// already has exclusive access and takes nothing.
 ///
 /// There is deliberately no exit safepoint. A returned reference is rooted by
 /// the caller before its next entry-style safepoint.
 #[inline]
 pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
     debug_assert!(
-        crate::rgil::am_i_holding_the_gil(),
-        "a GC operation needs the GIL"
+        crate::rgil::mutator_may_run(),
+        "a GC operation needs the GIL or GIL-disabled mode"
     );
-    let _reentry = ReentryGuard::enter();
-    // SAFETY: the GIL excludes every other mutator from running pyre code.
+    if crate::rgil::gil_disabled() {
+        gc_op_nogil(f)
+    } else {
+        let _reentry = ReentryGuard::enter();
+        // SAFETY: the GIL excludes every other mutator from running pyre code.
+        f(unsafe { singleton_mut() })
+    }
+}
+
+#[cold]
+fn gc_op_nogil<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
+    let nested = GC_THREAD.with(|t| t.in_gc_op.get());
+    if nested {
+        debug_assert!(
+            mutators_quiesced(),
+            "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
+        );
+        return f(unsafe { singleton_mut() });
+    }
+    if mutators_quiesced() {
+        GC_THREAD.with(|t| t.in_gc_op.set(true));
+        struct StwReentry;
+        impl Drop for StwReentry {
+            fn drop(&mut self) {
+                GC_THREAD.with(|t| t.in_gc_op.set(false));
+            }
+        }
+        let _g = StwReentry;
+        return f(unsafe { singleton_mut() });
+    }
+    // Leaf lock; paired with `GcOpNogilGuard::drop`.
+    GC_SYNC.gc_lock.lock();
+    GC_THREAD.with(|t| {
+        t.holds_gc_lock.set(true);
+        t.in_gc_op.set(true);
+    });
+    struct GcOpNogilGuard;
+    impl Drop for GcOpNogilGuard {
+        fn drop(&mut self) {
+            let held = GC_THREAD.with(|t| {
+                t.in_gc_op.set(false);
+                t.holds_gc_lock.replace(false)
+            });
+            if held {
+                // SAFETY: this thread took the lock in `gc_op_nogil`.
+                unsafe { GC_SYNC.gc_lock.unlock() };
+            }
+        }
+    }
+    let _g = GcOpNogilGuard;
     f(unsafe { singleton_mut() })
 }
 
@@ -717,7 +816,11 @@ impl Drop for ReentryGuard {
 /// which is `gc_op`).
 #[inline]
 pub fn in_gc_op() -> bool {
-    IN_GC_OP.load(Ordering::Relaxed)
+    if crate::rgil::gil_disabled() {
+        GC_THREAD.with(|t| t.in_gc_op.get())
+    } else {
+        IN_GC_OP.load(Ordering::Relaxed)
+    }
 }
 
 /// Execute a closure with `&MiniMarkGC` access (read-only query).
@@ -738,6 +841,16 @@ pub fn gc_query<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
 pub struct StwGuard {
     active: bool,
     owner: bool,
+    superseded: bool,
+}
+
+impl StwGuard {
+    /// Another thread's collection ran while this thread asked for STW.
+    /// The caller must not collect; retry the triggering operation instead.
+    #[inline]
+    pub fn superseded(&self) -> bool {
+        self.superseded
+    }
 }
 
 /// Quiesce every other registered mutator when the process-global GC is shared.
@@ -749,35 +862,110 @@ pub fn quiesce_mutators() -> StwGuard {
         return StwGuard {
             active: true,
             owner: false,
+            superseded: false,
         };
     }
 
-    if !stw_required() {
+    // GIL-on: other mutators wait for the GIL, so a single registered
+    // thread needs no STW. GIL-off: always publish `stw_requested` so a
+    // thread that registers during this collection parks in
+    // `register_thread` instead of bumping a nursery being evacuated.
+    if !stw_required() && !crate::rgil::gil_disabled() {
         return StwGuard {
             active: false,
             owner: false,
+            superseded: false,
         };
     }
 
+    let held_gc = crate::rgil::gil_disabled() && GC_THREAD.with(|t| t.holds_gc_lock.get());
     let mut state = GC_SYNC.quiesce.lock().unwrap();
+    if GC_SYNC.stw_requested.load(Ordering::Acquire) {
+        drop(state);
+        release_gc_lock_across_wait(held_gc);
+        park_as_mutator_for_foreign_stw();
+        reacquire_gc_lock_after_wait(held_gc);
+        return StwGuard {
+            active: false,
+            owner: false,
+            superseded: true,
+        };
+    }
+
     GC_SYNC.stw_requested.store(true, Ordering::Release);
     majit_ir::eval_breaker_word::set_stw();
 
     let collector_is_running =
         GC_THREAD.with(|t| t.registered.get()) && GC_THREAD.with(|t| t.running.get());
     let drain_target = usize::from(collector_is_running);
+    if held_gc {
+        // A thread blocked on the GC lock is not at a safepoint. Drop the
+        // leaf lock before waiting on RUNNING; retake it after the drain.
+        GC_THREAD.with(|t| t.holds_gc_lock.set(false));
+        // SAFETY: this thread holds `gc_lock` from `gc_op_nogil`.
+        unsafe { GC_SYNC.gc_lock.unlock() };
+    }
     state = GC_SYNC
         .quiesced
         .wait_while(state, |state| state.running != drain_target)
         .unwrap();
     drop(state);
+    if held_gc {
+        // Paired with the unlock above.
+        GC_SYNC.gc_lock.lock();
+        GC_THREAD.with(|t| t.holds_gc_lock.set(true));
+    }
     STW_OWNER.store(ident, Ordering::Release);
     STW_DEPTH.store(1, Ordering::Relaxed);
 
     StwGuard {
         active: true,
         owner: true,
+        superseded: false,
     }
+}
+
+/// Quiesce until this thread owns STW or no STW is required. Inspectors and
+/// other exclusive walks retry a superseded request; they are not a
+/// collection point that can skip the body.
+pub fn quiesce_mutators_owned() -> StwGuard {
+    loop {
+        let g = quiesce_mutators();
+        if !g.superseded() {
+            return g;
+        }
+    }
+}
+
+fn release_gc_lock_across_wait(held_gc: bool) {
+    if !held_gc {
+        return;
+    }
+    GC_THREAD.with(|t| t.holds_gc_lock.set(false));
+    // SAFETY: this thread holds `gc_lock` from `gc_op_nogil`.
+    unsafe { GC_SYNC.gc_lock.unlock() };
+}
+
+fn reacquire_gc_lock_after_wait(held_gc: bool) {
+    if !held_gc {
+        return;
+    }
+    // Paired with `release_gc_lock_across_wait`.
+    GC_SYNC.gc_lock.lock();
+    GC_THREAD.with(|t| t.holds_gc_lock.set(true));
+}
+
+fn park_as_mutator_for_foreign_stw() {
+    if GC_THREAD.with(|t| t.registered.get() && t.running.get()) {
+        park_until_stw_done();
+        return;
+    }
+    let state = GC_SYNC.quiesce.lock().unwrap();
+    drop(
+        GC_SYNC
+            .resumed
+            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire)),
+    );
 }
 
 /// Whether this thread currently owns or is nested inside collector-side STW.
@@ -816,7 +1004,7 @@ impl Drop for StwGuard {
 /// `collect_nursery`, `collect_full`, etc.
 pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
     gc_op(|gc| {
-        let _stw = quiesce_mutators();
+        let _stw = quiesce_mutators_owned();
         collect_fn(gc);
     });
 }
@@ -825,7 +1013,7 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
 /// Unlike [`request_stw`], `f` gets no `&mut MiniMarkGC`, so it may allocate, run write
 /// barriers, or trigger a collection (which nests through [`quiesce_mutators`]).
 pub fn stop_the_world<R>(f: impl FnOnce() -> R) -> R {
-    let _stw = quiesce_mutators();
+    let _stw = quiesce_mutators_owned();
     f()
 }
 
@@ -847,7 +1035,7 @@ pub fn stop_the_world<R>(f: impl FnOnce() -> R) -> R {
 /// sides of the fork and releases it on both sides.
 pub fn fork_under_stw<R>(fork_fn: impl FnOnce() -> R) -> R {
     gc_op(|_| {
-        let _stw = quiesce_mutators();
+        let _stw = quiesce_mutators_owned();
         let held = GC_SYNC.quiesce.lock().unwrap();
         let result = fork_fn();
         drop(held);
@@ -947,6 +1135,12 @@ pub fn safepoint_poll() {
     if GC_SYNC.stw_requested.load(Ordering::Relaxed) {
         park_until_stw_done();
     }
+}
+
+/// Whether a collector has asked other mutators to park.
+#[inline]
+pub(crate) fn stw_requested() -> bool {
+    GC_SYNC.stw_requested.load(Ordering::Relaxed)
 }
 
 // ──────────────────────────────────────────────────────────────

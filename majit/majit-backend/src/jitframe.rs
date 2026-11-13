@@ -766,7 +766,7 @@ pub fn standalone_jitframe_facts() -> JitframeDescrFacts {
         is_gc_object: true,
         type_id: STANDALONE_JITFRAME_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed),
         nursery_free_addr: {
-            let (free, _) = majit_gc::published_bump_cursor_addrs();
+            let (free, _) = majit_gc::live_bump_cursor_addrs();
             if free != 0 {
                 free
             } else {
@@ -774,7 +774,7 @@ pub fn standalone_jitframe_facts() -> JitframeDescrFacts {
             }
         },
         nursery_top_addr: {
-            let (_, top) = majit_gc::published_bump_cursor_addrs();
+            let (_, top) = majit_gc::live_bump_cursor_addrs();
             if top != 0 {
                 top
             } else {
@@ -851,7 +851,7 @@ pub fn try_bump_nursery_jitframe(
     if total >= facts.max_size_of_young_obj {
         return None;
     }
-    let (pub_free, pub_top) = majit_gc::published_bump_cursor_addrs();
+    let (pub_free, pub_top) = majit_gc::live_bump_cursor_addrs();
     let free_cell = if pub_free != 0 {
         pub_free
     } else {

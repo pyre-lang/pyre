@@ -41,6 +41,11 @@ pub struct NurseryPtrs {
     _top_hi: u32,
 }
 
+/// Bytes carved from the arena cursor for one mutator when the GIL is
+/// disabled. Clamped to the remaining gap before the current `nursery_top`
+/// barrier.
+pub const NURSERY_CHUNK_SIZE: usize = 32 * 1024;
+
 impl NurseryPtrs {
     /// Adjacent pair occupying two container words.
     pub const fn pair(free: *mut u8, top: *const u8) -> Self {
@@ -438,6 +443,25 @@ impl Nursery {
     pub fn release_to_fallback(&mut self) {
         let fallback = self.fallback_ptr();
         unsafe { self.claim_cursor(fallback) };
+    }
+
+    /// Carve `[free, free+chunk)` from the arena cursor for one mutator.
+    ///
+    /// `chunk` is [`NURSERY_CHUNK_SIZE`] clamped to the remaining gap. The
+    /// unused tail of an abandoned chunk is left until the next minor.
+    pub fn try_carve_chunk(&mut self, min_size: usize) -> Option<NurseryPtrs> {
+        let min_size = min_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+        let min_size = (min_size + crate::header::MEMORY_ALIGNMENT - 1)
+            & !(crate::header::MEMORY_ALIGNMENT - 1);
+        let remaining = self.remaining();
+        if remaining < min_size {
+            return None;
+        }
+        let chunk = NURSERY_CHUNK_SIZE.min(remaining);
+        let start = self.free_ptr();
+        let top = unsafe { start.add(chunk) };
+        unsafe { self.set_free_ptr(top) };
+        Some(NurseryPtrs::pair(start, top as *const u8))
     }
 
     /// Start of nursery.
