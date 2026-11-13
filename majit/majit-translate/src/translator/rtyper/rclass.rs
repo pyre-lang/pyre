@@ -72,8 +72,9 @@ use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::flowspace_adapter::const_ref_gcref_constant;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
+    self, _ptr, ForwardReference, GCREF, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -3375,6 +3376,26 @@ impl InstanceRepr {
         self: &Arc<Self>,
         host_obj: &HostObject,
     ) -> Result<Constant, TyperError> {
+        // Live refs-registered immortal (`bookkeeper.py
+        // Bookkeeper.immutablevalue`, `rclass.py
+        // InstanceRepr.convert_const_exact`). Emit the GCREF `_ptr`
+        // `IntCast` of that row (`const_ref_gcref_constant`); never a
+        // translation-time malloc copy.
+        if let Some(addr) = host_obj.live_ref_addr() {
+            if let Some(cached) = self.iprebuiltinstances.borrow().get(host_obj).cloned() {
+                return Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(cached)),
+                    GCREF.clone(),
+                ));
+            }
+            let constant = const_ref_gcref_constant(Some(addr));
+            if let ConstValue::LLPtr(ptr) = &constant.value {
+                self.iprebuiltinstances
+                    .borrow_mut()
+                    .insert(host_obj.clone(), ptr.as_ref().clone());
+            }
+            return Ok(constant);
+        }
         // upstream `try: return self.iprebuiltinstances[value]`.
         if let Some(cached) = self.iprebuiltinstances.borrow().get(host_obj).cloned() {
             return Ok(Constant::with_concretetype(
@@ -6709,6 +6730,73 @@ mod tests {
             "iprebuiltinstances cache must return the same _ptr identity"
         );
         // The cache holds exactly one entry for this prebuilt.
+        assert_eq!(inst.iprebuiltinstances.borrow().len(), 1);
+    }
+
+    #[test]
+    fn convert_const_exact_live_addr_is_gcref_intcast_not_struct() {
+        // `rclass.py InstanceRepr.convert_const_exact` of a live
+        // refs-registered immortal is the GCREF `_ptr` IntCast of that
+        // row (`const_ref_gcref_constant`), never a translation-time
+        // malloc copy.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{HostGetAttrError, HostObject, NativeInstanceDict};
+        struct LiveRef {
+            addr: i64,
+        }
+        impl NativeInstanceDict for LiveRef {
+            fn get(&self, _name: &str) -> Result<ConstValue, HostGetAttrError> {
+                Err(HostGetAttrError::Missing)
+            }
+            fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+                Ok(Vec::new())
+            }
+            fn live_addr(&self) -> Option<i64> {
+                Some(self.addr)
+            }
+        }
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("init exceptiondata");
+        let class = HostObject::new_class("LiveCls", vec![]);
+        let entry = ann.bookkeeper.getdesc(&class).unwrap();
+        let DescEntry::Class(rc) = &entry else {
+            unreachable!()
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
+        let addr = 0x1234_5678i64;
+        let prebuilt = HostObject::new_native_instance(class, Arc::new(LiveRef { addr }));
+        let value = ConstValue::HostObject(prebuilt.clone());
+        let c1 = (inst.as_ref() as &dyn Repr)
+            .convert_const(&value)
+            .expect("convert_const(live)#1");
+        let c2 = (inst.as_ref() as &dyn Repr)
+            .convert_const(&value)
+            .expect("convert_const(live)#2");
+        assert_eq!(c1.concretetype.as_ref(), Some(&*GCREF));
+        let (ConstValue::LLPtr(p1), ConstValue::LLPtr(p2)) = (&c1.value, &c2.value) else {
+            panic!(
+                "convert_const must produce LLPtr, got {:?} / {:?}",
+                c1.value, c2.value
+            );
+        };
+        assert_eq!(
+            p1._obj0_value().expect("obj0"),
+            Some(lltype::_ptr_obj::IntCast(addr))
+        );
+        assert_eq!(
+            p1._hashable_identity(),
+            p2._hashable_identity(),
+            "iprebuiltinstances cache must return the same live GCREF"
+        );
+        assert!(
+            !matches!(p1._obj0_value(), Ok(Some(lltype::_ptr_obj::Struct(_)))),
+            "live convert_const must not malloc a Struct copy"
+        );
         assert_eq!(inst.iprebuiltinstances.borrow().len(), 1);
     }
 

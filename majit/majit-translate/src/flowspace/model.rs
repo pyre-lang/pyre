@@ -293,6 +293,13 @@ pub type HostCallableFn = Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String
 pub trait NativeInstanceDict: Send + Sync {
     fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError>;
     fn keys(&self) -> Result<Vec<String>, HostGetAttrError>;
+    /// Live GC address of a refs-registered immortal
+    /// (`rclass.py InstanceRepr.convert_const_exact`,
+    /// `bookkeeper.py Bookkeeper.immutablevalue`). Default None: the
+    /// instance is a translation-time copy.
+    fn live_addr(&self) -> Option<i64> {
+        None
+    }
 }
 
 enum HostInstanceDict {
@@ -372,6 +379,19 @@ impl HostObject {
 
     pub fn is_instance(&self) -> bool {
         matches!(self.inner.kind, HostObjectKind::Instance { .. })
+    }
+
+    /// Refs-row address of a live immortal (`rclass.py
+    /// InstanceRepr.convert_const_exact`). None when the carrier is a
+    /// translation-time copy.
+    pub fn live_ref_addr(&self) -> Option<i64> {
+        match &self.inner.kind {
+            HostObjectKind::Instance {
+                instance_dict: HostInstanceDict::Native(dict),
+                ..
+            } => dict.live_addr(),
+            _ => None,
+        }
     }
 
     pub fn is_user_function(&self) -> bool {
