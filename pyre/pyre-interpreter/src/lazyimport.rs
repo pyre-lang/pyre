@@ -3,10 +3,9 @@
 
 use pyre_object::*;
 use rustpython_compiler::core::{PositionEncoding, SourceFileBuilder};
-use rustpython_compiler_core::bytecode::{CodeObject, CodeUnit, Instruction};
 
 use crate::compile::codegen::error::{CodegenError, CodegenErrorType};
-use crate::compile::{CompileError, Mode, ast, parser};
+use crate::compile::{CompileError, Mode};
 use crate::pyframe::PyFrame;
 use crate::typedef::make_new_descr;
 
@@ -1932,14 +1931,7 @@ pub fn apply_lazy_imports_mode_after_site() {
     }
 }
 
-// ── compile-wrapper: syntax checks + IMPORT_NAME bit0 ──────────────
-
-#[derive(Clone, Copy)]
-struct LazyCheckCtx {
-    in_function: bool,
-    in_class: bool,
-    in_try: bool,
-}
+// ── compile-wrapper: `from ... lazy import` check ──────────────────
 
 fn lazy_syntax_error(
     source: &str,
@@ -1960,193 +1952,6 @@ fn lazy_syntax_error(
         error: CodegenErrorType::SyntaxError(message),
         source_path: filename.to_owned(),
     })
-}
-
-fn validate_lazy_stmts(
-    stmts: &[ast::Stmt],
-    ctx: LazyCheckCtx,
-    source: &str,
-    filename: &str,
-) -> Result<(), CompileError> {
-    for stmt in stmts {
-        match stmt {
-            ast::Stmt::Import(node) if node.is_lazy => {
-                check_lazy_context(ctx, source, filename, node.range, "import")?;
-            }
-            ast::Stmt::ImportFrom(node) if node.is_lazy => {
-                let module = node.module.as_ref().map(|s| s.as_str()).unwrap_or("");
-                if node.level == 0 && module == "__future__" {
-                    // `_PyPegen_checked_from_import` raises on the `lazy` token.
-                    let start = node.range.start();
-                    let lazy_range = ruff_text_size::TextRange::new(
-                        start,
-                        start + ruff_text_size::TextSize::from(4u32),
-                    );
-                    return Err(lazy_syntax_error(
-                        source,
-                        filename,
-                        lazy_range,
-                        "lazy from __future__ import is not allowed".to_string(),
-                    ));
-                }
-                check_lazy_context(ctx, source, filename, node.range, "from ... import")?;
-                if node.names.first().is_some_and(|n| n.name.as_str() == "*") {
-                    return Err(lazy_syntax_error(
-                        source,
-                        filename,
-                        node.range,
-                        "lazy from ... import * is not allowed".to_string(),
-                    ));
-                }
-            }
-            ast::Stmt::FunctionDef(node) => {
-                validate_lazy_stmts(
-                    &node.body,
-                    LazyCheckCtx {
-                        in_function: true,
-                        in_class: false,
-                        in_try: false,
-                    },
-                    source,
-                    filename,
-                )?;
-            }
-            ast::Stmt::ClassDef(node) => {
-                validate_lazy_stmts(
-                    &node.body,
-                    LazyCheckCtx {
-                        in_function: false,
-                        in_class: true,
-                        in_try: false,
-                    },
-                    source,
-                    filename,
-                )?;
-            }
-            ast::Stmt::Try(node) => {
-                let try_ctx = LazyCheckCtx {
-                    in_try: true,
-                    ..ctx
-                };
-                validate_lazy_stmts(&node.body, try_ctx, source, filename)?;
-                for handler in &node.handlers {
-                    let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    validate_lazy_stmts(&h.body, try_ctx, source, filename)?;
-                }
-                validate_lazy_stmts(&node.orelse, try_ctx, source, filename)?;
-                validate_lazy_stmts(&node.finalbody, try_ctx, source, filename)?;
-            }
-            ast::Stmt::If(node) => {
-                validate_lazy_stmts(&node.body, ctx, source, filename)?;
-                for clause in &node.elif_else_clauses {
-                    validate_lazy_stmts(&clause.body, ctx, source, filename)?;
-                }
-            }
-            ast::Stmt::For(node) => {
-                validate_lazy_stmts(&node.body, ctx, source, filename)?;
-                validate_lazy_stmts(&node.orelse, ctx, source, filename)?;
-            }
-            ast::Stmt::While(node) => {
-                validate_lazy_stmts(&node.body, ctx, source, filename)?;
-                validate_lazy_stmts(&node.orelse, ctx, source, filename)?;
-            }
-            ast::Stmt::With(node) => {
-                validate_lazy_stmts(&node.body, ctx, source, filename)?;
-            }
-            ast::Stmt::Match(node) => {
-                for case in &node.cases {
-                    validate_lazy_stmts(&case.body, ctx, source, filename)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn check_lazy_context(
-    ctx: LazyCheckCtx,
-    source: &str,
-    filename: &str,
-    range: ruff_text_size::TextRange,
-    import_type: &str,
-) -> Result<(), CompileError> {
-    let message = if ctx.in_try {
-        format!("lazy {import_type} not allowed inside try/except blocks")
-    } else if ctx.in_function {
-        format!("lazy {import_type} not allowed inside functions")
-    } else if ctx.in_class {
-        format!("lazy {import_type} not allowed inside classes")
-    } else {
-        return Ok(());
-    };
-    Err(lazy_syntax_error(source, filename, range, message))
-}
-
-fn collect_import_name_lazy(stmts: &[ast::Stmt], out: &mut Vec<bool>) {
-    for stmt in stmts {
-        match stmt {
-            ast::Stmt::Import(node) => {
-                for _ in &node.names {
-                    out.push(node.is_lazy);
-                }
-            }
-            ast::Stmt::ImportFrom(node) => out.push(node.is_lazy),
-            ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => {}
-            ast::Stmt::Try(node) => {
-                collect_import_name_lazy(&node.body, out);
-                for handler in &node.handlers {
-                    let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    collect_import_name_lazy(&h.body, out);
-                }
-                collect_import_name_lazy(&node.orelse, out);
-                collect_import_name_lazy(&node.finalbody, out);
-            }
-            ast::Stmt::If(node) => {
-                collect_import_name_lazy(&node.body, out);
-                for clause in &node.elif_else_clauses {
-                    collect_import_name_lazy(&clause.body, out);
-                }
-            }
-            ast::Stmt::For(node) => {
-                collect_import_name_lazy(&node.body, out);
-                collect_import_name_lazy(&node.orelse, out);
-            }
-            ast::Stmt::While(node) => {
-                collect_import_name_lazy(&node.body, out);
-                collect_import_name_lazy(&node.orelse, out);
-            }
-            ast::Stmt::With(node) => collect_import_name_lazy(&node.body, out),
-            ast::Stmt::Match(node) => {
-                for case in &node.cases {
-                    collect_import_name_lazy(&case.body, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-pub fn patch_import_name_bit0(code: &mut CodeObject, flags: &[bool]) {
-    let mut flag_i = 0usize;
-    let mut i = 0usize;
-    let len = code.instructions.len();
-    let ptr = code.instructions.units_ptr() as *mut CodeUnit;
-    while i < len {
-        let unit = code.instructions[i];
-        if matches!(unit.op, Instruction::ImportName { .. }) {
-            if flag_i < flags.len() && flags[flag_i] {
-                let arg = u8::from(unit.arg);
-                if arg & 2 == 0 {
-                    unsafe {
-                        (*ptr.add(i)).arg = (arg | 1).into();
-                    }
-                }
-            }
-            flag_i += 1;
-        }
-        i += 1 + unit.op.cache_entries();
-    }
 }
 
 fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), CompileError> {
@@ -2178,7 +1983,6 @@ fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), Compil
             continue;
         }
         if at_stmt && rest_is_ident(bytes, i, b"from") {
-            let start = i;
             i += 4;
             i = skip_ws_and_comments(bytes, i);
             // Leading dots, then an optional dotted name: a name ends at the
@@ -2211,8 +2015,8 @@ fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), Compil
                 let after = skip_ws_and_comments(bytes, i + 4);
                 if rest_is_ident(bytes, after, b"import") {
                     let range = ruff_text_size::TextRange::new(
-                        ruff_text_size::TextSize::from(start as u32),
-                        ruff_text_size::TextSize::from((after + 6).min(bytes.len()) as u32),
+                        ruff_text_size::TextSize::from(i as u32),
+                        ruff_text_size::TextSize::from((i + 4) as u32),
                     );
                     return Err(lazy_syntax_error(
                         source,
@@ -2285,39 +2089,13 @@ fn skip_string(bytes: &[u8], i: usize) -> usize {
     bytes.len()
 }
 
-pub fn collect_lazy_import_flags(
+pub fn check_misplaced_lazy_import(
     source: &str,
     filename: &str,
     mode: Mode,
-) -> Result<Vec<bool>, CompileError> {
+) -> Result<(), CompileError> {
     if !matches!(mode, Mode::Exec | Mode::Single | Mode::BlockExpr) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    misplaced_from_lazy_import(source, filename)?;
-    let parsed = parser::parse_unchecked(source, parser::Mode::Module.into());
-    flags_from_mod(parsed.syntax(), source, filename)
-}
-
-pub fn flags_from_mod(
-    module: &ast::Mod,
-    source: &str,
-    filename: &str,
-) -> Result<Vec<bool>, CompileError> {
-    let body: &[ast::Stmt] = match module {
-        ast::Mod::Module(m) => &m.body,
-        ast::Mod::Expression(_) => return Ok(Vec::new()),
-    };
-    validate_lazy_stmts(
-        body,
-        LazyCheckCtx {
-            in_function: false,
-            in_class: false,
-            in_try: false,
-        },
-        source,
-        filename,
-    )?;
-    let mut flags = Vec::new();
-    collect_import_name_lazy(body, &mut flags);
-    Ok(flags)
+    misplaced_from_lazy_import(source, filename)
 }

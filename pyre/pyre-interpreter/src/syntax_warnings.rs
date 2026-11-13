@@ -786,7 +786,7 @@ pub fn compile_with_codegen_warnings_and_module(
     let _ = pyre_object::gc_roots::pin_root(module);
     let source = crate::compile::universal_newline(source);
     let filename_s = filename.to_string_lossy();
-    let flags = crate::lazyimport::collect_lazy_import_flags(&source, filename_s.as_ref(), mode)
+    crate::lazyimport::check_misplaced_lazy_import(&source, filename_s.as_ref(), mode)
         .map_err(SourceCompileError::Compile)?;
     emit_tokenizer_syntax_warnings_and_module(
         &source,
@@ -843,13 +843,11 @@ pub fn compile_with_codegen_warnings_and_module(
             )
             .map(|mut code| {
                 crate::pycode::fixup_code_get_iter(&mut code);
-                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
                 code
             })
         }),
         Ok(mut code) => {
             crate::pycode::fixup_code_get_iter(&mut code);
-            crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
             Ok(code)
         }
     };
@@ -904,9 +902,6 @@ pub fn compile_ast_with_codegen_warnings_and_module(
     let _module_roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(compile_module);
-    let filename_s = filename.to_string_lossy();
-    let flags = crate::lazyimport::flags_from_mod(&module, source, filename_s.as_ref())
-        .map_err(SourceCompileError::Compile)?;
     let escalated = core::cell::Cell::new(None);
     let mut handler = |location: crate::compile::SourceLocation, message: String| {
         warn_codegen_syntax(
@@ -943,7 +938,6 @@ pub fn compile_ast_with_codegen_warnings_and_module(
             .map_err(crate::compile::CompileError::from)
             .map(|mut code| {
                 crate::pycode::fixup_code_get_iter(&mut code);
-                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
                 code
             })
             .map_err(SourceCompileError::Compile),
