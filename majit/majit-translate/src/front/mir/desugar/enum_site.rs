@@ -206,16 +206,7 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .filter_map(|field| {
                     let name = field.name.clone()?;
-                    Some((
-                        name,
-                        tyref_to_value_type_with(
-                            &field.ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
-                    ))
+                    Some((name, self.value_type_of(&field.ty)))
                 })
                 .collect(),
         )
@@ -1684,13 +1675,7 @@ impl<'a> Lowering<'a> {
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
                             .unwrap_or_default();
                 } else {
-                    site.call_result_ty = tyref_to_value_type_with(
-                        &dest,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    );
+                    site.call_result_ty = self.value_type_of(&dest);
                     site.args_tuple_suffix =
                         crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -1698,13 +1683,7 @@ impl<'a> Lowering<'a> {
                 }
             }
             DiscCombinator::ResultUnwrapOrElse => {
-                site.call_result_ty = tyref_to_value_type_with(
-                    dest_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                );
+                site.call_result_ty = self.value_type_of(dest_ty);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -1721,13 +1700,7 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_ty = err_ty;
                 site.result_payload0_class = site.payload0_class.clone();
                 site.result_payload1_class = err_class;
-                site.call_result_ty = tyref_to_value_type_with(
-                    &dest,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                );
+                site.call_result_ty = self.value_type_of(&dest);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -1801,15 +1774,7 @@ impl<'a> Lowering<'a> {
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
         let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
-            .map(|ty| {
-                tyref_to_value_type_with(
-                    &ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                )
-            })
+            .map(|ty| self.value_type_of(&ty))
             .unwrap_or(ValueType::Ref(None));
         Some(crate::front::result_exc::OptionOkOrElseTrySite {
             result_var: result_var.clone(),
@@ -1986,13 +1951,7 @@ impl<'a> Lowering<'a> {
             return false;
         }
         matches!(
-            tyref_to_value_type_with(
-                option_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
+            self.value_type_of(option_ty),
             ValueType::Int | ValueType::Unsigned
         )
     }

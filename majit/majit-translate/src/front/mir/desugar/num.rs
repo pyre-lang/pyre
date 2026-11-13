@@ -32,13 +32,7 @@ impl<'a> Lowering<'a> {
         if !matches!(leaf.as_str(), "min" | "max") {
             return Ok(false);
         }
-        let result_ty = tyref_to_value_type_with(
-            dest_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let result_ty = self.value_type_of(dest_ty);
         if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
             return Ok(false);
         }
@@ -174,13 +168,7 @@ impl<'a> Lowering<'a> {
         }
         let peeled = self.tyref_peel_ref_to_pointee(ty);
         let ty = peeled.as_ref().unwrap_or(ty);
-        match tyref_to_value_type_with(
-            ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        ) {
+        match self.value_type_of(ty) {
             ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
                 Some(ty)
             }
@@ -465,13 +453,7 @@ impl<'a> Lowering<'a> {
                 .unwrap_or(spelling.as_str())
                 .trim()
                 .to_string();
-            let recast_ty = tyref_to_value_type_with(
-                &call.dest.ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            );
+            let recast_ty = self.value_type_of(&call.dest.ty);
             let bb_id = self.emit_bb(mir_bb);
             let res = self
                 .graph
@@ -534,13 +516,7 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(false);
         };
-        let dest_vt = tyref_to_value_type_with(
-            &call.dest.ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let dest_vt = self.value_type_of(&call.dest.ty);
         if dest_vt != ValueType::Ref(Some(root.clone())) {
             return Ok(false);
         }
@@ -2158,13 +2134,7 @@ impl<'a> Lowering<'a> {
         // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
         // sibling: converting it to Unsigned emits `cast_bool_to_uint`
         // through the ordinary `r_uint` builtin (`rbool.py`).
-        let src_is_bool = tyref_to_value_type_with(
-            src,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        ) == ValueType::Bool;
+        let src_is_bool = self.value_type_of(src) == ValueType::Bool;
         let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")

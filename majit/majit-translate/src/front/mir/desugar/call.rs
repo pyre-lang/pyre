@@ -220,13 +220,7 @@ impl<'a> Lowering<'a> {
         {
             raw
         } else {
-            tyref_to_value_type_with(
-                dest_class_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            )
+            self.value_type_of(dest_class_ty)
         };
         // A typed `Ref(Some(root))` already carries the intern key
         // (`tyref_to_value_type` paints a payload-carrying enum this way).
@@ -3171,15 +3165,7 @@ impl<'a> Lowering<'a> {
                     let elem_tyref = self.slice_swap_elem_tyref(&reg);
                     let elem_ty = elem_tyref
                         .as_ref()
-                        .map(|ty| {
-                            tyref_to_value_type_with(
-                                ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            )
-                        })
+                        .map(|ty| self.value_type_of(ty))
                         .unwrap_or(ValueType::Ref(None));
                     let elem_array_type_id = elem_tyref
                         .as_ref()
@@ -3493,15 +3479,7 @@ impl<'a> Lowering<'a> {
                     // stamped CCHARP (`ann_cast_int_to_ptr`). An i64
                     // aliased onto that RawPtr (`alloc_utf8_payload`)
                     // stays the identity alias.
-                    let src_kind = first_arg_ty.as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
+                    let src_kind = first_arg_ty.as_ref().map(|ty| self.value_type_of(ty));
                     let src_root = first_arg_ty.as_ref().and_then(|ty| {
                         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
                     });
@@ -3551,13 +3529,7 @@ impl<'a> Lowering<'a> {
                     // the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
-                    let dest_kind = tyref_to_value_type_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    );
+                    let dest_kind = self.value_type_of(&call.dest.ty);
                     let dest_is_ref = matches!(dest_kind, ValueType::Ref(_));
                     // Dest rstr `STR` (`is_rstr_str_layout_declaration`).
                     // Aliasing keeps the source annotation (GCREF or the
@@ -3570,15 +3542,7 @@ impl<'a> Lowering<'a> {
                     // `emit_cast_int_to_strptr`).
                     let dest_is_str = matches!(dest_kind, ValueType::Str)
                         || tyref_raw_ptr_pointee_is_string_value(&call.dest.ty, self.llbc);
-                    let src_kind = first_arg_ty.as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
+                    let src_kind = first_arg_ty.as_ref().map(|ty| self.value_type_of(ty));
                     let src_root = first_arg_ty.as_ref().and_then(|ty| {
                         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
                     });
@@ -4311,22 +4275,8 @@ impl<'a> Lowering<'a> {
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
                     let path = fd.item_meta.name_path();
-                    let src = first_arg_ty.as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
-                    let dst = tyref_to_value_type_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    );
+                    let src = first_arg_ty.as_ref().map(|ty| self.value_type_of(ty));
+                    let dst = self.value_type_of(&call.dest.ty);
                     if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
                         return self.emit_float_bytes_llop(
                             mir_bb,
@@ -4443,13 +4393,7 @@ impl<'a> Lowering<'a> {
                     let path = fd.item_meta.name_path();
                     match host_rthread_threadlocalref_llop(&path) {
                         Some(ThreadLocalRefLlop::Get) if self.var_is_const_int(&args[0]) => {
-                            let result_ty = tyref_to_value_type_with(
-                                &call.dest.ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            );
+                            let result_ty = self.value_type_of(&call.dest.ty);
                             return self.emit_threadlocalref_get(
                                 mir_bb,
                                 dest_local,
@@ -5305,16 +5249,7 @@ impl<'a> Lowering<'a> {
                     // `ll_set_length` is void. Bind a unit dest only when
                     // the MIR dest is `()`; a dest typed as the header is
                     // the same pointer `l.length = n` leaves unchanged.
-                    let dest_is_void = matches!(
-                        tyref_to_value_type_with(
-                            &call.dest.ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
-                        ValueType::Void
-                    );
+                    let dest_is_void = matches!(self.value_type_of(&call.dest.ty), ValueType::Void);
                     self.local_var[dest_local] = Some(LocalValue::One(if dest_is_void {
                         self.emit_unit(bb_id)
                     } else {
@@ -5665,15 +5600,7 @@ impl<'a> Lowering<'a> {
                         let zero = self.emit_const_uint(mir_bb, 0);
                         let count_from = third_arg_ty
                             .as_ref()
-                            .map(|ty| {
-                                tyref_to_value_type_with(
-                                    ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                    self.gc_struct_ids,
-                                    &self.raw_alloc_flavor_structs,
-                                )
-                            })
+                            .map(|ty| self.value_type_of(ty))
                             .unwrap_or(ValueType::Unsigned);
                         let count = self.retype_word(
                             mir_bb,
@@ -6371,13 +6298,7 @@ impl<'a> Lowering<'a> {
                         || self.callee_template_is(&reg, "alloc::string::<Impl>::to_string"))
                     && first_arg_ty.as_ref().is_some_and(|ty| {
                         matches!(
-                            tyref_to_value_type_with(
-                                ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ),
+                            self.value_type_of(ty),
                             ValueType::Str
                                 | ValueType::Int
                                 | ValueType::Unsigned
@@ -7360,16 +7281,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && second_arg_ty.as_ref().is_some_and(|t| {
-                matches!(
-                    tyref_to_value_type_with(
-                        t,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs
-                    ),
-                    ValueType::Int | ValueType::Unsigned
-                )
+                matches!(self.value_type_of(t), ValueType::Int | ValueType::Unsigned)
             })
             && let Some(residual) = match target {
                 CallTarget::FunctionPath { segments, .. } => {
@@ -7762,15 +7674,9 @@ impl<'a> Lowering<'a> {
                     first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-                        && second_arg_ty.as_ref().is_some_and(|ty| {
-                            tyref_to_value_type_with(
-                                ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ) == ValueType::Int
-                        })
+                        && second_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| self.value_type_of(ty) == ValueType::Int)
                 }
                 Some(
                     "bigint_lshift_int_int_result"
@@ -7778,23 +7684,12 @@ impl<'a> Lowering<'a> {
                     | "bigint_sub_int_int"
                     | "bigint_mul_int_int",
                 ) => {
-                    first_arg_ty.as_ref().is_some_and(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ) == ValueType::Int
-                    }) && second_arg_ty.as_ref().is_some_and(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ) == ValueType::Int
-                    })
+                    first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| self.value_type_of(ty) == ValueType::Int)
+                        && second_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| self.value_type_of(ty) == ValueType::Int)
                 }
                 _ => false,
             }
@@ -8142,15 +8037,7 @@ impl<'a> Lowering<'a> {
                         iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
-                .map(|ty| {
-                    tyref_to_value_type_with(
-                        &ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    )
-                })
+                .map(|ty| self.value_type_of(&ty))
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
         }
@@ -8210,13 +8097,7 @@ impl<'a> Lowering<'a> {
                 let item_tyref = self
                     .tyref_adt_type_arg(&iter_ty, 0)
                     .unwrap_or_else(|| clone_tyref(&iter_ty));
-                let payload_ty = tyref_to_value_type_with(
-                    &item_tyref,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                );
+                let payload_ty = self.value_type_of(&item_tyref);
                 let payload_class_root = enum_payload_instance_class_root(
                     &item_tyref,
                     self.llbc,
@@ -8226,13 +8107,7 @@ impl<'a> Lowering<'a> {
                 let elem_tyref = self
                     .tyref_adt_type_arg(&call.dest.ty, 0)
                     .unwrap_or_else(|| clone_tyref(&call.dest.ty));
-                let call_result_ty = tyref_to_value_type_with(
-                    &elem_tyref,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                );
+                let call_result_ty = self.value_type_of(&elem_tyref);
                 self.map_collect_sites
                     .push(crate::front::iter_adapter::MapCollectSite {
                         result_var: result_var.clone(),
@@ -8310,13 +8185,7 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .and_then(|ty| adt_path_of_tyref(ty, self.llbc));
         let identity_dest = adt_path_of_tyref(&call.dest.ty, self.llbc);
-        let identity_dest_ty = tyref_to_value_type_with(
-            &call.dest.ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let identity_dest_ty = self.value_type_of(&call.dest.ty);
         let dest_is_bool = matches!(identity_dest_ty, ValueType::Bool);
         // A borrow carries no representation of its own here -- `Rvalue::Ref`
         // aliases the place's Variable -- so the receiver's bank is the
@@ -8326,20 +8195,8 @@ impl<'a> Lowering<'a> {
         // member is a load, not an alias.
         let identity_banks_agree = first_arg_ty.as_ref().is_some_and(|ty| {
             let recv_ty = match self.tyref_peel_ref_to_pointee(ty) {
-                Some(pointee) => tyref_to_value_type_with(
-                    &pointee,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ),
-                None => tyref_to_value_type_with(
-                    ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ),
+                Some(pointee) => self.value_type_of(&pointee),
+                None => self.value_type_of(ty),
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });

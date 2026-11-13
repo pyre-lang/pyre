@@ -203,13 +203,7 @@ impl<'a> Lowering<'a> {
         let field = FieldDescriptor::new(field_name, Some(owner_root))
             .with_owner_id(owner_id)
             .with_base_is_deref(true);
-        let ty = tyref_to_value_type_with(
-            &field_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let ty = self.value_type_of(&field_ty);
         Some((field, ty))
     }
 
@@ -451,13 +445,7 @@ impl<'a> Lowering<'a> {
         // poolable `ConstPtr`, so they fall through to the materialised
         // path.
         match (
-            tyref_to_value_type_with(
-                dest_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
+            self.value_type_of(dest_ty),
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
@@ -653,32 +641,21 @@ impl<'a> Lowering<'a> {
             let value = value.as_variable().cloned().ok_or_else(|| {
                 LowerError::Schema(format!("bb{mir_bb}: pair slice item write of a constant"))
             })?;
-            let value_ty = tyref_to_value_type_with(
-                dest_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            );
+            let value_ty = self.value_type_of(dest_ty);
             return self.pair_setitem(mir_bb, seq, &index_payload.clone(), value, &value_ty);
         }
         if let Some((owner, flat_name, owner_id)) = self.flatten_list_storage_field(&inner, &elem) {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
             let bb_id = self.emit_bb(mir_bb);
+            let ty = self.value_type_of(dest_ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base,
                     field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
-                    ty: tyref_to_value_type_with(
-                        dest_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ),
+                    ty,
                 },
             });
             return Ok(());
@@ -1184,15 +1161,7 @@ impl<'a> Lowering<'a> {
                                         owner_declared_gc,
                                         self.llbc,
                                     )
-                                    .unwrap_or_else(|| {
-                                        tyref_to_value_type_with(
-                                            &field_dest_ty,
-                                            self.llbc,
-                                            self.tombstoned_leaves,
-                                            self.gc_struct_ids,
-                                            &self.raw_alloc_flavor_structs,
-                                        )
-                                    }),
+                                    .unwrap_or_else(|| self.value_type_of(&field_dest_ty)),
                                 );
                             let ty = if store_rstr_attr {
                                 ValueType::Str
@@ -1301,13 +1270,7 @@ impl<'a> Lowering<'a> {
                     let item_ty = if stored_is_pointer_word {
                         ValueType::Ref(None)
                     } else {
-                        tyref_to_value_type_with(
-                            dest_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
+                        self.value_type_of(dest_ty)
                     };
                     OpKind::ArrayWrite {
                         base,
@@ -1563,13 +1526,7 @@ impl<'a> Lowering<'a> {
                 .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
             (name == field_name).then_some(f)
         })?;
-        Some(tyref_to_value_type_with(
-            &field.ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        ))
+        Some(self.value_type_of(&field.ty))
     }
 
     /// Rust field type-check is the proof needed to narrow that producer
@@ -2015,16 +1972,8 @@ impl<'a> Lowering<'a> {
                 // type before choosing the annotation shell: in particular,
                 // a `usize` subtraction is an unsigned/non-negative value by
                 // type, even though its MIR destination is a tuple.
-                let scalar_ty =
-                    tyref_checked_binop_value_type(dest_ty, self.llbc).unwrap_or_else(|| {
-                        tyref_to_value_type_with(
-                            dest_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
+                let scalar_ty = tyref_checked_binop_value_type(dest_ty, self.llbc)
+                    .unwrap_or_else(|| self.value_type_of(dest_ty));
                 let result_ty = match scalar_ty {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
@@ -2265,13 +2214,7 @@ impl<'a> Lowering<'a> {
                         }
                         Operand::Const(_) => None,
                     };
-                    let dst_kind = tyref_to_value_type_with(
-                        dest_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    );
+                    let dst_kind = self.value_type_of(dest_ty);
                     // Dest-Str restore (`op_gc_restore_root` /
                     // `GCRefRepr.convert_from_to`) before a bank-crossing
                     // `cast_int_to_ptr` of immortal `*mut u8` onto STR
@@ -2795,13 +2738,7 @@ impl<'a> Lowering<'a> {
                 // The latter match RPython's LONG_TYPE/ULONG_TYPE carrier
                 // through annotation/rtyping even though the JIT codewriter
                 // deliberately has no 128-bit register kind.
-                let result_ty = match tyref_to_value_type_with(
-                    dest_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ) {
+                let result_ty = match self.value_type_of(dest_ty) {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
                     ValueType::Int128 => ValueType::Int128,
@@ -3021,16 +2958,8 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok((None, self.emit_gc_ref_as_ccharp(mir_bb, v)));
                 }
-                let dest_is_str = matches!(
-                    tyref_to_value_type_with(
-                        &ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ),
-                    ValueType::Str
-                ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
+                let dest_is_str = matches!(self.value_type_of(&ty), ValueType::Str)
+                    || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
                     || self.dest_ty_is_rstr_str(&ty);
                 let dest_is_gcref = tyref_is_gcref_spelling(&ty, self.llbc);
                 if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str || dest_is_gcref)
@@ -3063,13 +2992,7 @@ impl<'a> Lowering<'a> {
                 // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
                 // the int and ref banks. Aliasing would reuse one variable in
                 // both argument lists.
-                let dst_kind = tyref_to_value_type_with(
-                    &ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                );
+                let dst_kind = self.value_type_of(&ty);
                 let dest_raw_addr = ty_is_raw_address(
                     &ty,
                     self.llbc,
@@ -4399,13 +4322,7 @@ impl<'a> Lowering<'a> {
                         return Some(raw);
                     }
                 }
-                Some(tyref_to_value_type_with(
-                    &place.ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ))
+                Some(self.value_type_of(&place.ty))
             }
             Operand::Const(_) => None,
         }
@@ -4894,13 +4811,7 @@ impl<'a> Lowering<'a> {
         src_is_pointer: bool,
         src_ty: Option<&TyRef>,
     ) -> Option<(OpKind, Variable)> {
-        let dest_kind = tyref_to_value_type_with(
-            dest_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let dest_kind = self.value_type_of(dest_ty);
         // Dest-Str restore first: GCREF / FieldRead Str / immortal
         // `*mut u8` → rstr `STR` (`op_gc_restore_root` /
         // `GCRefRepr.convert_from_to`). Dest layout is rstr `STR`
@@ -5100,16 +5011,7 @@ impl<'a> Lowering<'a> {
         {
             return false;
         }
-        matches!(
-            tyref_to_value_type_with(
-                ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs
-            ),
-            ValueType::Int | ValueType::Int128
-        )
+        matches!(self.value_type_of(ty), ValueType::Int | ValueType::Int128)
     }
 
     /// `*mut Raw as usize`. The word stays in the int bank; `r_uint` changes
@@ -5299,13 +5201,7 @@ impl<'a> Lowering<'a> {
             return false;
         }
         matches!(
-            tyref_to_value_type_with(
-                ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs
-            ),
+            self.value_type_of(ty),
             ValueType::Unsigned | ValueType::UInt128
         )
     }
@@ -6218,13 +6114,7 @@ impl<'a> Lowering<'a> {
                     ))
                 })?
             } else {
-                tyref_to_value_type_with(
-                    &place_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                )
+                self.value_type_of(&place_ty)
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
             let zero = self.emit_const_uint(mir_bb, 0);
@@ -6257,16 +6147,7 @@ impl<'a> Lowering<'a> {
             } else {
                 offset
             };
-            let item_ty = self.with_item_class_root(
-                tyref_to_value_type_with(
-                    &place_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ),
-                &place_ty,
-            );
+            let item_ty = self.with_item_class_root(self.value_type_of(&place_ty), &place_ty);
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -6282,16 +6163,7 @@ impl<'a> Lowering<'a> {
             && let Some(index_payload) = v.get("Index")
             && let Some(seq) = self.item_seq_of_place(inner)
         {
-            let item_ty = self.with_item_class_root(
-                tyref_to_value_type_with(
-                    &place_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ),
-                &place_ty,
-            );
+            let item_ty = self.with_item_class_root(self.value_type_of(&place_ty), &place_ty);
             return self.pair_getitem(mir_bb, seq, &index_payload.clone(), &item_ty);
         }
         match place.kind {
@@ -6345,16 +6217,7 @@ impl<'a> Lowering<'a> {
                     && self.tyref_is_niche_option_ptr(&place_ty) =>
             {
                 let addr = self.item_addr_var(mir_bb, i as usize)?;
-                let value_ty = self.with_item_class_root(
-                    tyref_to_value_type_with(
-                        &place_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ),
-                    &place_ty,
-                );
+                let value_ty = self.with_item_class_root(self.value_type_of(&place_ty), &place_ty);
                 let helper_ty = Self::pair_helper_item_ty(majit_ir::rvec::VecItemKind::Ref);
                 let null = self.push_niche_null_ptr(mir_bb, &place_ty);
                 let null = self.retype_word(mir_bb, null, &value_ty, &helper_ty);
@@ -6790,13 +6653,7 @@ impl<'a> Lowering<'a> {
                         let list_place = peel_nested_storage_place(clone_place(&inner));
                         let base = self.resolve_place(mir_bb, list_place)?;
                         let bb_id = self.emit_bb(mir_bb);
-                        let ty = tyref_to_value_type_with(
-                            &place_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        );
+                        let ty = self.value_type_of(&place_ty);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7213,13 +7070,7 @@ impl<'a> Lowering<'a> {
                             } else if element_is_pointer_word {
                                 ValueType::Ref(None)
                             } else {
-                                tyref_to_value_type_with(
-                                    &place_ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                    self.gc_struct_ids,
-                                    &self.raw_alloc_flavor_structs,
-                                )
+                                self.value_type_of(&place_ty)
                             },
                             gckind: crate::front::typestr::gckind_from_array_type_id(
                                 array_type_id.as_deref(),
@@ -7959,13 +7810,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::function_path(segments),
                         args: crate::model::call_args(vec![]),
-                        result_ty: tyref_to_value_type_with(
-                            &place_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
+                        result_ty: self.value_type_of(&place_ty),
                     }
                 });
                 let res = self

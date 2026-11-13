@@ -9255,6 +9255,9 @@ struct LazyGraphCell {
     /// Declared with no graph (`rffi.llexternal`), as opposed to a
     /// `build` that ran and produced none.
     external: bool,
+    /// Set when the built graph was handed to this cell's only handle by
+    /// [`LazyGraph::build_for_sole_handle`] instead of being kept here.
+    moved_out: std::cell::Cell<bool>,
 }
 
 impl LazyGraph {
@@ -9265,6 +9268,7 @@ impl LazyGraph {
             build: std::cell::Cell::new(None),
             header: None,
             external: false,
+            moved_out: std::cell::Cell::new(false),
         }))
     }
 
@@ -9280,6 +9284,7 @@ impl LazyGraph {
             build: std::cell::Cell::new(Some(Box::new(build))),
             header: Some(header.into()),
             external: false,
+            moved_out: std::cell::Cell::new(false),
         }))
     }
 
@@ -9291,6 +9296,7 @@ impl LazyGraph {
             build: std::cell::Cell::new(None),
             header: Some(header.into()),
             external: true,
+            moved_out: std::cell::Cell::new(false),
         }))
     }
 
@@ -9324,14 +9330,44 @@ impl LazyGraph {
     /// The graph, built on the first call.
     pub fn get(&self) -> Option<&std::rc::Rc<FunctionGraph>> {
         let cell = &*self.0;
+        assert!(
+            !cell.moved_out.get(),
+            "LazyGraph::get after the graph was moved to its only handle's owner"
+        );
         cell.graph
             .get_or_init(|| cell.build.take()?().map(std::rc::Rc::new))
             .as_ref()
     }
 
+    /// The graph by value, for the one handle of a cell whose graph is not built yet: runs the
+    /// build and hands the graph over instead of keeping it, so the caller owns the only copy.
+    /// `None` when another handle shares the cell, when the graph was already built or moved out,
+    /// or when the build produced no graph — that outcome is recorded as [`Self::get`] records it,
+    /// so [`Self::is_graphless`] answers `true` afterwards.
+    pub fn build_for_sole_handle(&self) -> Option<FunctionGraph> {
+        let cell = &*self.0;
+        if std::rc::Rc::strong_count(&self.0) != 1
+            || std::rc::Rc::weak_count(&self.0) != 0
+            || cell.moved_out.get()
+            || cell.graph.get().is_some()
+        {
+            return None;
+        }
+        match cell.build.take().and_then(|build| build()) {
+            Some(graph) => {
+                cell.moved_out.set(true);
+                Some(graph)
+            }
+            None => {
+                let _ = cell.graph.set(None);
+                None
+            }
+        }
+    }
+
     /// Whether the graph has been built (or found absent) already.
     pub fn is_built(&self) -> bool {
-        self.0.graph.get().is_some()
+        self.0.moved_out.get() || self.0.graph.get().is_some()
     }
 
     /// The graph for writing. A graph another holder shares is copied
@@ -9344,6 +9380,10 @@ impl LazyGraph {
             };
         }
         let cell = std::rc::Rc::get_mut(&mut self.0).expect("unshared handle");
+        assert!(
+            !cell.moved_out.get(),
+            "LazyGraph::get after the graph was moved to its only handle's owner"
+        );
         if cell.graph.get().is_none() {
             let built = cell
                 .build
@@ -9363,6 +9403,9 @@ impl LazyGraph {
 
 impl fmt::Debug for LazyGraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.moved_out.get() {
+            return f.write_str("LazyGraph(<moved out>)");
+        }
         match self.0.graph.get() {
             Some(Some(graph)) => graph.fmt(f),
             Some(None) => f.write_str("LazyGraph(<no graph>)"),
@@ -24583,5 +24626,42 @@ mod tests {
             }
             other => panic!("expected null_mut call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lazy_graph_sole_handle_gets_the_built_graph_by_value() {
+        let lazy = LazyGraph::deferred(FunctionGraph::new("header"), || {
+            Some(FunctionGraph::new("built"))
+        });
+        let graph = lazy.build_for_sole_handle();
+        assert_eq!(graph.as_ref().map(|g| g.name.as_str()), Some("built"));
+        assert!(lazy.is_built());
+        assert!(!lazy.is_graphless());
+        assert_eq!(lazy.header().name, "header");
+        assert!(lazy.build_for_sole_handle().is_none());
+    }
+
+    #[test]
+    fn lazy_graph_shared_handle_keeps_the_built_graph() {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = ran.clone();
+        let lazy = LazyGraph::deferred(FunctionGraph::new("header"), move || {
+            flag.set(true);
+            Some(FunctionGraph::new("built"))
+        });
+        let other = lazy.clone();
+        assert!(lazy.build_for_sole_handle().is_none());
+        assert!(!ran.get(), "shared handle must not run the build");
+        let g1 = lazy.get().expect("graph");
+        let g2 = other.get().expect("graph");
+        assert_eq!(g1.name, "built");
+        assert!(std::rc::Rc::ptr_eq(g1, g2));
+    }
+
+    #[test]
+    fn lazy_graph_sole_handle_records_a_build_without_graph() {
+        let lazy = LazyGraph::deferred(FunctionGraph::new("header"), || None);
+        assert!(lazy.build_for_sole_handle().is_none());
+        assert!(lazy.is_graphless());
     }
 }

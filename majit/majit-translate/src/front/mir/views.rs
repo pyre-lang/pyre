@@ -985,13 +985,7 @@ impl<'a> Lowering<'a> {
         }
         let ty = ty?;
         raw_ptr_one_word_item_kind(ty, self.llbc)?;
-        let from = tyref_to_value_type_with(
-            ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let from = self.value_type_of(ty);
         Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
     }
 
@@ -1128,13 +1122,7 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: const struct field {index} out of range"
             )));
         };
-        let ty = tyref_to_value_type_with(
-            place_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
+        let ty = self.value_type_of(place_ty);
         let kind = match ty {
             ValueType::Unsigned => OpKind::ConstUInt(bits),
             ValueType::Int => {
@@ -1642,15 +1630,7 @@ impl<'a> Lowering<'a> {
             unreachable!("raw array storage local");
         };
         let item_ty = tyref_raw_array_parts(&self.body.locals.locals[storage].ty, self.llbc)
-            .map(|(item, _)| {
-                tyref_to_value_type_with(
-                    &TyRef::Other(item.clone()),
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                )
-            })
+            .map(|(item, _)| self.value_type_of(&TyRef::Other(item.clone())))
             .expect("raw array local has an array type");
         let ptr = self.local_var[storage]
             .as_ref()
@@ -1848,16 +1828,7 @@ impl<'a> Lowering<'a> {
         PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
             (
                 kind,
-                self.with_item_class_root(
-                    tyref_to_value_type_with(
-                        &pointee,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ),
-                    &pointee,
-                ),
+                self.with_item_class_root(self.value_type_of(&pointee), &pointee),
             )
         })
     }
@@ -2003,16 +1974,7 @@ impl<'a> Lowering<'a> {
         };
         let name = regular_call_name_path(reg, self.llbc).unwrap_or_default();
         let addr = self.item_addr_var(mir_bb, opt)?;
-        let dest_ty = self.with_item_class_root(
-            tyref_to_value_type_with(
-                &call.dest.ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
-            &call.dest.ty,
-        );
+        let dest_ty = self.with_item_class_root(self.value_type_of(&call.dest.ty), &call.dest.ty);
         let (result, keep_addr) = match name.as_str() {
             "core::option::<Impl>::copied" | "core::option::<Impl>::cloned" if by_ref => {
                 (addr, true)
@@ -2740,15 +2702,7 @@ impl<'a> Lowering<'a> {
                     )?
                 }
                 _ if is_slice_from_ref_name(&name) && args.len() == 1 => {
-                    let ptr_ty = arg_tys[0].as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
+                    let ptr_ty = arg_tys[0].as_ref().map(|ty| self.value_type_of(ty));
                     let ptr = match ptr_ty {
                         Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
                             self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
@@ -2772,15 +2726,7 @@ impl<'a> Lowering<'a> {
                     "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut",
                     _,
                 ) if args.len() == 2 => {
-                    let ptr_ty = arg_tys[0].as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    });
+                    let ptr_ty = arg_tys[0].as_ref().map(|ty| self.value_type_of(ty));
                     let ptr = match ptr_ty {
                         Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
                             self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
@@ -2909,19 +2855,14 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let result_ty = self.value_type_of(&dest_ty);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::BinOp {
                             op: "eq".to_string(),
                             lhs: len,
                             rhs: zero,
-                            result_ty: tyref_to_value_type_with(
-                                &dest_ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ),
+                            result_ty,
                         },
                     });
                     res
@@ -3027,13 +2968,7 @@ impl<'a> Lowering<'a> {
                         mir_bb,
                         majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Contains, kind),
                         vec![args[0].clone(), len, item],
-                        tyref_to_value_type_with(
-                            &dest_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
+                        self.value_type_of(&dest_ty),
                     )
                 }
                 "alloc::slice::<Impl>::to_vec" => {
@@ -3043,13 +2978,7 @@ impl<'a> Lowering<'a> {
                         mir_bb,
                         majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ToVec, kind),
                         vec![args[0].clone(), len],
-                        tyref_to_value_type_with(
-                            &dest_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
+                        self.value_type_of(&dest_ty),
                     )
                 }
                 "core::slice::<Impl>::first"

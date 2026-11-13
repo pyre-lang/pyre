@@ -2344,11 +2344,14 @@ fn analyze_pipeline_from_module_paths(
             );
         }
     }
+    // releases the LazyGraph handles: a slot that holds the only handle builds without a second copy
+    drop(free_function_graphs);
     pin_builtin_graphs(
         &canonical_function_graphs,
         &config.pipeline.builtin_graphs,
         &mut call_control,
     );
+    drop(canonical_function_graphs);
     // The registration loop below prefers the graph from
     // `mir_graph_lookup` over the one already carried in
     // `canonical_trait_impls` / `canonical_inherent_methods`.  Both
@@ -2524,6 +2527,7 @@ fn analyze_pipeline_from_module_paths(
             default_trait_methods.insert((impl_info.trait_name.clone(), method.name.clone()));
         }
     }
+    drop(canonical_trait_impls);
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     for (trait_leaf, _, method_name, _, _, _, _) in &concrete_trait_methods {
@@ -2671,6 +2675,7 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    drop(concrete_trait_methods);
     // RPython: direct_call → funcobj.graph — inherent methods are resolved
     // by direct graph linkage, not name-based trait method lookup.
     // Register only in function_graphs under qualified path (Type::method).
@@ -2727,6 +2732,8 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    drop(canonical_inherent_methods);
+    drop(mir_graph_lookup);
     prof.mark("  concrete-trait + inherent method registration");
     // `warmspot.py check_access_directly_sanity`: every spelling of one
     // trait-impl funcobj shares one GraphKey (`bookkeeper.py
@@ -2865,6 +2872,8 @@ fn analyze_pipeline_from_module_paths(
     // Decorator attrs live on the funcobj either way (`call.py`
     // `guess_call_kind` / `getcalldescr`).
     apply_harvested_funcobj_hints(&mut call_control, &program.harvested_hints);
+    let function_count = program.functions.len();
+    drop(std::mem::take(&mut program.functions));
 
     // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
     // portal and its green/red layout. Portal binding and graph discovery
@@ -3119,7 +3128,7 @@ fn analyze_pipeline_from_module_paths(
              {} lowered functions (program.functions), \
              {} registered graphs (function_graphs)",
             call_control.candidate_graph_count(),
-            program.functions.len(),
+            function_count,
             call_control.function_graphs().len(),
         )
     });

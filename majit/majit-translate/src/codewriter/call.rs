@@ -2888,15 +2888,18 @@ impl StoreCore {
             .get_or_init(|| {
                 let source = slot.source.as_ref()?;
                 slot.building.set(true);
-                let built = source.graph.get().map(|graph| {
-                    let mut graph = FunctionGraph::clone(graph);
-                    source.transform.apply(&mut graph);
-                    slot.attrs.apply(&mut graph);
-                    for pass in &self.passes[slot.since..] {
-                        self.apply_pass(pass, &mut graph);
-                    }
-                    graph
-                });
+                let built = source
+                    .graph
+                    .build_for_sole_handle()
+                    .or_else(|| source.graph.get().map(|graph| FunctionGraph::clone(graph)))
+                    .map(|mut graph| {
+                        source.transform.apply(&mut graph);
+                        slot.attrs.apply(&mut graph);
+                        for pass in &self.passes[slot.since..] {
+                            self.apply_pass(pass, &mut graph);
+                        }
+                        graph
+                    });
                 slot.building.set(false);
                 built.map(|graph| BuiltGraph {
                     signature: Self::signature_from_graph(&graph),

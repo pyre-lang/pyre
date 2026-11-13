@@ -57,18 +57,13 @@ impl<'a> Lowering<'a> {
         // Owner-qualified associated-function spelling
         // `unspecialized_fun_segments` emits for `RangeInclusive::new`
         // (`ops::range::RangeInclusive::new`).
+        let result_ty = self.value_type_of(place_ty);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
                 target: CallTarget::function_path(["ops", "range", "RangeInclusive", "new"]),
                 args: crate::model::call_args(vec![lo_v.clone(), hi_v.clone()]),
-                result_ty: tyref_to_value_type_with(
-                    place_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                ),
+                result_ty,
             },
         });
         res

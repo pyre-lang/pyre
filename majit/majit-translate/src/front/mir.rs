@@ -2118,6 +2118,8 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `tyref_to_value_type_with` results for this crate's sets, indexed by hash-cons type id.
+    value_type_by_id: std::cell::RefCell<Vec<Option<crate::model::ValueType>>>,
     /// This artefact's own `_exception_class_<Enum>` markers, cloned from
     /// the seeded program-wide set. Bodies do not read them. `finish`
     /// copies the vec; earlier crates stay out so
@@ -2416,6 +2418,7 @@ impl CrateLoweringState {
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
             raw_alloc_flavor_structs,
+            value_type_by_id: std::cell::RefCell::new(Vec::new()),
             exception_class_hints,
             immutable_fields,
             dont_look_inside,
@@ -2784,6 +2787,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            value_type_by_id,
             dont_look_inside,
             oopspec_fns,
             spec,
@@ -2836,6 +2840,7 @@ impl<'l> CrateLowering<'l> {
             Some(spec),
             false,
             None,
+            Some(value_type_by_id),
         ) {
             Ok(g) => g,
             Err(error) => {
@@ -3045,6 +3050,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            value_type_by_id,
             dont_look_inside,
             oopspec_fns,
             spec: spec_queue,
@@ -3084,6 +3090,7 @@ impl<'l> CrateLowering<'l> {
             Some(spec_queue),
             true,
             Some(spec.segments.join("::")),
+            Some(value_type_by_id),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -7400,6 +7407,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -7791,6 +7799,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
     graph_name: Option<String>,
+    value_type_by_id: Option<&std::cell::RefCell<Vec<Option<ValueType>>>>,
 ) -> Result<FunctionGraph, LowerError> {
     // A clause specialization's readable name (`RDict::new__spec_…`) is
     // known to the caller. The body is still the template `FunDecl`, so
@@ -8696,6 +8705,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             self_dont_look_inside,
             keep_zst_self,
             program_oopspec,
+            value_type_by_id,
         )?;
         lo.struct_fields = Some(struct_fields);
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -8756,6 +8766,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         self_dont_look_inside,
         keep_zst_self,
         program_oopspec,
+        value_type_by_id,
     )?;
     lo.struct_fields = Some(struct_fields);
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -8802,6 +8813,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 self_dont_look_inside,
                 keep_zst_self,
                 program_oopspec,
+                value_type_by_id,
             )?;
             lo.struct_fields = Some(struct_fields);
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();

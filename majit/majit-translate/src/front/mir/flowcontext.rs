@@ -156,6 +156,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Gc structs and enums for this lowering. Absence is Raw.
     pub(in crate::front::mir) gc_struct_ids:
         &'a std::collections::HashSet<majit_ir::descr::StructId>,
+    /// `tyref_to_value_type_with` results for this crate's sets, indexed by hash-cons type id.
+    pub(in crate::front::mir) value_type_by_id:
+        Option<&'a std::cell::RefCell<Vec<Option<ValueType>>>>,
     /// `_immutable_fields_` harvested once for this artefact.
     pub(in crate::front::mir) immutable_fields: &'a ImmutableFieldsTable,
     pub(in crate::front::mir) body: &'a Unstructured,
@@ -1404,6 +1407,7 @@ impl<'a> Lowering<'a> {
             self_dont_look_inside,
             keep_zst_self,
             empty_program_oopspec(),
+            None,
         )
     }
 
@@ -1424,6 +1428,7 @@ impl<'a> Lowering<'a> {
         self_dont_look_inside: bool,
         keep_zst_self: bool,
         program_oopspec: &'a std::collections::HashSet<String>,
+        value_type_by_id: Option<&'a std::cell::RefCell<Vec<Option<ValueType>>>>,
     ) -> Result<Self, LowerError> {
         let gc_mut_ref_params = gc_mut_ref_param_locals(
             &body.locals,
@@ -2046,6 +2051,7 @@ impl<'a> Lowering<'a> {
             oopspec_fns,
             tombstoned_leaves,
             gc_struct_ids,
+            value_type_by_id,
             immutable_fields,
             body,
             static_addrs,
@@ -2181,6 +2187,36 @@ impl<'a> Lowering<'a> {
             owner_root_reroot: None,
             pending_vec_frees: Vec::new(),
         })
+    }
+
+    /// `tyref_to_value_type_with` over this lowering's sets, memoised per hash-cons id.
+    pub(in crate::front::mir) fn value_type_of(&self, ty: &TyRef) -> ValueType {
+        let id = match ty {
+            TyRef::Dedup { id } => Some(*id as usize),
+            TyRef::Inline { value: (id, _) } => Some(*id as usize),
+            TyRef::Other(_) => None,
+        };
+        if let (Some(cache), Some(id)) = (self.value_type_by_id, id) {
+            let hit = cache.borrow().get(id).cloned().flatten();
+            if let Some(cached) = hit {
+                return cached;
+            }
+        }
+        let value = tyref_to_value_type_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        if let (Some(cache), Some(id)) = (self.value_type_by_id, id) {
+            let mut cache = cache.borrow_mut();
+            if id >= cache.len() {
+                cache.resize(id + 1, None);
+            }
+            cache[id] = Some(value.clone());
+        }
+        value
     }
 
     /// Switch this lowering to builder form so the ctor / append /
