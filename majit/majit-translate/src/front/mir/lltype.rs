@@ -6622,11 +6622,12 @@ pub(in crate::front::mir) fn wtf8_string_identity_segments(segments: &[String]) 
 /// `Cow<str-family>` (`unicodehelper.py str_decode_utf8` returns a
 /// plain str; the Cow ADT is that rstr).
 ///
-/// `as_str` / `as_ref` / `as_bytes` / `to_string` / `deref` are identity
-/// on either spelling (`rstr.py` has one string type). A rust-heap
-/// `String` still paints `ValueType::Ref` so `ll_strconcat` does not
-/// consume a `{cap, ptr, len}` header. `Cow<str>` paints `ValueType::Str`
-/// ([`tyref_is_cow_str`]).
+/// `as_bytes` / `to_string` are identity on either spelling (`rstr.py`
+/// has one string type). `as_str` / `as_ref` / `deref` of an already-STR
+/// word are identity; of a rust-heap header they are `Repr.rtype_str`.
+/// A rust-heap `String` still paints `ValueType::Ref` so `ll_strconcat`
+/// does not consume a `{cap, ptr, len}` header. `Cow<str>` paints
+/// `ValueType::Str` ([`tyref_is_cow_str`]).
 pub(in crate::front::mir) fn tyref_is_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_string_value(ty, llbc)
         || tyref_is_rust_heap_string(ty, llbc)

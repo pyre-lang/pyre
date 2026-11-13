@@ -6571,6 +6571,44 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// Interior pointer to `items[i]` of a host rust-heap `String` array.
+    ///
+    /// `n` is an unscaled item count (`ann_direct_ptradd`). Recast the
+    /// address into the Ref bank: `UnaryOp str` of an Int operand is
+    /// `IntegerRepr.rtype_str` (`ll_int2dec`), not `Repr.rtype_str` of
+    /// the `{ptr, cap, len}` header.
+    pub(in crate::front::mir) fn emit_rust_heap_string_interior_ptr(
+        &mut self,
+        bb_id: BlockId,
+        data: Variable,
+        index: Variable,
+        place_ty: &TyRef,
+    ) -> Variable {
+        let item = item_lltype_for_size(3 * crate::layout::target_word_size() as i64);
+        let addr = push_direct_ptradd(&mut self.graph, bb_id, data, index, &item);
+        let root = tyref_class_root_with(place_ty, self.llbc, self.tombstoned_leaves)
+            .filter(|root| is_rust_heap_string_root(root))
+            .unwrap_or_else(|| "String".to_string());
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "cast_int_to_ptr",
+                ]),
+                args: crate::model::call_args(vec![addr]),
+                result_ty: ValueType::Ref(Some(root)),
+            },
+        });
+        res
+    }
+
     pub(in crate::front::mir) fn resolve_place(
         &mut self,
         mir_bb: usize,
@@ -7673,6 +7711,22 @@ impl<'a> Lowering<'a> {
                     } else {
                         base
                     };
+                    // Host `Box<[String]>` / `&[String]` items are three-word
+                    // `{ptr, cap, len}` headers. `ArrayRead` loads one word
+                    // (`get_type_flag("String")` is FLAG_POINTER), which is
+                    // the UTF-8 data pointer. `rptr.py` InteriorPtrRepr of
+                    // an array of structs is `direct_ptradd` by
+                    // `sizeof(item)`; `Repr.rtype_str` then copies that
+                    // header so a residual `&str` trampoline
+                    // (`codepoints_in_utf8`) rebuilds via `rstr_payload`.
+                    if !string_byte_view
+                        && !string_array_view
+                        && !list_view
+                        && tyref_is_rust_heap_string(&place_ty, self.llbc)
+                    {
+                        return Ok(self
+                            .emit_rust_heap_string_interior_ptr(bb_id, base, idx_var, &place_ty));
+                    }
                     let kind = if string_byte_view {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {

@@ -1534,7 +1534,13 @@ impl<'a> Lowering<'a> {
                         if from_lossy_cow {
                             self.alias_dest_to_arg0(dest_local, arg, true);
                         } else {
-                            self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
+                            self.bind_str_view_of_receiver(
+                                dest_local,
+                                arg,
+                                &arg_locals,
+                                &call.dest.ty,
+                                bb_id,
+                            );
                         }
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -1672,16 +1678,24 @@ impl<'a> Lowering<'a> {
                 }
                 // `<String as AsRef<str>>::as_ref` / `String::as_str` /
                 // `<String as Borrow<str>>::borrow` — a `&str` view of the
-                // same string, identity in the lifted value model, so alias
-                // the destination to the receiver instead of emitting an
-                // `as_ref` method call the rtyper cannot route on the
-                // classdef-less string receiver.
+                // same string. An already-STR receiver is identity in the
+                // lifted value model; a rust-heap `{cap, ptr, len}` header
+                // is `Repr.rtype_str` (`bind_str_view_of_receiver`) so the
+                // residual `&str` trampoline (`rstr_payload`) sees `Ptr(STR)`.
+                // Alias rather than emit an `as_ref` getattr the rtyper
+                // cannot route on the classdef-less string receiver.
                 if args.len() == 1 && self.is_std_borrow_identity(&reg) {
                     let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
                         Some(built) => built,
                         None => args[0].clone(),
                     };
-                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
+                    self.bind_str_view_of_receiver(
+                        dest_local,
+                        arg,
+                        &arg_locals,
+                        &call.dest.ty,
+                        bb_id,
+                    );
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1694,7 +1708,13 @@ impl<'a> Lowering<'a> {
                         Some(built) => built,
                         None => args[0].clone(),
                     };
-                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
+                    self.bind_str_view_of_receiver(
+                        dest_local,
+                        arg,
+                        &arg_locals,
+                        &call.dest.ty,
+                        bb_id,
+                    );
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -2418,10 +2438,17 @@ impl<'a> Lowering<'a> {
                 // the same `ArrayRead` / `getitem` as any other `ListRepr`
                 // (`rlist.py` `AbstractBaseListRepr.rtype_getitem` /
                 // `ll_getitem_fast`) with `item_ty = Str`, on the list
-                // itself — never the host buf pointer.
+                // itself — never the host buf pointer. A rust-heap
+                // `{cap, ptr, len}` `Vec<String>` is not that list: dest
+                // `&String` is still string-family, so the interpolant of
+                // the receiver is the proof.
                 let translated_str_vec_index = args.len() == 2
                     && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                    && tyref_is_string_family(&call.dest.ty, self.llbc);
+                    && tyref_is_string_family(&call.dest.ty, self.llbc)
+                    && !crate::front::mir::interpolant_is_rust_heap_vec_string(
+                        &self.graph,
+                        &args[0],
+                    );
                 let vable_array_var = (args.len() == 2)
                     .then(|| declared_vable_array_var(&self.graph, &args[0]))
                     .flatten();

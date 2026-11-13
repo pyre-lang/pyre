@@ -3280,10 +3280,12 @@ impl<'a> Lowering<'a> {
     /// cannot route on the classdef-less string receiver (the `Cannot
     /// find attribute "as_ref" on UnicodeString` wall).  Bind the
     /// destination to the receiver instead, the same alias shape as the
-    /// container deref above.  Gated on the receiver being a string value
-    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
-    /// precise than the impl owner-leaf, plus the `str`-typed result so
-    /// `AsRef<[u8]>` is the `as_bytes` byte view
+    /// container deref above, except a rust-heap `{cap, ptr, len}`
+    /// interpolant is `Repr.rtype_str` ([`Self::bind_str_view_of_receiver`]).
+    /// Gated on the receiver being a string-family value
+    /// (`tyref_is_string_family`: already-STR `str`/`Wtf8`/`Wtf8Buf` or a
+    /// rust-heap `String`), more precise than the impl owner-leaf, plus
+    /// the `str`-typed result so `AsRef<[u8]>` is the `as_bytes` byte view
     /// ([`Self::is_string_as_bytes_identity`]) and `AsRef<OsStr>` /
     /// `AsRef<Path>` keep their ordinary lowering.
     pub(in crate::front::mir) fn is_string_to_str_identity(
@@ -7061,6 +7063,45 @@ impl<'a> Lowering<'a> {
             .flatten()
             .is_some_and(|local| self.string_byte_view_locals.contains(&local));
         self.alias_dest_to_arg0(dest_local, arg, inherit);
+    }
+
+    /// `&str` / `str` view of `arg`. An already-STR word is identity
+    /// (`rstr.py` one string type). A rust-heap `{cap, ptr, len}` header is
+    /// not `Ptr(STR)`: `Repr.rtype_str` copies it (`UnaryOp str` →
+    /// `jit_ll_str_from_rust_string`) so a later residual `&str` trampoline
+    /// (`codepoints_in_utf8`) rebuilds via `rstr_payload` from the same
+    /// lltype. Gate on the SSA interpolant, not the TyRef: a marked
+    /// exception-class `String` field is already `Ptr(STR)` even though its
+    /// LLBC type is `alloc::string::String`.
+    pub(in crate::front::mir) fn bind_str_view_of_receiver(
+        &mut self,
+        dest_local: usize,
+        arg: Variable,
+        arg_locals: &[Option<usize>],
+        dest_ty: &TyRef,
+        bb_id: crate::model::BlockId,
+    ) {
+        let dest_is_str =
+            tyref_strips_to_str(dest_ty, self.llbc) || tyref_is_string_value(dest_ty, self.llbc);
+        if dest_is_str && crate::front::mir::interpolant_is_rust_heap_string(&self.graph, &arg) {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            stamp_as_rstr_str(&res);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "str".to_string(),
+                    operand: arg,
+                    result_ty: ValueType::Str,
+                },
+            });
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+        } else {
+            self.alias_dest_to_arg0_inherit(dest_local, arg, arg_locals);
+        }
     }
 
     pub(in crate::front::mir) fn operand_is_string_byte_view(&self, op: &Operand) -> bool {

@@ -73,6 +73,16 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// `descroperation.py get_and_call_function`. The published address is the
+/// `getfunctionptr` word-ABI trampoline, not the raw slice/Result item.
+static GET_AND_CALL_FUNCTION_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("get_and_call_function")));
+
+/// Whether `fnaddr` is `get_and_call_function`'s residual trampoline.
+pub(crate) fn is_get_and_call_function_residual(fnaddr: i64) -> bool {
+    GET_AND_CALL_FUNCTION_FNADDRS.contains(&fnaddr)
+}
+
 /// `space.newutf8` / `w_str_from_storage_and_length`, identified by path.
 static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
@@ -1440,15 +1450,33 @@ pub(crate) fn helper_jitcode_fnaddr_is_callable(index: Option<usize>) -> bool {
 
 /// Whether this helper walk is an `MIFrame` the blackhole can `bh_call_*`.
 ///
-/// A Regular callee with a non-callable `jitcode.fnaddr` is not that
-/// frame: latching it as innermost skips the enclosing walk's
-/// declined-subwalk recovery (`cut_declined_subwalk`).
+/// Convert of a helper after `do_residual_call` is `setposition`+`run` of
+/// that MIFrame. A Regular graph with `fnaddr=None` / symbolic is not a
+/// `bh_call_*` target; execute-then-abort without a convertible frame
+/// re-runs the residual from the enclosing Python CALL.
 pub(crate) fn helper_frame_is_convertible(
     transparent_helper_subwalk: bool,
     transparent_helper_jitcode_index: Option<usize>,
 ) -> bool {
     transparent_helper_subwalk
         && helper_jitcode_fnaddr_is_callable(transparent_helper_jitcode_index)
+}
+
+/// `MIFrame.jitcode` of the helper `do_residual_call` is executing.
+///
+/// Innermost `helper_live` is that frame (`pyjitpl.py` `framestack[-1]`,
+/// pushed at `setup_call`). The walk stamp can still name the parent
+/// Regular graph that entered this body (`len_slot` around `w_dict_len`);
+/// convertibility follows the frame that holds the residual opcode.
+pub(crate) fn residual_call_helper_index<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<usize> {
+    ctx.session
+        .borrow()
+        .helper_live
+        .last()
+        .and_then(|live| live.jitcode_index)
+        .or(ctx.fbw_mode.transparent_helper_jitcode_index)
 }
 
 /// Jitcode index of the helper body about to be walked.
@@ -1760,27 +1788,16 @@ pub(crate) fn latch_abort_blackhole_innermost<Sym: WalkSym>(
         latchdbg!("origin={origin} callee-prologue-call-entry");
         return false;
     }
-    // Declined-subwalk: `handler_inline_call_*` (`blackhole.py`) takes
-    // `bhimpl_inline_call_*` only when the callee fnaddr is callable, so an
-    // uncallable Regular helper is not a `bh_call_*` target. Keep this gate
-    // so latching that helper as innermost does not skip the enclosing walk's
-    // `cut_declined_subwalk`.
+    // `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every live
+    // MIFrame (`_copy_data_from_miframe`) and `setposition`+`run`s each
+    // one. It never `bh_call_*`s this frame's own `fnaddr`;
+    // `handler_inline_call_*` is only for nested callees. An uncallable
+    // Regular helper is therefore a convert frame the same way
+    // `blackhole_if_trace_too_long` already latches it.
     //
-    // Trace-too-long: `blackhole_if_trace_too_long` (`pyjitpl.py`) raises
-    // `SwitchToBlackhole(ABORT_TOO_LONG)` and `convert_and_run_from_pyjitpl`
-    // (`blackhole.py`) copies every live MIFrame, helper frames included.
-    // Converting a frame resumes it at its own pc and never calls that
-    // frame's own fnaddr, so this callable gate does not apply.
-    if !matches!(innermost_build, InnermostMiframeBuild::TraceTooLong)
-        && ctx.fbw_mode.transparent_helper_subwalk
-        && !helper_frame_is_convertible(
-            ctx.fbw_mode.transparent_helper_subwalk,
-            ctx.fbw_mode.transparent_helper_jitcode_index,
-        )
-    {
-        latchdbg!("origin={origin} helper-fnaddr-not-callable");
-        return false;
-    }
+    // Unexecuted residuals do not reach this latch:
+    // `residual_declined_cuttable` (`history.cut` + `do_residual_call`
+    // of a callable ancestor) runs first.
     let last_exc_value = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
@@ -3680,7 +3697,10 @@ pub(crate) fn innermost_walk_jitcode<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     if ctx.fbw_mode.transparent_helper_subwalk {
-        helper_jitcode_arc(ctx.fbw_mode.transparent_helper_jitcode_index?)
+        // `framestack[-1]` is the MIFrame convert copies (`pyjitpl.py`
+        // `_copy_data_from_miframe`). The walk stamp can still name a
+        // parent Regular graph (`len_slot` around `w_dict_len`).
+        helper_jitcode_arc(residual_call_helper_index(ctx)?)
     } else if let Some(consts) = ctx.inline_callee_consts {
         crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
             .map(|pjc| pjc.jitcode.clone())
@@ -6617,6 +6637,26 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN
     );
+    // `pyjitpl.py do_residual_call` executes CALL_MAY_FORCE inside the
+    // helper MIFrame; `capture_resumedata(after_residual_call=True)`
+    // resumes `GUARD_NOT_FORCED` at the helper pc past the call.
+    // Convert of that frame is `setposition`+`run`. A Regular graph with
+    // `fnaddr=None` / symbolic is not a `bh_call_*` target: execute-then-
+    // abort re-runs the residual from the enclosing Python CALL. Stop
+    // unexecuted (`history.cut` then `do_residual_call` of a callable
+    // ancestor). `residualize_inline_call_via_fnaddr` is already that
+    // ancestor residual (`bhimpl_inline_call_*`); skip the refuse there.
+    if is_may_force
+        && ctx.fbw_mode.transparent_helper_subwalk
+        && !ctx.fbw_mode.bh_call_fnaddr_residual
+        && !helper_frame_is_convertible(
+            ctx.fbw_mode.transparent_helper_subwalk,
+            residual_call_helper_index(ctx),
+        )
+    {
+        stop_unexecuted_residual(ctx, op_pc, ResidualDecline::Symbolic, None)?;
+        return Ok(declined_symbolic(call_opcode));
+    }
     // `execute_varargs` runs the helper before `record_result_of_call_pure`.
     // Cannot-raise and can-raise elidable calls both reach `execute_residual_call`
     // here, once. A cannot-raise decline stays `PureUnfolded`: that cause does
@@ -11873,19 +11913,55 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `s.add(x)` on an exact `set`: same placement as `SysExcInfo` /
+    // `BuiltinLocals`. `__majit_wrap_set_descr_add` is a `BuiltinCode.func`
+    // PBC member, so the wrapper descent below would enter its jitcode
+    // first. Helper-innermost then records the insert body and the
+    // `spec_gate(SetAddMethod)` at the generic tail never fires. Consult
+    // here so Elided returns and Subst still reuses that tail.
+    //
+    // The zero-argument `super()` re-route is the second arm of the same
+    // shape — mutually exclusive by callable — and is asked second because
+    // `set.add` recognition is cheaper.
+    let mut direct_subst = None;
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+    {
+        match spec_gate(SpecFold::SetAddMethod, || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
+        })? {
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            Some(SetAddMethodSpec::Subst(subst)) => {
+                direct_subst = Some(subst);
+            }
+            None => {
+                direct_subst = spec_gate(SpecFold::BareSuperCall, || {
+                    try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+                })?;
+            }
+        }
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
-    // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        1,
-        &r_args,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
+    // user-function-only full-body walk below. A set.add / bare-super
+    // substitution already owns this CALL: skip the wrap so the generic
+    // tail below still concrete-executes `jit_set_add_method`.
+    if direct_subst.is_none()
+        && let Some(inlined) = try_walker_inline_builtin_call(
+            ctx,
+            op,
+            code,
+            1,
+            &r_args,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )?
+    {
         return Ok(inlined);
     }
 
@@ -11899,6 +11975,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
+    }
+
+    // `space.index` (`descroperation.py _index`) residualizes
+    // `get_and_call_function` of `__index__`. Helper-innermost walks that
+    // call inside `binary_slice_values_inner`; inline the body with the
+    // same `try_walker_inline_index` `range` / `complex` already use.
+    if let Some(inlined) = try_walker_inline_get_and_call_index(
+        ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+    )? {
+        return Ok(inlined);
     }
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
@@ -12731,14 +12817,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
-    // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
-    // concrete-executed by the shared tail below, so the force/exception
-    // guards, the heapcache invalidation and the `None` writeback are the ones
-    // the generic path already emits.  A decline leaves every binding
-    // untouched.
+    // `s.add(x)` / zero-argument `super()` were consulted before the
+    // wrapper descent. Subst still reuses this tail: the call is a MayForce
+    // residual, still guarded and still concrete-executed, so the
+    // force/exception guards, the heapcache invalidation and the `None`
+    // writeback are the ones the generic path already emits.
     //
     // The substituted descr carries `RuntimeHelperKind::SetAddMethod` for one
     // reason: `writes_live_heap` below reads the helper tag and the result
@@ -12753,37 +12836,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // marker is what makes the substitution invisible to the rollback rules
     // rather than merely survivable by them.
     //
-    // The zero-argument `super()` re-route is the second arm of the same shape
-    // and is spelled here rather than with the folds above precisely so it can
-    // reuse this tail: its leaf can run a `__class__` property, so it needs the
-    // concrete execution, the raise transcription and the force bracket that
-    // only the generic path performs.  The two arms are mutually exclusive by
-    // callable -- `set.add` bound method against the `super` type -- so the
-    // order between them is free; `set_add` is asked first only because it is
-    // the cheaper recognition.
-    //
     // An integer-strategy hit is not this tail.  The contains check does not
     // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
     // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
     // still counts that `Some` as the same row.
-    let direct_subst = if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
-    } else {
-        None
-    };
     let skip_indirect = direct_subst.is_some();
     let (funcptr, descr, allboxes) = match direct_subst {
         Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),

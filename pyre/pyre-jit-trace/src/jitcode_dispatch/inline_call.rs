@@ -6698,12 +6698,37 @@ pub(crate) fn helper_subwalk_executed_residual(
 /// `pre_fold_pos` (`pyjitpl.py` `history.cut` + `do_residual_call`).
 /// Residualize of the unbound helper itself fails, even when that helper
 /// recorded no ops, so the skip does not wait for enclosing stores.
-fn declined_unbound_regular_recovers_enclosing(error: &DispatchError) -> bool {
-    matches!(
-        error,
-        DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. }
-            if !majit_jitcode::codewriter::call::is_callable_fnaddr(*symbolic)
-    )
+pub(crate) fn declined_unbound_regular_recovers_enclosing(error: &DispatchError) -> bool {
+    match error {
+        DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. } => {
+            !majit_jitcode::codewriter::call::is_callable_fnaddr(*symbolic)
+        }
+        // Nested portal (`generator.py` `should_not_inline` /
+        // `generatorentry_driver`, `pyjitpl.py` `opimpl_jit_merge_point`):
+        // the helper walked into another jitdriver's merge point. That
+        // frame is not `convert_and_run_from_pyjitpl` of this helper;
+        // skip-cut to a callable ancestor and `do_residual_call`.
+        DispatchError::JitMergePointGreenKeyUnresolved { .. } => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod declined_unbound_tests {
+    use super::*;
+
+    #[test]
+    fn nested_portal_merge_point_recovers_enclosing() {
+        assert!(declined_unbound_regular_recovers_enclosing(
+            &DispatchError::JitMergePointGreenKeyUnresolved { pc: 8 }
+        ));
+        assert!(declined_unbound_regular_recovers_enclosing(
+            &DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+        ));
+        assert!(!declined_unbound_regular_recovers_enclosing(
+            &DispatchError::DeclinedResidualCall { pc: 0 }
+        ));
+    }
 }
 
 /// Resume past an already-executed helper residual (`MIFrame.make_result_of_lastop`).
@@ -16589,7 +16614,7 @@ pub(crate) struct IndexInlineCandidate {
     concrete_arg: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
-    method: pyre_object::PyObjectRef,
+    pub(crate) method: pyre_object::PyObjectRef,
     attr_cell: pyre_object::PyObjectRef,
     w_code: *const (),
     nparams: usize,
@@ -16629,8 +16654,15 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     // Every other lever that inlines app-level Python out of a specializer
     // declines once it is itself inside a callee sub-walk — `try_walker_inline_
     // type_call`, `..._property_get`, `..._property_set` and
-    // `..._subscr_getitem` all lead with this.
-    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
+    // `..._subscr_getitem` all lead with this. A helper-body walk is
+    // `space.index` hitting `get_and_call_function` (`descroperation.py
+    // _index`); that is the same call this prepare already inlines from
+    // `range` / `complex`.
+    if !ctx.is_authoritative_executor {
+        index_prepare_diag("not-authoritative-or-subwalk");
+        return None;
+    }
+    if ctx.fbw_mode.inline_subwalk && !ctx.fbw_mode.transparent_helper_subwalk {
         index_prepare_diag("not-authoritative-or-subwalk");
         return None;
     }
@@ -16807,6 +16839,67 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         (None, None) => Ok(None),
         _ => Err(DispatchError::callee_inline_unsupported(op.pc)),
     }
+}
+
+/// Inline `get_and_call_function` of a user `__index__` (`descroperation.py
+/// _index` / `space.index`).
+///
+/// Helper-innermost walks `binary_slice_values_inner` through
+/// `eval_slice_index` into that residual. The word-ABI trampoline is a
+/// 4-ref `CallMayForceR` (`getfunctionptr`); inlining the body records
+/// the instance read instead of leaving the call.
+pub(crate) fn try_walker_inline_get_and_call_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
+        return Ok(None);
+    };
+    if !super::residual_call::is_get_and_call_function_residual(addr) {
+        return Ok(None);
+    }
+    // `get_and_call_function(w_descr, w_obj, w_type, args_w)`: `args_w`
+    // interned as one GC-array word. `space.index` passes `&[]`.
+    let [method_op, obj_op, _type_op, extras_op] = r_args else {
+        return Ok(None);
+    };
+    let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(*extras_op) else {
+        return Ok(None);
+    };
+    if !matches!(
+        len_op.inline_const_to_value(),
+        Some(majit_ir::Value::Int(0))
+    ) {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, *obj_op) else {
+        return Ok(None);
+    };
+    let Some(concrete_method) = walker_concrete_ref_object(ctx, *method_op) else {
+        return Ok(None);
+    };
+    let Some(candidate) = prepare_walker_inline_index(ctx, *obj_op, concrete_obj) else {
+        return Ok(None);
+    };
+    if candidate.method != concrete_method {
+        return Ok(None);
+    }
+    let Some((result, _)) =
+        try_walker_inline_index(ctx, op, code, funcptr, r_args, call_descr, dst, candidate)?
+    else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Inline `obj[key]` into the receiver type's Python `__getitem__`.
@@ -21684,7 +21777,8 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         Err(
             error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
             | DispatchError::ResidualCallArgUnbound { .. }
-            | DispatchError::DeclinedResidualCall { .. }),
+            | DispatchError::DeclinedResidualCall { .. }
+            | DispatchError::JitMergePointGreenKeyUnresolved { .. }),
         ) => {
             // `SwitchToBlackhole` unwinds `_interpret`. A deeper helper
             // already staged its MIFrame; cutting and residualizing this
@@ -21693,7 +21787,11 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 return Err(error);
             }
             let declined_unbound = declined_unbound_regular_recovers_enclosing(&error);
-            let residual_declined = matches!(error, DispatchError::DeclinedResidualCall { .. });
+            let residual_declined = matches!(
+                error,
+                DispatchError::DeclinedResidualCall { .. }
+                    | DispatchError::JitMergePointGreenKeyUnresolved { .. }
+            );
             // `DeclinedResidualCall` is an unexecuted residual (`stop_unexecuted_residual`).
             // A callable helper that hit one after a nested unbound skip-cut
             // still cuts to its first-enter and `do_residual_call`s once.
@@ -22116,6 +22214,12 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     let descr_for_record = descr.clone();
     let ei_for_record = ei.clone();
     let funcptr = allboxes[0];
+    // `do_residual_call` of this helper's `jitcode.fnaddr`. The parent
+    // walk may be an unconvertible Regular graph; skip the
+    // `CallMayForce*` refuse that applies only to opcodes inside that
+    // body (`pyjitpl.py do_residual_call` / `bhimpl_inline_call_*`).
+    let saved_bh_call_fnaddr_residual = ctx.fbw_mode.bh_call_fnaddr_residual;
+    ctx.fbw_mode.bh_call_fnaddr_residual = true;
     let resid = {
         let mut record_call = |ctx: &mut WalkContext<'_, '_, Sym>,
                                value: Option<majit_ir::Value>| {
@@ -22169,6 +22273,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         ) {
             Ok(exec) => exec,
             Err(error) => {
+                ctx.fbw_mode.bh_call_fnaddr_residual = saved_bh_call_fnaddr_residual;
                 // Same as `finish_dispatch_residual_call`: a non-forces
                 // refusal before the hook still records the symbolic call.
                 // Forces record only from the hook. `do_residual_call`
@@ -22191,6 +22296,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             }
         }
     };
+    ctx.fbw_mode.bh_call_fnaddr_residual = saved_bh_call_fnaddr_residual;
     if !ran {
         // Decline before the hook. Record the symbolic op, then the same
         // abort the caller took. Do not invalidate: this return leaves

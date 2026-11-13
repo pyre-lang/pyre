@@ -2416,6 +2416,15 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `None` for every other walk, which is what keeps the durable-frame
     /// journal off every path but this one.
     pub generator_resume: Option<GeneratorResumeSubwalk>,
+    /// Set only while `residualize_inline_call_via_fnaddr` runs
+    /// `try_execute_residual_call_via_executor_inner`. That path is
+    /// `pyjitpl.py do_residual_call` of a callable `jitcode.fnaddr`
+    /// (`blackhole.py handler_inline_call_*` / `bhimpl_inline_call_*`).
+    /// The current `transparent_helper_jitcode_index` is the parent
+    /// helper, which may be a Regular graph with no callable fnaddr;
+    /// the refuse that stops `CallMayForce*` inside that unconvertible
+    /// body must not refuse this `bh_call_*` of the callee.
+    pub bh_call_fnaddr_residual: bool,
 }
 
 /// The suspended generator a resume sub-walk is running on.
@@ -2463,6 +2472,7 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             class_of_last_exc_is_const: self.class_of_last_exc_is_const,
             generator_resume: self.generator_resume,
             subwalk_floor: self.subwalk_floor,
+            bh_call_fnaddr_residual: self.bh_call_fnaddr_residual,
         }
     }
 }
@@ -2499,6 +2509,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             generator_resume: None,
+            bh_call_fnaddr_residual: false,
         }
     }
 }
@@ -5871,9 +5882,11 @@ pub fn walk<Sym: WalkSym>(
                 // `next_pc`. A helper whose `jitcode.fnaddr` is not callable
                 // is not a `bh_call_*` target: leave the claim unset so the
                 // enclosing walk's declined-subwalk recovery can run.
+                // Innermost `helper_live` is that frame (`framestack[-1]`);
+                // the walk stamp can still name a parent Regular graph.
                 let helper_convertible = residual_call::helper_frame_is_convertible(
                     ctx.fbw_mode.transparent_helper_subwalk,
-                    ctx.fbw_mode.transparent_helper_jitcode_index,
+                    residual_call::residual_call_helper_index(ctx),
                 ) && !error.is_clean_decline();
                 // `do_residual_call` already ran inside this helper.
                 // `GUARD_NOT_FORCED` snapshot miss: wrap so the latch is the
@@ -6039,7 +6052,27 @@ pub fn walk<Sym: WalkSym>(
                 // missing value latches even when the root allow-list has not
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame && abort_image_latchable {
+                //
+                // `DeclinedResidualCall` is an unexecuted residual
+                // (`stop_unexecuted_residual`). On a helper with no
+                // unrewindable effect it is `pyjitpl.py` `history.cut` then
+                // `do_residual_call` of that helper, not
+                // `convert_and_run_from_pyjitpl`.
+                // `JitMergePointGreenKeyUnresolved` is the same cut: the
+                // helper entered another jitdriver's merge point
+                // (`generatorentry_driver`), which is not this MIFrame's
+                // remainder.
+                let residual_declined_cuttable = ctx.fbw_mode.transparent_helper_subwalk
+                    && !helper_call_unrewindable
+                    && (matches!(
+                        error,
+                        DispatchError::DeclinedResidualCall { .. }
+                            | DispatchError::JitMergePointGreenKeyUnresolved { .. }
+                    ) || inline_call::declined_unbound_regular_recovers_enclosing(&error));
+                if coordinate_belongs_to_this_frame
+                    && abort_image_latchable
+                    && !residual_declined_cuttable
+                {
                     // The image belongs to THIS WalkContext's MIFrame.
                     // `_get_opimpl_method` has already advanced `self.pc`
                     // past an executed residual; latching at `opcode_position`

@@ -25935,6 +25935,230 @@ fn a_helper_is_convertible_only_when_its_fnaddr_is_callable() {
     ));
 }
 
+/// `CallMayForce*` inside a helper whose `jitcode.fnaddr` is not callable
+/// must not `execute_varargs`. `do_residual_call` would resume past the
+/// call in that helper MIFrame; without a convertible frame the abort
+/// re-runs the residual from the enclosing Python CALL.
+#[test]
+fn may_force_residual_in_uncallable_helper_stops_unexecuted() {
+    let mut tc = fresh_trace_ctx();
+    let (allboxes, descr) = may_force_call_i_fixture(&mut tc);
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let call_descr = descr.as_call_descr().expect("CallI descr");
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: None,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 31, true)
+        .expect_err("uncallable helper must not execute CallMayForce");
+    assert!(
+        matches!(err, DispatchError::DeclinedResidualCall { pc: 31 }),
+        "stop_unexecuted_residual, got {err:?}"
+    );
+}
+
+fn install_test_helper_jitcode(name: &str, fnaddr: i64) -> usize {
+    let mut runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    runtime_jc.fnaddr = fnaddr;
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![
+            *insns_opname_to_byte()
+                .get("void_return/")
+                .expect("`void_return/` must be in insns table"),
+        ],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    let source = format!("# {name}\nNone");
+    let code = pyre_interpreter::compile_exec(&source).expect("test code should compile");
+    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = jitcode;
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    unsafe { (*installed).index as usize }
+}
+
+/// Convertibility follows `helper_live.last()` (`framestack[-1]`), not the
+/// parent Regular stamp. `w_dict_len` is callable around `method_length`
+/// even when `len_slot` stamped the walk.
+#[test]
+fn residual_call_helper_index_uses_innermost_helper_live_not_stamp() {
+    let mut tc = fresh_trace_ctx();
+    let callable = install_test_helper_jitcode("helper_callable_innermost_may_force", 0x1234_5678);
+    assert!(
+        callable >= crate::jitcode_runtime::jitcode_count(),
+        "test helper must sit above the build-time table, got {callable}"
+    );
+    assert!(super::residual_call::helper_jitcode_fnaddr_is_callable(
+        Some(callable)
+    ));
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let frame_state = WalkFrameState::new(WalkFrameStateData {
+        callee_shadow: None,
+        concrete_registers_r: ([]).to_vec(),
+        outer_active_boxes: Vec::new(),
+        vstack_boxes: Vec::new(),
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_saved: None,
+        ..Default::default()
+    });
+    let registers_r = RegisterBank::default();
+    let registers_i = RegisterBank::default();
+    let registers_f = RegisterBank::default();
+    let mut live = LiveFrameRegs::new(&registers_r, &registers_i, &registers_f, &frame_state);
+    live.jitcode_index = Some(callable);
+    session.borrow_mut().helper_live.push(live);
+    let wc = WalkContext {
+        frame_state,
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: None,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &registers_r,
+        registers_i: &registers_i,
+        registers_f: &registers_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let helper_index = super::residual_call::residual_call_helper_index(&wc);
+    assert_eq!(
+        helper_index,
+        Some(callable),
+        "framestack[-1] is helper_live.last(), not the unconvertible stamp"
+    );
+    assert!(
+        super::residual_call::helper_frame_is_convertible(true, helper_index),
+        "w_dict_len-shaped innermost helper is convertible"
+    );
+    drop(wc);
+    session.borrow_mut().helper_live.pop();
+}
+
+/// `residualize_inline_call_via_fnaddr` is `do_residual_call` of a
+/// callable `jitcode.fnaddr` (`bhimpl_inline_call_*`). The parent
+/// helper may be unconvertible; that refuse must not block this
+/// `bh_call_*`.
+#[test]
+fn may_force_fnaddr_residual_from_uncallable_parent_executes() {
+    let mut tc = fresh_trace_ctx();
+    let (allboxes, descr) = may_force_call_i_fixture(&mut tc);
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let call_descr = descr.as_call_descr().expect("CallI descr");
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: None,
+            bh_call_fnaddr_residual: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (_result, born) =
+        execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 31, true)
+            .expect("fnaddr residual of a callable helper must execute CallMayForce");
+    drop(wc);
+    assert_eq!(
+        tc.box_value(born),
+        Some(majit_ir::Value::Int(42)),
+        "bh_call of add2_for_walker_test(40, 2) records 42"
+    );
+    assert_eq!(tc.opcode_of(born), Some(majit_ir::OpCode::CallMayForceI));
+}
+
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
 /// framestack level; an image missing ancestor helpers resumes the

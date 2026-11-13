@@ -607,6 +607,45 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     complete
 }
 
+/// `capture_resumedata` snapshots `virtualizable_boxes[debugdata]` as
+/// `_opimpl_setfield_vable` left it. A helper walk of `get_w_globals` /
+/// `getorcreatedebug` can store a Python object (None, str) in that slot
+/// when the inlined frame was `replace_box`'d onto the portal. Resume then
+/// writes that object as `PyFrame.debugdata` and `get_w_globals` reads its
+/// first word as `w_globals`. Null and a real `FrameDebugData` stay;
+/// `malloc_raw` payloads have no GC tid and stay too.
+fn portal_debugdata_ptr_is_payload(ptr: usize) -> bool {
+    if ptr == 0 {
+        return true;
+    }
+    match majit_gc::get_actual_typeid(majit_ir::GcRef(ptr)) {
+        Some(tid) => tid == crate::descr::FRAME_DEBUG_DATA_GC_TYPE_ID,
+        None => true,
+    }
+}
+
+fn sanitize_portal_debugdata_box(ctx: &mut TraceCtx) {
+    let Some(idx) = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name("debugdata"))
+    else {
+        return;
+    };
+    let Some((_, majit_ir::Value::Ref(ptr))) = ctx.virtualizable_entry_at(idx) else {
+        return;
+    };
+    if portal_debugdata_ptr_is_payload(ptr.as_usize()) {
+        return;
+    }
+    let null = ctx.const_ref(0);
+    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+        ctx,
+        "debugdata",
+        null,
+        majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+    );
+}
+
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
 /// the MIFrame registers as they stand after the residual call.  The
 /// capture below advances the operand-stack mirror to that same post-call
@@ -633,6 +672,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
+    sanitize_portal_debugdata_box(ctx.trace_ctx);
     if let Some((instance, init_result, caller)) = scope.constructor_assembler.clone() {
         return walker_capture_constructor_assembler_guard(
             ctx,
