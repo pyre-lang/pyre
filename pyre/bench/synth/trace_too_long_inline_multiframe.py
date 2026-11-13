@@ -8,8 +8,8 @@
 # 8 bytes and isize/usize = 4, so `_int_to_int_cast` records `int_signext` /
 # `int_and` that are the identity on 64-bit native; traces are a few ops
 # longer on wasm and a tiny `trace_limit` cuts one frame earlier or later.
-# 134..138 take the same snapshot on dynasm, cranelift and wasm; use 136
-# within that shared interval.
+# At 136 the wasm cut lands one frame earlier than native, so wasm keeps
+# its own baseline (`.wasm.jitstats`) for the adoption split.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The
