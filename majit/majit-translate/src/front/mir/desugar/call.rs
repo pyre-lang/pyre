@@ -5725,23 +5725,15 @@ impl<'a> Lowering<'a> {
                 // non-Vec header is a Goto, so a residual `drain` call
                 // would drop the range. Recognise the MIR shape only:
                 // std `Vec::drain` + immediate Drop of the Drain dest +
-                // either a captured `Range { start, end }` operand or
-                // the 3-arg `(vec, start, end)` ABI. A used Drain, or a
+                // a captured `Range { start, end }` operand. rustc MIR
+                // is `drain(self, Range)` (two args). A used Drain, or a
                 // 2-arg call whose range is not that aggregate, stays
                 // residual — the leaf name alone is not a rewrite.
                 if rust_vec_std_leaf(&original_segments) == Some("drain")
                     && self.mir_successor_is_immediate_drop_of_local(target, dest_local)
                 {
-                    let bounds = if args.len() == 2 {
-                        self.slice_index_range_sites.iter().find_map(|site| {
-                            (site.range_result == args[1])
-                                .then(|| (site.start.clone(), site.end.clone()))
-                        })
-                    } else if args.len() == 3 {
-                        Some((args[1].clone(), args[2].clone()))
-                    } else {
-                        None
-                    };
+                    let bounds =
+                        dropped_vec_drain_range_bounds(&args, &self.slice_index_range_sites);
                     if let Some((start, stop)) = bounds {
                         let _ = self.emit_path_call(
                             mir_bb,
@@ -10490,5 +10482,76 @@ impl Lowering<'_> {
             },
         });
         res
+    }
+}
+
+/// Exclusive `Range { start, end }` bounds for a dropped `Vec::drain`.
+/// rustc MIR is `drain(self, Range)` (two args). A 3-arg `(vec, start, end)`
+/// ABI is not produced; those calls stay residual.
+fn dropped_vec_drain_range_bounds(
+    args: &[Variable],
+    range_sites: &[crate::front::slice_index::SliceIndexRangeSite],
+) -> Option<(Variable, Variable)> {
+    if args.len() != 2 {
+        return None;
+    }
+    range_sites.iter().find_map(|site| {
+        (site.range_result == args[1]).then(|| (site.start.clone(), site.end.clone()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dropped_vec_drain_range_bounds;
+    use crate::flowspace::model::Variable;
+    use crate::front::slice_index::SliceIndexRangeSite;
+
+    #[test]
+    fn dropped_vec_drain_rewrites_only_range_start_end() {
+        let range = Variable::new();
+        let start = Variable::new();
+        let end = Variable::new();
+        let recv = Variable::new();
+        let sites = [SliceIndexRangeSite {
+            range_result: range.clone(),
+            start: start.clone(),
+            end: end.clone(),
+        }];
+        let two = dropped_vec_drain_range_bounds(&[recv.clone(), range.clone()], &sites);
+        assert_eq!(two.as_ref().map(|(s, e)| (s, e)), Some((&start, &end)));
+        assert!(
+            dropped_vec_drain_range_bounds(
+                &[recv.clone(), range, start.clone(), end.clone()],
+                &sites
+            )
+            .is_none(),
+            "a 4-arg call is not rustc Vec::drain"
+        );
+        assert!(
+            dropped_vec_drain_range_bounds(&[recv.clone(), start.clone(), end.clone()], &sites)
+                .is_none(),
+            "3-arg (vec, start, end) is not a proven Range {{ start, end }}"
+        );
+        assert!(
+            dropped_vec_drain_range_bounds(&[recv], &sites).is_none(),
+            "1-arg drain stays residual"
+        );
+    }
+
+    #[test]
+    fn dropped_vec_drain_unproven_range_stays_residual() {
+        let recv = Variable::new();
+        let other = Variable::new();
+        let start = Variable::new();
+        let end = Variable::new();
+        let sites = [SliceIndexRangeSite {
+            range_result: Variable::new(),
+            start,
+            end,
+        }];
+        assert!(
+            dropped_vec_drain_range_bounds(&[recv, other], &sites).is_none(),
+            "a 2-arg drain whose operand is not the captured Range stays residual"
+        );
     }
 }

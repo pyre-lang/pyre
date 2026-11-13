@@ -27,7 +27,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::rlist::{
     FixedSizeListRepr, ListIteratorRepr, ListLayout, ll_vec_copy_from_fixed_list_helper,
-    ll_vec_copy_from_fixed_list_into, rtype_getslice_via_ll_listslice,
+    ll_vec_copy_from_fixed_list_into, rtype_delslice_via_ll_listdelslice,
+    rtype_getslice_via_ll_listslice,
 };
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, hop_arg_const_string, inputconst_from_lltype,
@@ -291,6 +292,20 @@ impl Repr for RustVecRepr {
     fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
         rtype_getslice_via_ll_listslice(
+            hop,
+            ListLayout::RustVec,
+            self.lltype.clone(),
+            self.item_lltype().clone(),
+            v_lst,
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_delslice(r_lst, hop)` (`rlist.py`)
+    /// via `rtype_delslice_via_ll_listdelslice`. Length store is
+    /// `setfield(l, "len", newlength)` (`emit_rustvec_len_store`).
+    fn rtype_delslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        rtype_delslice_via_ll_listdelslice(
             hop,
             ListLayout::RustVec,
             self.lltype.clone(),
@@ -1535,6 +1550,163 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "ll_listslice_startonly"),
             "getslice [start:] must mint an ll_listslice_startonly helper graph, got {names:?}"
+        );
+    }
+
+    /// `del v[start:]` on a `Vec<isize>` (`VecItemKind::Int`) decomposes
+    /// to `"startonly"` and `gendirectcall`s the `look_inside_iff` wrapper.
+    /// No `_ll_list_resize_le`: the shrink is `setfield(l, "len", start)`.
+    #[test]
+    fn rtype_delslice_int_startonly_emits_look_inside_iff_wrapper() {
+        use crate::annotator::model::{SomeInteger, SomeValue, s_none};
+        use crate::flowspace::model::{Constant, SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = setup_rtyper();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_vec = rust_vec_repr(&rtyper, VecItemKind::Int);
+        let vec_lltype = r_vec.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(vec_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Void));
+        let spaceop = SpaceOperation::new(
+            "delslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = std::rc::Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::RustVec(
+            crate::annotator::model::SomeRustVec::for_kind(VecItemKind::Int),
+        ));
+        hop.args_r.borrow_mut().push(Some(r_vec.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation delslice must dispatch to RustVecRepr.rtype_delslice");
+        let ops = hop.llops.borrow();
+        assert_eq!(
+            ops.ops
+                .iter()
+                .filter(|op| op.opname == "direct_call")
+                .count(),
+            1,
+            "expected a single look_inside_iff wrapper direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let direct = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("delslice startonly emits one direct_call");
+        let dbg = format!("{:?}", direct.args[0]);
+        assert!(
+            dbg.contains("ll_listdelslice_startonly_look_inside_iff"),
+            "gendirectcall is the look_inside_iff wrapper, got {dbg}"
+        );
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listdelslice_startonly"),
+            "delslice must mint ll_listdelslice_startonly, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "_ll_list_resize_le"),
+            "RustVec delslice does not mint _ll_list_resize_le, got {names:?}"
+        );
+    }
+
+    /// `del v[a:b]` on a `Vec<PyObjectRef>` (`VecItemKind::Ref`) mints
+    /// `ll_listdelslice_startstop` and `ll_arraymove`. No `_ll_list_resize_le`.
+    #[test]
+    fn rtype_delslice_ref_startstop_emits_startstop_helper() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = setup_rtyper();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_vec = rust_vec_repr(&rtyper, VecItemKind::Ref);
+        let vec_lltype = r_vec.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(vec_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_stop = Variable::new();
+        v_stop.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let v_stop_h = Hlvalue::Variable(v_stop);
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Void));
+        let spaceop = SpaceOperation::new(
+            "delslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), v_stop_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = std::rc::Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::RustVec(
+            crate::annotator::model::SomeRustVec::for_kind(VecItemKind::Ref),
+        ));
+        hop.args_r.borrow_mut().push(Some(r_vec.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_stop_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        rtyper.translate_operation(&hop).expect(
+            "translate_operation delslice startstop must dispatch to RustVecRepr.rtype_delslice",
+        );
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listdelslice_startstop"),
+            "delslice [start:stop] must mint ll_listdelslice_startstop, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_arraymove"),
+            "delslice [start:stop] must mint ll_arraymove, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "_ll_list_resize_le"),
+            "RustVec delslice does not mint _ll_list_resize_le, got {names:?}"
         );
     }
 
