@@ -5831,7 +5831,7 @@ mod tests {
         );
         assert_eq!(skip("fn f(x: i64) -> &[u8] { &[] }"), None);
         assert_eq!(
-            skip("fn f(&self) -> &[u8] { &[] }"),
+            skip("fn f(&mut self) -> &[u8] { &[] }"),
             Some(HelperFnAddrSkip::MethodReceiver)
         );
         let pair_ret = parse_fn("fn f(x: i64) -> &[u8] { &[] }");

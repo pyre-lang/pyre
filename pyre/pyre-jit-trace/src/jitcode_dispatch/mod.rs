@@ -5823,12 +5823,14 @@ pub fn walk<Sym: WalkSym>(
                 // A translated helper is an `MIFrame` (`blackhole.py
                 // setposition` + `run`). Latch it here, while its banks are
                 // live, together with the paused caller at the CALL's
-                // `next_pc`. A helper whose `jitcode.fnaddr` is not callable
-                // is not a `bh_call_*` target: leave the claim unset so the
-                // enclosing walk's declined-subwalk recovery can run.
+                // `next_pc`. Convert copies bytecode (`_copy_data_from_miframe`);
+                // the frame's own `fnaddr` is not required. Native addresses
+                // are needed only for subsequent `inline_call_*` targets.
+                // Innermost `helper_live` is that frame (`framestack[-1]`);
+                // the walk stamp can still name a parent Regular graph.
                 let helper_convertible = residual_call::helper_frame_is_convertible(
                     ctx.fbw_mode.transparent_helper_subwalk,
-                    ctx.fbw_mode.transparent_helper_jitcode_index,
+                    residual_call::residual_call_helper_index(ctx),
                 ) && !error.is_clean_decline();
                 // `do_residual_call` already ran inside this helper.
                 // `GUARD_NOT_FORCED` snapshot miss: wrap so the latch is the
@@ -5994,7 +5996,27 @@ pub fn walk<Sym: WalkSym>(
                 // missing value latches even when the root allow-list has not
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame && abort_image_latchable {
+                //
+                // `DeclinedResidualCall` is an unexecuted residual
+                // (`stop_unexecuted_residual`). On a helper with no
+                // unrewindable effect it is `pyjitpl.py` `history.cut` then
+                // `do_residual_call` of that helper, not
+                // `convert_and_run_from_pyjitpl`.
+                // `JitMergePointGreenKeyUnresolved` is the same cut: the
+                // helper entered another jitdriver's merge point
+                // (`generatorentry_driver`), which is not this MIFrame's
+                // remainder.
+                let residual_declined_cuttable = ctx.fbw_mode.transparent_helper_subwalk
+                    && !helper_call_unrewindable
+                    && (matches!(
+                        error,
+                        DispatchError::DeclinedResidualCall { .. }
+                            | DispatchError::JitMergePointGreenKeyUnresolved { .. }
+                    ) || inline_call::declined_unbound_regular_recovers_enclosing(&error));
+                if coordinate_belongs_to_this_frame
+                    && abort_image_latchable
+                    && !residual_declined_cuttable
+                {
                     // The image belongs to THIS WalkContext's MIFrame.
                     // `_get_opimpl_method` has already advanced `self.pc`
                     // past an executed residual; latching at `opcode_position`
@@ -9684,7 +9706,7 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     }
     if let Some(level) = session.pending_portal_level.as_mut() {
         for parent in level.parents.iter_mut() {
-            walk_inline_parent_frame(parent, visitor);
+            walk_inline_parent_frame(parent, owner, visitor);
         }
         if level.w_code != 0 {
             let mut root = majit_ir::GcRef(level.w_code);

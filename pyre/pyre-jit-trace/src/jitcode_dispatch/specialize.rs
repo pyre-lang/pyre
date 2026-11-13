@@ -7480,8 +7480,6 @@ const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
 /// rewrapping arm.
 const POS_INNER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::pos_inner",
-    commit_label: "pos_inner_commit",
-    call_site_label: "pos_inner_call_site",
     decline_tag: "POS-INNER-SUBWALK",
 };
 
@@ -10786,7 +10784,16 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
     // SubWalkRewind::nothing_applied.
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+            if rewind.nothing_applied() =>
+        {
+            // Same gate as `try_walker_orthodox_frame_locals_getitem`: a
+            // latched helper abort is already `SwitchToBlackhole`. An
+            // unlatched look-inside wall residualizes STORE_SUBSCR
+            // (`pyjitpl.py` `do_residual_call`).
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
         }
         Err(error) => return Err(error),
@@ -17043,7 +17050,12 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // kills the enclosing portal/bridge walk; the fold contract
     // (`try_walker_orthodox_list_append` / `_opcode`) is to residualize
     // the helper instead, matching `inline_call.rs` rolling a declined
-    // descent back to the ordinary residual.
+    // descent back to the ordinary residual. `DeclinedResidualCall` is the
+    // same wall: an unexecuted residual (`do_residual_call` refused) that
+    // `history.cut` must roll back to the helper CALL.
+    // `JitMergePointGreenKeyUnresolved` is a nested jitdriver merge point
+    // (`generator.py` `generatorentry_driver` / `should_not_inline`):
+    // residualize this helper rather than abort the enclosing portal.
     //
     // `perform_call` does not refuse a null ref argument. A
     // `MayForceNullRefArgUnsupported` from an empty extra-args array interned
@@ -17067,7 +17079,9 @@ fn orthodox_helper_subwalk_result(
     match walk_result {
         Err(DispatchError::AbortMarkerReached { pc })
         | Err(DispatchError::GuardResumeCoordinateUnavailable { pc })
-        | Err(DispatchError::RegisterReadUnbound { pc, .. }) => {
+        | Err(DispatchError::RegisterReadUnbound { pc, .. })
+        | Err(DispatchError::DeclinedResidualCall { pc })
+        | Err(DispatchError::JitMergePointGreenKeyUnresolved { pc }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,

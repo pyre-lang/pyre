@@ -2272,11 +2272,11 @@ mod tests {
     #[test]
     fn test_try_cut_trace_from_returns_err_on_leak() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos().set(iop(2));
-        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
+        let op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
         op1.pos().set(iop(3));
-        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos().set(vop(4));
         let trace = TreeLoop::new(inputargs, vec![op0, op1, op2]);
         let start = TreeLoopCutPosition::new(1);

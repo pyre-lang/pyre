@@ -28674,6 +28674,7 @@ mod tests {
             "bytearray_data getslice must lower to ll_listslice_startstop: {ops:?}"
         );
     }
+
     fn graph_mentions_leaf(graph: &FunctionGraph, leaf: &str) -> bool {
         graph
             .blocks
@@ -51942,110 +51943,6 @@ mod tests {
         assert_eq!(ops[0].result, None);
     }
 
-    /// `list.bytes_set_len(l, n)` lowers to `setfield_gc_i(bytes_items.len)`.
-    #[test]
-    fn handle_list_call_bytes_set_len_lowers_to_len_field_write() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("list_bytes_set_len");
-        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let op = SpaceOperation {
-            result: None,
-            kind: OpKind::ConstInt(0),
-        };
-        let mut transformer = Transformer::new(&config);
-        let rewrite = transformer
-            ._handle_list_call(
-                "list.bytes_set_len",
-                &op,
-                &[l.clone(), n.clone()],
-                &mut graph,
-                "list_bytes_set_len",
-            )
-            .expect("list.bytes_set_len must lower");
-        let RewriteResult::Replace(ops) = rewrite else {
-            panic!("expected Replace");
-        };
-        assert_eq!(ops.len(), 1);
-        match &ops[0].kind {
-            OpKind::FieldWrite {
-                base,
-                field,
-                value,
-                ty,
-            } => {
-                assert_eq!(base, &l);
-                assert_eq!(field.name, "bytes_items.len");
-                assert_eq!(value.as_variable(), Some(&n));
-                assert!(matches!(ty, ValueType::Int));
-            }
-            other => panic!("expected FieldWrite, got {other:?}"),
-        }
-        assert_eq!(ops[0].result, None);
-    }
-
-    /// `list.bytes_setitem(l, i, v)` lowers to `getfield_gc_r(bytes_items.block)`
-    /// feeding `setarrayitem_gc_r` of the erased bytes array.
-    #[test]
-    fn handle_list_call_bytes_setitem_lowers_to_block_plus_setarrayitem() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("list_bytes_setitem");
-        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let op = SpaceOperation {
-            result: None,
-            kind: OpKind::ConstInt(0),
-        };
-        let mut transformer = Transformer::new(&config);
-        let rewrite = transformer
-            ._handle_list_call(
-                "list.bytes_setitem",
-                &op,
-                &[l.clone(), index.clone(), value.clone()],
-                &mut graph,
-                "list_bytes_setitem",
-            )
-            .expect("list.bytes_setitem must lower");
-        let RewriteResult::Replace(ops) = rewrite else {
-            panic!("expected Replace");
-        };
-        assert_eq!(ops.len(), 2);
-        let block = match &ops[0].kind {
-            OpKind::FieldRead { base, field, .. } => {
-                assert_eq!(base, &l);
-                assert_eq!(field.name, "bytes_items.block");
-                ops[0].result.clone().expect("block result var")
-            }
-            other => panic!("expected FieldRead, got {other:?}"),
-        };
-        match &ops[1].kind {
-            OpKind::ArrayWrite {
-                base,
-                index: idx,
-                value: written,
-                item_ty,
-                array_type_id,
-                nolength,
-                array: _,
-                gckind,
-            } => {
-                assert_eq!(base, &block);
-                assert_eq!(idx, &index);
-                assert_eq!(written.as_variable(), Some(&value));
-                assert!(matches!(item_ty, ValueType::Ref(None)));
-                assert_eq!(
-                    array_type_id.as_deref(),
-                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
-                );
-                assert!(!nolength);
-                assert!(gckind.is_gc());
-            }
-            other => panic!("expected ArrayWrite, got {other:?}"),
-        }
-        assert_eq!(ops[1].result, None);
-    }
-
     /// `list.ascii_set_len(l, n)` lowers to `setfield_gc_i(ascii_items.len)`.
     #[test]
     fn handle_list_call_ascii_set_len_lowers_to_len_field_write() {
@@ -52294,6 +52191,110 @@ mod tests {
             other => panic!("expected ArrayLen, got {other:?}"),
         }
         assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.bytes_set_len(l, n)` lowers to `setfield_gc_i(bytes_items.len)`.
+    #[test]
+    fn handle_list_call_bytes_set_len_lowers_to_len_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_bytes_set_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.bytes_set_len",
+                &op,
+                &[l.clone(), n.clone()],
+                &mut graph,
+                "list_bytes_set_len",
+            )
+            .expect("list.bytes_set_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "bytes_items.len");
+                assert_eq!(value.as_variable(), Some(&n));
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.bytes_setitem(l, i, v)` lowers to `getfield_gc_r(bytes_items.block)`
+    /// feeding `setarrayitem_gc_r` of the erased bytes array.
+    #[test]
+    fn handle_list_call_bytes_setitem_lowers_to_block_plus_setarrayitem() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_bytes_setitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.bytes_setitem",
+                &op,
+                &[l.clone(), index.clone(), value.clone()],
+                &mut graph,
+                "list_bytes_setitem",
+            )
+            .expect("list.bytes_setitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "bytes_items.block");
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayWrite {
+                base,
+                index: idx,
+                value: written,
+                item_ty,
+                array_type_id,
+                array: _,
+                nolength,
+                gckind,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert_eq!(written.as_variable(), Some(&value));
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!nolength);
+                assert!(gckind.is_gc());
+            }
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, None);
     }
 
     /// `list.bytes_capacity(l)` lowers to `getfield_gc_r(bytes_items.block)`

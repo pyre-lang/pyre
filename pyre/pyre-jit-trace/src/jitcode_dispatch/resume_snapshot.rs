@@ -633,6 +633,45 @@ pub(crate) fn dispatch_head_py_pc<Sym: WalkSym>(
     Some(skip_python_trivia_forward(code, next_instr) as u32)
 }
 
+/// `capture_resumedata` snapshots `virtualizable_boxes[debugdata]` as
+/// `_opimpl_setfield_vable` left it. A helper walk of `get_w_globals` /
+/// `getorcreatedebug` can store a Python object (None, str) in that slot
+/// when the inlined frame was `replace_box`'d onto the portal. Resume then
+/// writes that object as `PyFrame.debugdata` and `get_w_globals` reads its
+/// first word as `w_globals`. Null and a real `FrameDebugData` stay;
+/// `malloc_raw` payloads have no GC tid and stay too.
+fn portal_debugdata_ptr_is_payload(ptr: usize) -> bool {
+    if ptr == 0 {
+        return true;
+    }
+    match majit_gc::get_actual_typeid(majit_ir::GcRef(ptr)) {
+        Some(tid) => tid == crate::descr::FRAME_DEBUG_DATA_GC_TYPE_ID,
+        None => true,
+    }
+}
+
+fn sanitize_portal_debugdata_box(ctx: &mut TraceCtx) {
+    let Some(idx) = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name("debugdata"))
+    else {
+        return;
+    };
+    let Some((_, majit_ir::Value::Ref(ptr))) = ctx.virtualizable_entry_at(idx) else {
+        return;
+    };
+    if portal_debugdata_ptr_is_payload(ptr.as_usize()) {
+        return;
+    }
+    let null = ctx.const_ref(0);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx,
+        "debugdata",
+        null,
+        majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+    );
+}
+
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
 /// the MIFrame registers and `virtualizable_boxes` as they stand after
 /// the residual call (`write_box_at`).
@@ -651,6 +690,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
+    sanitize_portal_debugdata_box(ctx.trace_ctx);
     if let Some((instance, init_result, caller)) = scope.constructor_assembler.clone() {
         return walker_capture_constructor_assembler_guard(
             ctx,
@@ -3754,7 +3794,9 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
-    // unless a heap write already ran, in which case the guard is refused.
+    // unless a heap write already ran; then the helper section is numbered
+    // (`generate_guard` at this pc) when the Python chain and markers are
+    // complete.
     let (sections_have_markers, any_blocker) =
         numbered_helper_sections_blocker_free(ctx, &parent_frames);
     Ok((parent_frames, sections_have_markers && !any_blocker))
@@ -3869,14 +3911,19 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
 /// ([`HelperCallEntry`]) re-runs the call at that CALL's orgpc
 /// (`generate_guard(resumepc=orgpc)`): it is used when a section has
 /// no resume marker, or when a marked section can reach such a residual
-/// ([`helper_resume_reaches_blocker`]). An `after_residual_call` guard
-/// already ran that residual (`generate_guard` with
-/// `after_residual_call=True`). Collapse is refused once a
+/// ([`helper_resume_reaches_blocker`]) and no heap-writing residual
+/// has run yet. An `after_residual_call` guard already ran that residual
+/// (`generate_guard` with `after_residual_call=True`). Once a
 /// heap-writing residual or a journaled live-heap effect has executed
-/// since the level was entered, and so is a blocker section then (the
-/// guard is refused). GuardTrue/GuardFalse re-evaluate at `orgpc` and
-/// take the other arm (`generate_guard` / blackhole); the innermost
-/// section scans the fail arm only.
+/// since the level was entered, collapse would re-run it
+/// (`do_residual_call`); the helper section is numbered instead
+/// (`generate_guard` at this pc, `capture_resumedata` /
+/// `rebuild_from_resumedata`) when the Python chain and resume markers
+/// are complete. A remaining-body blocker is leftover `inline_call_*`
+/// that convert interprets (`interpret_unresolved_inline_call`).
+/// GuardTrue/GuardFalse re-evaluate at `orgpc` and take the other arm
+/// (`generate_guard` / blackhole); the innermost section scans the fail
+/// arm only.
 pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3941,6 +3988,30 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
     if heap_moved || journal_delta != 0 {
+        // Collapse to CALL-orgpc would re-run the residual (`do_residual_call`
+        // of the enclosing SET_ADD). Number the helper section instead
+        // (`generate_guard` at this pc, `capture_resumedata` /
+        // `rebuild_from_resumedata`). A remaining-body blocker is the same
+        // leftover `inline_call_*` convert interprets
+        // (`interpret_unresolved_inline_call`); refusing here aborts the
+        // walk, convert is the fallback, and the FOR_ITER item is dropped.
+        let (sections_have_markers, any_blocker) =
+            numbered_helper_sections_blocker_free(ctx, &parent_frames);
+        if python_chain_complete && sections_have_markers {
+            debug_assert!(
+                parent_frames.last().is_some_and(|frame| matches!(
+                    frame.resume_coord,
+                    ParentResumeCoord::Backxlat(_)
+                )),
+                "numbered helper innermost is a helper section, not a pending CALL dest"
+            );
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[numbered-helper-guard] frames-after-effect op_pc={op_pc} blocker={any_blocker}"
+                );
+            }
+            return Ok(NumberedHelperGuard::Frames(parent_frames));
+        }
         if fbw_debug_abort_enabled() {
             for (i, frame) in parent_frames.iter().enumerate() {
                 let blocker = frame.resume_marker_jit_pc.map(|pc| {
@@ -4086,12 +4157,14 @@ fn cloned_helper_live_banks(
 /// including `with_caller_py_pc`. A second constructor here omitted that
 /// coordinate, so a runnable numbered guard closed JUMP_BACKWARD under the
 /// wrong header (`extend_transparent_helper_chain` keeps a `Backxlat`
-/// innermost and does not rebuild it). Unread helper scratch is the
-/// register's typed zero (`collect_helper_section_boxes` /
-/// `consume_one_section`). Box count must equal `frame_value_count_at`,
-/// minus the pending result slot when the admission probe omits it.
-/// `live_after_jit_pc` is the residual's next jitcode pc the may-force
-/// pre-check passes as `post_call_pc` (`helper_may_force_resumes_in_frame`).
+/// innermost and does not rebuild it). Unread live colors decline
+/// (`collect_callee_active_boxes`); filling them as typed zero made
+/// `helper_may_force_resumes_in_frame` admit a helper whose later
+/// `GUARD_TRUE` compiled as `InvalidLoop`. Box count must equal
+/// `frame_value_count_at`, minus the pending result slot when the
+/// admission probe omits it. `live_after_jit_pc` is the residual's next
+/// jitcode pc the may-force pre-check passes as `post_call_pc`
+/// (`helper_may_force_resumes_in_frame`).
 fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4210,9 +4283,9 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
 /// `rebuild_from_numbering` splits that stream with `frame_value_count_at`
 /// at the same pc. `frame.boxes` is the image the section constructor
 /// collected with the pending call result nulled
-/// (`MIFrame.get_list_of_active_boxes`, `in_a_call`): a translated helper
-/// uses that jitcode's own liveness (`resume.py` `consume_one_section`,
-/// typed zeros for unread scratch); a Python parent declines unread colors.
+/// (`MIFrame.get_list_of_active_boxes`, `in_a_call`). A translated helper
+/// uses that jitcode's own liveness (`resume.py` `consume_one_section`);
+/// unread live colors decline, same as a Python parent.
 /// The paused banks hold the restored register, so they are not re-read
 /// here. An image whose length disagrees with the decoder's count is
 /// refused, so a parent cannot donate a tagged value into the next frame
@@ -4824,42 +4897,57 @@ fn innermost_helper_parent_frame<Sym: WalkSym>(
     let call_jitcode_pc = helper_live_banks
         .as_ref()
         .and_then(|(_, _, _, call_pc)| *call_pc);
+    // `helper_innermost_resume_frame` on main reads the helper walk's
+    // banks through `collect_callee_active_boxes`: an unread live color
+    // declines the section. Filling typed zeros here made the may-force
+    // probe (`helper_may_force_resumes_in_frame`) succeed for a helper
+    // whose later `GUARD_TRUE` compiled as `InvalidLoop` (`ConstInt(0)`
+    // failargs / subject). Pending dest is not admitted: the probe runs
+    // before `execute_varargs`, and main's innermost call has no
+    // `pending_dest`. Parked `helper_live` banks stay the source when
+    // `ctx.registers_*` still name the caller.
     let collected = if let Some((ref regs_i, ref regs_r, ref regs_f, _)) = helper_live_banks {
-        collect_helper_section_boxes(
+        collect_callee_active_boxes(
             regs_i,
             regs_r,
             regs_f,
             helper_index as u32,
             op_pc,
             resume_pc,
+            None,
         )
     } else {
-        collect_helper_section_boxes(
+        collect_callee_active_boxes(
             ctx.registers_i,
             ctx.registers_r,
             ctx.registers_f,
             helper_index as u32,
             op_pc,
             resume_pc,
+            None,
         )
     };
     let boxes = match collected {
         Ok(boxes) => boxes,
-        // Missing `-live-` window: residualize the helper. Propagating
-        // LoopBearing would discard the enclosing portal loop.
-        Err(DispatchError::LoopBearingCalleeInlineUnsupported { .. }) => {
-            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+        // Missing `-live-` window or unread live color: residualize the
+        // helper. Propagating LoopBearing would discard the enclosing
+        // portal loop.
+        Err(error) => {
+            return Err(match error {
+                DispatchError::LoopBearingCalleeInlineUnsupported { .. } => {
+                    DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc }
+                }
+                other => other,
+            });
         }
-        Err(error) => return Err(error),
     };
     // `with_caller_py_pc` maps this helper jitcode pc onto the Python
     // opcode the helper implements (FOR_ITER, BINARY_OP, …). A helper
-    // jitcode has no Python code, so that lookup is None. A CALL-entry
-    // section that `extend_transparent_helper_chain` pops already carried
-    // the CALL's `caller_py_pc`; a `Backxlat` innermost from
-    // `numbered_helper_guard_resume` does not pop, so copy the walk's
+    // jitcode has no Python code, so that lookup is None. Copy the walk's
     // `inline_caller_py_pc` (the Python opcode `vstack_cur_pypc` set)
     // or JUMP_BACKWARD / last_instr greens close under the wrong header.
+    // `extend_transparent_helper_chain` also copies a parked CALL-entry's
+    // `caller_py_pc` onto the restored innermost.
     let mut frame = InlineParentFrame {
         jitcode_index: helper_index as u32,
         call_jitcode_pc,
@@ -4925,8 +5013,9 @@ fn replace_or_push_paused_live<Sym: WalkSym>(
 /// Python inline callers; a section for the same paused CALL is replaced
 /// with CALL `next_pc` (`inline_parent_from_paused_live`) so the
 /// opcode-start live from `compute_inline_helper_call_entry_frame` cannot
-/// re-execute the CALL after the helper returns. Recursive activations of
-/// the same jitcode stay distinct.
+/// re-execute the CALL after the helper returns — including when the
+/// innermost helper section is already a `Backxlat` (numbered Frames /
+/// operator tail). Recursive activations of the same jitcode stay distinct.
 fn extend_transparent_helper_chain<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     mut parent_frames: Vec<InlineParentFrame>,
@@ -4949,22 +5038,33 @@ fn extend_transparent_helper_chain<Sym: WalkSym>(
     // the residual (`same_paused_activation` exists because index-only
     // matching also collapses recursive activations).
     //
-    // A `Backxlat` section for this helper is an operator/ctor tail that
-    // already names the continuation as innermost — leave it.
+    // A `Backxlat` section for this helper is the numbered innermost
+    // (`numbered_helper_guard_resume` Frames, or an operator/ctor tail).
+    // Keep it as innermost — do not rebuild it — but still replace the
+    // Python CALL-entry below. Returning here left `get_events` at the
+    // FOR_ITER opcode-start `-live-`, so `_setup_return_value_r` wrote
+    // dest from `code[position-1]` of that live and `_resume_mainloop`
+    // re-ran the residual `next` (`blackhole.py`; `pyjitpl.py`
+    // `capture_resumedata` only assigns `resumepc` to `framestack[-1]`,
+    // parents keep the pc after the CALL they paused in).
     let mut preserved_caller_py_pc = None;
-    if parent_frames
-        .last()
-        .is_some_and(|frame| frame.jitcode_index == helper_index as u32)
-    {
-        match parent_frames.last().map(|frame| frame.resume_coord) {
-            Some(ParentResumeCoord::Backxlat(_)) => return Ok(parent_frames),
-            Some(ParentResumeCoord::CallFallthrough(_)) => {
-                preserved_caller_py_pc = parent_frames.last().and_then(|frame| frame.caller_py_pc);
-                parent_frames.pop();
-            }
-            None => {}
+    let kept_inner = match parent_frames.last().map(|frame| {
+        (
+            frame.jitcode_index == helper_index as u32,
+            frame.resume_coord,
+        )
+    }) {
+        Some((true, ParentResumeCoord::Backxlat(_))) => {
+            preserved_caller_py_pc = parent_frames.last().and_then(|frame| frame.caller_py_pc);
+            parent_frames.pop()
         }
-    }
+        Some((true, ParentResumeCoord::CallFallthrough(_))) => {
+            preserved_caller_py_pc = parent_frames.last().and_then(|frame| frame.caller_py_pc);
+            parent_frames.pop();
+            None
+        }
+        _ => None,
+    };
     let (python_live, outer_helpers) = {
         let session = ctx.session.borrow();
         // Innermost Python/portal live only. Outer activations already sit
@@ -5007,14 +5107,17 @@ fn extend_transparent_helper_chain<Sym: WalkSym>(
         }
         parent_frames.push(rebuilt);
     }
-    let mut inner = innermost_helper_parent_frame(
-        ctx,
-        helper_index,
-        op_pc,
-        after_residual_call,
-        scope,
-        ctx.live_after_jit_pc,
-    )?;
+    let mut inner = match kept_inner {
+        Some(inner) => inner,
+        None => innermost_helper_parent_frame(
+            ctx,
+            helper_index,
+            op_pc,
+            after_residual_call,
+            scope,
+            ctx.live_after_jit_pc,
+        )?,
+    };
     if inner.caller_py_pc.is_none() {
         inner.caller_py_pc = preserved_caller_py_pc;
     }
@@ -5107,12 +5210,13 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
 /// reaches here as `[caller, tail, __init__]` without this path inserting
 /// anything. A numbered helper chain already appended the innermost helper
 /// section (`numbered_helper_guard_resume`); `extend_transparent_helper_chain`
-/// is then a no-op on that `Backxlat`. Otherwise a helper subwalk appends
-/// the paused portal/Python CALL, outer helpers, and the current helper at
-/// the guard's resume pc. Operator/ctor tails that already name the
-/// continuation as innermost are left unchanged. The outermost section must
-/// name a Python `CodeObject`: a helper-only numbering would make the helper
-/// the vable portal frame (`rebuild_from_resumedata`).
+/// keeps that `Backxlat` innermost and still replaces the Python CALL-entry
+/// with CALL `next_pc`. Otherwise a helper subwalk appends the paused
+/// portal/Python CALL, outer helpers, and the current helper at the guard's
+/// resume pc. Operator/ctor tails that already name the continuation as
+/// innermost are left unchanged. The outermost section must name a Python
+/// `CodeObject`: a helper-only numbering would make the helper the vable
+/// portal frame (`rebuild_from_resumedata`).
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
