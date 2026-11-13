@@ -78,6 +78,7 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
 /// Charon's `name_path` renders every inherent impl as `<Impl>`.
 pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_function_paths: HashSet<String> = HashSet::new();
     for llbc in llbcs {
         let llbc = llbc.borrow();
         let function_paths: HashSet<String> = llbc
@@ -321,8 +322,16 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     push_hint(&mut out, key, "dont_look_inside");
                 }
             }
+            // Impl-method instantiations are keyed `{owner}::{leaf}` /
+            // `{owner}::{leaf}::<T, U>` (`fun_decl_hint_keys`), not Charon's
+            // `<Impl>` name_path. Feed those keys to the memo copy so a
+            // `Cache::getorbuild` marker reaches the same lookup
+            // `fun_decl_has_harvested_hint` uses.
+            all_function_paths.extend(fun_decl_hint_keys(llbc, fd));
         }
+        all_function_paths.extend(function_paths);
     }
+    copy_specialize_memo_onto_instantiations(&mut out, &all_function_paths);
     for v in out.values_mut() {
         v.sort();
         v.dedup();
@@ -1511,6 +1520,62 @@ pub(crate) fn fun_decl_hint_keys(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
     }
 }
 
+/// Reverse of [`fun_decl_hint_keys`]: the local FunDecl harvest stores
+/// under `key`.
+///
+/// Several decls can share `{owner}::{leaf}` (the generic template and
+/// each monomorphized copy). Prefer a body-carrying local decl with the
+/// most `signature.inputs` so a memo host (`description.py` `MemoDesc` /
+/// `FunctionDesc.signature`, filled from the code object before
+/// `specialize.py` `memo` evaluates `func(*args)`) is the real funcobj,
+/// not a zero-input marker or an Opaque import.
+pub fn fun_decl_for_hint_key<'a>(llbc: &'a Llbc, key: &str) -> Option<&'a FunDecl> {
+    let stripped = strip_crate_prefix(key);
+    let mut best: Option<&FunDecl> = None;
+    for fd in llbc.iter_fun_decls() {
+        if !fun_decl_matches_hint_key(llbc, fd, key)
+            && (stripped == key || !fun_decl_matches_hint_key(llbc, fd, &stripped))
+        {
+            continue;
+        }
+        best = Some(match best {
+            None => fd,
+            Some(prev) => pick_hint_key_decl(prev, fd),
+        });
+    }
+    best
+}
+
+/// [`Llbc::local_fn`] (Charon `name_path`) then [`fun_decl_for_hint_key`]
+/// (harvest `{owner}::{leaf}`).
+pub fn fun_decl_for_name<'a>(llbc: &'a Llbc, name: &str) -> Option<&'a FunDecl> {
+    llbc.local_fn(name)
+        .or_else(|| fun_decl_for_hint_key(llbc, name))
+}
+
+fn fun_decl_matches_hint_key(llbc: &Llbc, fd: &FunDecl, key: &str) -> bool {
+    fun_decl_hint_keys(llbc, fd).iter().any(|k| {
+        k == key
+            || k.strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with("::<"))
+            || key
+                .strip_prefix(k.as_str())
+                .is_some_and(|rest| rest.starts_with("::<"))
+    })
+}
+
+fn pick_hint_key_decl<'a>(a: &'a FunDecl, b: &'a FunDecl) -> &'a FunDecl {
+    let rank = |fd: &FunDecl| {
+        (
+            fd.has_unstructured_body(),
+            fd.item_meta.is_local,
+            fd.signature.inputs.len(),
+            std::cmp::Reverse(fd.def_id),
+        )
+    };
+    if rank(b) > rank(a) { b } else { a }
+}
+
 /// Whether `fd` carries a harvested hint in `set`.
 ///
 /// Membership is the owner-qualified key and, when that `name_path` is
@@ -1549,6 +1614,44 @@ fn harvest_marker_fn_keys(
         prefix,
         function_paths,
     )]
+}
+
+/// Charon names a monomorphized copy `generic::<T, U>` while the
+/// `_annspecialcase_memo_` marker sits on the generic funcobj.
+/// `specialize.py memo` is annotator policy on that funcobj
+/// (`func._annspecialcase_`), so every instantiation must carry
+/// `specialize:memo`.
+///
+/// `function_paths` is the harvest key space: crate-stripped `name_path`
+/// plus [`fun_decl_hint_keys`] (`{owner}::{leaf}` for impl methods). A
+/// memo marker on `Cache::getorbuild` is stored as `cache::Cache::getorbuild`;
+/// an Ident that still carries `::<T, U>` is `{owner}::{leaf}::<T, U>`,
+/// which this copies onto so [`fun_decl_has_harvested_hint`] / the
+/// `SemanticFunctionHeader` owner-qualified lookup see the same bag.
+fn copy_specialize_memo_onto_instantiations(
+    out: &mut HashMap<String, Vec<String>>,
+    function_paths: &HashSet<String>,
+) {
+    let memo_rows: Vec<(String, Vec<String>)> = out
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|hint| hint == "specialize:memo"))
+        .map(|(key, hints)| (key.clone(), hints.clone()))
+        .collect();
+    for (generic, hints) in memo_rows {
+        for path in function_paths {
+            if path == &generic {
+                continue;
+            }
+            if path
+                .strip_prefix(generic.as_str())
+                .is_some_and(|rest| rest.starts_with("::<"))
+            {
+                for hint in &hints {
+                    push_hint(out, path.clone(), hint);
+                }
+            }
+        }
+    }
 }
 
 fn marker_path_to_fn_path(
@@ -1874,6 +1977,92 @@ mod tests {
                 &functions,
             ),
             "owner::Cache::getorbuild"
+        );
+    }
+
+    #[test]
+    fn specialize_memo_harvest_covers_generic_instantiations() {
+        let mut harvested = HashMap::from([(
+            "cache::Cache::getorbuild".to_string(),
+            vec!["specialize:memo".to_string()],
+        )]);
+        let function_paths = HashSet::from([
+            "cache::Cache::getorbuild".to_string(),
+            "cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>".to_string(),
+            "cache::Cache::get".to_string(),
+        ]);
+        super::copy_specialize_memo_onto_instantiations(&mut harvested, &function_paths);
+        assert_eq!(
+            harvested.get("cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>"),
+            Some(&vec!["specialize:memo".to_string()])
+        );
+        assert!(!harvested.contains_key("cache::Cache::get"));
+    }
+
+    #[test]
+    fn harvested_memo_keys_resolve_to_fun_decls_with_inputs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/llbc/majit-rlib.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = crate::test_support::load_ullbc(path);
+        let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+        let mut n = 0usize;
+        for (key, hints) in &harvested {
+            if !hints.iter().any(|h| h == "specialize:memo") {
+                continue;
+            }
+            if key.contains("::<") {
+                continue;
+            }
+            n += 1;
+            let fd = super::fun_decl_for_hint_key(llbc, key)
+                .unwrap_or_else(|| panic!("harvest key {key} has no FunDecl"));
+            assert!(
+                !fd.signature.inputs.is_empty(),
+                "{key} FunDecl {} has empty signature",
+                fd.item_meta.name_path()
+            );
+            assert!(
+                fd.has_unstructured_body(),
+                "{key} FunDecl {} has no Unstructured body",
+                fd.item_meta.name_path()
+            );
+        }
+        assert!(n > 0, "expected specialize:memo harvest keys in majit-rlib");
+    }
+
+    #[test]
+    fn specialize_memo_copy_stays_on_owner_qualified_impl_keys() {
+        let mut harvested = HashMap::from([(
+            "cache::Cache::getorbuild".to_string(),
+            vec!["specialize:memo".to_string()],
+        )]);
+        let function_paths = HashSet::from([
+            "cache::Cache::getorbuild".to_string(),
+            "cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>".to_string(),
+            "baseobjspace::InternalSpaceCache::getorbuild".to_string(),
+            "baseobjspace::InternalSpaceCache::getorbuild::<Callable, Space>".to_string(),
+            "cache::<Impl>::getorbuild::<SpaceCacheClass, SpaceCacheInstance>".to_string(),
+        ]);
+        super::copy_specialize_memo_onto_instantiations(&mut harvested, &function_paths);
+        assert_eq!(
+            harvested.get("cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>"),
+            Some(&vec!["specialize:memo".to_string()])
+        );
+        assert!(!harvested.contains_key("baseobjspace::InternalSpaceCache::getorbuild"));
+        assert!(
+            !harvested
+                .contains_key("baseobjspace::InternalSpaceCache::getorbuild::<Callable, Space>")
+        );
+        // Charon's `<Impl>` name_path is not the harvest key;
+        // `fun_decl_has_harvested_hint` reads `{owner}::{leaf}`.
+        assert!(
+            !harvested
+                .contains_key("cache::<Impl>::getorbuild::<SpaceCacheClass, SpaceCacheInstance>")
         );
     }
 

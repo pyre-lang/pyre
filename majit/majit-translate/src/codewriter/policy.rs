@@ -166,6 +166,28 @@ pub trait JitPolicy {
     /// the flow-graph case with no func object, which this type does
     /// not represent.
     fn look_inside_graph(&mut self, graph: &FunctionGraph) -> bool {
+        // `specialize.py memo` / `MemoDesc.pycall` evaluate the host
+        // callable and never `recursivecall` the original body, so that
+        // graph is not in `translator.graphs`. Harvested LLBC still has
+        // it; declining is `funcobj.graph is None` for `call.py
+        // find_all_graphs`. `_jit_look_inside_` cannot override this:
+        // the Mutex/HashMap body is not a JIT graph.
+        if graph.has_specialize_memo_hint() {
+            if crate::decline::enabled() {
+                crate::decline::record(
+                    crate::decline::gate::LOOK_INSIDE_GRAPH,
+                    "specialize-memo",
+                    format_args!(
+                        "{}",
+                        graph
+                            .source_identity
+                            .as_deref()
+                            .unwrap_or(graph.name.as_str())
+                    ),
+                );
+            }
+            return false;
+        }
         let mut contains_loop = !find_backedges(graph).is_empty();
         let see_function = if let Some(flag) = graph.func.jit_look_inside {
             // policy.py:56-57: `_jit_look_inside_` override.
@@ -955,6 +977,18 @@ mod tests {
         let mut policy = DefaultJitPolicy::new();
         let f = make_func("h", vec!["dont_look_inside"]);
         assert!(!policy.look_inside_graph(&f));
+    }
+
+    #[test]
+    fn specialize_memo_is_not_a_jit_graph() {
+        // `MemoDesc.pycall` does not recursivecall the original body
+        // (`specialize.py memo`); `find_all_graphs` must not enter it.
+        let mut policy = DefaultJitPolicy::new();
+        let f = make_func("getorbuild", vec!["specialize:memo"]);
+        assert!(!policy.look_inside_graph(&f));
+        let mut forced = make_func("getorbuild", vec!["specialize:memo"]);
+        forced.func.jit_look_inside = Some(true);
+        assert!(!policy.look_inside_graph(&forced));
     }
 
     #[test]

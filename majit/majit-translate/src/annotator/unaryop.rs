@@ -4585,7 +4585,7 @@ fn init_someinstance_overrides(
                         ));
                     }
                 }
-                if attr == "as_ref" || attr == "as_mut" {
+                if attr == "as_ref" || attr == "as_mut" || attr == "deref" || attr == "deref_mut" {
                     let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
                         let classdesc = cd.borrow().classdesc.clone();
                         super::classdesc::ClassDesc::lookup(&classdesc, &attr).is_some()
@@ -4690,6 +4690,68 @@ fn init_someinstance_overrides(
                 //                          return self.classdef.read_attr__class__()`.
                 if attr == "__class__" {
                     return super::classdesc::ClassDef::read_attr__class__(classdef);
+                }
+                // Constant enum variant: the tag is the harvested
+                // discriminant. `__pos_0` reads `const_box` when that
+                // box is the payload (`wrap_memo_v_as_result_ok` /
+                // `try_wrap_constant_enum_cast` store V in Result::Ok).
+                // A tuple variant's harvested `__pos_0` is the field
+                // type (`RetainedSpaceCache`), not V; recast at the
+                // live addr so leftover MixLevel of `Deref::deref`
+                // unions the same classdef. Same-classdef `const_box`
+                // falls through to `s_getattr` (unaryop.py
+                // SomeInstance.getattr returns the field TYPE).
+                if inst.is_constant() {
+                    if attr == "__discriminant"
+                        && !ann.bookkeeper.classdef_is_exception_class(classdef)
+                        && let Some(tag) = ann.bookkeeper.discriminant_of_variant_classdef(classdef)
+                    {
+                        return s_const_int(tag);
+                    }
+                    if attr == "__pos_0"
+                        && ann
+                            .bookkeeper
+                            .discriminant_of_variant_classdef(classdef)
+                            .is_some()
+                        && let Some(payload) = s_self.const_()
+                    {
+                        let s_payload =
+                            ann.bookkeeper
+                                .immutablevalue(payload)
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "AnnotatorError: SomeInstance.getattr({attr:?}) \
+                                 immutablevalue failed: {err:?}"
+                                    )
+                                });
+                        let payload_same_variant = match &s_payload {
+                            SomeValue::Instance(p) => {
+                                match (p.classdef.as_ref(), inst.classdef.as_ref()) {
+                                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !payload_same_variant {
+                            let s_field =
+                                super::classdesc::ClassDef::s_getattr(classdef, &attr, &inst.flags);
+                            if let Ok(field) = s_field {
+                                match ann
+                                    .bookkeeper
+                                    .recast_constant_payload_to_field(&s_payload, &field)
+                                {
+                                    Ok(Some(recast)) => return recast,
+                                    Ok(None) => return s_payload,
+                                    Err(err) => panic!(
+                                        "AnnotatorError: SomeInstance.getattr({attr:?}) \
+                                         recast_constant_payload_to_field failed: {err:?}"
+                                    ),
+                                }
+                            }
+                            return s_payload;
+                        }
+                    }
                 }
                 // unaryop.py:840 — `getbookkeeper().record_getattr(
                 //                       self.classdef.classdesc, attr)`.
@@ -7305,6 +7367,88 @@ mod tests {
         assert!(
             matches!(result, SomeValue::Integer(_)),
             "repr(transparent) integer __pos_0 is the word, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn getattr_pos0_recasts_payload_to_field_classdef() {
+        // `wrap_memo` / `try_wrap_constant_enum_cast` store V in
+        // `SpaceCacheInstance::ClassDictStrategy` `const_box`. Harvested
+        // `__pos_0` is `RetainedSpaceCache`; recast at the live addr so
+        // leftover MixLevel of `Deref::deref` unions the same classdef.
+        use super::super::model::SomeInstance;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let ann = mk_ann();
+        let bk = &ann.bookkeeper;
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2Holder".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Q2Holder::Inner".to_string(),
+            vec![("__pos_0".to_string(), "Q2Wrapper".to_string())],
+        );
+        reg.fields.insert(
+            "Q2Wrapper".to_string(),
+            vec![("keep_alive".to_string(), "i64".to_string())],
+        );
+        reg.fields
+            .insert("Q2Inner".to_string(), Vec::<(String, String)>::new());
+        bk.set_struct_fields(Rc::new(reg));
+        let mut variants = HashMap::new();
+        variants.insert(0i64, "Inner".to_string());
+        let mut enums = HashMap::new();
+        enums.insert("Q2Holder".to_string(), variants);
+        bk.set_enum_variant_by_discriminant(Rc::new(enums));
+
+        let inner_cd = bk
+            .getuniqueclassdef_for_struct_root("Q2Inner")
+            .expect("inner classdef");
+        let wrapper_cd = bk
+            .getuniqueclassdef_for_struct_root("Q2Wrapper")
+            .expect("wrapper classdef");
+        let variant_cd = bk
+            .getuniqueclassdef_for_enum_variant("Q2Holder", "Inner")
+            .expect("variant classdef");
+        let payload = bk
+            .intern_prebuilt_instance(0x5000, &inner_cd)
+            .expect("intern inner");
+        let payload_const = payload.const_().cloned().expect("payload const");
+        let mut inst =
+            SomeInstance::new(Some(variant_cd), false, std::collections::BTreeMap::new());
+        inst.base.const_box = Some(Constant::new(payload_const));
+        let mut v = Variable::named("holder");
+        ann.setbinding(&mut v, SomeValue::Instance(inst));
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0"))),
+            ],
+        );
+        let result = hl
+            .consider(&ann)
+            .expect("variant __pos_0 getattr must succeed")
+            .unwrap();
+        let SomeValue::Instance(got) = &result else {
+            panic!("__pos_0 recast must be SomeInstance, got {result:?}");
+        };
+        let got_cd = got.classdef.as_ref().expect("recast classdef");
+        assert!(
+            Rc::ptr_eq(got_cd, &wrapper_cd),
+            "__pos_0 recast classdef must be the field classdef, got {}",
+            got_cd.borrow().name
+        );
+        let got_host = result.const_().expect("recast const");
+        assert_eq!(
+            match got_host {
+                ConstValue::HostObject(h) => h.live_ref_addr(),
+                _ => None,
+            },
+            Some(0x5000)
         );
     }
 

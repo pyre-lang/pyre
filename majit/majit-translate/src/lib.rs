@@ -244,6 +244,7 @@ fn build_semantic_program_via_active_frontend(
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
+            let mut freeze_classes = std::collections::HashSet::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
@@ -370,6 +371,9 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                freeze_classes.extend(front::mir::harvest_freeze_classes_from_llbcs(
+                    std::slice::from_ref(&llbc),
+                ));
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -494,6 +498,7 @@ fn build_semantic_program_via_active_frontend(
                 known_trait_names: std::collections::HashSet::new(),
                 struct_fields: front::semantic::StructFieldRegistry::default(),
                 immutable_fields: std::collections::HashMap::new(),
+                freeze_classes: std::collections::HashSet::new(),
                 raw_alloc_flavor_structs: std::collections::HashSet::new(),
                 exception_class_hints: Vec::new(),
                 enum_variant_by_discriminant: std::collections::HashMap::new(),
@@ -515,6 +520,7 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.freeze_classes = freeze_classes;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
@@ -771,6 +777,10 @@ pub struct HostStaticAddrs<'a> {
     /// `func(*args)`). `majit-translate` does not import the interpreter;
     /// `pyre-jit-trace` prepass fills this from the live host.
     pub memo_host_call: Option<&'a crate::flowspace::model::HostCall>,
+    /// Live pointer of a freeze nested field, `(parent, attr, child)`
+    /// (`description.py` `FrozenDesc` `getattr(pyobj, attr)`). Empty
+    /// (the `Default`) intern no nested field eagerly.
+    pub ptr_fields: &'a [(i64, &'a str, i64)],
 }
 
 /// Multi-file analysis with explicit per-source module paths.
@@ -1984,6 +1994,13 @@ fn analyze_pipeline_from_module_paths(
     if let Some(hook) = static_addrs.memo_host_call {
         call_control.set_memo_host_call(Some(hook.clone()));
     }
+    call_control.set_prebuilt_ptr_fields(
+        static_addrs
+            .ptr_fields
+            .iter()
+            .map(|(parent, field, child)| (*parent, (*field).to_string(), *child))
+            .collect(),
+    );
     call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
@@ -2026,6 +2043,7 @@ fn analyze_pipeline_from_module_paths(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
+    call_control.freeze_classes = program.freeze_classes.clone();
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.

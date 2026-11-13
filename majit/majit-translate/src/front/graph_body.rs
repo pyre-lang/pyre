@@ -77,6 +77,12 @@ struct ProviderTables {
     cross: Rc<CrossCrateSpec>,
     /// One live layout table for the translation (`descr.py` `get_size_descr`).
     struct_layouts: StructLayoutTable,
+    /// Driver `specialize:memo` evaluator (`specialize.py memo` `func(*args)`).
+    /// Owned because [`crate::HostStaticAddrs::memo_host_call`] borrows the
+    /// caller's frame; demanded bodies rebuild that view per lowering.
+    memo_host_call: Option<crate::flowspace::model::HostCall>,
+    /// Live freeze nested pointers (`HostStaticAddrs::ptr_fields`).
+    ptr_fields: Vec<(i64, String, i64)>,
 }
 
 /// Loaded crates of one `GraphBodyProvider`, for Opaque-import
@@ -179,6 +185,12 @@ impl GraphBodyProvider {
                 crates: RefCell::new(Vec::new()),
             }),
             struct_layouts: Default::default(),
+            memo_host_call: static_addrs.memo_host_call.cloned(),
+            ptr_fields: static_addrs
+                .ptr_fields
+                .iter()
+                .map(|(parent, field, child)| (*parent, (*field).to_string(), *child))
+                .collect(),
         };
         Self {
             crates: Vec::new(),
@@ -571,6 +583,11 @@ impl ProviderTables {
             .map(OwnedScalarFieldStore::borrowed)
             .collect();
         let to_exc_object = carrier.to_exc_object.as_deref().map(borrowed_segments);
+        let ptr_fields: Vec<(i64, &str, i64)> = self
+            .ptr_fields
+            .iter()
+            .map(|(parent, field, child)| (*parent, field.as_str(), *child))
+            .collect();
         f(crate::HostStaticAddrs {
             pytypes: &pytypes,
             pytypes_by_struct: &pytypes_by_struct,
@@ -587,7 +604,8 @@ impl ProviderTables {
                     .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
             },
             scalar_field_stores: &scalar_field_stores,
-            memo_host_call: None,
+            memo_host_call: self.memo_host_call.as_ref(),
+            ptr_fields: &ptr_fields,
         })
     }
 }

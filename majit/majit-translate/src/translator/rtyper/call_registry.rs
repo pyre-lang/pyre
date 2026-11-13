@@ -942,6 +942,19 @@ impl CallRegistry {
             let Ok(cd) = self.bookkeeper.getuniqueclassdef(&host) else {
                 continue;
             };
+            // FORCE of `Ptr(FuncType)` is SomeInteger (`classdesc.py`
+            // `FORCE_ATTRIBUTES_INTO_CLASSES`, process-global). Integer ∪
+            // Function-PBC is swallowed (`let _ = add_source`); getattr
+            // stays Integer. Drop the FORCE shell so the family PBC lands
+            // (`ClassRepr.getclsfield`).
+            {
+                let mut cd_mut = cd.borrow_mut();
+                if let Some(attr) = cd_mut.attrs.get_mut(&field) {
+                    if matches!(&attr.s_value, SomeValue::Integer(_) | SomeValue::Impossible) {
+                        attr.s_value = SomeValue::Impossible;
+                    }
+                }
+            }
             for func_host in hosts {
                 let inst = HostObject::new_instance(host.clone(), Vec::new());
                 if inst

@@ -598,15 +598,35 @@ pub(crate) fn substituted_unstructured(
     Some(u)
 }
 
+fn tyref_to_json(ty: &TyRef) -> Value {
+    match ty {
+        TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
+        TyRef::Other(v) => serde_json::Value::clone(v),
+    }
+}
+
 /// `fn from(t: T) -> T { t }` as an Unstructured body. core's reflexive
 /// `impl<T> From<T> for T` extracts Opaque; `FunctionDesc.getuniquegraph`
 /// still builds this identity (`description.py` `specialize`).
 pub(crate) fn identity_unstructured(ty: &TyRef) -> Option<Unstructured> {
-    let ty_json = match ty {
-        TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
-        TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
-        TyRef::Other(v) => serde_json::Value::clone(v),
-    };
+    identity_unstructured_copying_input(0, std::slice::from_ref(ty), ty)
+}
+
+/// Copy `inputs[copy_input]` onto the return local. Local 0 is the
+/// return place; local `copy_input + 1` is that argument.
+///
+/// The one-input form is reflexive `From`. `Arg::<T>::get(self, arg)`
+/// copies input 1 — the `OpArg` operand whose bits equal `T` for every
+/// non-fieldless `OpArgType` (`instruction.rs` `Arg::get`, the same
+/// identity `oparg_arg_get_alias` already applies at call sites).
+pub(crate) fn identity_unstructured_copying_input(
+    copy_input: usize,
+    inputs: &[TyRef],
+    output: &TyRef,
+) -> Option<Unstructured> {
+    let src_ty = inputs.get(copy_input)?;
+    let src_local = (copy_input + 1) as u64;
     let span = serde_json::json!({
         "data": {
             "file_id": 0,
@@ -614,32 +634,41 @@ pub(crate) fn identity_unstructured(ty: &TyRef) -> Option<Unstructured> {
             "end": {"line": 1, "col": 1}
         }
     });
-    let local = |index: u64, name: Option<&str>| {
+    let local = |index: u64, name: Option<&str>, ty: &TyRef| {
         serde_json::json!({
             "index": index,
             "name": name,
             "span": span,
-            "ty": ty_json
+            "ty": tyref_to_json(ty)
         })
     };
-    let place = |index: u64| {
+    let place = |index: u64, ty: &TyRef| {
         serde_json::json!({
             "kind": {"Local": index},
-            "ty": ty_json
+            "ty": tyref_to_json(ty)
         })
     };
+    let mut locals = vec![local(0, None, output)];
+    for (i, ty) in inputs.iter().enumerate() {
+        let name = if inputs.len() == 1 && i == 0 {
+            Some("t")
+        } else {
+            None
+        };
+        locals.push(local((i + 1) as u64, name, ty));
+    }
     let value = serde_json::json!({
         "locals": {
-            "arg_count": 1,
-            "locals": [local(0, None), local(1, Some("t"))]
+            "arg_count": inputs.len() as u64,
+            "locals": locals
         },
         "span": span,
         "body": [{
             "statements": [{
                 "kind": {
                     "Assign": [
-                        place(0),
-                        {"Use": [{"Read": place(1)}, "No"]}
+                        place(0, output),
+                        {"Use": [{"Read": place(src_local, src_ty)}, "No"]}
                     ]
                 },
                 "span": span
@@ -2659,6 +2688,35 @@ mod tests {
         assert!(
             kind.get("Assign").is_some(),
             "identity assigns the argument to the return local; kind={kind}"
+        );
+        assert_eq!(
+            u.body[0].terminator.kind.get(),
+            "\"Return\"",
+            "identity terminator is Return"
+        );
+    }
+
+    /// `Arg::<T>::get(self, arg)` copies the second input (`OpArg`) onto
+    /// the return local — the same identity `oparg_arg_get_alias` applies
+    /// at call sites (`instruction.rs` `Arg::get`).
+    #[test]
+    fn identity_unstructured_copying_second_input_is_copy_and_return() {
+        let marker = TyRef::Other(json!({"Adt": {"id": 0}}).into());
+        let oparg = TyRef::Other(json!({"Scalar": {"Integer": {"Unsigned": "U32"}}}).into());
+        let dest = TyRef::Other(json!({"Scalar": {"Integer": {"Unsigned": "U32"}}}).into());
+        let u = identity_unstructured_copying_input(1, &[marker, oparg], &dest)
+            .expect("identity of input 1");
+        assert_eq!(u.locals.arg_count, 2);
+        assert_eq!(u.locals.locals.len(), 3);
+        assert_eq!(u.body.len(), 1);
+        let kind = u.body[0].statements[0].kind_value();
+        let src = kind
+            .pointer("/Assign/1/Use/0/Read/kind/Local")
+            .and_then(Value::as_u64);
+        assert_eq!(
+            src,
+            Some(2),
+            "copies local 2 (the OpArg argument); kind={kind}"
         );
         assert_eq!(
             u.body[0].terminator.kind.get(),

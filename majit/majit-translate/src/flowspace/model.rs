@@ -5659,6 +5659,11 @@ pub struct GraphFunc {
     /// `getattr(ll_eq_function, 'no_direct_compare', False)`. `false`
     /// mirrors the attribute-absent default.
     pub no_direct_compare: bool,
+    /// Declared rustc return is a non-carrier `Result<T, E>`
+    /// (`FunctionGraph.return_is_result`). `MemoDesc.pycall` wraps a
+    /// constant instance as `Result::Ok` only when this is set
+    /// (`description.py` `MemoDesc` keeps `s_result`).
+    pub return_is_result: bool,
 }
 
 impl GraphFunc {
@@ -5698,6 +5703,7 @@ impl GraphFunc {
             module: None,
             not_rpython: false,
             no_direct_compare: false,
+            return_is_result: false,
         }
     }
 

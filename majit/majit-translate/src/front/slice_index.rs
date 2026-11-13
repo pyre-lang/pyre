@@ -684,7 +684,7 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
     // A trait-impl identity segment is stripped so
     // `["vec","Vec","<impl Index<…>>","index"]` is the same owner/leaf
     // (`rlist.py` `AbstractBaseListRepr.rtype_getslice`).
-    if vec_inherent_index_from_leafs(&segs) {
+    if vec_inherent_index_from_leafs(&segs, "index") {
         return true;
     }
     let n = segs.len();
@@ -702,18 +702,32 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
 /// `"vec","Vec","index"` or `"vec","<Impl>","index"`. A trait-impl identity
 /// segment is ignored, matching [`crate::front::mir::trait_impl_identity_path`].
 pub(crate) fn vec_inherent_index_segments(segments: &[String]) -> bool {
+    vec_inherent_index_leaf_segments(segments, "index")
+}
+
+/// Residual `Vec::index_mut` that survived the write-lift
+/// (`try_lower_struct_field_vec_index` / `ll_setitem_fast`). A later
+/// method call on the slot (`entries[i].get_or_make_subentry`) is a
+/// list read: `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
+/// (`rlist.py`). Not consulted by the RangeTo `slice_index` rewrite
+/// (`vec_inherent_index_from_leafs` stays `"index"` only).
+pub(crate) fn vec_inherent_index_mut_segments(segments: &[String]) -> bool {
+    vec_inherent_index_leaf_segments(segments, "index_mut")
+}
+
+fn vec_inherent_index_leaf_segments(segments: &[String], leaf: &str) -> bool {
     let segs: Vec<&str> = segments
         .iter()
         .map(String::as_str)
         .filter(|seg| !crate::front::mir::is_trait_impl_identity_segment(seg))
         .collect();
-    vec_inherent_index_from_leafs(&segs)
+    vec_inherent_index_from_leafs(&segs, leaf)
 }
 
-fn vec_inherent_index_from_leafs(segs: &[&str]) -> bool {
+fn vec_inherent_index_from_leafs(segs: &[&str], leaf: &str) -> bool {
     let n = segs.len();
     n >= 3
-        && segs[n - 1] == "index"
+        && segs[n - 1] == leaf
         && segs[n - 3] == "vec"
         && (segs[n - 2] == "Vec" || segs[n - 2] == "<Impl>")
 }
@@ -2693,6 +2707,22 @@ mod tests {
             "vec".into(),
             "<Impl>".into(),
             "index_mut".into(),
+        ]));
+        assert!(vec_inherent_index_mut_segments(&[
+            "vec".into(),
+            "Vec".into(),
+            "index_mut".into(),
+        ]));
+        assert!(vec_inherent_index_mut_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "index_mut".into(),
+        ]));
+        assert!(!vec_inherent_index_mut_segments(&[
+            "vec".into(),
+            "Vec".into(),
+            "index".into(),
         ]));
     }
 

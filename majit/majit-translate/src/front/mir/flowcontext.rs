@@ -586,6 +586,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// loop rewrite `front::iter_adapter` synthesizes beside Map::collect
     /// (see [`crate::front::iter_adapter::IteratorAnySite`]).
     pub(in crate::front::mir) iterator_any_sites: Vec<crate::front::iter_adapter::IteratorAnySite>,
+    /// `Iterator::find` / `position` construction sites recorded for the
+    /// Option-result loop rewrite (`IteratorFindSite`).
+    pub(in crate::front::mir) iterator_find_sites:
+        Vec<crate::front::iter_adapter::IteratorFindSite>,
     /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
     /// recorded for the checked-arith rewiring pass
     /// (`front::checked_arith`) that runs after the body lowering
@@ -2360,6 +2364,7 @@ impl<'a> Lowering<'a> {
             next_call_results: Vec::new(),
             map_collect_sites: Vec::new(),
             iterator_any_sites: Vec::new(),
+            iterator_find_sites: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
             checked_arith_uint_sites: Vec::new(),

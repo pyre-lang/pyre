@@ -3277,6 +3277,20 @@ impl StoreCore {
         Self::slot_header(&slot).map(std::rc::Rc::new)
     }
 
+    /// `func._annspecialcase_ == "specialize:memo"` (`specialize.py memo`).
+    /// Walk GraphStore aliases (`share_trait_impl_funcobj_aliases`) so a
+    /// spelled `cache::Cache::getorbuild` hits the same `MemoDesc`. Never
+    /// `get()` — `MemoDesc.pycall` leaves `funcobj.graph is None`.
+    pub(crate) fn path_has_specialize_memo_hint(&self, path: &CallPath) -> bool {
+        self.alias_paths(path).into_iter().any(|alias| {
+            self.get_built(&alias)
+                .is_some_and(|g| g.has_specialize_memo_hint())
+                || self
+                    .funcobj_header(&alias)
+                    .is_some_and(|g| g.has_specialize_memo_hint())
+        })
+    }
+
     /// The funcobj `path` names, as its attributes read it, without building its graph:
     /// `call.py` reads `_elidable_function_`, `oopspec` and `_jit_look_inside_` off the funcobj.
     /// The built graph when the build already ran; the declared header (`slot_header`) of a
@@ -4750,6 +4764,11 @@ pub struct CallControl {
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
     /// `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    /// Classes whose inherent `_freeze_` returns True
+    /// (`bookkeeper.py` `immutablevalue`). Threaded onto the dual-gate
+    /// bookkeeper so interned classdescs receive NativeCallable
+    /// `_freeze_` returning True.
+    pub freeze_classes: HashSet<String>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// Threaded onto the dual-gate bookkeeper so interned classdescs
     /// receive `class_set("_alloc_flavor_", "raw")` (`rclass.py
@@ -4825,6 +4844,10 @@ pub struct CallControl {
     /// Copied onto `CallRegistry` so a memo funcobj without its own
     /// `GraphFunc.host_call` still evaluates at annotation time.
     memo_host_call: Option<HostCall>,
+    /// Live freeze nested pointers (`description.py` `FrozenDesc`
+    /// `getattr(pyobj, attr)`). Copied onto the dual-gate bookkeeper
+    /// before leftover MixLevel intern.
+    prebuilt_ptr_fields: Vec<(i64, String, i64)>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -5473,6 +5496,7 @@ impl CallControl {
             array_header_size: crate::layout::target_word_size(),
             struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
+            freeze_classes: HashSet::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
             immutable_array_types: HashSet::new(),
@@ -5481,6 +5505,7 @@ impl CallControl {
             atomic_load_decls: Vec::new(),
             bookkeeper: std::cell::RefCell::new(None),
             memo_host_call: None,
+            prebuilt_ptr_fields: Vec::new(),
         };
         cc.stamp_ll_math_llexternal_canraise();
         cc
@@ -7588,6 +7613,9 @@ impl CallControl {
     /// goes through this so a `_jit_look_inside_ = False` trampoline stays
     /// residual the way BFS would have left it.
     pub fn add_candidate_graph_if_look_inside(&mut self, path: CallPath) {
+        if self.function_graphs.path_has_specialize_memo_hint(&path) {
+            return;
+        }
         let Some(graph) = self.function_graphs.get(&path) else {
             return;
         };
@@ -10077,6 +10105,14 @@ impl CallControl {
         // `direct_call` targets as two paths.
         self.annotate_access_directly(&todo);
         while let Some(path) = todo.pop() {
+            // Seeded helper / wrapper spelling of a `specialize:memo`
+            // funcobj: drop it from the candidate set rather than
+            // `get()`-lifting the original body (`MemoDesc.pycall`).
+            if self.function_graphs.path_has_specialize_memo_hint(&path) {
+                self.candidate_graphs.remove(&path);
+                crate::decline::record(BFS_GATE, "callee-specialize-memo", format_args!("{path}"));
+                continue;
+            }
             let graph = match self.function_graphs.get(&path) {
                 Some(g) => g.clone(),
                 None => {
@@ -10108,6 +10144,20 @@ impl CallControl {
                         // jitcode appeared" into "this named path had no
                         // registered graph at BFS time".
                         if self.candidate_graphs.contains(&callee_path) {
+                            continue;
+                        }
+                        // `MemoDesc.pycall` never recursivecall's the original
+                        // body (`specialize.py memo`). `GraphStore::get` would
+                        // still lift that LLBC body; read the header only.
+                        if self
+                            .function_graphs
+                            .path_has_specialize_memo_hint(&callee_path)
+                        {
+                            crate::decline::record(
+                                BFS_GATE,
+                                "callee-specialize-memo",
+                                format_args!("{callee_path} in {path}"),
+                            );
                             continue;
                         }
                         let graph_ref = match self.function_graphs.get(&callee_path) {
@@ -11230,6 +11280,14 @@ impl CallControl {
         target: &CallTarget,
     ) -> Option<(CallPath, std::rc::Rc<FunctionGraph>)> {
         let path = self.direct_callee_graph_path(target, None)?;
+        // `MemoDesc.pycall`: `funcobj.graph is None` (`specialize.py memo`).
+        // `GraphStore::get` would lift the Mutex/HashMap body; `getcalldescr`
+        // would then check generic `[Ref, Ref, Ref]` against specialized
+        // `[Ref, Int]` (`call.py` `NON_VOID_ARGS != FUNC.ARGS`). Residual
+        // (`guess_call_kind`) does not look up a graph.
+        if self.function_graphs.path_has_specialize_memo_hint(&path) {
+            return None;
+        }
         let graph = self.function_graphs.get(&path)?;
         Some((path, graph))
     }
@@ -12294,6 +12352,15 @@ impl CallControl {
     /// Driver `specialize:memo` evaluator, if the prepass registered one.
     pub(crate) fn memo_host_call(&self) -> Option<&HostCall> {
         self.memo_host_call.as_ref()
+    }
+
+    /// Live freeze nested pointers (`FrozenDesc` `getattr(pyobj, attr)`).
+    pub fn set_prebuilt_ptr_fields(&mut self, fields: Vec<(i64, String, i64)>) {
+        self.prebuilt_ptr_fields = fields;
+    }
+
+    pub(crate) fn prebuilt_ptr_fields(&self) -> &[(i64, String, i64)] {
+        &self.prebuilt_ptr_fields
     }
 
     /// Write the `func` attributes the decorators behind `hints` set onto the
