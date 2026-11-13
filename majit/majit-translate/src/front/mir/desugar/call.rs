@@ -6445,6 +6445,8 @@ impl<'a> Lowering<'a> {
                     second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
                     dest_local,
                     target,
+                    &arg_locals,
+                    &arg_operands,
                 )? {
                     return Ok(());
                 }
@@ -6758,6 +6760,8 @@ impl<'a> Lowering<'a> {
                             second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
                             dest_local,
                             target,
+                            &arg_locals,
+                            &arg_operands,
                         )? {
                             return Ok(());
                         }

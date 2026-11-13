@@ -2075,6 +2075,173 @@ fn result_undecidable_err_payload_declines() {
     );
 }
 
+fn result_opaque_err_ok_lit_fixture(leaf: &str) -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let str_ty = serde_json::json!({
+        "Adt": {"builtin": "Str", "generics": generics}
+    });
+    let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+    let err_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let result_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [str_ref.clone(), err_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty, "Shared"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "result", "Result"]),
+                    "kind": {"Enum": [
+                        {
+                            "name": "Ok",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                        },
+                        {
+                            "name": "Err",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                        }
+                    ]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "ErrPayload"]),
+                    "kind": "Opaque"
+                }
+            ],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_result_str"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 2, "name": "ok_lit", "span": span, "ty": result_ty.clone()},
+                            {"index": 3, "name": "ok_ref", "span": span, "ty": result_ref.clone()},
+                            {"index": 4, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(2, &result_ty),
+                                        {"Aggregate": [
+                                            {"Adt": [0, 0, null]},
+                                            [{"Const": [{"Str": "hello"}, str_ref.clone()]}]
+                                        ]}
+                                    ]}
+                                },
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(3, &result_ref),
+                                        {"Ref": {
+                                            "place": place(2, &result_ty),
+                                            "kind": "Shared",
+                                            "ptr_metadata": null
+                                        }}
+                                    ]}
+                                }
+                            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(1, &result_ref)},
+                                        {"Read": place(3, &result_ref)}
+                                    ]}, "dest": place(4, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(4, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "result", "Result", leaf]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("result opaque-err Ok(lit) fixture parses")
+}
+
+/// `Result<&str, E> != Ok(lit)` with opaque `E`: the constant Ok
+/// discriminant makes both-Err unreachable, so the structural derive
+/// emits the disc switch and the `&str` BinOp without a residual
+/// `Result::ne`.
+#[test]
+fn result_opaque_err_ne_ok_lit_lowers_to_disc_switch_and_string_binop() {
+    let llbc = result_opaque_err_ok_lit_fixture("ne");
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower Ok(lit) Result::ne");
+    assert_result_str_cmp_shape(&graph, "ne");
+}
+
+/// The `eq` half of `Result<&str, E> == Ok(lit)` with opaque `E`.
+#[test]
+fn result_opaque_err_eq_ok_lit_lowers_to_disc_switch_and_string_binop() {
+    let llbc = result_opaque_err_ok_lit_fixture("eq");
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower Ok(lit) Result::eq");
+    assert_result_str_cmp_shape(&graph, "eq");
+}
+
 fn result_err_kind_fixture(
     err_kind: serde_json::Value,
     trait_decls: serde_json::Value,

@@ -3142,6 +3142,146 @@ impl<'a> Lowering<'a> {
         (join_val, join, join_thread)
     }
 
+    /// Discriminant of a `core::result::Result` `AggregateKind::Adt`.
+    /// Keyed on the Result TypeDecl path plus the variant's declared
+    /// tag; any other ADT is `None`.
+    fn result_aggregate_kind_disc(&self, kind: &Value, dest_ty: &TyRef) -> Option<i64> {
+        let peeled = self.peel_to_option_or_result(dest_ty)?;
+        if !crate::front::result_exc::tyref_is_result(&peeled, self.llbc) {
+            return None;
+        }
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => type_decl_ref_adt_id(head.as_object()?)?,
+        };
+        let td = self.llbc.type_by_id(type_id)?;
+        if td.item_meta.name_path() != "core::result::Result" {
+            return None;
+        }
+        let variant_idx = adt.get(1).and_then(Value::as_u64)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        variants.get(variant_idx as usize)?.discriminant_i64()
+    }
+
+    /// Discriminant of an `Operand::Const` Result ADT, including a
+    /// `Ref`/`Ptr` wrapper of that ADT. Other const kinds stay `None`.
+    fn result_const_expr_disc(&self, value: &Value) -> Option<i64> {
+        let ty = self.llbc.const_expr_ty(value)?;
+        let tyref: TyRef = serde_json::from_value(ty.clone()).ok()?;
+        let peeled = self.peel_to_option_or_result(&tyref)?;
+        if !crate::front::result_exc::tyref_is_result(&peeled, self.llbc) {
+            return None;
+        }
+        let mut kind = self.llbc.const_expr_kind(value)?;
+        for _ in 0..4 {
+            let Some(obj) = kind.as_object() else {
+                break;
+            };
+            if let Some(arr) = obj.get("Ref").and_then(Value::as_array) {
+                kind = self.llbc.const_expr_kind(arr.first()?)?;
+                continue;
+            }
+            if let Some(arr) = obj.get("Ptr").and_then(Value::as_array) {
+                kind = self.llbc.const_expr_kind(arr.get(1)?)?;
+                continue;
+            }
+            break;
+        }
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let variant_idx = adt.first()?.as_u64()?;
+        let def_id = self.tyref_adt_def_id(&peeled)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        variants.get(variant_idx as usize)?.discriminant_i64()
+    }
+
+    fn unique_local_assign(&self, local: usize) -> Option<(&Rvalue, &TyRef)> {
+        if self.multi_assigned_locals.contains(&local) {
+            return None;
+        }
+        let mut found = None;
+        for bb in &self.body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                if matches!(place.kind, PlaceKind::Local(i) if i as usize == local) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some((rvalue, &place.ty));
+                }
+            }
+        }
+        found
+    }
+
+    fn result_disc_place_local(place: &Place) -> Option<usize> {
+        match &place.kind {
+            PlaceKind::Local(i) => Some(*i as usize),
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                match &inner.kind {
+                    PlaceKind::Local(i) => Some(*i as usize),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Compile-time Result discriminant of a single-assignment local,
+    /// walking `Use` / `Ref` aliases to a Result `Aggregate` or const ADT.
+    fn result_local_const_disc(&self, start: usize) -> Option<i64> {
+        let mut local = start;
+        for _ in 0..8 {
+            if self.multi_assigned_locals.contains(&local) {
+                return None;
+            }
+            if let Some(&tag) = self.const_discriminant_locals.get(&local) {
+                let ty = &self.body.locals.locals.get(local)?.ty;
+                return self
+                    .peel_to_option_or_result(ty)
+                    .filter(|t| crate::front::result_exc::tyref_is_result(t, self.llbc))
+                    .and(Some(tag));
+            }
+            let (rvalue, dest_ty) = self.unique_local_assign(local)?;
+            match rvalue {
+                Rvalue::Aggregate(kind, _) => {
+                    return self.result_aggregate_kind_disc(kind, dest_ty);
+                }
+                Rvalue::Use(Operand::Const(value), _) => {
+                    return self.result_const_expr_disc(value);
+                }
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
+                | Rvalue::Ref { place, .. }
+                | Rvalue::RawPtr { place, .. } => {
+                    local = Self::result_disc_place_local(place)?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn result_operand_const_disc(
+        &self,
+        local: Option<usize>,
+        operand: Option<&Operand>,
+    ) -> Option<i64> {
+        match operand {
+            Some(Operand::Const(value)) => self.result_const_expr_disc(value),
+            Some(Operand::Copy(place) | Operand::Move(place)) => self
+                .result_local_const_disc(local.or_else(|| Self::result_disc_place_local(place))?),
+            _ => self.result_local_const_disc(local?),
+        }
+    }
+
     /// `<Result<T, E> as PartialEq>::eq` / `ne`. Twin of
     /// [`Self::try_lower_option_niche_eq_ne`]: same `PartialEq` path
     /// rewrite, tagged-sum layout instead of a niche word.
@@ -3151,6 +3291,12 @@ impl<'a> Lowering<'a> {
     /// variant subclass). Mixed tags → `ne` is True / `eq` is False;
     /// both `Ok` compare `T`; both `Err` compare `E`. Result convention
     /// is Ok=0 / Err=1, so `bool(disc)` takes Err as the true arm.
+    ///
+    /// A compile-time discriminant on one operand (`Aggregate` of
+    /// `core::result::Result`, a `Use`/`Ref` of that local, or a const
+    /// ADT) makes the other same-variant arm unreachable, so that
+    /// payload plan is not required. Both operands non-constant still
+    /// need both plans.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -3165,6 +3311,8 @@ impl<'a> Lowering<'a> {
         second_arg_ty: Option<&TyRef>,
         dest_local: usize,
         target: usize,
+        arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
     ) -> Result<bool, LowerError> {
         if args.len() != 2 {
             return Ok(false);
@@ -3193,15 +3341,154 @@ impl<'a> Lowering<'a> {
         };
         let ok_has_payload = self.result_variant_carries_payload(&lhs_ty, 0);
         let err_has_payload = self.result_variant_carries_payload(&lhs_ty, 1);
-        let mut stack = Vec::new();
-        let Some(ok_plan) = self.classify_payload_eq(&ok_tyref, ok_has_payload, &mut stack) else {
+        let lhs_const = self
+            .result_operand_const_disc(arg_locals.first().copied().flatten(), arg_operands.first());
+        let rhs_const = self
+            .result_operand_const_disc(arg_locals.get(1).copied().flatten(), arg_operands.get(1));
+        let skip_ok = matches!(lhs_const, Some(1)) || matches!(rhs_const, Some(1));
+        let skip_err = matches!(lhs_const, Some(0)) || matches!(rhs_const, Some(0));
+        if skip_ok && skip_err {
             return Ok(false);
+        }
+        let mut stack = Vec::new();
+        let ok_plan = if skip_ok {
+            None
+        } else {
+            match self.classify_payload_eq(&ok_tyref, ok_has_payload, &mut stack) {
+                Some(plan) => Some(plan),
+                None => return Ok(false),
+            }
         };
         stack.clear();
-        let Some(err_plan) = self.classify_payload_eq(&err_tyref, err_has_payload, &mut stack)
-        else {
-            return Ok(false);
+        let err_plan = if skip_err {
+            None
+        } else {
+            match self.classify_payload_eq(&err_tyref, err_has_payload, &mut stack) {
+                Some(plan) => Some(plan),
+                None => return Ok(false),
+            }
         };
+
+        if skip_ok || skip_err {
+            let const_tag = if skip_err { 0 } else { 1 };
+            let runtime_idx = if lhs_const.is_none() {
+                0
+            } else if rhs_const.is_none() {
+                1
+            } else {
+                0
+            };
+            let plan = if skip_err {
+                ok_plan
+                    .as_ref()
+                    .expect("const Ok keeps the Ok payload plan")
+            } else {
+                err_plan
+                    .as_ref()
+                    .expect("const Err keeps the Err payload plan")
+            };
+            let payload_owner = if skip_err { &ok_owner } else { &err_owner };
+            let payload_ty = if skip_err { &ok_ty } else { &err_ty };
+            let payload_tyref = if skip_err { &ok_tyref } else { &err_tyref };
+            let bb_id = self.emit_bb(mir_bb);
+            let d_runtime = emit_enum_disc_read(
+                &mut self.graph,
+                bb_id,
+                args[runtime_idx].clone(),
+                &result_owner,
+            );
+            let tag = push_block_op(&mut self.graph, bb_id, OpKind::ConstInt(const_tag));
+            let discs_ne = push_block_op(
+                &mut self.graph,
+                bb_id,
+                OpKind::BinOp {
+                    op: "ne".to_string(),
+                    lhs: d_runtime,
+                    rhs: tag,
+                    result_ty: ValueType::Int,
+                },
+            );
+            let placeholder = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            let mut carried: Vec<Variable> = Vec::new();
+            for v in &link_args {
+                if *v != placeholder && !carried.contains(v) {
+                    carried.push(v.clone());
+                }
+            }
+            let mixed_sources = diamond_arm_sources(&carried, &[]);
+            let match_sources = diamond_arm_sources(&carried, &[args[0].clone(), args[1].clone()]);
+            let (mixed_bb, mixed_inputs) =
+                self.graph.create_block_with_arg_vars(mixed_sources.len());
+            let (match_bb, match_inputs) =
+                self.graph.create_block_with_arg_vars(match_sources.len());
+            let mixed_val =
+                push_block_op(&mut self.graph, mixed_bb, OpKind::ConstBool(leaf == "ne"));
+            let lhs_match =
+                crate::front::option_variant::map_source(&match_sources, &match_inputs, &args[0])
+                    .expect("Result eq/ne lhs threaded into const-disc match arm");
+            let rhs_match =
+                crate::front::option_variant::map_source(&match_sources, &match_inputs, &args[1])
+                    .expect("Result eq/ne rhs threaded into const-disc match arm");
+            let (match_val, match_exit, match_exit_thread) = self.emit_result_payload_cmp(
+                match_bb,
+                &match_inputs,
+                leaf,
+                lhs_match,
+                rhs_match,
+                payload_owner,
+                payload_ty,
+                payload_tyref,
+                plan,
+            );
+            let (join, join_inputs) = self.graph.create_block_with_arg_vars(link_args.len());
+            let mixed_args = remap_diamond_goto_args(
+                &link_args,
+                &placeholder,
+                &mixed_val,
+                &mixed_sources,
+                &mixed_inputs,
+            );
+            self.graph.set_goto(mixed_bb, join, mixed_args);
+            let match_args = remap_payload_goto_args(
+                &link_args,
+                &placeholder,
+                &match_val,
+                &match_sources,
+                &match_inputs,
+                &match_inputs,
+                &match_exit_thread,
+            );
+            self.graph.set_goto(match_exit, join, match_args);
+            self.graph.set_branch(
+                bb_id,
+                discs_ne,
+                mixed_bb,
+                mixed_sources,
+                match_bb,
+                match_sources,
+            );
+            let mut remap: std::collections::HashMap<u64, Variable> =
+                std::collections::HashMap::new();
+            for (src, dst) in link_args.iter().zip(join_inputs.iter()) {
+                remap.insert(src.id(), dst.clone());
+            }
+            for value in self.local_var.iter_mut().flatten() {
+                value.remap_words(&remap);
+            }
+            self.remap_forwarded_provenance(&remap);
+            self.emit_block.set(mir_bb, join);
+            let join_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(join, target_bb, join_args);
+            return Ok(true);
+        }
+
+        let ok_plan = ok_plan.expect("both-runtime Result eq/ne classified Ok");
+        let err_plan = err_plan.expect("both-runtime Result eq/ne classified Err");
 
         let bb_id = self.emit_bb(mir_bb);
         let d1 = emit_enum_disc_read(&mut self.graph, bb_id, args[0].clone(), &result_owner);
