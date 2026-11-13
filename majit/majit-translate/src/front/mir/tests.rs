@@ -206,13 +206,14 @@ fn raw_scalar_pointer_tuple_field_is_int_banked() {
 #[test]
 fn os_path_family_tuple_field_is_owned_header_ref() {
     use crate::model::ValueType;
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(std::collections::HashMap::new());
     for spelling in [
-        "PathBuf",
         "path::PathBuf",
         "std::path::PathBuf",
-        "OsString",
         "ffi::OsString",
         "std::ffi::OsString",
+        "std::ffi::os_str::OsString",
     ] {
         assert_eq!(
             super::tuple_field_value_type(spelling),
@@ -226,6 +227,16 @@ fn os_path_family_tuple_field_is_owned_header_ref() {
         );
     }
     assert_eq!(
+        super::tuple_field_value_type("PathBuf"),
+        ValueType::Ref(None),
+        "a bare PathBuf leaf is not rpath.py s_Str0"
+    );
+    assert_eq!(
+        super::positional_field_type("PathBuf"),
+        "&PathBuf",
+        "a bare PathBuf leaf is still a GC pointer"
+    );
+    assert_eq!(
         super::tuple_field_value_type("other::PathBuf"),
         ValueType::Ref(None),
         "a lookalike stays classdef-less"
@@ -235,6 +246,21 @@ fn os_path_family_tuple_field_is_owned_header_ref() {
         "&other::PathBuf",
         "a lookalike instance is still a GC pointer"
     );
+    majit_ir::descr::register_struct_origins(std::collections::HashMap::from([(
+        "PathBuf".to_string(),
+        "path".to_string(),
+    )]));
+    assert_eq!(
+        super::tuple_field_value_type("PathBuf"),
+        ValueType::Ref(Some("path::PathBuf".into())),
+        "a CAST PathBuf leaf resolves through TypeDecl struct_origins"
+    );
+    assert_eq!(
+        super::positional_field_type("PathBuf"),
+        "PathBuf",
+        "a resolved PathBuf leaf is the owned header, not &PathBuf"
+    );
+    majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
 }
 
 use super::{no_tombstoned_leaves, scalar_replace_named_struct_aggregates};

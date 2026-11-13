@@ -2262,7 +2262,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// The callee is `From::from`: a `CallKind::Trait` on
-    /// `core::convert::From`, or a FunDecl whose leaf is `from`.
+    /// `core::convert::From`, or a FunDecl that is a method of a
+    /// `core::convert::From` impl (`fundecl_is_core_convert_from_from`).
     /// Combined with a string/path-family source and dest this is the
     /// annotation identity the blanket `Into::into` body (`U::from(self)`)
     /// lowers to when the selected `From` impl is Opaque.
@@ -2273,7 +2274,7 @@ impl<'a> Lowering<'a> {
             CallKind::Fun(FunId::Regular { id }) => self
                 .llbc
                 .fn_by_id(*id)
-                .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("from")),
+                .is_some_and(|fd| fundecl_is_core_convert_from_from(self.llbc, fd)),
             _ => false,
         }
     }

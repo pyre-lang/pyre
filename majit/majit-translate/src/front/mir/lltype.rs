@@ -5945,23 +5945,31 @@ pub(crate) fn is_str_family_class_root(root: &str) -> bool {
         || is_rust_heap_string_root(root)
         || root == "str"
         || is_os_path_family_root(root)
+        || is_os_path_family_root(&majit_ir::descr::canonical_struct_name(root))
 }
 
 /// Class-root / TypeDecl spelling of std `Path` / `PathBuf` / `OsStr` /
 /// `OsString`.
 ///
-/// `rpath.py` `_posix_rnormpath` annotates path values as `s_Str0`; the
-/// translator has one string type (`rstr.py`), so these project as
-/// `SomeString`. A lookalike (`other::PathBuf`) is not this family: after
-/// stripping `std` / `alloc` / `core`, the first remaining module must be
-/// a std path/ffi owner, or the spelling is the bare leaf.
+/// `rpath.py` `_posix_rnormpath` annotates path values as `s_Str0`;
+/// `annotator/model.py` `SomeString` is that one string type (`rstr.py`).
+/// A lookalike (`other::PathBuf`) is not this family: after stripping
+/// `std` / `alloc` / `core`, the first remaining module must be a std
+/// path/ffi owner. A bare leaf (`PathBuf`) is not a resolved TypeDecl
+/// path (`class_identity_spelling` of `std::path::PathBuf` is
+/// `path::PathBuf`; Charon Ident arrays also emit
+/// `std::ffi::os_str::OsString`). Callers that still see a CAST leaf
+/// pass it through `canonical_struct_name` (TypeDecl `name_path`
+/// module) before this predicate; [`is_str_family_class_root`] does
+/// that so `valuetype_to_someshell` of `Ref(Some("PathBuf"))` is
+/// `s_Str0`.
 pub(crate) fn is_os_path_family_root(root: &str) -> bool {
     let leaf = root.rsplit("::").next().unwrap_or(root);
     if !matches!(leaf, "PathBuf" | "Path" | "OsString" | "OsStr") {
         return false;
     }
-    if root == leaf {
-        return true;
+    if !root.contains("::") {
+        return false;
     }
     let stripped = root
         .strip_prefix("std::")
@@ -7418,6 +7426,46 @@ pub(in crate::front::mir) fn is_deref_fundecl(fd: &FunDecl, llbc: &Llbc) -> bool
     fundecl_impl_trait_decl_path(llbc, fd).is_some_and(|path| is_ops_deref_trait_path(&path))
 }
 
+/// Whether `fd` is the `from` method of an `impl core::convert::From`.
+///
+/// The impl id is the FunDecl's trait-impl name segment
+/// ([`trait_impl_id_for_fundecl`]); the trait is that impl's
+/// `impl_trait` declaration `item_meta.name_path()`
+/// ([`fundecl_impl_trait_decl_path`]). The method name is
+/// `TraitDecl` / `assoc_item_names` `from`, not the FunDecl leaf, so a
+/// free function whose name ends in `from` is not mistaken for the
+/// identity conversion. An unresolved impl, a non-`From` trait, or a methods table that does not name
+/// `from` is false. Instantiated copies share the template's impl id,
+/// so the methods row is not required to list this FunDecl's `def_id`.
+pub(in crate::front::mir) fn fundecl_is_core_convert_from_from(llbc: &Llbc, fd: &FunDecl) -> bool {
+    if fundecl_impl_trait_decl_path(llbc, fd).as_deref() != Some("core::convert::From") {
+        return false;
+    }
+    let Some(impl_id) = trait_impl_id_for_fundecl(fd) else {
+        return false;
+    };
+    let methods = llbc.trait_impl_methods(impl_id as usize);
+    if !methods.is_empty() {
+        return methods.iter().any(|method| {
+            let Some(method) = method.as_ref() else {
+                return false;
+            };
+            let Some(trait_id) = method.trait_id else {
+                return false;
+            };
+            let idx = method.method_idx.unwrap_or(0);
+            llbc.trait_method_name(trait_id, idx) == Some("from")
+        });
+    }
+    llbc.trait_impls_raw()
+        .get(impl_id as usize)
+        .and_then(|ti| ti.get("impl_trait"))
+        .and_then(|trait_ref| trait_ref.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|trait_id| llbc.trait_method_name(trait_id, 0))
+        == Some("from")
+}
+
 /// Whether `reg` resolves to a method of `core::ops::deref::Deref` /
 /// `DerefMut`. Unlike `deref_cast_root` this makes no claim about the
 /// dereferenced type — the caller pairs it with a
@@ -8851,13 +8899,18 @@ pub(in crate::front::mir) fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
 
 /// Field-type spelling of a `newtype_oparg!` transparent `u32` wrapper.
 ///
-/// [`tyref_is_oparg`] is the `TyRef` form. The annotator's
-/// `project_struct_field_type` sees the AST string
-/// (`bytecode::oparg::ConstIdx`) and must return `s_uint()` so
-/// `Result<ConstIdx, Infallible>::Ok.__pos_0` unions with the Integer
-/// `Into<ConstIdx>` result (`core::convert` `TryFrom` blanket
-/// `Ok(U::into(value))`). A lookalike (`other::ConstIdx`) keeps the
-/// named-struct intern.
+/// [`tyref_is_oparg`] is the `TyRef` form (`TypeDecl` `name_path`
+/// `rustpython_compiler_core::bytecode::oparg::X`). The annotator's
+/// `project_struct_field_type` sees the crate-stripped AST string
+/// (`bytecode::oparg::ConstIdx`, `field_row_struct_identity`) and the
+/// CAST leaf (`ConstIdx` from `charon_adt_to_ast_string` /
+/// `option_payload_tuple_suffix`). A CAST leaf is resolved through
+/// `canonical_struct_name` (TypeDecl `name_path` module) before this
+/// predicate so `Result<ConstIdx, Infallible>::Ok.__pos_0` unions with
+/// the Integer `Into<ConstIdx>` result (`core::convert` `TryFrom`
+/// blanket `Ok(U::into(value))`; `annotator/model.py` `SomeInteger`).
+/// A lookalike (`other::ConstIdx`) and a bare leaf with no origin
+/// keep the named-struct intern.
 pub(crate) fn is_oparg_newtype_spelling(ty: &str) -> bool {
     let t = ty
         .trim()
@@ -8875,8 +8928,6 @@ pub(crate) fn is_oparg_newtype_spelling(ty: &str) -> bool {
         rest
     } else if let Some(rest) = t.strip_prefix("oparg::") {
         rest
-    } else if !t.contains("::") {
-        t
     } else {
         return false;
     };
@@ -15472,8 +15523,12 @@ fn render_adt_suffix_type_args(
 /// ([`crate::front::llbc_hints::exception_class_key`]), the same
 /// declaration [`charon_adt_to_ast_string`] stamps: `ClassDesc.getuniqueclassdef`
 /// (`classdesc.py`) is that class, not the `__name__` leaf, so
-/// `Result<_, synth::E>` must not intern `E`. Every other monomorphic
-/// ADT keeps the TypeDecl leaf so existing intern keys stay put. Nested
+/// `Result<_, synth::E>` must not intern `E`. rpath `_posix_rnormpath`
+/// / `newtype_oparg!` wrappers keep the crate-stripped TypeDecl path
+/// (`path::PathBuf`, `bytecode::oparg::ConstIdx`) so Option intern
+/// noneifies as `SomeString` / `SomeInteger` (`annotator/model.py`).
+/// Vec elements still go through [`charon_adt_to_ast_string`] and keep
+/// the leaf (`type_align` of `Vec<PathBuf>`). Nested
 /// type arguments keep `&T` / `&mut T` so `Option<&T>` is not the tagged
 /// `Option<T>` class (`intern_niche_option_payload_spelling`;
 /// `model.py` `SomeObject.noneify`). [`charon_type_value_to_ast_string`]
@@ -15534,10 +15589,18 @@ pub(in crate::front::mir) fn charon_type_value_to_enum_arg(
     if let Some(key) = marked_exception_ast_name(llbc, &name) {
         return key;
     }
-    let leaf = name.rsplit("::").next().unwrap_or(&name);
     if rbigint_gc_root::is_root_path(&name) {
         return "RBigInt".to_string();
     }
+    if let Some(head) = crate_stripped_os_path_or_oparg_head(&name) {
+        let nested = render_adt_suffix_type_args(adt, llbc, depth, tombstoned);
+        return if nested.is_empty() {
+            head
+        } else {
+            format!("{head}<{}>", nested.join(","))
+        };
+    }
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
     let leaf_spelling = if tombstoned.contains(leaf) && !intern_suffix_keeps_cast_leaf(llbc, leaf) {
         super::class_identity_spelling(&name, tombstoned)
     } else {
@@ -15566,6 +15629,15 @@ fn intern_suffix_keeps_cast_leaf(llbc: &Llbc, leaf: &str) -> bool {
         })
         .count()
         >= 2
+}
+
+/// Option/Result intern-suffix head when the TypeDecl is rpath `s_Str0`
+/// or a `newtype_oparg!` wrapper. [`charon_adt_to_ast_string`] (Vec
+/// elements, CAST intern of the ADT itself) keeps the leaf so
+/// `type_align` still sees `Vec<PathBuf>`.
+fn crate_stripped_os_path_or_oparg_head(name_path: &str) -> Option<String> {
+    let stripped = strip_crate_prefix(name_path);
+    (is_os_path_family_root(&stripped) || is_oparg_newtype_spelling(&stripped)).then_some(stripped)
 }
 
 /// Declaration intern key when `name_path` is a marked exception class.
