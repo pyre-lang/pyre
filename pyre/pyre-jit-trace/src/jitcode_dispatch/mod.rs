@@ -10667,6 +10667,20 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // Same field list as `walk_parked_walk_tls_stack`: frame-address words
     // plus the slots those journals already forwarded
     // (`fbw_state::visit_journalled_frame_roots`).
+    // The escape-flush undo stays armed from force time until the abort
+    // epilogue consumes it. Its slots can be the only reference to the
+    // pre-walk locals the flush displaced, and the restore compares the live
+    // slots against `flush_image`, so both are forwarded on that window, as
+    // `walk_parked_walk_tls_stack` does for a parked undo.
+    let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
+    if let Some(undo) = escape_undo.as_mut() {
+        for slot in undo.slots.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+        for slot in undo.flush_image.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+    }
     let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
     for entry in locals_mirror.iter_mut() {
         // The frame identity is a GC edge (`executioncontext.py topframeref`).
