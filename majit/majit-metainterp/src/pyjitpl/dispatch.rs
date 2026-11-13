@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use majit_ir::{Descr, FieldDescr, GreenKey, GreenType, OpCode, OpRef, SizeDescr, Type, Value};
+use majit_ir::{GreenKey, GreenType, OpCode, OpRef, Type, Value};
 use smallvec::SmallVec;
 
 use super::{MIFrame, MIFrameStack};
@@ -1406,7 +1406,6 @@ fn refuse_walk_local_ref_args(
     func: usize,
     raw_i: &[i64],
     raw_r: &[i64],
-    args: &[OpRef],
     arg_classes: &str,
 ) -> Option<TraceAction> {
     let small_ref = raw_r.iter().any(|&ptr| {
@@ -1946,7 +1945,6 @@ where
     fn finalize_standard_virtualizable_may_force(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         active: Option<ActiveStandardVirtualizable>,
     ) -> TraceAction {
         // `prepare_standard_virtualizable_before_residual_call` reaches the
@@ -2010,7 +2008,6 @@ where
             };
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardNotForced,
                 &[],
                 resume_pc,
@@ -2045,21 +2042,12 @@ where
     fn record_state_guard(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         opcode: OpCode,
         args: &[OpRef],
         resume_pc: usize,
         after_residual_call: bool,
     ) -> OpRef {
-        self.record_state_guard_with_value(
-            ctx,
-            sym,
-            opcode,
-            args,
-            resume_pc,
-            after_residual_call,
-            None,
-        )
+        self.record_state_guard_with_value(ctx, opcode, args, resume_pc, after_residual_call, None)
     }
 
     /// Sibling of [`Self::record_state_guard`] that attaches `value` at
@@ -2069,7 +2057,6 @@ where
     fn record_state_guard_with_value(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         opcode: OpCode,
         args: &[OpRef],
         resume_pc: usize,
@@ -2098,7 +2085,6 @@ where
         let guard_op = ctx.record_guard_with_value(opcode, args, value);
         self.publish_last_guard_resume_snapshot(
             ctx,
-            sym,
             resume_pc,
             after_residual_call,
             GuardStampTarget::LastOp,
@@ -2128,7 +2114,6 @@ where
     fn nonstandard_virtualizable(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         pc: usize,
         vable_opref: OpRef,
         fielddescr: &majit_ir::DescrRef,
@@ -2141,7 +2126,7 @@ where
                 vable_opref,
                 standard_box,
             } => {
-                let promoted = self.implement_guard_value(ctx, sym, eqbox, isstandard, pc);
+                let promoted = self.implement_guard_value(ctx, eqbox, isstandard, pc);
                 ctx.commit_nonstandard_virtualizable(
                     promoted,
                     vable_opref,
@@ -2175,7 +2160,6 @@ where
     fn publish_last_guard_resume_snapshot(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         resume_pc: usize,
         after_residual_call: bool,
         target: GuardStampTarget,
@@ -2301,7 +2285,6 @@ where
     fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         box_: OpRef,
         runtime_value: i64,
         resume_pc: usize,
@@ -2315,7 +2298,6 @@ where
         // `pyjitpl.py` `implement_guard_value`
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardValue,
             &[box_, promoted_box],
             resume_pc,
@@ -2373,7 +2355,6 @@ where
     fn establish_nullity(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         src: OpRef,
         src_value: i64,
         opcode_pc: usize,
@@ -2390,10 +2371,10 @@ where
             // A known class already implies non-null, so the guard would be
             // redundant.
             if !ctx.heap_cache().is_class_known(src) {
-                self.record_state_guard(ctx, sym, OpCode::GuardNonnull, &[src], opcode_pc, false);
+                self.record_state_guard(ctx, OpCode::GuardNonnull, &[src], opcode_pc, false);
             }
         } else if !src.is_constant() {
-            self.record_state_guard(ctx, sym, OpCode::GuardIsnull, &[src], opcode_pc, false);
+            self.record_state_guard(ctx, OpCode::GuardIsnull, &[src], opcode_pc, false);
             let null = ctx.const_null();
             self.replace_box(ctx, src, null, Type::Ref);
         }
@@ -2431,7 +2412,6 @@ where
     fn goto_if_not(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         opcode_pc: usize,
         cond: OpRef,
         cond_value: i64,
@@ -2447,7 +2427,7 @@ where
         } else {
             (OpCode::GuardFalse, 0)
         };
-        self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
+        self.record_state_guard(ctx, guard, &[cond], opcode_pc, false);
         if cond_value == 0 {
             self.frames.current_mut().code_cursor = target;
         }
@@ -2496,7 +2476,6 @@ where
     fn create_segmented_trace(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         mp_opcode_pc: usize,
         mp_green_pc: Option<i64>,
     ) -> TraceAction {
@@ -2507,7 +2486,6 @@ where
         // emitted at loop close uses.
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardAlwaysFails,
             &[],
             mp_opcode_pc,
@@ -3287,7 +3265,6 @@ where
     fn finish_residual_call_exception_path(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         effectinfo: &majit_ir::descr::EffectInfo,
     ) -> TraceAction {
         let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
@@ -3331,7 +3308,6 @@ where
         if exc == 0 {
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardNoException,
                 &[],
                 resume_pc,
@@ -3351,7 +3327,6 @@ where
         let exc_class_box = ctx.const_int(typeptr);
         let guard_op = self.record_state_guard_with_value(
             ctx,
-            sym,
             OpCode::GuardException,
             &[exc_class_box],
             resume_pc,
@@ -3371,11 +3346,7 @@ where
     /// CALL_ASSEMBLER_* arms.  CALL_ASSEMBLER always can raise (the
     /// callee is arbitrary compiled code), so there is no
     /// `check_can_raise` gate — the exception path is unconditional.
-    fn finish_call_assembler_exception_path(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-    ) -> TraceAction {
+    fn finish_call_assembler_exception_path(&mut self, ctx: &mut TraceCtx) -> TraceAction {
         let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
         // `code_cursor` is post-call and points at this CALL_ASSEMBLER's
         // trailing `-live-` marker. `MIFrame::pc` is only the saved resume
@@ -3386,7 +3357,6 @@ where
         if exc == 0 {
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardNoException,
                 &[],
                 resume_pc,
@@ -3402,7 +3372,6 @@ where
         let exc_class_box = ctx.const_int(typeptr);
         let guard_op = self.record_state_guard_with_value(
             ctx,
-            sym,
             OpCode::GuardException,
             &[exc_class_box],
             resume_pc,
@@ -3441,7 +3410,6 @@ where
     fn record_or_fold_fused_guard(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         opcode: OpCode,
         lhs: OpRef,
         rhs: OpRef,
@@ -3492,7 +3460,7 @@ where
             // `generate_guard`'s `if isinstance(box, Const): return` is
             // `record_state_guard`'s own first gate, so a folded `cond`
             // suppresses the guard without a second test here.
-            self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
+            self.record_state_guard(ctx, guard, &[cond], opcode_pc, false);
         }
         if !taken {
             self.frames.current_mut().code_cursor = target;
@@ -4221,7 +4189,7 @@ where
             );
         }
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
         if !matches!(action, TraceAction::Continue) {
             return action;
         }
@@ -4229,7 +4197,7 @@ where
         if let Some(vbox) = vable_opref {
             ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
         }
-        self.finish_call_assembler_exception_path(ctx, sym)
+        self.finish_call_assembler_exception_path(ctx)
     }
 
     /// Report where a bytecode-level abort was DECIDED, which the merge point
@@ -4902,7 +4870,7 @@ where
     /// a `GuardOverflow` + branch to the overflow label (it did).  The guard's
     /// resume position is this op, so on failure the blackhole re-executes
     /// `int_*_jump_if_ovf` and performs the overflow branch itself.
-    fn trace_int_binop_jump_if_ovf(&mut self, ctx: &mut TraceCtx, sym: &mut S, opcode: OpCode) {
+    fn trace_int_binop_jump_if_ovf(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         // Canonical `Lii>i` encoding: [target:L][lhs:u8][rhs:u8][dst:u8].
         let (opcode_pc, target, lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
@@ -4956,7 +4924,7 @@ where
             };
             // The guard is box-less, so `record_state_guard`'s Const gate —
             // which reads `args[0]` — cannot see that the operation folded.
-            self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+            self.record_state_guard(ctx, guard, &[], opcode_pc, false);
         }
         if overflowed {
             // Overflow branch taken: the result register is not written; follow
@@ -10110,7 +10078,6 @@ mod tests {
         staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let recorder = crate::recorder::Trace::new();
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
-        let mut sym = SnapshotSym;
         let exc_class = ctx.const_int(0xc1a55);
         let mut machine =
             JitCodeMachine::<SnapshotSym, ClosureRuntime<fn(usize) -> usize>>::with_framestack(
@@ -10120,7 +10087,6 @@ mod tests {
             );
         let guard_op = machine.record_state_guard(
             &mut ctx,
-            &mut sym,
             OpCode::GuardException,
             &[exc_class],
             live_pc,

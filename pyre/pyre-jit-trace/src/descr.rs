@@ -12,10 +12,7 @@ use std::sync::LazyLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, IndexMapExt, JitCodeDescr, SizeDescr, SwitchDescr,
-    Type,
-};
+use majit_ir::{Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type};
 
 // TODO: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs
@@ -4188,6 +4185,8 @@ use pyre_object::functional::{
     RANGE_ITER_STEP_ONE_START_OFFSET, RANGE_ITER_STEP_ONE_STOP_OFFSET, RANGE_LENGTH_OFFSET,
     RANGE_PROMOTE_STEP_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
+#[cfg(test)]
+use pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS;
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_EXTENDED_USER_MAP_OFFSET, EXC_EXTENDED_USER_STORAGE_OFFSET,
     EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET, EXC_USER_MAP_OFFSET,
@@ -4201,11 +4200,10 @@ use pyre_object::interp_exceptions::{
     EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
     EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
     EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WINERROR_OFFSET,
-    EXC_WRITTEN_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
-    W_BASE_EXCEPTION_USER_GC_TYPE_ID, W_BASE_EXCEPTION_USER_SIZE, W_EXCEPTION_EXTENDED_GC_TYPE_ID,
-    W_EXCEPTION_EXTENDED_SIZE, W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID,
-    W_EXCEPTION_EXTENDED_USER_SIZE, exc_kind_canonical_is_user_layout,
-    exc_kind_uses_extended_layout, exc_realbase_pytype,
+    EXC_WRITTEN_OFFSET, ExcKind, W_BASE_EXCEPTION_SIZE, W_BASE_EXCEPTION_USER_GC_TYPE_ID,
+    W_BASE_EXCEPTION_USER_SIZE, W_EXCEPTION_EXTENDED_GC_TYPE_ID, W_EXCEPTION_EXTENDED_SIZE,
+    W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID, W_EXCEPTION_EXTENDED_USER_SIZE,
+    exc_kind_canonical_is_user_layout, exc_kind_uses_extended_layout, exc_realbase_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;

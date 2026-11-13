@@ -5,11 +5,10 @@
 /// complete, we compile it and cache the result.
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
-use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
-use majit_ir::{GREEN_INLINE, GcRef, GreenKey, GreenType, RetainedGreens, Type, Value};
+use majit_ir::{GREEN_INLINE, GcRef, GreenKey, GreenType, RetainedGreens, Value};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -3143,6 +3142,7 @@ impl WarmEnterState {
 mod tests {
     use super::*;
     use crate::test_greens::{gk, gk_with_uhash};
+    use majit_ir::Type;
 
     fn keys_sharing_index(index_of: impl Fn(u64) -> usize, n: usize) -> Vec<majit_ir::GreenKey> {
         let first = gk(1);
@@ -3232,7 +3232,7 @@ mod tests {
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         // `compile.py:566-567` order: register the strong owner, then attach.
         let token = attach_alive_for_key(&mut ws, &key, token);
-        let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
+        ws.cell_key_for(&key).expect("the key now owns a cell");
 
         assert!(
             ws.get_procedure_token_for_key(&key).is_some(),
@@ -3350,7 +3350,7 @@ mod tests {
         let key = GreenKey::new(vec![0x33, 0x44]);
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         let token = attach_alive_for_key(&mut ws, &key, token);
-        let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
+        ws.cell_key_for(&key).expect("the key now owns a cell");
         // The fixture's own handle is gone; `alive_loops` is the only owner,
         // exactly as `memmgr.py:9-12` describes production.
         drop(token);
@@ -4655,12 +4655,12 @@ mod tests {
         assert!(cell.should_remove_jitcell());
 
         // A cell that is tracing should NOT be removable
-        let mut cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
         cell.flags.set(cell.flags.get() | (JcFlags::JC_TRACING));
         assert!(!cell.should_remove_jitcell());
 
         // A cell with DONT_TRACE_HERE but no token history is removable
-        let mut cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
         assert!(!cell.should_remove_jitcell()); // has_seen_a_procedure_token is false
@@ -4671,7 +4671,7 @@ mod tests {
         // stamping a number: `has_seen_a_procedure_token` reads the weakref
         // slot (warmstate.py), which is what the arm below is a
         // reading of.
-        let mut cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
         {
@@ -4696,7 +4696,7 @@ mod tests {
         assert!(cell.should_remove_jitcell());
 
         // warmstate.py:222-225: FORCE_FINISH must NOT be removed
-        let mut cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_FORCE_FINISH));
         assert!(!cell.should_remove_jitcell());
@@ -5045,7 +5045,7 @@ mod tests {
 
         ws.force_start_tracing_for_key(&gk(key as i64), &[]);
         ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive(&mut ws, key, token);
 
         assert!(matches!(
@@ -5111,7 +5111,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         ws.set_function_threshold(2);
         let key = GreenKey::new(vec![0xC0, 0xDE]);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, Arc::clone(&token));
 
         for _ in 0..50 {
@@ -5129,7 +5129,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         ws.set_function_threshold(2);
         let key = gk(0xC0DE);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, token);
         for _ in 0..50 {
             assert!(matches!(
@@ -5212,7 +5212,7 @@ mod tests {
     fn tracing_and_compiled_is_already_tracing() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![0xA21, 0xA22]);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, token);
         let cell = ws.lookup_chain_with_key(&key).expect("compiled cell");
         cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
@@ -5335,7 +5335,7 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
         ws.set_function_threshold(1);
         let key = GreenKey::new(vec![0xD0, 0xC8]);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, token);
         {
             let cell = ws
@@ -5797,7 +5797,7 @@ mod tests {
         let squatter = GreenKey::new(vec![7300, colliding_last_green(&parked, 7300)]);
         assert_eq!(squatter.get_uhash(), parked_bucket);
         minted_ws.ensure_cell_for_key(&squatter);
-        let parked_token = token_with_compiled_code(&mut minted_ws);
+        let parked_token = token_with_compiled_code();
         minted_ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
         let minted = minted_ws
             .cell_key_for(&parked)
@@ -6282,7 +6282,7 @@ mod tests {
         }
         let mut ws = WarmEnterState::new(3);
         let key = GreenKey::new(vec![25, 27]);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         let _token = attach_alive_for_key(&mut ws, &key, token);
         let cell_key = ws.cell_key_for(&key).expect("fixture installed the cell");
 
@@ -6432,7 +6432,7 @@ mod tests {
         assert_ne!(pos_bits, neg_bits);
         let pos = GreenKey::with_types(vec![pos_bits as i64], vec![GreenType::Float]);
         let mut ws = WarmEnterState::new(3);
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         let _token = attach_alive_for_key(&mut ws, &pos, token);
         let cell_key = ws.cell_key_for(&pos).expect("fixture installed the cell");
         ws.set_confirm_enter_jit(Some(record));
@@ -6855,7 +6855,7 @@ mod tests {
     /// the entry gate test. The payload is never read — `has_compiled_code` is
     /// `self.compiled.get().is_some()` — so its type only has to satisfy the
     /// `Any + Send` bound.
-    fn token_with_compiled_code(ws: &mut WarmEnterState) -> Arc<JitCellToken> {
+    fn token_with_compiled_code() -> Arc<JitCellToken> {
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         token.set_compiled(Box::new(()));
         assert!(token.has_compiled_code());
@@ -6961,13 +6961,13 @@ mod tests {
         // Installed first, and keepable (a cell holding a procedure token is
         // never `should_remove_jitcell`), so `install_new_cell` folds it in
         // front of the second and it ends up HEADING the bucket.
-        let head_token = token_with_compiled_code(&mut ws);
+        let head_token = token_with_compiled_code();
         let head_cell =
             BaseJitCell::new_for_driver_with_greens(0, &head_key.values, &head_key.types);
         head_cell.set_procedure_token(Arc::clone(&head_token), false);
         ws.install_new_cell(bucket, Some(head_cell));
 
-        let chained_token = token_with_compiled_code(&mut ws);
+        let chained_token = token_with_compiled_code();
         let chained_cell =
             BaseJitCell::new_for_driver_with_greens(0, &chained_key.values, &chained_key.types);
         chained_cell.set_procedure_token(Arc::clone(&chained_token), false);
@@ -7059,7 +7059,7 @@ mod tests {
              the raw hash was taken",
         );
 
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &second, token);
         assert!(
             ws.lookup_chain_with_key(&second)
@@ -7258,7 +7258,7 @@ mod tests {
         // (counter.py install_new_cell).
         let mut tokens = Vec::new();
         for key in keys {
-            let token = token_with_compiled_code(&mut ws);
+            let token = token_with_compiled_code();
             ws.attach_procedure_to_interp_for_key(key, Arc::clone(&token));
             tokens.push(token);
         }
@@ -7331,7 +7331,7 @@ mod tests {
             "fixture: one table slot",
         );
 
-        let token = token_with_compiled_code(&mut ws);
+        let token = token_with_compiled_code();
         ws.attach_procedure_to_interp_for_key(&resident, Arc::clone(&token));
         assert_eq!(
             chain_len(&ws, stranger_hash),
@@ -7396,7 +7396,7 @@ mod tests {
         // and the bucket really chains rather than pruning down to one.
         let mut keys = Vec::new();
         for key in [&first, &second, &third] {
-            let token = token_with_compiled_code(&mut ws);
+            let token = token_with_compiled_code();
             attach_alive_for_key(&mut ws, key, token);
             keys.push(
                 ws.cell_key_for(key)
@@ -7467,7 +7467,7 @@ mod tests {
         assert_eq!(occupant.get_uhash(), parked_bucket);
         assert_ne!(occupant, parked);
         ws.ensure_cell_for_key(&occupant);
-        let parked_token = token_with_compiled_code(&mut ws);
+        let parked_token = token_with_compiled_code();
         ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
         let minted = ws
             .cell_key_for(&parked)
@@ -7488,9 +7488,9 @@ mod tests {
         let arriving = gk_with_uhash(minted, 8100);
         let sibling = gk_with_uhash(minted, 8200);
         assert_ne!(arriving, sibling, "fixture: two different green keys");
-        let arriving_token = token_with_compiled_code(&mut ws);
+        let arriving_token = token_with_compiled_code();
         ws.attach_procedure_to_interp_for_key(&arriving, Arc::clone(&arriving_token));
-        let sibling_token = token_with_compiled_code(&mut ws);
+        let sibling_token = token_with_compiled_code();
         ws.attach_procedure_to_interp_for_key(&sibling, Arc::clone(&sibling_token));
         assert!(
             !Arc::ptr_eq(&arriving_token, &sibling_token),

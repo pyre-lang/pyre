@@ -14,8 +14,9 @@
 //! and `run_forever`.
 
 use crate::jitexc::JitException;
-use indexmap::IndexMap;
-use majit_ir::{GcRef, OpCode, OpRef};
+use majit_ir::GcRef;
+#[cfg(test)]
+use majit_ir::{OpCode, OpRef};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -69,11 +70,8 @@ impl ExceptionState {
 // runs jitcode bytecodes with concrete values, following ALL code paths
 // (unlike trace IR which only has the traced path).
 
-use crate::jitcode::{self, JitArgKind, JitCode, JitCodeRuntimeExt};
+use crate::jitcode::{self, JitArgKind, JitCode};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
-use crate::pyjitpl::{
-    call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
-};
 
 // BlackholeInterpBuilder instruction setup
 // RPython `blackhole.py` `class BlackholeInterpBuilder` combines
@@ -5509,7 +5507,7 @@ mod tests {
             FunctionGraph::set_concretetype_of_inline(&y, ConcreteType::Signed);
 
             let config = GraphTransformConfig::default();
-            let mut rewritten = {
+            let rewritten = {
                 let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
                 transformer.transform(&graph).graph
             };

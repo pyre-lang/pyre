@@ -725,7 +725,7 @@ impl RustCodegen {
             }
             Pattern::PatternOp(target) => {
                 let mut args = Vec::new();
-                for (index, arg) in target.args.iter().enumerate() {
+                for (_, arg) in target.args.iter().enumerate() {
                     match arg {
                         Pattern::PatternVar(var) => {
                             let typ = var.typ.unwrap_or(self.binding_types[&var.name]);

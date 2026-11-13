@@ -967,12 +967,10 @@ fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String
 }
 
 use crate::TraceAction;
-use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
     AbortReason, BackEdgeAction, DetailedDriverRunOutcome, InlineDecision, JitStats, MetaInterp,
 };
-use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
 use crate::warmstate::{
     BaseJitCell, DoorCell, FunctionEntryStep, HotResult, JcFlags, WarmEnterState,
@@ -981,7 +979,7 @@ use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
 use majit_ir::operand::Operand;
-use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
+use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
 
 /// Bucket the variables of a given kind by IR `Type`, returning
 /// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
@@ -6586,7 +6584,7 @@ impl<S: JitState> JitDriver<S> {
                     let mut decline: Option<Decline> = None;
                     let mut cursor = 0usize;
                     {
-                        let mut consume = |bank: majit_ir::Type, index: u32| {
+                        let consume = |bank: majit_ir::Type, index: u32| {
                             if decline.is_some() {
                                 return;
                             }
@@ -7425,15 +7423,7 @@ impl<S: JitState> JitDriver<S> {
             .get_latest_descr(&frame)
             .handle_fail_is_plain_resume_guard();
         if is_plain && self.meta.virtualizable_info().is_none() {
-            return self.handle_fail(
-                frame,
-                green_key,
-                target_pc,
-                state,
-                env,
-                compiled_meta,
-                portal_rca,
-            );
+            return self.handle_fail(frame, green_key, target_pc, state, env, compiled_meta);
         }
         let mut result = self.meta.consume_executed_frame(green_key, frame);
         self.consume_compiled_entry_result(
@@ -7460,7 +7450,6 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         compiled_meta: &S::Meta,
-        portal_rca: bool,
     ) -> Option<PortalResume> {
         crate::pyjitpl::MetaInterp::<S::Meta>::finish_compiled_run_io();
         let rgd = crate::compile::resume_guard_from_fail(
@@ -7510,7 +7499,7 @@ impl<S: JitState> JitDriver<S> {
         // `must_compile(self, deadframe, metainterp_sd, jitdriver_sd)`:
         // tick this portal's warmstate, the `jd` `execute_assembler` /
         // `assembler_call_helper` passed into `handle_fail`.
-        let (must_compile, owning_key) = self.meta.must_compile_resume_guard(
+        let (must_compile, _) = self.meta.must_compile_resume_guard(
             rgd,
             &[],
             guard_value_operand,
@@ -7553,7 +7542,6 @@ impl<S: JitState> JitDriver<S> {
             state,
             env,
             compiled_meta,
-            portal_rca,
         )
     }
 
@@ -7791,7 +7779,7 @@ impl<S: JitState> JitDriver<S> {
         // assembler_call_helper` call `handle_fail(deadframe,
         // metainterp_sd, jitdriver_sd)` with this driver's `jitdriver_sd`.
         let jitdriver_sd = self.index().unwrap_or(0);
-        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
+        let (must_compile, _) = self.meta.must_compile_with_owning_key(
             &descr_arc,
             &[],
             guard_value_operand,
@@ -7852,7 +7840,6 @@ impl<S: JitState> JitDriver<S> {
             state,
             env,
             compiled_meta,
-            portal_rca,
         )
     }
 
@@ -7944,7 +7931,6 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         compiled_meta: &S::Meta,
-        portal_rca: bool,
     ) -> Option<PortalResume> {
         // `blackhole.py` `resume_in_blackhole`
         // compile.py `ResumeGuardDescr` storage — `rd_numb` /
@@ -9864,7 +9850,6 @@ impl<S: JitState> JitDriver<S> {
         }
         pre_run();
         let mut result = self.meta.run_compiled_detailed_with_token_on_driver(
-            self.index().unwrap_or(0),
             green_key,
             procedure_token,
             &live_values,
@@ -12272,10 +12257,7 @@ mod tests {
         )
     }
 
-    use crate::resume::ReconstructedFrame;
-    use majit_ir::{
-        Descr, FailDescr, GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value,
-    };
+    use majit_ir::{GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value};
     use std::sync::Arc;
 
     fn compiled_guard_descr(

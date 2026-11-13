@@ -825,8 +825,6 @@ pub fn materialize_bridge_virtual(
     cache: &mut BridgeVirtualCache<'_>,
 ) -> OpRef {
     use majit_ir::OpCode;
-    use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
-
     // resume.py VirtualCache: list caches indexed by virtual number
     // (ptr and int banks). This bridge helper is still OpRef-typed, so it
     // probes both banks before allocating.
@@ -2247,7 +2245,7 @@ mod tests {
     /// after a collection, not from the unrooted `concrete_ptr_cache` copy.
     #[test]
     fn seed_direct_virtuals_rereads_concrete_roots_after_collect() {
-        let mut cache = BridgeVirtualCache::recording(
+        let cache = BridgeVirtualCache::recording(
             1,
             default_bridge_array_descr,
             &[Some(majit_ir::GcRef(0x1000))],

@@ -1,6 +1,7 @@
 use super::*;
 use crate::RestoreConstPtr;
 use crate::jitcode_runtime::{decode_op_at, insns_opname_to_byte, named_jitcode};
+use crate::state::MIFrame;
 use majit_ir::Type;
 use majit_metainterp::{
     JitCodeSym, NonstandardVable, TraceAction, VableArrayStore, make_fail_descr,
@@ -5535,7 +5536,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     // the assertion below cannot read `concrete[reg_idx]` while wc
     // holds the mutable borrow.
     let expected: Vec<ConcreteValue> = concrete.clone();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9217,7 +9218,7 @@ fn switch_id_jumps_to_target_or_falls_through() {
         let value = tc.const_int(key);
         let regs_i = [value];
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
-        let _descr = done_descr_ref_for_tests();
+        done_descr_ref_for_tests();
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9282,7 +9283,7 @@ fn switch_id_requires_concrete_int_value() {
     let mut tc = fresh_trace_ctx();
     let regs_i = [OpRef::input_arg_int(0)];
     let descr_pool = switch_descr_pool(&[(5, 17)]);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9355,7 +9356,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(1);
     let regs_i = [value];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9420,7 +9421,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(0);
     let regs_i = [value];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -9484,7 +9485,7 @@ fn goto_if_not_requires_concrete_int_value() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_i = [OpRef::input_arg_int(0)];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -10114,82 +10115,92 @@ fn assembled_struct_quasi_descr_is_the_group_mutate_row(
 }
 
 #[test]
-fn assembled_property_fget_quasi_descr_is_the_group_mutate_row() {
-    // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
-    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
-    // with mutate_field `mutate_fget` for pyre `fget?`.
-    let expected_field = crate::descr::property_fget_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("W_Property.fget has mutate_fget");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "W_Property",
-        "fget",
-        "mutate_fget",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one W_Property.fget? /rdd with mutate_fget"
-    );
-}
-
-#[test]
-fn assembled_property_fset_quasi_descr_is_the_group_mutate_row() {
-    // `descriptor.py W_Property._immutable_fields_ = [..., "w_fset?", ...]`.
-    let expected_field = crate::descr::property_fset_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("W_Property.fset has mutate_fset");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "W_Property",
-        "fset",
-        "mutate_fset",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one W_Property.fset? /rdd with mutate_fset"
-    );
-}
-
-#[test]
-fn assembled_property_fdel_quasi_descr_is_the_group_mutate_row() {
-    // `descriptor.py W_Property._immutable_fields_ = [..., "w_fdel?"]`.
-    // `w_property_get_fdel` is a translated reader of pyre `fdel?`.
-    let expected_field = crate::descr::property_fdel_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("W_Property.fdel has mutate_fdel");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "W_Property",
-        "fdel",
-        "mutate_fdel",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one W_Property.fdel? /rdd with mutate_fdel"
-    );
-}
-
-#[test]
-fn assembled_cell_family_ever_mutated_quasi_descr_is_the_group_mutate_row() {
-    // `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
-    let expected_field = crate::descr::cell_family_ever_mutated_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("CellFamily.ever_mutated has mutate_ever_mutated");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "CellFamily",
-        "ever_mutated",
-        "mutate_ever_mutated",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one CellFamily.ever_mutated? /rdd with mutate_ever_mutated"
-    );
+fn assembled_struct_quasi_descrs_are_the_group_mutate_rows() {
+    let cases: &[(&str, &str, &str, fn() -> DescrRef)] = &[
+        // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
+        // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+        // with mutate_field `mutate_fget` for pyre `fget?`.
+        (
+            "W_Property",
+            "fget",
+            "mutate_fget",
+            crate::descr::property_fget_descr,
+        ),
+        // `descriptor.py W_Property._immutable_fields_ = [..., "w_fset?", ...]`.
+        (
+            "W_Property",
+            "fset",
+            "mutate_fset",
+            crate::descr::property_fset_descr,
+        ),
+        // `descriptor.py W_Property._immutable_fields_ = [..., "w_fdel?"]`.
+        // `w_property_get_fdel` is a translated reader of pyre `fdel?`.
+        (
+            "W_Property",
+            "fdel",
+            "mutate_fdel",
+            crate::descr::property_fdel_descr,
+        ),
+        // `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
+        (
+            "CellFamily",
+            "ever_mutated",
+            "mutate_ever_mutated",
+            crate::descr::cell_family_ever_mutated_descr,
+        ),
+        // `executioncontext.py ExecutionContext._immutable_fields_` `w_tracefunc?`.
+        // The translated `gettrace` read is `jit.promote(self.w_tracefunc)`.
+        (
+            "ExecutionContext",
+            "w_tracefunc",
+            "mutate_w_tracefunc",
+            crate::descr::ec_w_tracefunc_descr,
+        ),
+        // `executioncontext.py ExecutionContext._immutable_fields_` `profilefunc?`.
+        (
+            "ExecutionContext",
+            "profilefunc",
+            "mutate_profilefunc",
+            crate::descr::ec_profilefunc_descr,
+        ),
+        // `gil.py GILThreadLocals._immutable_fields_ = ['gil_ready?']`.
+        // The static is headerless, so a translated `gil_ready_word` field
+        // read assembles `record_quasiimmut_field` as `/idd` (int-banked
+        // raw place). `/rdd` would mean the assembler banked the static as
+        // a GC ref.
+        (
+            "GilReadyState",
+            "gil_ready",
+            "mutate_gil_ready",
+            crate::descr::gil_ready_descr,
+        ),
+        // `pycode.py PyCode._immutable_fields_` `w_globals?`.
+        // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+        // with mutate_field `mutate_w_globals`.
+        (
+            "PyCode",
+            "w_globals",
+            "mutate_w_globals",
+            crate::descr::pycode_w_globals_descr,
+        ),
+    ];
+    for &(struct_name, field, mutate_leaf, expected_field) in cases {
+        let expected_field = expected_field();
+        let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+            .expect(&format!("{struct_name}.{field} has {mutate_leaf}"));
+        let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+            struct_name,
+            field,
+            mutate_leaf,
+            expected_field,
+            expected_mutate,
+        );
+        let bank = if field == "gil_ready" { "idd" } else { "rdd" };
+        assert!(
+            seen > 0,
+            "translation must assemble at least one {struct_name}.{field}? /{bank} with {mutate_leaf}"
+        );
+    }
 }
 
 #[test]
@@ -10248,89 +10259,6 @@ fn assembled_classmethod_w_function_quasi_descr_is_the_group_mutate_row() {
     // deref, not a translated getfield, so the assembler does not emit
     // `record_quasiimmut_field`. The pin is `walker_pin_descriptor_slot`.
     let _ = seen;
-}
-
-#[test]
-fn assembled_ec_w_tracefunc_quasi_descr_is_the_group_mutate_row() {
-    // `executioncontext.py ExecutionContext._immutable_fields_` `w_tracefunc?`.
-    // The translated `gettrace` read is `jit.promote(self.w_tracefunc)`.
-    let expected_field = crate::descr::ec_w_tracefunc_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "ExecutionContext",
-        "w_tracefunc",
-        "mutate_w_tracefunc",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one ExecutionContext.w_tracefunc? /rdd with mutate_w_tracefunc"
-    );
-}
-
-#[test]
-fn assembled_ec_profilefunc_quasi_descr_is_the_group_mutate_row() {
-    // `executioncontext.py ExecutionContext._immutable_fields_` `profilefunc?`.
-    let expected_field = crate::descr::ec_profilefunc_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("ExecutionContext.profilefunc has mutate_profilefunc");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "ExecutionContext",
-        "profilefunc",
-        "mutate_profilefunc",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one ExecutionContext.profilefunc? /rdd with mutate_profilefunc"
-    );
-}
-
-#[test]
-fn assembled_gil_ready_quasi_descr_is_the_group_mutate_row() {
-    // `gil.py GILThreadLocals._immutable_fields_ = ['gil_ready?']`.
-    // The static is headerless, so a translated `gil_ready_word` field
-    // read assembles `record_quasiimmut_field` as `/idd` (int-banked
-    // raw place). `/rdd` would mean the assembler banked the static as
-    // a GC ref.
-    let expected_field = crate::descr::gil_ready_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("GilReadyState.gil_ready has mutate_gil_ready");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "GilReadyState",
-        "gil_ready",
-        "mutate_gil_ready",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one GilReadyState.gil_ready? /idd with mutate_gil_ready"
-    );
-}
-
-#[test]
-fn assembled_pycode_w_globals_quasi_descr_is_the_group_mutate_row() {
-    // `pycode.py PyCode._immutable_fields_` `w_globals?`.
-    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
-    // with mutate_field `mutate_w_globals`.
-    let expected_field = crate::descr::pycode_w_globals_descr();
-    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
-        .expect("PyCode.w_globals has mutate_w_globals");
-    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
-        "PyCode",
-        "w_globals",
-        "mutate_w_globals",
-        expected_field,
-        expected_mutate,
-    );
-    assert!(
-        seen > 0,
-        "translation must assemble at least one PyCode.w_globals? /rdd with mutate_w_globals"
-    );
 }
 
 #[test]
@@ -12329,7 +12257,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_value = regs_r[2];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let ops_before = tc.num_ops();
@@ -12626,7 +12554,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     // detect that the write happened.
     let sentinel_pre = tc.const_int(0xDEAD_BEEF);
     let regs_i: Vec<OpRef> = vec![sentinel_pre; 4];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12752,7 +12680,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     let regs_i: Vec<OpRef> = (0..4)
         .map(|i| tc.const_int(0xCAFE_F00D + i as i64))
         .collect();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12998,7 +12926,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
     // type-punning into the float slot is sufficient because the
     // walker treats the bank as opaque OpRef storage.
     let regs_f: Vec<OpRef> = (0..4).map(|i| tc.const_int(0xF1F1 + i as i64)).collect();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -13107,7 +13035,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -13209,8 +13137,8 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let arg_value = regs_r[2];
-    let descr = done_descr_ref_for_tests();
-    let descr_exc = make_fail_descr(2);
+    done_descr_ref_for_tests();
+    make_fail_descr(2);
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let ops_before = tc.num_ops();
@@ -13283,7 +13211,6 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         finish_value, arg_value,
         "the stashed payload must carry the bubbled exc OpRef",
     );
-    let _ = &descr_exc;
 }
 
 #[test]
@@ -13296,7 +13223,7 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         .expect("`inline_call_r_r/dR>r` must be in insns table");
     let caller_code = [inline_byte, 0x05, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -13359,7 +13286,7 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         .expect("`inline_call_r_r/dR>r` must be in insns table");
     let caller_code = [inline_byte, 0x03, 0x00, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[3] = make_jitcode_descr(999_999);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -13421,7 +13348,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
         .expect("`live/` must be in insns table");
     let code = [live_byte, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -13489,7 +13416,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
     let mut tc = fresh_trace_ctx();
     let regs = distinct_const_refs(&mut tc, 8);
     let expected_arg = regs[3];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -13557,7 +13484,7 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         .expect("`ref_return/r` must be in insns table");
     let code = [ret_byte, 0x07]; // index 7 — registers_r is empty
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -13694,7 +13621,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         .map(|i| tc.const_int(0xBEEF_0000 + i as i64))
         .collect();
     let expected_arg = regs_i[2];
-    let descr_int = make_fail_descr(42);
+    make_fail_descr(42);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -13992,7 +13919,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         .expect("`raise/r` must be in insns table");
     let code = [raise_byte, 0x05];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -14057,7 +13984,7 @@ fn step_through_goto_jumps_to_label_target() {
     // target = 0x002A = 42
     let code = [goto_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -14124,7 +14051,7 @@ fn step_through_goto_handles_high_byte_of_label() {
     // target = 0x010102 = 65794
     let code = [goto_byte, 0x02, 0x01, 0x01];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -14238,7 +14165,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
     let mut tc = fresh_trace_ctx();
     let regs = distinct_const_refs(&mut tc, 4);
     let active_exc = regs[0];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     // The standing exception is metainterp-level state
     // (`pyjitpl.py:2417`), so it is seeded on the session.
@@ -14304,7 +14231,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
         .expect("`catch_exception/L` must be in insns table");
     let code = [catch_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -14378,8 +14305,8 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     let mut tc = fresh_trace_ctx();
     let regs = distinct_const_refs(&mut tc, 4);
     let expected_exc = regs[2];
-    let descr_done = done_descr_ref_for_tests();
-    let descr_exc = make_fail_descr(99);
+    done_descr_ref_for_tests();
+    make_fail_descr(99);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -14602,8 +14529,8 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         ConcreteValue::Ref(exc_ptr),
         ConcreteValue::Null,
     ];
-    let descr_done = done_descr_ref_for_tests();
-    let descr_exc = make_fail_descr(99);
+    done_descr_ref_for_tests();
+    make_fail_descr(99);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -14709,8 +14636,8 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
     let active_exc = regs_r[1];
-    let descr_done = done_descr_ref_for_tests();
-    let descr_exc = make_fail_descr(99);
+    done_descr_ref_for_tests();
+    make_fail_descr(99);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     // The standing exception is metainterp-level state
@@ -14801,7 +14728,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         .expect("`reraise/` must be in insns table");
     let code = [reraise_byte];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -14862,7 +14789,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
     let exc = regs_r[2];
-    let descr_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -14986,8 +14913,8 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[3];
     let handler_ret = regs_r[5];
-    let descr_done = done_descr_ref_for_tests();
-    let descr_exc = make_fail_descr(99);
+    done_descr_ref_for_tests();
+    make_fail_descr(99);
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[11] = make_jitcode_descr(11);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -15115,7 +15042,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[2];
-    let descr_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[13] = make_jitcode_descr(13);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -15193,7 +15120,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     let code = [int_copy_byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 8);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -15267,7 +15194,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         src_val_pre, dst_val_pre,
         "fixture must seed src and dst with different OpRefs",
     );
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15333,7 +15260,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let code = [int_copy_byte, 0x00, 0x09]; // src=0 (in range), dst=9 (OOR)
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15396,7 +15323,7 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         .expect("`int_copy/i>i` must be in insns table");
     let code = [int_copy_byte, 0x07, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15478,7 +15405,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
     let code = [ref_copy_byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -15550,7 +15477,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
         src_val_pre, dst_val_pre,
         "fixture must seed src and dst with different OpRefs",
     );
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15684,7 +15611,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let code = [ref_copy_byte, 0x00, 0x09]; // src=0 (in range), dst=9 (OOR)
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15745,7 +15672,7 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         .expect("`ref_copy/r>r` must be in insns table");
     let code = [ref_copy_byte, 0x07, 0x00];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15816,7 +15743,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let arg0 = regs_i[2];
     let arg1 = regs_i[4];
     let dst_pre = regs_i[6];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -15983,7 +15910,7 @@ fn drive_int_between(
     regs_i[4] = mint(&mut tc, &b2);
     regs_i[6] = mint(&mut tc, &b3);
     let arg_b1 = regs_i[2];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16127,7 +16054,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let arg0 = regs_f[2];
     let arg1 = regs_f[4];
     let dst_pre = regs_f[6];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16226,7 +16153,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let regs_f = distinct_const_refs(&mut tc, 8);
     let arg = regs_f[2];
     let dst_pre = regs_f[5];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16313,7 +16240,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let regs_i = distinct_const_refs(&mut tc, 8);
     let arg = regs_i[2];
     let dst_pre = regs_i[5];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16444,7 +16371,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
     let arg0 = regs_r[2];
     let arg1 = regs_r[4];
     let dst_pre = regs_i[6];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -16829,7 +16756,7 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         .expect("`float_add/ff>f` must be in insns table");
     let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_f empty
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -16891,7 +16818,7 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         .expect("`int_add/ii>i` must be in insns table");
     let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_i empty
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -16955,7 +16882,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
     let code = [byte, 0x00, 0x01, 0x09]; // dst=9, registers_i.len()=4 → OOR
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -17036,7 +16963,7 @@ fn unsupported_opname_surfaces_typed_error() {
     // Operand encoding `rd>i`: 1B r-reg + 2B descr + 1B i-reg-dst = 4B.
     let code = [unsupported_byte, 0, 0, 0, 0];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -17584,7 +17511,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     // A `Const` box folds (`_all_constants` — CONST_NULL is a `Const`), so
     // the record path needs a genuinely non-const InputArg operand.
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let box_opref = OpRef::input_arg_ref(0);
     let regs_r = [box_opref];
     let regs_i = [OpRef::None];
@@ -17844,7 +17771,7 @@ fn abort_result_r_stops_the_walk() {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x05]; // dst byte = 5 (intentionally out-of-range)
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -17909,7 +17836,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     // Operand encoding `r`: 1B r-src only.
     let code = [byte, 0];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     // MIFrame.replace_active_box_in_frame selects the bank by the Box type.
     // Use a real Ref result; PtrEq would manufacture an IntOp in registers_r.
     let concrete_ptr: usize = 0xdead_beef;
@@ -18224,7 +18151,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     // Operand encoding `i`: 1B i-src only.
     let code = [byte, 0];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     // Symbolic side: a recorded op OpRef (not a Const).
     let value_opref = dummy_int_add_box(&mut tc);
     let ops_before = tc.num_ops();
@@ -18315,7 +18242,7 @@ fn ref_guard_value_on_const_records_nothing() {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let value_opref = tc.const_ref(0xdead_beef);
     let baseline_ops = tc.ops().len();
     let regs_r = [value_opref];
@@ -18426,7 +18353,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         majit_ir::ExtraEffect::CanRaise,
     );
     let descr_pool = vec![decoy, call_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -18786,7 +18713,7 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(7, majit_ir::ExtraEffect::ElidableCannotRaise);
     let descr_pool = vec![elidable_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -20641,7 +20568,7 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(8, majit_ir::ExtraEffect::ElidableCanRaise);
     let descr_pool = vec![elidable_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -20912,7 +20839,7 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let nothrow_descr = call_descr_with_effect(9, majit_ir::ExtraEffect::CannotRaise);
     let descr_pool = vec![nothrow_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -20997,7 +20924,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         Type::Ref,
         majit_ir::ExtraEffect::CanRaise,
     )];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -21085,7 +21012,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         Type::Ref,
         majit_ir::ExtraEffect::CanRaise,
     )];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -21173,7 +21100,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         Type::Ref,
         majit_ir::ExtraEffect::CanRaise,
     )];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -21239,7 +21166,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(1), make_fail_descr(1)];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -21342,7 +21269,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         majit_ir::ExtraEffect::CanRaise,
     );
     let descr_pool = vec![decoy, call_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -21445,7 +21372,7 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let elidable_descr = call_descr_with_effect(7, majit_ir::ExtraEffect::ElidableCannotRaise);
     let descr_pool = vec![elidable_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -21556,7 +21483,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         majit_ir::ExtraEffect::CanRaise,
     );
     let descr_pool = vec![decoy, call_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -21700,7 +21627,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         majit_ir::ExtraEffect::CanRaise,
     );
     let descr_pool = vec![mixed_descr.clone()];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -21779,7 +21706,7 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
     let regs_i = distinct_const_refs(&mut tc, 1);
     let regs_r = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(7)];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -21844,7 +21771,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 1);
     let descr_pool = vec![make_fail_descr(1)];
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -22051,7 +21978,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // Other slots default to `make_fail_descr`.
     let pool_len = crate::jitcode_runtime::all_descrs().len();
     let descr_pool = descr_pool_with_jitcode_adapters(pool_len);
-    let frame_done_descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -26624,7 +26551,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     let caller_code = [inline_byte, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[5] = make_jitcode_descr(5);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -26729,7 +26656,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
     let stale_exc = regs_r[0];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -26827,7 +26754,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -26919,7 +26846,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
     let regs_i = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -27009,7 +26936,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
     let regs_i = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -27104,7 +27031,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let regs_i = distinct_const_refs(&mut tc, 4);
     let regs_f = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -27197,7 +27124,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
     let regs_r = distinct_const_refs(&mut tc, 4);
     let regs_i = distinct_const_refs(&mut tc, 4);
     let regs_f = distinct_const_refs(&mut tc, 4);
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -27279,7 +27206,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     let dst_pre = regs_i[5];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27374,7 +27301,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
     let obj = regs_r[2];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
 
     // Pre-populate the heapcache as if a previous getfield had
     // already cached the field's value. RPython equivalent:
@@ -27461,7 +27388,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         false,
     ));
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27530,7 +27457,7 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
     let mut tc = fresh_trace_ctx();
     let descr = field_descr_with_index(0);
     let descr_pool = vec![descr];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -27609,7 +27536,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     let dst_pre = regs_i[5];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27709,7 +27636,7 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
     let value = regs_i[3];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27797,7 +27724,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
     let valuebox = regs_i[3];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     // Pre-cache valuebox as the current field value.
     tc.heapcache_getfield_now_known(obj, 1, valuebox);
     let ops_before = tc.num_ops();
@@ -27867,7 +27794,7 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
     let valuebox = regs_i[3];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27961,7 +27888,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         false,
     ));
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -28038,7 +27965,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     let dst_pre = regs_r[5];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -28190,7 +28117,7 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
     regs_i[3] = tc.const_int(1);
     let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let prof_before = tc.profiler().snapshot();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -28411,7 +28338,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     let index = regs_i[3];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let cached = tc.const_ref(0xCAFE_F00D);
     tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
     let ops_before = tc.num_ops();
@@ -28489,7 +28416,7 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
     let value = regs_r[6];
     let descr = field_descr_with_index(1);
     let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-    let frame_done = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -28603,7 +28530,7 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
         .get("ref_return/r")
         .expect("`ref_return/r` must be in insns table");
     let code = [ret_byte, 0x02];
-    let descr = make_fail_descr(1);
+    make_fail_descr(1);
     // PyPy `setup_call(argboxes)` analog: stamp `expected_arg` at
     // `R[2]_r` so the `ref_return r2` walker handler picks it up
     // from the fresh top-level register file.  Slots 0/1 stay
@@ -28614,7 +28541,6 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
     let (outcome, end_pc) = dispatch_via_miframe(
         unsafe { &mut *miframe.ctx },
         unsafe { &mut *miframe.sym },
-        miframe.concrete_frame_addr,
         miframe.orgpc,
         &session,
         &code,
@@ -28690,8 +28616,8 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
         .get("raise/r")
         .expect("`raise/r` must be in insns table");
     let code = [raise_byte, 0x03];
-    let descr_done = make_fail_descr(1);
-    let descr_exc = make_fail_descr(99);
+    make_fail_descr(1);
+    make_fail_descr(99);
     // Setup_call argbox at R[3]_r: `raise/r` reads its exc operand
     // from this slot in the fresh top-level register file.
     let argboxes_r = [OpRef::NONE, OpRef::NONE, OpRef::NONE, exc_oprep];
@@ -28699,7 +28625,6 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     let (outcome, _) = dispatch_via_miframe(
         unsafe { &mut *miframe.ctx },
         unsafe { &mut *miframe.sym },
-        miframe.concrete_frame_addr,
         miframe.orgpc,
         &session,
         &code,
@@ -28785,7 +28710,6 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
     let _ = dispatch_via_miframe(
         unsafe { &mut *miframe.ctx },
         unsafe { &mut *miframe.sym },
-        miframe.concrete_frame_addr,
         miframe.orgpc,
         &session,
         &code,
@@ -28820,7 +28744,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
     // 0xFF is unknown to the insns table (21 entries 0..=20 today).
     let code = [0xFFu8];
     let mut tc = fresh_trace_ctx();
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -28918,7 +28842,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let is_being_profiled = tc.const_int(0); // gi[1]
     let regs_i = [next_instr, is_being_profiled];
     let regs_r = [pycode, red0, red1];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -29990,7 +29914,7 @@ fn loop_header_stamps_seen_flag() {
     let mut tc = fresh_trace_ctx();
     let jdindex = tc.const_int(0);
     let regs_i = [jdindex];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -30329,7 +30253,7 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
     // i0 is a non-constant input arg → no concrete next_instr.
     let regs_i = [OpRef::input_arg_int(0)];
     let regs_r = [tc.const_ref(0x1_0000)];
-    let descr = done_descr_ref_for_tests();
+    done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -32838,7 +32762,6 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         &sub_body,
         nested_entry,
         "helper_subwalk_vable_scalars",
-        "helper_subwalk_vable_call_site",
         &[guard_src],
         &[ConcreteValue::Int(0)],
         &[],

@@ -135,7 +135,6 @@ pub(crate) fn carrier_ec_leave<Sym: WalkSym>(
 pub fn dispatch_via_miframe<Sym: WalkSym>(
     trace_ctx: &mut TraceCtx,
     sym: &mut Sym,
-    concrete_frame_addr: usize,
     orgpc: usize,
     session: &std::cell::RefCell<WalkSession>,
     jitcode_code: &[u8],
@@ -679,8 +678,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 }
                 fbw_publish_exit_last_instr(&mut wc, position);
                 fbw_store_token_in_vable(&mut wc, position)?;
-                let (finish_arg, finish_arg_type) =
-                    fbw_terminate_with_raise(&wc, seed.exc, seed.exc_concrete);
+                fbw_terminate_with_raise(&wc, seed.exc, seed.exc_concrete);
                 carrier_raise_escapes = true;
                 position
             }
@@ -993,7 +991,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         root_liveness_word,
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
-        "bridge_root_parent",
         None,
     );
     // The concrete image this paused root resumes from when a descendant
@@ -1087,7 +1084,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
-    root_frame_box: majit_ir::OpRef,
 ) -> Option<InlineParentFrame> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
@@ -1999,7 +1995,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             parent_recipe,
             root_sym.concrete_execution_context(),
             root_sym.execution_context(),
-            root_sym.frame(),
         )?;
     }
 

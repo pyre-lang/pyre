@@ -14,13 +14,12 @@
 //! `dispatch_inline_call_*` per-shape dispatchers. The `inline_call_*`
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
-use majit_jitcode::codewriter::jitcode::{DESCENT_ENTRY_LEN_SLOTS, DescentBlockerSummary};
+use majit_jitcode::codewriter::jitcode::DescentBlockerSummary;
 use pyre_interpreter::locals_w;
 use rustpython_wtf8::Wtf8;
 
 use super::*;
 use crate::PyJitCode;
-use majit_ir::descr::{FieldDescr, SwitchDescr};
 use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
 
 #[derive(Clone, Copy)]
@@ -6389,9 +6388,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     ref_operand_offset: usize,
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
@@ -6636,9 +6633,6 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         resolved_callable,
@@ -6656,7 +6650,6 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         arg_concretes,
         callee_args,
         callee_arg_concretes,
-        method_form,
         bound_method,
         w_code,
         nparams,
@@ -7503,10 +7496,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     ref_operand_offset: usize,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
@@ -7515,10 +7506,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
         ref_operand_offset,
         r_args,
-        call_descr,
         runtime_helper,
         dst_bank,
         dst,
@@ -7540,10 +7529,8 @@ pub(crate) fn try_walker_inline_exception_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     ref_operand_offset: usize,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -7551,10 +7538,8 @@ pub(crate) fn try_walker_inline_exception_type_call<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
         ref_operand_offset,
         r_args,
-        call_descr,
         majit_ir::RuntimeHelperKind::CallFn,
         dst_bank,
         dst,
@@ -7567,10 +7552,8 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     ref_operand_offset: usize,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
@@ -7844,17 +7827,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     // either, so they take their own route into the resolved `__len__`.
     if builtin_len_call
         && let Some(inlined) = spec_gate(SpecFold::LenUserDunder, || {
-            try_walker_inline_len_dunder(
-                ctx,
-                op,
-                code,
-                funcptr,
-                r_args,
-                call_descr,
-                dst,
-                r_args[2],
-                len_receiver,
-            )
+            try_walker_inline_len_dunder(ctx, op, code, dst, r_args[2], len_receiver)
         })?
     {
         return Ok(Some(inlined));
@@ -7908,7 +7881,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         callable_operand,
         fnaddr,
         helper_return,
-        "builtin_wrapper_call_site",
     ) else {
         return Ok(None);
     };
@@ -7932,7 +7904,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
 
     let mut callable_guard_op = r_args[0];
     let mut receiver_op = method_form.then_some(r_args[1]);
-    if let Some((w_class, version_tag)) = instance_call_class {
+    if let Some((w_class, _)) = instance_call_class {
         // The promoted-class lookup shape: the class and its version tag
         // together fix the `__call__` answer, so the wrapper this call
         // dispatches to is a constant of the pinned class rather than a field
@@ -7944,7 +7916,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
             r_args[0],
             live_receiver().unwrap_or(callable_operand),
             pinned_obj(&class_pin, w_class),
-            version_tag,
         )?;
         // After the pin, never before: the pin is what makes the cell pointer a
         // constant.  The tag covers a REPLACING store, which builds a fresh
@@ -7986,8 +7957,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
             let concrete = pinned_obj(pin, concrete);
             let w_class =
                 unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) };
-            let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
-            walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class, version_tag)?;
+            walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class)?;
         }
         callable_guard_op = ctx.trace_ctx.const_ref(live_callable() as i64);
         receiver_op = Some(type_const);
@@ -8231,7 +8201,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     callable_operand: pyre_object::PyObjectRef,
     fnaddr: usize,
     helper_return: HelperReturn,
-    active_tag: &'static str,
 ) -> Option<BuiltinWrapperCallSite> {
     let nested_helper = ctx.fbw_mode.inline_subwalk;
     // The helper level a guard inside the wrapper resumes through
@@ -8348,7 +8317,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            active_tag,
             vstack,
         )
     };
@@ -8924,7 +8892,6 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            "builtin_wrapper_call_site",
             vstack,
         )
     };
@@ -9299,9 +9266,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     callable: pyre_object::PyObjectRef,
@@ -9310,7 +9274,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     arg_concretes: Vec<ConcreteValue>,
     callee_args: Vec<OpRef>,
     callee_arg_concretes: Vec<ConcreteValue>,
-    method_form: bool,
     bound_method: Option<BoundMethodInline>,
     w_code: *const (),
     nparams: usize,
@@ -9325,9 +9288,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         callable,
@@ -9336,7 +9296,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         arg_concretes,
         callee_args,
         callee_arg_concretes,
-        method_form,
         bound_method,
         w_code,
         nparams,
@@ -9414,9 +9373,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     callable: pyre_object::PyObjectRef,
@@ -9425,7 +9381,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     arg_concretes: Vec<ConcreteValue>,
     mut callee_args: Vec<OpRef>,
     mut callee_arg_concretes: Vec<ConcreteValue>,
-    method_form: bool,
     bound_method: Option<BoundMethodInline>,
     w_code: *const (),
     nparams: usize,
@@ -10499,17 +10454,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // CALL boundary (single outer Python frame — re-execute the whole
     // call on deopt), captured via `fbw_mode.inline_subwalk` for
     // the sub-walk guards below.
-    if let Some((receiver, concrete_receiver, w_class, version_tag, attr_cell)) =
-        exception_receiver_guard
-    {
-        walker_guard_exception_attr_slot(
-            ctx,
-            op.pc,
-            receiver,
-            concrete_receiver,
-            w_class,
-            version_tag,
-        )?;
+    if let Some((receiver, concrete_receiver, w_class, _, attr_cell)) = exception_receiver_guard {
+        walker_guard_exception_attr_slot(ctx, op.pc, receiver, concrete_receiver, w_class)?;
         // After the class guards and the pin, never before: the pin is what
         // makes the cell pointer a constant, and an in-place write to the cell
         // is the one rebind the pin does not see.
@@ -11468,7 +11414,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Re-read after `to_pyobj` / cell emission, which can collect and
         // forward the cell. `new_for_call_with_closure_and_globals_obj` and
         // `FrameBox::new` also collect (`maybe_collect_for_external_malloc`).
-        let inline_w_code = callee_state.borrow().inline_w_code;
         let inline_w_globals = callee_state.borrow().inline_w_globals;
         let mut frame = match pyre_interpreter::pyframe::FrameBox::new(
             match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
@@ -11677,7 +11622,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // pre-adjustment Python coordinate.
                     op.pc as i32,
                     OuterActiveBoxesEntryTwin::Plain,
-                    "call_site_capture",
                     None,
                 );
                 restore_in_a_call_result(banks, saved);
@@ -13350,7 +13294,6 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     w_type: pyre_object::PyObjectRef,
@@ -13479,9 +13422,6 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
         ctx,
         op,
         code,
-        new_func_const,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         w_func,
@@ -13490,7 +13430,6 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
         arg_concretes,
         callee_args,
         callee_arg_concretes,
-        true,
         None,
         w_code,
         nparams,
@@ -13550,9 +13489,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -13695,7 +13632,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
             op,
             code,
             r_args,
-            call_descr,
             dst_bank,
             dst,
             w_type,
@@ -13818,9 +13754,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         init,
@@ -13832,7 +13765,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         arg_concretes,
         callee_args,
         callee_arg_concretes,
-        true,
         None,
         w_code,
         nparams,
@@ -14035,9 +13967,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if r_args.len() != 3 {
@@ -14113,7 +14043,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+    let Some(_) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
     // Decided once per callee on its jitcode payload; `None` means no body or
@@ -14138,7 +14068,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     // builtin residual so the interpreter's result check raises TypeError and
     // the exception-handler loop remains traceable. More complex bodies are
     // not executed speculatively; their inlined result is guarded below.
-    if let (Some(body), Some((callee_descr_refs, _, _))) = (
+    if let (Some(_), Some(_)) = (
         crate::state::sub_jitcode_body_for_code(w_code),
         crate::state::sub_jitcode_descr_pool_for_code(w_code),
     ) {
@@ -14165,9 +14095,6 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -14176,7 +14103,6 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         arg_concretes,
         vec![r_args[2]],
         vec![ConcreteValue::Ref(concrete_receiver)],
-        true,
         None,
         w_code,
         nparams,
@@ -14235,9 +14161,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if r_args.len() != 3 {
@@ -14307,9 +14231,6 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -14318,7 +14239,6 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         arg_concretes,
         vec![r_args[2]],
         vec![ConcreteValue::Ref(concrete_receiver)],
-        true,
         None,
         w_code,
         nparams,
@@ -14427,8 +14347,6 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     global_super: OpRef,
     self_obj: OpRef,
     cls: OpRef,
@@ -14558,9 +14476,6 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
         ctx,
         op,
         code,
-        fget_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         fget,
@@ -14569,7 +14484,6 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
         arg_concretes,
         vec![self_obj],
         vec![ConcreteValue::Ref(concrete_self)],
-        true,
         None,
         w_code,
         nparams,
@@ -14596,8 +14510,6 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     proxy: OpRef,
     name: &str,
     dst: usize,
@@ -14680,9 +14592,6 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         ctx,
         op,
         code,
-        fget_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         fget,
@@ -14691,7 +14600,6 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         arg_concretes,
         vec![self_op],
         vec![ConcreteValue::Ref(concrete_self)],
-        true,
         None,
         w_code,
         nparams,
@@ -14735,8 +14643,6 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -14750,8 +14656,6 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         ctx,
         op,
         code,
-        r_args,
-        call_descr,
         obj,
         Wtf8::new(name.as_str()),
         dst,
@@ -14769,7 +14673,6 @@ pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if r_args.len() != 4 {
@@ -14799,8 +14702,6 @@ pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
         ctx,
         op,
         code,
-        r_args,
-        call_descr,
         r_args[2],
         name,
         dst,
@@ -14814,8 +14715,6 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     name: &Wtf8,
     dst: usize,
@@ -14902,9 +14801,6 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
         ctx,
         op,
         code,
-        fget_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         fget,
@@ -14913,7 +14809,6 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
         arg_concretes,
         vec![obj],
         vec![ConcreteValue::Ref(concrete_obj)],
-        true,
         None,
         w_code,
         nparams,
@@ -14951,8 +14846,6 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -14968,7 +14861,7 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_descr, descr_type, descr_version_tag, descr_map, w_get)) = (unsafe {
+    let Some((w_type, version_tag, w_descr, descr_type, _, descr_map, w_get)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::data_descriptor_get_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -15003,22 +14896,11 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
     // The descriptor itself is mutable through `__class__` assignment.  Its
     // live map/class guard is therefore load-bearing even though the receiver
     // type lookup produced a constant pointer to it.
-    walker_guard_mapdict_instance_shape(
-        ctx,
-        op.pc,
-        descr_const,
-        w_descr,
-        descr_type,
-        descr_version_tag,
-        descr_map,
-    )?;
+    walker_guard_mapdict_instance_shape(ctx, op.pc, descr_const, w_descr, descr_type, descr_map)?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
-        get_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         w_get,
@@ -15031,7 +14913,6 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_obj),
             ConcreteValue::Ref(w_type),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -15114,8 +14995,6 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -15188,7 +15067,6 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
             obj,
             concrete_obj,
             pins.w_owner,
-            pins.owner_version_tag,
             pins.receiver_map,
         )?;
     }
@@ -15205,16 +15083,12 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
         descr_const,
         pins.w_descr,
         pins.descr_type,
-        pins.descr_version_tag,
         pins.descr_map,
     )?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
-        get_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         pins.w_get,
@@ -15227,7 +15101,6 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
             ConcreteValue::Ref(instance_concrete),
             ConcreteValue::Ref(pins.w_owner),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -15413,7 +15286,6 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
         callable,
         fnaddr,
         HelperReturn::CallResult,
-        "builtin_getattribute_call_site",
     ) else {
         return Ok(None);
     };
@@ -15459,8 +15331,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -15497,7 +15367,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     } else {
         None
     };
-    let (w_type, version_tag, receiver_map, w_getattribute, attr_cell) =
+    let (w_type, _, receiver_map, w_getattribute, attr_cell) =
         if let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = instance_hook {
             (w_type, version_tag, Some(map), w_getattribute, attr_cell)
         } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = type_hook {
@@ -15529,19 +15399,11 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
 
         let pre_fold_pos = ctx.trace_ctx.get_trace_position();
         if let Some(map) = receiver_map {
-            walker_guard_mapdict_instance_shape(
-                ctx,
-                op.pc,
-                obj,
-                concrete_obj,
-                w_type,
-                version_tag,
-                map,
-            )?;
+            walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
         } else {
             // The receiver is the class. `GuardClass` only names the shared
             // type layout, so pin the metaclass through `w_class`.
-            walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type, version_tag)?;
+            walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type)?;
         }
         // The version-tag pin above does not cover an in-place cell write.  Same
         // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
@@ -15580,9 +15442,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             ctx,
             op,
             code,
-            hook_const,
-            r_args,
-            call_descr,
             'r',
             dst,
             w_func,
@@ -15591,7 +15450,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             arg_concretes,
             callee_args,
             callee_arg_concretes,
-            true,
             None,
             w_code,
             nparams,
@@ -15649,7 +15507,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             obj,
             pinned_obj(&obj_pin, concrete_obj),
             pinned_obj(&type_pin, w_type),
-            version_tag,
             map,
         )?;
     } else {
@@ -15659,7 +15516,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             obj,
             pinned_obj(&obj_pin, concrete_obj),
             pinned_obj(&type_pin, w_type),
-            version_tag,
         )?;
     }
     let attr_cell = pinned_obj(&attr_cell_pin, attr_cell);
@@ -15698,8 +15554,6 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -15715,7 +15569,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, map, w_getattr, attr_cell)) = (unsafe {
+    let Some((w_type, _, map, w_getattr, attr_cell)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -15747,13 +15601,10 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             ctx,
             op,
             code,
-            r_args,
-            call_descr,
             obj,
             concrete_obj,
             &name,
             w_type,
-            version_tag,
             map,
             w_getattr,
             attr_cell,
@@ -15780,7 +15631,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     // do.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // Both pins the oracle asked for, plus the layout guard its map read needs.
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
     // The version-tag pin above does not cover an in-place cell write.  Same
     // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
     // on `ExceptionInlineReceiverGuard::attr_cell`.
@@ -15829,9 +15680,6 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         ctx,
         op,
         code,
-        getattr_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         w_func,
@@ -15840,7 +15688,6 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         arg_concretes,
         callee_args,
         callee_arg_concretes,
-        true,
         None,
         w_code,
         nparams,
@@ -15896,19 +15743,16 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
     name: &str,
     w_type: pyre_object::PyObjectRef,
-    version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
     w_getattr: pyre_object::PyObjectRef,
     attr_cell: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    let Some((descr_type, descr_version_tag, descr_map, w_get)) =
+    let Some((descr_type, _, descr_map, w_get)) =
         (unsafe { pyre_interpreter::objspace::std::mapdict::python_descr_get_pins(w_getattr) })
     else {
         return Ok(None);
@@ -15947,28 +15791,17 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         ConcreteValue::Ref(w_type),
     ];
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
     if !attr_cell.is_null() {
         super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
     }
-    walker_guard_mapdict_instance_shape(
-        ctx,
-        op.pc,
-        descr_const,
-        w_getattr,
-        descr_type,
-        descr_version_tag,
-        descr_map,
-    )?;
+    walker_guard_mapdict_instance_shape(ctx, op.pc, descr_const, w_getattr, descr_type, descr_map)?;
 
     let mut handed: Option<(OpRef, ConcreteValue)> = None;
     let got = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
-        get_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         w_get,
@@ -15981,7 +15814,6 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_obj),
             ConcreteValue::Ref(w_type),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -16035,9 +15867,6 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         ctx,
         op,
         code,
-        bound_op,
-        r_args,
-        call_descr,
         'r',
         dst,
         bound_fn,
@@ -16050,7 +15879,6 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         ],
         vec![name_const],
         vec![ConcreteValue::Ref(name_obj)],
-        true,
         None,
         call_code,
         call_nparams,
@@ -16089,8 +15917,6 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     obj: OpRef,
     value: OpRef,
     w_code_ptr: usize,
@@ -16121,7 +15947,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     if nparams != 2 {
         return Ok(None);
     }
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+    let Some(_) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
     // Decided once per callee on its jitcode payload; `None` means no body or
@@ -16132,8 +15958,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     if !body_facts.exc_override_straight_line {
         return Ok(None);
     }
-    let Some((setter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
-    else {
+    let Some(_) = crate::state::sub_jitcode_descr_pool_for_code(w_code) else {
         return Ok(None);
     };
     if body_facts.exc_override_has_nested_call {
@@ -16156,9 +15981,6 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         ctx,
         op,
         code,
-        fset_const,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         fset,
@@ -16170,7 +15992,6 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_obj),
             ConcreteValue::Ref(concrete_value),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -16372,9 +16193,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     candidate: IndexInlineCandidate,
 ) -> Result<Option<(OpRef, ConcreteValue)>, DispatchError> {
@@ -16401,9 +16219,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -16412,7 +16227,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         arg_concretes,
         vec![arg],
         vec![ConcreteValue::Ref(concrete_arg)],
-        true,
         None,
         w_code,
         nparams,
@@ -16467,9 +16281,7 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: Option<OpRef>,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -16528,11 +16340,6 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         ctx,
         op,
         code,
-        // A helper-descent entry carries no funcptr operand of its own; the
-        // method constant stands for the call the way the binop route's does.
-        funcptr.unwrap_or(getitem_const),
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         w_getitem,
@@ -16544,7 +16351,6 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_obj),
             ConcreteValue::Ref(concrete_key),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -16595,9 +16401,6 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     receiver_op: OpRef,
     concrete_receiver: pyre_object::PyObjectRef,
@@ -16650,9 +16453,6 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         'r',
         dst,
         w_len,
@@ -16661,7 +16461,6 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         arg_concretes,
         vec![receiver_op],
         vec![ConcreteValue::Ref(concrete_receiver)],
-        true,
         None,
         w_code,
         nparams,
@@ -16798,9 +16597,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 1 {
@@ -16899,9 +16696,6 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         'i',
         dst,
         method,
@@ -16910,7 +16704,6 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         arg_concretes,
         vec![receiver_op],
         vec![ConcreteValue::Ref(concrete_receiver)],
-        true,
         None,
         w_code,
         nparams,
@@ -17016,9 +16809,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -17086,9 +16877,6 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         w_iter,
@@ -17101,7 +16889,6 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         ],
         vec![obj_op],
         vec![ConcreteValue::Ref(concrete_obj)],
-        true,
         None,
         w_code,
         nparams,
@@ -17233,9 +17020,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -17311,9 +17096,6 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
-        r_args,
-        call_descr,
         dst_bank,
         dst,
         w_next,
@@ -17326,7 +17108,6 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         ],
         vec![iter_op],
         vec![ConcreteValue::Ref(iter_obj)],
-        true,
         None,
         w_code,
         nparams,
@@ -19631,7 +19412,6 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     code: &[u8],
     op_tag: i64,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -19711,8 +19491,6 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             op_tag,
             dunder,
             None,
-            r_args,
-            call_descr,
             dst,
             lhs,
             concrete_lhs,
@@ -19744,8 +19522,6 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ctx,
             op,
             code,
-            r_args,
-            call_descr,
             dst,
             dunder,
             method,
@@ -19792,8 +19568,6 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         op_tag,
         dunder,
         forward_method,
-        r_args,
-        call_descr,
         dst,
         lhs,
         concrete_lhs,
@@ -19822,8 +19596,6 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     op_tag: i64,
     forward_dunder: &'static str,
     forward_method: Option<pyre_object::PyObjectRef>,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     lhs: OpRef,
     mut concrete_lhs: pyre_object::PyObjectRef,
@@ -19962,8 +19734,6 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
         ctx,
         op,
         code,
-        r_args,
-        call_descr,
         dst,
         dunder,
         method,
@@ -20010,8 +19780,6 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dunder: &'static str,
     method: pyre_object::PyObjectRef,
@@ -20176,9 +19944,6 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         ctx,
         op,
         code,
-        method_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -20190,7 +19955,6 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_receiver),
             ConcreteValue::Ref(concrete_other),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -20344,7 +20108,6 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     code: &[u8],
     op_tag: i64,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -20461,9 +20224,6 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         ctx,
         op,
         code,
-        method_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -20475,7 +20235,6 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_lhs),
             ConcreteValue::Ref(concrete_rhs),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -20590,7 +20349,6 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -20707,9 +20465,6 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ctx,
         op,
         code,
-        method_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -20721,7 +20476,6 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_value),
             ConcreteValue::Ref(concrete_spec),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -20844,7 +20598,6 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
     code: &[u8],
     op_tag: i64,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -20914,9 +20667,6 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         ctx,
         op,
         code,
-        method_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -20928,7 +20678,6 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_haystack),
             ConcreteValue::Ref(concrete_needle),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -20962,7 +20711,6 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -21055,9 +20803,6 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
         ctx,
         op,
         code,
-        method_const,
-        r_args,
-        call_descr,
         'r',
         dst,
         method,
@@ -21069,7 +20814,6 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_classinfo),
             ConcreteValue::Ref(concrete_obj),
         ],
-        true,
         None,
         w_code,
         nparams,
@@ -23497,7 +23241,6 @@ fn python_portal_subwalk_site<Sym: WalkSym>(
         call_site_word,
         call_pc as i32,
         OuterActiveBoxesEntryTwin::Plain,
-        "call_site_capture",
         None,
     );
     PythonPortalSubwalkSite {
@@ -24062,11 +23805,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         // it are for builtin containers this declines.
         if is_subscr
             && let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, &[], &args, &[])
-            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(_) = setup.descr.as_call_descr()
             && let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
-                try_walker_inline_subscr_getitem(
-                    ctx, op, code, None, &args, call_descr, dst, dst_bank,
-                )
+                try_walker_inline_subscr_getitem(ctx, op, code, &args, dst, dst_bank)
             })?
         {
             return Ok(inlined);
@@ -24104,10 +23845,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         // `binary_value_from_tag`.  A Python forward dunder must be
         // admitted here too, or `p + i` residualizes the whole helper.
         if let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, &[], &args, &[])
-            && let Some(call_descr) = setup.descr.as_call_descr()
-            && let Some(inlined) = try_walker_inline_user_binop(
-                ctx, op, code, op_tag, &args, call_descr, dst, dst_bank,
-            )?
+            && let Some(_) = setup.descr.as_call_descr()
+            && let Some(inlined) =
+                try_walker_inline_user_binop(ctx, op, code, op_tag, &args, dst, dst_bank)?
         {
             return Ok(inlined);
         }
@@ -24356,11 +24096,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // containers, which this declines.
         if let Ok(setup) =
             inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
-            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(_) = setup.descr.as_call_descr()
             && let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
-                try_walker_inline_subscr_getitem(
-                    ctx, op, code, None, &ref_args, call_descr, dst, dst_bank,
-                )
+                try_walker_inline_subscr_getitem(ctx, op, code, &ref_args, dst, dst_bank)
             })?
         {
             return Ok(inlined);
@@ -24556,10 +24294,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // borrow the helper's own `calldescr` the fnaddr residual uses.
         if let Ok(setup) =
             inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
-            && let Some(call_descr) = setup.descr.as_call_descr()
-            && let Some(inlined) = try_walker_inline_user_binop(
-                ctx, op, code, op_tag, &ref_args, call_descr, dst, dst_bank,
-            )?
+            && let Some(_) = setup.descr.as_call_descr()
+            && let Some(inlined) =
+                try_walker_inline_user_binop(ctx, op, code, op_tag, &ref_args, dst, dst_bank)?
         {
             return Ok(inlined);
         }

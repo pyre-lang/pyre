@@ -194,7 +194,6 @@ impl JitState for UnpackJitState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::{JitCode, RuntimeBhDescr};
 

@@ -50,10 +50,7 @@
     non_snake_case,
     private_interfaces,
     unsafe_op_in_unsafe_fn,
-    unused_doc_comments,
-    unused_imports,
-    unused_unsafe,
-    unused_variables
+    unused_doc_comments
 )]
 
 //! pyre-jit-trace: Trace-time JIT for pyre.
@@ -228,7 +225,6 @@ pub mod generated {
 // Keep generated-code lint allowances scoped to this include wrapper.
 #[allow(unsafe_op_in_unsafe_fn, unused_variables)]
 mod generated_root {
-    use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
     include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
 }
 pub use generated_root::*;

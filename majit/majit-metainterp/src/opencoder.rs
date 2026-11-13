@@ -1,9 +1,10 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use indexmap::IndexMap;
 use majit_ir::operand::Operand;
-use majit_ir::{InputArg, OPCODE_COUNT, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{InputArg, OpCode, OpRc, OpRef, Type};
+#[cfg(test)]
+use majit_ir::{OPCODE_COUNT, Value};
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -3847,7 +3848,7 @@ mod tests {
     fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
         let op_args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| box_arg_operand(*a)).collect();
-        let mut op = majit_ir::Op::new(opcode, &op_args);
+        let op = majit_ir::Op::new(opcode, &op_args);
         op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
@@ -4065,7 +4066,7 @@ mod tests {
     fn test_trace_iterator_fail_args_remapped() {
         // opencoder.py next() routes guard fail_args through the
         // same _untag/_get path as regular args.
-        let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[iop(1)]);
+        let guard = op_at(2, majit_ir::OpCode::GuardTrue, &[iop(1)]);
         guard.setfailargs(vec![box_arg_operand(iarg(0)), box_arg_operand(iop(1))].into());
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntEq, &[iarg(0), iarg(0)]),
@@ -4089,7 +4090,7 @@ mod tests {
     fn test_trace_iterator_keeps_frontend_stamp() {
         // history.py FrontendOp `_resint` lives on the recorded box.
         // The structured walker must copy it onto the cls() result.
-        let mut add = op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        let add = op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]);
         add.set_value(majit_ir::value::Value::Int(7));
         let ops = vec![add];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
@@ -5404,7 +5405,7 @@ mod tests {
         let _ = buf.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
 
         // Build a minimal jitcode with 1 int reg and a LIVE op at pc 0.
-        let mut builder = crate::jitcode::JitCodeBuilder::new();
+        let builder = crate::jitcode::JitCodeBuilder::new();
         let mut jc = builder.finish();
         const LIVE_OP: u8 = 0x42;
         {
@@ -5668,7 +5669,7 @@ mod tests {
         // verbatim.
         let cut = t.cut_trace_from(cut_point, vec![OpRef::int_op(add1), i1]);
         // (i0, i1), l, iter = self.unpack(t2)
-        let mut it = cut.get_iter();
+        let it = cut.get_iter();
         let fresh_add1 = it.inputargs[0].opref();
         let fresh_i1 = it.inputargs[1].opref();
         let mut ops = Vec::new();

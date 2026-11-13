@@ -438,7 +438,7 @@ mod tests {
     /// distinct interned objects (`descr.py get_field_descr`).
     #[test]
     fn writing_locals_cells_stack_w_keeps_w_f_trace_heapcache_entry() {
-        use majit_ir::{Descr, OpRef};
+        use majit_ir::OpRef;
         use majit_metainterp::heapcache::{
             HeapCache, HeapCacheViewMut, SameConstantOracle, TestHeapcBoxes,
         };

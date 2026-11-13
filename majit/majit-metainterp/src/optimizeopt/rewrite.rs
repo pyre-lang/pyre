@@ -5,7 +5,7 @@ use majit_ir::operand::Operand;
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
-use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
+use majit_ir::{Const, Op, OpCode, OpRc, Value};
 use std::cell::{Cell, RefCell};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
@@ -282,7 +282,7 @@ impl OptRewrite {
                 == Some(i64::MIN)
         {
             let arg_zero = Operand::const_(majit_ir::Const::Int(0));
-            let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
+            let new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
             new_op.pos().set(op.pos().get());
             return OptimizationResult::Emit(new_op);
         }
@@ -398,7 +398,7 @@ impl OptRewrite {
     ///     else: return self.emit(op)
     fn optimize_nullness(
         &self,
-        op: &Op,
+        _op: &Op,
         op_rc: &majit_ir::OpRc,
         arg: &Operand,
         expect_nonnull: bool,
@@ -898,7 +898,7 @@ impl OptRewrite {
         // RPython: replace_op_with + send_extra_operation (routes through passes).
         if val & (val - 1) == 0 {
             let arg_mask = Operand::const_(Const::Int(val - 1));
-            let mut and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
+            let and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
             let and_op = OpRc::new(and_op);
             send_extra_operation_from(opt, &and_op, ctx);
@@ -957,7 +957,7 @@ impl OptRewrite {
                 let shiftbound = ctx.getintbound_handle(&shiftvar).borrow().clone();
                 if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                     let arg_shift = shiftvar.clone();
-                    let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
+                    let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
                     let rshift_op = OpRc::new(rshift_op);
                     send_extra_operation_from(opt, &rshift_op, ctx);
@@ -970,7 +970,7 @@ impl OptRewrite {
         let val = b2.get_constant_int();
         // rewrite.py:743-749: x // -1 → -x (if x > MININT)
         if val == -1 && b1.known_gt_const(i64::MIN) {
-            let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
+            let neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
             let neg_op = OpRc::new(neg_op);
             send_extra_operation_from(opt, &neg_op, ctx);
@@ -993,7 +993,7 @@ impl OptRewrite {
         if val & (val - 1) == 0 {
             let shift = val.trailing_zeros() as i64;
             let arg_shift = Operand::const_(Const::Int(shift));
-            let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
+            let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
             let rshift_op = OpRc::new(rshift_op);
             send_extra_operation_from(opt, &rshift_op, ctx);
@@ -1194,7 +1194,7 @@ impl OptRewrite {
                     .unwrap_or(majit_ir::Type::Int);
                 let opcode = OpCode::getarrayitem_for_type(item_type);
                 let arg_idx = Operand::const_(Const::Int(index + source_start));
-                let mut getop = Op::new(opcode, &[source_b.clone(), arg_idx.clone()]);
+                let getop = Op::new(opcode, &[source_b.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let getop = OpRc::new(getop);
                 send_extra_operation_from(opt, &getop, ctx);
@@ -1215,7 +1215,7 @@ impl OptRewrite {
                 // rewrite.py: emit SETARRAYITEM_GC
                 let arg_idx = Operand::const_(Const::Int(index + dest_start));
                 let arg_val = val;
-                let mut setop = Op::new(
+                let setop = Op::new(
                     OpCode::SetarrayitemGc,
                     &[dest_b.clone(), arg_idx.clone(), arg_val.clone()],
                 );
@@ -1268,7 +1268,7 @@ impl OptRewrite {
     /// when its intbound is exactly 0 or 1, fold this op to the other bit.
     fn try_boolinvers(
         &self,
-        op: &Op,
+        _op: &Op,
         op_rc: &majit_ir::OpRc,
         top: &Op,
         ctx: &mut OptContext,
@@ -1362,7 +1362,7 @@ impl OptRewrite {
                     return OptimizationResult::Remove;
                 }
                 if v == -1.0 {
-                    let mut neg = Op::new(OpCode::FloatNeg, std::slice::from_ref(rhs));
+                    let neg = Op::new(OpCode::FloatNeg, std::slice::from_ref(rhs));
                     neg.pos().set(op.pos().get());
                     return OptimizationResult::Replace(neg);
                 }
@@ -1390,7 +1390,7 @@ impl OptRewrite {
                 let reciprocal = 1.0 / divisor;
                 if Self::is_exact_power_of_two(reciprocal) {
                     let arg_recip = Operand::const_(Const::Float(reciprocal));
-                    let mut new_op = Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
+                    let new_op = Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
                     new_op.pos().set(op.pos().get());
                     return OptimizationResult::Emit(new_op);
                 }
@@ -1722,7 +1722,7 @@ impl OptRewrite {
                 if let Some(c) = ctx.get_constant_int_box(&op.arg_ref(0).get_box_replacement(false))
                     && c != 0
                 {
-                    let mut call_op = Op::new(
+                    let call_op = Op::new(
                         OpCode::CallN,
                         &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                     );
@@ -1754,7 +1754,7 @@ impl OptRewrite {
                     } else {
                         OpCode::CallPureR
                     };
-                    let mut call_op = Op::new(
+                    let call_op = Op::new(
                         call_opcode,
                         &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                     );
@@ -2174,7 +2174,6 @@ impl OptRewrite {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        ctx: &mut OptContext,
     ) {
         let producers: Vec<OpRc> = self
             .loop_invariant_producer
@@ -2183,7 +2182,7 @@ impl OptRewrite {
             .cloned()
             .collect();
         for op in &producers {
-            sb.add_loopinvariant_op(ctx, op);
+            sb.add_loopinvariant_op(op);
         }
     }
 
@@ -2239,9 +2238,9 @@ impl Optimization for OptRewrite {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        ctx: &mut OptContext,
+        _ctx: &mut OptContext,
     ) {
-        OptRewrite::produce_potential_short_preamble_ops(self, sb, ctx);
+        OptRewrite::produce_potential_short_preamble_ops(self, sb);
     }
 
     fn serialize_optrewrite(&self) -> Vec<(i64, Operand)> {
@@ -2264,7 +2263,7 @@ mod tests {
     use super::*;
 
     use crate::optimizeopt::optimizer::Optimizer;
-    use majit_ir::GcRef;
+    use majit_ir::{GcRef, OpRef};
 
     #[test]
     fn check_subclass_reads_cpu_subclassrange_fields() {
@@ -2483,7 +2482,7 @@ mod tests {
                 .expect("a materialized int operand has a live bound cell")
                 .make_ge_const(0);
         }
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
         let op_rc = OpRc::new(op.clone());
@@ -2545,7 +2544,7 @@ mod tests {
         // `force_op_from_preamble_op` requires a short-preamble producer.
         ctx.initialize_imported_short_preamble_builder(&[], &[], &[]);
         let source_op = ctx.materialize_operand_at(source);
-        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
+        let replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
         replay.pos().set(ctx.get_replacement_opref(source));
         let pass = OptRewrite::new();
         pass.loop_invariant_results.borrow_mut().insert(
@@ -2717,7 +2716,7 @@ mod tests {
         resolve_op_args_in_ctx(&mut call, &mut ctx);
         let op_rc = OpRc::new(call.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         let result = pass.propagate_forward(&call, &op_rc, &mut None, &mut ctx);
         (result, ctx)
     }
@@ -2887,9 +2886,9 @@ mod tests {
         // p0 = inputarg(Ref); guard_isnull(p0); finish(p0)
         let p0 = crate::history::test_support::TraceBuilder::new().input(majit_ir::Type::Ref, 0);
         let ops = {
-            let mut guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
+            let guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
             guard.pos().set(OpRef::void_op(0));
-            let mut finish = Op::new(OpCode::Finish, &[p0.clone()]);
+            let finish = Op::new(OpCode::Finish, &[p0.clone()]);
             finish.pos().set(OpRef::void_op(1));
             vec![guard, finish]
         };
@@ -2929,10 +2928,10 @@ mod tests {
             majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
         let arg = Operand::from_bound_inputarg(&input);
         arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
-        let mut guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
+        let guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
         guard.pos().set(OpRef::void_op(0));
         let guard_rc = OpRc::new(guard.clone());
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
 
         let result = pass.propagate_forward(&guard, &guard_rc, &mut None, &mut ctx);
         assert_remove(&result);
@@ -2946,13 +2945,13 @@ mod tests {
         let arg = Operand::from_bound_inputarg(&input);
         let value = majit_ir::GcRef(42);
         arg.set_forwarded_const(majit_ir::Const::from_gcref(value));
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardValue,
             &[arg, Operand::const_from_value(majit_ir::Value::Ref(value))],
         );
         guard.pos().set(OpRef::void_op(0));
         let guard_rc = OpRc::new(guard.clone());
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
 
         let result = pass.propagate_forward(&guard, &guard_rc, &mut None, &mut ctx);
         assert_remove(&result);
@@ -3271,7 +3270,7 @@ mod tests {
         let mut ctx = OptContext::new(3);
         ctx.emit_rc(ops[0].clone());
 
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         // Process op1 first (pass it through) on the producer the next
         // op's arg already wraps.
         ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
@@ -3578,7 +3577,7 @@ mod tests {
         ctx.emit_rc(ops[1].clone());
         ctx.make_constant_box(&Operand::from_bound_op(&ops[0]), Value::Int(0));
 
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         // Process CondCallN -> removed
         for i in 0..ops[2].num_args() {
             let resolved = ctx.resolve_operand_operand(&ops[2].arg(i));
@@ -3606,7 +3605,7 @@ mod tests {
         let mut ctx = OptContext::new(3);
         ctx.emit_rc(ops[0].clone());
 
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
         ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
         let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut None, &mut ctx);
@@ -3665,9 +3664,9 @@ mod tests {
         );
         let finish = Op::new(OpCode::Finish, &[]);
         let ops = {
-            let mut gv = guard_value;
+            let gv = guard_value;
             gv.pos().set(OpRef::void_op(0));
-            let mut fin = finish;
+            let fin = finish;
             fin.pos().set(OpRef::void_op(1));
             vec![(*int_gt).clone(), gv, fin]
         };

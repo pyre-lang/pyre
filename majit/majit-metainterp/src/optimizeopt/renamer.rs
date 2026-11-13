@@ -3,8 +3,6 @@
 //! Mirrors RPython's `optimizeopt/renamer.py`.
 //! Used during loop unrolling to rename OpRefs from one iteration to the next.
 
-use std::rc::Rc;
-
 use majit_ir::resoperation::{Op, OpCode, OpRc};
 use majit_ir::{InputArg, InputArgRc, OpRef, Type};
 

@@ -20,9 +20,9 @@
 //! parity); that cascades into every call site of `TraceCtx::*`.
 
 use crate::heapcache::{HeapCache, HeapCacheView, HeapCacheViewMut};
+#[cfg(test)]
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
-use indexmap::IndexMap;
 use majit_gc::header::GCREF;
 use majit_ir::{DescrRef, GcRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
@@ -8354,8 +8354,6 @@ impl TraceCtx {
 // narrows from crate-level to mod-level.
 mod tests {
     use super::*;
-    use crate::jit_state::JitState;
-    use majit_backend::JitCellToken;
     use majit_ir::Type;
 
     /// LIVE at pc 0 so `generate_guard` can step back `SIZE_LIVE_OP`

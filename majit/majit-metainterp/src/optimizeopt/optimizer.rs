@@ -29,13 +29,12 @@ pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earl
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
-use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
+use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
@@ -1033,7 +1032,7 @@ impl Optimizer {
                 "imported virtual leaf missing box.type"
             );
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-            let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(label_arg));
+            let op = majit_ir::Op::new(same_as_op, std::slice::from_ref(label_arg));
             op.pos().set(ctx.reserve_pos_typed(tp));
             // Op.type_ carries `tp` intrinsically (`ResOperation.type` /
             // `same_as_for_type`); the immediate push below makes the
@@ -1682,7 +1681,7 @@ impl Optimizer {
     /// arm, immediately before the late `unroll::export_state`.
     fn publish_preview_short_state(
         &mut self,
-        mut ctx: &mut OptContext,
+        ctx: &mut OptContext,
         resolved_args: &[Operand],
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
@@ -1814,100 +1813,99 @@ impl Optimizer {
                 seen.push(ptr);
             }
         }
-        let mut convert_produced =
-            |result: OpRef,
-             produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
-             const_group: bool| {
-                let canonical_result = ctx.get_replacement_opref(result);
-                let replay_result = if const_group {
-                    None
-                } else {
-                    // pure.py `produce_potential_short_preamble_ops` walks
-                    // `_newoperations`, not their replacements.  In particular,
-                    // `postprocess_GUARD_TRUE` can forward an already-emitted
-                    // pure comparison to CONST_1; PyPy still exports that
-                    // comparison Box and `PureOp.produce_op` installs it in the
-                    // next iteration's pure cache.  Keep the original result
-                    // identity for that case.  Using the inline Const as the
-                    // replay position would collapse distinct comparison Boxes
-                    // that happen to prove the same value.
-                    Some(exported_short_box_replay_result(
-                        result,
-                        canonical_result,
-                        &produced.kind,
-                    )?)
-                };
-                let preamble_op = produced.preamble_op.clone();
-                // shortpreamble.py keeps two boxes: `short_op.res` (body) and
-                // `preamble_op` (replay). `add_op_to_short` already minted the
-                // replay result. `exported_short_box_replay_result` only
-                // decides whether a forwarded-to-Const entry is kept; it must
-                // not be written onto `preamble_op.pos`.
-                if replay_result.is_none() && !const_group {
-                    return None;
+        let convert_produced = |result: OpRef,
+                                produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
+                                const_group: bool| {
+            let canonical_result = ctx.get_replacement_opref(result);
+            let replay_result = if const_group {
+                None
+            } else {
+                // pure.py `produce_potential_short_preamble_ops` walks
+                // `_newoperations`, not their replacements.  In particular,
+                // `postprocess_GUARD_TRUE` can forward an already-emitted
+                // pure comparison to CONST_1; PyPy still exports that
+                // comparison Box and `PureOp.produce_op` installs it in the
+                // next iteration's pure cache.  Keep the original result
+                // identity for that case.  Using the inline Const as the
+                // replay position would collapse distinct comparison Boxes
+                // that happen to prove the same value.
+                Some(exported_short_box_replay_result(
+                    result,
+                    canonical_result,
+                    &produced.kind,
+                )?)
+            };
+            let preamble_op = produced.preamble_op.clone();
+            // shortpreamble.py keeps two boxes: `short_op.res` (body) and
+            // `preamble_op` (replay). `add_op_to_short` already minted the
+            // replay result. `exported_short_box_replay_result` only
+            // decides whether a forwarded-to-Const entry is kept; it must
+            // not be written onto `preamble_op.pos`.
+            if replay_result.is_none() && !const_group {
+                return None;
+            }
+            // optimizer.py force_box loop parity.
+            //
+            // Resolve POSITIONALLY when a producer is registered at
+            // this slot: replay-op args carry the dep replay handle
+            // (produce_arg, shortpreamble.py) whose forwarded slot
+            // is empty, so only the body producer registered at the
+            // same position carries the Phase-1 forwarding to the
+            // canonical end box this export boundary needs.
+            //
+            // When positional resolution finds NO producer, the carried
+            // handle is unforwarded and resolves to itself
+            // (resoperation.py `get_box_replacement`): keep the handle OBJECT instead of
+            // re-minting a producer-less position-only box, so its
+            // identity (and the `Operand::Op`/`InputArg` shed) survives
+            // the export. The encoded OpRef is identical either way
+            // (`from_opref(arg.to_opref()) == arg.to_opref()`).
+            for i in 0..preamble_op.num_args() {
+                let arg = preamble_op.arg(i);
+                // The `OpRef::none()` sentinel has no producer box
+                // (`materialize_operand_at` doc) — routing it through the
+                // producer lookup is meaningless and trips the
+                // `get_box_replacement` "box must exist" debug tripwire.
+                if arg.is_none() {
+                    continue;
                 }
-                // optimizer.py force_box loop parity.
-                //
-                // Resolve POSITIONALLY when a producer is registered at
-                // this slot: replay-op args carry the dep replay handle
-                // (produce_arg, shortpreamble.py) whose forwarded slot
-                // is empty, so only the body producer registered at the
-                // same position carries the Phase-1 forwarding to the
-                // canonical end box this export boundary needs.
-                //
-                // When positional resolution finds NO producer, the carried
-                // handle is unforwarded and resolves to itself
-                // (resoperation.py:57-68): keep the handle OBJECT instead of
-                // re-minting a producer-less position-only box, so its
-                // identity (and the `Operand::Op`/`InputArg` shed) survives
-                // the export. The encoded OpRef is identical either way
-                // (`from_opref(arg.to_opref()) == arg.to_opref()`).
-                for i in 0..preamble_op.num_args() {
-                    let arg = preamble_op.arg(i);
-                    // The `OpRef::none()` sentinel has no producer box
-                    // (`materialize_operand_at` doc) — routing it through the
-                    // producer lookup is meaningless and trips the
-                    // `get_box_replacement` "box must exist" debug tripwire.
+                let resolved = ctx
+                    .heal_arg_to_canonical(&arg)
+                    .or_else(|| ctx.resolve_operand_operand_opt(&arg))
+                    .unwrap_or_else(|| arg.clone());
+                preamble_op.setarg(i, resolved);
+            }
+            if let Some(mut fail_args) = preamble_op.getfailargs() {
+                for arg in fail_args.iter_mut() {
                     if arg.is_none() {
                         continue;
                     }
-                    let resolved = ctx
-                        .heal_arg_to_canonical(&arg)
-                        .or_else(|| ctx.resolve_operand_operand_opt(&arg))
-                        .unwrap_or_else(|| arg.clone());
-                    preamble_op.setarg(i, resolved);
+                    *arg = arg.get_box_replacement(false);
                 }
-                if let Some(mut fail_args) = preamble_op.getfailargs() {
-                    for arg in fail_args.iter_mut() {
-                        if arg.is_none() {
-                            continue;
-                        }
-                        *arg = arg.get_box_replacement(false);
-                    }
-                    preamble_op.setfailargs(fail_args);
-                }
-                // An InputArg label arg whose canonical result forwards away
-                // is absent from `short_boxes.label_args`, so a re-lookup of
-                // `canonical_result` returns None and the per-slot original
-                // is lost. `produced.label_arg_idx` is the slot stamped at
-                // `add_short_input_arg` (the slot the renamed
-                // `short_inputargs[i]` pairs with — consumed by
-                // `slot_to_original`). Non-InputArg entries keep the same
-                // stamped field; `inline_short_preamble` does not read it.
-                Some(crate::optimizeopt::shortpreamble::PreambleOp {
-                    op: preamble_op,
-                    source_op: Some(produced.source_op.clone()),
-                    // short_op.res travels with the entry as the
-                    // exported `PreambleOp.res` operand; the preview
-                    // ProducedShortOp already carries the bound producer
-                    // / const operand, so it moves across unchanged.
-                    res: produced.res.clone(),
-                    kind: produced.kind,
-                    label_arg_idx: produced.label_arg_idx,
-                    invented_name: produced.invented_name,
-                    same_as_source: produced.same_as_source.clone(),
-                })
-            };
+                preamble_op.setfailargs(fail_args);
+            }
+            // An InputArg label arg whose canonical result forwards away
+            // is absent from `short_boxes.label_args`, so a re-lookup of
+            // `canonical_result` returns None and the per-slot original
+            // is lost. `produced.label_arg_idx` is the slot stamped at
+            // `add_short_input_arg` (the slot the renamed
+            // `short_inputargs[i]` pairs with — consumed by
+            // `slot_to_original`). Non-InputArg entries keep the same
+            // stamped field; `inline_short_preamble` does not read it.
+            Some(crate::optimizeopt::shortpreamble::PreambleOp {
+                op: preamble_op,
+                source_op: Some(produced.source_op.clone()),
+                // short_op.res travels with the entry as the
+                // exported `PreambleOp.res` operand; the preview
+                // ProducedShortOp already carries the bound producer
+                // / const operand, so it moves across unchanged.
+                res: produced.res.clone(),
+                kind: produced.kind,
+                label_arg_idx: produced.label_arg_idx,
+                invented_name: produced.invented_name,
+                same_as_source: produced.same_as_source.clone(),
+            })
+        };
         let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> = produced
             .into_iter()
             .filter_map(|(result, produced)| convert_produced(result, produced, false))
@@ -3341,7 +3339,7 @@ impl Optimizer {
         // flush=True (default) is used by optimize_loop (compile_loop) and
         // finish_and_compile — terminal op is sent through passes and ends
         // up in new_operations naturally.
-        if let Some(mut terminal_op) = last_op {
+        if let Some(terminal_op) = last_op {
             // RPython unroll.py:126-127 parity:
             //   for a in end_jump.getarglist():
             //       self.force_box_for_end_of_preamble(get_box_replacement(a))
@@ -3612,7 +3610,7 @@ impl Optimizer {
                         let arg_type = orig_box.type_();
                         // History.record_same_as: SAME_AS is a ResOp.
                         let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
-                        let mut op = Op::new(
+                        let op = Op::new(
                             OpCode::same_as_for_type(arg_type),
                             std::slice::from_ref(&orig_box),
                         );
@@ -5603,12 +5601,7 @@ impl Optimizer {
             // Rust adaptation: collect BEFORE the call (borrow checker) and pass
             // as parameter. available_boxes filtering happens inside
             // memo.finish() using liveboxes ∩ liveboxes_from_env.
-            let failarg_refs: Vec<OpRef> = op
-                .guard_fail_args()
-                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default();
-            let knowledge_for_resume =
-                self.collect_optimizer_knowledge_for_resume(ctx, &failarg_refs);
+            let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
             let knowledge = if knowledge_for_resume.is_empty() {
                 None
             } else {
@@ -5827,7 +5820,7 @@ impl Optimizer {
         };
         // virtualize.py:87 store_final_boxes_in_guard(guard_op, []) — the
         // pendingfields argument is the empty list.
-        let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx, &[]);
+        let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
         let knowledge = if knowledge_for_resume.is_empty() {
             None
         } else {
@@ -5851,7 +5844,6 @@ impl Optimizer {
     fn collect_optimizer_knowledge_for_resume(
         &mut self,
         ctx: &mut OptContext,
-        failargs: &[OpRef],
     ) -> crate::resume::OptimizerKnowledgeForResume {
         let mut heap_fields_raw: Vec<(Operand, DescrRef, Operand)> = Vec::new();
         let mut heap_arrayitems_raw: Vec<(Operand, i64, DescrRef, Operand)> = Vec::new();
@@ -5949,7 +5941,7 @@ impl Optimizer {
             _ => return None,
         };
         // optimizer.py: replace_op_with(op, opnum, [op.getarg(0)], descr)
-        let mut newop = Op::new(new_opcode, &[arg0]);
+        let newop = Op::new(new_opcode, &[arg0]);
         newop.pos().set(op.pos().get());
         if let Some(d) = op.getdescr() {
             newop.setdescr(d);
@@ -6372,7 +6364,7 @@ mod tests {
                     .expect("send extra New");
                 let alloc_box = ctx.materialize_operand_at(alloc_op.pos().get());
                 let value = op.arg(0);
-                let mut set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
+                let set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
                 set.setdescr(self.field_descr.clone());
                 opt.as_deref_mut()
                     .unwrap()
@@ -6452,7 +6444,7 @@ mod tests {
             _ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
-                let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
+                let restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
                 restarted.pos().set(op.pos().get());
                 return OptimizationResult::Restart(restarted);
             }
@@ -6575,7 +6567,7 @@ mod tests {
         opt.add_pass(Box::new(RestartIntAddAsSub));
         opt.add_pass(Box::new(CountRestartedIntSub { hits: hits.clone() }));
 
-        let mut ops = vec![Op::new(
+        let ops = vec![Op::new(
             OpCode::IntMul,
             &[
                 rooted_resop_operand(Type::Int, 0),
@@ -6775,7 +6767,7 @@ mod tests {
         // to themselves (the `same_box` arm of `resolve_operand_operand`),
         // deferring to the OpRef
         // store — no `Operand::Box`.
-        let mut call_a = Op::with_descr(
+        let call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
                 rooted_resop_operand(Type::Int, 0),
@@ -6783,7 +6775,7 @@ mod tests {
             ],
             call_descr_a,
         );
-        let mut guard_a = Op::with_descr(
+        let guard_a = Op::with_descr(
             OpCode::GuardNotForced,
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_a.clone(), 0),
@@ -6811,7 +6803,7 @@ mod tests {
             &[rooted_resop_operand(Type::Ref, 3)],
             field_descr_b.clone(),
         );
-        let mut call_b = Op::with_descr(
+        let call_b = Op::with_descr(
             OpCode::CallMayForceR,
             &[
                 rooted_resop_operand(Type::Int, 0),
@@ -6819,7 +6811,7 @@ mod tests {
             ],
             call_descr_b,
         );
-        let mut guard_b = Op::with_descr(
+        let guard_b = Op::with_descr(
             OpCode::GuardNotForced,
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_b.clone(), 0),
@@ -6986,7 +6978,7 @@ mod tests {
             added: Cell::new(false),
         }));
 
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 4)]),
@@ -7030,7 +7022,7 @@ mod tests {
             value: 123,
         }));
 
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
@@ -7060,7 +7052,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.skip_flush = true;
 
-        let mut ops = vec![
+        let ops = vec![
             Op::new(
                 OpCode::IntAdd,
                 &[
@@ -7100,7 +7092,7 @@ mod tests {
         // and must stay in the op list. optimize_bridge would park it in
         // terminal_op / try jump matching.
         let mut opt = Optimizer::default_pipeline();
-        let mut finish = Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 0)]);
+        let finish = Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 0)]);
         finish.pos().set(OpRef::void_op(1));
         let ops = vec![OpRc::new(finish)];
         opt.trace_inputargs = rooted_inputarg_operands(&[Type::Int]);
@@ -7191,7 +7183,7 @@ mod tests {
     #[test]
     fn test_ref_guard_value_is_not_bool_specialized() {
         let mut opt = Optimizer::new();
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::New, &[]),
             Op::new(OpCode::New, &[]),
             Op::new(
@@ -7248,7 +7240,7 @@ mod tests {
 
         let v0 = rooted_resop_operand(Type::Int, 0);
         let v1 = rooted_resop_operand(Type::Int, 1);
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
             Op::new(OpCode::Jump, &[v0, v1]),
         ];
@@ -7301,7 +7293,7 @@ mod tests {
                     .expect("send extra New A");
                 let alloc_a_box = ctx.materialize_operand_at(alloc_a_op.pos().get());
                 let value_a = op.arg(0);
-                let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
+                let set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
                 set_a.setdescr(self.field_descr.clone());
                 opt.as_deref_mut()
                     .unwrap()
@@ -7315,7 +7307,7 @@ mod tests {
                     .expect("send extra New B");
                 let alloc_b_box = ctx.materialize_operand_at(alloc_b_op.pos().get());
                 let value_b = op.arg(1);
-                let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
+                let set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
                 set_b.setdescr(self.field_descr.clone());
                 opt.as_deref_mut()
                     .unwrap()
@@ -7341,7 +7333,7 @@ mod tests {
 
         let v0 = rooted_resop_operand(Type::Int, 0);
         let v1 = rooted_resop_operand(Type::Int, 1);
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
             Op::new(OpCode::Jump, &[v0, v1]),
         ];
@@ -7393,7 +7385,7 @@ mod tests {
 
         let v0 = rooted_resop_operand(Type::Int, 0);
         let v1 = rooted_resop_operand(Type::Int, 1);
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
             Op::new(OpCode::Jump, &[v0, v1]),
         ];
@@ -7543,7 +7535,7 @@ mod tests {
 
     #[test]
     fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
-        let mut op = Op::new(
+        let op = Op::new(
             OpCode::CallPureI,
             &[
                 rooted_resop_operand(Type::Int, 0),
@@ -7563,7 +7555,7 @@ mod tests {
 
     #[test]
     fn test_is_call_pure_pure_canraise_true_for_other_raising_effects() {
-        let mut op = Op::new(
+        let op = Op::new(
             OpCode::CallPureI,
             &[
                 rooted_resop_operand(Type::Int, 0),
@@ -7639,7 +7631,7 @@ mod tests {
         let arg = rooted_resop_operand(Type::Int, 0);
 
         let old = {
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::GuardTrue,
                 std::slice::from_ref(&arg),
                 crate::compile::make_resume_guard_descr_typed(Vec::new()),
@@ -7650,7 +7642,7 @@ mod tests {
         ctx.push_new_operation(old);
 
         let new_guard = {
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::GuardFalse,
                 std::slice::from_ref(&arg),
                 crate::compile::make_resume_guard_descr_typed(Vec::new()),
@@ -7871,7 +7863,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
-        let mut preamble_op = Op::new(
+        let preamble_op = Op::new(
             OpCode::IntGe,
             &[
                 rooted_resop_operand(Type::Int, 3),
@@ -7898,7 +7890,7 @@ mod tests {
         );
         let b14 = ctx.materialize_operand_at(OpRef::int_op(14));
         let replay_op = {
-            let mut op = majit_ir::Op::new(
+            let op = majit_ir::Op::new(
                 majit_ir::OpCode::SameAsI,
                 &[rooted_resop_operand(Type::Int, 14)],
             );
@@ -7915,7 +7907,7 @@ mod tests {
             },
         );
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[b14.clone()]);
+        let guard = Op::new(OpCode::GuardTrue, &[b14.clone()]);
         guard.pos().set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
@@ -8120,21 +8112,21 @@ mod tests {
         let a = rooted_inputarg_operand(Type::Int, 0);
         let b_arg = rooted_inputarg_operand(Type::Int, 1);
         let four = Operand::const_from_value(majit_ir::Value::Int(4));
-        let mut cmp = Op::new(OpCode::IntGe, &[a.clone(), b_arg.clone()]);
+        let cmp = Op::new(OpCode::IntGe, &[a.clone(), b_arg.clone()]);
         cmp.pos().set(OpRef::int_op(2));
-        let mut guard_true = Op::with_descr(
+        let guard_true = Op::with_descr(
             OpCode::GuardTrue,
             &[rooted_resop_operand(Type::Int, 2)],
             crate::compile::make_resume_guard_descr_typed(Vec::new()),
         );
         guard_true.pos().set(OpRef::void_op(3));
-        let mut guard_value = Op::with_descr(
+        let guard_value = Op::with_descr(
             OpCode::GuardValue,
             &[a.clone(), four],
             crate::compile::make_resume_guard_descr_typed(Vec::new()),
         );
         guard_value.pos().set(OpRef::void_op(4));
-        let mut jump = Op::new(OpCode::Jump, &[a.clone(), b_arg.clone()]);
+        let jump = Op::new(OpCode::Jump, &[a.clone(), b_arg.clone()]);
         jump.pos().set(OpRef::void_op(5));
         let ops = vec![cmp, guard_true, guard_value, jump];
         let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);

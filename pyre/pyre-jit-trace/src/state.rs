@@ -5,21 +5,21 @@
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
 use crate::pypyjit_driver_layout;
-use majit_backend::Backend;
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
     BridgeInlineCarrier, BridgeVirtualCache, JitDriverStaticData, JitState, PendingRefArrayWrite,
     ReconstructRecipe, TraceAction, TraceCtx, decode_fieldnum, materialize_bridge_virtual,
 };
+#[cfg(test)]
 use pyre_interpreter::{locals_w, locals_w_mut};
 
-use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
+use pyre_interpreter::bytecode::{CodeObject, Instruction};
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_dict, is_float, is_int, py_type_check,
+    FLOAT_TYPE, INT_TYPE, is_bool, is_dict, is_float, is_int, py_type_check,
 };
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 
@@ -1192,7 +1192,7 @@ pub unsafe fn retain_live_ref_registers(_ctx: *const (), _regs: *mut i64, _len: 
 /// attached that node; an inlined `__next__` instead leaves the callee's node
 /// at the chain head.
 pub fn raise_at_py_pc_keeps_existing_traceback(raw_code: &CodeObject, py_pc: usize) -> bool {
-    match unsafe { pyre_interpreter::decode_instruction_at(raw_code, py_pc) } {
+    match pyre_interpreter::decode_instruction_at(raw_code, py_pc) {
         Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
         Some((Instruction::Reraise { .. }, _)) | Some((Instruction::ForIter { .. }, _)) => true,
         _ => false,
@@ -3526,7 +3526,6 @@ where
     (K, V): pyre_object::rordereddict::GcEntriesType,
 {
     use majit_ir::descr::{ArrayFlag, LLType};
-    use majit_ir::{ArrayDescr, Descr};
     let base_size = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items);
     let item_size = std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>();
     let len_offset = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, length);
@@ -5560,18 +5559,16 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // `GilReadyState.gil_ready`, `PyCode.w_globals`, and `W_CType.size`
     // resolve through [`quasi_immut_descr_from_mutate`] (mutate descr
     // required). The arm below is the remaining STRUCT: `PyObject.w_class`.
-    let qmut = unsafe {
-        if index == crate::descr::w_class_descr().index() {
-            // `PyObject.w_class?` — one process-global watcher; the
-            // struct_ptr is unused (every instance shares the invalidation).
-            Some(pyre_object::w_class_current_qmut())
-        } else {
-            debug_assert!(
-                false,
-                "unrecognised quasi-immutable field descr index {index:#x}"
-            );
-            None
-        }
+    let qmut = if index == crate::descr::w_class_descr().index() {
+        // `PyObject.w_class?` — one process-global watcher; the
+        // struct_ptr is unused (every instance shares the invalidation).
+        Some(pyre_object::w_class_current_qmut())
+    } else {
+        debug_assert!(
+            false,
+            "unrecognised quasi-immutable field descr index {index:#x}"
+        );
+        None
     }?;
     Some(std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
         descr.clone(),
@@ -14095,8 +14092,8 @@ mod tests {
     /// `get_list_of_active_boxes` → `JitCode::get_live_vars_info`
     /// (jitcode.py), so the test fixture must satisfy that
     /// liveness lookup.
-    fn install_test_jitcode(code: &CodeObject, code_ref: *const ()) {
-        install_test_jitcode_with_liveness(code, code_ref, &[0, 0, 0], 1);
+    fn install_test_jitcode(code_ref: *const ()) {
+        install_test_jitcode_with_liveness(code_ref, &[0, 0, 0], 1);
     }
 
     /// Register a skeleton jitcode for `code_ref` in `METAINTERP_SD` (keyed
@@ -14106,7 +14103,6 @@ mod tests {
     /// 0 instead of the empty `[0, 0, 0]` default. The single `live/` op the
     /// builder emits patches to liveness offset 0.
     fn install_test_jitcode_with_liveness(
-        code: &CodeObject,
         code_ref: *const (),
         all_liveness: &[u8],
         num_liveness_ops: usize,
@@ -15111,7 +15107,7 @@ mod tests {
         let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-        install_test_jitcode(&code, frame.pycode);
+        install_test_jitcode(frame.pycode);
         let mut ctx = crate::trace_ctx_for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.become_active_vable_owner();
@@ -15141,7 +15137,7 @@ mod tests {
         let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-        install_test_jitcode(&code, frame.pycode);
+        install_test_jitcode(frame.pycode);
         let array_len = concrete_frame_array_len(frame_ptr).unwrap_or(1);
         let mut input_types = vec![
             Type::Ref, // frame
@@ -18247,8 +18243,8 @@ mod indirectcalltargets_tests {
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
     use super::{
-        MetaInterpStaticData, MetainterpSdGuard, pyjitcode_for_jitcode_index,
-        raw_code_for_jitcode_index, walk_jitcode_constants_refs_in,
+        MetaInterpStaticData, MetainterpSdGuard, raw_code_for_jitcode_index,
+        walk_jitcode_constants_refs_in,
     };
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
     use pyre_interpreter::bytecode::CodeObject;

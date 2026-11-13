@@ -1,12 +1,7 @@
 // `dead_code` is deliberately absent here. The ports that run ahead of their
 // consumers carry the attribute per item instead, so the lint still reports
 // anything that newly stops being reached.
-#![allow(
-    unpredictable_function_pointer_comparisons,
-    unused_imports,
-    unused_mut,
-    unused_variables
-)]
+#![allow(unpredictable_function_pointer_comparisons)]
 
 //! `majit-meta`: Meta-tracing automation layer for the majit JIT framework.
 //!

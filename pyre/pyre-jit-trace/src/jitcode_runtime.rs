@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
-use majit_ir::{CallDescr, Descr, DescrRef, ExtraEffect, JitCodeDescr};
+use majit_ir::{DescrRef, ExtraEffect};
 use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
@@ -2059,7 +2059,6 @@ fn register_struct_tid_now(size: usize, offsets: Vec<usize>) -> u32 {
     {
         return 0;
     }
-    use majit_gc::GcAllocator;
     majit_gc::gc_sync::gc_op(|gc| {
         gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
     })
@@ -2168,7 +2167,6 @@ fn register_array_layout(
     item_gc_offsets: Vec<usize>,
     is_ptr: bool,
 ) -> u32 {
-    use majit_gc::GcAllocator;
     let var_offsets = if !item_gc_offsets.is_empty() {
         item_gc_offsets
     } else if is_ptr {
@@ -4485,8 +4483,6 @@ mod tests {
     /// `descr.rs pyframe_listed_descr_offsets_match_host_offset_of`.
     #[test]
     fn listed_object_descrs_match_rust_offsets_after_kind0() {
-        use majit_ir::SizeDescr;
-
         materialize_gccache_owned_descrs();
 
         let check_size = |label: &str, descr: majit_ir::DescrRef| {

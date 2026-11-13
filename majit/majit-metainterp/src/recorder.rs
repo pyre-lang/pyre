@@ -128,7 +128,7 @@ impl Snapshot {
     /// (`history.py` `ConstPtr`). This snapshot is the holder, so the
     /// walk traces those slots. The index word itself does not move.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        let mut trace_tagged =
+        let trace_tagged =
             |tagged: &SnapshotTagged, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| match tagged {
                 SnapshotTagged::Const(bits, Type::Ref) if *bits != 0 => {
                     majit_ir::const_ptr_table::trace_index(*bits as u32, visitor);

@@ -3,7 +3,6 @@
 //! Mirrors RPython's `schedule.py`: pack groups, accumulation tracking,
 //! guard analysis, and vector scheduling state.
 
-use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 

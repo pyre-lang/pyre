@@ -988,7 +988,7 @@ impl TreeLoop {
 
         let mut new_ops: Vec<OpRc> = Vec::with_capacity(cut_ops.len());
         for (i, op) in cut_ops.iter().enumerate() {
-            let mut new_op: Op = (**op).clone();
+            let new_op: Op = (**op).clone();
             new_op.pos().set(new_positions[i]);
             let opcode = new_op.opcode;
             for j in 0..new_op.num_args() {
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn target_token_minor_scan_follows_minimark_old_objects_pointing_to_young_lifetime() {
-        let mut token = TargetToken::new_loop(1);
+        let token = TargetToken::new_loop(1);
         assert!(token.take_minor_scan_pending());
         assert!(!token.take_minor_scan_pending());
 
@@ -1149,12 +1149,12 @@ mod tests {
     #[test]
     fn target_token_clone_preserves_pending_or_clean_slots() {
         let pending = TargetToken::new_loop(1);
-        let mut pending_clone = pending.clone();
+        let pending_clone = pending.clone();
         assert!(pending_clone.take_minor_scan_pending());
 
-        let mut clean = TargetToken::new_loop(2);
+        let clean = TargetToken::new_loop(2);
         assert!(clean.take_minor_scan_pending());
-        let mut clean_clone = clean.clone();
+        let clean_clone = clean.clone();
         assert!(!clean_clone.take_minor_scan_pending());
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
     fn test_trace_guards_can_have_fail_args() {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
@@ -1305,9 +1305,9 @@ mod tests {
         // Multiple guards can have different fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![iarg_box(0)]);
-        let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
+        let g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
         g1.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
@@ -1446,7 +1446,7 @@ mod tests {
         // inputarg on the first iteration, then the prior IntAdd's position.
         let mut prev = iarg_box(0);
         for i in 0..100 {
-            let mut op = Op::new(OpCode::IntAdd, &[prev, iarg_box(0)]);
+            let op = Op::new(OpCode::IntAdd, &[prev, iarg_box(0)]);
             op.pos().set(OpRef::int_op(i + 1));
             ops.push(op);
             prev = iop_box(i + 1);
@@ -1474,7 +1474,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let add_op = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        let mut guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
+        let guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
         guard_op.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
@@ -1497,13 +1497,13 @@ mod tests {
         // Multiple guards with varying fail_args sizes.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![]);
-        let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
+        let g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
         g1.setfailargs(smallvec::smallvec![iarg_box(0)]);
         let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
 
-        let mut g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g2.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
         let ops = vec![
@@ -1652,7 +1652,7 @@ mod tests {
         let ia1 = InputArg::new_int_rc(1);
         let op0 = OpRc::new(Op::new(OpCode::IntAddOvf, &[box_ia(&ia0), box_ia(&ia1)]));
         op0.pos().set(iop(2));
-        let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
+        let guard = Op::new(OpCode::GuardNoOverflow, &[]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let finish = OpRc::new(Op::new(OpCode::Finish, &[box_op(&op0)]));
         let trace =
@@ -1677,7 +1677,7 @@ mod tests {
     #[should_panic(expected = "is constant")]
     fn test_check_consistency_fail_args_const_invalid() {
         let ia0 = InputArg::new_int_rc(0);
-        let mut guard = Op::new(OpCode::GuardTrue, &[box_ia(&ia0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[box_ia(&ia0)]);
         guard.setfailargs(smallvec::smallvec![Operand::from_opref(OpRef::const_int(
             0
         ))]);
@@ -1691,7 +1691,7 @@ mod tests {
     #[should_panic(expected = "not in seen")]
     fn test_check_consistency_fail_args_undefined_invalid() {
         let ia0 = InputArg::new_int_rc(0);
-        let mut guard = Op::new(OpCode::GuardTrue, &[box_ia(&ia0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[box_ia(&ia0)]);
         guard.setfailargs(smallvec::smallvec![iop_box(99)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let finish = OpRc::new(Op::new(OpCode::Finish, &[]));
@@ -1738,7 +1738,7 @@ mod tests {
     #[should_panic(expected = "JUMP descr is not a loop target")]
     fn test_check_consistency_jump_descr_must_be_target_token() {
         let ia0 = InputArg::new_int_rc(0);
-        let mut jump = Op::new(OpCode::Jump, &[box_ia(&ia0)]);
+        let jump = Op::new(OpCode::Jump, &[box_ia(&ia0)]);
         jump.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let trace = TreeLoop::from_oprc(vec![ia0], vec![OpRc::new(jump)], vec![]);
         trace.check_consistency();
@@ -1801,7 +1801,7 @@ mod tests {
         // [0, num_inputargs); a malformed trace that references raw 0
         // without a matching inputarg would cache-miss in `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         add.pos().set(iop(2));
         let ops = vec![add, Op::new(OpCode::Jump, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1825,7 +1825,7 @@ mod tests {
         // Fresh boxes remint from `start_fresh=0`, so original
         // InputArgInt(2) becomes the second live inputarg at 1.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(2)];
-        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(2)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(2)]);
         add.pos().set(iop(3));
         let ops = vec![add, Op::new(OpCode::Jump, &[iop_box(3)])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1857,14 +1857,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // Pre-cut ops (2 inputargs → first op is BoxInt at position 2)
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos().set(iop(2));
         ops.push(op0);
         // Post-cut ops
-        let mut op1 = Op::new(OpCode::IntMul, &[iarg_box(0), iarg_box(1)]);
+        let op1 = Op::new(OpCode::IntMul, &[iarg_box(0), iarg_box(1)]);
         op1.pos().set(iop(3));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos().set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1892,13 +1892,13 @@ mod tests {
         // that list sees it as an inputarg; the producer is not replayed.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos().set(iop(2));
         ops.push(op0);
-        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
+        let op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
         op1.pos().set(iop(3));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos().set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1922,17 +1922,17 @@ mod tests {
         // Tagged constant OpRefs should not be remapped.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos().set(iop(1));
         ops.push(op0);
         let const_ref = OpRef::const_int(0);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::IntAdd,
             &[iarg_box(0), Operand::from_opref(const_ref)],
         );
         op1.pos().set(iop(2));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[iop_box(2)]);
+        let op2 = Op::new(OpCode::Jump, &[iop_box(2)]);
         op2.pos().set(vop(3));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1951,16 +1951,16 @@ mod tests {
         // Its pre-cut producers stay in the discarded prefix.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos().set(iop(1));
         ops.push(op0);
-        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(1), iarg_box(0)]);
+        let op1 = Op::new(OpCode::IntMul, &[iop_box(1), iarg_box(0)]);
         op1.pos().set(iop(2));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]);
+        let op2 = Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]);
         op2.pos().set(iop(3));
         ops.push(op2);
-        let mut op3 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let op3 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op3.pos().set(vop(4));
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
@@ -2013,14 +2013,14 @@ mod tests {
         // remaps to that inputarg. `CutTrace` does not replay the add.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos().set(iop(2));
         ops.push(op0);
-        let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         op1.pos().set(vop(3));
         op1.set_rd_resume_position(0);
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos().set(vop(4));
         ops.push(op2);
         let snapshots = vec![snapshot_with_frame_boxes(vec![
@@ -2053,15 +2053,15 @@ mod tests {
         // after the first snapshot. A suffix guard at offset 7 keeps
         // that snapshot; the live box remaps to an inputarg.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         add.pos().set(iop(2));
-        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.pos().set(vop(3));
         g0.set_rd_resume_position(0);
-        let mut g1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let g1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g1.pos().set(vop(4));
         g1.set_rd_resume_position(7);
-        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.pos().set(vop(5));
         let mut snap0 = snapshot_with_frame_boxes(vec![crate::recorder::SnapshotTagged::Box(
             iarg(0),
@@ -2101,14 +2101,14 @@ mod tests {
         // the sub at IntOp(2) while TraceIterator `_fresh` assigns IntOp(1),
         // and the snapshot box would miss the reminted op.
         let inputargs = vec![InputArg::new_int(0)];
-        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         add.pos().set(iop(1));
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.pos().set(vop(2));
         guard.set_rd_resume_position(0);
-        let mut sub = Op::new(OpCode::IntSub, &[iarg_box(0), iarg_box(0)]);
+        let sub = Op::new(OpCode::IntSub, &[iarg_box(0), iarg_box(0)]);
         sub.pos().set(iop(3));
-        let mut jump = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let jump = Op::new(OpCode::Jump, &[iop_box(3)]);
         jump.pos().set(vop(4));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(3), Type::Int),
@@ -2137,12 +2137,12 @@ mod tests {
         // The suffix snapshot keeps the slot; it is not dropped and the
         // load is not replayed (`opencoder.py CutTrace`).
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut load = Op::new(OpCode::GetarrayitemGcI, &[iarg_box(0), iarg_box(1)]);
+        let load = Op::new(OpCode::GetarrayitemGcI, &[iarg_box(0), iarg_box(1)]);
         load.pos().set(iop(2));
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.pos().set(vop(3));
         guard.set_rd_resume_position(0);
-        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.pos().set(vop(4));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
@@ -2176,12 +2176,12 @@ mod tests {
         // A snapshot box that is already in `original_boxes` remaps to that
         // inputarg; one that is not must not be appended.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos().set(iop(2));
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.pos().set(vop(3));
         guard.set_rd_resume_position(0);
-        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.pos().set(vop(4));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iarg(0), Type::Int),
@@ -2204,9 +2204,9 @@ mod tests {
         // LABEL types are the live boxes' types, not a declared-slot
         // fallback.
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(1)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(1)]);
         guard.pos().set(vop(2));
-        let mut jump = Op::new(OpCode::Jump, &[rarg_box(0), iarg_box(1)]);
+        let jump = Op::new(OpCode::Jump, &[rarg_box(0), iarg_box(1)]);
         jump.pos().set(vop(3));
         let trace = TreeLoop::new(inputargs, vec![guard, jump]);
         let start = TreeLoopCutPosition::new(0);
@@ -2223,11 +2223,11 @@ mod tests {
     fn test_cut_trace_from_panics_when_a_suffix_op_names_a_precut_producer() {
         // `_get` asserts on a TAGBOX whose position is not in `_cache`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos().set(iop(2));
-        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
+        let op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
         op1.pos().set(iop(3));
-        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        let op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos().set(vop(4));
         let trace = TreeLoop::new(inputargs, vec![op0, op1, op2]);
         let start = TreeLoopCutPosition::new(1);
@@ -2241,12 +2241,12 @@ mod tests {
         // A pre-cut snapshot box that is not in `original_boxes` must not
         // survive into Phase 2's `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         add.pos().set(iop(2));
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.pos().set(vop(3));
         guard.set_rd_resume_position(7);
-        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.pos().set(vop(4));
         let mut snap0 = snapshot_with_frame_boxes(vec![crate::recorder::SnapshotTagged::Box(
             iop(2),
@@ -2282,11 +2282,11 @@ mod tests {
         // `original_boxes` includes it and `CutTrace` remaps the arg
         // (`pyjitpl.py` `reached_loop_header` `live_arg_boxes`).
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut call = Op::new(OpCode::CallR, &[rarg_box(0)]);
+        let call = Op::new(OpCode::CallR, &[rarg_box(0)]);
         call.pos().set(rop(1));
-        let mut guard = Op::new(OpCode::GuardNonnull, &[rop_box(1)]);
+        let guard = Op::new(OpCode::GuardNonnull, &[rop_box(1)]);
         guard.pos().set(vop(2));
-        let mut jump = Op::new(OpCode::Jump, &[rarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[rarg_box(0)]);
         jump.pos().set(vop(3));
         let trace = TreeLoop::new(inputargs, vec![call, guard, jump]);
         let start = TreeLoopCutPosition::new(1);
@@ -2311,12 +2311,12 @@ mod tests {
         // `Getarrayitem*` that is not in `original_boxes` is a leak, not a
         // refusal (`opencoder.py` `TraceIterator._get`).
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut load = Op::new(OpCode::GetarrayitemGcI, &[iarg_box(0), iarg_box(1)]);
+        let load = Op::new(OpCode::GetarrayitemGcI, &[iarg_box(0), iarg_box(1)]);
         load.pos().set(iop(2));
-        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        let guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.pos().set(vop(3));
         guard.set_rd_resume_position(0);
-        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        let jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.pos().set(vop(4));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
@@ -2481,6 +2481,7 @@ use crate::call_descr::{
     EffectInfoSlot, make_call_descr_from_target_slot, make_call_descr_with_effect,
     make_call_may_force_descr,
 };
+#[cfg(test)]
 use crate::jitdriver::JitDriverStaticData;
 use crate::recorder::{Trace, TracePosition};
 use crate::trace_ctx::TraceCtx;

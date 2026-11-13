@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use majit_ir::operand::Operand;
-use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRc, Type, Value};
 
 use crate::optimizeopt::info::{
     ArrayStructInfo, PtrInfo, PtrInfoExt, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
@@ -310,7 +310,7 @@ impl OptVirtualize {
         &self,
         offset: i64,
         parent: &Operand,
-        source_op: &Op,
+        _source_op: &Op,
         source_op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
@@ -1584,7 +1584,7 @@ impl OptVirtualize {
     ///   the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(
         &self,
-        op: &Op,
+        _op: &Op,
         op_rc: &majit_ir::OpRc,
         opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
@@ -1707,7 +1707,7 @@ impl OptVirtualize {
         if !obj_is_null {
             let arg_vref = vref_box.clone();
             let arg_obj = obj_box.clone();
-            let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
+            let set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
             set_forced.setdescr(descr_forced);
             let set_forced = OpRc::new(set_forced);
             send_extra_operation_from(opt, &set_forced, ctx);
@@ -1717,7 +1717,7 @@ impl OptVirtualize {
         // `vrefinfo.descr_virtual_token` (`virtualref.py`).
         let arg_vref = vref_box.clone();
         let arg_null = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
-        let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
+        let set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(descr_virtual_token);
         let set_token = OpRc::new(set_token);
         send_extra_operation_from(opt, &set_token, ctx);
@@ -2931,6 +2931,7 @@ mod tests {
     use crate::history::test_support::trace_inputargs_from_ops;
     use crate::optimizeopt::info::RawBufferPtrInfo;
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::OpRef;
     use std::sync::Arc;
 
     // ── Test descriptors ──
@@ -4358,7 +4359,7 @@ mod tests {
             .collect();
         ctx.seed_boxes_canonical(&leaf_args);
 
-        let mut pass = OptVirtualize::new();
+        let pass = OptVirtualize::new();
         pass.setup();
 
         for rc in &wrapped {
@@ -4502,7 +4503,7 @@ mod tests {
         // opencoder.py:259 inputarg_from_tp — vable Ref + an opaque Int call
         // arg at slot 1 (slot 100 stays an outside-of-inputargs free opref).
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+        let pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8, 16],
             static_field_types: vec![Type::Int, Type::Int],
             static_field_descrs: vec![],
@@ -4514,7 +4515,7 @@ mod tests {
         });
         pass.setup();
 
-        let mut call = Op::new(
+        let call = Op::new(
             OpCode::CallMayForceI,
             &[
                 crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
@@ -4550,7 +4551,7 @@ mod tests {
         // here; slot 10 (the GetfieldRawI result) lives above the inputarg
         // range and is not seeded.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+        let pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
             static_field_descrs: vec![],
@@ -4563,7 +4564,7 @@ mod tests {
         pass.setup();
 
         let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
-        let mut get = Op::new(OpCode::GetfieldRawI, &[vable]);
+        let get = Op::new(OpCode::GetfieldRawI, &[vable]);
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
@@ -4575,7 +4576,7 @@ mod tests {
     fn test_standard_virtualizable_raw_setfield_is_not_absorbed_by_optimizer() {
         // opencoder.py:259 inputarg_from_tp — vable Ref + Int value inputarg.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+        let pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
             static_field_descrs: vec![],
@@ -4589,7 +4590,7 @@ mod tests {
 
         let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
         let value = ctx.materialize_operand_at(OpRef::input_arg_int(1));
-        let mut set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
+        let set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
         let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut None, &mut ctx);
@@ -4604,7 +4605,7 @@ mod tests {
     #[test]
     fn an_array_declaring_config_needs_no_lengths_and_still_installs_the_identity() {
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+        let pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
             static_field_descrs: vec![],
@@ -4653,7 +4654,7 @@ mod tests {
         drive_bound_ops(&mut pass, &mut ctx, std::slice::from_ref(&get_field));
         let array_ptr = Operand::from_bound_op(&get_field);
 
-        let mut get_item = Op::new(OpCode::GetarrayitemRawI, &[array_ptr, index]);
+        let get_item = Op::new(OpCode::GetarrayitemRawI, &[array_ptr, index]);
         get_item.setdescr(array_descr(24));
         let result =
             pass.propagate_forward(&get_item, &OpRc::new(get_item.clone()), &mut None, &mut ctx);
@@ -4686,7 +4687,7 @@ mod tests {
         let stored = crate::history::test_support::rooted_resop_operand(Type::Int, 2);
         ctx.seed_boxes_canonical(std::slice::from_ref(&stored));
 
-        let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[array_ptr, index, stored]);
+        let set_item = Op::new(OpCode::SetarrayitemRaw, &[array_ptr, index, stored]);
         set_item.setdescr(array_descr(24));
         let result =
             pass.propagate_forward(&set_item, &OpRc::new(set_item.clone()), &mut None, &mut ctx);
@@ -4988,7 +4989,7 @@ mod tests {
 
     fn new_with_vtable_then_guard_class(vtable: i64, expected: i64) -> Vec<Op> {
         let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, vtable as usize);
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardClass,
             &[
                 crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
@@ -5545,10 +5546,10 @@ mod tests {
         let unlisted_fd = nested_ref.clone() as DescrRef;
 
         let mut ctx = OptContext::new(3);
-        let mut pass = OptVirtualize::new();
+        let pass = OptVirtualize::new();
         pass.setup();
 
-        let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
+        let new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
         new_op.pos().set(OpRef::ref_op(0));
         let new_op_rc = OpRc::new(new_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
@@ -5636,10 +5637,10 @@ mod tests {
         let fd = group.field_descrs[0].clone() as DescrRef;
 
         let mut ctx = OptContext::new(2);
-        let mut pass = OptVirtualize::new();
+        let pass = OptVirtualize::new();
         pass.setup();
 
-        let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
+        let new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
         new_op.pos().set(OpRef::ref_op(0));
         let new_op_rc = OpRc::new(new_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
@@ -7229,7 +7230,7 @@ mod tests {
 
         let mut ctx = OptContext::new(wrapped.len());
         ctx.seed_boxes_canonical(&leaves);
-        let mut pass = OptVirtualize::new();
+        let pass = OptVirtualize::new();
         pass.setup();
 
         for &(opref, size) in raw_bufs {
@@ -7733,7 +7734,7 @@ mod tests {
         // jump(p0)
         let node_sd = size_descr(1);
         let next_fd = ref_field_descr(11);
-        let mut ops = vec![
+        let ops = vec![
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
@@ -7939,7 +7940,7 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8030,7 +8031,7 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8114,7 +8115,7 @@ mod tests {
     #[test]
     fn test_guard_fail_args_no_virtual_no_rd_numb() {
         // Guard with no virtuals in fail_args should not have rd_numb.
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8154,7 +8155,7 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8228,7 +8229,7 @@ mod tests {
         let fd_a = field_descr(10);
         let fd_b = field_descr(20);
 
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8317,7 +8318,7 @@ mod tests {
         let outer_fd = ref_field_descr(10);
         let inner_fd = field_descr(20);
 
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
@@ -8405,7 +8406,7 @@ mod tests {
         // the array's elements are added to liveboxes as TAGBOX, the array
         // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_resop_operand(
                 Type::Int,
@@ -8482,7 +8483,7 @@ mod tests {
         let array_sd = array_descr(40);
         let item_sd = size_descr(41);
         let item_value_fd = field_descr(42);
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Int,
