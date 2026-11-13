@@ -1,6 +1,6 @@
 use super::{
-    DecodedConst, bitflags_trait_empty_const, decode_literal, is_class_pytype_assoc_const,
-    primitive_float_const, scalar_to_const_value, static_key_segments,
+    DecodedConst, bitflags_trait_empty_const, co_fast_flags_const, decode_literal,
+    is_class_pytype_assoc_const, primitive_float_const, scalar_to_const_value, static_key_segments,
 };
 
 use crate::flowspace::model::ConstValue;
@@ -1693,6 +1693,43 @@ fn bitflags_trait_empty_const_folds_zero_and_rejects_all() {
         .is_none()
     );
     assert!(bitflags_trait_empty_const(&["unrelated".into()]).is_none());
+}
+
+#[test]
+fn co_fast_flags_const_folds_cell_and_siblings() {
+    let path = |leaf: &str| {
+        [
+            "rustpython_compiler_core".into(),
+            "bytecode".into(),
+            leaf.into(),
+        ]
+    };
+    assert_eq!(
+        co_fast_flags_const(&path("CO_FAST_CELL")),
+        Some(OpKind::ConstUInt(0x40))
+    );
+    assert_eq!(
+        co_fast_flags_const(&path("CO_FAST_LOCAL")),
+        Some(OpKind::ConstUInt(0x20))
+    );
+    assert_eq!(
+        co_fast_flags_const(&path("CO_FAST_FREE")),
+        Some(OpKind::ConstUInt(0x80))
+    );
+    assert_eq!(
+        co_fast_flags_const(&path("CO_FAST_ARG")),
+        Some(OpKind::ConstUInt(0x0E))
+    );
+    assert!(co_fast_flags_const(&path("CO_FAST_UNKNOWN")).is_none());
+    assert!(
+        co_fast_flags_const(&[
+            "rustpython_compiler_core".into(),
+            "bytecode".into(),
+            "<Impl>".into(),
+            "CO_FAST_CELL".into(),
+        ])
+        .is_none()
+    );
 }
 
 #[test]

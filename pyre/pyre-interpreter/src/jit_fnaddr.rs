@@ -3507,10 +3507,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // init-assigned `BIGINT_GC_TYPE_ID` / `W_DICT_VIEW_ITERATOR_GC_TYPE_ID`
     // cells — none is a build-time constant, so all three carry
     // `#[dont_look_inside]` and bind their `-> bool` / `-> u32` Rust `fn`
-    // directly by qualified path.  A type-id cell deliberately does NOT get
-    // a `jit_static_pytype_addrs` / `jit_static_ref_addrs` row: those carry
-    // the address of a value fixed at build time, and folding a
-    // runtime-stamped id that way would bake `TypeIdCell::UNASSIGNED`.
+    // directly by qualified path.  A `#[pyre_class]` TypeIdCell *does* get a
+    // `jit_static_ref_addrs` row (`pyre_class_typeidcell_addrs`): that row is
+    // the cell's address, so a Global place is the prebuilt
+    // (`flowcontext.py` `FlowContext.find_global`, `bookkeeper.py`
+    // `immutablevalue`) and `get()` stays a field load.  Folding `get()` as
+    // `int_values` would bake `TypeIdCell::UNASSIGNED`; the refs row is not
+    // that fold.  These two readers are not `#[pyre_class]` cells, so they
+    // keep the residual binding.
     //
     // `enabled` binds the trampoline instead: it gates the GC allocation route
     // of every boxing constructor, so a descended body reaches it, and a raw
@@ -7428,10 +7432,29 @@ pub fn pyre_class_pytype_addrs() -> Vec<(&'static str, i64)> {
     rows
 }
 
+/// The `TypeIdCell` static of every `#[pyre_class]` type, keyed by the
+/// fully-qualified Rust path the flowgraph names the global read with
+/// (`PyreClassDescriptor::gc_type_id_path`).
+///
+/// Concatenated into [`jit_static_ref_addrs`]: the cell is a prebuilt
+/// instance (`flowcontext.py` `FlowContext.find_global` → `const(value)`,
+/// `bookkeeper.py` `immutablevalue`), and the row is its address so a
+/// subsequent `TypeIdCell::get` is a field load, not a baked
+/// `TypeIdCell::UNASSIGNED`.
+pub fn pyre_class_typeidcell_addrs() -> Vec<(&'static str, i64)> {
+    let mut rows = Vec::new();
+    pyre_object::lltype::for_each_class_descriptor(|d| {
+        rows.push((d.gc_type_id_path, d.gc_type_id as *const _ as i64));
+    });
+    rows
+}
+
 /// Build-time addresses of the prebuilt dict-strategy singletons pyre
 /// source references as opaque ref constants.  Same translation-boundary
 /// contract as [`jit_static_pytype_addrs`]; the front-end records these
-/// under `ValueType::Ref(None)`.
+/// under `ValueType::Ref(None)`.  Also concatenates every `#[pyre_class]`
+/// TypeIdCell address ([`pyre_class_typeidcell_addrs`]) so a Global place
+/// of the cell is `ConstRefAddr` of the prebuilt.
 pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
     macro_rules! ref_addr {
         ($key:literal, $($path:tt)::+) => {
@@ -7639,6 +7662,7 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         ),
     ];
     v.extend(jit_static_fnptrcell_addrs());
+    v.extend(pyre_class_typeidcell_addrs());
     v
 }
 
@@ -7773,8 +7797,8 @@ mod tests {
         ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
-        pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
+        pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
+        shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
         w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
         w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
@@ -9387,6 +9411,59 @@ mod tests {
             checked += 1;
         });
         assert!(checked > 0, "no descriptor was visited");
+    }
+
+    /// Every `#[pyre_class]` TypeIdCell is in `jit_static_ref_addrs` under
+    /// the path Charon puts on the Global place, at the cell's address.
+    /// A missing row leaves `Place::Global` as a nullary Call on the
+    /// static's path (`flowcontext.py` `FlowContext.find_global`).
+    #[test]
+    fn jit_static_ref_addrs_covers_every_pyre_class_typeidcell() {
+        let harvest = pyre_class_typeidcell_addrs();
+        let bindings: HashMap<&'static str, i64> = jit_static_ref_addrs().into_iter().collect();
+
+        assert!(
+            !harvest.is_empty(),
+            "no `#[pyre_class]` TypeIdCell was harvested at all, so this \
+             table cannot be read as empty-because-correct"
+        );
+
+        let mut seen: HashMap<&'static str, i64> = HashMap::new();
+        for (path, addr) in &harvest {
+            if let Some(first) = seen.insert(*path, *addr) {
+                panic!(
+                    "{path} appears twice (addresses {first:#x} and \
+                     {addr:#x}); the key must name one cell, or the \
+                     Global place binds whichever row it meets last"
+                );
+            }
+            assert_ne!(*addr, 0, "{path} has no address");
+            assert_eq!(
+                bindings.get(path).copied(),
+                Some(*addr),
+                "{path} is harvested at {addr:#x} but `jit_static_ref_addrs` \
+                 does not bind that address"
+            );
+        }
+
+        let mut checked = 0usize;
+        pyre_object::lltype::for_each_class_descriptor(|d| {
+            let addr = d.gc_type_id as *const _ as i64;
+            assert_eq!(
+                seen.get(d.gc_type_id_path).copied(),
+                Some(addr),
+                "{} ({}) is not in `pyre_class_typeidcell_addrs` at the \
+                 cell's address",
+                d.pyname,
+                d.gc_type_id_path
+            );
+            checked += 1;
+        });
+        assert_eq!(
+            checked,
+            harvest.len(),
+            "every descriptor must yield exactly one TypeIdCell row"
+        );
     }
 
     #[test]

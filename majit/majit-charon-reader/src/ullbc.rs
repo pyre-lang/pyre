@@ -1243,11 +1243,26 @@ pub struct TypeLayout {
     pub repr: Option<TypeRepr>,
 }
 
+fn default_repr_algo() -> String {
+    "Rust".to_string()
+}
+
 /// Representation properties that affect the low-level value shape.
 #[derive(Clone, Debug, Deserialize)]
 pub struct TypeRepr {
     #[serde(default)]
     pub transparent: bool,
+    /// Charon `repr_algo`: `"Rust"` or `"C"` (`rffi.py` `CStruct` /
+    /// `lltype.Struct`). Older fixtures omit the key; treat that as `"Rust"`.
+    #[serde(default = "default_repr_algo")]
+    pub repr_algo: String,
+}
+
+impl TypeRepr {
+    /// `rffi.py` `CStruct` / `lltype.Struct._gckind = 'raw'`.
+    pub fn is_c(&self) -> bool {
+        self.repr_algo == "C"
+    }
 }
 
 /// Per-variant field offsets within [`TypeLayout`].
@@ -1378,6 +1393,18 @@ impl TypeDecl {
                     .as_ref()
                     .is_some_and(|repr| repr.transparent)
             })
+    }
+
+    /// Whether every emitted target layout records `repr_algo == "C"`
+    /// (`rffi.py` `CStruct` / `lltype.Struct`). Missing layout is Rust.
+    pub fn is_repr_c(&self) -> bool {
+        let Some(entries) = self.layout_entries() else {
+            return false;
+        };
+        !entries.is_empty()
+            && entries
+                .iter()
+                .all(|entry| entry.value.repr.as_ref().is_some_and(TypeRepr::is_c))
     }
 }
 
@@ -4528,7 +4555,38 @@ mod tests {
             "repr": {"repr_algo": "Rust", "transparent": true}
         }"#;
         let layout: TypeLayout = serde_json::from_str(json).unwrap();
-        assert!(layout.repr.unwrap().transparent);
+        let repr = layout.repr.unwrap();
+        assert!(repr.transparent);
+        assert_eq!(repr.repr_algo, "Rust");
+        assert!(!repr.is_c());
+    }
+
+    #[test]
+    fn repr_algo_defaults_to_rust_when_absent() {
+        let json = r#"{
+            "size": 8, "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": true}
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        let repr = layout.repr.unwrap();
+        assert!(repr.transparent);
+        assert_eq!(repr.repr_algo, "Rust");
+        assert!(!repr.is_c());
+    }
+
+    #[test]
+    fn repr_algo_c_is_preserved() {
+        let json = r#"{
+            "size": 8, "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "C"}
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        let repr = layout.repr.unwrap();
+        assert!(!repr.transparent);
+        assert_eq!(repr.repr_algo, "C");
+        assert!(repr.is_c());
     }
 
     /// An enum's per-variant field offsets, plus the niche tag position.

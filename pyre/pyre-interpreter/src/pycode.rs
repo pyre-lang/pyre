@@ -4026,44 +4026,11 @@ fn constants_as_mut_slice(
 }
 
 /// Resolve compiler-emitted GET_ITER yield-from mode 1 to the coro-check
-/// modes `fixup_get_iter` writes, put BUILD_LIST_FROM_ARG back in front of
-/// GET_ITER, and walk nested code constants.
+/// modes `fixup_get_iter` writes, and walk nested code constants.
 pub fn fixup_code_get_iter(code: &mut crate::CodeObject) {
     code.instructions.fixup_get_iter(code.flags);
-    reorder_build_list_from_arg(code);
     for constant in constants_as_mut_slice(&mut code.constants) {
         fixup_constant_get_iter(constant);
-    }
-}
-
-/// Temporary patch until the codegen emits BUILD_LIST_FROM_ARG before
-/// GET_ITER on the non-inlined list-comprehension path, as the inlined path
-/// already does. The pinned compiler emits `GET_ITER` (plus its CACHE units)
-/// then `BUILD_LIST_FROM_ARG`; GET_ITER pushes the iterator and an index slot,
-/// so BUILD_LIST_FROM_ARG (pop one value, push the list, push the value back)
-/// would take the NULL index slot. Rotate each such pair to
-/// `BUILD_LIST_FROM_ARG; GET_ITER (+ caches)`, which leaves
-/// `[list, iterator, index]` on the stack, and move the per-unit locations
-/// with it.
-fn reorder_build_list_from_arg(code: &mut crate::CodeObject) {
-    use crate::bytecode::{CodeUnit, Instruction};
-    let len = code.instructions.len();
-    let ptr = code.instructions.units_ptr() as *mut CodeUnit;
-    let mut i = 0usize;
-    while i < len {
-        let unit = code.instructions[i];
-        let last = i + 1 + unit.op.cache_entries();
-        if matches!(unit.op, Instruction::GetIter { .. })
-            && last < len
-            && matches!(code.instructions[last].op, Instruction::BuildListFromArg)
-        {
-            // SAFETY: `i..=last` lies inside the `len` units the code object owns.
-            unsafe { std::slice::from_raw_parts_mut(ptr.add(i), last - i + 1) }.rotate_right(1);
-            if code.locations.len() == len {
-                code.locations[i..=last].rotate_right(1);
-            }
-        }
-        i += 1 + code.instructions[i].op.cache_entries();
     }
 }
 

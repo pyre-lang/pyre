@@ -31,7 +31,7 @@ use crate::annotator::model::{
     r#typeof,
 };
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::{ConstValue, HostObject, Variable};
 use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType, VecFieldPart};
 use crate::translator::rtyper::error::TyperError;
 
@@ -184,6 +184,7 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| fn_const_incoming(bookkeeper, &op.kind))
                         .or_else(|| fn_ptr_annotation_incoming(bookkeeper, result, &op.kind))
                         .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
                         .or_else(|| type_someobject_incoming(&op.kind))
@@ -799,9 +800,10 @@ fn type_someobject_incoming(kind: &OpKind) -> Option<Incoming> {
     )]))))
 }
 
-/// Typed `null_fn` (`model.rs push_null_fn_ptr_with_spelling`) is
-/// `lltype.nullptr(FuncType)` as constant `SomePtr`
-/// (`builtin.rs fn_null_constant` / `ann_nullptr` `immutablevalue`).
+/// Typed `null_fn` (`model.rs push_null_fn_ptr_with_spelling`). A spelled
+/// `fn` / `Option<fn>` null is `s_None` (`fn_null_constant`); its dest
+/// is `NoneRepr` Void. Untyped `ptr::null_fn()` stays constant
+/// `SomePtr` (`ann_nullptr`) with `Ptr(FuncType)`.
 fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
     let bk = bookkeeper?;
     let OpKind::Call { target, args, .. } = kind else {
@@ -832,26 +834,90 @@ fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) ->
         &args_s,
         &std::collections::HashMap::new(),
     ) {
-        Ok(sv @ SomeValue::Ptr(_)) => Some(Incoming::Annotation(Rc::new(sv))),
+        Ok(sv @ SomeValue::Ptr(_)) | Ok(sv @ SomeValue::None_(_)) => {
+            Some(Incoming::Annotation(Rc::new(sv)))
+        }
         _ => None,
     }
 }
 
-/// A function-pointer FieldRead / Call / Input is `SomePtr(Ptr(FuncType))`
-/// (`lltype.py` `SomePtr` / `getfunctionptr`), never `SomeInteger`.
-/// `history.getkind` of `Ptr(FuncType)` stays `'int'`, so the op bank is
-/// still Int. `pairtype(SomePtr, SomePtr).union` requires equal
-/// `ll_ptrtype`; FieldRead / Call dests carry the `stamp_fn_ptr`
-/// `Ptr(FuncType)`, and Input seeds through
-/// `fn_ptr_somevalue_for_spelling_in` with this bookkeeper so a
-/// `Result<(), E>` of the exception carrier is `Void`
-/// (`fn_ptr_result_lltype` / `ann_nullptr`).
+/// Value-used FnDef (`fn_const_segments` 0-arg Call). Twin of
+/// [`typed_null_fn_incoming`]. The real path (`legacy_const_define_hlvalue`)
+/// materialises `CallRegistry.entry.host_object`; `bookkeeper.py`
+/// `immutablevalue` / `getdesc` of that host is `SomePBC([FunctionDesc])`.
+/// The walker has the Bookkeeper only: recover the already-inserted host
+/// from `descs` (the cache `register_callee` / `getdesc` populate). Do not
+/// mint a second HostObject (`getdesc_for_const` Function arm).
+fn fn_const_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::Call { target, args, .. } = kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let segments = crate::model::fn_const_segments(target)?;
+    let host = fn_const_registered_host(bk, segments)?;
+    match bk.immutablevalue(&ConstValue::HostObject(host)) {
+        Ok(sv @ SomeValue::PBC(_)) => Some(Incoming::Annotation(Rc::new(sv))),
+        _ => None,
+    }
+}
+
+fn fn_const_name_matches(name: &str, segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if name == leaf {
+        return true;
+    }
+    let dotted = segments.join(".");
+    let colon = segments.join("::");
+    name == dotted || name == colon
+}
+
+fn fn_const_registered_host(bk: &Bookkeeper, segments: &[String]) -> Option<HostObject> {
+    let mut found: Option<HostObject> = None;
+    for entry in bk.descs.borrow().values() {
+        let Some(fd) = entry.as_function() else {
+            continue;
+        };
+        let fd = fd.borrow();
+        let Some(host) = fd.base.pyobj.clone() else {
+            continue;
+        };
+        let Some(gf) = host.user_function() else {
+            continue;
+        };
+        if !fn_const_name_matches(&gf.name, segments)
+            && !fn_const_name_matches(&fd.name, segments)
+            && !fn_const_name_matches(host.qualname(), segments)
+        {
+            continue;
+        }
+        match &found {
+            None => found = Some(host.clone()),
+            Some(prev) if prev == &host => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+/// A function-pointer FieldRead / Call / Input seeds lattice bottom.
+/// `stamp_fn_ptr` still stamps `Ptr(FuncType)` on a live fn dest
+/// (`FunctionsPBCRepr.lowleveltype` for one row). An `Option<fn>` Input
+/// is `s_None` (`derive_subject_inputcells`); its dest is `NoneRepr`
+/// Void (`rnone.py` `NoneRepr.lowleveltype`), not `Ptr(FuncType)`.
+/// Forcing `SomePtr` here unions `SomePtr ∪ SomePBC` (`llannotation.py`
+/// `pairtype(SomePtr, SomeObject).union`); leaving the dest as
+/// `Flat(Int)` unions `Integer ∪ PBC`. Match-path getattr / pycall
+/// writes the family onto this bottom (`derive_subject_inputcells`).
 fn fn_ptr_annotation_incoming(
     bookkeeper: Option<&Rc<Bookkeeper>>,
     result: &Variable,
     kind: &OpKind,
 ) -> Option<Incoming> {
-    let bk = bookkeeper?;
     match kind {
         OpKind::FieldRead {
             ty: ValueType::Int, ..
@@ -859,47 +925,53 @@ fn fn_ptr_annotation_incoming(
         | OpKind::Call {
             result_ty: ValueType::Int,
             ..
-        } => {
-            // Dest `concretetype` is `Ptr(FuncType)` from `stamp_fn_ptr`
-            // (`operation.rs` FieldRead `field_ty` / `place_ty`; Call dest).
-            // Charon's field type is the alias-expanded `FnPtr`, so the
-            // stamp covers `BuiltinCode.func` without a name-keyed alias.
-            fn_ptr_from_dest_concretetype(result)
-        }
+        } => dest_is_fn_ptr(result).then(|| Incoming::Annotation(Rc::new(SomeValue::Impossible))),
         OpKind::Input {
             ty: ValueType::Int,
             class_root: Some(root),
             ..
         } => {
+            let bk = bookkeeper?;
             crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(root, Some(bk.as_ref()))
-                .filter(somevalue_is_fn_ptr)
-                .map(|sv| Incoming::Annotation(Rc::new(sv)))
+                .is_some()
+                .then(|| {
+                    // Skip-path Input has no MIR `stamp_fn_ptr`. A bare
+                    // `fn` keeps `Ptr(FuncType)` (`FunctionsPBCRepr.lowleveltype`
+                    // / `history.getkind` `'int'`). `Option<fn>` is `s_None`
+                    // (`derive_subject_inputcells` / `store_profilefunc`
+                    // setattr of None) and stamps `NoneRepr` Void — the
+                    // same seed rule as `stamp_fn_ptr_legacy_dests`.
+                    if super::flowspace_adapter::fn_ptr_input_seeds_s_none(root) {
+                        result.set_concretetype(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                        ));
+                        Incoming::Annotation(Rc::new(crate::annotator::model::s_none()))
+                    } else {
+                        crate::front::mir::stamp_fn_ptr_spelling(
+                            result,
+                            root,
+                            crate::ErrorCarrierSpec::default(),
+                        );
+                        Incoming::Annotation(Rc::new(SomeValue::Impossible))
+                    }
+                })
         }
         _ => None,
     }
 }
 
+fn dest_is_fn_ptr(result: &Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    matches!(
+        result.concretetype(),
+        Some(LowLevelType::Ptr(ref ptr_ty)) if matches!(ptr_ty.TO, PtrTarget::Func(_))
+    )
+}
+
+#[cfg(test)]
 fn somevalue_is_fn_ptr(sv: &SomeValue) -> bool {
     use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
     matches!(sv, SomeValue::Ptr(p) if matches!(p.ll_ptrtype.TO, PtrTarget::Func(_)))
-}
-
-/// Dest `concretetype` stamped `Ptr(FuncType)` (`stamp_fn_ptr`, the
-/// `stamp_raw_u8_ccharp` / `var_concretetype_is_ccharp` pattern). That
-/// `ll_ptrtype` is minted through `fn_ptr_somevalue_for_spelling_in` so
-/// it equals `fn_null_constant` of the same spelling.
-fn fn_ptr_from_dest_concretetype(result: &Variable) -> Option<Incoming> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
-    let ct = result.concretetype()?;
-    let LowLevelType::Ptr(ptr_ty) = ct else {
-        return None;
-    };
-    if !matches!(ptr_ty.TO, PtrTarget::Func(_)) {
-        return None;
-    }
-    Some(Incoming::Annotation(Rc::new(SomeValue::Ptr(SomePtr::new(
-        *ptr_ty,
-    )))))
 }
 
 /// Typed `null_raw` (`model.rs push_null_raw_ptr_with_spelling`) is a
@@ -3663,52 +3735,67 @@ mod tests {
         }
     }
 
-    /// Typed `null_fn` (`push_null_fn_ptr_with_spelling`) annotates as
-    /// constant `SomePtr` (`ann_nullptr` `immutablevalue`).
+    /// Untyped `null_fn` annotates as constant `SomePtr` (`ann_nullptr`).
+    /// A spelled `fn` / `Option<fn>` null is `s_None`.
     #[test]
     fn typed_null_fn_annotates_as_constant_someptr() {
-        let bk = Rc::new(Bookkeeper::new());
-        for spelling in [None, Some("fn() -> i64")] {
-            let mut graph = FunctionGraph::new("typed_null_fn");
-            let entry = graph.startblock;
-            let null_var = graph.push_null_fn_ptr_with_spelling(entry, spelling);
-            graph.set_return(entry, Some(null_var.clone()));
-            annotate_with_bookkeeper(&graph, Some(&bk));
-            match read_binding_some(&null_var).as_deref() {
-                Some(sv @ SomeValue::Ptr(_)) => {
-                    use crate::annotator::model::SomeObjectTrait;
-                    assert!(
-                        sv.is_constant(),
-                        "spelling {spelling:?} must be immutablevalue, got {sv:?}"
-                    );
-                }
-                other => panic!("spelling {spelling:?}: expected constant SomePtr, got {other:?}"),
-            }
-        }
-    }
-
-    /// A join of constant `null_fn` (`ann_nullptr` `immutablevalue`) with a
-    /// non-constant same-type `SomePtr` drops the constant
-    /// (`llannotation.py pairtype(SomePtr, SomePtr).union`,
-    /// `annrpython.py mergeinputargs` / `model.py unionof`). Two identical
-    /// constants stay constant.
-    #[test]
-    fn typed_null_fn_join_drops_constant_unless_both_sides_match() {
         use crate::annotator::model::SomeObjectTrait;
 
         let bk = Rc::new(Bookkeeper::new());
-        let spelling = "fn() -> i64";
-        let s_fn =
-            crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(spelling, Some(&bk))
-                .expect("fn spelling");
-        assert!(
-            matches!(&s_fn, SomeValue::Ptr(_)) && !s_fn.is_constant(),
-            "Some of Option<fn> is a non-constant SomePtr, got {s_fn:?}"
-        );
+        let mut untyped = FunctionGraph::new("typed_null_fn_untyped");
+        let entry = untyped.startblock;
+        let null_var = untyped.push_null_fn_ptr_with_spelling(entry, None);
+        untyped.set_return(entry, Some(null_var.clone()));
+        annotate_with_bookkeeper(&untyped, Some(&bk));
+        match read_binding_some(&null_var).as_deref() {
+            Some(sv @ SomeValue::Ptr(_)) => {
+                assert!(
+                    somevalue_is_fn_ptr(sv) && sv.is_constant(),
+                    "untyped null_fn must be immutablevalue SomePtr(FuncType), got {sv:?}"
+                );
+            }
+            other => panic!("untyped: expected constant SomePtr, got {other:?}"),
+        }
 
-        // Constant arrives first, then a non-constant of the same
-        // `ll_ptrtype`. Without the join fix the same-type arm keeps the
-        // first arrival unchanged, so this stays a constant null.
+        let mut spelled = FunctionGraph::new("typed_null_fn_spelled");
+        let entry = spelled.startblock;
+        let null_var = spelled.push_null_fn_ptr_with_spelling(entry, Some("fn() -> i64"));
+        spelled.set_return(entry, Some(null_var.clone()));
+        annotate_with_bookkeeper(&spelled, Some(&bk));
+        match read_binding_some(&null_var).as_deref() {
+            Some(sv @ SomeValue::None_(_)) => {
+                assert!(sv.is_constant(), "spelled null_fn is s_None, got {sv:?}");
+            }
+            other => panic!("spelled: expected constant s_None, got {other:?}"),
+        }
+    }
+
+    /// A join of spelled `null_fn` (`s_None`) with a function-PBC
+    /// noneifies (`binaryop.py` `pairtype(SomeObject, SomeNone)`). Two
+    /// identical `s_None` constants stay constant.
+    #[test]
+    fn typed_null_fn_join_drops_constant_unless_both_sides_match() {
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::{SomeObjectTrait, SomePBC};
+        use crate::flowspace::argument::Signature;
+        use std::cell::RefCell;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let spelling = "fn() -> i64";
+        let s_fn = SomeValue::PBC(SomePBC::new(
+            vec![DescEntry::function(Rc::new(RefCell::new(
+                FunctionDesc::new(
+                    bk.clone(),
+                    None,
+                    "f",
+                    Signature::new(vec![], None, None),
+                    None,
+                    None,
+                ),
+            )))],
+            false,
+        ));
+
         let mixed = {
             let mut graph = FunctionGraph::new("typed_null_fn_mixed_join");
             let pred_const = graph.create_block();
@@ -3726,13 +3813,10 @@ mod tests {
             phi_var
         };
         match read_binding_some(&mixed).as_deref() {
-            Some(sv @ SomeValue::Ptr(_)) => {
-                assert!(
-                    !sv.is_constant(),
-                    "const null_fn ∪ live same-type ptr must drop the constant, got {sv:?}"
-                );
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(pbc.can_be_none, "s_None ∪ PBC noneifies, got {pbc:?}");
             }
-            other => panic!("expected non-constant SomePtr join, got {other:?}"),
+            other => panic!("expected noneified SomePBC join, got {other:?}"),
         }
 
         let identical = {
@@ -3751,14 +3835,101 @@ mod tests {
             phi_var
         };
         match read_binding_some(&identical).as_deref() {
-            Some(sv @ SomeValue::Ptr(_)) => {
+            Some(sv @ SomeValue::None_(_)) => {
                 assert!(
                     sv.is_constant(),
-                    "join of two identical null_fn constants must stay constant, got {sv:?}"
+                    "join of two identical spelled null_fn constants must stay s_None, got {sv:?}"
                 );
             }
-            other => panic!("expected constant SomePtr join, got {other:?}"),
+            other => panic!("expected constant s_None join, got {other:?}"),
         }
+    }
+
+    /// A 0-arg `fn_const_segments` Call annotates as `SomePBC([FunctionDesc])`
+    /// (`bookkeeper.py` `immutablevalue` / `getdesc` of the registry host).
+    /// Join with spelled `null_fn` (`s_None`) is `SomePBC(can_be_None=True)`
+    /// (`model.py` `SomePBC.noneify`).
+    #[test]
+    fn fn_const_incoming_is_somepbc_and_join_with_spelled_null_fn_noneifies() {
+        use crate::flowspace::model::{GraphFunc, HostObject};
+
+        let bk = Rc::new(Bookkeeper::new());
+        let gf = GraphFunc::new(
+            "fn_const_callee",
+            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let host = HostObject::new_user_function(gf);
+        bk.getdesc(&host).expect("FunctionDesc in descs");
+
+        let mut incoming_graph = FunctionGraph::new("fn_const_incoming");
+        let entry = incoming_graph.startblock;
+        let fn_var = incoming_graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        crate::model::FN_CONST_HEAD,
+                        "fn_const_callee",
+                    ]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        incoming_graph.set_return(entry, Some(fn_var.clone()));
+        annotate_with_bookkeeper(&incoming_graph, Some(&bk));
+        match read_binding_some(&fn_var).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(!pbc.can_be_none, "fn_const dest is SomePBC, got {pbc:?}");
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("fn_const dest expected SomePBC, got {other:?}"),
+        }
+        assert_eq!(
+            read_binding(&fn_var),
+            ValueType::Int,
+            "FunctionsPBCRepr Ptr(FuncType) word is Int"
+        );
+
+        let mixed = {
+            let mut graph = FunctionGraph::new("fn_const_null_fn_join");
+            let pred_fn = graph.create_block();
+            let pred_none = graph.create_block();
+            let fn_var = graph
+                .push_op_var(
+                    pred_fn,
+                    OpKind::Call {
+                        target: CallTarget::function_path([
+                            crate::model::FN_CONST_HEAD,
+                            "fn_const_callee",
+                        ]),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            let null_var = graph.push_null_fn_ptr_with_spelling(pred_none, Some("fn() -> i64"));
+            let (join, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            branch_start_to_preds(&mut graph, pred_fn, pred_none);
+            graph.set_goto(pred_fn, join, vec![fn_var]);
+            graph.set_goto(pred_none, join, vec![null_var]);
+            graph.set_return(join, Some(phi_var.clone()));
+            annotate_with_bookkeeper(&graph, Some(&bk));
+            phi_var
+        };
+        match read_binding_some(&mixed).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(
+                    pbc.can_be_none,
+                    "s_None ∪ fn_const PBC noneifies, got {pbc:?}"
+                );
+            }
+            other => panic!("expected noneified SomePBC join, got {other:?}"),
+        }
+        assert_eq!(read_binding(&mixed), ValueType::Int);
     }
 
     fn builtin_code_fn_spelling() -> &'static str {
@@ -3786,10 +3957,16 @@ mod tests {
         }
     }
 
-    /// Typed `null_fn` ∪ FieldRead whose dest is `Ptr(FuncType)` (`stamp_fn_ptr`).
+    /// Typed `null_fn` ∪ a function-PBC is noneified PBC (`s_None` ∪
+    /// `SomePBC`). FieldRead dests are no longer forced `SomePtr`.
     #[test]
     fn typed_null_fn_phi_fn_fieldread_is_someptr() {
-        use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+        use std::cell::RefCell;
+
         let spelling = builtin_code_fn_spelling();
         let bk = Rc::new(Bookkeeper::new());
         let mut graph = FunctionGraph::new("typed_null_fn_phi_fn_fieldread");
@@ -3798,57 +3975,48 @@ mod tests {
         let (join, phi_args) = graph.create_block_with_arg_vars(1);
         let phi = phi_args[0].clone();
         let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
-        let base = graph
-            .push_op_var(
-                pred_field,
-                OpKind::Input {
-                    name: "code".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let field_var = graph
-            .push_op_var(
-                pred_field,
-                OpKind::FieldRead {
-                    base,
-                    field: FieldDescriptor::new("func", Some("BuiltinCode".into())),
-                    ty: ValueType::Int,
-                    pure: false,
-                },
-                true,
-            )
-            .unwrap();
-        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
-            .expect("fn spelling is SomePtr");
-        stamp_someptr_lltype(&field_var, &sv);
+        let field_var = graph.alloc_value_var();
+        *field_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::PBC(SomePBC::new(
+            vec![DescEntry::function(Rc::new(RefCell::new(
+                FunctionDesc::new(
+                    bk.clone(),
+                    None,
+                    "builtin_code_func",
+                    Signature::new(vec![], None, None),
+                    None,
+                    None,
+                ),
+            )))],
+            false,
+        ))));
         branch_start_to_preds(&mut graph, pred_null, pred_field);
         graph.set_goto(pred_null, join, vec![null_var.clone()]);
         graph.set_goto(pred_field, join, vec![field_var.clone()]);
         graph.set_return(join, Some(phi.clone()));
-        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ fn FieldRead");
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ function PBC");
         let phi_sv = read_binding_some(&phi).expect("phi annotated");
         let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
-        let field_sv = read_binding_some(&field_var).expect("FieldRead annotated");
         assert!(
-            somevalue_is_fn_ptr(&phi_sv),
-            "phi is SomePtr(FuncType), got {:?}",
-            phi_sv
+            matches!(null_sv.as_ref(), SomeValue::None_(_)),
+            "spelled null_fn is s_None, got {:?}",
+            null_sv
         );
-        assert_eq!(
-            someptr_ll(&null_sv),
-            someptr_ll(&field_sv),
-            "null_fn and FieldRead share ll_ptrtype (`pairtype(SomePtr, SomePtr).union`)"
-        );
-        assert_eq!(someptr_ll(&phi_sv), someptr_ll(&null_sv));
+        match phi_sv.as_ref() {
+            SomeValue::PBC(pbc) => assert!(pbc.can_be_none, "s_None ∪ PBC noneifies"),
+            other => panic!("phi is noneified SomePBC, got {other:?}"),
+        }
     }
 
-    /// Typed `null_fn` ∪ Call whose dest is `Ptr(FuncType)` (`stamp_fn_ptr`).
+    /// Typed `null_fn` ∪ a planted function-PBC (Call dests are no
+    /// longer forced `SomePtr`).
     #[test]
     fn typed_null_fn_phi_fn_call_is_someptr() {
-        use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+        use std::cell::RefCell;
+
         let spelling = builtin_code_fn_spelling();
         let bk = Rc::new(Bookkeeper::new());
         let mut graph = FunctionGraph::new("typed_null_fn_phi_fn_call");
@@ -3857,43 +4025,34 @@ mod tests {
         let (join, phi_args) = graph.create_block_with_arg_vars(1);
         let phi = phi_args[0].clone();
         let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
-        let call_var = graph
-            .push_op_var(
-                pred_call,
-                OpKind::Call {
-                    target: CallTarget::function_path(["gateway", "builtin_code_get"]),
-                    args: vec![],
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
-            .expect("fn spelling is SomePtr");
-        stamp_someptr_lltype(&call_var, &sv);
+        let call_var = graph.alloc_value_var();
+        *call_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::PBC(SomePBC::new(
+            vec![DescEntry::function(Rc::new(RefCell::new(
+                FunctionDesc::new(
+                    bk.clone(),
+                    None,
+                    "builtin_code_get",
+                    Signature::new(vec![], None, None),
+                    None,
+                    None,
+                ),
+            )))],
+            false,
+        ))));
         branch_start_to_preds(&mut graph, pred_null, pred_call);
         graph.set_goto(pred_null, join, vec![null_var.clone()]);
         graph.set_goto(pred_call, join, vec![call_var.clone()]);
         graph.set_return(join, Some(phi.clone()));
-        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ fn Call");
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ function PBC");
         let phi_sv = read_binding_some(&phi).expect("phi annotated");
-        let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
-        let call_sv = read_binding_some(&call_var).expect("Call annotated");
-        assert!(
-            somevalue_is_fn_ptr(&phi_sv),
-            "phi is SomePtr(FuncType), got {:?}",
-            phi_sv
-        );
-        assert_eq!(
-            someptr_ll(&null_sv),
-            someptr_ll(&call_sv),
-            "null_fn and stamped Call share ll_ptrtype"
-        );
-        assert_eq!(someptr_ll(&phi_sv), someptr_ll(&null_sv));
+        match phi_sv.as_ref() {
+            SomeValue::PBC(pbc) => assert!(pbc.can_be_none, "s_None ∪ PBC noneifies"),
+            other => panic!("phi is noneified SomePBC, got {other:?}"),
+        }
     }
 
     /// Typed `null_fn` ∪ `ConstInt(-1)` stays `UnionError`
-    /// (`pairtype(SomePtr, SomeObject).union`).
+    /// (`SomeInteger.noneify`).
     #[test]
     fn typed_null_fn_phi_constint_neg1_is_union_error() {
         use crate::annotator::bookkeeper::Bookkeeper;
@@ -3919,68 +4078,65 @@ mod tests {
         );
     }
 
-    /// `Result<(), PyError>` with the exception carrier is `Void` on both
-    /// arms (`fn_ptr_result_lltype` / `ann_nullptr`).
+    /// `Result<(), PyError>` with the exception carrier is `Void` on the
+    /// `stamp_fn_ptr` lltype (`fn_ptr_result_lltype`). Spelled `null_fn`
+    /// is `s_None` and noneifies a function-PBC.
     #[test]
     fn typed_null_fn_phi_startup_fn_fieldread_is_void_result() {
         use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use std::cell::RefCell;
+
         let spelling = startup_fn_spelling();
         let bk = Rc::new(Bookkeeper::new());
         bk.set_exception_carrier("error::PyErrorObject");
         bk.alias_exception_carrier_handle("error::PyError");
+        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling lltype");
+        assert_eq!(
+            fn_ptr_func_type(&sv).result,
+            LowLevelType::Void,
+            "carrier Result<(), E> is Void (`fn_ptr_result_lltype`)"
+        );
         let mut graph = FunctionGraph::new("typed_null_fn_phi_startup");
         let pred_null = graph.create_block();
         let pred_field = graph.create_block();
         let (join, phi_args) = graph.create_block_with_arg_vars(1);
         let phi = phi_args[0].clone();
         let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
-        let base = graph
-            .push_op_var(
-                pred_field,
-                OpKind::Input {
-                    name: "def".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let field_var = graph
-            .push_op_var(
-                pred_field,
-                OpKind::FieldRead {
-                    base,
-                    field: FieldDescriptor::new("startup", Some("BuiltinModuleDef".into())),
-                    ty: ValueType::Int,
-                    pure: false,
-                },
-                true,
-            )
-            .unwrap();
-        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
-            .expect("fn spelling is SomePtr");
-        stamp_someptr_lltype(&field_var, &sv);
+        let field_var = graph.alloc_value_var();
+        *field_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::PBC(SomePBC::new(
+            vec![DescEntry::function(Rc::new(RefCell::new(
+                FunctionDesc::new(
+                    bk.clone(),
+                    None,
+                    "startup",
+                    Signature::new(vec![], None, None),
+                    None,
+                    None,
+                ),
+            )))],
+            false,
+        ))));
         branch_start_to_preds(&mut graph, pred_null, pred_field);
         graph.set_goto(pred_null, join, vec![null_var.clone()]);
         graph.set_goto(pred_field, join, vec![field_var.clone()]);
         graph.set_return(join, Some(phi.clone()));
-        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ startup FieldRead");
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ function PBC");
         let phi_sv = read_binding_some(&phi).expect("phi annotated");
         let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
-        let field_sv = read_binding_some(&field_var).expect("FieldRead annotated");
-        assert_eq!(
-            fn_ptr_func_type(&null_sv).result,
-            LowLevelType::Void,
-            "carrier Result<(), E> is Void on null_fn"
+        assert!(
+            matches!(null_sv.as_ref(), SomeValue::None_(_)),
+            "spelled null_fn is s_None, got {:?}",
+            null_sv
         );
-        assert_eq!(
-            fn_ptr_func_type(&field_sv).result,
-            LowLevelType::Void,
-            "carrier Result<(), E> is Void on FieldRead"
-        );
-        assert_eq!(someptr_ll(&null_sv), someptr_ll(&field_sv));
-        assert!(somevalue_is_fn_ptr(&phi_sv));
+        match phi_sv.as_ref() {
+            SomeValue::PBC(pbc) => assert!(pbc.can_be_none, "s_None ∪ PBC noneifies"),
+            other => panic!("phi is noneified SomePBC, got {other:?}"),
+        }
     }
 
     #[test]

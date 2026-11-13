@@ -1216,10 +1216,13 @@ impl<'a> Lowering<'a> {
             CallFunc::Regular(reg) => {
                 let id = regular_call_fun_decl_id(&reg.kind)?;
                 let fd = self.llbc.fn_by_id(id)?;
-                // A residual callee is entered through its Rust ABI, which
-                // takes the address of the word. The cell exists only inside
-                // a traced body.
-                if fun_decl_is_residual(fd, self.dont_look_inside) {
+                // A `dont_look_inside` body is entered through its Rust
+                // ABI, which takes the address of the word
+                // (`unwrap_residual_gc_mut_ref`). An Opaque import still
+                // has `&mut T` in its signature: wrap so pycall of the
+                // defining graph (`FunctionDesc.pycall`) sees the cell
+                // (`expand_pop_roots`).
+                if fun_decl_is_dont_look_inside(fd, self.dont_look_inside) {
                     return None;
                 }
                 let mut cells = Vec::new();
@@ -1295,6 +1298,11 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// `CellParam` only when the local already holds a MutRef cell.
+    /// A `&mut T` GC local or a by-value GC ADT that is not yet a cell
+    /// is `WholeLocal` so `install_gc_mut_ref_call` wraps it
+    /// (`emit_gc_mut_ref_cell`). Shared `&T` stays out: it is a pointer,
+    /// not a cell payload.
     pub(in crate::front::mir) fn classify_gc_mut_ref_arg(
         &self,
         arg_local: Option<usize>,
@@ -1304,22 +1312,25 @@ impl<'a> Lowering<'a> {
             if self.gc_mut_ref_params.contains(&local) {
                 return Ok(GcMutRefArg::CellParam(local));
             }
-            let Some(recorded) = self.atomic_ref_place.get(&local).cloned() else {
-                return Err(gc_mut_ref_not_whole_local());
-            };
-            let followed = self.concrete_borrow_place(recorded);
-            if let PlaceKind::Local(slot) = &followed.kind {
-                let slot = *slot as usize;
-                if self.gc_mut_ref_params.contains(&slot) {
-                    return Ok(GcMutRefArg::CellParam(slot));
+            if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
+                let followed = self.concrete_borrow_place(recorded);
+                if let PlaceKind::Local(slot) = &followed.kind {
+                    let slot = *slot as usize;
+                    if self.gc_mut_ref_params.contains(&slot) {
+                        return Ok(GcMutRefArg::CellParam(slot));
+                    }
+                    return Ok(GcMutRefArg::WholeLocal(slot));
                 }
-                return Ok(GcMutRefArg::WholeLocal(slot));
+                if let Some(cell) = self.deref_cell_param_local(&followed) {
+                    return Ok(GcMutRefArg::CellParam(cell));
+                }
+                if self.mut_ref_cell_root(&followed.ty).is_some() {
+                    return Ok(GcMutRefArg::Place(followed));
+                }
+                return Err(gc_mut_ref_not_whole_local());
             }
-            if let Some(cell) = self.deref_cell_param_local(&followed) {
-                return Ok(GcMutRefArg::CellParam(cell));
-            }
-            if self.mut_ref_cell_root(&followed.ty).is_some() {
-                return Ok(GcMutRefArg::Place(followed));
+            if let Some(arg) = self.gc_mut_ref_arg_from_local_ty(local) {
+                return Ok(arg);
             }
             return Err(gc_mut_ref_not_whole_local());
         }
@@ -1344,6 +1355,36 @@ impl<'a> Lowering<'a> {
             }
         }
         Err(gc_mut_ref_not_whole_local())
+    }
+
+    /// Whole-local wrap when the local is `&mut T` of a GC handle, or a
+    /// by-value GC ADT (`attribute_error_with_context`'s `PyError`).
+    /// `pointer_target_json` excludes a shared `&T`.
+    fn gc_mut_ref_arg_from_local_ty(&self, local: usize) -> Option<GcMutRefArg> {
+        let ty = &self.body.locals.locals.get(local)?.ty;
+        if tyref_gc_mut_ref_cell_root(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
+            return Some(GcMutRefArg::WholeLocal(local));
+        }
+        if tyref_is_raw_or_borrowed_pointer(ty, self.llbc) {
+            return None;
+        }
+        mut_ref_cell_root_of(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        .then_some(GcMutRefArg::WholeLocal(local))
     }
 
     pub(in crate::front::mir) fn install_gc_mut_ref_call(
@@ -1503,6 +1544,13 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: GC reference copy-out place is not a projection"
                         )));
                     };
+                    // `expand_pop_roots` reloads the root into the same
+                    // field it came from. The cell holds the handle word
+                    // `resolve_place` copied in; `InstanceRepr.setfield`
+                    // writes that one field. A GC handle dest_ty is a Ptr
+                    // (`tyref_by_value_struct_decl`), so this is one
+                    // FieldWrite of the variant payload, not a leaf-copy
+                    // through the handle's inner field.
                     self.emit_projection_write(
                         mir_bb,
                         clone_place(inner),

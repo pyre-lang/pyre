@@ -102,6 +102,15 @@ CHARON_CORE_INCLUDE = [
     "core::cell::Cell",
     "--include",
     "core::cell::UnsafeCell",
+    # `Ref` / `RefMut` / `RefCell` stay `kind: Opaque` unless the type
+    # itself is included; `Deref::deref` then cannot FieldRead `value`,
+    # and `RefCell::borrow` cannot FieldRead `value` beside the flag.
+    "--include",
+    "core::cell::Ref",
+    "--include",
+    "core::cell::RefMut",
+    "--include",
+    "core::cell::RefCell",
     # `OnceLock<fn>` payload is the `value` field after `Once`; the type
     # stays `kind: Opaque` / empty layout unless included, so
     # `OnceLock::get` cannot derive that offset. Include the type, not

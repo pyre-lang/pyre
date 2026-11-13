@@ -18,18 +18,19 @@ use crate::model::{
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    adt_node, boxing_cluster_ctor_new_counts, boxing_cluster_with_nested_header, calls_leaf,
-    code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site, empty_llbc,
-    empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field,
-    ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
-    interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
-    llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape, option_adt_node, option_enum,
-    option_int_arg, option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node,
-    result_enum, rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph,
-    struct_ctor_ops, struct_decl, struct_news, type_decl_struct, tyref_to_attr_value_type,
-    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
-    window_meta, window_mut_u8_ptr, window_opaque_fun, window_place, window_shared_slice,
-    window_slice, window_span, window_u8, window_unwind_and_return_blocks, window_usize,
+    adt_node, boxing_cluster_ctor_new_counts, boxing_cluster_with_nested_header, c_layout,
+    calls_leaf, code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site,
+    empty_llbc, empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops,
+    i64_field, ident_path, interior_bb, interior_caller, interior_i64, interior_local,
+    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_usize,
+    leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape,
+    option_adt_node, option_enum, option_int_arg, option_ok_or_else_site, push_fn_const,
+    replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count, some_ctor_ops,
+    some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
+    type_decl_struct, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
+    window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
+    window_place, window_shared_slice, window_slice, window_span, window_u8,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -208,6 +209,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
             None,
             true,
+            None,
             None,
             None,
         )
@@ -1978,7 +1980,8 @@ fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
 #[test]
 fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
     use std::collections::{HashMap, HashSet};
-    let owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
+    let mut owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
+    owner["layout"] = c_layout();
     let fun = |def_id: u64, leaf: &str, output: serde_json::Value| {
         serde_json::json!({
             "def_id": def_id,
@@ -7350,6 +7353,119 @@ fn reconstructed_impl_generics_binds_swapped_const_params() {
     ));
 }
 
+/// Residual `w_module_dict_get_strategy` returns `*mut ModuleDictStrategy`.
+/// Intern the Call dest so getattr `getitem_str` sees the classdef
+/// (`celldict.py` `getdictvalue_no_unwrapping`).
+#[test]
+fn w_module_dict_get_strategy_call_result_is_interned() {
+    use crate::model::{CallTarget, OpKind};
+
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("::w_module_dict_getitem_str")
+        })
+        .expect("w_module_dict_getitem_str in pyre-object LLBC");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower w_module_dict_getitem_str");
+        let ops = graph_ops(&graph);
+        let dest = ops.iter().find_map(|op| {
+            let OpKind::Call { target, .. } = &op.kind else {
+                return None;
+            };
+            let is_get_strategy = match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    segments.last().map(String::as_str) == Some("w_module_dict_get_strategy")
+                }
+                CallTarget::Method { name, .. } => name == "w_module_dict_get_strategy",
+                _ => false,
+            };
+            is_get_strategy.then(|| op.result.clone()).flatten()
+        });
+        let Some(dest) = dest else {
+            panic!(
+                "getitem_str must call get_strategy; ops={:?}",
+                ops.iter()
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Call { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            ops.iter().any(|op| {
+                crate::model::cast_instance_of(&op.kind, &dest)
+                    .is_some_and(|root| root.rsplit("::").next() == Some("ModuleDictStrategy"))
+            }),
+            "residual get_strategy dest intern's ModuleDictStrategy; graph={}",
+            graph.dump()
+        );
+    });
+}
+
+/// Residual `Vec::from_raw_parts` in `rffi.mallocfn` (`rstr.mallocstr`)
+/// dest intern's as the `Vec<u8>` list so setattr `__pos_0` of
+/// `Result<Vec<u8>, MemoryError>::Ok` unions (`rlist.py`).
+#[test]
+fn mallocfn_from_raw_parts_dest_is_interned_as_list() {
+    use crate::model::{CallTarget, OpKind};
+
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("::mallocfn"))
+        .expect("mallocfn in majit-rlib LLBC");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower mallocfn");
+        let ops = graph_ops(&graph);
+        let dest = ops.iter().find_map(|op| {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                return None;
+            };
+            if args.len() != 3 {
+                return None;
+            }
+            let is_from_raw_parts = match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    segments.last().map(String::as_str) == Some("from_raw_parts")
+                }
+                CallTarget::Method { name, .. } => name == "from_raw_parts",
+                _ => false,
+            };
+            is_from_raw_parts.then(|| op.result.clone()).flatten()
+        });
+        let Some(dest) = dest else {
+            panic!(
+                "mallocfn must residual 3-arg from_raw_parts; ops={:?}",
+                ops.iter()
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Call { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            ops.iter().any(|op| {
+                crate::model::cast_instance_of(&op.kind, &dest)
+                    .is_some_and(majit_ir::descr::is_list_container_spelling)
+            }),
+            "residual from_raw_parts dest intern's as list; graph={}",
+            graph.dump()
+        );
+    });
+}
+
 /// Production `w_module_dict_setitem_str_internal` names the inherent
 /// `ModuleDictStrategy::setitem_str` FunDecl, not the trait trampoline.
 #[test]
@@ -8827,7 +8943,7 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             "is_local": true
         })
     };
-    let ffi_type = serde_json::json!({
+    let mut ffi_type = serde_json::json!({
         "def_id": 1,
         "item_meta": meta(&["libffi_sys", "ffi_type"]),
         "kind": {"Struct": [{
@@ -8836,7 +8952,8 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             "attr_info": null
         }]}
     });
-    let cif = serde_json::json!({
+    ffi_type["layout"] = c_layout();
+    let mut cif = serde_json::json!({
         "def_id": 0,
         "item_meta": meta(&["libffi_sys", "ffi_cif"]),
         "kind": {"Struct": [
@@ -8857,6 +8974,7 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
             }
         ]}
     });
+    cif["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![cif, ffi_type], vec![]);
     let body: Unstructured = serde_json::from_value(serde_json::json!({
         "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
@@ -9369,6 +9487,71 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
     assert_eq!(
         bare_path.last().map(String::as_str),
         Some("option::Option"),
+        "without a dest_ty the presence check may keep the unsuffixed leaf"
+    );
+}
+
+/// Try residual dest_ty spells uninhabited ok as a non-object payload
+/// (`charon_type_value_to_ast_string` → `??scalar`). dest_adt with that
+/// ok is still the instantiation so intern of `Result::Err` is
+/// `Result<??scalar,E>::Err` (`intern_enum_variant_host` peels to the
+/// carrier). A rejected dest_adt interned the bare template and
+/// setattr of Break.__pos_0 was `Result::Err ∪ PyError`.
+#[test]
+fn resolve_aggregate_adt_result_err_dest_ty_scalar_keeps_suffix() {
+    let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let kind = serde_json::json!({"Adt": [0, 1]});
+    let dest = TyRef::Other(serde_json::json!({
+        "Value": [7, result_adt_node(
+            0,
+            serde_json::json!(null),
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        )]
+    }));
+    let (path, leaf, _, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, Some(&dest))
+        .expect("Err constructor");
+    assert_eq!(leaf, "Err");
+    assert_eq!(
+        path.last().map(String::as_str),
+        Some("result::Result<??scalar,i64>"),
+        "dest_adt with residual ??scalar must intern the instantiation"
+    );
+    let (bare_path, _, _, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, None)
+        .expect("presence check without dest_ty still resolves the ADT");
+    assert_eq!(
+        bare_path.last().map(String::as_str),
+        Some("result::Result"),
         "without a dest_ty the presence check may keep the unsuffixed leaf"
     );
 }
@@ -10221,8 +10404,8 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
 }
 
 /// `unicode_translate_error_str` has two plain Result expects:
-/// `start_slot.as_ref().expect(...)` and `usize::try_from(start).expect(...)`.
-/// Each stays a regular call of the extracted core body
+/// `start_slot.as_ref().expect(...)` and `try_from.expect`. They stay
+/// regular calls of the extracted core body
 /// `match self { Ok(t) => t, Err(_) => <diverging Never call> }`.
 /// Carrier Result expect stays on `result_exc` and is not this site.
 #[test]
@@ -11359,6 +11542,58 @@ fn saturating_sub_wrapper_diamond_real() {
     });
 }
 
+/// `FrameAnchor` is the depth `usize`. `live`'s `&self` is that word.
+///
+/// `mergeinputargs` of `live` unions Integer ∪ Ptr when a caller seeds
+/// SomePtr of the wrapper. The harvest records the type as a transparent
+/// unsigned scalar so the annotator keeps the inner word.
+#[test]
+#[ignore]
+fn frame_anchor_live_input_is_the_depth_word() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    crate::front::mir::link_transparent_scalar_types(std::slice::from_ref(&llbc));
+    assert_eq!(
+        llbc.transparent_scalar_kind("pyre_interpreter::eval::FrameAnchor"),
+        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
+        "FrameAnchor is the depth usize"
+    );
+    assert_eq!(
+        llbc.transparent_scalar_kind("eval::FrameAnchor"),
+        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
+        "interned class_root matches the harvested kind"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::live")
+        .expect("lower eval::<Impl>::live");
+    let input = graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } if name == "self" => Some((ty.clone(), class_root.clone())),
+            _ => None,
+        })
+        .expect("live has a self Input");
+    assert_eq!(
+        input.0,
+        crate::model::ValueType::Unsigned,
+        "live `&self` is the depth word"
+    );
+    assert_eq!(
+        input.1.as_deref(),
+        Some("eval::FrameAnchor"),
+        "live keeps the interned class_root so the annotator can match the harvest"
+    );
+    assert!(
+        graph.return_class_root.as_deref() != Some("eval::FrameAnchor"),
+        "live returns *mut PyFrame, not the anchor wrapper"
+    );
+}
+
 /// A translated opcode helper is a PyPy frame method, not a generic
 /// classdef-less reference.  Its receiver is the per-frame red argument
 /// that owns `pycode`, globals, and locals, so the front must retain the
@@ -11628,15 +11863,7 @@ fn option_niche_null_cast_of_ref_to_raw_struct_is_int() {
         }]),
         false,
     );
-    raw["layout"] = serde_json::json!([{
-        "key": "fixture-target",
-        "value": {
-            "size": 4,
-            "align": 4,
-            "variant_layouts": [{"field_offsets": [0]}],
-            "repr": {"transparent": false}
-        }
-    }]);
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -11746,6 +11973,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         None,
         tomb,
         &cells,
+        &std::collections::HashSet::<usize>::new(),
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
@@ -11773,6 +12001,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         None,
         tomb,
         &residual,
+        &std::collections::HashSet::<usize>::new(),
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
@@ -11786,8 +12015,199 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
     );
 }
 
-/// A residual callee — no body, or `dont_look_inside` — is not given a
-/// cell signature. The traced callee with the same `&mut` GC pointer is.
+/// `Option<&mut T>` of a GC handle is an Option-cell source. Its Some
+/// payload local and a reborrow of that local join `gc_mut_ref_params`.
+/// `Option<&mut i64>` is not a source.
+#[test]
+fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
+    use majit_charon_reader::ullbc::{Place, Rvalue};
+
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
+    let mut_ref = serde_json::json!({"Ref": ["Erased", pointee.clone(), "Mut"]});
+    let option_ty = option_adt_node(0, mut_ref.clone());
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let mut_i64 = serde_json::json!({"Ref": ["Erased", i64_ty, "Mut"]});
+    let option_i64 = option_adt_node(0, mut_i64);
+    let unit = serde_json::json!({"Tuple": []});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let gc_locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": 1,
+        "locals": [
+            local(0, None, &unit),
+            local(1, Some("opt"), &option_ty),
+            local(2, Some("p"), &mut_ref),
+            local(3, Some("tmp"), &mut_ref)
+        ]
+    }))
+    .unwrap();
+    let option_cells = super::gc_mut_ref_option_param_locals(
+        &gc_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        false,
+        &raw_alloc,
+    );
+    assert!(
+        option_cells.contains(&1),
+        "Option<&mut GC-handle> is an Option-cell source"
+    );
+    let cells =
+        super::gc_mut_ref_param_locals(&gc_locals, &llbc, tomb, &gc_struct_ids, false, &raw_alloc);
+    assert!(
+        !cells.contains(&1),
+        "the Option parameter itself is not a cell"
+    );
+
+    let i64_locals: majit_charon_reader::ullbc::Locals =
+        serde_json::from_value(serde_json::json!({
+            "arg_count": 1,
+            "locals": [
+                local(0, None, &unit),
+                local(1, Some("opt"), &option_i64)
+            ]
+        }))
+        .unwrap();
+    let i64_option_cells = super::gc_mut_ref_option_param_locals(
+        &i64_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        false,
+        &raw_alloc,
+    );
+    assert!(
+        i64_option_cells.is_empty(),
+        "Option<&mut i64> is not a GC cell source"
+    );
+    let residual = super::gc_mut_ref_option_param_locals(
+        &gc_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        true,
+        &raw_alloc,
+    );
+    assert!(residual.is_empty());
+
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "span": span,
+        "locals": {
+            "arg_count": 1,
+            "locals": [
+                local(0, None, &unit),
+                local(1, Some("opt"), &option_ty),
+                local(2, Some("p"), &mut_ref),
+                local(3, Some("tmp"), &mut_ref)
+            ]
+        },
+        "body": [{
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span, "kind": "Return"}
+        }]
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let mut lowering = super::Lowering::new(
+        &llbc,
+        "fixture::unwrap".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        tomb,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &raw_alloc,
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(lowering.gc_mut_ref_option_params.contains(&1));
+    assert!(!lowering.gc_mut_ref_params.contains(&1));
+    let opt_input = lowering
+        .graph
+        .block(lowering.graph.startblock)
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "opt"))
+        .expect("opt input");
+    let OpKind::Input { ty, class_root, .. } = &opt_input.kind else {
+        panic!("opt is an input");
+    };
+    let class_root = class_root
+        .as_deref()
+        .expect("Option<&mut T> Input carries a class_root");
+    assert!(
+        class_root.starts_with("Option<MutRef<"),
+        "Option<&mut T> Input is nullable MutRef, got {class_root}"
+    );
+    match ty {
+        ValueType::Ref(Some(root)) => assert!(
+            root.starts_with("MutRef<"),
+            "Option<&mut T> value root is MutRef, got {root}"
+        ),
+        other => panic!("Option<&mut T> Input is Ref(MutRef), got {other:?}"),
+    }
+
+    let opt_place = serde_json::json!({"kind": {"Local": 1}, "ty": option_ty});
+    let mut_place = serde_json::json!({"kind": {"Local": 2}, "ty": mut_ref});
+    let some_field = serde_json::json!({
+        "kind": {"Projection": [opt_place, {"Field": [1, 0]}]},
+        "ty": mut_ref
+    });
+    let p_dest: Place = serde_json::from_value(mut_place.clone()).unwrap();
+    let payload: Rvalue = serde_json::from_value(serde_json::json!({
+        "Use": [{"Read": some_field}, "No"]
+    }))
+    .unwrap();
+    let _ = lowering.lower_assign(0, p_dest, payload);
+    assert!(
+        lowering.gc_mut_ref_params.contains(&2),
+        "Some payload of an Option-cell param is a cell local"
+    );
+
+    let deref_p = serde_json::json!({
+        "kind": {"Projection": [mut_place, "Deref"]},
+        "ty": pointee
+    });
+    let tmp_dest: Place =
+        serde_json::from_value(serde_json::json!({"kind": {"Local": 3}, "ty": mut_ref})).unwrap();
+    let reborrow: Rvalue = serde_json::from_value(serde_json::json!({
+        "Ref": {"place": deref_p, "kind": "TwoPhaseMut", "ptr_metadata": null}
+    }))
+    .unwrap();
+    let _ = lowering.lower_assign(0, tmp_dest, reborrow);
+    assert!(
+        lowering.gc_mut_ref_params.contains(&3),
+        "TwoPhaseMut reborrow of a cell local stays a cell"
+    );
+}
+
+/// A `dont_look_inside` callee is not given a cell signature (the Rust
+/// ABI takes the address of the word). An Opaque import of a `&mut` GC
+/// pointer still wraps so pycall of the defining graph sees the cell
+/// (`expand_pop_roots`). The traced callee with the same formal is a
+/// cell.
 #[test]
 fn mut_ref_cell_signature_skips_a_residual_callee() {
     let span = serde_json::json!({"data": {
@@ -11911,7 +12331,11 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
         .expect("a traced &mut GC pointer is a cell");
     assert_eq!(traced.0, Some(0));
     assert!(traced.1[0].1.starts_with("MutRef<"));
-    assert!(lowering.gc_mut_ref_signature(&call(1), &[]).is_none());
+    let opaque = lowering
+        .gc_mut_ref_signature(&call(1), &[])
+        .expect("an Opaque &mut GC pointer is a cell");
+    assert_eq!(opaque.0, Some(1));
+    assert!(opaque.1[0].1.starts_with("MutRef<"));
     assert!(lowering.gc_mut_ref_signature(&call(2), &[]).is_none());
 }
 

@@ -338,22 +338,25 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
     extra
 }
 
-/// Per-block extra-live MIR locals for a struct-field `ptr::add`.
+/// Per-block extra-live MIR locals for a struct-field `ptr::add` or
+/// `Vec::index_mut`.
 ///
-/// `(*p.add(i)).field` lowers to `getinteriorfield`
-/// (`rewrite_op_getinteriorfield`) whose base is the GcArray header and
-/// whose index is `i`. The field block never spells those operands, so
-/// plain liveness drops them before the use. The header is the add base
-/// when nothing produces it, `entries_item_ptr`'s argument, or
-/// `entry_ptr`'s receiver — the same recovery [`struct_field_ptr_add_trace`]
-/// records on the alias.
+/// `(*p.add(i)).field` and `storage[current].field` lower to
+/// `getinteriorfield` (`rewrite_op_getinteriorfield`) whose base is the
+/// GcArray / list header and whose index is `i`. The field block never
+/// spells those operands, so plain liveness drops them before the use.
+/// The header is the add base, `entries_item_ptr`'s argument,
+/// `entry_ptr`'s receiver, or the Vec `index_mut` peels from `&mut
+/// storage` — the same recovery the intercept records on the alias.
 pub(in crate::front::mir) fn compute_interior_field_extra_live(
     body: &Unstructured,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
     let mut extra = vec![Vec::new(); body.body.len()];
     let forward_blocks = forward_reachable_mask(llbc, body);
+    let empty_raw = std::collections::HashSet::<String>::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -367,30 +370,48 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
         let PlaceKind::Local(dest) = call.dest.kind else {
             continue;
         };
-        let Some(traced) = struct_field_ptr_add_trace(
+        let dest = dest as usize;
+        let (header_local, index_local) = if let Some(traced) = struct_field_ptr_add_trace(
             reg,
             call.args.len(),
             operand_local(call.args.first()),
             call.args.first().and_then(operand_tyref),
             operand_local(call.args.get(1)),
-            dest as usize,
+            dest,
             body,
             llbc,
             tombstoned,
-        ) else {
+        ) {
+            let header_local = match traced.header {
+                TracedPtrAddHeader::EntriesItem { local } => local,
+                TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
+            };
+            (header_local, traced.index_local)
+        } else if let Some(traced) = struct_field_vec_index_trace(
+            reg,
+            call.args.len(),
+            operand_local(call.args.first()),
+            call.args.get(1).and_then(operand_tyref),
+            operand_local(call.args.get(1)),
+            dest,
+            Some(&call.dest.ty),
+            body,
+            llbc,
+            gc_struct_ids,
+            &empty_raw,
+            tombstoned,
+        ) {
+            (traced.header_local, traced.index_local)
+        } else {
             continue;
-        };
-        let header_local = match traced.header {
-            TracedPtrAddHeader::EntriesItem { local } => local,
-            TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
         for (use_idx, use_bb) in body.body.iter().enumerate() {
             if !forward_blocks[use_idx] {
                 continue;
             }
-            if block_has_struct_field_value_use(llbc, use_bb, dest as usize) {
+            if block_has_struct_field_value_use(llbc, use_bb, dest) {
                 extra[use_idx].push(header_local);
-                extra[use_idx].push(traced.index_local);
+                extra[use_idx].push(index_local);
             }
         }
     }

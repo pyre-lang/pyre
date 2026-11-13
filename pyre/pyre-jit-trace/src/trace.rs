@@ -1366,6 +1366,22 @@ pub fn trace_bytecode<Sym: WalkSym>(
 /// seeded, e.g. a `goto_if_not` over a non-concrete Int produced by an
 /// unfolded `residual_call`).
 ///
+/// Operand layout `cIRFIRF` / `iIRFIRF`: opcode + jdindex byte, then six
+/// count-prefixed register lists `gi, gr, gf, ri, rr, rf`.
+fn decode_jit_merge_point_reg_lists(code: &[u8], mp_pc: usize) -> Option<[Vec<u8>; 6]> {
+    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c` or `i`)
+    let mut lists: [Vec<u8>; 6] = Default::default();
+    for slot in lists.iter_mut() {
+        let count = *code.get(cursor)? as usize;
+        cursor += 1;
+        for _ in 0..count {
+            slot.push(*code.get(cursor)?);
+            cursor += 1;
+        }
+    }
+    Some(lists)
+}
+
 /// Decode the loop-header `jit_merge_point` that governs a bridge resume
 /// coordinate and return its red-ref (`rr`) register list.
 ///
@@ -1376,16 +1392,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
 /// `pycode`, the `PyFrame.dispatch` argument) are Constants of this
 /// per-code JitCode, populated by `copy_constants`.
 ///
-/// Operand layout `cIRFIRF`: jdindex(`c`, 1 byte) followed by six
-/// count-prefixed register lists `gi, gr, gf, ri, rr, rf`.  Returns `None`
-/// when no preceding merge point exists (straight-line resume) or the
-/// operand stream is truncated.
+/// Returns `None` when no preceding merge point exists (straight-line
+/// resume) or the operand stream is truncated.
 ///
 /// A body-guard bridge enters past its loop's merge point, so the governing
 /// op is the last merge point at or before `entry`. Main traces enter past
 /// the header merge too but seed from the sidecar through
 /// `static_entry_merge_point_green_regs`; this helper stays bridge-only.
-///
 pub(crate) fn bridge_resume_merge_point_regs(
     code: &[u8],
     scan: &crate::pyjitcode::LoopScanIndex,
@@ -1394,25 +1407,22 @@ pub(crate) fn bridge_resume_merge_point_regs(
     let mp_pc = scan
         .merge_point_at_or_before(entry)
         .or_else(|| scan.merge_point_at_or_after(entry))?;
-    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
-    let mut lists: [Vec<u8>; 6] = Default::default();
-    for slot in lists.iter_mut() {
-        let count = *code.get(cursor)? as usize;
-        cursor += 1;
-        for _ in 0..count {
-            slot.push(*code.get(cursor)?);
-            cursor += 1;
-        }
-    }
-    let [_gi, _gr, _gf, _ri, rr, _rf] = lists;
+    let [_gi, _gr, _gf, _ri, rr, _rf] = decode_jit_merge_point_reg_lists(code, mp_pc)?;
     Some(rr)
+}
+
+/// Int-green colors `gi` = `[next_instr, is_being_profiled]` of the
+/// `jit_merge_point` at `mp_pc` (`portal_jit_merge_point_graph_args`).
+pub(crate) fn merge_point_int_green_regs(code: &[u8], mp_pc: usize) -> Option<Vec<u8>> {
+    let [gi, _gr, _gf, _ri, _rr, _rf] = decode_jit_merge_point_reg_lists(code, mp_pc)?;
+    Some(gi)
 }
 
 /// `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver` starts the
 /// portal graph at `support.split_before_jit_merge_point`: the merge itself,
 /// after the dispatch's `get_is_being_profiled` diamond. The static sidecar
 /// can name the diamond's first non-live operation, not just a live marker.
-fn static_entry_merge_point(
+pub(crate) fn static_entry_merge_point(
     code: &[u8],
     scan: &crate::pyjitcode::LoopScanIndex,
     entry: usize,
@@ -1433,24 +1443,12 @@ fn static_entry_merge_point(
 /// enters before the marker, so forward selection (unlike bridge resume's
 /// backward selection) identifies the marker owned by this green entry.
 
-fn static_entry_merge_point_green_regs(
+pub(crate) fn static_entry_merge_point_green_regs(
     code: &[u8],
     scan: &crate::pyjitcode::LoopScanIndex,
     entry: usize,
 ) -> Option<Vec<u8>> {
-    let mp_pc = static_entry_merge_point(code, scan, entry)?.pc;
-    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
-    let mut lists: [Vec<u8>; 6] = Default::default();
-    for slot in lists.iter_mut() {
-        let count = *code.get(cursor)? as usize;
-        cursor += 1;
-        for _ in 0..count {
-            slot.push(*code.get(cursor)?);
-            cursor += 1;
-        }
-    }
-    let [gi, _gr, _gf, _ri, _rr, _rf] = lists;
-    Some(gi)
+    merge_point_int_green_regs(code, static_entry_merge_point(code, scan, entry)?.pc)
 }
 
 type PerfnWalkResult = Result<
@@ -5409,28 +5407,57 @@ fn portal_dispatch_merge_sandwich_contains(
 
 /// Guard-resume op2 sits immediately after `jit_merge_point`. A body merge
 /// the header-table path does not name still has the sandwich in the byte
-/// stream.
+/// stream. The dispatch-loop head (`interp_jit.py PyFrame.dispatch`) may
+/// put vsd promote / debugdata ops after the merge instead of a trailing
+/// `-live-`; the merge itself is still the close site for that green.
 fn live_follows_portal_merge(code: &[u8], marker: usize) -> bool {
-    let Some(at) = crate::jitcode_runtime::decode_op_at(code, marker) else {
-        return false;
-    };
-    if at.opname != "live" {
-        return false;
-    }
     let mut pc = 0;
-    while pc < marker {
+    while pc < code.len() {
         let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
-            return false;
+            break;
         };
-        if op.next_pc == marker {
-            return op.opname == "jit_merge_point";
+        if op.opname == "jit_merge_point" {
+            if op.pc == marker || op.next_pc == marker {
+                return true;
+            }
+            if let Some(op2) = crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                && op2.opname == "live"
+                && op2.pc == marker
+            {
+                return true;
+            }
         }
-        if op.next_pc <= pc || op.next_pc > marker {
-            return false;
+        if op.next_pc <= pc {
+            break;
         }
         pc = op.next_pc;
     }
     false
+}
+
+/// Whether a FunctionEntry sidecar offset is a valid walk start for `start_pc`.
+///
+/// Truncation-carry of an unlowered py_pc through `first_op_offset` /
+/// `resume_entry_for` floors to an earlier opcode (`abort_permanent` block).
+/// Walking from that offset rewinds the live frame. The round-trip
+/// `containing_py_pc_for_jitcode_pc` + `skip_python_trivia_forward` rejects
+/// that carry.
+///
+/// A non-generator portal (`interp_jit.py PyFrame.dispatch`) maps every
+/// instruction-start green onto the one loop head, so the same floor is py 0
+/// for every `start_pc`. `merge_entry_by_green` already named this offset
+/// for this green; accept it without the round-trip.
+fn sidecar_offset_encodes_start_pc(pjc: &crate::PyJitCode, off: usize, start_pc: usize) -> bool {
+    if pjc.merge_entry_for(start_pc) == Some(off) {
+        return true;
+    }
+    let landed = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+    let landed = if pjc.code_ptr.is_null() {
+        landed
+    } else {
+        crate::jitcode_dispatch::skip_python_trivia_forward(unsafe { &*pjc.code_ptr }, landed)
+    };
+    landed >= start_pc
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
@@ -5471,58 +5498,16 @@ fn run_perfn_walk<Sym: WalkSym>(
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
     } else if is_resume_sidecar {
-        sidecar_entry.filter(|&off| {
-            let landed =
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
-            let landed = if pjc.code_ptr.is_null() {
-                landed
-            } else {
-                crate::jitcode_dispatch::skip_python_trivia_forward(
-                    unsafe { &*pjc.code_ptr },
-                    landed,
-                )
-            };
-            landed >= start_pc
-        })
+        sidecar_entry.filter(|&off| sidecar_offset_encodes_start_pc(&pjc, off, start_pc))
     } else if uses_entry_sidecar {
-        // The resume-marker table forward-carries a py_pc that emitted no op of
-        // its own to the next py that did.  When lowering stopped early — an
-        // unported opcode ends the body with `abort_permanent` — every later py
-        // is unlowered, so that carry crosses the truncation and hands back the
-        // abort block.  The block's own coordinate is the unported instruction,
-        // far BEFORE `start_pc`: walking from it reaches the marker at once and
-        // `fbw_abort_resume_py_pc` back-translates to that earlier py, rewinding
-        // the live frame so every instruction between it and `start_pc` runs a
-        // second time.  Require the coordinate to round-trip forward instead —
-        // a trace-entry green heads its own block, so its marker back-translates
-        // to itself, and a genuine trivia carry lands on a LATER py.  Anything
-        // else is a body that does not encode `start_pc`, which is exactly the
-        // decline below.
-        //
-        // The back-translation names the FIRST Python instruction whose
-        // lowering region owns the offset, and Python trivia -- `Nop`
-        // (a bare `pass`), `Cache`, `ExtendedArg`, `Resume`, `NotTaken` --
-        // lowers to nothing, so a trivia run immediately before a loop header
-        // owns the header's own offset and back-translates to the trivia.
-        // Comparing that raw coordinate rejected every loop preceded by a
-        // `pass`: the whole function then ran interpreted.  Normalize the
-        // landing forward past trivia first; an unported instruction is not
-        // trivia, so the carry-across-truncation case above still fails the
-        // test.
+        // Truncation-carry of an unlowered py_pc through `first_op_offset`
+        // is rejected by `sidecar_offset_encodes_start_pc`. A genuine
+        // `merge_entry_by_green` hit (including the shared
+        // `PyFrame.dispatch` loop head) is accepted; `static_entry_merge_point`
+        // then advances past the `get_is_being_profiled` diamond to the JMP
+        // (`warmspot.py split_before_jit_merge_point`).
         sidecar_entry
-            .filter(|&off| {
-                let landed =
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
-                let landed = if pjc.code_ptr.is_null() {
-                    landed
-                } else {
-                    crate::jitcode_dispatch::skip_python_trivia_forward(
-                        unsafe { &*pjc.code_ptr },
-                        landed,
-                    )
-                };
-                landed >= start_pc
-            })
+            .filter(|&off| sidecar_offset_encodes_start_pc(&pjc, off, start_pc))
             .and_then(|sidecar| {
                 static_entry_merge_point(pjc.jitcode.code.as_slice(), pjc.loop_scan(), sidecar)
                     .map(|merge| merge.pc)
@@ -5770,8 +5755,15 @@ fn run_perfn_walk<Sym: WalkSym>(
         // without it loop-carried collection operands remain `OpRef::NONE`.
         if !is_bridge_trace && !pjc.is_resume_entry_offset(entry) {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            // The shared `PyFrame.dispatch` loop head maps every green onto
+            // one jitcode offset, so `pcdep_trivia_at(entry)` floors head
+            // bytes to py 0. Seed the live Ref colors of the GREEN python
+            // pc (`first_op_offset`) so a FunctionEntry at a mid-function
+            // case (e.g. `returns_through_finally` at py 14) sees that
+            // instruction's stack/locals, not the function-entry live set.
+            let pcdep_at = pjc.first_op_offset(start_pc).unwrap_or(entry);
             if let Some(pcdep) =
-                crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, entry as i32)
+                crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, pcdep_at as i32)
             {
                 let mut live_slot_seeds = Vec::new();
                 seed_loop_entry_ref_slots(
@@ -5950,7 +5942,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // so `dispatch_via_miframe` writes `top_regs_i[color] = value`. Empty for a
     // non-branch-guard resume (`bridge_walk_entry_pc == None`), where the walk
     // enters at the opcode boundary with no live mid-opcode Int temps.
-    let argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
+    let mut argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
         // Clamp to the jitcode's Int register count: `sym.registers_i` may carry
         // trailing scratch/constant colors beyond `num_regs_i`, and
         // `dispatch_via_miframe` rejects an argbox list longer than the callee
@@ -5983,6 +5975,36 @@ fn run_perfn_walk<Sym: WalkSym>(
     } else {
         Vec::new()
     };
+    // A mid-case / bridge entry never executes the dispatch-head
+    // `jit_merge_point` (`interp_jit.py PyFrame.dispatch`), so the Int
+    // greens `gi` = `[next_instr, is_being_profiled]` stay `OpRef::NONE`
+    // unless filled. Seed only colors that resume data left empty; the
+    // colors come from the governing merge's `gi` list, not from a
+    // hardcoded register index.
+    let gi_colors = static_entry_green_regs.clone().or_else(|| {
+        let scan = pjc.loop_scan();
+        scan.merge_point_at_or_before(entry)
+            .or_else(|| scan.merge_point_at_or_after(entry))
+            .and_then(|mp| merge_point_int_green_regs(pjc.jitcode.code.as_slice(), mp))
+    });
+    if let Some(gi) = gi_colors.as_ref() {
+        let num_regs_i = pjc.jitcode.num_regs_i() as usize;
+        for (&color, value) in gi
+            .iter()
+            .zip([start_pc as i64, i64::from(is_being_profiled)])
+        {
+            let color = color as usize;
+            if color >= num_regs_i {
+                continue;
+            }
+            if color >= argboxes_i.len() {
+                argboxes_i.resize(color + 1, majit_ir::OpRef::NONE);
+            }
+            if argboxes_i[color].is_none() {
+                argboxes_i[color] = ctx.const_int(value);
+            }
+        }
+    }
 
     // resume.py `_callback_f` parity: seed the Float bank the same
     // way as argboxes_i. Empty for a non-marker resume; `truncate(num_regs_f)`
@@ -7434,7 +7456,21 @@ fn scan_loop_body_abort_permanent_pc(
     let back_edges: Vec<(usize, usize)> = scan
         .label_gotos
         .iter()
-        .filter(|&&(pc, target)| pc > merge_point && target <= header)
+        .filter(|&&(pc, target)| {
+            pc > merge_point
+                && target <= header
+                && scan.loop_headers.iter().any(|&lh| {
+                    // `jump_absolute` emits `loop_header` then the
+                    // dispatch-continue `goto`. A later opcode's continue
+                    // also targets the shared head (`interp_jit.py
+                    // PyFrame.dispatch`) but is not a back-edge: the
+                    // JUMP_BACKWARD goto sits between that `loop_header`
+                    // and the later goto.
+                    lh > merge_point
+                        && lh <= pc
+                        && !scan.label_gotos.iter().any(|&(g, _)| g > lh && g < pc)
+                })
+        })
         .map(|&(pc, target)| (target, pc))
         .collect();
     let abort_permanent_pcs = scan

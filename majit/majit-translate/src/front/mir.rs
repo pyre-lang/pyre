@@ -445,6 +445,12 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            for (key, kind) in prog.struct_fields.transparent_scalar_kinds {
+                acc.struct_fields
+                    .transparent_scalar_kinds
+                    .entry(key)
+                    .or_insert(kind);
+            }
             for root in prog.struct_fields.foreign_body_roots {
                 acc.struct_fields.note_foreign_body_crate_root(&root);
             }
@@ -2262,6 +2268,11 @@ pub(crate) struct CrateLoweringState {
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+    /// Artefacts of this program, so an Opaque-imported generic can
+    /// enqueue `FunctionDesc.cachedgraph` on the crate that holds its
+    /// body. `None` on the `lower_all` path, which drops each crate's
+    /// state after lowering.
+    cross_crate: Option<std::rc::Rc<dyn crate::front::clause_spec::CrossCrateLookup>>,
     skipped: LoweringSkips,
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
@@ -2537,6 +2548,7 @@ impl CrateLoweringState {
             func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            cross_crate: None,
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
@@ -2586,6 +2598,21 @@ impl CrateLoweringState {
     #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn raw_alloc_flavor_structs(&self) -> &std::collections::HashSet<String> {
         &self.raw_alloc_flavor_structs
+    }
+
+    pub(crate) fn attach_cross_crate(
+        &mut self,
+        cross: std::rc::Rc<dyn crate::front::clause_spec::CrossCrateLookup>,
+    ) {
+        self.cross_crate = Some(cross);
+    }
+
+    pub(crate) fn spec_queue(&self) -> &std::cell::RefCell<crate::front::clause_spec::SpecQueue> {
+        &self.spec
+    }
+
+    pub(crate) fn cross_crate(&self) -> Option<&dyn crate::front::clause_spec::CrossCrateLookup> {
+        self.cross_crate.as_deref()
     }
 }
 
@@ -2847,12 +2874,21 @@ impl<'l> CrateLowering<'l> {
     ) -> Option<crate::model::FunctionGraph> {
         let locals = fd.unstructured_locals()?;
         let mut graph = crate::model::FunctionGraph::new(graph_name_of(self.llbc, fd));
+        let residual = fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside);
         let cells = gc_mut_ref_param_locals(
             &locals,
             self.llbc,
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            residual,
+            &self.state.raw_alloc_flavor_structs,
+        );
+        let option_cells = gc_mut_ref_option_param_locals(
+            &locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            &self.state.gc_struct_ids,
+            residual,
             &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
@@ -2862,6 +2898,7 @@ impl<'l> CrateLowering<'l> {
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
             &cells,
+            &option_cells,
             &self.state.gc_struct_ids,
             fundecl_keeps_zst_self(
                 self.llbc,
@@ -2950,6 +2987,7 @@ impl<'l> CrateLowering<'l> {
             false,
             None,
             Some(value_type_by_id),
+            self.state.cross_crate(),
         ) {
             Ok(g) => g,
             Err(error) => {
@@ -3098,12 +3136,21 @@ impl<'l> CrateLowering<'l> {
             .fn_by_id(spec.body.fn_id)
             .expect("a declared specialization names its FunDecl");
         let mut graph = crate::model::FunctionGraph::new(spec.body.segments.join("::"));
+        let residual = fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside);
         let cells = gc_mut_ref_param_locals(
             &spec.body.body.locals,
             self.llbc,
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            residual,
+            &self.state.raw_alloc_flavor_structs,
+        );
+        let option_cells = gc_mut_ref_option_param_locals(
+            &spec.body.body.locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            &self.state.gc_struct_ids,
+            residual,
             &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
@@ -3113,6 +3160,7 @@ impl<'l> CrateLowering<'l> {
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
             &cells,
+            &option_cells,
             &self.state.gc_struct_ids,
             fundecl_keeps_zst_self(
                 self.llbc,
@@ -3200,6 +3248,7 @@ impl<'l> CrateLowering<'l> {
             true,
             Some(spec.segments.join("::")),
             Some(value_type_by_id),
+            self.state.cross_crate(),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -4621,18 +4670,27 @@ fn register_type_alias_struct(
     }
 }
 
-/// Record every spelling of an ADT whose fields are raw words.
-/// `GcKind::Raw` also covers classed structs that are not GC headers
-/// (a strategy singleton, a type object). Those stay instances.
+/// Record every spelling of an ADT that is lltype raw storage
+/// (`rffi.py` `CStruct` / `adt_def_is_raw_storage`). Flavor-raw
+/// classes (`rclass.py` `getgcflavor`) and Rust-repr aggregates
+/// (`rclass.py` `getinstancerepr`) stay instances.
 fn note_raw_word_owner(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     td: &TypeDecl,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+    if !adt_def_is_raw_storage(
+        td.def_id,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        raw_alloc_flavor_structs,
+        &mut stack,
+    ) {
         return;
     }
     let name = td.item_meta.name_path();
@@ -4645,6 +4703,12 @@ fn note_raw_word_owner(
     // are not C structs. `raw_struct_ptr_annotation` must not mint SomePtr
     // for them (`tyref_input_class_root`; RPython forbids closures).
     if majit_charon_reader::ullbc::is_closure_leaf(&leaf) {
+        return;
+    }
+    // A transparent scalar is the inner word, not a C struct.
+    // `raw_struct_ptr_annotation` must not mint SomePtr for it
+    // (`derive_subject_inputcells` seeds that word).
+    if struct_fields.transparent_scalar_kind(&name).is_some() {
         return;
     }
     struct_fields
@@ -5353,6 +5417,13 @@ fn derive_program_metadata(
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
 
+    for (path, kind) in discover_transparent_scalar_kinds(llbc) {
+        struct_fields
+            .transparent_scalar_kinds
+            .entry(path)
+            .or_insert_with(|| transparent_scalar_value_type(kind));
+    }
+
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
             continue;
@@ -5374,6 +5445,7 @@ fn derive_program_metadata(
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
             );
             note_declared_gc_owner(&mut struct_fields, td, gc_struct_ids);
         }
@@ -6713,6 +6785,12 @@ impl DuplicateLeafFacts {
         self.struct_fields
             .gc_struct_ids
             .extend(other.struct_fields.gc_struct_ids);
+        for (key, kind) in other.struct_fields.transparent_scalar_kinds {
+            self.struct_fields
+                .transparent_scalar_kinds
+                .entry(key)
+                .or_insert(kind);
+        }
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)
@@ -7518,6 +7596,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -7693,8 +7772,6 @@ pub(crate) use self::gcroot::{
     harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
     is_shadow_stack_bracket_close, is_slice_buffer_free_call,
 };
-#[cfg(test)]
-pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
@@ -7707,7 +7784,7 @@ pub(crate) use self::lltype::{
     is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, strip_crate_prefix,
+    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
     struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
     type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
@@ -7922,6 +7999,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec_body: bool,
     graph_name: Option<String>,
     value_type_by_id: Option<&std::cell::RefCell<Vec<Option<ValueType>>>>,
+    cross_crate: Option<&dyn crate::front::clause_spec::CrossCrateLookup>,
 ) -> Result<FunctionGraph, LowerError> {
     // A clause specialization's readable name (`RDict::new__spec_…`) is
     // known to the caller. The body is still the template `FunDecl`, so
@@ -8840,6 +8918,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        if let Some(cross) = cross_crate {
+            lo.set_cross_crate(cross);
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -8901,6 +8982,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    if let Some(cross) = cross_crate {
+        lo.set_cross_crate(cross);
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -8947,6 +9031,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 if spec_body {
                     lo.set_spec_body();
                 }
+            }
+            if let Some(cross) = cross_crate {
+                lo.set_cross_crate(cross);
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;

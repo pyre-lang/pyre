@@ -2295,12 +2295,13 @@ impl HostEnv {
                 .expect("std.alloc.alloc_zeroed bound above"),
         );
         // `std::slice::from_raw_parts(p, len)` and `_mut` — raw-pointer
-        // -> slice constructors called from pyre-object string / bytes
-        // helpers when packing a `*const u8` + `usize` into a `&[u8]`
-        // (`pyre_object::unicodeobject::w_str_new_from_bytes`, etc.).  No
-        // analyzer needed today: the registry surface is enough to
-        // retire the Skip; the rtyper-side lowering still routes
-        // through the M2.5g extern-Rust-helper walker once that lands.
+        // -> slice constructors. Pyre source writes the `std::` re-export
+        // (`object_array::alloc_list_items_block_gc`); Charon / MIR
+        // lowering emit the canonical `["core", "slice", "raw", _]`
+        // FunctionPath, the same std→core normalisation as `core.ptr`
+        // / `core.mem` above. Bind `core.slice.raw` to the SAME
+        // `std.slice` callables so `std_slice_from_raw_parts` and the
+        // `BUILTIN_TYPER` row see one `HostObject`.
         let std_slice = HostObject::new_module("std.slice");
         std_slice.module_set(
             "from_raw_parts",
@@ -2309,6 +2310,19 @@ impl HostEnv {
         std_slice.module_set(
             "from_raw_parts_mut",
             HostObject::new_builtin_callable("std.slice.from_raw_parts_mut"),
+        );
+        let core_slice_raw = HostObject::new_module("core.slice.raw");
+        core_slice_raw.module_set(
+            "from_raw_parts",
+            std_slice
+                .module_get("from_raw_parts")
+                .expect("std.slice.from_raw_parts bound above"),
+        );
+        core_slice_raw.module_set(
+            "from_raw_parts_mut",
+            std_slice
+                .module_get("from_raw_parts_mut")
+                .expect("std.slice.from_raw_parts_mut bound above"),
         );
 
         // `BigInt::from(v)` callsites in `pyre-object` (longobject /
@@ -2541,8 +2555,8 @@ impl HostEnv {
             HostObject::new_builtin_callable("core.ptr.null_mut"),
         );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
-        // Null `Option<fn>` — `SomePtr(FuncType)`, not `null_mut`'s
-        // classdef-less instance. See `fn_null_constant`.
+        // Null `Option<fn>` — spelled `null_fn` is `s_None`, untyped
+        // stays `SomePtr(FuncType)`. See `fn_null_constant`.
         core_ptr.module_set(
             "null_fn",
             HostObject::new_builtin_callable("core.ptr.null_fn"),
@@ -2877,6 +2891,7 @@ impl HostEnv {
         mods.insert("std.alloc".into(), std_alloc);
         mods.insert("alloc.alloc".into(), alloc_alloc);
         mods.insert("std.slice".into(), std_slice);
+        mods.insert("core.slice.raw".into(), core_slice_raw);
         mods.insert("BigInt".into(), bigint);
         mods.insert("longlong2float".into(), longlong2float);
         mods.insert("majit_metainterp".into(), majit_metainterp);

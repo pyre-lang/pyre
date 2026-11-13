@@ -10247,10 +10247,11 @@ impl FunctionGraph {
         });
     }
 
-    /// Null function pointer for `Option<fn>`'s `None` arm. Annotates as
-    /// `SomePtr(FuncType)` (`fn_null_constant`), the same `ll_ptrtype` as a
-    /// `fn` field read, so the two arms union. A `null_mut()` null is a
-    /// classdef-less `SomeInstance` and does not.
+    /// Null function pointer for `Option<fn>`'s `None` arm. A spelled
+    /// `fn` / `Option<fn>` null annotates as `s_None` (`fn_null_constant`)
+    /// so it noneifies a function-PBC. Untyped `ptr::null_fn()` stays
+    /// `SomePtr(FuncType)`. A `null_mut()` null is a classdef-less
+    /// `SomeInstance`.
     pub fn push_null_fn_ptr(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
         self.push_null_fn_ptr_with_spelling(block, None)
     }
@@ -10267,7 +10268,13 @@ impl FunctionGraph {
     ) -> crate::flowspace::model::Variable {
         let res = self.alloc_value_var();
         let args = match spelling {
-            Some(s) if !s.is_empty() => vec![LinkArg::from(ConstValue::byte_str(s))],
+            Some(s) if !s.is_empty() => {
+                // `fn_null_constant` of a spelling is `s_None`;
+                // `NoneRepr.lowleveltype` is `Void` (`rnone.py`).
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                res.set_concretetype(Some(LowLevelType::Void));
+                vec![LinkArg::from(ConstValue::byte_str(s))]
+            }
             _ => crate::model::call_args(vec![]),
         };
         self.block_mut(block).operations.push(SpaceOperation {
@@ -10373,6 +10380,37 @@ impl FunctionGraph {
             let synthetic = concrete_to_canonical_lltype(ty);
             var.set_concretetype(synthetic);
         }
+    }
+
+    /// Copy a `Ptr(FuncType)` stamp (`stamp_fn_ptr` /
+    /// `FunctionsPBCRepr.lowleveltype`) onto a phi dest. A spelled
+    /// `null_fn` dest is `NoneRepr` Void and is not copied. A phi
+    /// whose annotation is a function PBC (`can_be_None`) keeps this
+    /// pointer; a phi that only receives the spelled null follows
+    /// `s_None` (`Void`).
+    pub(crate) fn copy_fn_ptr_concretetype(
+        src: &crate::flowspace::model::Variable,
+        dst: &crate::flowspace::model::Variable,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let is_fn_ptr = |ty: &LowLevelType| matches!(ty, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Func(_)));
+        let Some(ty) = src.concretetype() else {
+            return;
+        };
+        if !is_fn_ptr(&ty) {
+            return;
+        }
+        if dst.concretetype().as_ref().is_some_and(is_fn_ptr) {
+            return;
+        }
+        dst.set_concretetype(Some(ty));
+    }
+
+    pub(crate) fn lltype_is_fn_ptr(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        matches!(ty, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Func(_)))
     }
 
     /// Walk the startblock-reachable block closure (`iterblocks()`
@@ -11609,7 +11647,17 @@ impl FunctionGraph {
     pub fn set_return(&mut self, block: BlockId, value: Option<crate::flowspace::model::Variable>) {
         let returnblock = self.returnblock;
         let arg = match value {
-            Some(var) => LinkArg::Value(var),
+            Some(var) => {
+                // `FunctionsPBCRepr.lowleveltype` is `Ptr(FuncType)` on
+                // the dest (`history.getkind` `'int'`). The returnblock
+                // inputarg is a distinct phi; without this copy the
+                // skip-path projects `s_None` to `GcRef` and
+                // `func_result_kind` disagrees with `FUNC.RESULT='i'`.
+                if let Some(phi) = self.block(returnblock).inputargs.first().cloned() {
+                    Self::copy_fn_ptr_concretetype(&var, &phi);
+                }
+                LinkArg::Value(var)
+            }
             None => LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
                 ConstValue::None,
                 crate::translator::rtyper::lltypesystem::lltype::VOID,

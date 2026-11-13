@@ -1958,6 +1958,36 @@ impl FunctionDesc {
         self.record_access_directly_graph()
     }
 
+    /// Live `None` cache entry, if `cachedgraph` has already built it.
+    /// Does not lift a pending source graph: a miss means the annotator
+    /// never specialized this desc as the default graph
+    /// (`description.py FunctionDesc.cachedgraph`).
+    pub(crate) fn cached_none_key(&self) -> Option<Rc<PyGraph>> {
+        self.cache.borrow().get(&GraphCacheKey::None).cloned()
+    }
+
+    /// Bind `graph` as this desc's `None` cachedgraph when that key is
+    /// vacant, then return the live cache entry.
+    ///
+    /// A vacant key is the `cachedgraph` miss `default_specialize` would
+    /// take for a regular (non-AccessDirect) graph; installing the
+    /// already-lifted subject body is the native-source stand-in for
+    /// `buildgraph` (`description.py FunctionDesc.cachedgraph`). An
+    /// occupied key is a hit (`pycall` already specialized this desc);
+    /// that entry stays the annotated graph. `access_directly` stays
+    /// false (`specialize.py default_specialize` without AccessDirect).
+    pub(crate) fn record_none_key_graph_from(
+        &self,
+        graph: Rc<PyGraph>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        graph.access_directly.set(false);
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache.entry(GraphCacheKey::None).or_insert(graph);
+        }
+        self.cachedgraph(GraphCacheKey::None, None, None)
+    }
+
     /// `specialize_argtype` cache key for one `args_s[i].knowntype`.
     /// Instance annotations keep `ClassDesc` identity for equality and
     /// `ClassDesc.name` for `cachedgraph` formatting (`description.py`).
@@ -4178,6 +4208,40 @@ mod tests {
         let graph = fd
             .record_access_directly_graph_from(other.clone())
             .expect("AccessDirect cache hit");
+        assert!(Rc::ptr_eq(&graph, &first));
+        assert!(!Rc::ptr_eq(&graph, &other));
+    }
+
+    #[test]
+    fn record_none_key_graph_from_installs_the_provided_graph() {
+        let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
+        let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+        fd.install_source_template(template.clone());
+        let provided = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+
+        let graph = fd
+            .record_none_key_graph_from(provided.clone())
+            .expect("None-key cache install");
+        assert!(Rc::ptr_eq(&graph, &provided));
+        assert!(!graph.access_directly.get());
+        assert!(!Rc::ptr_eq(&graph, &template));
+        let cached = fd.cached_none_key().expect("None-key cache entry");
+        assert!(Rc::ptr_eq(&graph, &cached));
+    }
+
+    #[test]
+    fn record_none_key_graph_from_keeps_an_existing_cache_graph() {
+        let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
+        let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+        fd.install_source_template(template.clone());
+        let first = fd
+            .cachedgraph(GraphCacheKey::None, None, None)
+            .expect("None-key template install");
+        let other = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+
+        let graph = fd
+            .record_none_key_graph_from(other.clone())
+            .expect("None-key cache hit");
         assert!(Rc::ptr_eq(&graph, &first));
         assert!(!Rc::ptr_eq(&graph, &other));
     }

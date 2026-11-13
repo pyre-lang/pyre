@@ -2536,6 +2536,29 @@ fn containing_py_pc_prefers_exact_owner_of_a_late_block() {
 }
 
 #[test]
+fn forward_py_pc_covers_dispatch_loop_head_before_first_opcode_run() {
+    // `interp_jit.py PyFrame.dispatch`: head ops sit before any opcode case.
+    // Exact/pred twins start at the first case; floor pad `(0, 0)` owns the
+    // prefix. A vsd-promote guard's `-live-` in that prefix must still pair
+    // with a Python pc (`resume_position_for_jitcode_pc`).
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (100, 6)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(100, 6)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(100, 6)];
+
+    assert_eq!(
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&pyjit.metadata, 68),
+        0
+    );
+    assert_eq!(
+        pyjit.forward_py_pc_for_jitcode_pc(68),
+        Some(0),
+        "dispatch-head live before the first case must floor to the entry green",
+    );
+    assert_eq!(pyjit.resume_position_for_jitcode_pc(68), Some((68, 0)));
+}
+
+#[test]
 fn exact_vstack_step_uses_depth_of_its_own_python_opcode() {
     let code = pyre_interpreter::compile_exec("answer = f(1)").unwrap();
     let code = Box::into_raw(Box::new(code));
@@ -33564,12 +33587,12 @@ fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
     let goto = crate::jitcode_runtime::decode_op_at(&body, load.next_pc).expect("goto");
     assert_eq!(goto.key, "goto_if_not_ptr_nonzero/rL");
     assert!(
-        exception_string_override_straight_line(&body, &[]),
+        exception_string_override_straight_line(&body, &[], None),
         "LOAD_FAST unbound-local check is dispatch protocol"
     );
     let mismatched = load_fast_unbound_check_body(0x03);
     assert!(
-        !exception_string_override_straight_line(&mismatched, &[]),
+        !exception_string_override_straight_line(&mismatched, &[], None),
         "goto src must be the getarrayitem_vable_r dest"
     );
 }

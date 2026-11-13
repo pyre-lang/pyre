@@ -124,17 +124,15 @@ pub fn compile_source_with_opts(
         ..opts
     };
     let source = universal_newline(source);
-    let flags = crate::lazyimport::collect_lazy_import_flags(&source, filename, mode)?;
+    crate::lazyimport::check_misplaced_lazy_import(&source, filename, mode)?;
     match rp_compile(&source, mode, filename, opts.clone()) {
         Ok(mut code) => {
             crate::pycode::fixup_code_get_iter(&mut code);
-            crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
             Ok(code)
         }
         Err(error) => retry_named_escape_parse(&source, error, |rewritten| {
             rp_compile(rewritten, mode, filename, opts).map(|mut code| {
                 crate::pycode::fixup_code_get_iter(&mut code);
-                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
                 code
             })
         }),

@@ -5378,11 +5378,11 @@ pub fn step<Sym: WalkSym>(
     // Per-CodeObject portal JitCodes whose drained body does not carry
     // `interp_jit.py PyFrame.dispatch`'s `jit_merge_point` still need
     // `MIFrame.debug_merge_point` at the Python-opcode emission boundary.
-    // True-portal jitcode now emits that marker at every instruction start
-    // (the `get_is_being_profiled` diamond sits in front of it), and
-    // `record_python_debug_merge_point` skips a green whose remaining floor
-    // segment still contains `jit_merge_point` so the handler below records
-    // the one marker `opimpl_jit_merge_point` does.
+    // A non-generator body emits that marker once at the dispatch-loop
+    // head; `record_python_debug_merge_point` skips a floor that still
+    // contains `jit_merge_point`, or a shared-head dispatch whose merge
+    // sits outside the case floor, so the handler below records the one
+    // marker `opimpl_jit_merge_point` does.
     // `-live-` is codewriter resume metadata, not an interpreter opcode.
     // Consume it first so the marker on the following real op captures this
     // opcode's own live anchor rather than the preceding one's.
@@ -11131,6 +11131,13 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     if jit_merge_point_ahead(code, jit_pc, floor_end) {
         return Ok(None);
     }
+    // Shared loop head: the merge is not in this opcode's floor, so the
+    // scan above misses it. A synthesized DMP would `maybe_segment_python_merge`
+    // on `force_finish` before the walk gotos the head, where
+    // `has_compiled_targets` can still JUMP (`reached_loop_header`).
+    if active.0.metadata.has_shared_dispatch_merge() {
+        return Ok(None);
+    }
     {
         let mut session = ctx.session.borrow_mut();
         note_debug_merge_point_py_pc(&mut session, py_pc);
@@ -15149,6 +15156,28 @@ fn record_synthetic_debug_merge_point<Sym: WalkSym>(
         .record_op(OpCode::DebugMergePoint, &debug_args);
 }
 
+/// `has_compiled_targets(get_procedure_token(greenkey))` (`pyjitpl.py`)
+/// for the portal greens of this merge visit.
+fn green_has_compiled_targets<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code_green: OpRef,
+    next_instr: usize,
+    is_being_profiled: bool,
+) -> bool {
+    let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
+        Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
+        _ => match top_level_live_code(ctx) {
+            Some(ptr) => ptr,
+            None => return false,
+        },
+    };
+    let key = crate::driver::make_green_key(code_ptr, next_instr, is_being_profiled);
+    ctx.trace_ctx
+        .has_compiled_targets_fn
+        .as_ref()
+        .is_some_and(|has_targets| has_targets(key))
+}
+
 /// `_create_segmented_trace_and_blackhole` at a synthesized Python opcode
 /// boundary. Top-level only, and only once `last_exc_value` is clear: the
 /// segmented-trace handoff has no blackhole frame to preserve that slot.
@@ -15166,6 +15195,19 @@ fn maybe_segment_python_merge<Sym: WalkSym>(
         && ctx.trace_ctx.force_finish_trace()
         && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
     {
+        // A green with compiled targets still JUMPs (`reached_loop_header`).
+        if let Some(code_ptr) = top_level_live_code(ctx) {
+            let key =
+                crate::driver::make_green_key(code_ptr, py_pc, live_frame_is_being_profiled(ctx));
+            if ctx
+                .trace_ctx
+                .has_compiled_targets_fn
+                .as_ref()
+                .is_some_and(|has_targets| has_targets(key))
+            {
+                return Ok(None);
+            }
+        }
         create_segmented_trace(ctx, jit_pc, py_pc, true)
     } else {
         Ok(None)
@@ -18283,6 +18325,7 @@ fn handle<Sym: WalkSym>(
             if ctx.is_top_level
                 && ctx.trace_ctx.force_finish_trace()
                 && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
+                && !green_has_compiled_targets(ctx, code_green, next_instr, is_being_profiled)
             {
                 if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr, false)? {
                     return Ok((outcome, op.next_pc));

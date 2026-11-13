@@ -13581,7 +13581,7 @@ mod tests {
                             "size": 16,
                             "align": 8,
                             "variant_layouts": [{"field_offsets": [0, 8]}],
-                            "repr": {"transparent": false}
+                            "repr": {"repr_algo": "C", "transparent": false}
                         }
                     }]
                 }],
@@ -13853,7 +13853,7 @@ mod tests {
                                 {"field_offsets": []},
                                 {"field_offsets": [8, 12]}
                             ],
-                            "repr": {"transparent": false}
+                            "repr": {"repr_algo": "C", "transparent": false}
                         }
                     }]
                 }],
@@ -14174,7 +14174,7 @@ mod tests {
                                 {"field_offsets": [0]},
                                 {"field_offsets": []}
                             ],
-                            "repr": {"transparent": false}
+                            "repr": {"repr_algo": "C", "transparent": false}
                         }
                     }]
                 }],

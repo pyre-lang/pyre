@@ -9698,8 +9698,20 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .is_some_and(|result| field_read_result_has_value_use(graph, result));
         // One variable, two uses: the copy keeps the loaded word and the
-        // later field read gets its own interior address.
+        // later field read gets its own interior address. Offset 0 of a
+        // one-word FLAG_STRUCT is a transparent payload load: the interior
+        // address is the container, which is not the payload.
+        // `rewrite_raw_substruct_address` of offset 0 aliases a fresh
+        // Variable to `cast_ptr_to_int` of the container and never makes
+        // that Variable an `op.result`. Retargeting the later FieldRead
+        // onto it leaves a used-never-defined base that `ssa_to_ssi`
+        // skips (`regalloc.py` `make_dependencies` colors only
+        // `inputargs` / `op.result`). `InstanceRepr.getfield` emits
+        // `cast_pointer` as an `op.result` in the using block; the
+        // loaded word is already that defined value and is what
+        // `ssa_to_ssi` threads through a later block.
         if let Some(offset) = word_offset
+            && offset != 0
             && later_base
             && value_use
             && !field.taken_by_address
@@ -20364,6 +20376,237 @@ mod tests {
             )),
             "a GC holder keeps the by-value read; ops={gc_ops:?}"
         );
+    }
+
+    /// A GC handle lives in a MutRef cell for a `&mut self` call on one
+    /// arm; a later block reached through a join reads a field of the
+    /// payload by address. The mixed later_base+value_use rewrite of
+    /// `MutRef.value` (one-word FLAG_STRUCT at offset 0) used to retarget
+    /// that FieldRead onto a Variable that
+    /// `rewrite_raw_substruct_address` never made an `op.result`.
+    /// `InstanceRepr.getfield` emits `cast_pointer` as an `op.result` in
+    /// the using block; the copy-out is already that defined word.
+    #[test]
+    fn mut_ref_copy_out_join_field_read_base_is_defined() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::flatten::RegKind;
+        use crate::model::FieldDescriptor;
+
+        let cell_owner = "cell_join::Cell";
+        let handle_owner = "cell_join::Handle";
+        let cell_id = majit_ir::descr::StructId::from_canonical(cell_owner);
+        let handle_id = majit_ir::descr::StructId::from_canonical(handle_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (cell_owner.to_string(), Some(cell_id)),
+                (handle_owner.to_string(), Some(handle_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            cell_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "value".into(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            handle_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![StructFieldLayout {
+                    name: "kind".into(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(cell_owner)]);
+
+        let mut graph = FunctionGraph::new("mut_ref_copy_out_join");
+        let cell = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "cell".into(),
+                    ty: ValueType::Ref(Some(cell_owner.into())),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&cell, ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, cell.clone());
+        let cond = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&cond, ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, cond.clone());
+        let copy = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: cell,
+                    field: FieldDescriptor::new("value", Some(cell_owner.into())),
+                    ty: ValueType::Ref(Some(handle_owner.into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&copy, ConcreteType::GcRef);
+
+        let (join, join_args) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&join_args[0], ConcreteType::GcRef);
+        let (other, other_args) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&other_args[0], ConcreteType::GcRef);
+        graph.set_branch(
+            graph.startblock,
+            cond,
+            join,
+            vec![copy.clone()],
+            other,
+            vec![copy.clone()],
+        );
+        let kind = graph
+            .push_op_var(
+                join,
+                OpKind::FieldRead {
+                    base: copy.clone(),
+                    field: FieldDescriptor::new("kind", Some(handle_owner.into()))
+                        .with_taken_by_address(true)
+                        .with_base_is_deref(true)
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&kind, ConcreteType::Signed);
+        graph.set_return(join, Some(join_args[0].clone()));
+        graph.set_return(other, Some(other_args[0].clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+
+        fn graph_defines(graph: &FunctionGraph, var: &crate::flowspace::model::Variable) -> bool {
+            graph.blocks.iter().any(|block| {
+                block.inputargs.contains(var)
+                    || block
+                        .operations
+                        .iter()
+                        .any(|op| op.result.as_ref() == Some(var))
+            })
+        }
+        fn assert_op_operands_graph_defined(graph: &FunctionGraph) {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    for operand in crate::inline::op_variable_refs(&op.kind) {
+                        assert!(
+                            graph_defines(graph, &operand),
+                            "operand {operand:?} is never an inputarg or op.result; op={:?}",
+                            op.kind
+                        );
+                    }
+                }
+            }
+        }
+        fn assert_op_operands_block_defined(graph: &FunctionGraph) {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    for operand in crate::inline::op_variable_refs(&op.kind) {
+                        assert!(
+                            graph.variable_defined_in_block(block.id, &operand),
+                            "operand {operand:?} is not defined in {:?}; op={:?}",
+                            block.id,
+                            op.kind
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_op_operands_graph_defined(&graph);
+        let kind_base_after_transform = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. } if field.name == "kind" => Some(base.clone()),
+                _ => None,
+            })
+            .expect("payload kind FieldRead remains");
+        assert!(
+            graph_defines(&graph, &kind_base_after_transform),
+            "kind FieldRead base must be a defined SSA value; base={kind_base_after_transform:?}"
+        );
+
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::model_ssa::ssa_to_ssi(&mut graph);
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        assert_op_operands_block_defined(&graph);
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let kind_base = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. } if field.name == "kind" => Some(base.clone()),
+                _ => None,
+            })
+            .expect("payload kind FieldRead remains after SSI");
+        assert!(
+            graph.blocks.iter().any(|block| {
+                graph.variable_defined_in_block(block.id, &kind_base)
+                    && block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { base, field, .. }
+                                if base == &kind_base && field.name == "kind"
+                        )
+                    })
+            }),
+            "ssa_to_ssi must thread the kind FieldRead base; base={kind_base:?}"
+        );
+        assert!(
+            regallocs[&RegKind::Ref].coloring.contains_key(&kind_base)
+                || regallocs[&RegKind::Int].coloring.contains_key(&kind_base),
+            "liveness must assign the kind FieldRead base a register; base={kind_base:?}"
+        );
+        let _ = crate::flatten::flatten_graph(&graph, &mut regallocs);
     }
 
     /// `(*p).inner.x` on a raw `&mut S`. `rewrite_op_getsubstruct` is
@@ -35123,59 +35366,114 @@ mod tests {
         }
     }
 
-    /// `lltype.nullptr(FUNC)` is a Constant (`rtype_const_result`).
-    /// `specialize_block` rewrites the hop; publication copies that
-    /// Constant onto the FunctionGraph as Signed 0 (`history.getkind`
-    /// of `Ptr(FuncType)` is `'int'`).
+    /// Untyped `ptr::null_fn()` is `ann_nullptr` / `SomePtr`
+    /// (`lltype.ann_nullptr`). `rtype_const_result` folds it to
+    /// `nullptr(FUNC)`; `history.getkind` of `Ptr(FuncType)` is `'int'`,
+    /// so publication is Signed 0.
     #[test]
-    fn ptr_null_fn_builtin_rewrites_to_int_constant_zero() {
+    fn ptr_null_fn_untyped_rewrites_to_int_constant_zero() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_fn_untyped");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+        graph.set_return(entry, Some(result_var.clone()));
+        apply_rtyper_const_results_match(&mut graph);
+
+        let result = transform_graph(&graph, &config);
+        let folded = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("null_fn result must survive as a constant definition");
+        assert!(
+            matches!(folded.kind, OpKind::ConstInt(0)),
+            "untyped null_fn stayed {:?}",
+            folded.kind
+        );
+        assert!(
+            !result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| is_null_fn_call_kind(&op.kind)),
+            "null_fn Call must not survive"
+        );
+    }
+
+    /// Isolated spelled `null_fn("fn() -> i64")` is `s_None` /
+    /// `NoneRepr` Void (`rnone.py`). Publication is `ConstNone`;
+    /// `jtransform` erases Void (`flatten.py` drops Void).
+    #[test]
+    fn ptr_null_fn_spelled_isolated_is_const_none_erased_by_jtransform() {
         use crate::flowspace::model::ConstValue;
 
-        for args in [
-            crate::model::call_args(vec![]),
-            vec![LinkArg::from(ConstValue::byte_str("fn() -> i64"))],
-        ] {
-            let config = GraphTransformConfig::default();
-            let mut graph = FunctionGraph::new("ptr_null_fn_constant");
-            let entry = graph.startblock;
-            let result_var = graph
-                .push_op_var(
-                    entry,
-                    OpKind::Call {
-                        target: CallTarget::function_path(["core", "ptr", "null_fn"]),
-                        args,
-                        result_ty: ValueType::Int,
-                    },
-                    true,
-                )
-                .unwrap();
-            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
-            graph.set_return(entry, Some(result_var.clone()));
-            apply_rtyper_const_results_match(&mut graph);
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_fn_spelled");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: vec![LinkArg::from(ConstValue::byte_str("fn() -> i64"))],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+        graph.set_return(entry, Some(result_var.clone()));
+        apply_rtyper_const_results_match(&mut graph);
 
-            let result = transform_graph(&graph, &config);
-            let folded = result
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Void
+        );
+        let folded = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var));
+        assert!(
+            folded.is_some_and(|op| matches!(op.kind, OpKind::ConstNone)),
+            "isolated spelled null_fn is NoneRepr Void, got {:?}",
+            folded.map(|op| &op.kind),
+        );
+
+        let result = transform_graph(&graph, &config);
+        assert!(
+            !result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| is_null_fn_call_kind(&op.kind)),
+            "null_fn Call must not survive"
+        );
+        assert!(
+            result
                 .graph
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
                 .find(|op| op.result.as_ref() == Some(&result_var))
-                .expect("null_fn result must survive as a constant definition");
-            assert!(
-                matches!(folded.kind, OpKind::ConstInt(0)),
-                "null_fn stayed {:?}",
-                folded.kind
-            );
-            assert!(
-                !result
-                    .graph
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.operations)
-                    .any(|op| is_null_fn_call_kind(&op.kind)),
-                "null_fn Call must not survive"
-            );
-        }
+                .is_none(),
+            "jtransform erases ConstNone Void (flatten drops Void)",
+        );
     }
 
     /// Generated `Option<fn>::is_some` (`push_niche_is_some` /
@@ -35189,7 +35487,10 @@ mod tests {
             let config = GraphTransformConfig::default();
             let mut graph = FunctionGraph::new("is_some__spec_fn");
             let entry = graph.startblock;
-            let class_root = spelling.clone().or_else(|| Some("fn".into()));
+            let class_root = Some(match spelling.as_deref() {
+                Some(s) => format!("Option<{s}>"),
+                None => "Option<fn>".to_string(),
+            });
             let opt = graph
                 .push_op_var(
                     entry,
@@ -35206,7 +35507,9 @@ mod tests {
             graph.push_niche_is_some(
                 entry,
                 opt.clone(),
-                Some(&NicheIntNull::FnPtr(spelling.clone())),
+                Some(&NicheIntNull::FnPtr(Some(
+                    spelling.clone().unwrap_or_else(|| "fn".into()),
+                ))),
                 None,
                 result_var.clone(),
             );
@@ -35234,9 +35537,13 @@ mod tests {
                 !kinds.iter().any(|kind| is_null_fn_call_kind(kind)),
                 "spelling {spelling:?}: null_fn Call survived {kinds:?}"
             );
+            // Isolated `Option<fn>` Input is `s_None`; `is_` of two
+            // constant Nones can fold to `ConstBool`. A live
+            // `SomePBC(can_be_None)` field keeps `int_is_zero`.
             assert!(
-                kinds.iter().any(|kind| op_is_int_zero_test(kind)),
-                "spelling {spelling:?}: expected int_eq/int_ne/int_is_zero/int_is_true against 0, got {kinds:?}"
+                kinds.iter().any(|kind| op_is_int_zero_test(kind)
+                    || matches!(kind, OpKind::ConstBool(_) | OpKind::ConstInt(0))),
+                "spelling {spelling:?}: expected int_eq/int_ne/int_is_zero/int_is_true against 0 or a folded constant, got {kinds:?}"
             );
         }
     }

@@ -27,7 +27,7 @@
   },
   "linux": {
     "base": "b1e01cf4a6085e81f8d685dee7a769ab170100b4",
-    "brackets_reaching_no_collection": 130,
+    "brackets_reaching_no_collection": 131,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,

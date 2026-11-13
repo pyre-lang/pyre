@@ -46,17 +46,27 @@
 //!
 //! ## Payload representation
 //!
-//! `get` returns `Option<&T>`, but the `Some` payload is materialised by
-//! `OpKind::ArrayRead`, which yields the element VALUE, not a pointer-to-slot.
-//! In the list model a `&T` and a `T` use the same item register — a GC pointer
-//! for object items and the scalar bank for `u8`/`i64` items — and no consumer
-//! derefs a slot-pointer.  The site's payload type therefore comes from the
-//! destination `Option` consumer shape rather than being hard-coded to a
-//! reference.  The receiver is a `SomeList`-modelled slice (its
-//! `Input` op carries the list-container `class_root`), so `__len` and the
-//! element read repr-dispatch to `arraylen_gc` / `getarrayitem` on the
-//! underlying length-prefixed GcArray.  A primitive `&T` payload needs no
-//! class narrowing: the rewrite's bare-call arm carries the element's scalar
+//! `get` returns `Option<&T>`. For a scalar or thin-pointer `T` the `Some`
+//! payload is materialised by `OpKind::ArrayRead`, which yields the element
+//! VALUE, not a pointer-to-slot. In the list model a `&T` and a `T` use the
+//! same item register — a GC pointer for object items and the scalar bank
+//! for `u8`/`i64` items — and no consumer derefs a slot-pointer.
+//!
+//! A packed Copy C-repr struct (`CodeUnit`, two scalar/fieldless fields)
+//! cannot use that collapse: `Option<&T>` is a pointer niche, `None` is
+//! null, and the continuation FieldReads `.op` through the unwrapped
+//! pointer. Copying `T` as a `u16` would mix the value bank with that
+//! null. The Some arm therefore emits the element ADDRESS
+//! (`base + i * size_of::<T>()`); [`SliceGetSite::payload_is_element_addr`]
+//! is that flag.
+//!
+//! The site's payload type therefore comes from the destination `Option`
+//! consumer shape rather than being hard-coded to a reference.  The
+//! receiver is a `SomeList`-modelled slice (its `Input` op carries the
+//! list-container `class_root`), so `__len` and the element read
+//! repr-dispatch to `arraylen_gc` / `getarrayitem` on the underlying
+//! length-prefixed GcArray.  A primitive `&T` payload needs no class
+//! narrowing: the rewrite's bare-call arm carries the element's scalar
 //! [`ValueType`] directly.
 //!
 //! ## The rewrite (`rewire_one_slice_get_site`)
@@ -260,6 +270,26 @@ pub(crate) struct SliceGetSite {
     /// `<[*mut PyObject]>::get` returns `Option<&PyObjectRef>`: the successful
     /// list item and the null arm must both retain the `PyObject` ClassDef.
     pub payload_narrow_root: Option<String>,
+    /// True when `Option<&T>`'s Some payload is the ADDRESS of packed
+    /// Copy C-repr struct element `T` (itemsize [`Self::element_byte_size`]),
+    /// not an `ArrayRead` of `T`. `None` is the typed null of the
+    /// pointer niche. Field reads of `T` go through that address.
+    pub payload_is_element_addr: bool,
+    /// Byte size of `T` when [`Self::payload_is_element_addr`]. 0 otherwise.
+    pub element_byte_size: usize,
+}
+
+/// ARRAY identity used only to name the packed struct's stride. The
+/// rewriter does not `ArrayRead` that identity; it emits
+/// `base + i * size`.
+pub(crate) fn packed_copy_array_type_id(size: usize) -> Option<String> {
+    match size {
+        1 => Some("[u8]".into()),
+        2 => Some("[u16]".into()),
+        4 => Some("[u32]".into()),
+        8 => Some("[u64]".into()),
+        _ => None,
+    }
 }
 
 /// Rewrite every recorded `<[T]>::get` call site into the bounds-checked
@@ -413,27 +443,45 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         .ok_or_else(|| format!("{name}: slice not threaded into Some arm"))?;
     let index_in_then = map_source(&then_sources, &then_inputs, &index)
         .ok_or_else(|| format!("{name}: index not threaded into Some arm"))?;
-    let elem = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(elem.clone()),
-        kind: OpKind::ArrayRead {
-            base: slice_in_then,
-            // The element read and the `Some::__pos_0` field write below
-            // consume the same `elem`, so the read's declared element type
-            // must be the value type the devirtualized `T` carries
-            // (`site.payload_ty`, `Ref(None)` for a GC-pointer element) — a
-            // hardcoded `Ref(None)` would disagree for scalar elements.
-            item_ty: site.payload_ty.clone(),
-            index: index_in_then,
-            array_type_id: site.array_type_id.clone(),
-            array: None,
-            nolength: crate::front::typestr::nolength_from_array_type_id(
-                site.array_type_id.as_deref(),
-            ),
-            gckind: crate::front::typestr::gckind_from_array_type_id(site.array_type_id.as_deref()),
-            pure: false,
-        },
-    });
+    let elem = if site.payload_is_element_addr {
+        if !matches!(site.element_byte_size, 1 | 2 | 4 | 8) {
+            return Err(format!(
+                "{name}: packed slice::get has no element byte size"
+            ));
+        }
+        emit_packed_element_addr(
+            graph,
+            then_bb,
+            slice_in_then,
+            index_in_then,
+            site.element_byte_size,
+        )
+    } else {
+        let elem = graph.alloc_value_var();
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: Some(elem.clone()),
+            kind: OpKind::ArrayRead {
+                base: slice_in_then,
+                // The element read and the `Some::__pos_0` field write below
+                // consume the same `elem`, so the read's declared element type
+                // must be the value type the devirtualized `T` carries
+                // (`site.payload_ty`, `Ref(None)` for a GC-pointer element) — a
+                // hardcoded `Ref(None)` would disagree for scalar elements.
+                item_ty: site.payload_ty.clone(),
+                index: index_in_then,
+                array_type_id: site.array_type_id.clone(),
+                array: None,
+                nolength: crate::front::typestr::nolength_from_array_type_id(
+                    site.array_type_id.as_deref(),
+                ),
+                gckind: crate::front::typestr::gckind_from_array_type_id(
+                    site.array_type_id.as_deref(),
+                ),
+                pure: false,
+            },
+        });
+        elem
+    };
     let then_result = if site.niche {
         emit_narrow(graph, then_bb, elem, &site.payload_narrow_root)
     } else {
@@ -515,6 +563,41 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
     Ok(())
 }
 
+fn emit_packed_element_addr(
+    graph: &mut FunctionGraph,
+    then_bb: crate::model::BlockId,
+    slice: Variable,
+    index: Variable,
+    itemsize: usize,
+) -> Variable {
+    let size = graph.alloc_value_var();
+    graph.block_mut(then_bb).operations.push(SpaceOperation {
+        result: Some(size.clone()),
+        kind: OpKind::ConstInt(itemsize as i64),
+    });
+    let offset = graph.alloc_value_var();
+    graph.block_mut(then_bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::BinOp {
+            op: "mul".to_string(),
+            lhs: index,
+            rhs: size,
+            result_ty: ValueType::Int,
+        },
+    });
+    let addr = graph.alloc_value_var();
+    graph.block_mut(then_bb).operations.push(SpaceOperation {
+        result: Some(addr.clone()),
+        kind: OpKind::BinOp {
+            op: "add".to_string(),
+            lhs: slice,
+            rhs: offset,
+            result_ty: ValueType::Int,
+        },
+    });
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +613,8 @@ mod tests {
             niche: false,
             niche_null_cast: None,
             payload_narrow_root: None,
+            payload_is_element_addr: false,
+            element_byte_size: 0,
         }
     }
 
@@ -968,12 +1053,91 @@ mod tests {
         );
     }
 
+    /// Packed Copy C-repr `T` (`CodeUnit`, itemsize 2): `Option<&T>` is a
+    /// pointer niche. The Some arm is `base + i * 2`, not an `ArrayRead`
+    /// of a `u16` that would mix the value bank with the null None.
+    #[test]
+    fn rewrite_packed_struct_get_emits_element_address() {
+        let mut g = FunctionGraph::new("test_slice_get_packed");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let opt = emit_call(&mut g, a, vec![slice, index]);
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = slice_get_site(opt);
+        site.niche = true;
+        site.payload_ty = ValueType::Int;
+        site.payload_is_element_addr = true;
+        site.element_byte_size = 2;
+        site.payload_narrow_root = None;
+        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 1);
+        assert!(
+            !residual_get_survives(&g, a),
+            "residual get call removed from A"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "packed get must not copy the struct as an array item"
+        );
+        let binops: Vec<&str> = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.contains(&"mul") && binops.contains(&"add"),
+            "Some arm is base + i * itemsize; binops={binops:?}"
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ConstInt(2))),
+            "itemsize 2 is a constant"
+        );
+        assert_eq!(packed_copy_array_type_id(2).as_deref(), Some("[u16]"));
+        assert_eq!(packed_copy_array_type_id(3), None);
+    }
+
+    /// A packed site with no itemsize declines (fail-safe).
+    #[test]
+    fn rewrite_packed_struct_get_declines_without_itemsize() {
+        let mut g = FunctionGraph::new("test_slice_get_packed_decline");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let opt = emit_call(&mut g, a, vec![slice, index]);
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = slice_get_site(opt);
+        site.payload_is_element_addr = true;
+        site.element_byte_size = 0;
+        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 0);
+        assert!(
+            residual_get_survives(&g, a),
+            "residual call survives on decline"
+        );
+    }
+
     /// `get_mut` of a scalar spelling is not recorded: `ArrayRead` would copy
     /// the integer and a write through `&mut T` would miss the slot.
     /// `portal_diag_bump`'s `[AtomicU64]::get` and `RDict` `Option<Entry>`
     /// never produce a proof at all (`slice_get_element` is scalar /
-    /// thin-pointer only), so they stay residual even though the callee
-    /// spelling is `core::slice::<Impl>::get`.
+    /// thin-pointer only; packed Copy rejects interior mutability), so they
+    /// stay residual even though the callee spelling is
+    /// `core::slice::<Impl>::get`.
     #[test]
     fn get_mut_scalar_and_aggregate_elements_stay_unrecorded() {
         let u8_id = "[u8]".to_string();

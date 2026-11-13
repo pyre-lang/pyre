@@ -519,7 +519,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.ptr", "null_mut", rtype_ptr_null),
         ("core.ptr", "null", rtype_ptr_null),
         ("std.ptr", "null", rtype_ptr_null),
-        // Null `Option<fn>` — `SomePtr(FuncType)`, `lltype.nullptr`.
+        // Null `Option<fn>` — spelled `s_None`; untyped `SomePtr(FuncType)`.
         ("core.ptr", "null_fn", rtype_null_fn),
         // Raw-address niche `None` — `lltype.nullptr(T)` or `llmemory.NULL`.
         ("core.ptr", "null_raw", rtype_null_raw),
@@ -537,6 +537,10 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.alloc", "alloc_zeroed", rtype_std_alloc_zeroed),
         ("alloc.alloc", "alloc", rtype_std_alloc),
         ("alloc.alloc", "alloc_zeroed", rtype_std_alloc_zeroed),
+        // `std::slice::from_raw_parts{,_mut}` — Charon
+        // `core::slice::raw` shares the HOST_ENV callable.
+        ("std.slice", "from_raw_parts", rtype_from_raw_parts),
+        ("std.slice", "from_raw_parts_mut", rtype_from_raw_parts),
         // `pyre_object::lltype::malloc_raw` — raw (non-GC) typed alloc.
         // The GC sibling `malloc_typed` is fused into `NewWithVtable` by
         // the front-end and never reaches `findbltintyper`; the raw path
@@ -2462,6 +2466,24 @@ fn rtype_std_alloc_raw(
     vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
 
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
+/// `std::slice::from_raw_parts{,_mut}(p, n)` — the data word is `p`.
+/// `EntryNonConstant.specialize_call` (`rlib/nonconst.py`) identity:
+/// `hop.inputarg(hop.r_result, arg=0)`. The length is a window
+/// companion or a residual consumer's operand, not this result.
+fn rtype_from_raw_parts(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    let r_result = {
+        let borrow = hop.r_result.borrow();
+        borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_from_raw_parts: r_result missing".to_string())
+            })?
+            .clone()
+    };
+    hop.exception_cannot_occur()?;
+    Ok(Some(hop.inputarg(&r_result, 0)?))
 }
 
 /// RPython `@typer_for(hasattr) def rtype_builtin_hasattr(hop)`
@@ -5193,11 +5215,13 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
 }
 
 /// `core.ptr.null_fn` — `lltype.nullptr(FuncType)` (`rptr.py`
-/// `PtrRepr` over a function type). The annotation is `SomePtr`, so the
-/// null is an `LLPtr` of the result's function type rather than
-/// `convert_const(None)` on an `InstanceRepr`. A constant spelling
-/// argument is consumed at annotation (`fn_null_constant`); `r_result`
-/// already carries that `FuncType`.
+/// `PtrRepr` over a function type). Untyped `ptr::null_fn()` annotates
+/// `SomePtr`; a spelled `fn` / `Option<fn>` null is `s_None`
+/// (`fn_null_constant`). A constant spelling argument is consumed at
+/// annotation; `r_result` already carries that `FuncType` when the
+/// annotation is `SomePtr`. Isolated `s_None` is `NoneRepr` Void;
+/// `stamp_fn_ptr` stays on the dest (`setconcretetype` /
+/// `translate_hl_to_ll`).
 ///
 /// `ann_nullptr` is `immutablevalue`, so a constant annotation folds
 /// through `rbuiltin.py` `rtype_const_result`. `history.getkind` of
@@ -6795,6 +6819,33 @@ mod tests {
             lookup_typer(&std_host).is_some(),
             "BUILTIN_TYPER missing std.ptr.write"
         );
+    }
+
+    #[test]
+    fn from_raw_parts_typer_is_shared_by_core_slice_raw_and_std_slice() {
+        for attr in ["from_raw_parts", "from_raw_parts_mut"] {
+            let std_host = HOST_ENV
+                .import_module("std.slice")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing std.slice.{attr}"));
+            let core_host = HOST_ENV
+                .import_module("core.slice.raw")
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing core.slice.raw.{attr}"));
+            assert_eq!(
+                std_host, core_host,
+                "core.slice.raw.{attr} must be the std.slice HostObject"
+            );
+            assert_eq!(std_host.qualname(), format!("std.slice.{attr}"));
+            assert!(
+                lookup_typer(&std_host).is_some(),
+                "BUILTIN_TYPER missing std.slice.{attr}"
+            );
+            assert!(
+                lookup_typer(&core_host).is_some(),
+                "the shared HostObject must carry the typer"
+            );
+        }
     }
 
     #[test]

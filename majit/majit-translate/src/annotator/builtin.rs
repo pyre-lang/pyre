@@ -405,6 +405,19 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // qualname covers both spellings.
     analyzer_for(&mut reg, "std.alloc.alloc", std_alloc_raw);
     analyzer_for(&mut reg, "std.alloc.alloc_zeroed", std_alloc_raw);
+    // `std::slice::from_raw_parts{,_mut}` — Charon spells
+    // `core::slice::raw::from_raw_parts{,_mut}`. `flowspace/model.rs`
+    // shares one HostObject, so this qualname covers both.
+    analyzer_for(
+        &mut reg,
+        "std.slice.from_raw_parts",
+        std_slice_from_raw_parts,
+    );
+    analyzer_for(
+        &mut reg,
+        "std.slice.from_raw_parts_mut",
+        std_slice_from_raw_parts,
+    );
     // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
     // pointer constant (also the value of
     // `pyre_object::pyobject::PY_NULL`, whose HOST_ENV attr binds to
@@ -416,9 +429,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "core.ptr.null", ptr_null_constant);
     analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
     // `Option<fn>`'s null niche. A GC pointer's null is
-    // `ptr_null_constant` (classdef-less only when unspelled); a raw
-    // function pointer's null is `SomePtr(FuncType)` (`fn_null_constant`),
-    // the same `ll_ptrtype` as the matching `fn` value so the two arms union.
+    // `ptr_null_constant` (classdef-less only when unspelled); a spelled
+    // `fn` / `Option<fn>` null is `s_None` (`fn_null_constant`) so it
+    // noneifies a function-PBC. Untyped `ptr::null_fn()` stays
+    // `SomePtr(FuncType)`.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
     // Raw-address niche `None` (`Option<&Raw>`, `Option<NonNull<Raw>>`).
     // A spelled class root is `lltype.nullptr(T)` (`SomePtr` of that raw
@@ -1814,6 +1828,28 @@ fn std_alloc_raw(
     Ok(raw_alloc_ptr_somevalue())
 }
 
+/// Analyzer for `std::slice::from_raw_parts{,_mut}(p, n)`.
+///
+/// The data word of the slice is `p` (`ann_direct_ptradd` returns
+/// `s_p`). A leftover residual of a pointer-slice view
+/// (`alloc_list_items_block_gc`) keeps that Call; the length rides
+/// the residual consumer (`shadow_stack_copy_range`) or a window
+/// companion, not this result.
+fn std_slice_from_raw_parts(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "std.slice.from_raw_parts expects (ptr, len)",
+        ));
+    }
+    let s_p = arg_at(args_s, 0, "std.slice.from_raw_parts").clone();
+    let _ = arg_at(args_s, 1, "std.slice.from_raw_parts");
+    Ok(s_p)
+}
+
 /// `None` of an instance class: `s_None ∪ SomeInstance(cd)` is
 /// `SomeInstance(cd, can_be_None=True)` (`model.py`), and `rclass.py`
 /// `InstanceRepr.convert_const(None)` is its `nullptr`. A front end that
@@ -1859,17 +1895,12 @@ fn ptr_null_constant(
     }
 }
 
-/// Null `Option<fn>` — `lltype.nullptr(FuncType)` as `SomePtr`, not the
-/// `SomeInstance` that `ptr_null_constant` returns for a GC pointer
-/// (classdef-less only when unspelled). `llannotation.py`
-/// `pairtype(SomePtr, SomePtr).union` requires the same `ll_ptrtype` as
-/// the function-pointer field read.
-/// An optional constant spelling is the FUNC type `lltype.nullptr` takes
-/// (`getfunctionptr`); without it the coarse empty `FuncType` is used.
-///
-/// `ann_nullptr` returns `immutablevalue(nullptr(T.const))`, so the
-/// annotation is a constant; `rbuiltin.py` `rtype_const_result` then
-/// emits that nullptr as a Constant.
+/// Null `Option<fn>` / spelled `fn`. A spelled `fn` / `Option<fn>`
+/// null is `s_None` so it unions with a function-PBC via
+/// `SomePBC.noneify` (`binaryop.py` `pairtype(SomeObject, SomeNone)`).
+/// Untyped `ptr::null_fn()` (no spelling) and a raw rffi
+/// `nullptr(FuncType)` that never meets a PBC stay `SomePtr`
+/// (`ann_nullptr` `immutablevalue(nullptr(T))`).
 pub(crate) fn fn_null_constant(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1878,8 +1909,12 @@ pub(crate) fn fn_null_constant(
     if !kwds.is_empty() {
         return Err(AnnotatorError::new("ptr::null_fn() takes no keywords"));
     }
-    let mut s = match args_s {
-        [] => super::bookkeeper::raw_fn_ptr_somevalue(),
+    match args_s {
+        [] => {
+            let mut s = super::bookkeeper::raw_fn_ptr_somevalue();
+            stamp_fn_null_const(&mut s);
+            Ok(s)
+        }
         [Some(s_ty)] => {
             let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
                 return Err(AnnotatorError::new(
@@ -1892,16 +1927,13 @@ pub(crate) fn fn_null_constant(
                         "ptr::null_fn() type argument is not a function pointer: {spelling}"
                     ))
                 },
-            )?
+            )?;
+            Ok(super::model::s_none())
         }
-        _ => {
-            return Err(AnnotatorError::new(
-                "ptr::null_fn() takes an optional function-pointer type argument",
-            ));
-        }
-    };
-    stamp_fn_null_const(&mut s);
-    Ok(s)
+        _ => Err(AnnotatorError::new(
+            "ptr::null_fn() takes an optional function-pointer type argument",
+        )),
+    }
 }
 
 /// `ann_nullptr`: `immutablevalue(nullptr(T))` on the `SomePtr`.
@@ -2359,9 +2391,22 @@ fn cast_instance_intrinsic(
     // `SomeList` carries no `can_be_None` — upstream's does not either — so
     // the nullability computed above has nowhere to land on this arm; a null
     // operand is still admitted rather than hard-errored.
-    if matches!(&projected, SomeValue::List(_)) {
+    if let SomeValue::List(list) = &projected {
+        let dest_item = list.listdef.s_value();
         return match operand {
-            SomeValue::List(_) => Ok(operand.clone()),
+            SomeValue::List(op_list) => {
+                // Same-family identity: the operand ListDef can hold the dest
+                // item. Different-family is `IdentityDesc.leave_tunnel` of the
+                // dest spelling (`rerased.py` `leave_tunnel`): the operand is
+                // erased storage of another pair and is not unioned in. The
+                // first visit seeds Impossible `s_input` with `projected`.
+                let op_item = op_list.listdef.s_value();
+                if union(&op_item, &dest_item).is_ok() {
+                    Ok(operand.clone())
+                } else {
+                    bk.leave_erasing_pair_list_tunnel(&root, &projected)
+                }
+            }
             SomeValue::Instance(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
@@ -2374,11 +2419,8 @@ fn cast_instance_intrinsic(
     }
     // A `Vec` of one-word items is `SomeRustVec` (`project_rust_vec`),
     // not `SomeList`. The unique-graph of `gc_alloc_young_storage_box`
-    // (`specialize:argtype(0)`) seeds that dest as RustVec; a list /
-    // GCREF operand that fell through to the pin_root List pass-through
-    // below returned List and `mergeinputargs` then saw List ∪ RustVec.
-    // Recast to the dest annotation the way the List / Tuple / Dict
-    // arms already recast a pointer-shaped operand.
+    // (`specialize:argtype(0)`) seeds that dest as RustVec. Recast a
+    // list / GCREF operand to that dest (`ann_cast_pointer`).
     if matches!(&projected, SomeValue::RustVec(_)) {
         return match operand {
             SomeValue::RustVec(_) => Ok(operand.clone()),
@@ -2456,6 +2498,8 @@ fn cast_instance_intrinsic(
     // `raw_struct_ptr_annotation` (`rclass.py` `ll_cast_to_object`:
     // dest is the target class annotation). Operand `can_be_none` is
     // applied on the instance arm below, unchanged.
+    // A Rust-repr aggregate is `rclass.py` `getinstancerepr` and takes
+    // the ClassDef arm below.
     let payload_dest = bk.by_value_payload_annotation(&root);
     if matches!(&payload_dest, SomeValue::Ptr(_)) {
         return match operand {
@@ -2519,14 +2563,16 @@ fn cast_instance_intrinsic(
                     std::collections::BTreeMap::new(),
                 )));
             }
-            // `GcArray` is a GCREF (`rlist.py`). `pin_root(p as PyObjectRef)`
-            // is `rgc.pin` of that word (`rgc.py`).
-            return Ok(operand.clone());
+            // List-modelled GcArray recast onto dest Instance is
+            // `ann_cast_opaque_ptr` / `ann_cast_pointer`: dest annotation
+            // (`SomePtr(typeOf(cast_p))`). `rgc.pin` takes a GCREF.
+            true
         }
         SomeValue::String(_) => {
-            // `STR` is `Ptr(GcStruct)` (`rstr.py`). `pin_root(p as PyObjectRef)`
-            // is `rgc.pin` of that GCREF (`rgc.py`).
-            return Ok(operand.clone());
+            // STR is `Ptr(GcStruct)` (`rstr.py`). Recast onto dest
+            // Instance is `ann_cast_opaque_ptr` / `ann_cast_pointer`: dest
+            // annotation. `rgc.pin` takes a GCREF.
+            true
         }
         other => {
             // A root the bookkeeper models as a list or string (a
@@ -2991,8 +3037,9 @@ fn jit_conditional_call(
 /// return annmodel.unionof(s_res, args_s[0].nonnoneify())
 /// ```
 ///
-/// Pyre's fn-const is `SomePtr(FuncType)` rather than always `SomePBC`.
-/// A `Ptr(FuncType)` takes RESULT via `lltype_to_annotation`.
+/// A residual `Ptr(FuncType)` (untyped / rffi nullptr) takes RESULT
+/// via `lltype_to_annotation`. A reified `FnDef` is `SomePBC` and
+/// takes `emulate_pbc_call`.
 fn jit_conditional_call_elidable(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -4011,30 +4058,41 @@ mod tests {
         assert!(merged_i.can_be_none, "union is nullable");
     }
 
-    /// `lltype.nullptr(FUNC)` of a spelled signature is the same
-    /// `SomePtr` as a `Some` of that `fn` type (`getfunctionptr`).
+    /// Spelled `null_fn` is `s_None`; it noneifies a function-PBC
+    /// (`binaryop.py` `pairtype(SomeObject, SomeNone)`).
     #[test]
     fn typed_null_fn_unions_with_matching_fn_pointer() {
-        use crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling;
-        use crate::annotator::model::{SomeObjectTrait, SomeValue, unionof};
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::{SomeObjectTrait, SomePBC, SomeValue, unionof};
+        use crate::flowspace::argument::Signature;
         use crate::flowspace::model::{ConstValue, Constant};
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
         let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
-        let s_fn = fn_ptr_somevalue_for_spelling(spelling).expect("fn spelling");
+        let bk = bk();
         let mut s_ty = crate::annotator::model::s_str0();
         s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
-        let s_null = fn_null_constant(&bk(), &[Some(s_ty)], &std::collections::HashMap::new())
+        let s_null = fn_null_constant(&bk, &[Some(s_ty)], &std::collections::HashMap::new())
             .expect("typed null_fn");
         assert!(
-            s_null.is_constant(),
-            "typed nullptr is immutablevalue, got {s_null:?}"
+            matches!(s_null, SomeValue::None_(_)) && s_null.is_constant(),
+            "spelled null_fn is s_None, got {s_null:?}"
         );
-        let merged =
-            unionof([&s_fn, &s_null]).expect("typed None unions with Some of the same fn type");
-        assert!(
-            matches!(merged, SomeValue::Ptr(_)),
-            "typed null_fn must stay SomePtr, got {merged:?}"
-        );
+        let fd = DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            "f",
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))));
+        let s_fn = SomeValue::PBC(SomePBC::new(vec![fd], false));
+        let merged = unionof([&s_fn, &s_null]).expect("s_None unions with function PBC");
+        match merged {
+            SomeValue::PBC(pbc) => assert!(pbc.can_be_none, "None ∪ PBC noneifies"),
+            other => panic!("typed null_fn ∪ PBC must be noneified PBC, got {other:?}"),
+        }
     }
 
     fn raw_mapped_obj_bk() -> (Rc<Bookkeeper>, parking_lot::MutexGuard<'static, ()>) {
@@ -5012,6 +5070,8 @@ mod tests {
         assert!(is_registered(
             "pyre_object::gc_hook::gc_alloc_failed_pending"
         ));
+        assert!(is_registered("std.slice.from_raw_parts"));
+        assert!(is_registered("std.slice.from_raw_parts_mut"));
     }
 
     #[test]
@@ -5794,10 +5854,13 @@ mod tests {
             &[Some(s_str), Some(s_root)],
             &no_kwds(),
         )
-        .expect("pin_root of STR is rgc.pin");
+        .expect("ann_cast_opaque_ptr of STR onto PyObject is dest Instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("STR recast onto PyObject is dest Instance, got {out:?}");
+        };
         assert!(
-            matches!(out, SomeValue::String(_)),
-            "STR GCREF must stay SomeString, got {out:?}"
+            inst.can_be_none,
+            "GCREF word recast is can_be_None=True, same as Ptr/Address"
         );
     }
 
@@ -5820,10 +5883,138 @@ mod tests {
             &[Some(s_list), Some(s_root)],
             &no_kwds(),
         )
-        .expect("pin_root of GcArray is rgc.pin");
+        .expect("ann_cast_opaque_ptr of GcArray onto PyObject is dest Instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("GcArray recast onto PyObject is dest Instance, got {out:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "GCREF word recast is can_be_None=True, same as Ptr/Address"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_list_operand_object_root_dest_is_instance() {
+        // `ann_cast_opaque_ptr` / `ann_cast_pointer` return dest
+        // `SomePtr(typeOf(cast_p))`. A List-modelled GcArray recast onto
+        // `*mut PyObject` is dest Instance; `rgc.pin` takes a GCREF.
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_none(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("pyobject::PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("List operand recast onto PyObject");
+        let SomeValue::Instance(inst) = out else {
+            panic!("List dest PyObject is SomeInstance, got {out:?}");
+        };
+        assert!(inst.can_be_none, "GCREF word recast is can_be_None=True");
+        assert!(
+            inst.classdef.is_some(),
+            "dest Instance must intern the PyObject classdef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_string_operand_object_root_dest_is_instance() {
+        // STR recast onto `*mut PyObject` is dest Instance
+        // (`ann_cast_opaque_ptr` / `ann_cast_pointer`). `rgc.pin` takes
+        // a GCREF.
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::default());
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("pyobject::PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_str), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("String operand recast onto PyObject");
+        let SomeValue::Instance(inst) = out else {
+            panic!("String dest PyObject is SomeInstance, got {out:?}");
+        };
+        assert!(inst.can_be_none, "GCREF word recast is can_be_None=True");
+        assert!(
+            inst.classdef.is_some(),
+            "dest Instance must intern the PyObject classdef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_instance_to_itemsblock_root_is_list() {
+        // Reverse of List→PyObject: dest ItemsBlock is the two-field
+        // `{capacity, [PyObjectRef; 0]}` GcArray `project_struct_field_type`
+        // models as SomeList (`FixedSizeListRepr`).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::ItemsBlock".to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "ItemsBlock".to_string(),
+            reg.fields["object_array::ItemsBlock"].clone(),
+        );
+        reg.note_declared_gc_name("object_array::ItemsBlock");
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("object_array::ItemsBlock"))
+            .expect("ItemsBlock root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Instance recast onto ItemsBlock");
         assert!(
             matches!(out, SomeValue::List(_)),
-            "GcArray GCREF must stay SomeList, got {out:?}"
+            "ItemsBlock dest must project as SomeList, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_instance_to_utf8str_root_is_string() {
+        // Reverse of String→PyObject: dest Utf8Str is rstr `STR`
+        // (`is_rstr_str_layout_declaration`) and `project_struct_field_type`
+        // answers `s_str0`.
+        let bk = bk();
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("unicodeobject::Utf8Str"))
+            .expect("Utf8Str root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Instance recast onto Utf8Str");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "Utf8Str dest must project as SomeString, got {out:?}"
         );
     }
 
@@ -7385,6 +7576,188 @@ mod tests {
         );
     }
 
+    fn some_list_of_object(bk: &Rc<Bookkeeper>) -> SomeValue {
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_item =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let listdef =
+            crate::annotator::listdef::ListDef::new(Some(bk.clone()), s_item, false, false);
+        SomeValue::List(crate::annotator::model::SomeList::new(listdef))
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_object_list_to_str_list_is_rerased_leave_tunnel() {
+        // List[Instance(PyObject)] unerase onto `[str]` is `leave_tunnel` of
+        // the `[str]` pair, not identity of the operand ListDef.
+        let bk = bk();
+        let operand = some_list_of_object(&bk);
+        let SomeValue::List(op_list) = &operand else {
+            panic!("operand must be SomeList");
+        };
+        let op_listdef = op_list.listdef.clone();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[str]"))
+            .expect("[str] dest constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(operand), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("PyObject-list unerase onto [str]");
+        let SomeValue::List(out_list) = out else {
+            panic!("[str] dest must be SomeList, got {out:?}");
+        };
+        assert!(
+            matches!(out_list.listdef.s_value(), SomeValue::String(_)),
+            "leave_tunnel of [str] must yield a String item, got {:?}",
+            out_list.listdef.s_value()
+        );
+        assert!(
+            !out_list.listdef.same_as(&op_listdef),
+            "the [str] ListDef must not be the operand's PyObject ListDef"
+        );
+        out_list.listdef.mutate().expect("setitem mutate");
+        out_list
+            .listdef
+            .generalize(&crate::annotator::model::s_str0())
+            .expect("setitem of a str into the [str] list");
+        assert!(
+            matches!(op_listdef.s_value(), SomeValue::Instance(_)),
+            "setitem of a str must not touch the operand ListItem, got {:?}",
+            op_listdef.s_value()
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_two_str_list_casts_share_pair_listdef() {
+        // Two `[str]` unerase sites of PyObject-list operands share the
+        // pair's ListDef (`_get_desc` keyed by dest spelling).
+        use crate::annotator::bookkeeper::PositionKey;
+        let bk = bk();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[str]"))
+            .expect("[str] dest constant");
+        bk.set_position_key(Some(PositionKey::new(11, 0, 0)));
+        let first = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(some_list_of_object(&bk)), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("first [str] cast");
+        bk.set_position_key(Some(PositionKey::new(12, 0, 1)));
+        let second = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(some_list_of_object(&bk)), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("second [str] cast");
+        let (SomeValue::List(a), SomeValue::List(b)) = (first, second) else {
+            panic!("[str] dest must be SomeList");
+        };
+        assert!(
+            a.listdef.same_as(&b.listdef),
+            "two [str] casts of PyObject storage share one ListDef"
+        );
+        assert!(
+            Rc::ptr_eq(&a.listdef.listitem_rc(), &b.listdef.listitem_rc()),
+            "two [str] casts of PyObject storage share one ListItem"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_same_family_list_is_identity() {
+        // Same-family: operand ListDef item unions with dest `[PyObject]`
+        // item, so the operand is returned unchanged.
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "PyObject".to_string(),
+            "pyobject".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let pyobj = "pyobject::PyObject";
+        let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
+        let pyobj_identity = crate::front::semantic::ClassIdentity {
+            id: pyobj_id,
+            spelling: pyobj.to_string(),
+        };
+        reg.fields.insert(
+            pyobj.to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields
+            .insert("PyObject".to_string(), reg.fields[pyobj].clone());
+        reg.class_identity
+            .insert(pyobj.to_string(), Some(pyobj_identity.clone()));
+        reg.class_identity
+            .insert("PyObject".to_string(), Some(pyobj_identity));
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let s_item =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let op_listdef =
+            crate::annotator::listdef::ListDef::new(Some(bk.clone()), s_item, false, false);
+        let operand = SomeValue::List(crate::annotator::model::SomeList::new(op_listdef.clone()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("[PyObject] dest constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(operand), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("same-family [PyObject] cast");
+        let SomeValue::List(out_list) = out else {
+            panic!("[PyObject] dest must be SomeList, got {out:?}");
+        };
+        assert!(
+            out_list.listdef.same_as(&op_listdef),
+            "same-family [PyObject] must return the operand ListDef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_identity_desc_enter_tunnel_after_leave_records_reflow() {
+        // `enter_tunnel` of a wider `s_obj` after `leave_tunnel` keeps the
+        // leave's position scheduled and generalizes `s_input`.
+        use crate::annotator::bookkeeper::{IdentityDesc, PositionKey};
+        let bk = bk();
+        let pk = PositionKey::new(3, 4, 5);
+        bk.set_position_key(Some(pk.clone()));
+        let mut desc = IdentityDesc::new();
+        let narrow = SomeValue::Integer(SomeInteger::new(true, false));
+        desc.enter_tunnel(&bk, &narrow).expect("seed enter_tunnel");
+        let left = desc.leave_tunnel(&bk);
+        assert!(
+            matches!(left, SomeValue::Integer(ref i) if i.nonneg),
+            "leave_tunnel returns the seeded s_input"
+        );
+        assert!(
+            desc.reflowpositions.contains_key(&Some(pk.clone())),
+            "leave_tunnel records the current position"
+        );
+        let wide = SomeValue::Integer(SomeInteger::new(false, false));
+        desc.enter_tunnel(&bk, &wide)
+            .expect("widening enter_tunnel");
+        assert!(
+            matches!(&desc.s_input, SomeValue::Integer(i) if !i.nonneg),
+            "s_input must generalize to signed, got {:?}",
+            desc.s_input
+        );
+        assert!(
+            desc.reflowpositions.contains_key(&Some(pk)),
+            "the leave position stays scheduled for reflow"
+        );
+    }
+
     #[test]
     fn cast_instance_intrinsic_object_slice_root_narrows_to_somelist() {
         // `emit_object_vec_gcarray` narrows `gcarray_from_pyobject_vec`
@@ -8487,6 +8860,45 @@ mod tests {
         let err = call_builtin(&bk(), "std.alloc.alloc_zeroed", &[], &no_kwds())
             .expect_err("Layout argument is required");
         assert!(err.to_string().contains("expects a Layout"), "got {err}");
+    }
+
+    #[test]
+    fn from_raw_parts_returns_the_pointer_operand() {
+        use crate::flowspace::model::HOST_ENV;
+
+        let s_p = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        for name in ["std.slice.from_raw_parts", "std.slice.from_raw_parts_mut"] {
+            let out = call_builtin(
+                &bk(),
+                name,
+                &[Some(s_p.clone()), Some(s_n.clone())],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|err| panic!("{name} annotates as the pointer: {err}"));
+            assert_eq!(out, s_p, "{name}");
+        }
+        let std_host = HOST_ENV
+            .import_module("std.slice")
+            .and_then(|m| m.module_get("from_raw_parts_mut"))
+            .expect("std.slice.from_raw_parts_mut");
+        let core_host = HOST_ENV
+            .import_module("core.slice.raw")
+            .and_then(|m| m.module_get("from_raw_parts_mut"))
+            .expect("core.slice.raw.from_raw_parts_mut");
+        assert_eq!(
+            std_host, core_host,
+            "core.slice.raw.from_raw_parts_mut must be the std.slice HostObject"
+        );
+        assert_eq!(std_host.qualname(), "std.slice.from_raw_parts_mut");
+        assert!(is_registered(std_host.qualname()));
+        let segs = ["core", "slice", "raw", "from_raw_parts_mut"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let via_path = crate::flowspace::model::host_env_callable(&segs)
+            .expect("Charon 4-segment path resolves in HOST_ENV");
+        assert_eq!(via_path, std_host);
     }
 
     #[test]

@@ -354,13 +354,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `local_var` by local and only falls back to the recorded
     /// Variable for a base/index without a backing local (a constant).
     pub(in crate::front::mir) index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
-    /// MIR locals bound by `ptr::add` whose result is used only as
-    /// `(*dest).field` on a struct pointee. The use emits
-    /// `InteriorFieldRead` / `InteriorFieldWrite` off the recovered GcArray
-    /// header (`getinteriorfield`), not off the item pointer. Same
-    /// block-split re-resolve as [`Lowering::index_elem_alias`]: the header
-    /// and index are kept as the resolving-block Variable plus the source
-    /// MIR local.
+    /// MIR locals bound by `ptr::add` or `Vec::index_mut` whose result is
+    /// used only as `(*dest).field` / `(*dest).field[i]` on a struct
+    /// pointee. The use emits `InteriorFieldRead` / `InteriorFieldWrite`
+    /// off the recovered GcArray / list header (`getinteriorfield`), not
+    /// off the item pointer. Same block-split re-resolve as
+    /// [`Lowering::index_elem_alias`]: the header and index are kept as
+    /// the resolving-block Variable plus the source MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
     /// Option dest of a fused Copy-struct `<[T]>::get`, bound to `i < len`.
@@ -379,9 +379,22 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// same restriction [`Lowering::const_discriminant_locals`] carries:
     /// this map is not a flow-state.
     pub(in crate::front::mir) atomic_ref_place: std::collections::HashMap<usize, Place>,
-    /// Parameter locals declared `&mut T` where `T` is a GC reference.
-    /// The local holds the one-field cell, not the reference word.
+    /// Locals that hold a MutRef cell: `&mut T` parameters whose `T` is a
+    /// GC reference, whole-local copies of those, the Some payload of an
+    /// [`Self::gc_mut_ref_option_params`] member, and a reborrow
+    /// (`&mut *p` / `&TwoPhaseMut *p` / `&*p`) of a member. The local
+    /// holds the one-field cell, not the reference word.
+    ///
+    /// `_trace` unwraps `operr: Option<&mut OperationError>` then
+    /// reborrows it for `reload` / `normalize_exception`
+    /// (`executioncontext.py` `_trace`). The Option formal is the
+    /// same cell, nullable (`gc_mut_ref_input_stamp`).
     pub(in crate::front::mir) gc_mut_ref_params: std::collections::HashSet<usize>,
+    /// Parameter locals declared `Option<&mut T>` whose payload occupies
+    /// a MutRef cell. The Option word is that cell, nullable; members
+    /// are not `&mut T`, so [`Lowering::gc_mut_ref_param_root`] keeps
+    /// naming only `&mut T`.
+    pub(in crate::front::mir) gc_mut_ref_option_params: std::collections::HashSet<usize>,
     /// MIR locals whose value is the address of a primitive, produced by a
     /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
     ///
@@ -425,6 +438,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// This body is a `cachedgraph` copy, so clause refs have been
     /// replaced and a `TraitImpl` call names the impl method.
     pub(in crate::front::mir) spec_body: bool,
+    /// Loaded artefacts of this program. An Opaque-imported generic
+    /// enqueues its spec on the crate that holds the body.
+    pub(in crate::front::mir) cross_crate:
+        Option<&'a dyn crate::front::clause_spec::CrossCrateLookup>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -701,6 +718,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Arrays that received a [`Self::pointer_word_vars`] store. A later
     /// `getitem` is that same word, not the wrapper's inner integer.
     pub(in crate::front::mir) pointer_word_arrays: std::collections::HashSet<Variable>,
+    /// Destinations of a rewritten `RefCell::borrow` / `borrow_mut` /
+    /// `get_mut` (`FieldRead value`). A following `Ref::deref` of that
+    /// dest is `same_as`: the register already holds the payload, not a
+    /// `Ref` guard.
+    pub(in crate::front::mir) refcell_payload_vars: Vec<Variable>,
 }
 
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
@@ -715,6 +737,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     generics: Option<&FunGenerics>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_mut_ref_params: &std::collections::HashSet<usize>,
+    gc_mut_ref_option_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
@@ -819,20 +842,21 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             i == 1,
             tombstoned_leaves,
         );
-        // Same membership as [`gc_mut_ref_param_locals`], including the
-        // residual exclusion: a cell parameter is the `MutRef<T>` the
-        // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
-        let cell_root = if gc_mut_ref_params.contains(&i) {
-            tyref_gc_mut_ref_cell_root(
-                &local.ty,
-                llbc,
-                tombstoned_leaves,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        } else {
-            None
-        };
+        // Same membership as [`gc_mut_ref_param_locals`] /
+        // [`gc_mut_ref_option_param_locals`], including the residual
+        // exclusion: a cell parameter is the `MutRef<T>` the caller
+        // passes, not `T`. An `Option<&mut T>` formal is that cell,
+        // nullable. Seeding `T` hoists `value` onto `T`'s class.
+        let cell_stamp = gc_mut_ref_input_stamp(
+            &local.ty,
+            i,
+            gc_mut_ref_params,
+            gc_mut_ref_option_params,
+            llbc,
+            tombstoned_leaves,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         // `class_root` carries the param's named-ADT leaf so
         // `derive_subject_inputcells` can seed the receiver's
         // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -855,8 +879,8 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
-        let class_root = if let Some(root) = &cell_root {
-            Some(root.clone())
+        let class_root = if let Some((_, class_root)) = &cell_stamp {
+            Some(class_root.clone())
         } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
         } else {
@@ -903,9 +927,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // A function pointer is `Int`-colored (`history.getkind` of
                 // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
                 // `Option<fn(inputs) -> output>` spelling so
-                // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
-                // (`fn_ptr_somevalue_for_spelling`) instead of
-                // `valuetype_to_someshell`'s `SomeInteger`.
+                // `derive_subject_inputcells` seeds `Impossible`
+                // (`fn_ptr_somevalue_for_spelling` is the recogniser)
+                // instead of `valuetype_to_someshell`'s `SomeInteger`.
                 // A `Vec` of one-word items is `Int`-colored (its header
                 // address); carry its spelling so
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
@@ -944,7 +968,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 }),
             }
         };
-        if let Some(root) = cell_root {
+        if let Some((root, _)) = cell_stamp {
             ty = ValueType::Ref(Some(root));
         }
         let len_slot = len_shadow[i];
@@ -1454,6 +1478,14 @@ impl<'a> Lowering<'a> {
             self_dont_look_inside,
             raw_alloc_flavor_structs,
         );
+        let gc_mut_ref_option_params = gc_mut_ref_option_param_locals(
+            &body.locals,
+            llbc,
+            tombstoned_leaves,
+            gc_struct_ids,
+            self_dont_look_inside,
+            raw_alloc_flavor_structs,
+        );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
             pair_len_shadows(body, llbc, &name, accum);
@@ -1602,21 +1634,22 @@ impl<'a> Lowering<'a> {
             // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
             // `RootScope` method form puts `&self` first, so stamping index 1
             // there annotates the receiver and leaves the GC pointer untouched.
-            // Same membership as [`gc_mut_ref_param_locals`]: a cell
-            // parameter is the `MutRef<T>` the caller passes, not `T`.
-            let cell_root = if gc_mut_ref_params.contains(&i) {
-                tyref_gc_mut_ref_cell_root(
-                    &local.ty,
-                    llbc,
-                    tombstoned_leaves,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            } else {
-                None
-            };
-            let class_root = if let Some(root) = &cell_root {
-                Some(root.clone())
+            // Same membership as [`gc_mut_ref_param_locals`] /
+            // [`gc_mut_ref_option_param_locals`]: a cell parameter is
+            // the `MutRef<T>` the caller passes, not `T`. An
+            // `Option<&mut T>` formal is that cell, nullable.
+            let cell_stamp = gc_mut_ref_input_stamp(
+                &local.ty,
+                i,
+                &gc_mut_ref_params,
+                &gc_mut_ref_option_params,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            let class_root = if let Some((_, class_root)) = &cell_stamp {
+                Some(class_root.clone())
             } else if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
             } else {
@@ -1646,9 +1679,9 @@ impl<'a> Lowering<'a> {
                     // A function pointer is `Int`-colored (`history.getkind` of
                     // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
                     // `Option<fn(inputs) -> output>` spelling so
-                    // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
-                    // (`fn_ptr_somevalue_for_spelling`) instead of
-                    // `valuetype_to_someshell`'s `SomeInteger`.
+                    // `derive_subject_inputcells` seeds `Impossible`
+                    // (`fn_ptr_somevalue_for_spelling` is the recogniser)
+                    // instead of `valuetype_to_someshell`'s `SomeInteger`.
                     // A `Vec` of one-word items is `Int`-colored (its header
                     // address); carry its spelling so
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
@@ -1687,7 +1720,7 @@ impl<'a> Lowering<'a> {
                     }),
                 }
             };
-            if let Some(root) = cell_root {
+            if let Some((root, _)) = cell_stamp {
                 ty = ValueType::Ref(Some(root));
             }
             let len_slot = len_shadow[i];
@@ -1799,7 +1832,8 @@ impl<'a> Lowering<'a> {
         n_slots += function_scope_plan.len();
         local_var.resize(n_slots, None);
         let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
-        let interior_live = compute_interior_field_extra_live(body, llbc, tombstoned_leaves);
+        let interior_live =
+            compute_interior_field_extra_live(body, llbc, gc_struct_ids, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
             extra_live.resize(interior_live.len(), Vec::new());
         }
@@ -2133,6 +2167,7 @@ impl<'a> Lowering<'a> {
             fused_copy_struct_get_cf: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
+            gc_mut_ref_option_params,
             scalar_address_locals: Vec::new(),
             cell_locals: cell_plan.locals,
             cell_descr: cell_plan.descr,
@@ -2141,6 +2176,7 @@ impl<'a> Lowering<'a> {
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
+            cross_crate: None,
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
@@ -2198,6 +2234,7 @@ impl<'a> Lowering<'a> {
             raw_address_uint_src: std::collections::HashMap::new(),
             pointer_word_vars: std::collections::HashSet::new(),
             guard_word_vars: std::collections::HashSet::new(),
+            refcell_payload_vars: Vec::new(),
             pointer_word_arrays: std::collections::HashSet::new(),
             root_scope_moved_locals,
             root_bracket,
@@ -3226,6 +3263,40 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Copy cell / Option-cell provenance onto a single-assignment dest.
+    /// Multi-assigned dests stay out: the map is not a flow-state.
+    fn inherit_gc_mut_ref_provenance(&mut self, dest_local: usize, rvalue: &Rvalue) {
+        if self.multi_assigned_locals.contains(&dest_local) {
+            return;
+        }
+        match rvalue {
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                if let PlaceKind::Local(src_local) = src.kind {
+                    let src_local = src_local as usize;
+                    if self.gc_mut_ref_params.contains(&src_local) {
+                        self.gc_mut_ref_params.insert(dest_local);
+                    }
+                    if self.gc_mut_ref_option_params.contains(&src_local) {
+                        self.gc_mut_ref_option_params.insert(dest_local);
+                    }
+                }
+                if let Some(opt_local) = option_some_payload_local(src)
+                    && self.gc_mut_ref_option_params.contains(&opt_local)
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
+            }
+            Rvalue::Ref { place, .. } => {
+                if let Some(cell) = deref_of_local(place)
+                    && self.gc_mut_ref_params.contains(&cell)
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(in crate::front::mir) fn lower_assign(
         &mut self,
         mir_bb: usize,
@@ -3507,13 +3578,10 @@ impl<'a> Lowering<'a> {
                 }
                 // `let q = p` keeps the cell ABI. `gc_mut_ref_param_root`
                 // otherwise only names the original parameter local.
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
-                    && !self.multi_assigned_locals.contains(&dest_local)
-                    && let PlaceKind::Local(src_local) = src.kind
-                    && self.gc_mut_ref_params.contains(&(src_local as usize))
-                {
-                    self.gc_mut_ref_params.insert(dest_local);
-                }
+                // An `Option<&mut T>` Some payload and a reborrow of a
+                // cell (`&mut *p`) inherit the same set; `_trace` unwraps
+                // `operr` that way (`executioncontext.py` `_trace`).
+                self.inherit_gc_mut_ref_provenance(dest_local, &rvalue);
                 // `_j = move _i` of a whole always-`Ok` local is the same
                 // payload, so `_j` keeps the constant tag its `expect` /
                 // `Discriminant` readers fold against (`with_roots!` returns
@@ -5016,6 +5084,65 @@ impl<'a> Lowering<'a> {
             self.block_list_view_conflict[row].insert(local_idx);
             self.block_entry_list_view_locals[row].remove(local_idx);
         }
+    }
+}
+
+/// `Some` payload of an `Option` place: field 0 of variant Some.
+///
+/// Charon spells that as `Field[1, 0]` on the Option, or `Downcast(1)`
+/// then `Field[null, 0]` (`if let Some(p) = opt`). A leading Deref
+/// covers `&Option`. Variant None (`Field[0, 0]`) is rejected.
+pub(in crate::front::mir) fn option_some_payload_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let field = elem.field_payload()?.as_array()?;
+    if field.len() != 2 || field[1].as_u64() != Some(0) {
+        return None;
+    }
+    if field[0].as_u64() == Some(0) {
+        return None;
+    }
+    if field[0].as_u64() == Some(1) {
+        return peel_option_base(inner, true);
+    }
+    if field[0].is_null() {
+        return peel_option_base(inner, false);
+    }
+    None
+}
+
+fn peel_option_base(place: &Place, mut saw_some: bool) -> Option<usize> {
+    let mut cur = place;
+    for _ in 0..8 {
+        match &cur.kind {
+            PlaceKind::Local(i) => return saw_some.then_some(*i as usize),
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                cur = inner;
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if v.get("Downcast").and_then(serde_json::Value::as_u64) == Some(1) =>
+            {
+                saw_some = true;
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `*p` of a whole local `p`.
+pub(in crate::front::mir) fn deref_of_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind else {
+        return None;
+    };
+    if atom != "Deref" {
+        return None;
+    }
+    match &inner.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        _ => None,
     }
 }
 

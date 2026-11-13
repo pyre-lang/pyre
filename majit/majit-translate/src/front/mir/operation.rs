@@ -373,6 +373,78 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// `Vec::index_mut` consumed only as `(*dest).field` / `(*dest).field[i]`
+    /// on a named struct element.
+    ///
+    /// Records the Vec header and the index so the field use emits
+    /// `setinteriorfield` (`rewrite_op_setinteriorfield`).
+    /// `create_utf8_index_storage` writes `storage[current].baseindex` and
+    /// `storage[current].ofs[i]` this way (`rutf8.py`). A word-stride
+    /// `ArrayRead` of that element would be false, and a residual
+    /// `index_mut` is not in CallRegistry.
+    ///
+    /// The loop increments `current` after the field writes of that
+    /// iteration; [`captured_local_reaches_field_uses`] already requires
+    /// the captured index at each field use, so a later increment does
+    /// not decline the intercept.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_struct_field_vec_index(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(traced) = struct_field_vec_index_trace(
+            reg,
+            args.len(),
+            arg_locals.first().copied().flatten(),
+            second_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            Some(dest_ty),
+            self.body,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.tombstoned_leaves,
+        ) else {
+            return Ok(false);
+        };
+        let index_var = args.get(1).cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field Vec::index_mut lost its index operand"
+            ))
+        })?;
+        let header_var = args.first().cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field Vec::index_mut lost its Vec operand"
+            ))
+        })?;
+        self.interior_field_alias.insert(
+            dest_local,
+            InteriorFieldAlias {
+                header: InteriorHeader::Local {
+                    local: traced.header_local,
+                    var: header_var.clone(),
+                },
+                index_local: traced.index_local,
+                index_var,
+                array_type_id: traced.array_type_id,
+            },
+        );
+        self.alias_dest_to_arg0_inherit(dest_local, header_var, arg_locals);
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// `*p.add(i)` where `p` is the data pointer of a `&[u8]` byte string.
     ///
     /// `<[u8]>::as_ptr` aliases that pointer to the string and marks it.
@@ -1858,18 +1930,18 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
             return None;
         }
-        // A `repr(transparent)` scalar wrapper is its inner word
-        // (`tyref_is_borrowed_transparent_scalar`). A store of that
-        // word through a borrow — rustc capturing `&FrameAnchor` into
-        // a closure env — is already the int; `cast_pointer` has no
-        // integer operand.
-        if tyref_is_borrowed_transparent_scalar(
+        // A transparent scalar is the inner word. Recasting a store onto
+        // the wrapper class minted Instance and unioned Integer ∪ Instance
+        // at `FrameAnchor::live` (`mergeinputargs`).
+        if tyref_transparent_inner_value_type(
             ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-        ) {
+        )
+        .is_some()
+        {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
@@ -4692,13 +4764,18 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
-        if tyref_is_borrowed_transparent_scalar(
+        // A transparent scalar dest is the inner word. A classdef recast
+        // here is the same Integer ∪ Instance wall as a fieldless-enum
+        // tag compare (`pair(rtype_eq) (InstanceRepr, IntegerRepr)`).
+        if tyref_transparent_inner_value_type(
             dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-        ) {
+        )
+        .is_some()
+        {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
@@ -4790,6 +4867,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         )?;
         let id = adt_node_def_id(node)?;
         let decl = self.llbc.type_by_id(id)?;
@@ -4843,7 +4921,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// PTRTYPE of a niche-Option payload that is a pointer to a storage-raw
-    /// ADT (`Option<&MappedObj>`, `Option<&OwnedFd>`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
+    /// ADT (`Option<&OwnedFd>`, `rffi.py` `CStruct`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
     /// returns `SomePtr(PTRTYPE)` (`lltype.py` `ann_cast_int_to_ptr`). The
     /// Option word itself stays the Address `rnone.py` `rtype_is_None`
     /// compares for an int-bank enum; a raw-struct borrow Option is already
@@ -4854,7 +4932,7 @@ impl<'a> Lowering<'a> {
     /// `ty_is_raw_address`. Struct PTRTYPE is the overlay `Ptr(Struct)` of
     /// a pointee whose declared `_gckind` is Raw (`declared_raw_adt_node` /
     /// `history.getkind` of `Ptr(TO)` from `TO._gckind`). A GcType seed
-    /// stays Instance (`rclass.py` `InstanceRepr._setup_repr`).
+    /// stays Instance (`rclass.py` `getinstancerepr`).
     pub(in crate::front::mir) fn payload_storage_raw_ptr_lltype(
         &self,
         option_ty: &TyRef,
@@ -4903,6 +4981,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
         )?;
         let id = adt_node_def_id(adt)?;
         let decl = self.llbc.type_by_id(id)?;
@@ -6669,6 +6748,25 @@ impl<'a> Lowering<'a> {
                     // payload is `rffi.py` `CCHARP`, not `Ref(None)`.
                     let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
                     let place_ty = tyref_subst_bound_typevar(&place_ty, &inner.ty, self.llbc);
+                    // `Option<&mut T>` of a GC handle is already the MutRef
+                    // cell (`gc_mut_ref_input_stamp`). Some.`__pos_0` / `_0`
+                    // is that word; peeling it as a transparent handle
+                    // field would recast the cell to `T` and
+                    // `inherit_gc_mut_ref_provenance` would still mark the
+                    // dest a cell (`expand_pop_roots`).
+                    if matches!(field_name.as_str(), "__pos_0" | "_0" | "0") {
+                        let niche = self.tyref_is_niche_option_ptr(&inner.ty);
+                        let cell = tyref_option_gc_mut_ref_cell_root(
+                            &inner.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        if niche && cell.is_some() {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                    }
                     // Projecting the sized field of a `repr(transparent)`
                     // wrapper is the identity on its low-level value, including
                     // through a borrow: the borrow carries no representation of
@@ -6706,14 +6804,16 @@ impl<'a> Lowering<'a> {
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
                     // word. Charon spells the positional field `_0`
-                    // (`is_positional`); the front names it `__pos_0`.
+                    // (`is_positional`); the front names it `__pos_0`. A
+                    // registry-linked scalar whose layout omitted
+                    // `repr(transparent)` names its one word `.bits` / `.0`.
                     // A by-value integer newtype (`VersionTag(u64)`) is
                     // the same word (`history.getkind`).
                     // A `&Newtype` is an address: `(*self).0` loads that
                     // integer (`history.getkind` of the field). Aliasing
                     // the deref would return the Ref receiver as the
                     // payload.
-                    if (field_name == "__pos_0" || field_name == "_0")
+                    if is_transparent_scalar_payload_field_name(&field_name)
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -6758,8 +6858,8 @@ impl<'a> Lowering<'a> {
                     // `call_once` Args tuple sees `SomeInstance(T)` rather
                     // than a classdef-less word (`rclass.py`
                     // `InstanceRepr._setup_repr`). An int-bank raw-address
-                    // niche (`Option<&MappedObj>`, `Option<fn>`,
-                    // `Option<&RawStruct>`) keeps the Address / SomePtr
+                    // niche (`Option<&OwnedFd>`, `Option<fn>`,
+                    // `Option<&CStruct>`) keeps the Address / SomePtr
                     // word for Discriminant / `is_` / `null_raw`
                     // (`rnone.py` `rtype_is_None`). The Some payload of a
                     // storage-raw enum pointer is that same word retyped as
@@ -6789,6 +6889,21 @@ impl<'a> Lowering<'a> {
                             ));
                         }
                         if self.option_niche_is_int_bank(&option_ty) {
+                            return Ok(base);
+                        }
+                        // `Option<&mut T>` of a GC handle is already the
+                        // MutRef cell (`gc_mut_ref_input_stamp`). Recasting
+                        // `__pos_0` to `T` would make the Some dest the
+                        // payload while inherit still marks it a cell.
+                        if tyref_option_gc_mut_ref_cell_root(
+                            &option_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                        .is_some()
+                        {
                             return Ok(base);
                         }
                         if let Some(root) = self.option_niche_payload_class_root(&option_ty) {
@@ -6895,7 +7010,12 @@ impl<'a> Lowering<'a> {
                                 // host offset. A cast onto the gc shell is the Gc
                                 // pointee's narrow.
                                 if stripped.as_ref().is_some_and(|n| {
-                                    raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
+                                    raw_ptr_node_is_declared_raw(
+                                        n,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        &self.raw_alloc_flavor_structs,
+                                    )
                                 }) {
                                     None
                                 } else {
@@ -7885,6 +8005,27 @@ impl<'a> Lowering<'a> {
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && tyref_transparent_inner_value_type(
+                        &inner.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .is_some()
+                    && indexed_field_parts(field_payload)
+                        .is_some_and(|(variant, idx)| variant.is_none() && idx == 0)
+                    && self.resolve_adt_field(&inner.ty, field_payload).is_none()
+                {
+                    // Opaque registered scalar: no field list, so the
+                    // `resolve_adt_field` peel above does not run. The
+                    // only projection is the payload word.
+                    let wrapper_ty = clone_tyref(&inner.ty);
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                }
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner, name, ty, word)) =
                         self.opaque_scalar_field(&inner.ty, &place_ty, field_payload)
                 {
@@ -8149,6 +8290,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_const_fn_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
+                    .or_else(|| co_fast_flags_const(&segments))
                     .or_else(|| encoding_name_const(&segments))
                     .or_else(|| gc_ref_null_const(&segments))
                     .or_else(|| bitflags_trait_empty_const(&segments));

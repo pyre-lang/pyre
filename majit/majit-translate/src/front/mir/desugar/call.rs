@@ -56,6 +56,15 @@ impl<'a> Lowering<'a> {
             melt_abort_message_chain(&mut self.graph, bb_id);
             return Ok(());
         }
+        // `null_mut()` of a scalar `_arrayfld` GcArray (`*mut TypedItemsBlock`)
+        // is `lltype.nullptr(GcArray(ITEM))`. Residual `ptr_null_constant`
+        // is a classdef-less Instance; dest recast is skipped when the
+        // Call dest already names that root. Runs before the raw/spelled-GC
+        // `null_mut` arms because a declared scalar flexible GcArray dest
+        // is also a spelled GC root.
+        if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         // `null_mut::<T>()` / `null::<T>()` of a Raw pointee is
         // `lltype.nullptr(T)` (`null_raw`). The generic call-result
         // `__cast_instance_intrinsic` tail below would recast a GC
@@ -69,13 +78,6 @@ impl<'a> Lowering<'a> {
         // `SomeString(can_be_None=True)` so the live STR arm unions
         // (`annmodel.SomeString.noneify`).
         if self.try_lower_str_family_ptr_null(mir_bb, &call, dest_local, target)? {
-            return Ok(());
-        }
-        // `null_mut()` of a scalar `_arrayfld` GcArray (`*mut TypedItemsBlock`)
-        // is `lltype.nullptr(GcArray(ITEM))`. Residual `ptr_null_constant`
-        // is a classdef-less Instance; dest recast is skipped when the
-        // Call dest already names that root.
-        if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
@@ -280,12 +282,19 @@ impl<'a> Lowering<'a> {
                 // residual host call as a classdef-less instance, and
                 // `if let Some(s)` then could not return a `SomeString`.
                 if self.tyref_is_niche_option_ptr(dest_class_ty) {
-                    self.option_niche_payload_class_root(dest_class_ty)
-                        .or_else(|| {
-                            self.option_niche_null_cast(dest_class_ty)
-                                .is_some()
-                                .then(|| root.clone())
-                        })
+                    tyref_option_gc_mut_ref_cell_root(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                    .or_else(|| {
+                        self.option_niche_null_cast(dest_class_ty)
+                            .is_some()
+                            .then(|| root.clone())
+                    })
                 } else if crate::front::result_exc::tyref_lowers_as_result_exc(
                     &call.dest.ty,
                     self.llbc,
@@ -312,7 +321,17 @@ impl<'a> Lowering<'a> {
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
-                .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                // A GC `&mut T` payload is the MutRef cell, not `T`.
+                .or_else(|| {
+                    tyref_option_gc_mut_ref_cell_root(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
+                })
                 // A `dont_look_inside` residual returning `Option<*mut T>`
                 // whose dest type is the `Option<…>` ADT, not a bare raw
                 // pointer, misses `raw_ptr_pointee_class_root`. Narrow it
@@ -345,9 +364,41 @@ impl<'a> Lowering<'a> {
                     root.rsplit("::")
                         .next()
                         .is_some_and(|leaf| {
-                            matches!(leaf, "ClassDictStrategy" | "SysState" | "TypedItemsBlock")
+                            matches!(
+                                leaf,
+                                "ClassDictStrategy"
+                                    | "SysState"
+                                    | "TypedItemsBlock"
+                                    | "ModuleDictStrategy"
+                            )
                         })
                         .then_some(root)
+                })
+                // Residual `Vec::from_raw_parts` (`rffi.mallocfn` /
+                // `rstr.mallocstr`) dest is `Vec<u8>`: `tyref_to_value_type`
+                // paints `Ref(None)` and `valuetype_to_someshell` seeds a
+                // classdef-less instance, so setattr `__pos_0` of
+                // `Result<Vec<u8>, MemoryError>::Ok` dies (`rlist.py`).
+                // Intern the list spelling `derive_subject_inputcells`
+                // already uses for a `Vec<T>` param
+                // (`is_list_container_spelling`). One-word-item `Vec` is
+                // Int-banked (`RustVecRepr`) and never reaches this arm.
+                // Slice `from_raw_parts` dests stay the pointer identity
+                // (`ann_direct_ptradd`).
+                .or_else(|| {
+                    [&call.dest.ty, dest_class_ty].into_iter().find_map(|ty| {
+                        let spelling = tyref_to_ast_string(ty, self.llbc);
+                        let stripped = spelling
+                            .trim()
+                            .trim_start_matches('&')
+                            .trim_start_matches("mut ")
+                            .trim_start_matches("*const ")
+                            .trim_start_matches("*mut ")
+                            .trim();
+                        (majit_ir::descr::is_list_container_spelling(&spelling)
+                            && (stripped.starts_with("Vec<") || stripped.starts_with("VecDeque<")))
+                        .then_some(spelling)
+                    })
                 }),
             _ => None,
         };
@@ -356,8 +407,27 @@ impl<'a> Lowering<'a> {
         // `result_narrow_root` for the ARRAY layout stamp
         // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
         // array-item recast whose getarrayitem dest is still GCREF.
+        //
+        // Residual `w_module_dict_get_strategy` is
+        // `*mut ModuleDictStrategy` (`dictmultiobject.py`
+        // `W_ModuleDictObject.get_strategy`). `tyref_to_value_type`
+        // paints `Ref(Some(root))`, but `valuetype_to_someshell(Ref)`
+        // still seeds a classdef-less instance, so getattr
+        // `getitem_str` / `getdictvalue_no_unwrapping` / `length`
+        // dies (`celldict.py`). Intern that Call dest. Identity CAST
+        // of `*mut PyObject` stays omitted (`rclass.py`
+        // `getinstancerepr`). A residual `Vec<T>` dest is the same
+        // classdef-less hole: intern the list spelling even when the
+        // declared pointee already names it
+        // (`__cast_instance_intrinsic` list arm).
         let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
-            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (ValueType::Ref(Some(declared)), Some(narrowed))
+                if declared == narrowed
+                    && narrowed.rsplit("::").next() != Some("ModuleDictStrategy")
+                    && !majit_ir::descr::is_list_container_spelling(narrowed) =>
+            {
+                None
+            }
             (_, other) => other.cloned(),
         };
 
@@ -474,6 +544,7 @@ impl<'a> Lowering<'a> {
         let (
             slice_get_index_is_scalar,
             slice_get_element,
+            slice_get_packed_size,
             slice_first_element,
             slice_object_array_type_id,
         ) = match &call.func {
@@ -489,6 +560,13 @@ impl<'a> Lowering<'a> {
                             array_type_id.as_ref(),
                         )
                     });
+                // Packed Copy C-repr `T` (`CodeUnit`): `get` returns
+                // `Option<&T>`, so the Some payload is the element
+                // ADDRESS. `first`/`last` still `ArrayRead` a value
+                // and stay off this proof. `get_mut` stays residual.
+                let packed = (scalar && !is_get_mut && element.is_none())
+                    .then(|| self.slice_get_packed_element(reg))
+                    .flatten();
                 // `first` / `last` share `get`'s `T` generic; the same
                 // ARRAY identity / thin-pointer proof feeds their
                 // `ArrayRead`. Skip the generic walk on every other
@@ -502,9 +580,9 @@ impl<'a> Lowering<'a> {
                 // `[u8]` slice is length-prefixed and still not the GC
                 // array object `bh_arraylen_gc` reads.
                 let object_array_type_id = self.slice_object_array_type_id(reg);
-                (scalar, element, first_element, object_array_type_id)
+                (scalar, element, packed, first_element, object_array_type_id)
             }
-            _ => (false, None, None, None),
+            _ => (false, None, None, None, None),
         };
         // A void ZST stays in `Call.args`. The callee's `Input` still
         // lists that parameter, and the annotator counts it. The
@@ -872,9 +950,23 @@ impl<'a> Lowering<'a> {
                 }
                 // Checked `Wtf8::from_bytes(&[u8])` is the window pair
                 // (`rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8`).
-                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty) {
+                // `String::from_utf8_lossy(&[u8])` is the same window
+                // (`unicodehelper.py str_decode_utf8` replace / U+FFFD).
+                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty)
+                    || self.is_string_from_utf8_lossy(&reg, &call.dest.ty)
+                {
                     let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
                     if self.try_lower_wtf8_from_bytes_checked(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                    if self.try_lower_from_utf8_lossy(
                         mir_bb,
                         &reg,
                         &spliced,
@@ -1891,6 +1983,23 @@ impl<'a> Lowering<'a> {
                     &args,
                     &arg_locals,
                     dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // `storage[current].field` on a named struct element is
+                // `setinteriorfield` (`rewrite_op_setinteriorfield`).
+                // `Vec::index_mut` of `Utf8LocElem` is that shape
+                // (`rutf8.py` `create_utf8_index_storage`); a residual
+                // `index_mut` is not in CallRegistry.
+                if self.try_lower_struct_field_vec_index(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
                     target,
                 )? {
                     return Ok(());
@@ -8287,6 +8396,29 @@ impl<'a> Lowering<'a> {
             tyref_node(&peeled, self.llbc)
                 .is_some_and(|node| type_node_is_thin_box(node, self.llbc))
         });
+        let refcell_borrow = matches!(
+            &op_kind,
+            OpKind::Call { target, .. }
+                if crate::front::std_identity::is_refcell_borrow_target(target)
+        );
+        let ref_deref_payload = match &op_kind {
+            OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } if crate::front::std_identity::is_ref_deref_target(target)
+                && args
+                    .first()
+                    .and_then(|a| a.as_variable())
+                    .is_some_and(|v| self.refcell_payload_vars.iter().any(|p| p == v)) =>
+            {
+                args.first()
+                    .and_then(|a| a.as_variable())
+                    .cloned()
+                    .map(|operand| (operand, result_ty.clone()))
+            }
+            _ => None,
+        };
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
             identity_recv.as_deref(),
@@ -8298,6 +8430,18 @@ impl<'a> Lowering<'a> {
             identity_layout.as_deref(),
             receiver_is_thin_box,
         );
+        let op_kind = if let Some((operand, result_ty)) = ref_deref_payload {
+            OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand,
+                result_ty,
+            }
+        } else {
+            op_kind
+        };
+        if refcell_borrow && matches!(&op_kind, OpKind::FieldRead { .. }) {
+            self.refcell_payload_vars.push(result_var.clone());
+        }
         // `Option::as_deref` / `as_deref_mut` on a null-niche
         // `Option<Box<T>>` is the pointer word (`Box::as_mut` is the
         // same identity on the box itself). `None` stays null.
@@ -8638,6 +8782,8 @@ impl<'a> Lowering<'a> {
         // call.  `slice_get_element` is scalar / thin-pointer only: an
         // `AtomicU64` or `Option<Entry>` element never produces a proof, and
         // `get_mut` of a scalar is dropped because `ArrayRead` would copy it.
+        // Packed Copy C-repr `T` (`CodeUnit`) is a separate proof: the
+        // Some payload is the element ADDRESS, not a copied `T`.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -8651,12 +8797,34 @@ impl<'a> Lowering<'a> {
             // `get` rewriter has neither, so its diamond would read the string
             // object as a GC array.  Leave the residual call.
             && !self.slice_receiver_is_string_byte_view(&arg_locals, first_arg_ty.as_ref())
-            && let Some((item_ty, array_type_id)) = slice_get_element.clone()
-            && let Some(mut site) =
-                self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
         {
-            site.object_array_type_id = slice_object_array_type_id.clone();
-            self.slice_get_sites.push(site);
+            let proven = if let Some((item_ty, array_type_id)) = slice_get_element.clone() {
+                Some((item_ty, array_type_id, false, 0usize))
+            } else {
+                slice_get_packed_size.and_then(|size| {
+                    crate::front::slice_get::packed_copy_array_type_id(size)
+                        .map(|array_type_id| (ValueType::Int, Some(array_type_id), true, size))
+                })
+            };
+            if let Some((item_ty, array_type_id, payload_is_element_addr, element_byte_size)) =
+                proven
+                && let Some(mut site) = self.recognize_slice_get_site(
+                    &call.dest.ty,
+                    &result_var,
+                    item_ty,
+                    array_type_id,
+                )
+            {
+                site.object_array_type_id = slice_object_array_type_id.clone();
+                if payload_is_element_addr {
+                    site.payload_is_element_addr = true;
+                    site.element_byte_size = element_byte_size;
+                    site.payload_ty = ValueType::Int;
+                    // A raw element address is not a CodeUnit instance.
+                    site.payload_narrow_root = None;
+                }
+                self.slice_get_sites.push(site);
+            }
         }
         // Capture `<[u8]>::is_ascii(slice)` sites for the
         // `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`).
@@ -8824,8 +8992,8 @@ impl<'a> Lowering<'a> {
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
-        // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
+        // `unwrap_or_else`/`or_else`/`is_some_and`/`map_or` are extracted
+        // core bodies (`CHARON_CORE_INCLUDE`); this records the remaining
         // Option/Result methods whose semantics are the same shape.
         let combinator = match &op_kind {
             OpKind::Call {
@@ -9096,7 +9264,9 @@ impl<'a> Lowering<'a> {
         // Narrow a call result whose declared pointee differs from the
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
-        // the roots already match, so the Call dest is the value.
+        // the roots already match, so the Call dest is the value — except
+        // residual `*mut ModuleDictStrategy` and residual `Vec<T>` list
+        // dests, which still intern.
         //
         // The narrowed Variable keeps the Call dest's `concretetype`
         // (`Variable.copy`, `flowspace/model.py`): `do_fixed_newlist`
@@ -9239,6 +9409,13 @@ impl<'a> Lowering<'a> {
 
     pub(in crate::front::mir) fn set_spec_body(&mut self) {
         self.spec_body = true;
+    }
+
+    pub(in crate::front::mir) fn set_cross_crate(
+        &mut self,
+        cross: &'a dyn crate::front::clause_spec::CrossCrateLookup,
+    ) {
+        self.cross_crate = Some(cross);
     }
 
     /// Specialized path for a direct call whose type args are concrete,
@@ -9390,28 +9567,22 @@ impl<'a> Lowering<'a> {
         if fun_decl_is_convert_into_impl(self.llbc, fd) {
             return None;
         }
-        // No unstructured body: keep the ordinary `CallKind::Trait` route.
-        // A spec path for this method would name a graph nobody registers.
-        // A zero-arg opaque impl method is the exception: it has no body
-        // to copy, and `collect_foreign_opaque_method_externals` registers
-        // the impl path when `foreign_opaque_method_result_valuetype`
-        // accepts the result (`Default::default` on an opaque `Self`).
+        // No unstructured body here. `enqueue_spec` names
+        // `FunctionDesc.cachedgraph`: the identity body of the reflexive
+        // `impl<T> From<T> for T` (`description.py` `getuniquegraph`), or
+        // the defining crate's copy of an Opaque import when that crate
+        // is loaded. Any other selected `From` impl names its registered
+        // path, not the generic trait residual `["From", "from"]`. A
+        // zero-arg opaque impl method names the path
+        // `collect_foreign_opaque_method_externals` registers
+        // (`Default::default` on an opaque `Self`).
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
-            // Reflexive `impl<T> From<T> for T` is opaque in core; a
-            // Trait call still selects that impl. Direct Fun calls
-            // alias (`is_reflexive_from`); a residual path must name
-            // `FunctionDesc.cachedgraph` of the identity body
-            // (`description.py` `getuniquegraph` / `specialize`).
-            if fun_decl_is_reflexive_from(self.llbc, fd)
-                && let Some(segments) = self.enqueue_spec(fd, &generics)
-            {
+            if let Some(segments) = self.enqueue_spec(fd, &generics) {
                 return Some((segments, None));
             }
-            let path = fd.item_meta.name_path();
-            let leaf = path.rsplit("::").next().unwrap_or("fn");
-            // Any other selected `From` impl: the registered identity
-            // path, not the generic trait residual `["From", "from"]`.
             if fun_decl_is_convert_from_impl(self.llbc, fd) {
+                let path = fd.item_meta.name_path();
+                let leaf = path.rsplit("::").next().unwrap_or("fn");
                 return Some((spec_segments(self.llbc, fd, leaf), None));
             }
             return self.opaque_nullary_impl_target(fd);
@@ -9428,8 +9599,8 @@ impl<'a> Lowering<'a> {
 
     /// Impl path of a zero-arg method whose declaration has no body.
     ///
-    /// `enqueue_spec` refuses an opaque body. The call still has to name
-    /// the path `collect_foreign_opaque_method_externals` registers, or a
+    /// The call still has to name the path
+    /// `collect_foreign_opaque_method_externals` registers, or a
     /// specialized caller keeps the unregistered trait path. A method
     /// with a receiver is left on that trait path: retargeting it would
     /// resolve graphs the prepass does not annotate.
@@ -9467,17 +9638,6 @@ impl<'a> Lowering<'a> {
         if fun_decl_is_convert_into_impl(self.llbc, fd) {
             return None;
         }
-        // Only a body this LLBC extracted can be copied. An opaque
-        // declaration (a foreign crate's or std's) keeps its bare path,
-        // except the reflexive `impl<T> From<T> for T`: its body is
-        // identity (`fn from(t: T) -> T { t }`) and
-        // `FunctionDesc.getuniquegraph` still builds that graph
-        // (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
-        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
-            && !fun_decl_is_reflexive_from(self.llbc, fd)
-        {
-            return None;
-        }
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
         if self.callee_is_host_builtin(fd) {
             return None;
@@ -9493,6 +9653,17 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
+        // Only a body this LLBC extracted can be copied here. An Opaque
+        // import is the same function object in the defining crate
+        // (`bookkeeper.py` `getdesc`); enqueue on that crate's queue.
+        // The reflexive `impl<T> From<T> for T` is the exception: its
+        // body is identity and `declare_spec` builds that graph
+        // (`FunctionDesc.getuniquegraph`).
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+            && !fun_decl_is_reflexive_from(self.llbc, fd)
+        {
+            return self.enqueue_cross_crate_spec(fd, generics, &path);
+        }
         // `FunctionDesc.cachedgraph`: each concrete instantiation is
         // its own graph, including a look-inside generic whose body
         // names no `Clause`. The inner residual then sees the type
@@ -9501,13 +9672,7 @@ impl<'a> Lowering<'a> {
             crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
-        let leaf = fd
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("fn")
-            .to_string();
+        let leaf = path.rsplit("::").next().unwrap_or("fn").to_string();
         let leaf = crate::front::clause_spec::spec_leaf(&leaf, fd.def_id, generics, self.llbc);
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
@@ -9518,6 +9683,86 @@ impl<'a> Lowering<'a> {
                 const_generics,
             });
         Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
+    /// `FunctionDesc.cachedgraph(key)` for an Opaque-imported generic:
+    /// the body lives on the defining crate, so the spec is declared
+    /// there under the leaf hashed from that crate's remapped generics.
+    fn enqueue_cross_crate_spec(
+        &self,
+        _fd: &FunDecl,
+        generics: &serde_json::Value,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let cross = self.cross_crate?;
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+        let (types, const_generics) =
+            crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let mut result = None;
+        let mut decline: Option<&'static str> = None;
+        cross.with_crates(&mut |crates| {
+            let Some((def_idx, def_fd)) =
+                crate::front::clause_spec::unique_local_unstructured(crates, path)
+            else {
+                decline = Some("no-defining-fun");
+                return;
+            };
+            let def_llbc = crates[def_idx].llbc;
+            let remapped = crate::front::clause_spec::remap_generics_to_llbc(
+                self.llbc,
+                def_llbc,
+                crates,
+                &trait_refs,
+                &types,
+                &const_generics,
+            );
+            let (trait_refs, types, const_generics) = match remapped {
+                Ok(args) => args,
+                Err(reason) => {
+                    decline = Some(reason);
+                    return;
+                }
+            };
+            let mut generics = serde_json::Map::new();
+            generics.insert("types".into(), serde_json::Value::Array(types.clone()));
+            generics.insert(
+                "const_generics".into(),
+                serde_json::Value::Array(const_generics.clone()),
+            );
+            generics.insert(
+                "trait_refs".into(),
+                serde_json::Value::Array(trait_refs.clone()),
+            );
+            let remapped_generics = serde_json::Value::Object(generics);
+            let leaf = path.rsplit("::").next().unwrap_or("fn").to_string();
+            let leaf = crate::front::clause_spec::spec_leaf(
+                &leaf,
+                def_fd.def_id,
+                &remapped_generics,
+                def_llbc,
+            );
+            let segments = spec_segments(def_llbc, def_fd, &leaf);
+            crates[def_idx]
+                .spec
+                .borrow_mut()
+                .enqueue(crate::front::clause_spec::SpecRequest {
+                    fn_id: def_fd.def_id,
+                    leaf,
+                    trait_refs,
+                    types,
+                    const_generics,
+                });
+            result = Some(segments);
+        });
+        if result.is_none() {
+            crate::decline::record_named(
+                crate::decline::gate::CROSS_CRATE_SPEC,
+                decline.unwrap_or("no-defining-fun"),
+                path,
+            );
+        }
+        result
     }
 
     /// `HOST_ENV` resolves the bare call segments, or the crate-qualified
@@ -9741,6 +9986,7 @@ impl<'a> Lowering<'a> {
     /// Class root of an inherent `&self` method whose owner ADT is opaque
     /// in this crate. `dont_look_inside` callees stay residual and are
     /// not painted. `core`/`std`/`alloc` owners are not struct classes.
+    /// `&mut self` of a GC handle is a MutRef cell, not this payload class.
     pub(in crate::front::mir) fn opaque_traced_method_self_root(
         &self,
         reg: &RegularCall,
@@ -9775,6 +10021,23 @@ impl<'a> Lowering<'a> {
         }
         let td = self.llbc.type_by_id(adt_def_id)?;
         if !matches!(td.kind, TypeDeclKind::Opaque) && !td.published_struct_copy {
+            return None;
+        }
+        // `&mut self` of a GC handle occupies a MutRef cell
+        // (`mut_ref_cell_root_of`). Painting the payload class here
+        // replaces that cell with `T`, and `install_gc_mut_ref_call`
+        // then skips wrap because args[0] is no longer the resolved
+        // operand (`expand_pop_roots`).
+        if fd.signature.inputs.first().is_some_and(|ty| {
+            tyref_gc_mut_ref_cell_root(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+            .is_some()
+        }) {
             return None;
         }
         // A fieldless enum is an int. Painting `self` as an instance
@@ -9879,6 +10142,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     self.immutable_fields,
+                    &self.raw_alloc_flavor_structs,
                     &mut raw_stack,
                 ) {
                     let owner = td

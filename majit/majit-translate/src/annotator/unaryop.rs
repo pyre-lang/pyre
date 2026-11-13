@@ -7352,6 +7352,41 @@ mod tests {
     }
 
     #[test]
+    fn pyerror_handle_getattr_value_follows_s_getattr() {
+        // `unaryop.py` `SomeInstance.getattr` special-cases only
+        // `__class__`. A missing `value` on the handle is
+        // `ClassDef.s_getattr` → `SomeImpossibleValue`.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+        let ann = mk_ann();
+        let handle = ClassDef::new_standalone("pyre_interpreter::error::PyError", None);
+        let mut v = Variable::named("operr");
+        ann.setbinding(
+            &mut v,
+            SomeValue::Instance(SomeInstance::new(
+                Some(handle.clone()),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("value"))),
+            ],
+        );
+        let result = hl
+            .consider(&ann)
+            .expect("getattr of a missing attr follows s_getattr")
+            .unwrap();
+        assert!(
+            matches!(result, SomeValue::Impossible),
+            "expected Impossible, got {result:?}"
+        );
+    }
+
+    #[test]
     fn str_method_upper_preserves_unicode_family() {
         let ann = mk_ann();
         let unicode = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
