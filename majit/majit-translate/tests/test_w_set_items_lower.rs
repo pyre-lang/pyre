@@ -5,7 +5,7 @@
 mod common;
 
 use common::{OBJECT_LLBC, load_llbc_if_present, lower_named_with_static_addrs};
-use majit_translate::model::{FunctionGraph, LinkArg, OpKind};
+use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::collections::HashSet;
 
@@ -115,6 +115,56 @@ fn w_set_items_fieldread_bases_are_defined() {
         bad.is_empty(),
         "undefined FieldRead bases in w_set_items:\n{}\n{}",
         bad.join("\n"),
+        dump_graph(&graph)
+    );
+}
+
+#[test]
+fn set_strategy_trampoline_keeps_its_vtable_call() {
+    let Some(llbc) = load_llbc_if_present(OBJECT_LLBC) else {
+        return;
+    };
+    let graph =
+        match lower_named_with_static_addrs(llbc, "set_strategy_add_key_ptr", production_addrs()) {
+            Ok(graph) => graph,
+            Err(err) => panic!("set_strategy_add_key_ptr lower failed: {err}"),
+        };
+    eprintln!(
+        "set_strategy_add_key_ptr name={:?} source_identity={:?}",
+        graph.name, graph.source_identity
+    );
+    let mut self_calls = 0usize;
+    let mut family_add = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("set_strategy_add_key_ptr") => {
+                    self_calls += 1;
+                }
+                OpKind::IndirectCall { family_key, .. }
+                    if family_key
+                        .as_ref()
+                        .map(|(trait_root, method)| (trait_root.as_str(), method.as_str()))
+                        == Some(("SetStrategy", "add")) =>
+                {
+                    family_add += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        self_calls,
+        0,
+        "trampoline body must not Call its own FunctionPath\n{}",
+        dump_graph(&graph)
+    );
+    assert!(
+        family_add > 0,
+        "trampoline body must keep IndirectCall family SetStrategy::add\n{}",
         dump_graph(&graph)
     );
 }

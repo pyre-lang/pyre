@@ -25294,7 +25294,7 @@ fn residual_call_refused_up_front_probe(
     let session = std::cell::RefCell::new(WalkSession::default());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
-    let wc = WalkContext {
+    let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
@@ -25333,7 +25333,14 @@ fn residual_call_refused_up_front_probe(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+    residual_call_refused_up_front(
+        &mut wc,
+        opcode,
+        &allboxes,
+        call_descr,
+        usize::MAX,
+        usize::MAX,
+    )
 }
 
 #[test]
