@@ -861,6 +861,22 @@ fn opkind_from_rtyper_constant(c: &Constant) -> Option<OpKind> {
             Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
             _ => Some(OpKind::ConstRefNull),
         },
+        ConstValue::LLPtr(p)
+            if kind == Some(crate::model::ConcreteType::GcRef)
+                && matches!(
+                    p._obj0_value(),
+                    Ok(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(_)
+                    ))
+                ) =>
+        {
+            match p._obj0_value() {
+                Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(n))) => {
+                    Some(OpKind::ConstRefAddr(n))
+                }
+                _ => None,
+            }
+        }
         ConstValue::LLAddress(addr) if !addr.nonzero() => match kind {
             Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
             _ => Some(OpKind::ConstRefAddr(0)),
@@ -13239,6 +13255,195 @@ mod tests {
             object._getattr(field).unwrap(),
             crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Signed(42)
         ));
+    }
+
+    #[test]
+    fn populated_memo_attaches_driver_host_call() {
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::HostCall;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        registry.set_memo_host_call(Some(HostCall(std::sync::Arc::new(|args| {
+            assert!(args.is_empty());
+            Ok(ConstValue::Int(42))
+        }))));
+        let mut graph = LegacyGraph::new("getorbuild");
+        graph.source_identity = Some("cache::Cache::getorbuild".into());
+        graph.hints.push("specialize:memo".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(
+            crate::parse::CallPath {
+                segments: vec!["cache".into(), "Cache".into(), "getorbuild".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            graph,
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "cache",
+                "Cache",
+                "getorbuild",
+            ]))
+            .unwrap();
+        assert!(entry.function_desc.borrow().is_memo());
+        assert!(
+            entry
+                .host_object
+                .user_function()
+                .unwrap()
+                .host_call
+                .is_some()
+        );
+        assert!(entry.function_desc.borrow().cache.borrow().is_empty());
+        let result = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap();
+        let SpecializeResult::Annotation(value) = result else {
+            panic!("memo annotation expected")
+        };
+        assert!(value.is_constant());
+        assert!(matches!(
+            *value,
+            crate::annotator::model::SomeValue::Integer(_)
+        ));
+        assert!(entry.function_desc.borrow().cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn constant_prebuilt_getorbuild_folds_to_const_ref_addr() {
+        // specialize.py memo + rclass.py InstanceRepr.convert_const_exact:
+        // constant PREBUILT receiver + constant SpaceCacheClass key fold
+        // to ConstRefAddr of the live refs row. The original getorbuild
+        // body is not lifted, so LOCK is never a CallRegistry subject.
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::{SomeInstance, SomeObjectTrait};
+        use crate::flowspace::model::{HostCall, HostGetAttrError, HostObject, NativeInstanceDict};
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::sync::Arc;
+
+        struct LiveRef {
+            addr: i64,
+        }
+        impl NativeInstanceDict for LiveRef {
+            fn get(&self, _name: &str) -> Result<ConstValue, HostGetAttrError> {
+                Err(HostGetAttrError::Missing)
+            }
+            fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+                Ok(Vec::new())
+            }
+            fn live_addr(&self) -> Option<i64> {
+                Some(self.addr)
+            }
+        }
+
+        const PREBUILT: i64 = 0x0000_BEEF;
+        const RESULT: i64 = 0x1234_5678;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let cache_class = HostObject::new_class("cache.Cache", vec![]);
+        cache_class.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "cache.Cache._freeze_",
+                Arc::new(|_| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        let cache =
+            HostObject::new_native_instance(cache_class, Arc::new(LiveRef { addr: PREBUILT }));
+        let result_class =
+            HostObject::new_class("objspace.std.classdict.ClassDictStrategy", vec![]);
+        let result =
+            HostObject::new_native_instance(result_class, Arc::new(LiveRef { addr: RESULT }));
+        let expected_cache = cache.clone();
+        let native_result = result.clone();
+        let mut func = GraphFunc::new(
+            "getorbuild",
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+        );
+        func.annspecialcase = Some("specialize:memo".into());
+        func.host_call = Some(HostCall(Arc::new(move |args| {
+            let has_prebuilt = args.iter().any(|arg| match arg {
+                ConstValue::HostObject(h) => h.live_ref_addr() == Some(PREBUILT),
+                _ => false,
+            });
+            if !has_prebuilt {
+                return Err("specialize:memo host_call: no PREBUILT receiver".into());
+            }
+            let has_key = args.iter().any(|arg| matches!(arg, ConstValue::Int(0)));
+            if !has_key {
+                return Err("specialize:memo host_call: no fromcache key".into());
+            }
+            assert_eq!(args[0], ConstValue::HostObject(expected_cache.clone()));
+            Ok(ConstValue::HostObject(native_result.clone()))
+        })));
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["cache", "Cache", "getorbuild"]),
+            Signature::new(vec!["cache".into(), "key".into()], None, None),
+            func,
+        );
+        let s_cache = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::HostObject(cache))
+            .unwrap();
+        assert!(matches!(
+            s_cache,
+            crate::annotator::model::SomeValue::PBC(_)
+        ));
+        let mut s_key = crate::annotator::model::SomeInteger::default();
+        s_key.base.const_box = Some(Constant::new(ConstValue::Int(0)));
+        let s_key = crate::annotator::model::SomeValue::Integer(s_key);
+        let SpecializeResult::Annotation(s_result) = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut vec![Some(s_cache), Some(s_key)], None)
+            .unwrap()
+        else {
+            panic!("memo must first return its result annotation")
+        };
+        assert!(s_result.is_constant());
+        assert!(matches!(
+            *s_result,
+            crate::annotator::model::SomeValue::Instance(_)
+        ));
+        assert!(
+            entry.function_desc.borrow().cache.borrow().is_empty(),
+            "memo must not lift the getorbuild body (LOCK stays off the graph)"
+        );
+
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let repr = rtyper.getrepr(&s_result).unwrap();
+        rtyper.call_all_setups().unwrap();
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+        let converted = repr.convert_const(&ConstValue::HostObject(result)).unwrap();
+        assert_eq!(
+            opkind_from_rtyper_constant(&converted),
+            Some(OpKind::ConstRefAddr(RESULT))
+        );
+
+        let isolated_class = HostObject::new_class("isolated.ObjSpace", vec![]);
+        let isolated_cd = ann.bookkeeper.getuniqueclassdef(&isolated_class).unwrap();
+        let s_isolated = crate::annotator::model::SomeValue::Instance(SomeInstance::new(
+            Some(isolated_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let mut s_key = crate::annotator::model::SomeInteger::default();
+        s_key.base.const_box = Some(Constant::new(ConstValue::Int(0)));
+        let s_key = crate::annotator::model::SomeValue::Integer(s_key);
+        let err = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut vec![Some(s_isolated), Some(s_key)], None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be a class or a frozen PBC"),
+            "{err}"
+        );
     }
 
     fn link_to_returnblock(args: Vec<LinkArg>, returnblock_id: BlockId) -> crate::model::Link {

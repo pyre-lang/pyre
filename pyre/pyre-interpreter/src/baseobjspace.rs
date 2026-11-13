@@ -502,6 +502,11 @@ impl<F: SpaceCallable<S>, S> InternalSpaceCache<F, S> {
     pub fn visit_values_mut(&self, visit: impl FnMut(&mut F::Value)) {
         self.base.visit_values_mut(visit);
     }
+
+    /// Address of the `Cache` field (`cache.py Cache`, frozen PBC).
+    pub fn cache_addr(&self) -> i64 {
+        &self.base as *const _ as i64
+    }
 }
 
 impl<F: SpaceCallable<S>, S> majit_rlib::cache::CacheBuilder<F, F::Value>
@@ -642,6 +647,29 @@ pub enum SpaceCacheClass {
     SysState,
 }
 
+impl SpaceCacheClass {
+    /// Every fromcache key the PREBUILT space can intern
+    /// (`baseobjspace.py fromcache` / `Cache.getorbuild`).
+    pub const ALL: [Self; 2] = [Self::ClassDictStrategy, Self::SysState];
+
+    /// Crate-stripped type path used as the refs-row name
+    /// (`jit_static_ref_addrs`, `static_key_matches`).
+    pub fn jit_ref_name(self) -> &'static str {
+        match self {
+            Self::ClassDictStrategy => "objspace::std::classdict::ClassDictStrategy",
+            Self::SysState => "module::sys::state::SysState",
+        }
+    }
+
+    pub fn from_discriminant(d: i64) -> Option<Self> {
+        match d {
+            0 => Some(Self::ClassDictStrategy),
+            1 => Some(Self::SysState),
+            _ => None,
+        }
+    }
+}
+
 /// A `fromcache` value plus the IsolatedStrong that keeps an isolated
 /// space alive. InternalSpaceCache stores Isolated(Weak); `fromcache`
 /// upgrades only this wrapper so `ObjSpace → cache → ObjSpace` cannot cycle.
@@ -677,6 +705,10 @@ impl<T> RetainedSpaceCache<T> {
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&this.inner, &other.inner)
     }
+
+    pub fn as_ptr(&self) -> *const T {
+        std::sync::Arc::as_ptr(&self.inner)
+    }
 }
 
 impl<T> std::ops::Deref for RetainedSpaceCache<T> {
@@ -694,6 +726,15 @@ pub enum SpaceCacheInstance {
 }
 
 impl SpaceCacheInstance {
+    /// Live address of the inner strategy object
+    /// (`bookkeeper.py Bookkeeper.immutablevalue` of `Cache.getorbuild`).
+    pub fn live_addr(&self) -> i64 {
+        match self {
+            Self::ClassDictStrategy(cache) => cache.as_ptr() as i64,
+            Self::SysState(cache) => cache.as_ptr() as i64,
+        }
+    }
+
     /// Attach IsolatedStrong to a cloned cache so an escaped result keeps
     /// its isolated space alive. The stored clone is left untouched.
     fn retain_owner(self) -> Self {
@@ -976,6 +1017,11 @@ impl ObjSpace {
             .getorbuild(cls)
             .unwrap_or_else(|_| panic!("recursive object-space cache construction"))
             .retain_owner()
+    }
+
+    /// Address of this space's `fromcache` `Cache` (`cache.py Cache`).
+    pub fn fromcache_cache_addr(&self) -> i64 {
+        self.fromcache.cache_addr()
     }
 
     pub fn walk_cache_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {

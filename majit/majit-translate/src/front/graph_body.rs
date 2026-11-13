@@ -582,6 +582,7 @@ impl ProviderTables {
                     .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
             },
             scalar_field_stores: &scalar_field_stores,
+            memo_host_call: None,
         })
     }
 }

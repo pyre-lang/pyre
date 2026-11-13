@@ -69,7 +69,7 @@ use crate::annotator::description::{AnnSignature, FunctionDesc, copy_or_mint_uni
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
+use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostCall, HostObject};
 use crate::flowspace::pygraph::PyGraph;
 use crate::parse::{CallPath, GraphSpecialization};
 
@@ -566,6 +566,11 @@ pub struct CallRegistry {
     /// populated, on its first lookup (`bookkeeper.py getdesc`: the
     /// descriptor is created the first time the object is seen).
     getdesc: RefCell<Option<Getdesc>>,
+    /// Driver `specialize:memo` evaluator (`specialize.py memo` `func(*args)`).
+    /// Attached in [`Self::get_or_register_with_func`] when the source
+    /// callable has `_annspecialcase_ = specialize:memo` and no evaluator
+    /// of its own.
+    memo_host_call: RefCell<Option<HostCall>>,
 }
 
 /// [`CallRegistry::set_getdesc`]'s callback: the entry for a path the
@@ -582,7 +587,13 @@ impl CallRegistry {
             two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
             getdesc: RefCell::new(None),
+            memo_host_call: RefCell::new(None),
         }
+    }
+
+    /// Driver `specialize:memo` evaluator (`GraphFunc.host_call`).
+    pub fn set_memo_host_call(&self, hook: Option<HostCall>) {
+        *self.memo_host_call.borrow_mut() = hook;
     }
 
     /// Describe a function object the registry has no entry for through
@@ -1516,6 +1527,14 @@ impl CallRegistry {
             );
             return existing;
         }
+        let mut graph_func = graph_func;
+        if graph_func.host_call.is_none()
+            && graph_func.annspecialcase.as_deref() == Some("specialize:memo")
+        {
+            if let Some(hook) = self.memo_host_call.borrow().clone() {
+                graph_func.host_call = Some(hook);
+            }
+        }
         let host_object = HostObject::new_user_function(graph_func);
         let exception_object_result = is_exception_object_materializer(&key);
         let desc = self
@@ -2392,6 +2411,85 @@ mod tests {
         assert!(
             err.to_string().contains("no host_call hook registered"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn get_or_register_with_func_attaches_driver_memo_host_call() {
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_memo_host_call(Some(HostCall(Arc::new(|args| {
+            assert!(args.is_empty());
+            Ok(ConstValue::Int(42))
+        }))));
+        let mut func = GraphFunc::new(
+            "getorbuild",
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+        );
+        func.annspecialcase = Some("specialize:memo".into());
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["cache", "Cache", "getorbuild"]),
+            signature(&[]),
+            func,
+        );
+        assert!(entry.function_desc.borrow().is_memo());
+        assert!(
+            entry
+                .host_object
+                .user_function()
+                .unwrap()
+                .host_call
+                .is_some(),
+            "driver memo_host_call must attach when GraphFunc.host_call is None"
+        );
+        let SpecializeResult::Annotation(value) = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap()
+        else {
+            panic!("memo annotation expected")
+        };
+        assert!(value.is_constant());
+        assert!(matches!(value.const_(), Some(ConstValue::Int(42))));
+    }
+
+    #[test]
+    fn get_or_register_with_func_keeps_existing_memo_host_call() {
+        use crate::annotator::description::SpecializeResult;
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_memo_host_call(Some(HostCall(Arc::new(|_| Ok(ConstValue::Int(1))))));
+        let mut func = GraphFunc::new(
+            "getorbuild",
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+        );
+        func.annspecialcase = Some("specialize:memo".into());
+        func.host_call = Some(HostCall(Arc::new(|_| Ok(ConstValue::Int(7)))));
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["cache", "Cache", "owned_memo"]),
+            signature(&[]),
+            func,
+        );
+        let SpecializeResult::Annotation(value) = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap()
+        else {
+            panic!("memo annotation expected")
+        };
+        assert!(
+            matches!(value.const_(), Some(ConstValue::Int(7))),
+            "an already-set GraphFunc.host_call wins over the driver hook"
         );
     }
 

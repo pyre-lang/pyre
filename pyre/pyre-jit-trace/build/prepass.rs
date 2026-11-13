@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v25";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v26";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -246,6 +246,90 @@ fn forward_engine_env_aliases() {
             unsafe { std::env::set_var(engine_name, value) };
         }
     }
+}
+
+/// Driver `specialize:memo` evaluator (`specialize.py memo` `func(*args)`).
+/// Decodes a PREBUILT space / fromcache cache PBC plus a constant
+/// `SpaceCacheClass` key and returns the live inner strategy as a
+/// `HostObject` whose identity `bookkeeper.py Bookkeeper.immutablevalue`
+/// keeps stable. Isolated receivers have no PREBUILT live address and
+/// are refused.
+fn specialize_memo_host_call() -> majit_translate::flowspace::model::HostCall {
+    use majit_translate::flowspace::model::{
+        ConstValue, HostCall, HostGetAttrError, HostObject, NativeInstanceDict,
+    };
+    use pyre_interpreter::SpaceCacheClass;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct LiveRef {
+        addr: i64,
+    }
+    impl NativeInstanceDict for LiveRef {
+        fn get(&self, _name: &str) -> Result<ConstValue, HostGetAttrError> {
+            Err(HostGetAttrError::Missing)
+        }
+        fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+            Ok(Vec::new())
+        }
+        fn live_addr(&self) -> Option<i64> {
+            Some(self.addr)
+        }
+    }
+
+    let space = pyre_interpreter::object_space();
+    let mut prebuilt = vec![space as *const _ as i64, space.fromcache_cache_addr()];
+    for cls in SpaceCacheClass::ALL {
+        prebuilt.push(space.fromcache(cls).live_addr());
+    }
+    let intern = Mutex::new(HashMap::<i64, HostObject>::new());
+    let classes = Mutex::new(HashMap::<String, HostObject>::new());
+
+    HostCall(Arc::new(move |args: &[ConstValue]| {
+        let has_prebuilt = args.iter().any(|arg| match arg {
+            ConstValue::HostObject(h) => h.live_ref_addr().is_some_and(|a| prebuilt.contains(&a)),
+            ConstValue::LLPtr(p) => matches!(
+                p._obj0_value(),
+                Ok(Some(
+                    majit_translate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(n)
+                )) if prebuilt.contains(&n)
+            ),
+            ConstValue::Int(n) => prebuilt.contains(n),
+            _ => false,
+        });
+        if !has_prebuilt {
+            return Err("specialize:memo host_call: no PREBUILT receiver".to_string());
+        }
+        let key = args.iter().find_map(|arg| match arg {
+            ConstValue::Int(n) => SpaceCacheClass::from_discriminant(*n),
+            ConstValue::HostObject(h) => SpaceCacheClass::ALL.into_iter().find(|cls| {
+                let name = cls.jit_ref_name();
+                let leaf = name.rsplit("::").next().unwrap_or(name);
+                h.simple_name() == leaf || h.qualname().contains(name)
+            }),
+            _ => None,
+        });
+        let Some(key) = key else {
+            return Err("specialize:memo host_call: no fromcache key".to_string());
+        };
+        let inst = pyre_interpreter::object_space().fromcache(key);
+        let addr = inst.live_addr();
+        let qualname = key.jit_ref_name();
+        let mut intern = intern.lock().expect("memo intern");
+        if let Some(existing) = intern.get(&addr) {
+            return Ok(ConstValue::HostObject(existing.clone()));
+        }
+        let class = {
+            let mut classes = classes.lock().expect("memo classes");
+            classes
+                .entry(qualname.to_string())
+                .or_insert_with(|| HostObject::new_class(qualname, Vec::new()))
+                .clone()
+        };
+        let host = HostObject::new_native_instance(class, Arc::new(LiveRef { addr }));
+        intern.insert(addr, host.clone());
+        Ok(ConstValue::HostObject(host))
+    }))
 }
 
 /// Entry of the real build: the translation prepass over the LLBC set.
@@ -1481,6 +1565,7 @@ fn real_main() {
     let static_pytype_by_struct = pyre_interpreter::pyre_class_pytype_by_struct_addrs();
     let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
     let static_int_values = pyre_interpreter::jit_static_int_values();
+    let memo_host_call = specialize_memo_host_call();
     let static_addrs = majit_translate::HostStaticAddrs {
         pytypes: &static_pytype_addrs,
         pytypes_by_struct: &static_pytype_by_struct,
@@ -1491,6 +1576,7 @@ fn real_main() {
         // assignment the lowering already reaches, so it declares no store
         // boundary.
         scalar_field_stores: &[],
+        memo_host_call: Some(&memo_host_call),
     };
     // Per-source crate-stripped module paths — the analyzer-side
     // metadata (`front::mir`) records

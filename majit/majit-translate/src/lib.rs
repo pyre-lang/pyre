@@ -749,6 +749,10 @@ pub struct HostStaticAddrs<'a> {
     /// Empty (the `Default`) declares none, which leaves every call to be
     /// lowered by descending into its callee as usual.
     pub scalar_field_stores: &'a [ScalarFieldStore<'a>],
+    /// Driver-supplied `specialize:memo` evaluator (`specialize.py memo`
+    /// `func(*args)`). `majit-translate` does not import the interpreter;
+    /// `pyre-jit-trace` prepass fills this from the live host.
+    pub memo_host_call: Option<&'a crate::flowspace::model::HostCall>,
 }
 
 /// Multi-file analysis with explicit per-source module paths.
@@ -1013,7 +1017,12 @@ fn apply_harvested_funcobj_hints(
 ) {
     use crate::codewriter::call::DecoratorAttr;
     for (path_str, hints) in harvested_hints {
-        if hints.iter().all(|h| DecoratorAttr::from_hint(h).is_none()) {
+        // `specialize:memo` is annotator policy (`func._annspecialcase_`),
+        // not a JIT `DecoratorAttr`. Body-less funcobjs still need
+        // `GraphFunc.annspecialcase` (`Bookkeeper.newfuncdesc`).
+        let has_decorator = hints.iter().any(|h| DecoratorAttr::from_hint(h).is_some());
+        let has_memo = hints.iter().any(|h| h == "specialize:memo");
+        if !has_decorator && !has_memo {
             continue;
         }
         let segs: Vec<&str> = path_str.split("::").collect();
@@ -1045,7 +1054,12 @@ fn apply_harvested_funcobj_hints(
             )
         };
         for p in &paths {
-            call_control.mark_decorator_hints(p, hints);
+            if has_decorator {
+                call_control.mark_decorator_hints(p, hints);
+            }
+            if has_memo {
+                call_control.mark_specialize_memo(p);
+            }
         }
     }
 }
@@ -1918,6 +1932,9 @@ fn analyze_pipeline_from_module_paths(
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
     let mut call_control = call::CallControl::new();
+    if let Some(hook) = static_addrs.memo_host_call {
+        call_control.set_memo_host_call(Some(hook.clone()));
+    }
     call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
@@ -5838,6 +5855,70 @@ mod harvested_funcobj_hints_tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
+    }
+
+    /// `#[specialize_memo]` on `Cache::getorbuild` harvests as
+    /// `specialize:memo` (`cache.py` `Cache.getorbuild._annspecialcase_`).
+    #[test]
+    fn harvested_cache_getorbuild_is_specialize_memo() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/llbc/majit-rlib.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = crate::test_support::load_ullbc(path);
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+        let hits: Vec<_> = harvested
+            .iter()
+            .filter(|(key, hints)| {
+                key.contains("getorbuild") && hints.iter().any(|hint| hint == "specialize:memo")
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "Cache::getorbuild specialize:memo missing; getorbuild keys: {:?}",
+            harvested
+                .keys()
+                .filter(|key| key.contains("getorbuild"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Body-less `specialize:memo` is annotator policy
+    /// (`func._annspecialcase_`), not a JIT `DecoratorAttr`. Harvest still
+    /// stamps the token so `source_graph_func` copies it onto
+    /// `GraphFunc.annspecialcase` (`Bookkeeper.newfuncdesc`).
+    #[test]
+    fn harvested_specialize_memo_stamps_without_decorator_attr() {
+        use crate::codewriter::call::DecoratorAttr;
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let path = CallPath::from_segments(["cache", "Cache", "getorbuild"]);
+            cc.register_function_graph(path.clone(), FunctionGraph::new("getorbuild"));
+            let mut harvested = std::collections::HashMap::new();
+            harvested.insert(
+                "cache::Cache::getorbuild".to_string(),
+                vec!["specialize:memo".to_string()],
+            );
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+            let graph = cc
+                .function_graphs()
+                .get(&path)
+                .expect("registered getorbuild graph");
+            assert!(
+                graph.hints.iter().any(|h| h == "specialize:memo"),
+                "harvested specialize:memo must land on the registered graph: {:?}",
+                graph.hints
+            );
+            assert!(
+                DecoratorAttr::from_hint("specialize:memo").is_none(),
+                "specialize:memo is not a JIT DecoratorAttr"
+            );
+        });
     }
 
     /// The same fallback still stamps `oopspec` that the previous skip

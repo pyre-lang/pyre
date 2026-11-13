@@ -664,7 +664,7 @@ pub fn build_value_to_hlvalue_map(
 /// `llmemory.Address` is int-kinded.  `cast_int_to_ptr` is not usable
 /// here — it asserts odd (tagged) integers (lltype.py) and
 /// host addresses are even — so the `_ptr` is built directly.
-fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
+pub(crate) fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF, LowLevelType};
     let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
         panic!("GCREF must be a Ptr lowleveltype");

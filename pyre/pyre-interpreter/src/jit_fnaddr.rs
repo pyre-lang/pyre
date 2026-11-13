@@ -7697,6 +7697,13 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             crate::builtins::hash_secret() as *const [u8; 16] as i64,
         ),
     ];
+    // PREBUILT `space.fromcache(K)` instances (`cache.py Cache.getorbuild`
+    // `specialize:memo`, `bookkeeper.py Bookkeeper.immutablevalue`).
+    // Names are the crate-stripped key type paths; holder rows stay.
+    for cls in crate::baseobjspace::SpaceCacheClass::ALL {
+        let inst = crate::baseobjspace::object_space().fromcache(cls);
+        v.push((cls.jit_ref_name(), inst.live_addr()));
+    }
     v.extend(jit_static_fnptrcell_addrs());
     v.extend(pyre_class_typeidcell_addrs());
     v
@@ -9557,6 +9564,24 @@ mod tests {
         assert_eq!(
             bindings["pyobject::OBJECT_LAYOUT"],
             pyre_object::object_layout_static_addr() as i64
+        );
+    }
+
+    #[test]
+    fn jit_static_ref_addrs_covers_fromcache_instances() {
+        let bindings: HashMap<&'static str, i64> = jit_static_ref_addrs().into_iter().collect();
+        for cls in crate::baseobjspace::SpaceCacheClass::ALL {
+            let inst = crate::baseobjspace::object_space().fromcache(cls);
+            assert_eq!(
+                bindings.get(cls.jit_ref_name()).copied(),
+                Some(inst.live_addr()),
+                "{}",
+                cls.jit_ref_name()
+            );
+        }
+        assert_eq!(
+            bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],
+            crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64
         );
     }
 
