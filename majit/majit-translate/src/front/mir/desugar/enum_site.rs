@@ -500,12 +500,17 @@ impl<'a> Lowering<'a> {
         Some(format!("{}{}", td.item_meta.name_path(), suffix))
     }
 
-    /// Registered ADT pointee of a one-word niche `Option<&T>` /
-    /// `Option<&mut T>` / `Option<*mut T>`.
+    /// Class root of a one-word niche `Option<&T>` / `Option<&mut T>` /
+    /// `Option<*mut T>`: the registered ADT pointee, except a GC `&mut T`
+    /// payload which is the MutRef cell (`gc_mut_ref_input_stamp` /
+    /// `tyref_option_gc_mut_ref_cell_root`).
     ///
     /// Rust uses the null pointer niche for this Option shape. It therefore
-    /// maps to RPython's nullable `SomeInstance(T)`, not to an Option
-    /// container class with `__discriminant` / `__pos_0` fields.
+    /// maps to RPython's nullable `SomeInstance`, not to an Option
+    /// container class with `__discriminant` / `__pos_0` fields. `None`
+    /// (`option_niche_null_cast`) and the Some-arm identity share this
+    /// root so a `None` of `Option<&mut T>` unions with a MutRef wrap
+    /// (`model.py` `SomeInstance.__init__` / `binaryop.py` `union`).
     pub(in crate::front::mir) fn option_niche_payload_class_root(
         &self,
         dest_ty: &TyRef,
@@ -513,7 +518,15 @@ impl<'a> Lowering<'a> {
         if !self.tyref_is_niche_option_ptr(dest_ty) {
             return None;
         }
-        self.option_payload_instance_class_root(dest_ty)
+        // A GC `&mut T` payload is the MutRef cell, not `T`.
+        tyref_option_gc_mut_ref_cell_root(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .or_else(|| self.option_payload_instance_class_root(dest_ty))
     }
 
     /// Target projection for the null half of a nullable Option whose payload
@@ -605,9 +618,10 @@ impl<'a> Lowering<'a> {
         // `None` of a nullable instance is RPython's `None`, which unions
         // into `SomeInstance(T, can_be_none=True)` and keeps the class
         // (`model.py` `unionof`). The bare `null_mut()` is classdef-less.
-        // Narrow the null to the payload class (`rnone.py`
-        // `pairtype(NoneRepr, Repr).convert_from_to`).
-        if let Some(root) = self.option_payload_instance_class_root(option_ty) {
+        // Narrow the null to the same class the Some arm occupies
+        // (`rnone.py` `pairtype(NoneRepr, Repr).convert_from_to`):
+        // MutRef cell for a GC `&mut T`, payload class otherwise.
+        if let Some(root) = self.option_niche_payload_class_root(option_ty) {
             return Some((root.clone(), ValueType::Ref(Some(root))));
         }
         None
@@ -862,6 +876,8 @@ impl<'a> Lowering<'a> {
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
+            payload_is_element_addr: false,
+            element_byte_size: 0,
         })
     }
 

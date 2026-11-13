@@ -152,6 +152,11 @@ pub mod gate {
     /// `rewrite_op_free` still wants a free; omitting it is a leak when
     /// the header was allocated here and only a phi hid the producer.
     pub const RUST_VEC_DROP: &str = "rust-vec-drop";
+    /// Cross-crate `FunctionDesc.cachedgraph`: an Opaque-imported generic
+    /// whose defining FunDecl could not be specialized (no unique body,
+    /// or the call-site generics could not be rewritten into that crate's
+    /// tables). The call keeps the unspecialized path.
+    pub const CROSS_CRATE_SPEC: &str = "clause_spec::cross_crate_spec";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.

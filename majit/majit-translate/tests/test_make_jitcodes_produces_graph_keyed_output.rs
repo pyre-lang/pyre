@@ -305,6 +305,9 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
         // `(AccessDirect, key)` graph; `cachedgraph` registers it under
         // alt_name `{name}__AccessDirect_None`. The regular graph is only
         // in the closure when an unflagged frame also calls it.
+        // A generic callee is first its type-argument `cachedgraph`
+        // (`{name}__spec_{key}`, `clause_spec::spec_leaf`); the leaf is
+        // compared without that key.
         for required_leaf in ["execute_opcode_step", "execute_pop_top"] {
             assert!(
                 reg.by_path.keys().any(|path| {
@@ -312,6 +315,7 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
                         .as_ref()
                         .unwrap_or(path)
                         .last_segment()
+                        .and_then(|leaf| leaf.split("__spec_").next())
                         == Some(required_leaf)
                 }),
                 "ordinary portal closure must contain `{required_leaf}`",

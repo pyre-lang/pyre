@@ -432,10 +432,10 @@ pub struct TwoPhaseSubject {
     /// retaining the `GraphRef` lets post-rtype consumers inspect the exact
     /// low-level operations that succeeded.
     pub graph: crate::flowspace::model::GraphRef,
-    /// The annotator's `PyGraph` for an AccessDirect subject: the origin
-    /// FunctionDesc's `cachedgraph((AccessDirect, None))` entry. Publish
-    /// identity-checks this against the desc cache (`Rc::ptr_eq`). Regular
-    /// subjects leave it empty.
+    /// The annotator's `PyGraph` for a two-phase subject: AccessDirect
+    /// uses `cachedgraph((AccessDirect, None))`; a regular subject uses
+    /// `cachedgraph(None)` when that key holds this lift. Publish
+    /// identity-checks this against the desc cache (`Rc::ptr_eq`).
     pub pygraph: Option<Rc<PyGraph>>,
     pub graph_key: crate::flowspace::model::GraphKey,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,

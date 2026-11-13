@@ -873,7 +873,50 @@ impl RPythonAnnotator {
                             .graph()
                             .map(|g| g.borrow().name.clone())
                             .unwrap_or_default();
-                        format!(" graph={gname} op_index={}", pk.op_index)
+                        let op_txt = pk
+                            .block()
+                            .map(|b| {
+                                let block = b.borrow();
+                                let fmt_op = |op: &crate::flowspace::model::SpaceOperation| {
+                                    let args = op
+                                        .args
+                                        .iter()
+                                        .map(|a| {
+                                            let s = a.to_string();
+                                            if s.len() > 96 {
+                                                format!("{}…", &s[..96])
+                                            } else {
+                                                s
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!("{}({}) -> {}", op.opname, args, op.result)
+                                };
+                                let n = block.operations.len();
+                                let mut parts = vec![format!(" nops={n}")];
+                                match block.operations.get(pk.op_index) {
+                                    Some(cur) => {
+                                        parts.push(format!(" op={}", fmt_op(cur)));
+                                        if let Some(prev) = pk
+                                            .op_index
+                                            .checked_sub(1)
+                                            .and_then(|i| block.operations.get(i))
+                                        {
+                                            parts.push(format!(" prev={}", fmt_op(prev)));
+                                        }
+                                    }
+                                    None => parts.push(" op=<oob>".to_string()),
+                                }
+                                let start = pk.op_index.saturating_sub(2);
+                                let end = (pk.op_index.saturating_add(3)).min(n);
+                                for i in start..end {
+                                    parts.push(format!(" [{i}]={}", fmt_op(&block.operations[i])));
+                                }
+                                parts.join("")
+                            })
+                            .unwrap_or_else(|| " block=<none>".to_string());
+                        format!(" graph={gname} op_index={}{op_txt}", pk.op_index)
                     });
                     panic!(
                         "setbinding: new value does not contain old ({:?} ⊄ {:?}) var={}{}",

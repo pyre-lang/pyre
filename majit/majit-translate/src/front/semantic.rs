@@ -487,11 +487,11 @@ pub struct StructFieldRegistry {
     /// queries treat a missing or stale fingerprint as absent and rebuild.
     #[serde(skip)]
     pub(crate) field_path_index: std::cell::RefCell<Option<FieldPathIndex>>,
-    /// Owners whose fields are only scalar words and pointers to those
-    /// (`adt_def_is_raw_storage`). Empty on a hand-built fixture, which
+    /// Owners that are lltype raw storage (`rffi.py` `CStruct` /
+    /// `adt_def_is_raw_storage`). Empty on a hand-built fixture, which
     /// keeps the `GcKind::Raw` gate. A harvested program lists every
-    /// spelling of those owners; a classed struct that is merely not a
-    /// GC header is absent, so a pointer to it stays an instance.
+    /// spelling of those owners; a Rust-repr class (`rclass.py`
+    /// `getinstancerepr`) is absent, so a pointer to it stays an instance.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
     /// `StructId`s whose declared `_gckind` is `Gc` (`GcType` impl,
@@ -501,6 +501,14 @@ pub struct StructFieldRegistry {
     /// `_arrayfld` until a test seeds the declared fact.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// `#[repr(transparent)]` wrappers whose unique sized field is a
+    /// scalar (`discover_transparent_scalar_kinds`). Keyed by the full
+    /// path and, when it still names a module, the crate-stripped path
+    /// (`eval::FrameAnchor`). Bare leaves stay off the map: they collide
+    /// across crates (`InternalBitFlags`). The value is that inner word;
+    /// the wrapper is not a C struct.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) transparent_scalar_kinds: HashMap<String, crate::model::ValueType>,
     /// Crate roots of FunDecls that lowered a body and are not local
     /// alias roots. Intern and field lookup strip these prefixes
     /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
@@ -686,6 +694,48 @@ impl<'a> FieldRowsEntry<'a> {
 }
 
 impl StructFieldRegistry {
+    /// Inner word of a harvested transparent scalar, or `None`.
+    ///
+    /// Harvest dual-publishes the full path and the crate-stripped path
+    /// (`eval::FrameAnchor`). Charon's field spelling of a capture is the
+    /// ADT leaf (`&FrameAnchor`); intern of that leaf is
+    /// `Instance(eval::FrameAnchor)` while `live`'s `&self` is the depth
+    /// word. Bare leaves stay off the map (`InternalBitFlags` collides);
+    /// a unique kind across suffix keys is that word.
+    pub(crate) fn transparent_scalar_kind(
+        &self,
+        class_root: &str,
+    ) -> Option<crate::model::ValueType> {
+        let stripped = class_root
+            .trim()
+            .trim_start_matches("&mut ")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let lookup = stripped
+            .split_once('<')
+            .map(|(bare, _)| bare)
+            .unwrap_or(stripped);
+        if let Some(kind) = self
+            .transparent_scalar_kinds
+            .get(stripped)
+            .or_else(|| self.transparent_scalar_kinds.get(lookup))
+            .cloned()
+        {
+            return Some(kind);
+        }
+        let canonical = majit_ir::descr::canonical_struct_name(lookup);
+        if canonical.as_str() != lookup
+            && let Some(kind) = self
+                .transparent_scalar_kinds
+                .get(canonical.as_str())
+                .cloned()
+        {
+            return Some(kind);
+        }
+        unique_transparent_scalar_kind(&self.transparent_scalar_kinds, lookup)
+    }
+
     /// Look up a field's type.  For array-typed fields like
     /// `Vec<Point>`, this returns the full type string `"Vec<Point>"`.
     /// Callers use `array_element_type_from_str` to extract `"Point"`.
@@ -1145,6 +1195,34 @@ pub(crate) fn is_path_suffix(longer: &str, shorter: &str) -> bool {
     longer[..prefix_len].ends_with("::")
 }
 
+/// Kind of `lookup` when every harvested transparent-scalar key whose
+/// leaf matches agrees. Two crates' `InternalBitFlags` disagree and
+/// stay `None`; `FrameAnchor` / `&FrameAnchor` share one unsigned word.
+fn unique_transparent_scalar_kind(
+    kinds: &HashMap<String, crate::model::ValueType>,
+    lookup: &str,
+) -> Option<crate::model::ValueType> {
+    let leaf = lookup.rsplit("::").next().unwrap_or(lookup);
+    let mut found: Option<&crate::model::ValueType> = None;
+    for (key, kind) in kinds {
+        let key_leaf = key.rsplit("::").next().unwrap_or(key);
+        if key_leaf != leaf {
+            continue;
+        }
+        let matches_lookup = key == lookup || is_path_suffix(key, lookup);
+        let matches_bare_leaf = !lookup.contains("::") && is_path_suffix(key, leaf);
+        if !matches_lookup && !matches_bare_leaf {
+            continue;
+        }
+        match found {
+            None => found = Some(kind),
+            Some(prev) if prev != kind => return None,
+            Some(_) => {}
+        }
+    }
+    found.cloned()
+}
+
 /// Exact memory layout of a type, resolved from Charon's per-target
 /// `variant_layouts.field_offsets` in the LLBC (not the `#[repr(C)]`-
 /// approximating heuristic).  Keyed in [`SemanticProgram::exact_layouts`]
@@ -1465,6 +1543,36 @@ mod tests {
             list_family_bare_vec_spelling("rlist::TypedItemsBlock"),
             None
         );
+    }
+
+    #[test]
+    fn transparent_scalar_kind_resolves_unique_leaf_and_refuses_collision() {
+        let mut reg = StructFieldRegistry::default();
+        reg.transparent_scalar_kinds.insert(
+            "eval::FrameAnchor".to_string(),
+            crate::model::ValueType::Unsigned,
+        );
+        reg.transparent_scalar_kinds.insert(
+            "pyre_interpreter::eval::FrameAnchor".to_string(),
+            crate::model::ValueType::Unsigned,
+        );
+        assert_eq!(
+            reg.transparent_scalar_kind("&FrameAnchor"),
+            Some(crate::model::ValueType::Unsigned)
+        );
+        assert_eq!(
+            reg.transparent_scalar_kind("FrameAnchor"),
+            Some(crate::model::ValueType::Unsigned)
+        );
+        reg.transparent_scalar_kinds.insert(
+            "crate_a::InternalBitFlags".to_string(),
+            crate::model::ValueType::Unsigned,
+        );
+        reg.transparent_scalar_kinds.insert(
+            "crate_b::InternalBitFlags".to_string(),
+            crate::model::ValueType::Int,
+        );
+        assert_eq!(reg.transparent_scalar_kind("InternalBitFlags"), None);
     }
 
     /// `remove` then `insert` of a different key restores `len`. The suffix

@@ -1189,7 +1189,8 @@ impl RPythonTyper {
     /// same Variable identity.
     pub fn setconcretetype(&self, var: &Variable) -> Result<(), TyperError> {
         let repr = self.bindingrepr(&Hlvalue::Variable(var.clone()))?;
-        var.set_concretetype(Some(repr.lowleveltype().clone()));
+        let ll = repr.lowleveltype().clone();
+        var.set_concretetype(Some(ll));
         Ok(())
     }
 
@@ -1391,6 +1392,8 @@ impl RPythonTyper {
         // `same_as` so downstream ops see the typed value.
         let op_result: Hlvalue = match &hop.spaceop.result {
             Hlvalue::Variable(v) => {
+                // `op.result.concretetype = hop.r_result.lowleveltype`
+                // (rtyper.py).
                 v.set_concretetype(Some(expected.clone()));
                 Hlvalue::Variable(v.clone())
             }
@@ -2166,9 +2169,8 @@ impl RPythonTyper {
             let r = self.bindingrepr(a)?;
             match a {
                 Hlvalue::Variable(v) => {
-                    // `Variable.concretetype` is `Rc<RefCell<...>>`; the
-                    // write propagates through every clone of the same
-                    // Variable identity.
+                    // `a.concretetype = r.lowleveltype` (rtyper.py
+                    // setup_block_entry).
                     v.set_concretetype(Some(r.lowleveltype().clone()));
                 }
                 Hlvalue::Constant(_) => {

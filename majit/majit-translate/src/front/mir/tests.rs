@@ -2548,7 +2548,7 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
             }
         })
     };
-    let ffi_type = struct_decl(
+    let mut ffi_type = struct_decl(
         1,
         ident_path(&["libffi_sys", "ffi_type"]),
         serde_json::json!([{
@@ -2558,7 +2558,8 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
         }]),
         false,
     );
-    let cif = struct_decl(
+    ffi_type["layout"] = c_layout();
+    let mut cif = struct_decl(
         0,
         ident_path(&["libffi_sys", "ffi_cif"]),
         serde_json::json!([
@@ -2580,6 +2581,7 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
         ]),
         false,
     );
+    cif["layout"] = c_layout();
     let dest = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
     let llbc = int_as_ptr_cast_llbc(vec![cif, ffi_type], dest);
     for name in ["unary_cast", "rvalue_cast"] {
@@ -9278,6 +9280,18 @@ pub(in crate::front::mir) fn type_decl_struct(
     })
 }
 
+/// `rffi.py` `CStruct` fixture: same as [`type_decl_struct`] plus
+/// `repr_algo: "C"` so `adt_def_is_raw_storage` admits it.
+pub(in crate::front::mir) fn type_decl_c_struct(
+    id: u64,
+    path: &[&str],
+    fields: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let mut decl = type_decl_struct(id, path, fields);
+    decl["layout"] = c_layout();
+    decl
+}
+
 #[test]
 fn trait_clone_of_build_hasher_default_is_identity() {
     let hasher = named_adt(0, vec![named_adt(1, vec![])]);
@@ -9635,7 +9649,7 @@ fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let raw_graph = lower_raw_ptr_is_null(
         raw_ptr,
-        vec![type_decl_struct(
+        vec![type_decl_c_struct(
             0,
             &["fixture", "RawStruct"],
             vec![struct_field_json("word", i64_ty)],
@@ -14155,6 +14169,19 @@ pub(in crate::front::mir) fn transparent_layout() -> serde_json::Value {
     }])
 }
 
+/// One-word `repr_algo: "C"` layout (`rffi.py` `CStruct`).
+pub(in crate::front::mir) fn c_layout() -> serde_json::Value {
+    serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "C", "transparent": false}
+        }
+    }])
+}
+
 pub(in crate::front::mir) fn struct_decl(
     def_id: u64,
     name: serde_json::Value,
@@ -14351,6 +14378,182 @@ fn generic_residual_borrow_of_transparent_scalar_is_refused() {
         call_leafs(&ops).iter().any(|leaf| leaf == "f"),
         "non-transparent instantiation must stay a residual call; ops={ops:?}"
     );
+}
+
+/// A `bitflags!` newtype registered as an unsigned scalar is the word.
+///
+/// `CodeFlags` is a Struct whose layout records `transparent: false`, so
+/// the linked kind — not `repr(transparent)` — is the scalar. Field
+/// reads of `.bits` / `.0` and `Self { bits: x }` are that word;
+/// `IntegerRepr.rtype_or_` emits `int_or`. RPython has no wrapper
+/// object (`r_uint`).
+#[test]
+fn registered_transparent_scalar_union_lowers_to_integer_ops() {
+    let span = fixture_span();
+    let flags_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics(), "builtin": null}
+    });
+    let bits_ty = u32_ty();
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let field0 = |base: u64, base_ty: &serde_json::Value, field_ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"Projection": [
+                {"kind": {"Local": base}, "ty": base_ty},
+                {"Field": [null, 0]}
+            ]},
+            "ty": field_ty
+        })
+    };
+    let flags_decl = {
+        let mut decl = struct_decl(
+            0,
+            ident_path(&["fixture", "Flags"]),
+            serde_json::json!([{
+                "name": "bits",
+                "ty": bits_ty,
+                "attr_info": null
+            }]),
+            false,
+        );
+        decl["layout"] = serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": false}
+            }
+        }]);
+        decl
+    };
+    let union_fn = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "union"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [flags_ty, flags_ty],
+            "output": flags_ty
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": flags_ty},
+                {"index": 1, "name": "self", "span": span, "ty": flags_ty},
+                {"index": 2, "name": "other", "span": span, "ty": flags_ty},
+                {"index": 3, "name": null, "span": span, "ty": bits_ty},
+                {"index": 4, "name": null, "span": span, "ty": bits_ty},
+                {"index": 5, "name": null, "span": span, "ty": bits_ty},
+                {"index": 6, "name": null, "span": span, "ty": flags_ty}
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            place(3, &bits_ty),
+                            {"Use": [{"Read": field0(1, &flags_ty, &bits_ty)}, "No"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            place(4, &bits_ty),
+                            {"Use": [{"Read": field0(2, &flags_ty, &bits_ty)}, "No"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            place(5, &bits_ty),
+                            {"BinaryOp": [
+                                "BitOr",
+                                {"Read": place(3, &bits_ty)},
+                                {"Read": place(4, &bits_ty)}
+                            ]}
+                        ]}}
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 0},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": place(3, &bits_ty)},
+                                {"Move": place(4, &bits_ty)}
+                            ]
+                        },
+                        "dest": place(6, &flags_ty),
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}
+                },
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            place(0, &flags_ty),
+                            {"Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": place(5, &bits_ty)}]
+                            ]}
+                        ]}}
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [flags_decl],
+            "fun_decls": [union_fn],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Flags".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    let graph = super::lower_function(&llbc, "union").expect("lower union");
+    let ops = graph_ops(&graph);
+    let dump = graph.dump();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Input { name, ty: ValueType::Unsigned, .. } if name == "self"
+        )),
+        "registered Flags must intern as Unsigned, got {dump}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op: label, .. } if label == "bitor"
+        )),
+        "union must lower the payload `|` as bitor, got {dump}"
+    );
+    for op in &ops {
+        match &op.kind {
+            OpKind::FieldRead { field, .. } => {
+                panic!("getattr {} survived; graph={dump}", field.name);
+            }
+            OpKind::FieldWrite { field, .. } => {
+                panic!("setattr {} survived; graph={dump}", field.name);
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            } => {
+                panic!("instantiate survived; graph={dump}");
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(in crate::front::mir) fn ptr_ty() -> serde_json::Value {
@@ -17372,9 +17575,10 @@ fn map_or_value_bank(ty: &ValueType) -> char {
     }
 }
 
-/// Payload enum used as a raw-address niche (`Option<&RawEnum>`): not
-/// fieldless, no GcType, one word of layout so the shared-ref Option is
-/// the null-pointer niche.
+/// Payload enum used as a raw-address niche (`Option<&RawEnum>`):
+/// `rffi.py` `CStruct` analogue (`repr_algo: "C"`), not fieldless, no
+/// GcType, one word of layout so the shared-ref Option is the
+/// null-pointer niche.
 fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -17403,7 +17607,7 @@ fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
                 "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
             }
         ]},
-        "layout": interior_layout(8, &[0], false)
+        "layout": interior_c_layout(8, &[0], false)
     })
 }
 
@@ -18297,7 +18501,7 @@ fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
 /// intern'd T as an Instance (GcRef) against a Signed overlay.
 #[test]
 fn interned_result_of_mut_ref_payload_is_pointer() {
-    let native = interior_struct(
+    let native = interior_c_struct(
         1,
         &["pyre_module", "module", "mmap", "interp_mmap", "NativeMMap"],
         &[(
@@ -19327,7 +19531,7 @@ fn map_or_niche_raw_struct_is_operands_agree() {
         vec![payload_ty.clone()],
         interior_i64(),
     );
-    let owned = interior_struct(
+    let owned = interior_c_struct(
         1,
         &["fixture", "OwnedFd"],
         &[(
@@ -20625,7 +20829,7 @@ fn null_mut_of_raw_struct_is_null_raw_without_cast() {
     let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
     let llbc = llbc_with_types(
         "fixture",
-        vec![interior_struct(
+        vec![interior_c_struct(
             0,
             &["fixture", "RawStruct"],
             &[("word", interior_i64())],
@@ -24330,6 +24534,47 @@ fn mut_ref_cell_try_dispatch_binary_special() {
     assert_eq!(cell_params, 2, "lhs and rhs are the cell parameters");
 }
 
+/// `PyError::normalize_exception` `&mut self` is a MutRef cell. The
+/// startblock Input names that cell so getattr of `.value` stays on it
+/// (`alias_exception_carrier_handle`). Ignored by default (loads the
+/// real LLBC).
+#[test]
+#[ignore]
+fn normalize_exception_self_input_is_mut_ref_cell() {
+    use crate::model::{OpKind, ValueType};
+
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "pyre_interpreter::error::<Impl>::normalize_exception",
+    )
+    .expect("lower normalize_exception");
+    let start = graph.block(graph.startblock);
+    let mut self_input = None;
+    for op in &start.operations {
+        let OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } = &op.kind
+        else {
+            continue;
+        };
+        if name == "self" {
+            self_input = Some((ty.clone(), class_root.clone()));
+            break;
+        }
+    }
+    let (ty, class_root) = self_input.expect("self Input");
+    let root = class_root.as_deref().unwrap_or("");
+    assert!(
+        root.starts_with("MutRef<"),
+        "self class_root {root:?} ty={ty:?} is not the cell"
+    );
+    assert!(matches!(ty, ValueType::Ref(_)), "self ty {ty:?}");
+}
+
 /// `sub_impl` passes `&mut a` / `&mut b` into
 /// `try_dispatch_binary_special`. The cell is built in the caller,
 /// passed as the argument, and read back into the local after the call.
@@ -26640,6 +26885,75 @@ fn deque_compare_scalar_slice_get_lowers_to_a_guarded_item_read() {
 /// Slice `get` is not object-pointer-specific, and a literal index has no
 /// Place type.  This production helper exercises both the generalized
 /// Option payload recognizer and its generic-type fallback for `get(1)`.
+/// `base_op` is `code.instructions.get(index)?.op`. The residual
+/// `core::slice::<Impl>::get` of `[CodeUnit]` must rewrite: otherwise
+/// skip-path lifting of `first_traceable_index` dual-gate-skips `_trace`.
+#[test]
+#[ignore]
+fn base_op_slice_get_is_rewritten() {
+    use crate::model::{CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::pycode::base_op")
+        .expect("lower base_op");
+    let mut residual_get = 0usize;
+    let mut array_reads = 0usize;
+    let mut addr_arith = 0usize;
+    let mut ops: Vec<String> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => {
+                    if crate::front::slice_get::is_slice_get_segments(segments) {
+                        residual_get += 1;
+                    }
+                    ops.push(format!("b{bi}.{oi} Call {segments:?} nargs={}", args.len()));
+                }
+                OpKind::ArrayRead {
+                    array_type_id,
+                    item_ty,
+                    ..
+                } => {
+                    array_reads += 1;
+                    ops.push(format!(
+                        "b{bi}.{oi} ArrayRead id={array_type_id:?} ty={item_ty:?}"
+                    ));
+                }
+                OpKind::BinOp { op: bin, .. } => {
+                    if bin == "mul" || bin == "add" {
+                        addr_arith += 1;
+                    }
+                    ops.push(format!("b{bi}.{oi} BinOp {bin}"));
+                }
+                OpKind::FieldRead { field, ty, .. } => {
+                    ops.push(format!("b{bi}.{oi} FieldRead {} ty={ty:?}", field.name));
+                }
+                other => {
+                    let s = format!("{other:?}");
+                    if s.contains("get") || s.contains("CodeUnit") || s.contains("Instruction") {
+                        ops.push(format!("b{bi}.{oi} {s}"));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        residual_get,
+        0,
+        "base_op slice get residual; ops:\n{}",
+        ops.join("\n")
+    );
+    assert!(
+        array_reads > 0 || addr_arith > 0,
+        "base_op in-bounds arm must read the unit or its address; ops:\n{}",
+        ops.join("\n")
+    );
+}
+
 #[test]
 #[ignore]
 fn slice_get_constant_index_lowers_to_a_guarded_item_read() {
@@ -33576,6 +33890,102 @@ fn interior_shared(inner: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Ref": [null, inner, "Shared"]})
 }
 
+fn interior_vec_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["alloc", "vec", "Vec"], false),
+        "kind": {"Struct": []}
+    })
+}
+
+fn interior_vec_of(elem: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [elem],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn interior_index_mut_opaque(
+    def_id: u64,
+    vec_ty: &serde_json::Value,
+    vec_ref: &serde_json::Value,
+    usize_ty: &serde_json::Value,
+    elem_ref: &serde_json::Value,
+) -> serde_json::Value {
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [1, vec_ty]},
+        "kind": "InherentImplBlock"
+    }}});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["vec", 0]},
+                {"Ident": ["Vec", 0]},
+                impl_seg,
+                {"Ident": ["index_mut", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [vec_ref, usize_ty],
+            "output": elem_ref
+        },
+        "body": "Opaque"
+    })
+}
+
+fn interior_call_with_types(
+    fun: u64,
+    args: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+    target: u64,
+    unwind: u64,
+    types: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": interior_span(),
+        "kind": {
+            "Call": {
+                "call": {
+                    "func": {
+                        "Regular": {
+                            "kind": {"Fun": fun},
+                            "generics": {
+                                "regions": [],
+                                "types": types,
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    },
+                    "args": args
+                },
+                "dest": dest,
+                "target": target,
+                "on_unwind": unwind
+            }
+        }
+    })
+}
+
 fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
     serde_json::json!([{
         "key": "fixture-target",
@@ -33588,13 +33998,56 @@ fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json:
     }])
 }
 
-fn interior_struct(
+fn interior_c_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
+    serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": size,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": offsets}],
+            "repr": {"repr_algo": "C", "transparent": transparent}
+        }
+    }])
+}
+
+pub(in crate::front::mir) fn interior_struct(
     def_id: u64,
     path: &[&str],
     fields: &[(&str, serde_json::Value)],
     size: u64,
     offsets: &[u64],
     transparent: bool,
+) -> serde_json::Value {
+    interior_struct_with_layout(
+        def_id,
+        path,
+        fields,
+        interior_layout(size, offsets, transparent),
+    )
+}
+
+/// Same as [`interior_struct`] with `repr_algo: "C"` (`rffi.py` `CStruct`).
+pub(in crate::front::mir) fn interior_c_struct(
+    def_id: u64,
+    path: &[&str],
+    fields: &[(&str, serde_json::Value)],
+    size: u64,
+    offsets: &[u64],
+    transparent: bool,
+) -> serde_json::Value {
+    interior_struct_with_layout(
+        def_id,
+        path,
+        fields,
+        interior_c_layout(size, offsets, transparent),
+    )
+}
+
+fn interior_struct_with_layout(
+    def_id: u64,
+    path: &[&str],
+    fields: &[(&str, serde_json::Value)],
+    layout: serde_json::Value,
 ) -> serde_json::Value {
     let fields: Vec<_> = fields
         .iter()
@@ -33604,7 +34057,7 @@ fn interior_struct(
         "def_id": def_id,
         "item_meta": interior_meta(path, true),
         "kind": {"Struct": fields},
-        "layout": interior_layout(size, offsets, transparent)
+        "layout": layout
     })
 }
 
@@ -34981,6 +35434,244 @@ fn interior_field_write_of_ptr_add() {
     );
 }
 
+/// `storage[current].y = v` through `Vec::index_mut` is `setinteriorfield`
+/// (`rutf8.py` `create_utf8_index_storage`).
+#[test]
+fn interior_field_write_of_vec_index_mut() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let vec_ty = interior_vec_of(&adt);
+    let vec_ref = interior_mut_ref(vec_ty.clone());
+    let elem_ref = interior_mut_ref(adt.clone());
+    let caller = interior_caller(
+        "write_point_vec",
+        3,
+        vec![vec_ref.clone(), usize_ty.clone(), i64_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("storage"), &vec_ref),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("value"), &i64_ty),
+            interior_local(4, Some("slot"), &elem_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call_with_types(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &vec_ref)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &elem_ref),
+                    2,
+                    1,
+                    vec![adt.clone(), usize_ty.clone()],
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field(4, &elem_ref, &adt, &i64_ty, 1),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let index_mut = interior_index_mut_opaque(1, &vec_ty, &vec_ref, &usize_ty, &elem_ref);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_point(), interior_vec_decl()],
+        vec![caller, index_mut],
+    );
+    let graph = lower_interior(&llbc, "write_point_vec");
+    let ops = graph_ops(&graph);
+    let writes: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        .copied()
+        .collect();
+    assert_eq!(writes.len(), 1, "ops={ops:?}");
+    let block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        })
+        .expect("InteriorFieldWrite block");
+    assert!(
+        block.inputargs.len() >= 3,
+        "inputargs={:?}",
+        block.inputargs
+    );
+    let OpKind::InteriorFieldWrite {
+        base,
+        index,
+        value,
+        field,
+        item_ty,
+        array_type_id,
+        array: _,
+    } = &writes[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "y");
+    assert_eq!(field.base_is_deref, Some(true));
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+    assert_eq!(base, &block.inputargs[0]);
+    assert_eq!(index, &block.inputargs[1]);
+    assert_eq!(value, &block.inputargs[2]);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "index_mut"),
+        "ops={ops:?}"
+    );
+}
+
+fn interior_u8_array16() -> serde_json::Value {
+    let u8_ty = interior_u8();
+    let len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "16"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    serde_json::json!({"Array": [u8_ty, len, null]})
+}
+
+fn interior_loc_elem() -> serde_json::Value {
+    interior_struct(
+        0,
+        &["fixture", "Utf8LocElem"],
+        &[
+            ("baseindex", interior_i64()),
+            ("ofs", interior_u8_array16()),
+        ],
+        24,
+        &[0, 8],
+        false,
+    )
+}
+
+fn interior_field_index(
+    slot: u64,
+    slot_ty: &serde_json::Value,
+    elem_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+    index_local: u64,
+    index_ty: &serde_json::Value,
+    stored_ty: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(slot, slot_ty, elem_ty, field_ty, field_idx),
+                {"Index": {
+                    "offset": {"Read": interior_place(index_local, index_ty)},
+                    "from_end": false
+                }}
+            ]
+        },
+        "ty": stored_ty
+    })
+}
+
+/// `storage[current].ofs[i] = v` through `Vec::index_mut` reads the `ofs`
+/// interior field then writes the byte (`rutf8.py` `create_utf8_index_storage`).
+#[test]
+fn interior_nested_field_index_write_of_vec_index_mut() {
+    let usize_ty = interior_usize();
+    let u8_ty = interior_u8();
+    let ofs_ty = interior_u8_array16();
+    let adt = interior_adt(0);
+    let vec_ty = interior_vec_of(&adt);
+    let vec_ref = interior_mut_ref(vec_ty.clone());
+    let elem_ref = interior_mut_ref(adt.clone());
+    let caller = interior_caller(
+        "write_ofs",
+        4,
+        vec![
+            vec_ref.clone(),
+            usize_ty.clone(),
+            usize_ty.clone(),
+            u8_ty.clone(),
+        ],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("storage"), &vec_ref),
+            interior_local(2, Some("current"), &usize_ty),
+            interior_local(3, Some("i"), &usize_ty),
+            interior_local(4, Some("value"), &u8_ty),
+            interior_local(5, Some("slot"), &elem_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call_with_types(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &vec_ref)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(5, &elem_ref),
+                    2,
+                    1,
+                    vec![adt.clone(), usize_ty.clone()],
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field_index(5, &elem_ref, &adt, &ofs_ty, 1, 3, &usize_ty, &u8_ty),
+                        interior_use(interior_place(4, &u8_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &u8_ty),
+                        interior_use(interior_place(4, &u8_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let index_mut = interior_index_mut_opaque(1, &vec_ty, &vec_ref, &usize_ty, &elem_ref);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_loc_elem(), interior_vec_decl()],
+        vec![caller, index_mut],
+    );
+    let graph = lower_interior(&llbc, "write_ofs");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "nested ofs[i] reads the interior ofs field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+        "nested ofs[i] writes the byte; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "index_mut"),
+        "ops={ops:?}"
+    );
+}
+
 /// `*self = fresh` through `&mut Self` is the field-wise structcopy
 /// (`rffi.py` `_get_structcopy_fn`) even when a field is
 /// `Atomic<usize>` (`tyref_atomic_inner_value_type`).
@@ -35099,6 +35790,164 @@ fn deref_store_of_nested_struct_field_has_no_move_plan() {
     assert!(
         msg.contains("deref store is not a field, array element, or raw word"),
         "s_ty={s_ty:?} err={msg}"
+    );
+}
+
+/// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through
+/// `Option<&mut Handle>` of a one-word GC handle. The Some payload and
+/// the TwoPhaseMut reborrow inherit the MutRef cell, so `*p = fresh` is
+/// `FieldWrite "value"` (`executioncontext.py` `_trace`).
+#[test]
+fn deref_store_through_option_mut_gc_handle_lowers() {
+    let handle_ty = interior_adt(1);
+    let payload_ty = interior_adt(2);
+    let mut_h = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let option_ty = option_adt_node(0, mut_h.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let handle_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Handle"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+            "attr_info": null
+        }]},
+        "layout": interior_layout(8, &[0], true)
+    });
+    let payload_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Payload"], true),
+        "kind": {"Struct": []}
+    });
+    let gctype_trait = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false),
+        "methods": []
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [2, payload_ty.clone()]}]}
+        }
+    });
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let opt_place = interior_place(1, &option_ty);
+    let some_payload = serde_json::json!({
+        "kind": {"Projection": [opt_place.clone(), {"Field": [1, 0]}]},
+        "ty": mut_h.clone()
+    });
+    let p_place = interior_place(3, &mut_h);
+    let tmp_place = interior_place(4, &mut_h);
+    let touch = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["Handle", 0]},
+                impl_seg,
+                {"Ident": ["touch", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "signature": {"is_unsafe": true, "inputs": [mut_h.clone()], "output": unit.clone()},
+        "body": {"Unstructured": {
+            "span": interior_span(),
+            "locals": {"arg_count": 1, "locals": [
+                interior_local(0, None, &unit),
+                interior_local(1, Some("self"), &mut_h)
+            ]},
+            "body": [interior_bb(vec![], interior_return())]
+        }}
+    });
+    let some_bb = interior_bb(
+        vec![
+            interior_assign(
+                p_place.clone(),
+                serde_json::json!({"Use": [{"Read": some_payload}, "No"]}),
+            ),
+            interior_assign(
+                interior_deref(3, &mut_h, &handle_ty),
+                serde_json::json!({
+                    "Use": [{"Move": interior_place(2, &handle_ty)}, "No"]
+                }),
+            ),
+            interior_assign(
+                tmp_place.clone(),
+                serde_json::json!({
+                    "Ref": {
+                        "place": interior_deref(3, &mut_h, &handle_ty),
+                        "kind": "TwoPhaseMut",
+                        "ptr_metadata": null
+                    }
+                }),
+            ),
+        ],
+        interior_call(
+            1,
+            vec![serde_json::json!({"Move": tmp_place})],
+            interior_place(0, &unit),
+            1,
+            2,
+        ),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["fixture", "store_opt"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [option_ty.clone(), handle_ty.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": interior_span(),
+            "locals": {"arg_count": 2, "locals": [
+                interior_local(0, None, &unit),
+                interior_local(1, Some("opt"), &option_ty),
+                interior_local(2, Some("fresh"), &handle_ty),
+                interior_local(3, Some("p"), &mut_h),
+                interior_local(4, Some("tmp"), &mut_h)
+            ]},
+            "body": [
+                some_bb,
+                interior_bb(vec![], interior_return()),
+                interior_bb(vec![], interior_unwind())
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [option_enum(0), handle_decl, payload_decl],
+            "fun_decls": [caller, touch],
+            "global_decls": [],
+            "trait_decls": [gctype_trait],
+            "trait_impls": [gctype_impl]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "store_opt")
+        .unwrap_or_else(|err| panic!("lower store_opt: {err:?}"));
+    let ops = graph_ops(&graph);
+    let write_names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        write_names.contains(&"value"),
+        "deref store through Option<&mut Handle> is FieldWrite value; ops={ops:?}"
     );
 }
 
@@ -35763,10 +36612,11 @@ fn interior_field_const_index_stays_direct_ptradd() {
     assert_direct_ptradd_not_residual_add(&ops);
 }
 
-/// `&(*p.add(i)).y` is an address, not a value read, so the add stays
-/// `direct_ptradd`. The census test is the guard; this locks the lowering.
+/// `&(*p.add(i)).y` of a copy-scalar field is identity
+/// (`tyref_is_identity_field_word`): `getinteriorfield` of `y`, the same
+/// as a value read (`ll_getitem_fast`).
 #[test]
-fn interior_field_address_of_stays_direct_ptradd() {
+fn interior_field_address_of_copy_scalar_is_interior_read() {
     let i64_ty = interior_i64();
     let usize_ty = interior_usize();
     let adt = interior_adt(0);
@@ -35819,8 +36669,45 @@ fn interior_field_address_of_stays_direct_ptradd() {
     let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
     let graph = lower_interior(&llbc, "addr_point");
     let ops = graph_ops(&graph);
-    assert_no_interior(&ops);
-    assert_direct_ptradd_not_residual_add(&ops);
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let block = interior_read_block(&graph);
+    assert!(
+        block.inputargs.len() >= 2,
+        "header and index stay live; inputargs={:?}",
+        block.inputargs
+    );
+    let OpKind::InteriorFieldRead {
+        base,
+        index,
+        field,
+        item_ty,
+        array_type_id,
+        array: _,
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "y");
+    assert_eq!(field.owner_root.as_deref(), Some("Point"));
+    assert_eq!(field.base_is_deref, Some(true));
+    assert_eq!(field.taken_by_address, false);
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+    assert_eq!(base, &block.inputargs[0]);
+    assert_eq!(index, &block.inputargs[1]);
+    assert!(
+        !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
+        "ops={ops:?}"
+    );
 }
 
 /// A `repr(transparent)` pointee is the inner word, not a GcArray of

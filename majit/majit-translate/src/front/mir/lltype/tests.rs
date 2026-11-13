@@ -5,11 +5,11 @@ use super::{
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
     is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
     json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
-    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
-    tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
+    json_ty_packed_copy_struct_byte_size, json_ty_scalar_element_spelling, no_immutable_fields,
+    no_raw_alloc_flavor, no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
+    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
+    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
+    tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
     tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
     tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
@@ -26,9 +26,10 @@ use majit_charon_reader::{
 };
 
 use crate::front::mir::tests::{
-    adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
-    code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span,
-    fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
+    adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, c_layout,
+    call_leafs, code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc,
+    fixture_span, fixture_ty, graph_ops, i64_field, i64_ty, ident_path, interior_c_struct,
+    interior_i64, interior_meta, interior_struct, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, opaque_type_decl, option_adt_node, option_adt_node_from_types,
     option_enum, option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node,
@@ -750,7 +751,14 @@ fn utf8str_pointee_is_not_a_raw_word() {
     });
     let gc = std::collections::HashSet::new();
     assert!(
-        !super::pointee_is_raw_word(&node, &llbc, &gc),
+        !super::pointee_is_raw_word(
+            &node,
+            &llbc,
+            &gc,
+            no_immutable_fields(),
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "Utf8Str pointee is rstr STR, not a raw word"
     );
 }
@@ -765,12 +773,18 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
         "kind": {"Struct": []}
     });
-    let lookalike = serde_json::json!({
-        "def_id": 1,
-        "item_meta": window_meta(&["other", "Utf8Str"], true),
-        "kind": {"Struct": []}
-    });
-    let owner_rstr = struct_decl(
+    let mut lookalike = struct_decl(
+        1,
+        ident_path(&["other", "Utf8Str"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    lookalike["layout"] = c_layout();
+    let mut owner_rstr = struct_decl(
         2,
         ident_path(&["fixture", "RstrOwner"]),
         serde_json::json!([{
@@ -780,7 +794,8 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         }]),
         false,
     );
-    let owner_other = struct_decl(
+    owner_rstr["layout"] = c_layout();
+    let mut owner_other = struct_decl(
         3,
         ident_path(&["fixture", "OtherOwner"]),
         serde_json::json!([{
@@ -790,6 +805,7 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
         }]),
         false,
     );
+    owner_other["layout"] = c_layout();
     let llbc = window_llbc(vec![utf8, lookalike, owner_rstr, owner_other], vec![]);
     let adt = |id: u64| {
         serde_json::json!({
@@ -799,20 +815,34 @@ fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     assert!(
-        !super::pointee_is_raw_word(&adt(0), &llbc, &gc),
+        !super::pointee_is_raw_word(
+            &adt(0),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "unicodeobject::Utf8Str is rstr STR"
     );
     assert!(
-        super::pointee_is_raw_word(&adt(1), &llbc, &gc),
+        super::pointee_is_raw_word(
+            &adt(1),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "other::Utf8Str is not rstr STR"
     );
     assert!(
-        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of *mut unicodeobject::Utf8Str is not raw storage"
     );
     assert!(
-        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of *mut other::Utf8Str is classified by its own declaration"
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "repr(C) owner of *mut other::Utf8Str is raw storage"
     );
 }
 
@@ -1637,7 +1667,7 @@ fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
 
 #[test]
 fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
-    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
     use crate::annotator::builtin::fn_null_constant;
     use crate::annotator::model::SomeValue;
     use crate::flowspace::model::{ConstValue, Constant, Variable};
@@ -1649,12 +1679,17 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
     let var = Variable::named("fnptr");
     super::stamp_fn_ptr_spelling(&var, spelling, crate::ErrorCarrierSpec::default());
     let bk = Rc::new(Bookkeeper::new());
+    let s_ll = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref())).expect("fn spelling");
+    let SomeValue::Ptr(p_ll) = &s_ll else {
+        panic!("fn_ptr_somevalue_for_spelling_in is the lltype helper, got {s_ll:?}");
+    };
     let mut s_ty = crate::annotator::model::s_str0();
     s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
     let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
-    let SomeValue::Ptr(p_null) = &s_null else {
-        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
-    };
+    assert!(
+        matches!(s_null, SomeValue::None_(_)),
+        "spelled null_fn annotates as s_None, got {s_null:?}"
+    );
     let ct = var.concretetype().expect("dest stamped");
     let LowLevelType::Ptr(ptr_ty) = ct else {
         panic!("stamp must be Ptr, got {ct:?}");
@@ -1664,8 +1699,14 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
         "stamp is Ptr(FuncType)"
     );
     assert_eq!(
-        *ptr_ty, p_null.ll_ptrtype,
-        "stamp_fn_ptr equals fn_null_constant of the same spelling (`ann_nullptr`)"
+        *ptr_ty, p_ll.ll_ptrtype,
+        "stamp_fn_ptr equals func_type_from_fn_spelling of the same spelling"
+    );
+
+    let s_untyped = fn_null_constant(&bk, &[], &HashMap::new()).expect("untyped null_fn");
+    assert!(
+        matches!(s_untyped, SomeValue::Ptr(_)),
+        "untyped ptr::null_fn stays SomePtr, got {s_untyped:?}"
     );
 }
 
@@ -1695,8 +1736,15 @@ fn stamp_fn_ptr_spelling_carrier_result_is_void() {
     let mut s_ty = crate::annotator::model::s_str0();
     s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
     let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
-    let SomeValue::Ptr(p_null) = &s_null else {
-        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
+    assert!(
+        matches!(s_null, SomeValue::None_(_)),
+        "spelled null_fn annotates as s_None, got {s_null:?}"
+    );
+    let s_ll =
+        crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling");
+    let SomeValue::Ptr(p_ll) = &s_ll else {
+        panic!("lltype helper is SomePtr, got {s_ll:?}");
     };
     let ct = var.concretetype().expect("dest stamped");
     let LowLevelType::Ptr(ptr_ty) = ct else {
@@ -1711,8 +1759,8 @@ fn stamp_fn_ptr_spelling_carrier_result_is_void() {
         "carrier Result<(), E> is Void (`fn_ptr_result_lltype`)"
     );
     assert_eq!(
-        *ptr_ty, p_null.ll_ptrtype,
-        "stamp_fn_ptr with the carrier equals fn_null_constant"
+        *ptr_ty, p_ll.ll_ptrtype,
+        "stamp_fn_ptr with the carrier equals func_type_from_fn_spelling"
     );
 }
 
@@ -1748,8 +1796,17 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
         s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
         let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new())
             .unwrap_or_else(|e| panic!("{spelling}: typed null_fn: {e}"));
-        let SomeValue::Ptr(p_null) = &s_null else {
-            panic!("{spelling}: fn_null_constant must be SomePtr, got {s_null:?}");
+        assert!(
+            matches!(s_null, SomeValue::None_(_)),
+            "{spelling}: spelled null_fn is s_None, got {s_null:?}"
+        );
+        let s_ll = crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+            spelling,
+            Some(bk.as_ref()),
+        )
+        .unwrap_or_else(|| panic!("{spelling}: fn spelling"));
+        let SomeValue::Ptr(p_ll) = &s_ll else {
+            panic!("{spelling}: lltype helper is SomePtr, got {s_ll:?}");
         };
         let ct = var
             .concretetype()
@@ -1762,8 +1819,8 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
             "{spelling}: stamp is Ptr(FuncType)"
         );
         assert_eq!(
-            *ptr_ty, p_null.ll_ptrtype,
-            "{spelling}: stamp_fn_ptr equals fn_null_constant of the same spec"
+            *ptr_ty, p_ll.ll_ptrtype,
+            "{spelling}: stamp_fn_ptr equals func_type_from_fn_spelling of the same spec"
         );
     }
 }
@@ -2095,6 +2152,10 @@ fn fn_ptr_ty_keeps_gcref_result() {
     assert_eq!(ft.args[0], LowLevelType::Unsigned);
     assert_eq!(ft.args[1], LowLevelType::Unsigned);
     assert_eq!(
+        ft.args[2], *GCREF,
+        "*mut GCREF FUNC arg is the GCREF root slot, not OBJECTPTR"
+    );
+    assert_eq!(
         ft.args[3],
         LowLevelType::Signed,
         "*mut bool FUNC arg is the slot address, not OBJECTPTR"
@@ -2119,6 +2180,58 @@ fn fn_ptr_ty_keeps_gcref_result() {
     assert_eq!(
         ft_opaque.result, *GCREF,
         "bare GCREFOpaque FUNC.RESULT is GCREF"
+    );
+
+    // `AllocNurseryCollectingTypedRootedFn`: `*mut GcRef` / `GcRef`
+    // (`majit_ir::GcRef`) is the same GCREF word.
+    let gcref_word = serde_json::json!({
+        "Adt": {"id": 4, "generics": empty_generics()}
+    });
+    let llbc_gcref = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+            type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_alias(
+                3,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [gcrefopaque_adt.clone(), "Mut"]}),
+            ),
+            type_decl_struct(4, &["majit_ir", "GcRef"], vec![]),
+        ],
+        vec![],
+    );
+    let ty_gcref = TyRef::Other(serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [
+                    {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    {"RawPtr": [gcref_word.clone(), "Mut"]},
+                    {"RawPtr": [{"Scalar": "Bool"}, "Mut"]}
+                ],
+                "output": gcref_word,
+                "is_unsafe": true
+            }
+        }
+    }));
+    let ft_gcref =
+        super::func_type_from_fn_ptr_ty(&ty_gcref, &llbc_gcref, crate::ErrorCarrierSpec::default())
+            .expect("GcRef hook FnPtr lowers");
+    assert_eq!(ft_gcref.args.len(), 4);
+    assert_eq!(
+        ft_gcref.args[2], *GCREF,
+        "*mut GcRef FUNC arg is the GCREF root slot, not OBJECTPTR"
+    );
+    assert_eq!(
+        ft_gcref.args[3],
+        LowLevelType::Signed,
+        "*mut bool FUNC arg is the slot address, not OBJECTPTR"
+    );
+    assert_eq!(
+        ft_gcref.result, *GCREF,
+        "GcRef FUNC.RESULT is GCREF (`llmemory.py` GCREF)"
     );
 }
 
@@ -2786,6 +2899,7 @@ fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
     assert!(type_arg_is_concrete("Result<(), PyError>"));
     assert!(type_arg_is_concrete("??scalar"));
     assert!(!type_arg_is_concrete("Result<??scalar, PyError>"));
+    assert!(type_arg_is_concrete("Never"));
     assert!(!type_arg_is_concrete("TypeVar#0"));
     assert!(!type_arg_is_concrete("Result<TypeVar, E>"));
     assert!(!type_arg_is_concrete("??TypeVar#0"));
@@ -2797,6 +2911,8 @@ fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
         Some("<??scalar,PyError>"),
         "whole-arg ??scalar is Charon Never and still suffixes Result"
     );
+    assert!(!type_arg_is_concrete("Option<??scalar>"));
+    assert!(!type_arg_is_concrete("??TraitType"));
 }
 
 #[test]
@@ -3120,16 +3236,25 @@ fn enum_suffix_keeps_unit_ok_when_err_splits() {
         Some("<WordHasher,fn() -> ()>")
     );
     // Charon hash-cons `{"Value":[id,"Never"]}` is a type-name string.
-    // `??scalar` is not an instantiation; `Never` is.
+    // Residual dest_ty of Try::branch spells that uninhabited ok as a
+    // non-object payload (`??scalar`); dest_adt still intern's.
     let llbc = empty_llbc();
     assert_eq!(
         charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, "Never"]}), &llbc, 0),
         "Never"
     );
     assert_eq!(
+        charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, null]}), &llbc, 0),
+        "??scalar"
+    );
+    assert_eq!(
         enum_instantiation_suffix_from_args(&["Never".into(), "BytecodeCorruption".into()])
             .as_deref(),
         Some("<Never,BytecodeCorruption>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??scalar".into(), "PyError".into()]).as_deref(),
+        Some("<??scalar,PyError>")
     );
     assert_eq!(
         enum_instantiation_suffix_from_args(&["Option<Never>".into(), "i64".into()]).as_deref(),
@@ -4712,8 +4837,13 @@ fn a_scalar_element_names_its_width_and_a_thin_pointer_needs_no_name() {
         )
     );
     // A named ADT is the element itself, not a pointer to one, so its size
-    // is whatever the struct is — `String` is three words.
+    // is whatever the struct is — `String` is three words. Packed Copy
+    // detection needs the TypeDecl field list; a missing decl declines.
     assert_eq!(spelling(named_adt.clone()), None);
+    assert_eq!(
+        json_ty_packed_copy_struct_byte_size(&named_adt, &llbc),
+        None
+    );
 
     let thin = |ty: serde_json::Value| json_ty_is_thin_pointer_element(&ty, &llbc);
     assert!(thin(
@@ -5232,7 +5362,7 @@ fn charon_ref_renders_ampersand_prefix() {
 /// the prefix is erased. Top-level `&T` still strips.
 #[test]
 fn option_of_ref_to_raw_storage_keeps_ampersand() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5242,6 +5372,7 @@ fn option_of_ref_to_raw_storage_keeps_ampersand() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let opt_ref_raw = option_adt_node(0, option_shared_ref(adt_node(1)));
@@ -5281,7 +5412,7 @@ fn option_of_ref_to_raw_storage_keeps_ampersand() {
 /// `RootScope::get`).
 #[test]
 fn enum_payload_of_ref_to_raw_storage_is_int() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5291,6 +5422,7 @@ fn enum_payload_of_ref_to_raw_storage_is_int() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let tomb = no_tombstoned_leaves();
@@ -5328,7 +5460,7 @@ fn enum_payload_of_ref_to_raw_storage_is_int() {
 /// `call_once` read share `Tuple<&RawCell>` (`render_adt_type_args`).
 #[test]
 fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         0,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5338,6 +5470,7 @@ fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![raw], vec![]);
     let payload = TyRef::Other(option_shared_ref(adt_node(0)));
     assert_eq!(
@@ -5354,13 +5487,16 @@ fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
     );
 }
 
-/// Charon `monomorphize:false`: a field typed `Option<Raw>` is the
-/// Option template plus type args. The template (TypeVar payload) is
-/// not raw storage; the instantiation is, so the owner is too.
+/// Charon `monomorphize:false`: a field typed `Option<RawCell>` is the
+/// Option template plus type args. `rclass.py` `getinstancerepr`: a
+/// payload-carrying Rust-repr enum (the template and the `Option<CStruct>`
+/// instantiation) is a tagged class, not lltype raw storage. `rffi.py`
+/// `CStruct`: `RawCell` itself and a repr(C) owner whose only field is
+/// `*mut RawCell` are raw storage.
 #[test]
-fn option_instantiation_of_raw_payload_is_a_raw_word() {
+fn option_instantiation_of_c_struct_payload_is_a_tagged_instance() {
     let option = option_enum(0);
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         1,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5370,39 +5506,52 @@ fn option_instantiation_of_raw_payload_is_a_raw_word() {
         }]),
         false,
     );
-    let owner = struct_decl(
+    raw["layout"] = c_layout();
+    let mut owner = struct_decl(
         2,
         ident_path(&["fixture", "OwnerBag"]),
         serde_json::json!([{
             "name": "cell",
-            "ty": option_adt_node(0, adt_node(1)),
+            "ty": {"RawPtr": [adt_node(1), "Mut"]},
             "attr_info": null
         }]),
         false,
     );
+    owner["layout"] = c_layout();
     let llbc = llbc_with_types("fixture", vec![option, raw, owner], vec![]);
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     assert!(
-        !adt_def_is_raw_storage(0, &llbc, &gc, immut, &mut Vec::new()),
-        "Option TypeDecl template (TypeVar payload) is not raw storage"
+        !adt_def_is_raw_storage(0, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "Option TypeDecl template (TypeVar payload) is getinstancerepr"
     );
     let inst = TyRef::Other(option_adt_node(0, adt_node(1)));
     assert!(
-        field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
-        "Option<RawCell> instantiation is a raw word"
+        !field_ty_is_raw_word(
+            &inst,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new()
+        ),
+        "Option<RawCell> instantiation is getinstancerepr, not a raw word"
     );
     assert!(
-        adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of Option<RawCell> is raw storage"
+        adt_def_is_raw_storage(1, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "RawCell is rffi.py CStruct raw storage"
+    );
+    assert!(
+        adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "repr(C) owner of *mut RawCell is raw storage"
     );
 }
 
 /// Nested `Option<Option<&T>>` re-enters the Option def by value.
-/// `lltype.py` `Struct._first_struct` classifies from the declared field
-/// types, so a GC referent is not raw storage and a raw referent is.
+/// `rclass.py` `getinstancerepr`: the payload-carrying instantiation is
+/// an instance for a GC referent and for a raw one.
 #[test]
-fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
+fn option_of_option_of_ref_is_not_raw_storage() {
     let option = option_enum(0);
     let gc_t = struct_decl(
         1,
@@ -5410,7 +5559,7 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
         serde_json::json!([]),
         false,
     );
-    let raw = struct_decl(
+    let mut raw = struct_decl(
         2,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5420,6 +5569,7 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
         }]),
         false,
     );
+    raw["layout"] = c_layout();
     let nested = |inner: serde_json::Value| option_adt_node(0, option_adt_node(0, inner));
     let owner_gc = struct_decl(
         3,
@@ -5451,20 +5601,34 @@ fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
     let inst_gc = TyRef::Other(nested(option_shared_ref(adt_node(1))));
     let inst_raw = TyRef::Other(nested(option_shared_ref(adt_node(2))));
     assert!(
-        !field_ty_is_raw_word(&inst_gc, &llbc, &gc, immut, &mut Vec::new()),
+        !field_ty_is_raw_word(
+            &inst_gc,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
         "Option<Option<&PyObject>> is not a raw word"
     );
     assert!(
-        !adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Option<Option<&PyObject>> is not raw storage"
     );
     assert!(
-        field_ty_is_raw_word(&inst_raw, &llbc, &gc, immut, &mut Vec::new()),
-        "Option<Option<&RawCell>> is a raw word"
+        !field_ty_is_raw_word(
+            &inst_raw,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        ),
+        "Option<Option<&RawCell>> is getinstancerepr, not a raw word"
     );
     assert!(
-        adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
-        "owner of Option<Option<&RawCell>> is raw storage"
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
+        "Rust-repr owner of Option<Option<&RawCell>> is not raw storage"
     );
 }
 
@@ -5492,11 +5656,18 @@ fn option_instantiation_of_scalar_payload_is_not_a_raw_word() {
         serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
     ));
     assert!(
-        !field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        !field_ty_is_raw_word(
+            &inst,
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new()
+        ),
         "Option<i64> instantiation stays the tagged Instance intern"
     );
     assert!(
-        !adt_def_is_raw_storage(1, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(1, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Option<i64> is not raw storage"
     );
 }
@@ -5535,7 +5706,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let raw_cell = struct_decl(
+    let mut raw_cell = struct_decl(
         3,
         ident_path(&["fixture", "RawCell"]),
         serde_json::json!([{
@@ -5545,6 +5716,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
+    raw_cell["layout"] = c_layout();
     let classed_ptr = serde_json::json!({"RawPtr": [adt_node(2), "Mut"]});
     let raw_ptr = serde_json::json!({"RawPtr": [adt_node(3), "Mut"]});
     let owner_of_classed = struct_decl(
@@ -5557,7 +5729,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let owner_of_raw = struct_decl(
+    let mut owner_of_raw = struct_decl(
         5,
         ident_path(&["fixture", "RawPtrOwner"]),
         serde_json::json!([{
@@ -5567,7 +5739,8 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
-    let owner_of_scalar = struct_decl(
+    owner_of_raw["layout"] = c_layout();
+    let mut owner_of_scalar = struct_decl(
         6,
         ident_path(&["fixture", "ScalarAtomicOwner"]),
         serde_json::json!([{
@@ -5577,6 +5750,7 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         }]),
         false,
     );
+    owner_of_scalar["layout"] = c_layout();
     let view = struct_decl(
         7,
         ident_path(&["fixture", "AtomicPtrView"]),
@@ -5611,7 +5785,14 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
     let gc = std::collections::HashSet::new();
     let immut = no_immutable_fields();
     let raw = |ty: serde_json::Value| {
-        field_ty_is_raw_word(&TyRef::Other(ty), &llbc, &gc, immut, &mut Vec::new())
+        field_ty_is_raw_word(
+            &TyRef::Other(ty),
+            &llbc,
+            &gc,
+            immut,
+            no_raw_alloc_flavor(),
+            &mut Vec::new(),
+        )
     };
     assert!(
         raw(atomic_of(1, u32_ty)),
@@ -5630,27 +5811,27 @@ fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
         "&Atomic<*mut ClassedInst> is the same stored word as the Atomic"
     );
     assert!(
-        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "classed instance with a Vec field is not raw storage"
     );
     assert!(
-        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "RawCell of one integer is raw storage"
     );
     assert!(
-        !adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of AtomicPtr to a classed instance is not a raw-word owner"
     );
     assert!(
-        adt_def_is_raw_storage(5, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(5, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of AtomicPtr to a storage-raw ADT is a raw-word owner"
     );
     assert!(
-        adt_def_is_raw_storage(6, &llbc, &gc, immut, &mut Vec::new()),
+        adt_def_is_raw_storage(6, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "owner of Atomic<u32> is a raw-word owner"
     );
     assert!(
-        !adt_def_is_raw_storage(7, &llbc, &gc, immut, &mut Vec::new()),
+        !adt_def_is_raw_storage(7, &llbc, &gc, immut, no_raw_alloc_flavor(), &mut Vec::new()),
         "borrowed view of AtomicPtr to a classed instance is not a raw-word owner"
     );
 }
@@ -5681,7 +5862,7 @@ fn option_of_ref_to_integer_word_erases_ampersand() {
         }]),
         true,
     );
-    let raw_word = struct_decl(
+    let mut raw_word = struct_decl(
         3,
         ident_path(&["fixture", "RawWord"]),
         serde_json::json!([{
@@ -5691,6 +5872,7 @@ fn option_of_ref_to_integer_word_erases_ampersand() {
         }]),
         false,
     );
+    raw_word["layout"] = c_layout();
     let llbc = llbc_with_types(
         "fixture",
         vec![option_enum(0), inner, outer, raw_word],
@@ -9992,6 +10174,93 @@ fn opaque_transparent_gc_handle_keeps_the_wrapper_class() {
     assert_handle_class(&llbc, &ty, Some("Word"));
 }
 
+/// An imported Opaque pointer handle is a GC `&mut T` cell. The
+/// defining crate sees a transparent struct; the importer sees
+/// `TypeDeclKind::Opaque` (`opaque_pointer_handle`).
+#[test]
+fn opaque_imported_handle_mut_ref_is_a_cell() {
+    let mut decls = pointer_handle_decls();
+    decls[2] = (
+        3,
+        opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+    );
+    let (llbc, ty) = load_handle_with_width(
+        decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Opaque PyError is a MutRef payload"
+    );
+    let mut_ty: TyRef = serde_json::from_value(serde_json::json!({
+        "Ref": ["Erased", {"Value": [9003, adt_body(3)]}, "Mut"]
+    }))
+    .unwrap();
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut Opaque PyError occupies a MutRef cell"
+    );
+}
+
+/// `apply_published_structs` fills the Opaque import; the word is
+/// still a MutRef cell (`published_struct_copy`).
+#[test]
+fn published_imported_handle_mut_ref_is_a_cell() {
+    let defining_decls = pointer_handle_decls();
+    let (defining, _) = load_handle_with_width(
+        defining_decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    let rows = crate::front::mir::harvest_published_structs(&defining);
+    let mut dest_decls = pointer_handle_decls();
+    dest_decls[2] = (
+        3,
+        opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+    );
+    let (mut llbc, ty) = load_handle_with_width(
+        dest_decls,
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+        Some(8),
+    );
+    crate::front::mir::apply_published_structs(&mut llbc, &rows);
+    assert!(
+        llbc.type_by_id(3)
+            .is_some_and(|td| td.published_struct_copy),
+        "PyError import is a published struct copy"
+    );
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "published PyError is a MutRef payload"
+    );
+    let mut_ty: TyRef = serde_json::from_value(serde_json::json!({
+        "Ref": ["Erased", {"Value": [9003, adt_body(3)]}, "Mut"]
+    }))
+    .unwrap();
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc_struct_ids, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut published PyError occupies a MutRef cell"
+    );
+}
+
 /// `celldict.py` `erase({})`: a by-value transparent newtype intern's
 /// as the inner struct, so unique-graph `mergeinputargs` unifies the
 /// wrapper with that operand (`rordereddict.rtype_len`).
@@ -11481,7 +11750,7 @@ fn raw_store_struct(def_id: u64) -> serde_json::Value {
             "size": 16,
             "align": 8,
             "variant_layouts": [{"field_offsets": [0, 8]}],
-            "repr": {"transparent": false}
+            "repr": {"repr_algo": "C", "transparent": false}
         }
     }]);
     decl
@@ -11507,7 +11776,7 @@ fn raw_storage_enum(def_id: u64, payload_id: u64) -> serde_json::Value {
             "size": 16,
             "align": 8,
             "variant_layouts": [{"field_offsets": [0]}],
-            "repr": {"transparent": false}
+            "repr": {"repr_algo": "C", "transparent": false}
         }
     }]);
     decl
@@ -11544,6 +11813,7 @@ fn tagged_outer_option_of_niche_raw_enum_borrow_is_not_raw_address() {
             &llbc,
             &empty_gc,
             super::no_immutable_fields(),
+            no_raw_alloc_flavor(),
             &mut stack
         ),
         "RawEnum with a raw-struct payload is storage-raw"
@@ -12050,6 +12320,7 @@ fn stamp_option_method_inputs(
         llbc,
         None,
         &empty_s,
+        &empty_u,
         &empty_u,
         &gc_struct_ids,
         false,
@@ -13875,6 +14146,302 @@ fn option_of_mut_object_pointer_slice_is_not_gcarray_list() {
     );
 }
 
+/// `None` of `Option<&mut H>` for a GC handle is the nullable MutRef cell
+/// (`gc_mut_ref_input_stamp`), not payload `H`. `Option<&H>` and
+/// `Option<*mut H>` keep the payload class
+/// (`option_payload_instance_class_root`).
+#[test]
+fn option_gc_mut_ref_none_is_mut_ref_cell_null() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let handle_ty = adt_node(0);
+    let payload_ty = adt_node(1);
+    let mut_ref = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let shared_ref = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Shared"]});
+    let raw_ptr = serde_json::json!({"RawPtr": [handle_ty.clone(), "Mut"]});
+    let option_mut = option_adt_node(2, mut_ref);
+    let option_shared = option_adt_node(2, shared_ref);
+    let option_raw = option_adt_node(2, raw_ptr);
+    let unit = serde_json::json!({"Tuple": []});
+    let layout = |transparent: bool, size: u64| {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": transparent}
+            }
+        }])
+    };
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let takes = |id: u64, leaf: &str, opt_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(vec![ident("fixture"), ident(leaf)], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [opt_ty.clone()],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("opt"), opt_ty)
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let caller = |id: u64, leaf: &str, callee: u64, opt_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(vec![ident("fixture"), ident(leaf)], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("none"), opt_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span,
+                            "kind": {"Assign": [
+                                place(1, opt_ty),
+                                {"Aggregate": [
+                                    {"Adt": [2, 0, null]},
+                                    []
+                                ]}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": callee},
+                                                "generics": empty_generics()
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, opt_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty, "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": layout(true, 8)
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []},
+                    "layout": layout(false, 0)
+                },
+                option_enum(2)
+            ],
+            "fun_decls": [
+                caller(0, "call_mut_none", 1, &option_mut),
+                takes(1, "takes_mut", &option_mut),
+                caller(2, "call_shared_none", 3, &option_shared),
+                takes(3, "takes_shared", &option_shared),
+                caller(4, "call_raw_none", 5, &option_raw),
+                takes(5, "takes_raw", &option_raw)
+            ],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let option_mut_ty: TyRef = serde_json::from_value(option_mut.clone()).unwrap();
+    let option_shared_ty: TyRef = serde_json::from_value(option_shared.clone()).unwrap();
+    let option_raw_ty: TyRef = serde_json::from_value(option_raw.clone()).unwrap();
+    let tomb = no_tombstoned_leaves();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_mut_ty, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Option<&mut Handle> occupies a MutRef cell"
+    );
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_shared_ty, &llbc, tomb, &gc, &raw)
+            .is_none(),
+        "Option<&Handle> is not a MutRef cell"
+    );
+    assert!(
+        super::tyref_option_gc_mut_ref_cell_root(&option_raw_ty, &llbc, tomb, &gc, &raw).is_none(),
+        "Option<*mut Handle> is not a MutRef cell"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        let mut_cast = lowering.option_niche_null_cast(&option_mut_ty);
+        assert!(
+            matches!(
+                &mut_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<&mut Handle> is MutRef, got {mut_cast:?}"
+        );
+        let shared_cast = lowering.option_niche_null_cast(&option_shared_ty);
+        assert!(
+            matches!(
+                &shared_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && !root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<&Handle> is payload Handle, got {shared_cast:?}"
+        );
+        let raw_cast = lowering.option_niche_null_cast(&option_raw_ty);
+        assert!(
+            matches!(
+                &raw_cast,
+                Some((root, ValueType::Ref(Some(r))))
+                    if r == root && !root.starts_with("MutRef<") && root.contains("Handle")
+            ),
+            "None of Option<*mut Handle> is payload Handle, got {raw_cast:?}"
+        );
+    });
+    let cast_roots = |name: &str| {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind).map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let mut_roots = cast_roots("call_mut_none");
+    assert!(
+        mut_roots
+            .iter()
+            .any(|root| root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_mut_none lowers None as MutRef, got {mut_roots:?}"
+    );
+    assert!(
+        mut_roots
+            .iter()
+            .all(|root| root.starts_with("MutRef<") || !root.contains("Handle")),
+        "call_mut_none must not cast None to payload Handle, got {mut_roots:?}"
+    );
+    let shared_roots = cast_roots("call_shared_none");
+    assert!(
+        shared_roots
+            .iter()
+            .any(|root| !root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_shared_none lowers None as payload Handle, got {shared_roots:?}"
+    );
+    let raw_roots = cast_roots("call_raw_none");
+    assert!(
+        raw_roots
+            .iter()
+            .any(|root| !root.starts_with("MutRef<") && root.contains("Handle")),
+        "call_raw_none lowers None as payload Handle, got {raw_roots:?}"
+    );
+    let takes_mut =
+        crate::test_support::lower_function(&llbc, "takes_mut").expect("lower takes_mut");
+    let opt_input = takes_mut
+        .block(takes_mut.startblock)
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "opt"))
+        .expect("opt input");
+    let OpKind::Input { ty, class_root, .. } = &opt_input.kind else {
+        panic!("opt is an input");
+    };
+    let class_root = class_root
+        .as_deref()
+        .expect("Option<&mut Handle> Input carries a class_root");
+    assert!(
+        class_root.starts_with("Option<MutRef<"),
+        "takes_mut Input is nullable MutRef, got {class_root}"
+    );
+    match ty {
+        ValueType::Ref(Some(root)) => assert!(
+            root.starts_with("MutRef<"),
+            "takes_mut value root is MutRef, got {root}"
+        ),
+        other => panic!("takes_mut Input is Ref(MutRef), got {other:?}"),
+    }
+}
+
 #[test]
 fn mut_ref_cell_root_names_a_gc_pointer_only() {
     let llbc = fixture_llbc();
@@ -14258,6 +14825,915 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
     );
 }
 
+/// Result Err peel of a GC handle: the Place arm wraps the payload as
+/// a MutRef cell before the `&mut self` call (`install_gc_mut_ref_call`).
+#[test]
+fn result_err_peel_wraps_gc_handle_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let result_ty = result_adt_node(2, unit.clone(), handle_ty.clone());
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let err_place = serde_json::json!({
+        "kind": {"Projection": [place(1, &result_ty), {"Field": [1, 0]}]},
+        "ty": handle_ty
+    });
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [result_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("res"), &result_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": err_place}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                },
+                result_enum(2)
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Result Err peel emits a MutRef constructor before set_flag"
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "Result Err peel writes FieldWrite value on the cell"
+    );
+}
+
+/// `&mut Result<P, H>` Err peel of a transparent one-field GC handle:
+/// wrap copy-out writes the Err payload field (`Err.__pos_0`), the handle
+/// word `expand_pop_roots` reloads. A leaf-copy through the handle's
+/// inner field would getattr `Err.__pos_0.__pos_0`.
+#[test]
+fn result_err_peel_mut_ref_copy_out_writes_err_pos0() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let result_ty = result_adt_node(2, unit.clone(), handle_ty.clone());
+    let mut_result = serde_json::json!({"Ref": ["Erased", result_ty.clone(), "Mut"]});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let deref_result = serde_json::json!({
+        "kind": {"Projection": [place(1, &mut_result), "Deref"]},
+        "ty": result_ty
+    });
+    let err_place = serde_json::json!({
+        "kind": {"Projection": [deref_result, {"Field": [1, 0]}]},
+        "ty": handle_ty
+    });
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_result.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("res"), &mut_result)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": err_place}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                },
+                result_enum(2)
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Err peel of &mut Result wraps a MutRef cell before set_flag; graph={}",
+        graph.dump()
+    );
+    let copy_out: Vec<_> = ops[call_idx + 1..]
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } if !mut_ref_value_field(field) => {
+                Some((field.owner_root.clone(), field.name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copy_out.len(),
+        1,
+        "wrap copy-out is one FieldWrite of the Err payload; got {copy_out:?}; graph={}",
+        graph.dump()
+    );
+    let (owner, name) = &copy_out[0];
+    assert_eq!(
+        name,
+        "__pos_0",
+        "copy-out writes Err.__pos_0, the handle word; got {owner:?}.{name}; graph={}",
+        graph.dump()
+    );
+    assert!(
+        owner
+            .as_deref()
+            .is_some_and(|owner| owner.ends_with("::Err")),
+        "copy-out owner is the Err variant; got {owner:?}.{name}; graph={}",
+        graph.dump()
+    );
+}
+
+/// By-value GC handle auto-ref: WholeLocal wraps the payload as a
+/// MutRef cell (`emit_gc_mut_ref_cell`).
+#[test]
+fn by_value_gc_handle_auto_ref_wraps_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let payload_ty = adt(1);
+    let handle_ty = adt(0);
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("self"), &mut_self)
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [handle_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("h"), &handle_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, &handle_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"RawPtr": [payload_ty, "Mut"]},
+                        "attr_info": null
+                    }]},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"transparent": true}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                    "kind": {"Struct": []}
+                }
+            ],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [gctype_impl_for_adt(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "by-value handle auto-ref emits a MutRef constructor before set_flag"
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "by-value handle auto-ref writes FieldWrite value on the cell"
+    );
+}
+
+/// Imported Opaque handle + Opaque method FunDecl: wrap from the
+/// signature (`gc_mut_ref_signature` does not skip a body-less
+/// `&mut T` GC formal).
+#[test]
+fn opaque_gc_handle_auto_ref_wraps_as_mut_ref_cell() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let handle_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let method_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(vec![
+            ident("fixture"),
+            ident("Handle"),
+            impl_seg,
+            ident("set_flag"),
+        ], false),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [mut_self.clone()],
+            "output": unit
+        },
+        "body": "Opaque"
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [handle_ty.clone()],
+            "output": unit
+        },
+        "body": {
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        local(0, None, &unit),
+                        local(1, Some("context"), &handle_ty)
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span,
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{"Move": place(1, &handle_ty)}]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let handle_decl = opaque_handle_decl(0, ident_path(&["fixture", "Handle"]), 8);
+    let payload_decl = struct_decl(
+        1,
+        ident_path(&["fixture", "Payload"]),
+        empty_fields(),
+        false,
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "target_information": [{
+                "key": "fixture-target",
+                "value": {
+                    "target_pointer_size": 8,
+                    "is_little_endian": true
+                }
+            }],
+            "type_decls": [handle_decl, payload_decl],
+            "fun_decls": [caller, method_decl],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": [
+                gctype_impl_for_adt(1),
+                deref_impl(
+                    1,
+                    serde_json::json!({"Value": [0, adt_body(0)]}),
+                    vec![serde_json::json!({"Value": [1, adt_body(1)]})],
+                    vec![
+                        serde_json::json!({"Value": [0, adt_body(0)]}),
+                        serde_json::json!({"Value": [1, adt_body(1)]}),
+                    ],
+                )
+            ]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let handle: TyRef = serde_json::from_value(handle_ty.clone()).unwrap();
+    let mut_ty: TyRef = serde_json::from_value(mut_self.clone()).unwrap();
+    let tomb = no_tombstoned_leaves();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    assert!(
+        super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "Opaque Handle is a MutRef payload, ty={:?}",
+        super::tyref_to_value_type(&handle, &llbc)
+    );
+    assert!(
+        super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc, &raw)
+            .as_deref()
+            .is_some_and(|root| root.starts_with("MutRef<")),
+        "&mut Opaque Handle occupies a MutRef cell"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let call_idx = ops
+        .iter()
+        .position(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+            _ => false,
+        })
+        .expect("set_flag is a FunctionPath");
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("MutRef<")
+        )),
+        "Opaque handle auto-ref emits a MutRef constructor before set_flag, graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops[..call_idx].iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+        )),
+        "Opaque handle auto-ref writes FieldWrite value on the cell"
+    );
+}
+
 /// A Float `to_string` receiver, including `&f64`, is excluded from
 /// `UnaryOp("str")`. Int/Bool/Char and a non-float Ref are not.
 #[test]
@@ -14563,7 +16039,13 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
             2,
             &["fixture", "Sized"],
             serde_json::json!({"Struct": []}),
-            Some(serde_json::json!([{"key": "any", "value": {"size": 8}}])),
+            Some(serde_json::json!([{
+                "key": "any",
+                "value": {
+                    "size": 8,
+                    "repr": {"repr_algo": "C", "transparent": false}
+                }
+            }])),
         ),
         ty(
             3,
@@ -15532,5 +17014,198 @@ fn struct_item_gcarray_unknown_pointer_field_declines() {
         )
         .is_none(),
         "undecidable pointer ITEM field must decline"
+    );
+}
+
+fn adt_is_raw_storage(
+    llbc: &Llbc,
+    def_id: u64,
+    flavor: &std::collections::HashSet<String>,
+) -> bool {
+    adt_def_is_raw_storage(
+        def_id,
+        llbc,
+        &std::collections::HashSet::new(),
+        no_immutable_fields(),
+        flavor,
+        &mut Vec::new(),
+    )
+}
+
+fn enum_type_decl(
+    def_id: u64,
+    path: &[&str],
+    variants: serde_json::Value,
+    repr_algo: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, true),
+        "kind": {"Enum": variants},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 1,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"repr_algo": repr_algo, "transparent": false}
+            }
+        }]
+    })
+}
+
+fn fieldless_variants() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": "A",
+            "fields": [],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        },
+        {
+            "name": "B",
+            "fields": [],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+        }
+    ])
+}
+
+/// A Rust-repr data-carrying struct is `rclass.py` `getinstancerepr`,
+/// not lltype raw storage.
+#[test]
+fn rust_repr_data_struct_is_not_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "RootedItems"],
+            &[("len", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "Rust-repr RootedItems must not be lltype raw storage"
+    );
+}
+
+/// `repr_algo == "C"` with raw-word fields is `rffi.py` `CStruct`.
+#[test]
+fn repr_c_struct_is_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_c_struct(
+            0,
+            &["fixture", "timespec"],
+            &[("tv_sec", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "repr(C) timespec must be lltype raw storage"
+    );
+}
+
+/// A fieldless enum is the discriminant integer, including under Rust repr.
+#[test]
+fn fieldless_enum_stays_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![enum_type_decl(
+            0,
+            &["fixture", "Ordering"],
+            fieldless_variants(),
+            "Rust",
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "fieldless enum stays the discriminant integer"
+    );
+}
+
+/// Zero-variant enum (`libc::DIR`) is an FFI opaque with no constructible value.
+#[test]
+fn zero_variant_enum_is_ffi_opaque_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![enum_type_decl(
+            0,
+            &["libc", "DIR"],
+            serde_json::json!([]),
+            "Rust",
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "Enum([]) FFI opaque is lltype raw storage"
+    );
+}
+
+/// `_alloc_flavor_ = raw` stays `InstanceRepr` (`rclass.py` `getgcflavor`)
+/// even when the TypeDecl is `repr(C)`.
+#[test]
+fn flavor_raw_class_is_excluded_from_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_c_struct(
+            0,
+            &["fixture", "MapNodeOverlay"],
+            &[("word", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "repr(C) overlay is storage-raw without the flavor set"
+    );
+    let mut flavor = std::collections::HashSet::new();
+    flavor.insert("fixture::MapNodeOverlay".to_string());
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, &flavor),
+        "flavor-raw class is excluded from lltype raw storage"
+    );
+}
+
+/// Registered transparent scalar (`external_transparent_scalar_kinds` /
+/// `CodeFlags`): Rust-repr struct whose Charon layout records
+/// `transparent: false`. The registry is that missing flag; the type
+/// stays the inner word (`IntegerRepr.rtype_or_`).
+#[test]
+fn registered_transparent_scalar_stays_raw_storage() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "CodeFlags"],
+            &[("bits", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![],
+    );
+    assert!(
+        !adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "unregistered Rust-repr flag struct is getinstancerepr"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::CodeFlags".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    assert!(
+        adt_is_raw_storage(&llbc, 0, no_raw_alloc_flavor()),
+        "registered transparent scalar stays the inner word"
     );
 }

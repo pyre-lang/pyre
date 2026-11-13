@@ -2623,6 +2623,15 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if crate::flowspace::model::is_jit_ll_arraycopy_path(canonical_strip) {
         return Some(SKIP_JIT_LL_ARRAYCOPY);
     }
+    // `core::slice::raw::from_raw_parts{,_mut}` is an opaque foreign
+    // decl. Layer-1 `call_registry.lookup` beats `host_env_callable`,
+    // so a harvested stub would be the callee. Declining the registry
+    // entry lets the callsite reach the `std.slice` host builtin
+    // (`std_slice_from_raw_parts`). The `from_raw_parts` leaf is
+    // shared with `Vec::from_raw_parts`; only the slice paths decline.
+    if is_slice_from_raw_parts(canonical_strip) {
+        return Some(SKIP_SLICE_FROM_RAW_PARTS);
+    }
 
     None
 }
@@ -2663,6 +2672,9 @@ fn is_ptr_write(canonical_strip: &[String]) -> bool {
 /// [`registration_decline`] reason for `std::alloc::alloc` / `alloc_zeroed`.
 const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
 
+/// [`registration_decline`] reason for `slice::from_raw_parts{,_mut}`.
+const SKIP_SLICE_FROM_RAW_PARTS: &str = "skip-slice-from-raw-parts";
+
 /// `std::alloc::alloc` / `alloc_zeroed` and the `alloc::alloc` re-export.
 /// The `alloc_zeroed` leaf is unique; the `alloc` leaf is not.
 fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
@@ -2675,6 +2687,29 @@ fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
             true
         }
         [leaf] if leaf == "alloc_zeroed" => true,
+        _ => false,
+    }
+}
+
+/// `core::slice::raw::from_raw_parts{,_mut}` and the `std::slice` re-export.
+/// The bare `from_raw_parts` leaf is `Vec::from_raw_parts` as well.
+fn is_slice_from_raw_parts(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [core, slice, raw, leaf]
+            if core == "core"
+                && slice == "slice"
+                && raw == "raw"
+                && (leaf == "from_raw_parts" || leaf == "from_raw_parts_mut") =>
+        {
+            true
+        }
+        [std, slice, leaf]
+            if std == "std"
+                && slice == "slice"
+                && (leaf == "from_raw_parts" || leaf == "from_raw_parts_mut") =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -4076,10 +4111,16 @@ fn declared_return_annotation(
             s
         });
     }
-    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
-    // the same shell FieldRead and a `raw:<owner>` token already use.
-    // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
-    // (`llannotation.py` pairtype(SomePtr, SomeObject).union).
+    // A transparent scalar is the inner word, not Ptr of a wrapper
+    // struct. Residual `FrameAnchor::new` must meet live's Unsigned
+    // Input as Integer, not SomePtr.
+    if let Some(cell) = bk.transparent_scalar_annotation(root) {
+        return Some(cell);
+    }
+    // A by-value `rffi.py` `CStruct` is Ptr of that struct
+    // (`history.getkind`), the same shell FieldRead and a `raw:<owner>`
+    // token already use. A Rust-repr aggregate is `rclass.py`
+    // `getinstancerepr` (SomeInstance).
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
@@ -4192,6 +4233,9 @@ fn raw_ptr_token_annotation(
     }
     let root = raw_owner_return_root(token?)?;
     let bk = registry.bookkeeper();
+    if let Some(cell) = bk.transparent_scalar_annotation(root) {
+        return Some(cell);
+    }
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
@@ -5862,12 +5906,14 @@ fn origin_function_entry(
     call_registry.lookup(&FunctionPathKey::from(&origin))
 }
 
-/// Wrap the AccessDirect subject's lifted body as the `PyGraph`
-/// `default_specialize` would `cachedgraph`.
-fn wrap_access_direct_pygraph(
+/// Wrap the subject's lifted body as the `PyGraph` `default_specialize`
+/// would `cachedgraph`. AccessDirect sets `access_directly`; a regular
+/// None-key graph does not (`specialize.py default_specialize`).
+fn wrap_cached_pygraph(
     legacy: &LegacyGraph,
     graph: &crate::flowspace::model::GraphRef,
     desc: &crate::annotator::description::FunctionDesc,
+    access_directly: bool,
 ) -> Rc<PyGraph> {
     let func = desc
         .base
@@ -5881,8 +5927,28 @@ fn wrap_access_direct_pygraph(
         func,
         signature: RefCell::new(desc.signature.clone()),
         defaults: RefCell::new(Some(desc.defaults.clone())),
-        access_directly: Cell::new(true),
+        access_directly: Cell::new(access_directly),
     })
+}
+
+/// Wrap the AccessDirect subject's lifted body as the `PyGraph`
+/// `default_specialize` would `cachedgraph`.
+fn wrap_access_direct_pygraph(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    desc: &crate::annotator::description::FunctionDesc,
+) -> Rc<PyGraph> {
+    wrap_cached_pygraph(legacy, graph, desc, true)
+}
+
+/// Wrap a regular subject's lifted body as the `None` cachedgraph
+/// (`description.py FunctionDesc.cachedgraph`).
+fn wrap_regular_pygraph(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    desc: &crate::annotator::description::FunctionDesc,
+) -> Rc<PyGraph> {
+    wrap_cached_pygraph(legacy, graph, desc, false)
 }
 
 #[cfg(test)]
@@ -6105,6 +6171,237 @@ fn drive_access_direct_subject(
     Ok((driven, cached))
 }
 
+/// Regular-subject None-key seed: the subject's own lift when that key
+/// is vacant, else today's fresh-lift path (`description.py
+/// FunctionDesc.cachedgraph` miss vs hit).
+enum RegularSeed {
+    Cached(FlowspaceAdapterOutput),
+    Fresh(FlowspaceAdapterOutput),
+}
+
+/// Lift a regular subject and bind it as the origin FunctionDesc's
+/// `None` cachedgraph when that key is vacant. An occupied key that
+/// holds a different graph keeps the fresh lift; pycall already
+/// specialized the occupant (`description.py FunctionDesc.cachedgraph`).
+fn seed_regular_lift(
+    legacy: &LegacyGraph,
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    path: &crate::parse::CallPath,
+) -> Result<RegularSeed, TyperError> {
+    let _ = call_registry.ensure_session()?;
+    let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
+        legacy,
+        call_registry,
+    )?;
+    let Some(entry) = origin_function_entry(call_registry, function_graphs, path) else {
+        return Ok(RegularSeed::Fresh(lifted));
+    };
+    let desc = entry.function_desc.borrow();
+    if let Some(existing) = desc.cached_none_key() {
+        if Rc::ptr_eq(&existing.graph, &lifted.graph) {
+            return Ok(RegularSeed::Cached(lifted));
+        }
+        return Ok(RegularSeed::Fresh(lifted));
+    }
+    let provided = wrap_regular_pygraph(legacy, &lifted.graph, &desc);
+    desc.record_none_key_graph_from(provided)
+        .map_err(|err| TyperError::message(err.to_string()))?;
+    Ok(RegularSeed::Cached(lifted))
+}
+
+/// Annotate the origin FunctionDesc's `None` PyGraph, or reuse the
+/// annotation `recursivecall` already wrote on that same graph.
+fn drive_regular_subject(
+    legacy: &LegacyGraph,
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    path: &crate::parse::CallPath,
+    lifted: FlowspaceAdapterOutput,
+) -> Result<(DrivenSubject, Rc<PyGraph>), TyperError> {
+    let _ = call_registry.ensure_session()?;
+    let Some(entry) = origin_function_entry(call_registry, function_graphs, path) else {
+        return Err(TyperError::message(format!(
+            "regular subject {path}: origin FunctionDesc is not in CallRegistry"
+        )));
+    };
+    let cached = entry
+        .function_desc
+        .borrow()
+        .cached_none_key()
+        .ok_or_else(|| {
+            TyperError::message(format!(
+                "regular subject {path}: cache holds a graph this subject did not provide"
+            ))
+        })?;
+    if !Rc::ptr_eq(&cached.graph, &lifted.graph) {
+        return Err(TyperError::message(format!(
+            "regular subject {path}: cache holds a graph this subject did not provide"
+        )));
+    }
+    let reuse = flowspace_startblock_is_annotated(call_registry, &lifted.graph);
+    if rtyper_verbose_enabled() {
+        let kind = if reuse {
+            "seeded reuse"
+        } else {
+            "seeded annotate"
+        };
+        eprintln!("[PREPASS None-key cache] {kind}: {path}");
+    }
+    let driven = if reuse {
+        (
+            lifted.graph,
+            lifted.value_to_var,
+            lifted.value_to_var_candidates,
+            lifted.constant_concretetypes,
+            lifted.constant_hlvalues,
+            lifted.block_map,
+        )
+    } else {
+        drive_lifted_subject(legacy, call_registry, false, lifted)?
+    };
+    Ok((driven, cached))
+}
+
+/// Drain the shared annotator's pending queue after a batch of entry
+/// seeds so caller-unioned callees finish `processblock`
+/// (`annrpython.py RPythonAnnotator.complete_pending_blocks`).
+fn drain_session_pending(call_registry: &CallRegistry) -> Result<(), TyperError> {
+    let (annotator, _) = call_registry.ensure_session()?;
+    annotator
+        .complete_pending_blocks()
+        .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
+    annotator
+        .raise_if_subject_blocked()
+        .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
+    call_registry
+        .bookkeeper()
+        .compute_at_fixpoint()
+        .map_err(|err| TyperError::message(format!("compute_at_fixpoint failed: {err}")))?;
+    Ok(())
+}
+
+fn phase_a_subject_recorded(call_registry: &CallRegistry, path: &crate::parse::CallPath) -> bool {
+    let tp = call_registry.two_phase();
+    tp.subjects.contains_key(path) || tp.annotate_skipped.contains_key(path)
+}
+
+fn path_startblock_is_annotated(
+    path: &crate::parse::CallPath,
+    call_registry: &CallRegistry,
+    seeded_access_direct: &HashMap<crate::parse::CallPath, FlowspaceAdapterOutput>,
+    seeded_regular: &HashMap<crate::parse::CallPath, FlowspaceAdapterOutput>,
+    fresh_regular: &HashSet<crate::parse::CallPath>,
+) -> bool {
+    if fresh_regular.contains(path) {
+        return false;
+    }
+    if let Some(lifted) = seeded_access_direct.get(path) {
+        return flowspace_startblock_is_annotated(call_registry, &lifted.graph);
+    }
+    if let Some(lifted) = seeded_regular.get(path) {
+        return flowspace_startblock_is_annotated(call_registry, &lifted.graph);
+    }
+    false
+}
+
+fn phase_a_try_drive(
+    path: &crate::parse::CallPath,
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    seeded_access_direct: &mut HashMap<crate::parse::CallPath, FlowspaceAdapterOutput>,
+    seeded_regular: &mut HashMap<crate::parse::CallPath, FlowspaceAdapterOutput>,
+    fresh_regular: &HashSet<crate::parse::CallPath>,
+    phase_a_reasons: &mut Vec<String>,
+    determinism_trace: bool,
+    index: usize,
+    drive_class: &str,
+    drain_after: bool,
+) {
+    let Some(legacy) = function_graphs.get(path) else {
+        return;
+    };
+    if crate::codewriter::call::is_access_directly_path(path)
+        && !seeded_access_direct.contains_key(path)
+    {
+        return;
+    }
+    let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
+    if determinism_trace {
+        emit_determinism_trace("phaseA", index, &path.display_name());
+    }
+    if rtyper_verbose_enabled() {
+        eprintln!("[PREPASS drive] {drive_class}: {path}");
+    }
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if crate::codewriter::call::is_access_directly_path(path) {
+            let Some(lifted) = seeded_access_direct.remove(path) else {
+                return Err(TyperError::message(format!(
+                    "AccessDirect subject {path}: cache holds a graph this subject did not provide"
+                )));
+            };
+            drive_access_direct_subject(&legacy, call_registry, function_graphs, path, lifted)
+                .map(|(driven, pygraph)| subject_with_pygraph(driven, Some(pygraph)))
+        } else if fresh_regular.contains(path) {
+            let Some(lifted) = seeded_regular.remove(path) else {
+                return drive_subject(&legacy, call_registry, /* do_rtype = */ false)
+                    .map(|driven| subject_with_pygraph(driven, None));
+            };
+            drive_lifted_subject(&legacy, call_registry, false, lifted)
+                .map(|driven| subject_with_pygraph(driven, None))
+        } else if let Some(lifted) = seeded_regular.remove(path) {
+            drive_regular_subject(&legacy, call_registry, function_graphs, path, lifted)
+                .map(|(driven, pygraph)| subject_with_pygraph(driven, Some(pygraph)))
+        } else {
+            drive_subject(&legacy, call_registry, /* do_rtype = */ false)
+                .map(|driven| subject_with_pygraph(driven, None))
+        }
+    }));
+    match attempt {
+        Ok(Ok((
+            graph,
+            value_to_var,
+            value_to_var_candidates,
+            constant_concretetypes,
+            constant_hlvalues,
+            block_map,
+            pygraph,
+        ))) => {
+            call_registry.two_phase().subjects.insert(
+                path.clone(),
+                crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                    graph: graph.clone(),
+                    pygraph,
+                    graph_key: crate::flowspace::model::GraphKey::of(&graph),
+                    value_to_var,
+                    value_to_var_candidates,
+                    constant_concretetypes,
+                    constant_hlvalues,
+                    block_map,
+                },
+            );
+            if drain_after {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drain_session_pending(call_registry)
+                }));
+            }
+        }
+        other => {
+            if let Some(reason) = phase_a_failure_reason(&other) {
+                record_phase_a_skip(call_registry, path, reason, phase_a_reasons);
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unpoison_failed_subject_callees(
+                    call_registry,
+                    &session_at_entry,
+                    function_graphs,
+                    true,
+                );
+            }));
+        }
+    }
+}
+
 /// Whole-program two-phase rtyper prepass.
 ///
 /// Mirrors upstream `translator.annotate()` → `rtyper.specialize()`
@@ -6142,18 +6439,21 @@ pub(crate) fn run_two_phase_prepass(
         function_graphs,
         &[],
         portals,
+        &[],
     );
 }
 
 /// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
 /// `CallControl::builtin_wrapper_indirect_graphs` already unioned into
-/// the subject set by `CodeWriter::run_two_phase_prepass`.
+/// the subject set by `CodeWriter::run_two_phase_prepass`, and the
+/// BFS seed graphs (`find_all_graphs_bfs` todo) as entry roots.
 pub(crate) fn run_two_phase_prepass_with_wrappers(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
+    entry_roots: &[crate::parse::CallPath],
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(
@@ -6162,6 +6462,7 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
             function_graphs,
             builtin_wrapper_graphs,
             portals,
+            entry_roots,
         )
     }));
     check_access_directly_sanity(call_registry, candidate_graphs, function_graphs, portals);
@@ -7011,6 +7312,7 @@ fn run_two_phase_prepass_inner(
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
+    entry_roots: &[crate::parse::CallPath],
 ) {
     // Exists to localise prepass nondeterminism (gh#1139).
     let determinism_trace = crate::determinism_trace_enabled();
@@ -7033,25 +7335,21 @@ fn run_two_phase_prepass_inner(
     // Alias spellings of one GraphStore slot are one prepass subject:
     // `description.py FunctionDesc.cachedgraph` returns the cached graph
     // on a hit, and `GraphStore::alias_paths` lists every spelling bound
-    // to that GraphKey.
-    let mut access_direct_alias_rep: HashMap<
+    // to that GraphKey. AccessDirect and Regular stay distinct
+    // (`specialize.py default_specialize` keys).
+    let mut alias_rep: HashMap<
         crate::parse::CallPath,
         (&crate::parse::CallPath, &crate::parse::CallPath),
     > = HashMap::new();
     for path in paths.iter().copied() {
-        if !crate::codewriter::call::is_access_directly_path(path) {
-            continue;
-        }
         let aliases = function_graphs.alias_paths(path);
-        let Some(rep) = paths
-            .iter()
-            .copied()
-            .find(|candidate| aliases.contains(candidate))
-        else {
+        let Some(rep) = paths.iter().copied().find(|candidate| {
+            aliases.contains(candidate) && candidate.specialization == path.specialization
+        }) else {
             continue;
         };
         if path != rep {
-            access_direct_alias_rep.insert(path.clone(), (path, rep));
+            alias_rep.insert(path.clone(), (path, rep));
         }
     }
 
@@ -7064,7 +7362,7 @@ fn run_two_phase_prepass_inner(
     let mut seeded_access_direct: HashMap<crate::parse::CallPath, FlowspaceAdapterOutput> =
         HashMap::new();
     for path in paths.iter() {
-        if access_direct_alias_rep.contains_key(*path) {
+        if alias_rep.contains_key(*path) {
             continue;
         }
         if !crate::codewriter::call::is_access_directly_path(path) {
@@ -7088,92 +7386,269 @@ fn run_two_phase_prepass_inner(
         }
     }
 
-    // ── Phase A — annotate-all over the portal closure ───────────────
-    for (index, path) in paths.iter().enumerate() {
-        if access_direct_alias_rep.contains_key(*path) {
+    // Seed each regular subject's lift as `cachedgraph(None)` when vacant.
+    let mut seeded_regular: HashMap<crate::parse::CallPath, FlowspaceAdapterOutput> =
+        HashMap::new();
+    let mut fresh_regular: HashSet<crate::parse::CallPath> = HashSet::new();
+    for path in paths.iter() {
+        if alias_rep.contains_key(*path) {
+            continue;
+        }
+        if crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seed_regular_lift(&legacy, call_registry, function_graphs, path)
+        }));
+        match attempt {
+            Ok(Ok(RegularSeed::Cached(lifted))) => {
+                seeded_regular.insert((*path).clone(), lifted);
+            }
+            Ok(Ok(RegularSeed::Fresh(lifted))) => {
+                fresh_regular.insert((*path).clone());
+                seeded_regular.insert((*path).clone(), lifted);
+            }
+            other => {
+                if let Some(reason) = phase_a_failure_reason(&other) {
+                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
+                }
+            }
+        }
+    }
+    let occupied_key_fallbacks = fresh_regular.len();
+
+    let path_set: HashSet<crate::parse::CallPath> = paths.iter().copied().cloned().collect();
+    let mut root_set: HashSet<crate::parse::CallPath> = HashSet::new();
+    for seed in entry_roots.iter().chain(builtin_wrapper_graphs.iter()) {
+        let mapped = alias_rep
+            .get(seed)
+            .map(|(_, r)| (*r).clone())
+            .unwrap_or_else(|| seed.clone());
+        if path_set.contains(&mapped) {
+            root_set.insert(mapped);
+        }
+    }
+
+    let mut n_roots = 0usize;
+    let mut n_callees = 0usize;
+    let mut n_leftovers = 0usize;
+    let mut drive_index = 0usize;
+
+    // ── Phase A — entry roots first (`annrpython.py` `build_types`) ──
+    for path in paths.iter() {
+        if alias_rep.contains_key(*path) {
+            continue;
+        }
+        if !root_set.contains(*path) {
+            continue;
+        }
+        if phase_a_subject_recorded(call_registry, path) {
+            continue;
+        }
+        let annotated = path_startblock_is_annotated(
+            path,
+            call_registry,
+            &seeded_access_direct,
+            &seeded_regular,
+            &fresh_regular,
+        );
+        let drive_class = if annotated {
+            n_callees += 1;
+            "callee"
+        } else {
+            n_roots += 1;
+            "root"
+        };
+        phase_a_try_drive(
+            path,
+            call_registry,
+            function_graphs,
+            &mut seeded_access_direct,
+            &mut seeded_regular,
+            &fresh_regular,
+            &mut phase_a_reasons,
+            determinism_trace,
+            drive_index,
+            drive_class,
+            false,
+        );
+        drive_index += 1;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain_session_pending(call_registry)
+    }));
+
+    let mut leftover_paths: Vec<&crate::parse::CallPath> = Vec::new();
+    for path in paths.iter() {
+        if alias_rep.contains_key(*path) {
+            continue;
+        }
+        if phase_a_subject_recorded(call_registry, path) {
+            continue;
+        }
         if crate::codewriter::call::is_access_directly_path(path)
             && !seeded_access_direct.contains_key(*path)
         {
             continue;
         }
-        let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
-        if determinism_trace {
-            emit_determinism_trace("phaseA", index, &path.display_name());
-        }
-        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if crate::codewriter::call::is_access_directly_path(path) {
-                let Some(lifted) = seeded_access_direct.remove(*path) else {
-                    return Err(TyperError::message(format!(
-                        "AccessDirect subject {path}: cache holds a graph this subject did not provide"
-                    )));
-                };
-                drive_access_direct_subject(&legacy, call_registry, function_graphs, path, lifted)
-                    .map(|(driven, pygraph)| subject_with_pygraph(driven, Some(pygraph)))
-            } else {
-                drive_subject(&legacy, call_registry, /* do_rtype = */ false)
-                    .map(|driven| subject_with_pygraph(driven, None))
-            }
-        }));
-        match attempt {
-            Ok(Ok((
-                graph,
-                value_to_var,
-                value_to_var_candidates,
-                constant_concretetypes,
-                constant_hlvalues,
-                block_map,
-                pygraph,
-            ))) => {
-                call_registry.two_phase().subjects.insert(
-                    (*path).clone(),
-                    crate::translator::rtyper::call_registry::TwoPhaseSubject {
-                        graph: graph.clone(),
-                        pygraph,
-                        graph_key: crate::flowspace::model::GraphKey::of(&graph),
-                        value_to_var,
-                        value_to_var_candidates,
-                        constant_concretetypes,
-                        constant_hlvalues,
-                        block_map,
-                    },
-                );
-            }
-            other => {
-                // The graph was a prepass subject: record the annotate-half
-                // failure so publish classifies it as annotate-skipped, not
-                // never-a-subject. Upstream `translator.graphs` contains every
-                // graph the codewriter later sees (`driver.py` task_annotate
-                // then task_rtype_lltype); a failed annotate is still a
-                // subject. `downcast_ref::<String>` misses `AnnotatorError`
-                // payloads (`panic_payload_text`).
-                if let Some(reason) = phase_a_failure_reason(&other) {
-                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
-                }
-                // Annotate-half failed (or panicked): repair shared-callee state.
-                // unpoison is itself contained — a panic here must not
-                // abort the remaining Phase A graphs.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    unpoison_failed_subject_callees(
-                        call_registry,
-                        &session_at_entry,
-                        function_graphs,
-                        true,
-                    );
-                }));
-            }
+        let annotated = path_startblock_is_annotated(
+            path,
+            call_registry,
+            &seeded_access_direct,
+            &seeded_regular,
+            &fresh_regular,
+        );
+        if annotated {
+            n_callees += 1;
+            phase_a_try_drive(
+                path,
+                call_registry,
+                function_graphs,
+                &mut seeded_access_direct,
+                &mut seeded_regular,
+                &fresh_regular,
+                &mut phase_a_reasons,
+                determinism_trace,
+                drive_index,
+                "callee",
+                false,
+            );
+            drive_index += 1;
+        } else {
+            leftover_paths.push(*path);
         }
     }
 
-    let mut alias_keys: Vec<crate::parse::CallPath> =
-        access_direct_alias_rep.keys().cloned().collect();
+    // Isolated leftover graphs: caller-first batches so a leftover's
+    // body `pycall` can annotate its leftover callees before those
+    // callees are declared-seeded (`annrpython.py` `build_types` /
+    // `complete_pending_blocks`). Mix-level helpers still take a
+    // declared seed (`annlowlevel.py` `MixLevelHelperAnnotator.getgraph`).
+    // Drain once per batch, not per leftover.
+    //
+    // Direct + indirect leftover→leftover edges from
+    // `GraphStore::body_call_callees` (`call.py graphs_from`). Local to
+    // this function; batch membership follows `paths` order.
+    let mut leftover_index: HashMap<crate::parse::CallPath, usize> = HashMap::new();
+    for (i, path) in leftover_paths.iter().enumerate() {
+        leftover_index.entry((*path).clone()).or_insert(i);
+        for alias in function_graphs.alias_paths(path) {
+            leftover_index.entry(alias).or_insert(i);
+        }
+    }
+    let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); leftover_paths.len()];
+    for (caller_i, caller) in leftover_paths.iter().enumerate() {
+        let callees = function_graphs.body_call_callees(caller, builtin_wrapper_graphs);
+        let mut seen: HashSet<usize> = HashSet::new();
+        for callee in callees {
+            let Some(&callee_i) = leftover_index.get(&callee) else {
+                continue;
+            };
+            if callee_i == caller_i {
+                continue;
+            }
+            if seen.insert(callee_i) {
+                incoming[callee_i].push(caller_i);
+            }
+        }
+    }
+    drop(leftover_index);
+
+    let mut leftover_driven = vec![false; leftover_paths.len()];
+    let mut n_batches = 0usize;
+    loop {
+        let mut remaining: Vec<usize> = Vec::new();
+        let mut annotated_now: Vec<usize> = Vec::new();
+        for (i, path) in leftover_paths.iter().enumerate() {
+            if leftover_driven[i] {
+                continue;
+            }
+            if phase_a_subject_recorded(call_registry, path) {
+                continue;
+            }
+            let annotated = path_startblock_is_annotated(
+                path,
+                call_registry,
+                &seeded_access_direct,
+                &seeded_regular,
+                &fresh_regular,
+            );
+            if annotated {
+                annotated_now.push(i);
+            } else {
+                remaining.push(i);
+            }
+        }
+        for i in annotated_now {
+            n_callees += 1;
+            phase_a_try_drive(
+                leftover_paths[i],
+                call_registry,
+                function_graphs,
+                &mut seeded_access_direct,
+                &mut seeded_regular,
+                &fresh_regular,
+                &mut phase_a_reasons,
+                determinism_trace,
+                drive_index,
+                "callee",
+                false,
+            );
+            drive_index += 1;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        let mut is_remaining = vec![false; leftover_paths.len()];
+        for &i in &remaining {
+            is_remaining[i] = true;
+        }
+        let mut batch: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|&i| incoming[i].iter().all(|&caller| !is_remaining[caller]))
+            .collect();
+        if batch.is_empty() {
+            batch.push(remaining[0]);
+        }
+        n_batches += 1;
+        for i in batch {
+            leftover_driven[i] = true;
+            n_leftovers += 1;
+            phase_a_try_drive(
+                leftover_paths[i],
+                call_registry,
+                function_graphs,
+                &mut seeded_access_direct,
+                &mut seeded_regular,
+                &fresh_regular,
+                &mut phase_a_reasons,
+                determinism_trace,
+                drive_index,
+                "leftover",
+                false,
+            );
+            drive_index += 1;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_session_pending(call_registry)
+        }));
+    }
+
+    eprintln!(
+        "[PREPASS drive] roots={n_roots} callees={n_callees} leftovers={n_leftovers} occupied-key-fallbacks={occupied_key_fallbacks}"
+    );
+    eprintln!(
+        "[PREPASS entry-vs-callee] roots={n_roots} callees={n_callees} leftovers={n_leftovers} batches={n_batches} occupied-key-fallbacks={occupied_key_fallbacks}"
+    );
+
+    let mut alias_keys: Vec<crate::parse::CallPath> = alias_rep.keys().cloned().collect();
     alias_keys.sort_by_cached_key(|p| p.display_name());
     for alias_key in alias_keys {
-        let (alias_path, rep) = access_direct_alias_rep[&alias_key];
+        let (alias_path, rep) = alias_rep[&alias_key];
         let subject = call_registry.two_phase().subjects.get(rep).cloned();
         if let Some(subject) = subject {
             call_registry
@@ -9678,6 +10153,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_raw_parts_is_declined_and_unregistered() {
+        for segments in [
+            vec![
+                "core".to_string(),
+                "slice".into(),
+                "raw".into(),
+                "from_raw_parts_mut".into(),
+            ],
+            vec![
+                "core".into(),
+                "slice".into(),
+                "raw".into(),
+                "from_raw_parts".into(),
+            ],
+            vec!["std".into(), "slice".into(), "from_raw_parts_mut".into()],
+            vec!["std".into(), "slice".into(), "from_raw_parts".into()],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_SLICE_FROM_RAW_PARTS),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["from_raw_parts_mut".into()]),
+            None,
+            "bare leaf is Vec::from_raw_parts as well"
+        );
+        assert_eq!(
+            registration_decline(&["core".into(), "slice".into(), "from_raw_parts_mut".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "slice::raw::from_raw_parts_mut");
+        fields.note_foreign_body_callable("std", "slice::from_raw_parts_mut");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["core", "slice", "raw", "from_raw_parts_mut"],
+            vec!["std", "slice", "from_raw_parts_mut"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            };
+            let mut graph = LegacyGraph::new("from_raw_parts_mut");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "slice", "raw", "from_raw_parts_mut"][..],
+            &["std", "slice", "from_raw_parts_mut"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "slice", "raw", "from_raw_parts_mut"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.slice.raw.from_raw_parts_mut resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+    }
+
     /// Residual `majit_rlib::jit::conditional_call*` bodies are
     /// `ConditionalCallEntry`, not graphs. Layer-1 would otherwise beat
     /// HOST_ENV and the annotator would walk `function(a)` as an ll
@@ -9919,7 +10468,11 @@ mod tests {
             crate::annotator::model::SomeValue::Impossible,
         )));
         ret.set_concretetype(Some(GCREF.clone()));
-        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        // `__fn_const` is the registry HostObject (`SomePBC`). The builtin
+        // `pycall`s that desc; `bindinputargs` needs one startblock
+        // inputarg for signature `["obj"]`.
+        let obj = crate::flowspace::model::Variable::named("obj");
+        let startblock = crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(obj)]);
         let func = GraphFunc::new(
             "dummy_compute",
             Constant::new(ConstValue::Dict(Default::default())),
@@ -10941,9 +11494,116 @@ mod tests {
         assert!(!Rc::ptr_eq(&manufactured, &subject_pygraph));
     }
 
-    /// SSA `Option<fn>` return phi: one Some arm and three `null_fn` None
-    /// arms, cond threaded through every split. Same predecessor shape as
-    /// production `builtin_fixed_arity_fn` (one Some + three `null_fn`).
+    /// Value-used FnDef the front end spells as a 0-arg `__fn_const`
+    /// Call (`flowspace_adapter` `legacy_const_define_hlvalue`). The
+    /// annotator constant is the registry HostObject
+    /// (`bookkeeper.py` `immutablevalue` / `getdesc` → `SomePBC`
+    /// `[FunctionDesc]`).
+    const OPTION_FN_PBC_CALLEE: &str = "option_fn_pbc_callee";
+
+    fn option_fn_pbc_callee_path() -> crate::parse::CallPath {
+        crate::parse::CallPath {
+            segments: vec![OPTION_FN_PBC_CALLEE.into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    fn option_fn_pbc_callee_legacy() -> LegacyGraph {
+        let mut graph = LegacyGraph::new(OPTION_FN_PBC_CALLEE).with_return_type("i64");
+        let start = graph.startblock;
+        let zero = graph.push_op_var(start, OpKind::ConstInt(0), true).unwrap();
+        graph.set_return(start, Some(zero));
+        graph
+    }
+
+    fn option_fn_pbc_callee_pygraph() -> Rc<PyGraph> {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{Block as FlowBlock, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::SIGNED;
+        let ret = Variable::new();
+        ret.annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
+        ret.set_concretetype(Some(SIGNED));
+        let startblock = FlowBlock::shared(vec![]);
+        let graph = crate::flowspace::model::FunctionGraph::with_return_var(
+            OPTION_FN_PBC_CALLEE,
+            startblock.clone(),
+            Hlvalue::Variable(ret.clone()),
+        );
+        let zero = Constant::with_concretetype(ConstValue::Int(0), SIGNED);
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Constant(zero)],
+            Some(graph.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph)),
+            func: GraphFunc::new(
+                OPTION_FN_PBC_CALLEE,
+                Constant::new(ConstValue::Dict(Default::default())),
+            ),
+            signature: RefCell::new(Signature::new(vec![], None, None)),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: Cell::new(false),
+        })
+    }
+
+    /// Register the value-used FnDef and seed a call table so
+    /// `SomePBC(can_be_None=True)` is `FunctionsPBCRepr`
+    /// (`rpbc.py` `SomePBC.rtyper_makerepr`: `querycallfamily` and
+    /// `total_calltable_size > 0`). `FunctionsPBCRepr.convert_const(None)`
+    /// is `nullptr(FUNC)` (`rpbc.py`).
+    fn register_option_fn_pbc_callee(registry: &CallRegistry) {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::FunctionDesc;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, SIGNED};
+
+        let key = FunctionPathKey::from_segments([OPTION_FN_PBC_CALLEE]);
+        let pygraph = option_fn_pbc_callee_pygraph();
+        let entry = registry.register_callee(key, Signature::new(vec![], None, None), pygraph);
+        entry.set_declared_funcptr_type(FuncType {
+            args: vec![],
+            result: SIGNED,
+        });
+        FunctionDesc::consider_call_site(
+            &[entry.function_desc.clone()],
+            &ArgumentsForTranslation::new(vec![], None, None),
+            &SomeValue::Integer(SomeInteger::default()),
+            None,
+        )
+        .expect("consider_call_site of 0-arg fn() -> i64");
+    }
+
+    fn push_option_fn_pbc_const(graph: &mut LegacyGraph, block: crate::model::BlockId) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.into(),
+                            OPTION_FN_PBC_CALLEE.into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap()
+    }
+
+    /// SSA `Option<fn>` return phi: Some arm is a value-used FnDef
+    /// (`__fn_const` → `SomePBC([FunctionDesc])`) and three spelled
+    /// `null_fn` Nones are `s_None`. Merge is `s_None ∪ SomePBC` →
+    /// `SomePBC(can_be_None=True)` (`model.py` `SomePBC.noneify` /
+    /// `unionof`). Repr is `FunctionsPBCRepr` (`rpbc.py`);
+    /// `convert_const(None)` is `nullptr(FUNC)`. Same predecessor
+    /// shape as production `builtin_fixed_arity_fn`.
     fn option_fn_return_phi_match_graph() -> LegacyGraph {
         let mut graph = LegacyGraph::new("option_fn_return_phi_match").with_return_type("i64");
         let start = graph.startblock;
@@ -10968,19 +11628,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let some_fn = graph
-            .push_op_var(
-                start,
-                crate::model::OpKind::Input {
-                    name: "f".into(),
-                    ty: ValueType::Int,
-                    class_root: Some("fn() -> i64".into()),
-                },
-                true,
-            )
-            .unwrap();
+        let some_fn = push_option_fn_pbc_const(&mut graph, start);
         graph.push_inputarg_var(start, cond.clone());
-        graph.push_inputarg_var(start, some_fn.clone());
         graph.set_branch(
             start,
             cond.clone(),
@@ -11004,7 +11653,8 @@ mod tests {
     /// Two-phase Match: the returnblock inputarg is the live
     /// `getreturnvar()` twin (`rtyper.py specialize_block`
     /// `setconcretetype`), so `func_result_kind` is `'i'` without the
-    /// Func→Int comparison residue.
+    /// Func→Int comparison residue. `FunctionsPBCRepr.lowleveltype` is
+    /// `Ptr(FuncType)`; `history.getkind` of that pointer is `'int'`.
     #[test]
     fn two_phase_match_option_fn_return_phi_maps_returnblock_inputarg() {
         let _lock = anchor_lock();
@@ -11017,8 +11667,10 @@ mod tests {
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        register_option_fn_pbc_callee(&registry);
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(path.clone(), graph.clone());
+        graphs.insert(option_fn_pbc_callee_path(), option_fn_pbc_callee_legacy());
         run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs, &[]);
         let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
             .expect("publish reads the cache");
@@ -11057,6 +11709,8 @@ mod tests {
 
         let mut callcontrol = crate::codewriter::call::CallControl::new();
         callcontrol.register_function_graph(path.clone(), graph.clone());
+        callcontrol
+            .register_function_graph(option_fn_pbc_callee_path(), option_fn_pbc_callee_legacy());
         callcontrol.find_all_graphs_for_tests();
         let mut codewriter = crate::codewriter::codewriter::CodeWriter::new();
         codewriter.run_two_phase_prepass(&callcontrol);
@@ -11074,9 +11728,16 @@ mod tests {
         assert_eq!(jitcode.calldescr().result_type, 'i');
     }
 
-    /// One Some arm and one `null_fn` None arm, cond threaded.
-    /// Fused dual-gate Match: both arms stay live, so publication does
-    /// not depend on GraphStore TDC.
+    /// One Some arm (value-used FnDef / `__fn_const` `SomePBC`) and one
+    /// spelled `null_fn` None arm (`s_None`), cond threaded. Fused
+    /// dual-gate Match: `s_None ∪ SomePBC` → `SomePBC(can_be_None=True)`
+    /// (`model.py` `SomePBC.noneify`); repr is `FunctionsPBCRepr`
+    /// (`rpbc.py`). The spelled hop dest is `NoneRepr` Void; the typed
+    /// null (`FunctionsPBCRepr.convert_const(None)` = `nullptr(FUNC)`)
+    /// is placed on the None-arm link into the returnblock
+    /// (`rtyper.py` `insert_link_conversions` / `convertvar` /
+    /// `inputconst`). `flatten.py` drops the Void hop. Both arms stay
+    /// live, so publication does not depend on GraphStore TDC.
     fn option_fn_one_none_arm_graph() -> LegacyGraph {
         let mut graph = LegacyGraph::new("option_fn_one_none_arm").with_return_type("i64");
         let start = graph.startblock;
@@ -11094,19 +11755,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let some_fn = graph
-            .push_op_var(
-                start,
-                crate::model::OpKind::Input {
-                    name: "f".into(),
-                    ty: ValueType::Int,
-                    class_root: Some("fn() -> i64".into()),
-                },
-                true,
-            )
-            .unwrap();
+        let some_fn = push_option_fn_pbc_const(&mut graph, start);
         graph.push_inputarg_var(start, cond.clone());
-        graph.push_inputarg_var(start, some_fn.clone());
         graph.set_branch(start, cond, pred_some, vec![some_fn], pred_none, vec![]);
         graph.set_return(pred_some, Some(some_phi));
         let none = graph.push_null_fn_ptr_with_spelling(pred_none, Some("fn() -> i64"));
@@ -11114,11 +11764,40 @@ mod tests {
         graph
     }
 
-    /// Match-path: a graph whose None arm is `null_fn` publishes
-    /// `ConstInt(0)` on the FunctionGraph before jtransform
-    /// (`rtyper.py specialize_block` `same_as(Constant, op.result)`).
+    /// `FunctionsPBCRepr.convert_const(None)` (`rpbc.py`) is
+    /// `nullptr(FUNC)`: an `LLPtr` null whose concretetype is
+    /// `Ptr(FuncType)`. `history.getkind` of that pointer is `'int'`,
+    /// so publication is `ConstInt(0)`.
+    fn is_typed_null_fn_ptr_constant(c: &Constant) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let Some(LowLevelType::Ptr(ptr)) = c.concretetype.as_ref() else {
+            return false;
+        };
+        if !matches!(ptr.TO, PtrTarget::Func(_)) {
+            return false;
+        }
+        match &c.value {
+            ConstValue::LLPtr(p) if llptr_is_null(p) => {}
+            _ => return false,
+        }
+        matches!(opkind_from_rtyper_constant(c), Some(OpKind::ConstInt(0)))
+            && kind_of_rtyper_constant(c) == Some(ConcreteType::Signed)
+    }
+
+    /// Match-path: dual-gate Match. The spelled `null_fn` hop dest is
+    /// `NoneRepr` Void (`ConstNone`, erased by jtransform /
+    /// `flatten.py`). `insert_link_conversions` / `convertvar`
+    /// (`rtyper.py`) plus `FunctionsPBCRepr.convert_const(None)`
+    /// (`rpbc.py`) put `nullptr(FUNC)` on the None-arm link into the
+    /// returnblock (`ConstInt(0)` / kind `'i'` / `Ptr(FuncType)`).
+    /// After `transform_graph` no `null_fn` call remains.
     #[test]
-    fn match_null_fn_none_arm_publishes_const_int_before_jtransform() {
+    fn match_null_fn_none_arm_converts_on_link_to_null_fn_ptr() {
+        use crate::codewriter::jtransform::{GraphTransformConfig, transform_graph};
+        use crate::codewriter::type_state::{
+            apply_from_flowspace_constants, apply_from_flowspace_variables,
+        };
+
         let _lock = anchor_lock();
         let mut graph = option_fn_one_none_arm_graph();
         let null_fn_results: Vec<_> = graph
@@ -11135,21 +11814,26 @@ mod tests {
         );
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        register_option_fn_pbc_callee(&registry);
         let graphs = crate::codewriter::call::GraphStore::default();
         let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
-        let DualGateOutcome::Match { const_results, .. } = outcome else {
+        let DualGateOutcome::Match {
+            real_value_to_var,
+            real_constants,
+            const_results,
+        } = outcome
+        else {
             panic!("Option<fn> None-arm graph must Match, got {outcome:?}");
         };
+        apply_from_flowspace_variables(&real_value_to_var);
+        apply_from_flowspace_constants(&real_constants);
         apply_rtyper_const_results(&mut graph, &const_results);
-        assert!(
-            !graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| op_is_null_fn_call(&op.kind)),
-            "FunctionGraph must not carry null_fn after publication"
-        );
         for result in &null_fn_results {
+            assert_eq!(
+                LegacyGraph::concretetype_of(result),
+                ConcreteType::Void,
+                "spelled null_fn hop dest is NoneRepr Void"
+            );
             let folded = graph
                 .blocks
                 .iter()
@@ -11157,11 +11841,68 @@ mod tests {
                 .find(|op| op.result.as_ref() == Some(result))
                 .expect("null_fn result must survive as a constant definition");
             assert!(
-                matches!(folded.kind, OpKind::ConstInt(0)),
-                "None arm stayed {:?} before jtransform",
+                matches!(folded.kind, OpKind::ConstNone),
+                "spelled null_fn hop dest publishes ConstNone (erased by jtransform), got {:?}",
                 folded.kind
             );
         }
+
+        let (annotator, _) = registry
+            .session_if_started()
+            .expect("dual-gate Match starts the rtyper session");
+        let fixed = annotator.fixed_graphs.borrow();
+        let rtyped = fixed
+            .values()
+            .find(|g| g.borrow().name == graph.name)
+            .cloned()
+            .unwrap_or_else(|| {
+                let names: Vec<_> = fixed.values().map(|g| g.borrow().name.clone()).collect();
+                panic!(
+                    "rtyped subject graph {:?} missing from fixed_graphs; present {names:?}",
+                    graph.name
+                )
+            });
+        let flow = rtyped.borrow();
+        let returnblock = flow.returnblock.clone();
+        let incoming: Vec<_> = flow
+            .iterlinks()
+            .into_iter()
+            .filter(|link| {
+                link.borrow()
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| std::rc::Rc::ptr_eq(t, &returnblock))
+            })
+            .collect();
+        let typed_nulls: Vec<_> = incoming
+            .iter()
+            .flat_map(|link| link.borrow().args.clone())
+            .filter_map(|arg| match arg {
+                Some(Hlvalue::Constant(c)) if is_typed_null_fn_ptr_constant(&c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            typed_nulls.len(),
+            1,
+            "None-arm link into returnblock must carry nullptr FUNC \
+             after insert_link_conversions / convertvar; incoming {:?}",
+            incoming
+                .iter()
+                .map(|link| link.borrow().args.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        assert!(
+            !transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| op_is_null_fn_call(&op.kind)),
+            "null_fn Call must not survive transform_graph"
+        );
     }
 
     /// A `FnPtrCell<fn(..)>` static is a prebuilt `ConstRefAddr`; `get`
@@ -18588,7 +19329,16 @@ mod tests {
                 "ty": i64_ty(),
                 "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
             }]},
-            "src": "Normal"
+            "src": "Normal",
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "C", "transparent": false}
+                }
+            }]
         });
         let file = serde_json::json!({
             "charon_version": "0.1.201",

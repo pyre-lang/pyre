@@ -1248,7 +1248,10 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
         );
     }
     for owner in ["synth::U", "U", "fixture::synth::U"] {
-        assert!(fields.raw_word_owners.contains(owner), "{owner}");
+        assert!(
+            !fields.raw_word_owners.contains(owner),
+            "{owner} is a Rust-repr payload enum (`rclass.py` `getinstancerepr`)"
+        );
     }
 
     let build_a = lower(&llbc, "build_a");

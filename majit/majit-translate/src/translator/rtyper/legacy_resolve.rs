@@ -54,6 +54,7 @@ fn resolve_types_inner(
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> Result<(), crate::translator::rtyper::error::TyperError> {
     crate::translator::rtyper::legacy_annotator::refuse_merged_frozen_pbc_reprs(graph)?;
+    propagate_fn_ptr_stamps(graph);
 
     // RPython `rtyper.setup_block_entry` writes `Signed` for `etype`
     // and `GcRef` for `evalue` on every graph's exceptblock unconditionally
@@ -116,7 +117,9 @@ fn resolve_types_inner(
         for op in &block.operations {
             if let Some(result_var) = op.result.as_ref() {
                 let inferred = infer_concrete_from_op(&op.kind, raw_alloc_flavor_structs);
-                if inferred != ConcreteType::Unknown {
+                if inferred != ConcreteType::Unknown
+                    && FunctionGraph::concretetype_of(result_var) != ConcreteType::Void
+                {
                     // The op carries authoritative result kind (post-
                     // jtransform `float_*` rewrite, explicit Call /
                     // FieldRead / etc. result_ty).  Override any
@@ -124,7 +127,9 @@ fn resolve_types_inner(
                     // UnaryOp result to Int, which would shadow a later
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
-                    // rewrite arm.
+                    // rewrite arm. A spelled `null_fn` dest is already
+                    // `NoneRepr` Void (`fn_null_constant`); Call
+                    // `result_ty` Int is the surface bank.
                     commit_concretetype(result_var, inferred);
                 }
                 seed_raw_ptr_cast_source(&op.kind, raw_alloc_flavor_structs);
@@ -484,6 +489,21 @@ fn concrete_from_annotation(
             // `getFrozenPBCRepr` → `SingleFrozenPBCRepr.lowleveltype = Void`.
             return Ok(ConcreteType::Void);
         }
+        let all_function = pbc
+            .descriptions
+            .values()
+            .all(|d| matches!(d, DescEntry::Func(_)));
+        if all_function {
+            // `FunctionsPBCRepr.lowleveltype` is `Ptr(FuncType)` for one
+            // unique call-table row (`CanBeNull` is still that pointer).
+            // `history.getkind` of `Ptr(FuncType)` is `'int'`.
+            return Ok(ConcreteType::Signed);
+        }
+    }
+    // `SomeNone.rtyper_makerepr` is `NoneRepr` (`rnone.py`);
+    // `NoneRepr.lowleveltype` is `Void`.
+    if matches!(s, SomeValue::None_(_)) {
+        return Ok(ConcreteType::Void);
     }
     // `rptr.py` `SomePtr.rtyper_makerepr` → `PtrRepr(self.ll_ptrtype)`:
     // the concretetype of a SomePtr value IS `ll_ptrtype`.
@@ -563,6 +583,9 @@ fn link_is_raise_like(link: &Link) -> bool {
 fn convert_link(graph: &FunctionGraph, link: &Link) {
     let target_block = graph.block(link.target);
     for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        if let Some(v) = src.as_variable() {
+            FunctionGraph::copy_fn_ptr_concretetype(v, dst);
+        }
         // A `LinkArg::Const(_)` whose `concretetype` carries a
         // construction-site repr (e.g. `set_return`'s
         // `Constant(None, concretetype=Void)`) is authoritative —
@@ -580,12 +603,27 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
             // `insert_link_conversions` converts the Constant INTO dest
             // (`rtyper.py`: `link.args[i] = inputconst(r_a2, a1.value)`).
             // Dest stays Signed; `IntegerRepr.convert_const` (`rint.py`)
-            // raises TyperError for None.
+            // raises TyperError for None. A `Ptr(FuncType)` dest is the
+            // `FunctionsPBCRepr` word: `None` is nullptr, not an integer.
             if incoming == ConcreteType::Void
                 && FunctionGraph::concretetype_of(dst) == ConcreteType::Signed
             {
+                if dst
+                    .concretetype()
+                    .as_ref()
+                    .is_some_and(FunctionGraph::lltype_is_fn_ptr)
+                {
+                    continue;
+                }
                 let _ = inputconst(signed_repr().as_ref(), &value.value)
                     .unwrap_or_else(|e| panic!("{e}"));
+                continue;
+            }
+            if dst
+                .concretetype()
+                .as_ref()
+                .is_some_and(FunctionGraph::lltype_is_fn_ptr)
+            {
                 continue;
             }
             FunctionGraph::set_concretetype_of_inline(dst, incoming);
@@ -700,6 +738,42 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
     }
 }
 
+/// Copy `Ptr(FuncType)` stamps along Value links onto phi dests.
+/// `insert_link_conversions` converts into the dest repr; a function-PBC
+/// dest (`can_be_None` included) is `FunctionsPBCRepr.lowleveltype`.
+/// A spelled `null_fn` dest is `NoneRepr` Void (`fn_null_constant`);
+/// `copy_fn_ptr_concretetype` does not copy that. A phi that only
+/// receives the spelled null follows its annotation (`s_None` → Void).
+fn propagate_fn_ptr_stamps(graph: &FunctionGraph) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target = graph.block(link.target);
+                for (dst, src) in target.inputargs.iter().zip(link.args.iter()) {
+                    let Some(v) = src.as_variable() else {
+                        continue;
+                    };
+                    let had = dst
+                        .concretetype()
+                        .as_ref()
+                        .is_some_and(FunctionGraph::lltype_is_fn_ptr);
+                    FunctionGraph::copy_fn_ptr_concretetype(v, dst);
+                    if !had
+                        && dst
+                            .concretetype()
+                            .as_ref()
+                            .is_some_and(FunctionGraph::lltype_is_fn_ptr)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A stamped raw `Ptr` (`CArrayPtr` / `CCHARP`, `Ptr(FuncType)`,
 /// `Ptr(Struct)` spill cell, `Ptr(Array(Char))` varsize cell) is the
 /// `ann_malloc` / `ann_cast_int_to_ptr` concretetype.
@@ -708,12 +782,18 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
 /// `somevalue_to_valuetype` of a non-function `SomePtr`) must not
 /// replace it with the canonical scalar.
 fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
-    if var.concretetype().as_ref().is_some_and(|ty| {
-        matches!(
-            ty,
+    if let Some(ty) = var.concretetype()
+        && matches!(
+            &ty,
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
-        ) && crate::model::try_getkind(ty, true, true, true) == Ok(ConcreteType::Signed)
-    }) {
+        )
+        && crate::model::try_getkind(&ty, true, true, true) == Ok(ConcreteType::Signed)
+    {
+        // Keep the lltype stamp. Also project `history.getkind` onto the
+        // kind overlay: `somevalue_to_valuetype` of `s_None` / a
+        // non-function PBC is `Ref`, and leaving that overlay as `GcRef`
+        // makes `graph_result_kind` `'r'` while `FUNC.RESULT` is `'i'`.
+        FunctionGraph::set_concretetype_of_inline(var, ConcreteType::Signed);
         return;
     }
     FunctionGraph::set_concretetype_of_inline(var, concrete);
@@ -1924,14 +2004,17 @@ mod tests {
 
         let none_c = graph.create_block();
         let nfn0 = graph.push_null_fn_ptr_with_spelling(none_c, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn0, spelling, crate::ErrorCarrierSpec::default());
         graph.set_return(none_c, Some(nfn0));
 
         let none_fn1 = graph.create_block();
         let nfn1 = graph.push_null_fn_ptr_with_spelling(none_fn1, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn1, spelling, crate::ErrorCarrierSpec::default());
         graph.set_return(none_fn1, Some(nfn1));
 
         let none_fn2 = graph.create_block();
         let nfn2 = graph.push_null_fn_ptr_with_spelling(none_fn2, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn2, spelling, crate::ErrorCarrierSpec::default());
         graph.set_return(none_fn2, Some(nfn2));
 
         let mid1 = graph.create_block();
@@ -1939,6 +2022,8 @@ mod tests {
         graph.set_branch(start, keep, some_block, vec![holder], mid1, vec![]);
         graph.set_branch(mid1, n1, none_c, vec![], mid2, vec![]);
         graph.set_branch(mid2, n2, none_fn1, vec![], none_fn2, vec![]);
+        let phi = graph.block(graph.returnblock).inputargs[0].clone();
+        stamp_fn_ptr_spelling(&phi, spelling, crate::ErrorCarrierSpec::default());
 
         let path = CallPath::from_segments(["option_fn_from_holder"]);
         let mut callcontrol = CallControl::new();
@@ -1990,5 +2075,101 @@ mod tests {
             ConcreteType::Unknown => panic!("unresolved return kind"),
         };
         assert_eq!(graph_result_kind, 'i');
+    }
+
+    /// Same Skip-path shape as `skip_raw_someptr_return_phi_is_signed_not_gcref`
+    /// without stamping the return phi. `set_return` copies `Ptr(FuncType)`
+    /// from the FieldRead dest so `func_result_kind` stays `'i'`.
+    #[test]
+    fn skip_option_fn_return_phi_is_signed_without_explicit_phi_stamp() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jitcode::JitCode;
+        use crate::front::mir::stamp_fn_ptr_spelling;
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("option_fn_from_holder_nostamp").with_return_type("i64");
+        let start = graph.startblock;
+        let keep = push_typed_input(&mut graph, start, "keep", ValueType::Bool);
+        let n1 = push_typed_input(&mut graph, start, "n1", ValueType::Bool);
+        let n2 = push_typed_input(&mut graph, start, "n2", ValueType::Bool);
+        let holder = push_typed_input(&mut graph, start, "holder", ValueType::Ref(None));
+        let spelling = "fn(i64) -> i64";
+        let (some_block, some_args) = graph.create_block_with_arg_vars(1);
+        let field_val = graph
+            .push_op_var(
+                some_block,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "func",
+                        Some("gateway::BuiltinCode".to_string()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        stamp_fn_ptr_spelling(&field_val, spelling, crate::ErrorCarrierSpec::default());
+        graph.set_return(some_block, Some(field_val));
+        let none_c = graph.create_block();
+        let nfn0 = graph.push_null_fn_ptr_with_spelling(none_c, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn0, spelling, crate::ErrorCarrierSpec::default());
+        graph.set_return(none_c, Some(nfn0));
+        let none_fn1 = graph.create_block();
+        let nfn1 = graph.push_null_fn_ptr_with_spelling(none_fn1, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn1, spelling, crate::ErrorCarrierSpec::default());
+        graph.set_return(none_fn1, Some(nfn1));
+        let none_fn2 = graph.create_block();
+        let nfn2 = graph.push_null_fn_ptr_with_spelling(none_fn2, Some(spelling));
+        stamp_fn_ptr_spelling(&nfn2, spelling, crate::ErrorCarrierSpec::default());
+        graph.set_return(none_fn2, Some(nfn2));
+        let mid1 = graph.create_block();
+        let mid2 = graph.create_block();
+        graph.set_branch(start, keep, some_block, vec![holder], mid1, vec![]);
+        graph.set_branch(mid1, n1, none_c, vec![], mid2, vec![]);
+        graph.set_branch(mid2, n2, none_fn1, vec![], none_fn2, vec![]);
+
+        let path = CallPath::from_segments(["option_fn_from_holder_nostamp"]);
+        let mut callcontrol = CallControl::new();
+        callcontrol.register_function_graph(path.clone(), graph.clone());
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        let skip = codewriter
+            .dual_gate_skip_reason(&graph, &callcontrol)
+            .expect("dual-gate should classify");
+        assert!(
+            skip.is_some(),
+            "must take the Skip path (Match already Signed via PtrRepr); got Match"
+        );
+        let jitcode = std::sync::Arc::new(JitCode::new("option_fn_from_holder_nostamp"));
+        let transform = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            codewriter.transform_graph_to_jitcode(
+                &graph,
+                &path,
+                &mut callcontrol,
+                &crate::GraphTransformConfig::default(),
+                &jitcode,
+                false,
+                0,
+            );
+        }));
+        if let Err(payload) = transform {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            assert!(
+                !msg.contains("FUNC.RESULT"),
+                "func_result_kind panic: {msg}"
+            );
+        }
+        let returnvar = &graph.block(graph.returnblock).inputargs[0];
+        assert_eq!(
+            FunctionGraph::concretetype_of(returnvar),
+            ConcreteType::Signed
+        );
     }
 }
