@@ -1105,7 +1105,6 @@ fn recipe_parent_frame_from_helper(
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: call_jit_pc,
-        call_pc: call_jit_pc,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole,

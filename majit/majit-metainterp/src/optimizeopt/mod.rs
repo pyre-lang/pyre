@@ -10757,9 +10757,10 @@ mod ensure_ptr_info_arg0_tests {
             index: 0,
             parent: parent.clone(),
         });
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[receiver], descr);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[receiver], descr);
         op.pos().set(OpRef::int_op(1));
         let _ = ctx.ensure_ptr_info_arg0(&op);
+        let op = OpRc::new(op);
         let (arg_guards, _result_guards) = ctx
             .collect_use_box_guards(&op)
             .expect("use_box guards of an Instance GETFIELD receiver");
