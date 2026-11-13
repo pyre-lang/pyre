@@ -553,51 +553,40 @@ pub unsafe fn _delitem_slice_helper(items: &mut Vec<u8>, start: i64, step: i64, 
         start = start.wrapping_add(step.wrapping_mul(slicelength.wrapping_sub(1)));
         step = step.wrapping_neg();
     }
-    let n = items.len();
-    let p = items.as_mut_ptr();
     if step == 1 {
         debug_assert!(start >= 0);
         if slicelength > 0 {
             let s = start as usize;
-            let count = slicelength as usize;
-            let mut j = s;
-            while j + count < n {
-                unsafe {
-                    *p.add(j) = *p.add(j + count);
-                }
-                j += 1;
-            }
-            unsafe {
-                items.set_len(n - count);
-            }
+            let e = s + slicelength as usize;
+            items.drain(s..e);
         }
-        return;
-    }
-    let mut i = start;
-    let mut discard: i64 = 1;
-    while discard < slicelength {
+    } else {
+        let n = items.len();
+        let p = items.as_mut_ptr();
+        let mut i = start;
+        let mut discard: i64 = 1;
+        while discard < slicelength {
+            let mut j = i.wrapping_add(1);
+            i = i.wrapping_add(step);
+            while j < i {
+                unsafe {
+                    *p.add(j.wrapping_sub(discard) as usize) = *p.add(j as usize);
+                }
+                j = j.wrapping_add(1);
+            }
+            discard = discard.wrapping_add(1);
+        }
         let mut j = i.wrapping_add(1);
-        i = i.wrapping_add(step);
-        while j < i {
+        let n_i = n as i64;
+        while j < n_i {
             unsafe {
-                *p.add(j.wrapping_sub(discard) as usize) = *p.add(j as usize);
+                *p.add(j.wrapping_sub(slicelength) as usize) = *p.add(j as usize);
             }
             j = j.wrapping_add(1);
         }
-        discard = discard.wrapping_add(1);
-    }
-    let mut j = i.wrapping_add(1);
-    let n_i = n as i64;
-    while j < n_i {
-        unsafe {
-            *p.add(j.wrapping_sub(slicelength) as usize) = *p.add(j as usize);
-        }
-        j = j.wrapping_add(1);
-    }
-    let new_start = n_i - slicelength;
-    debug_assert!(new_start >= 0);
-    unsafe {
-        items.set_len(new_start as usize);
+        start = n_i - slicelength;
+        debug_assert!(start >= 0);
+        items.truncate(start as usize);
     }
 }
 
