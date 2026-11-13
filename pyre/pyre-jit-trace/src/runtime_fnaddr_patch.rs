@@ -2752,6 +2752,17 @@ mod tests {
         }
     }
 
+    fn tagged_reloc_tag(kind: &ConstIRelocKind) -> String {
+        match kind {
+            ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
+            ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
+            ConstIRelocKind::Vtable {
+                impl_key,
+                trait_leaf,
+            } => format!("Vtable {impl_key}::{trait_leaf}"),
+        }
+    }
+
     fn note_tagged_reloc_mismatch(
         tag: String,
         location: String,
@@ -2784,10 +2795,58 @@ mod tests {
         }
     }
 
+    /// Shared per-slot check for [`tagged_reloc_path_matches_old_value_correspondence`].
+    /// Vtable slots have no build word, so they skip the value oracle and
+    /// must equal [`runtime_vtable_addr`]. FnAddr / StaticAddr keep the
+    /// old-vs-new correspondence, including IcfCollision.
+    fn check_tagged_reloc_slot(
+        kind: &ConstIRelocKind,
+        location: String,
+        build: i64,
+        old: i64,
+        new: i64,
+        colliding: &std::collections::HashSet<i64>,
+        unexpected: &mut Vec<String>,
+        vtable_bad: &mut Vec<String>,
+    ) {
+        if let ConstIRelocKind::Vtable {
+            impl_key,
+            trait_leaf,
+        } = kind
+        {
+            let expected = runtime_vtable_addr(impl_key, trait_leaf);
+            if new == 0 || new != expected {
+                vtable_bad.push(format!(
+                    "{} in {location} new={new:#x} expected={expected:#x}",
+                    tagged_reloc_tag(kind)
+                ));
+            }
+            return;
+        }
+        if old == new {
+            return;
+        }
+        note_tagged_reloc_mismatch(
+            tagged_reloc_tag(kind),
+            location,
+            build,
+            old,
+            new,
+            runtime_lookup_for_reloc_kind(kind),
+            colliding,
+            unexpected,
+        );
+    }
+
     /// Every tagged FnAddr / StaticAddr slot's final value after the
     /// provenance pipeline must equal the final value HEAD's value-based
     /// pipeline writes for the same build word — including slots that
     /// pipeline zeroed.
+    ///
+    /// Vtable slots carry no build word (the assembler writes 0 and the
+    /// reloc carries `{impl_key, trait_leaf}`). They are checked against
+    /// `runtime_vtable_addr` (the `rclass.py` `getvtable` constant), not
+    /// against the value oracle.
     ///
     /// Optimized MSVC links pass `/OPT:REF,ICF` to link.exe, so identical-
     /// COMDAT folding can give several distinct functions one build address
@@ -2808,89 +2867,58 @@ mod tests {
 
         let colliding = production_colliding_build_words();
         let mut unexpected = Vec::new();
+        let mut vtable_bad = Vec::new();
         for ((orig_jc, old_jc), new_jc) in orig.iter().zip(&old_jcs).zip(&new_jcs) {
             let Some(orig_body) = orig_jc.try_body() else {
                 continue;
             };
             let old_body = old_jc.try_body().expect("old oracle kept the body");
             let new_body = new_jc.try_body().expect("new pipeline kept the body");
-            if let Some(kind) = &orig_jc.fnaddr_reloc
-                && old_jc.fnaddr != new_jc.fnaddr
-            {
-                let tag = match kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                    ConstIRelocKind::Vtable {
-                        impl_key,
-                        trait_leaf,
-                    } => format!("Vtable {impl_key}::{trait_leaf}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+            if let Some(kind) = &orig_jc.fnaddr_reloc {
+                check_tagged_reloc_slot(
+                    kind,
                     format!("fnaddr in {}", orig_jc.name),
                     orig_jc.fnaddr,
                     old_jc.fnaddr,
                     new_jc.fnaddr,
-                    runtime_lookup_for_reloc_kind(kind),
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
             for desc in &orig_body.reloc_consts_i {
                 let idx = desc.constants_i_index;
-                let build = orig_body.constants_i[idx];
-                let old = old_body.constants_i[idx];
-                let new = new_body.constants_i[idx];
-                if old == new {
-                    continue;
-                }
-                let tag = match &desc.kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                    ConstIRelocKind::Vtable {
-                        impl_key,
-                        trait_leaf,
-                    } => format!("Vtable {impl_key}::{trait_leaf}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+                check_tagged_reloc_slot(
+                    &desc.kind,
                     format!("{} constants_i[{idx}]", orig_jc.name),
-                    build,
-                    old,
-                    new,
-                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    orig_body.constants_i[idx],
+                    old_body.constants_i[idx],
+                    new_body.constants_i[idx],
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
             for desc in &orig_body.reloc_consts_r {
                 let idx = desc.constants_r_index;
-                let build = orig_body.constants_r[idx].get();
-                let old = old_body.constants_r[idx].get();
-                let new = new_body.constants_r[idx].get();
-                if old == new {
-                    continue;
-                }
-                let tag = match &desc.kind {
-                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
-                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
-                    ConstIRelocKind::Vtable {
-                        impl_key,
-                        trait_leaf,
-                    } => format!("Vtable {impl_key}::{trait_leaf}"),
-                };
-                note_tagged_reloc_mismatch(
-                    tag,
+                check_tagged_reloc_slot(
+                    &desc.kind,
                     format!("{} constants_r[{idx}]", orig_jc.name),
-                    build,
-                    old,
-                    new,
-                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    orig_body.constants_r[idx].get(),
+                    old_body.constants_r[idx].get(),
+                    new_body.constants_r[idx].get(),
                     &colliding,
                     &mut unexpected,
+                    &mut vtable_bad,
                 );
             }
         }
+        vtable_bad.sort();
+        vtable_bad.dedup();
+        assert!(
+            vtable_bad.is_empty(),
+            "Vtable slot did not equal runtime_vtable_addr or was zero: {vtable_bad:?}"
+        );
         unexpected.sort();
         unexpected.dedup();
         assert!(
