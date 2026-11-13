@@ -47,7 +47,7 @@ first = gc.collect()
 second = gc.collect()
 assert isinstance(first, int)
 assert isinstance(second, int)
-assert first + second > 0
+assert first >= 400
 
 assert isinstance(gc.get_objects(), list)
 assert isinstance(gc.get_objects(None), list)
@@ -64,6 +64,12 @@ with assert_raises(TypeError):
 import weakref
 class Frozen: pass
 obj = Frozen(); obj.cycle = obj; ref = weakref.ref(obj)
+before = Frozen()
 gc.freeze(); assert gc.get_freeze_count() > 0
+assert not any(o is before for o in gc.get_objects())
+after = Frozen()
+assert any(o is after for o in gc.get_objects())
 del obj; gc.collect(); assert ref() is not None
 gc.unfreeze(); assert gc.get_freeze_count() == 0
+assert any(o is before for o in gc.get_objects())
+gc.collect(); assert ref() is None
