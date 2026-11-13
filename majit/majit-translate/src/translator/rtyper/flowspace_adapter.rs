@@ -1777,6 +1777,67 @@ fn is_vec_set_len_segments(segments: &[String]) -> bool {
     }
 }
 
+/// `Vec::truncate(l, n)` is `del l[min(n, len(l)):]`. Rust is a no-op when
+/// `n > len`; startonly `ll_listdelslice_startonly` would grow via
+/// `_ll_list_resize_le` once the debug `ll_assert(start <= len)` is gone.
+fn is_vec_truncate_segments(segments: &[String]) -> bool {
+    match segments {
+        [a, b, c, leaf]
+            if a == "alloc"
+                && b == "vec"
+                && (c == "<Impl>" || c == "Vec")
+                && leaf == "truncate" =>
+        {
+            true
+        }
+        [a, b, leaf] if a == "vec" && b == "Vec" && leaf == "truncate" => true,
+        _ => false,
+    }
+}
+
+/// Synthetic marker the MIR drain rewrite plants for a dropped
+/// `Vec::drain(v, a..b)` (`__delslice_range`, same channel as `__getslice_range`).
+fn is_delslice_range_marker(segments: &[String]) -> bool {
+    is_getslice_marker(segments, "__delslice_range")
+}
+
+/// `del l[min(n, len(l)):]` (`decompose_slice_args` `"startonly"` when
+/// stop is constant `None`). `len` then builtin `min` (`builtin_min` /
+/// `rtype_builtin_min` / `ll_min`, same `simple_call` as `core::cmp::min`)
+/// then `delslice`.
+fn vec_truncate_delslice(
+    receiver: Hlvalue,
+    new_len: Hlvalue,
+    result: Hlvalue,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    let builtin = HOST_ENV
+        .lookup_builtin("min")
+        .ok_or_else(|| TyperError::message("builtin `min` missing from HOST_ENV".to_string()))?;
+    let cur_len = Hlvalue::Variable(Variable::new());
+    let start = Hlvalue::Variable(Variable::new());
+    Ok(vec![
+        FlowspaceOp::new("len", vec![receiver.clone()], cur_len.clone()),
+        FlowspaceOp::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(builtin))),
+                new_len,
+                cur_len,
+            ],
+            start.clone(),
+        ),
+        FlowspaceOp::new(
+            "delslice",
+            vec![
+                receiver,
+                start,
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
+            ],
+            result,
+        ),
+    ])
+}
+
 // `<Vec<T> as Index<usize>>::index` (Rust MIR `v[i]` / `vec::Vec::index`).
 //
 // RPython writes the same operation as `lst[i]`:
@@ -1909,6 +1970,14 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             ..
         } if is_vec_set_len_segments(segments) => false,
+        // `Vec::truncate` lowers to `len` + `simple_call(min)` +
+        // `delslice`; `rtype_builtin_min` is `exception_cannot_occur` and
+        // `DelSlice.canraise` is `[]`. Dropped `Vec::drain(a..b)` is
+        // `delslice` only.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            ..
+        } if is_vec_truncate_segments(segments) || is_delslice_range_marker(segments) => false,
         // `Vec::index` lowers (in `translate_op`) to `getitem`, whose
         // `canraise` is `[IndexError, KeyError, Exception]` (`operation.py`).
         // `RustVecRepr.rtype_getitem` then `exception_cannot_occur`.
@@ -2545,6 +2614,8 @@ enum FunctionPathHighLevel<'a> {
     VecFromElem,
     VecPush,
     VecSetLen,
+    VecTruncate,
+    DelsliceRange,
     VecIndex,
     VecExtendFromSlice,
     RdictInsertOrGet(&'static str),
@@ -2754,6 +2825,12 @@ fn function_path_high_level_kind<'a>(
     }
     if is_vec_set_len_segments(segments) {
         return Some(FunctionPathHighLevel::VecSetLen);
+    }
+    if is_vec_truncate_segments(segments) && nargs == 2 {
+        return Some(FunctionPathHighLevel::VecTruncate);
+    }
+    if is_delslice_range_marker(segments) && nargs == 3 {
+        return Some(FunctionPathHighLevel::DelsliceRange);
     }
     if vec_inherent_index_segments(segments) {
         return Some(FunctionPathHighLevel::VecIndex);
@@ -3164,6 +3241,31 @@ fn emit_function_path_high_level_op(
                 ],
                 result,
             )])
+        }
+        FunctionPathHighLevel::VecTruncate => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "Vec::truncate requires exactly two args (receiver, new_len), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::truncate requires a receiver arg".to_string())
+            })?;
+            let new_len = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::truncate requires a new_len arg".to_string())
+            })?;
+            vec_truncate_delslice(receiver, new_len, result)
+        }
+        FunctionPathHighLevel::DelsliceRange => {
+            if arg_hls.len() != 3 {
+                return Err(TyperError::message(format!(
+                    "__delslice_range requires exactly three args (receiver, start, stop), got {}",
+                    arg_hls.len()
+                )));
+            }
+            Ok(vec![FlowspaceOp::new("delslice", arg_hls, result)])
         }
         FunctionPathHighLevel::VecIndex => {
             if arg_hls.len() != 2 {
@@ -11129,6 +11231,43 @@ mod tests {
         assert!(op_canraise(&op.kind));
     }
 
+    fn assert_truncate_len_min_delslice(
+        translated: &[crate::flowspace::model::SpaceOperation],
+        receiver: &Hlvalue,
+        new_len: &Hlvalue,
+        result: &Hlvalue,
+    ) {
+        assert_eq!(translated.len(), 3);
+        assert_eq!(translated[0].opname, "len");
+        assert_eq!(translated[0].args, vec![receiver.clone()]);
+        let cur_len = &translated[0].result;
+        assert_eq!(translated[1].opname, "simple_call");
+        assert_eq!(translated[1].args.len(), 3);
+        let Hlvalue::Constant(ref min_const) = translated[1].args[0] else {
+            panic!("truncate min callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = min_const.value else {
+            panic!("truncate min callable must be a HostObject");
+        };
+        assert_eq!(host.qualname(), "min");
+        assert_eq!(translated[1].args[1], *new_len);
+        assert_eq!(translated[1].args[2], *cur_len);
+        let start = &translated[1].result;
+        assert_eq!(translated[2].opname, "delslice");
+        assert_eq!(translated[2].args.len(), 3);
+        assert_eq!(translated[2].args[0], *receiver);
+        assert_eq!(translated[2].args[1], *start);
+        let Hlvalue::Constant(ref stop) = translated[2].args[2] else {
+            panic!("delslice stop must be Constant None");
+        };
+        assert!(
+            matches!(stop.value, ConstValue::None),
+            "del l[min(n, len(l)):] stop is None, got {:?}",
+            stop.value
+        );
+        assert_eq!(translated[2].result, *result);
+    }
+
     #[test]
     fn translate_op_vec_set_len_lowers_to_setattr_len() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -11180,6 +11319,111 @@ mod tests {
             ));
             assert_eq!(translated[0].args[2], new_len);
             assert_eq!(translated[0].result, result);
+        }
+    }
+
+    #[test]
+    fn translate_op_vec_truncate_lowers_to_delslice_startonly() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_vec_truncate_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let receiver = Hlvalue::Variable(Variable::new());
+        let new_len = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), receiver.clone());
+        value_map.insert(vars[1].clone(), new_len.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        for segments in [
+            vec!["vec".into(), "Vec".into(), "truncate".into()],
+            vec![
+                "alloc".into(),
+                "vec".into(),
+                "<Impl>".into(),
+                "truncate".into(),
+            ],
+        ] {
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
+                    result_ty: ValueType::Void,
+                },
+            };
+            assert!(
+                !op_canraise(&op.kind),
+                "Vec::truncate lowers to len + min + delslice, which do not raise"
+            );
+            let translated = translate_op(&op, &value_map, &empty_call_registry())
+                .expect("Vec::truncate must lower to len + min + delslice");
+            assert_truncate_len_min_delslice(&translated, &receiver, &new_len, &result);
+        }
+    }
+
+    #[test]
+    fn translate_op_dropped_vec_drain_range_lowers_to_delslice_startstop() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_vec_drain_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let receiver = Hlvalue::Variable(Variable::new());
+        let start = Hlvalue::Variable(Variable::new());
+        let stop = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), receiver.clone());
+        value_map.insert(vars[1].clone(), start.clone());
+        value_map.insert(vars[2].clone(), stop.clone());
+        value_map.insert(vars[3].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__delslice_range".into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![
+                    vars[0].clone(),
+                    vars[1].clone(),
+                    vars[2].clone(),
+                ]),
+                result_ty: ValueType::Void,
+            },
+        };
+        assert!(
+            !op_canraise(&op.kind),
+            "dropped Vec::drain(a..b) lowers to delslice, which does not raise"
+        );
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("dropped Vec::drain(a..b) must lower to delslice startstop");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "delslice");
+        assert_eq!(translated[0].args, vec![receiver, start, stop]);
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
+    fn vec_drain_function_path_is_not_high_level_without_marker() {
+        for segments in [
+            vec!["vec".into(), "Vec".into(), "drain".into()],
+            vec![
+                "alloc".into(),
+                "vec".into(),
+                "<Impl>".into(),
+                "drain".into(),
+            ],
+        ] {
+            assert!(
+                function_path_high_level_kind(&segments, 2).is_none(),
+                "Vec::drain is not delslice without the dropped-Drain marker, {segments:?}"
+            );
+            assert!(
+                function_path_high_level_kind(&segments, 3).is_none(),
+                "Vec::drain is not delslice without the dropped-Drain marker, {segments:?}"
+            );
         }
     }
 

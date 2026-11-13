@@ -1521,6 +1521,26 @@ fn init_somerustvec_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+    // unaryop.py `SomeList.delslice`: check_negative_slice; void.
+    // SomeRustVec has no listdef, so there is no resize() analog.
+    register(
+        reg,
+        OpKind::DelSlice,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_start = ann
+                    .annotation(&hl.args[1])
+                    .expect("rustvec.delslice: start unbound");
+                let s_stop = ann
+                    .annotation(&hl.args[2])
+                    .expect("rustvec.delslice: stop unbound");
+                check_negative_slice(&s_start, &s_stop, "slicing");
+                None
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 fn init_somelist_overrides(
@@ -7047,6 +7067,27 @@ mod tests {
                 .unwrap_or("")
                 .contains("no field \"cap\""),
             "got {err:?}"
+        );
+
+        let mut v_start = Variable::named("start");
+        ann.setbinding(
+            &mut v_start,
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        );
+        let hl_delslice = HLOperation::new(
+            OpKind::DelSlice,
+            vec![
+                Hlvalue::Variable(v_vec.clone()),
+                Hlvalue::Variable(v_start),
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
+            ],
+        );
+        assert!(
+            hl_delslice
+                .consider(&ann)
+                .expect("rustvec delslice")
+                .is_none(),
+            "SomeRustVec.delslice is void"
         );
 
         let hl_get = HLOperation::new(

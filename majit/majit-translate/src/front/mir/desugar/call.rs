@@ -5610,6 +5610,43 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Dropped `Vec::drain(v, a..b)` is `del l[a:b]`
+                // (`rlist.py` `ll_listdelslice_startstop`). Drain's
+                // destructor does the deletion; `TermKind::Drop` of a
+                // non-Vec header is a Goto, so a residual `drain` call
+                // would drop the range. Recognise the MIR shape only:
+                // std `Vec::drain` + immediate Drop of the Drain dest +
+                // either a captured `Range { start, end }` operand or
+                // the 3-arg `(vec, start, end)` ABI. A used Drain, or a
+                // 2-arg call whose range is not that aggregate, stays
+                // residual — the leaf name alone is not a rewrite.
+                if rust_vec_std_leaf(&original_segments) == Some("drain")
+                    && self.mir_successor_is_immediate_drop_of_local(target, dest_local)
+                {
+                    let bounds = if args.len() == 2 {
+                        self.slice_index_range_sites.iter().find_map(|site| {
+                            (site.range_result == args[1])
+                                .then(|| (site.start.clone(), site.end.clone()))
+                        })
+                    } else if args.len() == 3 {
+                        Some((args[1].clone(), args[2].clone()))
+                    } else {
+                        None
+                    };
+                    if let Some((start, stop)) = bounds {
+                        let _ = self.emit_path_call(
+                            mir_bb,
+                            "__delslice_range",
+                            vec![args[0].clone(), start, stop],
+                            ValueType::Void,
+                        );
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // `ptr::copy_nonoverlapping::<T>(src, dst, n)` is
                 // `rgc.ll_arraycopy` / `llmemory.raw_memcopy` of `n`
                 // items (`rlist.py` `ll_arraycopy`). A one-word `T` is
@@ -10131,6 +10168,31 @@ impl Lowering<'_> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// Successor terminator is `Drop` of `dest_local` with no intervening
+    /// runtime statements: the MIR of `let _ = vec.drain(a..b)` /
+    /// `vec.drain(a..b);`.
+    fn mir_successor_is_immediate_drop_of_local(&self, target: usize, dest_local: usize) -> bool {
+        let Some(bb) = self.body.body.get(target) else {
+            return false;
+        };
+        let Ok(TermKind::Drop { place, .. }) = bb.term_ref(self.llbc) else {
+            return false;
+        };
+        match place.kind {
+            PlaceKind::Local(local) if local as usize == dest_local => {}
+            _ => return false,
+        }
+        bb.statements.iter().all(|stmt| {
+            matches!(
+                stmt.stmt_kind_ref(),
+                Ok(StmtKind::StorageLive(_)
+                    | StmtKind::StorageDead(_)
+                    | StmtKind::Borrowck(_)
+                    | StmtKind::PlaceMention(_))
+            )
+        })
     }
 
     /// Signed-word `raw_load` of a fn-pointer niche (`FnPtrCell::get` at
