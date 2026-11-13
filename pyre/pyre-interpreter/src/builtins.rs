@@ -21939,18 +21939,23 @@ pub(crate) fn tuple_structural_hash(mut obj: PyObjectRef) -> Result<i64, crate::
         if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
             return Ok(hash);
         }
-        // `W_TupleObject.descr_hash`: a cache miss takes
-        // `_unroll_condition`, then `_descr_hash_unroll` or
+        // Specialised II/FF/OO use `make_specialised_class descr_hash`
+        // (unrolled field lanes, no jitdriver). `W_TupleObject.descr_hash`
+        // takes `_unroll_condition`, then `_descr_hash_unroll` or
         // `_descr_hash_jitdriver`, then the length mangle. Element
         // hashes are `space.hash_w` (`try_hash_value`). Either arm can
         // collect, so reload `obj` before writing the cache.
-        let len = w_tuple_len(obj);
-        let acc = if pyre_object::tupleobject::unroll_condition(obj) {
-            pyre_object::with_roots!(obj => _descr_hash_unroll_w(obj))?
+        let hash = if is_specialised_tuple(obj) {
+            pyre_object::with_roots!(obj => specialised_tuple_descr_hash_w(obj))?
         } else {
-            pyre_object::with_roots!(obj => _descr_hash_jitdriver_w(obj))?
+            let len = w_tuple_len(obj);
+            let acc = if pyre_object::tupleobject::unroll_condition(obj) {
+                pyre_object::with_roots!(obj => _descr_hash_unroll_w(obj))?
+            } else {
+                pyre_object::with_roots!(obj => _descr_hash_jitdriver_w(obj))?
+            };
+            tuple_hash_finish(acc, len)
         };
-        let hash = tuple_hash_finish(acc, len);
         pyre_object::w_tuple_set_cached_hash(obj, hash);
         Ok(hash)
     }
@@ -22540,6 +22545,84 @@ unsafe fn _descr_hash_jitdriver(mut obj: PyObjectRef) -> i64 {
     hash_tuple_xx_storage!(obj)
 }
 
+/// One unboxed field lane of `make_specialised_class descr_hash`.
+/// `int` → `_hash_int`; `float` → `_hash_float`, or NaN → identity hash
+/// of a fresh float box (`default_identity_hash` / `space.newfloat`).
+unsafe fn specialised_tuple_unboxed_lane(obj: PyObjectRef, i: usize) -> u64 {
+    unsafe {
+        debug_assert!(!is_specialised_tuple_oo(obj));
+        if is_specialised_tuple_ii(obj) {
+            _hash_int(w_specialised_tuple_ii_getvalue(obj, i)) as u64
+        } else {
+            let value = w_specialised_tuple_ff_getvalue(obj, i);
+            if value.is_nan() {
+                let boxed = w_float_new(value);
+                crate::typedef::default_identity_hash_value(boxed) as u64
+            } else {
+                _hash_float(value) as u64
+            }
+        }
+    }
+}
+
+/// One object-or-unboxed field lane of `make_specialised_class descr_hash`.
+unsafe fn specialised_tuple_lane_w(obj: PyObjectRef, i: usize) -> Result<u64, crate::PyError> {
+    unsafe {
+        if is_specialised_tuple_oo(obj) {
+            let mut value = w_specialised_tuple_oo_getvalue(obj, i);
+            Ok(pyre_object::with_roots!(value => try_hash_value(value))? as u64)
+        } else {
+            Ok(specialised_tuple_unboxed_lane(obj, i))
+        }
+    }
+}
+
+/// One object-or-unboxed field lane of `make_specialised_class descr_hash`
+/// for `hash_value`.
+unsafe fn specialised_tuple_lane(obj: PyObjectRef, i: usize) -> u64 {
+    unsafe {
+        if is_specialised_tuple_oo(obj) {
+            let mut value = w_specialised_tuple_oo_getvalue(obj, i);
+            pyre_object::with_roots!(value => hash_value(value)) as u64
+        } else {
+            specialised_tuple_unboxed_lane(obj, i)
+        }
+    }
+}
+
+/// `specialisedtupleobject.py make_specialised_class descr_hash`.
+///
+/// `Cls_ii` / `Cls_ff` / `Cls_oo` mix two unrolled field lanes
+/// (`unrolling_iterable` over the 2 slots); there is no `_unroll_condition`
+/// test and no `hash_driver`. Object lanes use `space.hash`
+/// (`try_hash_value`). The OO field reads, `try_hash_value`, and a NaN
+/// float box can collect, so the tuple stays pinned.
+unsafe fn specialised_tuple_descr_hash_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let mut acc = tuple_hash_mix(XXPRIME_5, specialised_tuple_lane_w(obj, 0)?);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        acc = tuple_hash_mix(acc, specialised_tuple_lane_w(obj, 1)?);
+        Ok(tuple_hash_finish(acc, 2))
+    }
+}
+
+/// `specialisedtupleobject.py make_specialised_class descr_hash` for
+/// `hash_value`. Object lanes use the infallible element hash.
+unsafe fn specialised_tuple_descr_hash(obj: PyObjectRef) -> i64 {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let mut acc = tuple_hash_mix(XXPRIME_5, specialised_tuple_lane(obj, 0));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        acc = tuple_hash_mix(acc, specialised_tuple_lane(obj, 1));
+        tuple_hash_finish(acc, 2)
+    }
+}
+
 /// CPython/PyPy's deterministic seed expansion
 /// (`Python/bootstrap_hash.c` / `rsiphash.py:lcg_urandom`).
 fn hash_secret_from_seed(mut seed: u32) -> [u8; 16] {
@@ -22881,13 +22964,16 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            // 3.14 `tuple_hash` cache on the object; the walk itself is
-            // PyPy's `_unroll_condition` fork (`_descr_hash_unroll` vs
+            // Tuple hash cache on the object. Specialised II/FF/OO use
+            // `make_specialised_class descr_hash`; `W_TupleObject` takes
+            // `_unroll_condition` (`_descr_hash_unroll` vs
             // `_descr_hash_jitdriver`).
             if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
                 return hash;
             }
-            let hash = if pyre_object::tupleobject::unroll_condition(obj) {
+            let hash = if is_specialised_tuple(obj) {
+                pyre_object::with_roots!(obj => specialised_tuple_descr_hash(obj))
+            } else if pyre_object::tupleobject::unroll_condition(obj) {
                 pyre_object::with_roots!(obj => _descr_hash_unroll(obj))
             } else {
                 pyre_object::with_roots!(obj => _descr_hash_jitdriver(obj))
@@ -30274,6 +30360,41 @@ mod tests {
         let h2 = _hash_tuple_xx(&[1, 2]);
         let h3 = _hash_tuple_xx(&[1, 2, 3]);
         assert_eq!(try_hash_value(nested).unwrap(), _hash_tuple_xx(&[h2, h3]));
+    }
+
+    /// `make_specialised_class descr_hash` lanes match `W_TupleObject.descr_hash`
+    /// over the same boxed items.
+    #[test]
+    fn specialised_tuple_descr_hash_matches_array_backed() {
+        crate::typedef::init_typeobjects();
+        let cases = [
+            (
+                w_specialised_tuple_ii_new(1, 2),
+                w_tuple_new_array_backed(vec![w_int_new(1), w_int_new(2)]),
+            ),
+            (
+                w_specialised_tuple_ff_new(1.5, -0.0),
+                w_tuple_new_array_backed(vec![w_float_new(1.5), w_float_new(-0.0)]),
+            ),
+            (
+                w_specialised_tuple_ff_new(f64::INFINITY, 2.0),
+                w_tuple_new_array_backed(vec![w_float_new(f64::INFINITY), w_float_new(2.0)]),
+            ),
+            (
+                w_specialised_tuple_oo_new(w_str_new("a"), w_none()),
+                w_tuple_new_array_backed(vec![w_str_new("a"), w_none()]),
+            ),
+        ];
+        for (spec, general) in cases {
+            unsafe {
+                assert!(is_specialised_tuple(spec));
+                assert!(!is_specialised_tuple(general));
+            }
+            assert_eq!(
+                try_hash_value(spec).unwrap(),
+                try_hash_value(general).unwrap()
+            );
+        }
     }
 
     #[test]
