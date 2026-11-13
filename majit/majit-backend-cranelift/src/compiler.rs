@@ -786,13 +786,6 @@ pub fn jit_threadlocalref_base() -> *const i64 {
     majit_rlib::rthread::threadlocalref_addr()
 }
 
-/// C ABI for compiled bodies. Cranelift's execute_token is
-/// `(jf_ptr, dispatch_key)` and has no `threadlocal_addr` argument, so the
-/// prologue host-calls this; `THREADLOCALREF_GET` then loads off that base.
-extern "C" fn jit_threadlocalref_addr() -> usize {
-    majit_rlib::rthread::threadlocalref_addr() as usize
-}
-
 // ── GIL release/reacquire shims ──
 
 /// User-installable hook for GIL release before CallReleaseGil.
@@ -1103,7 +1096,33 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-/// In-code guard→bridge tail signature: `(jf_ptr, dispatch_key, live failargs...)`.
+/// Compiled loop/bridge body ABI, one signature for every entry kind.
+///
+/// `llmodel.py` `make_execute_token` `FUNCPTR` is
+/// `(jitframe, threadlocal_addr) -> jitframe`. Cranelift keeps the
+/// `dispatch_key` LABEL selector as the second argument (`br_table` on a
+/// single function entry; x86 exposes one `_ll_loop_code` per LABEL).
+/// `threadlocal_addr` is the third (`x86/assembler.py` `_call_header`
+/// stores `r_arg2` at `THREADLOCAL_OFS`; `_call_assembler_emit_call`
+/// passes the caller's saved value). Extra Tail params follow: recovery
+/// `jf_gcmap`/`jf_descr`, or register-carried failargs.
+fn compiled_body_signature(
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    n_extras: usize,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+    sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key
+    sig.params.push(AbiParam::new(ptr_type)); // threadlocal_addr
+    for _ in 0..n_extras {
+        sig.params.push(AbiParam::new(cl_types::I64));
+    }
+    sig.returns.push(AbiParam::new(ptr_type));
+    sig
+}
+
+/// In-code guard→bridge tail signature: compiled-body ABI plus live failargs.
 ///
 /// x86 `assembler.py assemble_bridge` rebuilds the guard's fail locations
 /// (`rebuild_faillocs_from_descr`) and `regalloc.py prepare_bridge` /
@@ -1113,9 +1132,9 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
 /// so the equivalent is `CallConv::Tail` arguments in `rd_locs` order for
 /// the failargs that fit in Tail GPRs; the rest stay in jitframe slots.
 /// The loop bakes this signature at guard emission; `compile_bridge`
-/// declares the same one on the bridge body. The host wrapper keeps
-/// `(jf_ptr, dispatch_key)` and loads the compact jitframe slots for
-/// deadframe / `run_compiled_code` / blackhole entry.
+/// declares the same one on the bridge body. The host wrapper keeps the
+/// compiled-body ABI and loads the compact jitframe slots for deadframe /
+/// `run_compiled_code` / blackhole entry.
 ///
 /// Extra args are always `I64` (a jitframe word). `GuardInfo.fail_arg_types`
 /// and `compile_bridge` inputarg `.tp` can disagree on Float vs Int; a typed
@@ -1123,21 +1142,14 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
 /// The frame round-trip carried every box as `I64`; register-carried extra
 /// args keep that carrier so the two signatures cannot split the ABI.
 fn attached_bridge_tail_sig(ptr_type: cranelift_codegen::ir::Type, n_extra: usize) -> Signature {
-    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-    sig.params.push(AbiParam::new(ptr_type));
-    sig.params.push(AbiParam::new(cl_types::I32));
-    for _ in 0..n_extra {
-        sig.params.push(AbiParam::new(cl_types::I64));
-    }
-    sig.returns.push(AbiParam::new(ptr_type));
-    sig
+    compiled_body_signature(ptr_type, cranelift_codegen::isa::CallConv::Tail, n_extra)
 }
 
 /// A LABEL whose descr is a `LoopTargetDescr` is a JUMP target
 /// (`assembler.py fixup_target_tokens` / `set_dispatch_target`).
 ///
 /// `compile.py compile_retrace` attaches such a LABEL as a bridge.
-/// `emit_loop_tail_call` then `closing_jump`s into it with the two-arg
+/// `emit_loop_tail_call` then `closing_jump`s into it with the compiled-body
 /// Tail signature a loop uses for `br_table` label entry
 /// (`x86/regalloc.py consider_jump` moves args into the LABEL's
 /// `_x86_arglocs` and `assembler.py closing_jump` jumps to
@@ -3086,7 +3098,7 @@ const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
 /// Publish the inputarg-ref gcmap on dispatch_key selector 0.
 ///
 /// A retrace bridge (`compile.py compile_retrace`) is a loop-like body:
-/// two-arg Tail + `br_table` on `dispatch_key`, matching how loops
+/// compiled-body Tail + `br_table` on `dispatch_key`, matching how loops
 /// enter a LABEL (`x86/regalloc.py consider_jump` /
 /// `assembler.py closing_jump` jump to `_ll_loop_code` and never
 /// re-enter the bridge prologue). Key 0 is the guard HIT / host
@@ -6689,17 +6701,17 @@ fn emit_call_assembler_body_call(
     func_ptr: usize,
     jf_ptr: CValue,
     dispatch_key: CValue,
+    threadlocal_addr: CValue,
 ) -> CValue {
-    let mut sig = Signature::new(body_call_conv);
-    sig.params.push(AbiParam::new(ptr_type));
-    sig.params.push(AbiParam::new(cl_types::I32));
-    sig.returns.push(AbiParam::new(ptr_type));
+    let sig = compiled_body_signature(ptr_type, body_call_conv, 0);
     let name = format!("ca_body_{func_ptr:x}");
     let func_id = module
         .declare_function(&name, Linkage::Import, &sig)
         .expect("call-assembler body import");
     let fref = module.declare_func_in_func(func_id, builder.func);
-    let call = builder.ins().call(fref, &[jf_ptr, dispatch_key]);
+    let call = builder
+        .ins()
+        .call(fref, &[jf_ptr, dispatch_key, threadlocal_addr]);
     builder.inst_results(call)[0]
 }
 
@@ -7787,7 +7799,7 @@ fn emit_cmp_guard_class(
 /// inter-function JMPs, so this dispatcher does the equivalent:
 ///
 /// The JUMP args still round-trip through jitframe slots: the loop body
-/// has one `(jf_ptr, dispatch_key)` signature and a `br_table` loader per
+/// has one compiled-body signature and a `br_table` loader per
 /// LABEL, so carrying args in the Tail call would need one entry
 /// signature covering the union of every LABEL's arity. The guard→bridge
 /// edge has a per-guard live list known at loop compile, which is why
@@ -7852,6 +7864,7 @@ fn emit_loop_tail_call(
     target_code_ptr: CValue,
     dispatch_jf_ptr: CValue,
     dispatch_key: CValue,
+    threadlocal_addr: CValue,
 ) {
     emit_tail_call(
         builder,
@@ -7859,13 +7872,14 @@ fn emit_loop_tail_call(
         target_code_ptr,
         dispatch_jf_ptr,
         dispatch_key,
+        threadlocal_addr,
         &[],
     );
 }
 
 /// `_build_failure_recovery`: Tail extras carry the per-guard `jf_gcmap` /
 /// `jf_descr` immediates `generate_quick_failure` would PUSH. The trampoline
-/// is a raw JMP, so a patched HIT lands on the 2-arg bridge body and the
+/// is a raw JMP, so a patched HIT lands on the compiled-body bridge and the
 /// extras in the leftover Tail GPRs are ignored — recovery never runs, so
 /// descr/gcmap/exception staging stay off the hit path (`patch_jump_for_descr`).
 fn emit_recovery_tail_call(
@@ -7874,6 +7888,7 @@ fn emit_recovery_tail_call(
     target_code_ptr: CValue,
     dispatch_jf_ptr: CValue,
     dispatch_key: CValue,
+    threadlocal_addr: CValue,
     gcmap: CValue,
     descr: CValue,
 ) {
@@ -7883,6 +7898,7 @@ fn emit_recovery_tail_call(
         target_code_ptr,
         dispatch_jf_ptr,
         dispatch_key,
+        threadlocal_addr,
         &[gcmap, descr],
     );
 }
@@ -7893,6 +7909,7 @@ fn emit_tail_call(
     target_code_ptr: CValue,
     dispatch_jf_ptr: CValue,
     dispatch_key: CValue,
+    threadlocal_addr: CValue,
     extras: &[CValue],
 ) {
     // Both this body and the target body were compiled with
@@ -7902,17 +7919,18 @@ fn emit_tail_call(
     // The host call_conv cannot speak tail calls; hard-code `Tail` here
     // so this matches the body's signature regardless of which call_conv
     // the enclosing `emit_guard_exit` received for its non-tail helper calls.
-    let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-    target_sig.params.push(AbiParam::new(ptr_type));
-    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-    for _ in extras {
-        target_sig.params.push(AbiParam::new(cl_types::I64));
-    }
-    target_sig.returns.push(AbiParam::new(ptr_type));
+    // `x86/assembler.py` `_call_assembler_emit_call` passes the caller's
+    // saved `threadlocal_addr`; a JMP overlay keeps the same registers.
+    let target_sig = compiled_body_signature(
+        ptr_type,
+        cranelift_codegen::isa::CallConv::Tail,
+        extras.len(),
+    );
     let target_sig_ref = builder.import_signature(target_sig);
-    let mut args = Vec::with_capacity(2 + extras.len());
+    let mut args = Vec::with_capacity(3 + extras.len());
     args.push(dispatch_jf_ptr);
     args.push(dispatch_key);
+    args.push(threadlocal_addr);
     args.extend_from_slice(extras);
     builder
         .ins()
@@ -7929,12 +7947,20 @@ fn emit_closing_jump_tail(
     jf_ptr: CValue,
     target_code_ptr: CValue,
     dispatch_key: CValue,
+    threadlocal_addr: CValue,
     target_depth: Option<CValue>,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
 ) {
     let Some(target_depth) = target_depth else {
-        emit_loop_tail_call(builder, ptr_type, target_code_ptr, jf_ptr, dispatch_key);
+        emit_loop_tail_call(
+            builder,
+            ptr_type,
+            target_code_ptr,
+            jf_ptr,
+            dispatch_key,
+            threadlocal_addr,
+        );
         return;
     };
     // `assembler.py:927 _check_frame_depth_bridge` parity, deferred for
@@ -8021,6 +8047,7 @@ fn emit_closing_jump_tail(
         target_code_ptr,
         dispatch_jf_ptr,
         dispatch_key,
+        threadlocal_addr,
     );
 }
 
@@ -8034,6 +8061,7 @@ fn emit_attached_loop_dispatch(
     guaranteed_frame_depth: i64,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    threadlocal_addr: CValue,
 ) -> bool {
     match target {
         ClosingJumpTarget::Baked {
@@ -8064,6 +8092,7 @@ fn emit_attached_loop_dispatch(
                 jf_ptr,
                 target_code_ptr,
                 dispatch_key,
+                threadlocal_addr,
                 depth,
                 ptr_type,
                 call_conv,
@@ -8144,6 +8173,7 @@ fn emit_attached_loop_dispatch(
                 jf_ptr,
                 target_code_ptr,
                 dispatch_key,
+                threadlocal_addr,
                 Some(target_depth),
                 ptr_type,
                 call_conv,
@@ -8871,6 +8901,7 @@ fn generate_guard_no_exception(
     merge_targets: &[(usize, cranelift_codegen::ir::Block)],
     guard_exit_shares: &mut GuardExitShares,
     preamble_phase: bool,
+    tl_base_var: Variable,
 ) {
     // Direct memory load from global JIT_EXC_VALUE (no TLS/host call).
     let exc_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
@@ -8897,6 +8928,7 @@ fn generate_guard_no_exception(
         builder,
         opref_vars,
         cur_jf,
+        tl_base_var,
         info,
         ref_root_slots,
         stale_ref_vars,
@@ -8918,6 +8950,7 @@ fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     jf_ptr: CValue,
+    tl_base_var: Variable,
     info: &mut GuardInfo,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
@@ -9017,8 +9050,9 @@ fn emit_guard_exit(
         let key = builder
             .ins()
             .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
+        let tl = builder.use_var(tl_base_var);
         emit_recovery_tail_call(
-            builder, ptr_type, params[2], shared_jf, key, params[0], params[1],
+            builder, ptr_type, params[2], shared_jf, key, tl, params[0], params[1],
         );
         return;
     }
@@ -9052,6 +9086,7 @@ fn emit_guard_exit(
         let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
         if enabled {
+            let tl = builder.use_var(tl_base_var);
             let fall_through = emit_attached_loop_dispatch(
                 builder,
                 jf_ptr,
@@ -9059,6 +9094,7 @@ fn emit_guard_exit(
                 info.guaranteed_frame_depth,
                 ptr_type,
                 call_conv,
+                tl,
             );
             if !fall_through {
                 return;
@@ -9069,7 +9105,7 @@ fn emit_guard_exit(
     // `generate_quick_failure`: leave through the per-guard trampoline.
     // Default target is `_build_failure_recovery` (gcmap/descr extras);
     // `patch_jump_for_descr` overwrites the trampoline with a JMP to the
-    // 2-arg bridge body, so the extras never land. Exception staging stays
+    // compiled-body bridge, so the extras never land. Exception staging stays
     // in the recovery helper so a patched hit still sees the
     // pending-exception cells (`prepare_resume_from_failure`).
     debug_assert_ne!(info.stub_addr, 0, "guard exit missing recovery stub");
@@ -9077,7 +9113,10 @@ fn emit_guard_exit(
     let key = builder
         .ins()
         .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
-    emit_recovery_tail_call(builder, ptr_type, stub, jf_ptr, key, gcmap_val, descr_val);
+    let tl = builder.use_var(tl_base_var);
+    emit_recovery_tail_call(
+        builder, ptr_type, stub, jf_ptr, key, tl, gcmap_val, descr_val,
+    );
 }
 
 /// `_push_all_regs_to_frame` analog for one guard exit: store the fail args
@@ -10819,10 +10858,11 @@ fn run_compiled_code_inner(
     // llmodel.py:322: llop.gc_writebarrier(ll_frame)
     with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf));
 
-    // llmodel.py:323 parity: ll_frame = func(ll_frame)
-    // The `trace_N_entry` wrapper takes a second `dispatch_key` argument
-    // (the entry `br_table` LABEL selector); 0 enters the preamble.
-    let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
+    // llmodel.py:323: ll_frame = func(ll_frame, ll_threadlocal_addr)
+    // The `trace_N_entry` wrapper also takes `dispatch_key` (the entry
+    // `br_table` LABEL selector); 0 enters the preamble.
+    let threadlocal_addr = majit_rlib::rthread::threadlocalref_addr() as usize;
+    let func: unsafe extern "C" fn(*mut i64, i32, usize) -> *mut i64 =
         unsafe { std::mem::transmute(code_ptr) };
 
     // Residual helpers from this call see `we_are_jitted() == false`.
@@ -10849,7 +10889,7 @@ fn run_compiled_code_inner(
             ),
         );
     }
-    let result_jf = unsafe { func(jf_ptr, dispatch_key as i32) };
+    let result_jf = unsafe { func(jf_ptr, dispatch_key as i32, threadlocal_addr) };
     if debug_prints {
         majit_ir::debug::log_one("jit-running", &format!("post-call result_jf={result_jf:p}"));
     }
@@ -11868,14 +11908,11 @@ impl CraneliftBackend {
         let frontend_config = self.module.target_config();
         let ptr_type = frontend_config.pointer_type();
         let call_conv = frontend_config.default_call_conv;
-        let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-        sig.params.push(AbiParam::new(ptr_type));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        // `generate_quick_failure` PUSHes gcmap then descr; `_build_failure_recovery`
-        // POPs them into `jf_gcmap` / `jf_descr`. Tail extras are that pair.
-        sig.params.push(AbiParam::new(cl_types::I64));
-        sig.params.push(AbiParam::new(cl_types::I64));
-        sig.returns.push(AbiParam::new(ptr_type));
+        // Compiled-body ABI plus the gcmap/descr pair `generate_quick_failure`
+        // PUSHes and `_build_failure_recovery` POPs into `jf_gcmap` / `jf_descr`.
+        // `threadlocal_addr` sits in the same register a patched JMP to a
+        // bridge body expects (`x86/assembler.py` `_call_assembler_emit_call`).
+        let sig = compiled_body_signature(ptr_type, cranelift_codegen::isa::CallConv::Tail, 2);
         let name = format!("failure_recovery_{}", if exc { "exc" } else { "noexc" });
         let func_id = self
             .module
@@ -11893,8 +11930,8 @@ impl CraneliftBackend {
             builder.switch_to_block(block);
             builder.seal_block(block);
             let jf_ptr = builder.block_params(block)[0];
-            let gcmap_val = builder.block_params(block)[2];
-            let descr_val = builder.block_params(block)[3];
+            let gcmap_val = builder.block_params(block)[3];
+            let descr_val = builder.block_params(block)[4];
             builder.ins().set_pinned_reg(jf_ptr);
             // `_build_failure_recovery`: POP [ebp+jf_gcmap]; POP [ebp+jf_descr].
             builder
@@ -12146,31 +12183,26 @@ impl CraneliftBackend {
             Vec::new()
         };
         // `generate_quick_failure` + `patch_jump_for_descr`: the guard stub
-        // is a 2-arg Tail trampoline (`jf_ptr`, `dispatch_key`) and the
-        // patched jump lands on the same ABI. Failargs already sit in
-        // jitframe slots the recovery stub stored, so the bridge body
-        // loads them like a LABEL entry rather than taking Tail extras.
-        // A retrace bridge with a dispatchable LABEL was already 2-arg
+        // is a compiled-body Tail trampoline and the patched jump lands on
+        // the same ABI. Failargs already sit in jitframe slots the recovery
+        // stub stored, so the bridge body loads them like a LABEL entry
+        // rather than taking Tail extras. A retrace bridge with a
+        // dispatchable LABEL was already compiled-body ABI
         // (`op_is_dispatchable_label`).
         let n_tail_extras = 0;
         let register_carried = is_bridge && n_tail_extras > 0;
 
+        // x86/regalloc.py `_ll_loop_code` parity: a JUMP re-enters the
+        // target at a SPECIFIC LABEL, not always the first. PyPy exposes
+        // one code address per LABEL; cranelift has a single function
+        // entry, so the target LABEL is selected by a `dispatch_key`
+        // argument that the entry block `br_table`s on. The host wrapper
+        // passes 0 for the preamble; an in-code closing-jump passes the
+        // target descr's `label_block_id + 1`.
         let sig = if register_carried {
             attached_bridge_tail_sig(ptr_type, n_tail_extras)
         } else {
-            let mut sig = Signature::new(body_call_conv);
-            sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
-            // x86/regalloc.py `_ll_loop_code` parity: a JUMP
-            // re-enters the target at a SPECIFIC LABEL, not always the first.
-            // PyPy exposes one code address per LABEL; cranelift has a single
-            // function entry, so the target LABEL is selected by a `dispatch_key`
-            // argument that the entry block `br_table`s on.  The host wrapper
-            // passes 0 for the preamble; an in-code closing-jump passes the target
-            // descr's `label_block_id + 1`.
-            sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-            // RPython `_call_footer`: mov eax, ebp; ret
-            sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
-            sig
+            compiled_body_signature(ptr_type, body_call_conv, 0)
         };
 
         let body_name = format!("trace_{}_body", self.func_counter);
@@ -12183,10 +12215,7 @@ impl CraneliftBackend {
             .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
 
         // Wrapper sig: same I/O shape, host call conv.
-        let mut wrapper_sig = Signature::new(call_conv);
-        wrapper_sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-        wrapper_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-        wrapper_sig.returns.push(AbiParam::new(ptr_type));
+        let wrapper_sig = compiled_body_signature(ptr_type, call_conv, 0);
         let entry_id = self
             .module
             .declare_function(&entry_name, Linkage::Local, &wrapper_sig)
@@ -12653,8 +12682,11 @@ impl CraneliftBackend {
         // `_call_header_shadowstack` at the target.  Split the prologue on the
         // flag so an in-code entry pays for neither.
         let raw_dispatch_key = builder.block_params(entry_block)[1];
+        // `llmodel.py` `make_execute_token` / `x86/assembler.py` `_call_header`:
+        // the assembler function's second argument is `threadlocal_addr`.
+        let initial_tl_addr = builder.block_params(entry_block)[2];
         let entry_arg_params: Vec<CValue> = if register_carried {
-            builder.block_params(entry_block)[2..].to_vec()
+            builder.block_params(entry_block)[3..].to_vec()
         } else {
             Vec::new()
         };
@@ -13151,22 +13183,11 @@ impl CraneliftBackend {
         // it to a stack slot reloaded on every access.
         builder.ins().set_pinned_reg(jf_ptr);
 
-        // Cranelift execute_token is `(jf_ptr, dispatch_key)`; there is no
-        // `threadlocal_addr` argument. Load `pypy_threadlocal_s` once here
-        // the way `THREADLOCALREF_GET` already host-calls
-        // `threadlocalref_addr`, then address `tlfield_nursery_*` off it.
+        // `llmodel.py` `make_execute_token` / `x86/assembler.py` `_call_header`:
+        // compiled code receives `pypy_threadlocal_s` as `threadlocal_addr`
+        // and addresses `tlfield_nursery_*` / `THREADLOCALREF_GET` off it.
         let tl_base_var = builder.declare_var(ptr_type);
-        let tl_base_v = emit_host_call(
-            module,
-            &mut builder,
-            ptr_type,
-            call_conv,
-            jit_threadlocalref_addr as *const () as usize,
-            &[],
-            Some(ptr_type),
-        )
-        .expect("threadlocalref_addr");
-        builder.def_var(tl_base_var, tl_base_v);
+        builder.def_var(tl_base_var, initial_tl_addr);
 
         // `assembler.py genop_load_from_gc_table` holds the table in the
         // code buffer and loads PC-relative. cranelift's JITModule has no
@@ -14490,6 +14511,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14534,6 +14556,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14595,6 +14618,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14658,6 +14682,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14702,6 +14727,7 @@ impl CraneliftBackend {
                             &merge_targets,
                             &mut guard_exit_shares,
                             preamble_phase,
+                            tl_base_var,
                         );
                     }
                 }
@@ -14752,6 +14778,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14823,6 +14850,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14870,6 +14898,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -14928,6 +14957,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15070,6 +15100,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             cur_jf,
+                            tl_base_var,
                             info,
                             &ref_root_slots,
                             &stale_ref_vars,
@@ -15115,6 +15146,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15142,6 +15174,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15205,6 +15238,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15326,6 +15360,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15494,6 +15529,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -15870,7 +15906,10 @@ impl CraneliftBackend {
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
 
-                        // fn(jf_ptr, dispatch_key) → jf_ptr  (simple_call parity).
+                        // fn(jf_ptr, dispatch_key, threadlocal_addr) → jf_ptr
+                        // (`llmodel.py` `make_execute_token` /
+                        // `assembler.py` `_call_assembler_emit_call`
+                        // `simple_call(addr, [argloc, threadlocal_loc])`).
                         // assembler.py `_call_assembler_emit_call` calls
                         // `_ll_function_addr`, which is the assembler body.
                         // The host-ABI wrapper exists so `execute_token` can
@@ -15880,6 +15919,7 @@ impl CraneliftBackend {
                         // (dispatch_key 0); the callee is a freshly entered
                         // function, not an external-JUMP LABEL re-entry.
                         let ca_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
+                        let ca_threadlocal = builder.use_var(tl_base_var);
                         let result_jf = if let Some(baked) = baked_addr {
                             emit_call_assembler_body_call(
                                 module,
@@ -15889,18 +15929,16 @@ impl CraneliftBackend {
                                 baked,
                                 args_ptr,
                                 ca_dispatch_key,
+                                ca_threadlocal,
                             )
                         } else {
-                            let mut sig = Signature::new(body_call_conv);
-                            sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                            sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-                            sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
+                            let sig = compiled_body_signature(ptr_type, body_call_conv, 0);
                             let sig_ref = builder.import_signature(sig);
                             let call_inst = builder.ins().call_indirect(
                                 sig_ref,
                                 slot_code_addr
                                     .expect("slot-only CALL_ASSEMBLER loaded _ll_function_addr"),
-                                &[args_ptr, ca_dispatch_key],
+                                &[args_ptr, ca_dispatch_key, ca_threadlocal],
                             );
                             builder.inst_results(call_inst)[0]
                         };
@@ -16577,6 +16615,7 @@ impl CraneliftBackend {
                             &merge_targets,
                             &mut guard_exit_shares,
                             preamble_phase,
+                            tl_base_var,
                         );
                         cond_call_consumed_guard_no_exception = true;
                     }
@@ -16684,6 +16723,7 @@ impl CraneliftBackend {
                             &merge_targets,
                             &mut guard_exit_shares,
                             preamble_phase,
+                            tl_base_var,
                         );
                         cond_call_consumed_guard_no_exception = true;
                     }
@@ -18458,6 +18498,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             cur_jf,
+                            tl_base_var,
                             info,
                             &ref_root_slots,
                             &stale_ref_vars,
@@ -18481,6 +18522,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -18658,6 +18700,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -18696,6 +18739,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         cur_jf,
+                        tl_base_var,
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
@@ -19534,8 +19578,8 @@ impl CraneliftBackend {
                 // ── Thread-local reference get ──
                 OpCode::ThreadlocalrefGet => {
                     // Load from a thread-local slot. arg(0) = offset in bytes
-                    // into `pypy_threadlocal_s`. The base is the prologue
-                    // `threadlocalref_addr` load.
+                    // into `pypy_threadlocal_s`. The base is the body's
+                    // `threadlocal_addr` argument (`llop.threadlocalref_addr`).
                     let offset = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let base = builder.use_var(tl_base_var);
                     let addr = builder.ins().iadd(base, offset);
@@ -19760,6 +19804,7 @@ impl CraneliftBackend {
             wb.seal_block(eb);
             let jf_ptr_in = wb.block_params(eb)[0];
             let dispatch_key_in = wb.block_params(eb)[1];
+            let threadlocal_in = wb.block_params(eb)[2];
             // The body/bridges keep the jitframe base in the pinned register,
             // which `enable_pinned_reg` makes NOT callee-saved in Cranelift.
             // This wrapper is the host(Rust, SystemV/AAPCS — the pinned reg IS
@@ -19786,10 +19831,11 @@ impl CraneliftBackend {
             // Deadframe / blackhole / `run_compiled_code` still land here
             // with those values in compact jitframe slots, so the wrapper
             // loads them and the body keeps one signature. That extras path
-            // cannot go through the 2-arg stub.
-            let mut body_args = Vec::with_capacity(2 + n_tail_extras);
+            // cannot go through the compiled-body stub.
+            let mut body_args = Vec::with_capacity(3 + n_tail_extras);
             body_args.push(jf_ptr_in);
             body_args.push(dispatch_key_in);
+            body_args.push(threadlocal_in);
             if register_carried {
                 for i in 0..n_tail_extras {
                     let dest = source_slots_for_entry.get(i).copied().unwrap_or(i);
@@ -19824,6 +19870,7 @@ impl CraneliftBackend {
                     call_header_stub_ptr,
                     jf_ptr_in,
                     dispatch_key_in,
+                    threadlocal_in,
                 );
                 wb.ins().jump(merge, &[BlockArg::from(ret_stub)]);
 
@@ -21510,8 +21557,8 @@ impl CraneliftBackend {
     ///
     /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Allocation and the
     /// slot stores are shared (`prepare_done_raw_entry_frame`); the call is
-    /// this backend's `(jitframe, dispatch_key)` convention. Key 0 is the
-    /// peeled preamble.
+    /// this backend's `(jitframe, dispatch_key, threadlocal_addr)` convention.
+    /// Key 0 is the peeled preamble.
     #[inline(always)]
     fn run_done_raw_entry(
         &self,
@@ -21532,10 +21579,12 @@ impl CraneliftBackend {
         let facts = self.jitframe_facts;
         let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots, facts) };
         let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
-        let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
+        let func: unsafe extern "C" fn(*mut i64, i32, usize) -> *mut i64 =
             unsafe { std::mem::transmute(code_ptr) };
         // Raw entry does not set the runtime JIT flag; rlib/jit.py `_we_are_jitted` is 0 in residual helpers.
-        let returned = unsafe { func(jf_ptr as *mut i64, 0) as *mut JitFrame };
+        // `llmodel.py` `make_execute_token`: `llop.threadlocalref_addr`.
+        let threadlocal_addr = majit_rlib::rthread::threadlocalref_addr() as usize;
+        let returned = unsafe { func(jf_ptr as *mut i64, 0, threadlocal_addr) as *mut JitFrame };
         // Host frames keep the descr load on the pointer the run returned
         // (`done_ref_from_ran`). A moving nursery may come back as a
         // forwarding stub (`emit_call_footer_shadowstack` then
@@ -22053,7 +22102,7 @@ impl majit_backend::Backend for CraneliftBackend {
     /// `llmodel.py` `execute_token` / `warmstate.py execute_assembler` ref
     /// finish: inline hot path, cold general fallback when exec diag is on.
     /// Slot 0 is `get_ref_value_direct`. The call uses this backend's
-    /// `(jitframe, dispatch_key)` convention.
+    /// `(jitframe, dispatch_key, threadlocal_addr)` convention.
     #[inline]
     fn execute_token_done_ref_raw(
         &self,
@@ -25208,8 +25257,8 @@ mod tests {
 
     /// `compile.py compile_retrace` attaches a bridge that contains a
     /// `LoopTargetDescr` LABEL. Loops enter that LABEL through
-    /// `dispatch_key` (`emit_loop_tail_call` passes only
-    /// `(jf_ptr, dispatch_key)`), matching `x86/regalloc.py
+    /// `dispatch_key` (`emit_loop_tail_call` passes the compiled-body
+    /// ABI), matching `x86/regalloc.py
     /// consider_jump` / `assembler.py closing_jump` jumping to
     /// `_ll_loop_code` rather than the bridge prologue. Extra Tail
     /// failargs would overwrite the JUMP's carried refs at the bridge
