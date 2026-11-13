@@ -1,18 +1,21 @@
 use super::{
-    adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
-    charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
-    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_immutable_fields,
-    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
-    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
-    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
-    tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
+    adt_def_is_raw_storage, adt_field_read_value_type, adt_node_class_root_identity,
+    charon_type_value_to_ast_string, charon_type_value_to_enum_arg, dont_look_inside_return_token,
+    field_ty_is_raw_word, is_cow_str_family_class_root, is_niche_option_gc_payload_spelling,
+    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
+    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
+    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
+    tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -82,6 +85,180 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(!is_str_family_class_root("other::BytesKey"));
     assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
+}
+
+fn cow_enum_decl(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["borrow", 0]},
+                {"Ident": ["Cow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Borrowed",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Owned",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+fn builtin_str_node() -> serde_json::Value {
+    serde_json::json!({"Adt": {"builtin": "Str", "generics": window_empty_generics()}})
+}
+
+fn cow_ty(def_id: u64, payload: serde_json::Value) -> TyRef {
+    TyRef::Other(named_adt(def_id, vec![payload]))
+}
+
+/// `Cow<str>` is rstr (`unicodehelper.py str_decode_utf8`). `Cow<[u8]>`
+/// stays the Cow ADT. A live Cow value paints `ValueType::Str` so
+/// `Option::map` mergeinputargs sees SomeString on every producer.
+#[test]
+fn cow_str_paints_as_str_cow_bytes_stays_instance() {
+    let string_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": window_meta(&["alloc", "string", "String"], false),
+        "kind": {"Struct": []}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![cow_enum_decl(0), option_enum(1), string_decl],
+        vec![],
+    );
+    let cow_str = cow_ty(0, builtin_str_node());
+    let cow_ref_str = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", named_adt(0, vec![builtin_str_node()]), "Shared"]
+    }));
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let cow_bytes = cow_ty(
+        0,
+        serde_json::json!({
+            "Adt": {"builtin": "Slice", "generics": {"types": [u8_ty]}}
+        }),
+    );
+    let cow_string = cow_ty(
+        0,
+        serde_json::json!({
+            "Adt": {"id": 2, "builtin": null, "generics": window_empty_generics()}
+        }),
+    );
+    let option_cow_str = TyRef::Other(option_adt_node(1, named_adt(0, vec![builtin_str_node()])));
+
+    assert!(tyref_is_cow_str(&cow_str, &llbc));
+    assert!(tyref_is_cow_str(&cow_ref_str, &llbc));
+    assert!(tyref_is_cow_str(&cow_string, &llbc));
+    assert!(!tyref_is_cow_str(&cow_bytes, &llbc));
+    assert!(!tyref_is_cow_str(&option_cow_str, &llbc));
+
+    assert!(tyref_is_string_family(&cow_str, &llbc));
+    assert!(!tyref_is_string_family(&cow_bytes, &llbc));
+
+    assert!(matches!(
+        tyref_to_value_type(&cow_str, &llbc),
+        ValueType::Str
+    ));
+    assert!(matches!(
+        tyref_to_value_type(&cow_ref_str, &llbc),
+        ValueType::Str
+    ));
+    assert!(matches!(
+        tyref_to_value_type(&cow_string, &llbc),
+        ValueType::Str
+    ));
+    assert!(
+        !matches!(tyref_to_value_type(&cow_bytes, &llbc), ValueType::Str),
+        "Cow<[u8]> must stay the Cow ADT, got {:?}",
+        tyref_to_value_type(&cow_bytes, &llbc)
+    );
+    let option_cow_bytes = TyRef::Other(option_adt_node(
+        1,
+        named_adt(
+            0,
+            vec![serde_json::json!({
+                "Adt": {"builtin": "Slice", "generics": {"types": [u8_ty]}}
+            })],
+        ),
+    ));
+    assert!(
+        matches!(tyref_to_value_type(&option_cow_str, &llbc), ValueType::Str),
+        "Option<Cow<str>> is a nullable SomeString, got {:?}",
+        tyref_to_value_type(&option_cow_str, &llbc)
+    );
+    assert!(
+        tyref_is_option_of_string_value(&option_cow_str, &llbc),
+        "Option<Cow<str>> is the nullable-string niche"
+    );
+    assert!(
+        tyref_is_niche_option(&option_cow_str, &llbc),
+        "Option<Cow<str>> is_some is ptr_nonzero"
+    );
+    assert!(
+        !tyref_is_option_of_string_value(&option_cow_bytes, &llbc),
+        "Option<Cow<[u8]>> stays the Cow ADT"
+    );
+    assert!(
+        !matches!(
+            tyref_to_value_type(&option_cow_bytes, &llbc),
+            ValueType::Str
+        ),
+        "Option<Cow<[u8]>> stays tagged, got {:?}",
+        tyref_to_value_type(&option_cow_bytes, &llbc)
+    );
+}
+
+/// Class-root spellings of `Cow<str-family>` are SomeString
+/// (`unicodehelper.py str_decode_utf8`). `Cow<[u8]>` stays the Cow ADT.
+#[test]
+fn cow_str_class_root_is_str_family_cow_bytes_is_not() {
+    for root in [
+        "borrow::Cow<str>",
+        "alloc::borrow::Cow<str>",
+        "Cow<str>",
+        "Cow<&str>",
+        "borrow::Cow<&str>",
+        "Cow<'static, str>",
+        "borrow::Cow<String>",
+        "borrow::Cow<string::String>",
+    ] {
+        assert!(
+            is_cow_str_family_class_root(root),
+            "{root} is Cow<str-family>"
+        );
+        assert!(
+            !is_str_family_class_root(root),
+            "{root} is not an rstr header"
+        );
+    }
+    for root in [
+        "borrow::Cow<[u8]>",
+        "Cow<[u8]>",
+        "alloc::borrow::Cow<[u8]>",
+        "borrow::Cow",
+        "Cow",
+        "option::Option<str>",
+    ] {
+        assert!(
+            !is_cow_str_family_class_root(root),
+            "{root} is not Cow<str-family>"
+        );
+    }
 }
 
 #[test]
@@ -342,6 +519,10 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     assert!(intern_none("option::Option<PathBuf>"));
     assert!(intern_none("Option<ffi::OsString>"));
     assert!(!intern_none("Option<other::PathBuf>"));
+    assert!(intern_none("Option<borrow::Cow<str>>"));
+    assert!(intern_none("option::Option<Cow<'static, str>>"));
+    assert!(intern_none("Option<alloc::borrow::Cow<String>>"));
+    assert!(!intern_none("Option<borrow::Cow<[u8]>>"));
     assert!(!intern_none("Option<pyobject::PyObject>"));
     assert!(!intern_none("Option<W_BufferedReader>"));
     assert!(!intern_none("pyobject::PyObject"));
@@ -382,6 +563,29 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     assert!(!intern("Option<pyobject::PyObject>"));
     assert!(!intern("Option<W_BufferedReader>"));
     assert!(!intern("Option<*mut u8>"));
+}
+
+#[test]
+fn is_rustc_pointer_niche_spelling_matches_rustc_option_niche() {
+    assert!(is_rustc_pointer_niche_spelling("&T"));
+    assert!(is_rustc_pointer_niche_spelling("&mut T"));
+    assert!(is_rustc_pointer_niche_spelling("NonNull<object::PyObject>"));
+    assert!(is_rustc_pointer_niche_spelling(
+        "core::ptr::non_null::NonNull<object::PyObject>"
+    ));
+    assert!(is_rustc_pointer_niche_spelling("Box<T>"));
+    assert!(is_rustc_pointer_niche_spelling("alloc::boxed::Box<T>"));
+    assert!(is_rustc_pointer_niche_spelling("Arc<T>"));
+    assert!(is_rustc_pointer_niche_spelling("Rc<T>"));
+    assert!(!is_rustc_pointer_niche_spelling("*mut object::PyObject"));
+    assert!(!is_rustc_pointer_niche_spelling("*const object::PyObject"));
+    assert!(!is_rustc_pointer_niche_spelling("error::PyError"));
+    assert!(!is_rustc_pointer_niche_spelling("i64"));
+    assert!(!is_rustc_pointer_niche_spelling("Box"));
+    assert!(!is_rustc_pointer_niche_spelling("fn()"));
+    assert!(!is_rustc_pointer_niche_spelling(
+        "Option<NonNull<object::PyObject>>"
+    ));
 }
 
 /// `node_is_string_value` identifies the rstr `STR` layout set by
@@ -4323,6 +4527,135 @@ fn a_shelled_variant_carries_the_inherited_discriminant_as_its_first_row() {
     assert_eq!(offsets.get("loop_header_pc"), Some(&8));
 }
 
+/// A pointer-niche payload enum (`CodePageFail { NoTranslation, Os(PyError) }`
+/// with `PyError = NonNull<PyObject>`) records its tag as `Branch.int_ty =
+/// Isize`. That width has a field-type spelling, so the base registers
+/// `__discriminant` and the payload at byte 0 seats on the tag — the same
+/// explicit shell a missing layout takes.
+#[test]
+fn a_pointer_niche_payload_enum_takes_the_explicit_shell() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |name: &str| {
+        serde_json::json!({
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": [name, 0]}
+            ],
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    };
+    let ptr_field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": {"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        })
+    };
+    let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+        serde_json::json!({
+            "name": name,
+            "fields": fields,
+            "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+        })
+    };
+    let fail = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta("Fail"),
+        "kind": {"Enum": [
+            variant("NoTranslation", vec![], 0),
+            variant("Os", vec![ptr_field("os")], 1)
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "discriminator": {"Branch": {
+                    "offset": 0,
+                    "int_ty": {"Signed": "Isize"},
+                    "children": [[{"start": 0, "end": 0}, {"Known": 0}]],
+                    "fallback": {"Known": 1}
+                }},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [fail],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let (_, _, fields, _, _, _, exact_layouts, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+
+    assert_eq!(
+        fields.fields.get("fixture::Fail"),
+        Some(&vec![crate::front::semantic::FieldRow::named(
+            "__discriminant",
+            "isize"
+        )]),
+        "the spelled Isize tag is the base's one __discriminant row"
+    );
+
+    let os_rows = fields
+        .fields
+        .get("fixture::Fail::Os")
+        .expect("payload variant registers rows");
+    assert_eq!(
+        os_rows
+            .first()
+            .map(|row| (row.name.as_str(), row.ty.as_str())),
+        Some(("__discriminant", "isize")),
+        "the payload rows must start with the inherited tag, not the pointer field"
+    );
+
+    let variant_sid = majit_ir::descr::StructId::from_canonical("Fail::Os");
+    let offsets = &exact_layouts
+        .get(&variant_sid)
+        .expect("shelled variant registers an exact layout")
+        .field_offsets;
+    assert_eq!(offsets.get("__discriminant"), Some(&0));
+    let payload_off = offsets.get("os").copied();
+    assert!(
+        payload_off.is_some_and(|off| off != 0),
+        "the payload must not alias the tag at byte 0, got {payload_off:?}"
+    );
+}
+
 /// An `ArrayRead` element is addressable two ways: a scalar names its
 /// spelling so the descr computes the real width, or a thin pointer takes
 /// the identity-less mint's one-target-word assumption, which is already
@@ -4388,6 +4721,381 @@ fn a_scalar_element_names_its_width_and_a_thin_pointer_needs_no_name() {
     ));
     assert!(thin(serde_json::json!({"RawPtr": [named_adt, "Mut"]})));
     assert!(!thin(uint("U8")));
+}
+
+fn named_copy_field(name: &str, ty: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": name, "ty": ty, "attr_info": null})
+}
+
+#[test]
+fn json_ty_is_by_value_copy_aggregate_accepts_named_copy_structs() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let unsafe_cell = type_decl_struct(
+        1,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field(
+            "value",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+        )],
+    );
+    let atomic = type_decl_struct(
+        2,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![named_copy_field("v", adt_node(1))],
+    );
+    let unique = type_decl_struct(
+        3,
+        &["core", "ptr", "unique", "Unique"],
+        vec![named_copy_field(
+            "pointer",
+            serde_json::json!({"RawPtr": [u8_ty.clone(), "Mut"]}),
+        )],
+    );
+    let entry = type_decl_struct(
+        4,
+        &["fixture", "Entry"],
+        vec![named_copy_field("key", u8_ty.clone())],
+    );
+    let option = option_enum(5);
+    let arg_marker = opaque_type_decl(
+        6,
+        &["rustpython_compiler_core", "bytecode", "instruction", "Arg"],
+    );
+    let instruction = serde_json::json!({
+        "def_id": 7,
+        "item_meta": {
+            "name": [
+                {"Ident": ["rustpython_compiler_core", 0]},
+                {"Ident": ["bytecode", 0]},
+                {"Ident": ["instruction", 0]},
+                {"Ident": ["Instruction", 0]}
+            ],
+            "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {"name": "Nop", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+            {"name": "LoadName", "fields": [{
+                "name": null,
+                "ty": adt_node(6),
+                "attr_info": null
+            }], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+        ]}
+    });
+    let code_unit = type_decl_struct(
+        8,
+        &["rustpython_compiler_core", "bytecode", "CodeUnit"],
+        vec![
+            named_copy_field("op", adt_node(7)),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            pair,
+            unsafe_cell,
+            atomic,
+            unique,
+            entry,
+            option,
+            arg_marker,
+            instruction,
+            code_unit,
+        ],
+        vec![],
+    );
+    assert!(
+        json_ty_is_by_value_copy_aggregate(&adt_node(0), &llbc),
+        "a two-field Copy struct is the getarrayitem item"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&adt_node(2), &llbc),
+        "AtomicU64 is interior-mutable; get must not copy the slot"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&adt_node(3), &llbc),
+        "a pointer field is not a by-value Copy item"
+    );
+    let option_ty = serde_json::json!({
+        "Adt": {
+            "id": 5,
+            "generics": {
+                "regions": [],
+                "types": [adt_node(4)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&option_ty, &llbc),
+        "Option<Entry> is an enum slot, not a Copy struct item"
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&u8_ty, &llbc),
+        "a scalar stays on the existing spelling arm"
+    );
+    assert!(
+        json_ty_is_by_value_copy_aggregate(&adt_node(8), &llbc),
+        "CodeUnit is a Copy struct of a C-like opcode enum plus a byte"
+    );
+}
+
+#[test]
+fn json_ty_is_by_value_copy_aggregate_rejects_interior_mut_and_heap_payloads() {
+    let atomic = type_decl_struct(
+        0,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![named_copy_field(
+            "v",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![atomic], vec![]);
+    assert!(!json_ty_is_by_value_copy_aggregate(&adt_node(0), &llbc));
+}
+
+#[test]
+fn unique_unsafecell_slice_deref_field_index_picks_the_cell_slice() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = type_decl_struct(
+        1,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field("value", typevar)],
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [adt_node(0), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder = type_decl_struct(
+        2,
+        &["fixture", "CellPairUnits"],
+        vec![
+            named_copy_field("units", cell_ty),
+            named_copy_field("pad", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![pair, unsafecell, holder], vec![]);
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": ["_", {
+            "Adt": {
+                "id": 2,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }, "Shared"]
+    }));
+    let dest = TyRef::Other(serde_json::json!({
+        "Ref": ["_", {"Slice": [adt_node(0), null]}, "Shared"]
+    }));
+    assert_eq!(
+        unique_unsafecell_slice_deref_field_index(&recv, &dest, &llbc),
+        Some(0)
+    );
+}
+
+/// A slice of a unique two-segment Copy struct keeps the TypeDecl leaf.
+/// `strip_crate_prefix("fixture::CodePair")` is `CodePair`, so Place Index
+/// `array_type_id` stays `[CodePair]`.
+#[test]
+fn unique_leaf_copy_struct_slice_keeps_leaf_spelling() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let pair = type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![pair], vec![]);
+    let slice = TyRef::Other(serde_json::json!({"Slice": [adt_node(0), null]}));
+    assert_eq!(super::tyref_to_ast_string(&slice, &llbc), "[CodePair]");
+}
+
+/// Two TypeDecls share the leaf `CopyInstrWord`. Harvest of
+/// `UnsafeCell<Box<[CopyInstrWord]>>` qualifies the slice element
+/// (`field_row_struct_identity`) as the crate-stripped identity, the
+/// same identity ArrayRead / InteriorFieldRead use
+/// (`adt_node_class_root_identity`). `tyref_to_ast_string` keeps the
+/// TypeDecl leaf. Projecting that field is a SomeList whose item is
+/// that instance, so getitem (`listdef.py` `read_item`) is not
+/// Impossible.
+#[test]
+fn harvested_copy_struct_slice_item_is_class_identity_not_duplicate_leaf() {
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let bytecode_word = type_decl_struct(
+        0,
+        &["fixture", "bytecode", "CopyInstrWord"],
+        vec![
+            named_copy_field("op", u8_ty.clone()),
+            named_copy_field("arg", u8_ty.clone()),
+        ],
+    );
+    let gc_word = type_decl_struct(
+        1,
+        &["fixture", "gc", "CopyInstrWord"],
+        vec![
+            named_copy_field("wrappers", usize_ty.clone()),
+            named_copy_field("pinned", usize_ty),
+        ],
+    );
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = type_decl_struct(
+        2,
+        &["core", "cell", "UnsafeCell"],
+        vec![named_copy_field("value", typevar)],
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [adt_node(0), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder = type_decl_struct(
+        3,
+        &["fixture", "CellInstrUnits"],
+        vec![
+            named_copy_field("units", cell_ty),
+            named_copy_field("pad", u8_ty),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![bytecode_word, gc_word, unsafecell, holder],
+        vec![],
+    );
+
+    let slice = TyRef::Other(serde_json::json!({"Slice": [adt_node(0), null]}));
+    assert_eq!(
+        super::tyref_to_ast_string(&slice, &llbc),
+        "[CopyInstrWord]",
+        "tyref_to_ast_string keeps the TypeDecl leaf"
+    );
+    let tombstoned = super::tombstoned_leaves_of(&llbc);
+    assert!(
+        tombstoned.contains("CopyInstrWord"),
+        "duplicate leaf is withdrawn; tombstoned={tombstoned:?}"
+    );
+    assert_eq!(
+        adt_node_class_root_identity(&adt_node(0), &llbc, &tombstoned).as_deref(),
+        Some("bytecode::CopyInstrWord"),
+        "ArrayRead / InteriorFieldRead FLAG_STRUCT item identity"
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("harvest CellInstrUnits");
+    let units_ty = program
+        .struct_fields
+        .fields
+        .get("CellInstrUnits")
+        .or_else(|| program.struct_fields.fields.get("fixture::CellInstrUnits"))
+        .and_then(|rows| rows.iter().find(|row| row.name == "units"))
+        .map(|row| row.ty.clone())
+        .unwrap_or_default();
+    assert!(
+        units_ty.contains("[bytecode::CopyInstrWord]"),
+        "harvested units field carries the ArrayRead item identity; units_ty={units_ty:?}; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        program.struct_fields.fields.get("CopyInstrWord").is_none(),
+        "harden withdraws the duplicate leaf; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(program.struct_fields));
+    let projected = bk.project_struct_field_type(&units_ty);
+    let SomeValue::List(list) = &projected else {
+        panic!("units projects to SomeList, got {projected:?}");
+    };
+    let item = list.listdef.read_item(None);
+    assert!(
+        !matches!(item, SomeValue::Impossible),
+        "getitem read_item must not be Impossible; SomeList={list:?} item={item:?}"
+    );
+    let SomeValue::Instance(inst) = &item else {
+        panic!("list item is SomeInstance of the Copy struct, got {item:?}");
+    };
+    let classdef = inst.classdef.as_ref().expect("named instance");
+    assert_eq!(
+        classdef.borrow().name,
+        "bytecode::CopyInstrWord",
+        "list item matches ArrayRead class identity"
+    );
+    let _ = bk
+        .getuniqueclassdef_for_struct_root("bytecode::CopyInstrWord")
+        .expect("element classdef projects");
+    assert!(
+        classdef.borrow().attrs.contains_key("arg"),
+        "element rows are the bytecode CopyInstrWord fields; attrs={:?}",
+        classdef.borrow().attrs.keys().collect::<Vec<_>>()
+    );
 }
 
 /// `Vec::index_mut` of `Vec<Box<T>>` is one word per element when `T` has
@@ -5478,6 +6186,193 @@ fn field_row_struct_identity_qualifies_array_of_adt_element() {
     assert_eq!(primitive_layout, "[i64;0]");
     assert_eq!(
         super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
+fn field_row_struct_identity_qualifies_slice_element_behind_box_and_unsafecell() {
+    // `charon_adt_to_ast_string` renders the ADT leaf, so a harvested
+    // `[CopyInstrWord]` would collide with a second TypeDecl of the same
+    // leaf. The slice arm qualifies only a by-value Copy struct element
+    // (`json_ty_is_by_value_copy_aggregate`, the FLAG_STRUCT item
+    // `adt_node_class_root_identity` names). A slice-of-Copy-struct row,
+    // including `[T]` reached through `Box` / `UnsafeCell`, carries the
+    // TypeDecl path the same way a by-value ADT field does and keeps
+    // the wrapper spelling.
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "bytecode", "CopyInstrWord"],
+                vec![
+                    named_copy_field("op", u8_ty.clone()),
+                    named_copy_field("arg", u8_ty.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["host", "gc", "CopyInstrWord"],
+                vec![
+                    named_copy_field("wrappers", u8_ty.clone()),
+                    named_copy_field("pinned", u8_ty),
+                ],
+            ),
+            type_decl_struct(
+                2,
+                &["core", "cell", "UnsafeCell"],
+                vec![named_copy_field("value", typevar)],
+            ),
+        ],
+        vec![],
+    );
+    let word = adt_node(0);
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [word.clone(), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    assert_eq!(cell_layout, "UnsafeCell<Box<[CopyInstrWord]>>");
+    assert_eq!(
+        super::field_row_struct_identity(&cell_ty, &llbc, &cell_layout).as_deref(),
+        Some("UnsafeCell<Box<[bytecode::CopyInstrWord]>>")
+    );
+
+    let slice_ty = TyRef::Other(serde_json::json!({"Slice": [word.clone(), null]}));
+    let slice_layout = super::tyref_to_field_layout_string(&slice_ty, &llbc, &gc, &raw);
+    assert_eq!(slice_layout, "[CopyInstrWord]");
+    assert_eq!(
+        super::field_row_struct_identity(&slice_ty, &llbc, &slice_layout).as_deref(),
+        Some("[bytecode::CopyInstrWord]")
+    );
+
+    let box_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [word, null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let box_layout = super::tyref_to_field_layout_string(&box_ty, &llbc, &gc, &raw);
+    assert_eq!(box_layout, "Box<[CopyInstrWord]>");
+    assert_eq!(
+        super::field_row_struct_identity(&box_ty, &llbc, &box_layout).as_deref(),
+        Some("Box<[bytecode::CopyInstrWord]>")
+    );
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let primitive = TyRef::Other(serde_json::json!({"Slice": [i64_ty, null]}));
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    assert_eq!(primitive_layout, "[i64]");
+    assert_eq!(
+        super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
+fn field_row_struct_identity_keeps_slice_of_gc_pointer_struct() {
+    // `RDict.entries` is `UnsafeCell<Box<[Entry<IdentityKey, PyObjectRef>]>>`.
+    // The slice arm must not qualify a GC-pointer-carrying struct: that
+    // spelling stays `tyref_to_field_layout_string`.
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let gc_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Mut"
+        ]
+    });
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "rordereddict_entries", "Entry"],
+                vec![
+                    named_copy_field("key", gc_ptr.clone()),
+                    named_copy_field("value", gc_ptr),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["core", "cell", "UnsafeCell"],
+                vec![named_copy_field("value", typevar)],
+            ),
+        ],
+        vec![],
+    );
+    let entry = named_adt(
+        0,
+        vec![
+            serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+            serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+        ],
+    );
+    assert!(
+        !json_ty_is_by_value_copy_aggregate(&entry, &llbc),
+        "a GC/raw pointer field is not a by-value Copy item"
+    );
+    let box_slice = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [entry, null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [box_slice],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let cell_layout = super::tyref_to_field_layout_string(&cell_ty, &llbc, &gc, &raw);
+    assert_eq!(
+        cell_layout,
+        "UnsafeCell<Box<[Entry<??TypeVar#0,??TypeVar#1>]>>"
+    );
+    assert_eq!(
+        super::field_row_struct_identity(&cell_ty, &llbc, &cell_layout),
         None
     );
 }
@@ -9410,6 +10305,149 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
     );
 }
 
+/// `#[repr(transparent)] struct Anchor { depth: usize, _not_send: PhantomData }`
+/// plus a rustc closure env that captures `&Anchor`. Mirrors
+/// `eval::FrameAnchor` / `_trace::{closure#2}.__pos_5`.
+fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let phantom_adt = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let anchor_adt = serde_json::json!({"Adt": {"id": 1, "generics": generics}});
+    let borrowed_anchor =
+        serde_json::json!({"Ref": [{"Erased": null}, anchor_adt.clone(), "Shared"]});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201", "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": type_decl_meta(&["core", "marker", "PhantomData"]),
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 0, "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }],
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": type_decl_meta(&["eval", "FrameAnchor"]),
+                    "kind": {"Struct": [
+                        {
+                            "name": "depth",
+                            "ty": usize_ty,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        },
+                        {
+                            "name": "_not_send",
+                            "ty": phantom_adt,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }
+                    ]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0, 8]}],
+                            "repr": {"repr_algo": "Rust", "transparent": true}
+                        }
+                    }],
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": type_decl_meta(&["fixture", "Holder"]),
+                    "kind": {"Struct": [{
+                        "name": "anchor",
+                        "ty": borrowed_anchor.clone(),
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                    }]},
+                    "src": "Normal"
+                },
+                {
+                    "def_id": 3,
+                    "item_meta": type_decl_meta(&["fixture", "_trace", "closure"]),
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": borrowed_anchor.clone(),
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]},
+                    "layout": [{
+                        "key": "x86_64-unknown-linux-gnu",
+                        "value": {
+                            "size": 8, "align": 8,
+                            "variant_layouts": [{"field_offsets": [0]}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }],
+                    "src": {"Closure": {"info": {"kind": "Fn"}}}
+                }
+            ],
+            "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let borrowed = serde_json::from_value::<TyRef>(borrowed_anchor).expect("borrowed TyRef");
+    let by_value = adt_ty(1);
+    (llbc, borrowed, by_value)
+}
+
+/// A closure env that captures `&TransparentWrapper` of a scalar must
+/// paint that field as the inner word, matching `Rvalue::Ref` aliasing
+/// of the local. Layout `&eval::FrameAnchor` would project
+/// `Ptr(FrameAnchor)` against the stored Integer
+/// (`annotator/model.py` `unionof`).
+#[test]
+fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
+    let (llbc, borrowed, by_value) = llbc_with_transparent_anchor_closure_env();
+    let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let tomb = no_tombstoned_leaves();
+    assert_eq!(
+        tyref_to_value_type(&by_value, &llbc),
+        ValueType::Unsigned,
+        "by-value transparent wrapper is its depth word"
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed, &llbc),
+        ValueType::Unsigned,
+        "a borrow of the wrapper is the same word"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&by_value, &llbc, &gc_ids, &raw),
+        "usize",
+        "by-value layout is the inner scalar"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
+        "usize",
+        "a captured &Wrapper layout is the inner scalar, not &eval::FrameAnchor"
+    );
+    let ordinary = llbc.type_by_id(2).expect("ordinary holder");
+    let env = llbc.type_by_id(3).expect("closure env");
+    assert!(type_decl_is_closure_env(env));
+    assert!(!type_decl_is_closure_env(ordinary));
+    assert_eq!(
+        tyref_to_attr_value_type_for_struct_field(&borrowed, env, &llbc, &gc_ids, &raw),
+        ValueType::Unsigned,
+        "closure-env FORCE of a captured &Wrapper is the inner word"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &borrowed, &borrowed, false, true, None, &llbc, tomb, &gc_ids, &raw
+        ),
+        ValueType::Unsigned,
+        "closure-env getfield of a captured &Wrapper is the inner word"
+    );
+}
+
 fn raw_mut_u8() -> TyRef {
     fixture_ty(serde_json::json!({
         "RawPtr": [
@@ -10121,6 +11159,433 @@ fn option_map_family_keeps_regular_call_to_core_body() {
     assert_eq!(
         is_some_and_calls, 2,
         "caller keeps two regular calls to the core is_some_and body, got {is_some_and_calls}"
+    );
+}
+
+fn option_core_regular_call_count(graph: &crate::model::FunctionGraph, leaf: &str) -> usize {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == leaf,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some(leaf)
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count()
+}
+
+fn option_core_body_matches_tag(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{ExitSwitch, OpKind};
+    graph.blocks.iter().any(|block| {
+        matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+            || block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            || block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"))
+    })
+}
+
+fn option_core_body_calls_fnonce(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "call_once" || name == "call" || name == "call_mut",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
+            }
+            _ => false,
+        })
+    })
+}
+
+/// `Option::map_or_else` / `Option::flatten` stay regular calls of the
+/// extracted core bodies (`CHARON_CORE_INCLUDE`), same as `map_or`.
+///
+/// `lower_function` has no `SpecQueue`, so the caller may still spell
+/// `CallTarget::Method`; production `enqueue_spec` names the extracted
+/// body once the FunDecl is Unstructured and the call's `trait_refs`
+/// are concrete (`TraitImpl`, not `Clause`).
+#[test]
+fn option_map_or_else_and_flatten_keep_regular_call_to_core_body() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+
+    let map_or_else_caller = crate::test_support::lower_function(llbc, "concat_operand_name")
+        .expect("lower concat_operand_name");
+    let map_or_else_calls = option_core_regular_call_count(&map_or_else_caller, "map_or_else");
+    assert_eq!(
+        map_or_else_calls, 1,
+        "concat_operand_name keeps one regular call to the core map_or_else body, got {map_or_else_calls}"
+    );
+
+    crate::test_support::with_lowering(llbc, |ctx| {
+        let mut lowered_map_or_else = 0usize;
+        let mut lowered_flatten = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            let is_map_or_else = name_path.ends_with("::option::<Impl>::map_or_else");
+            let is_flatten = name_path.ends_with("::option::<Impl>::flatten");
+            if !is_map_or_else && !is_flatten {
+                continue;
+            }
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            assert!(
+                option_core_body_matches_tag(&graph),
+                "{name_path}: core body matches on the Option tag"
+            );
+            if is_map_or_else {
+                assert!(
+                    option_core_body_calls_fnonce(&graph),
+                    "{name_path}: core body calls d()/f(t); ops={:?}",
+                    graph_ops(&graph)
+                );
+                lowered_map_or_else += 1;
+            } else {
+                lowered_flatten += 1;
+            }
+        }
+        assert_eq!(
+            lowered_map_or_else, 1,
+            "extracted map_or_else FunDecl bodies must lower, got {lowered_map_or_else}"
+        );
+        assert_eq!(
+            lowered_flatten, 1,
+            "extracted flatten FunDecl bodies must lower, got {lowered_flatten}"
+        );
+
+        let mut flatten_caller_calls = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            if !fd
+                .item_meta
+                .name_path()
+                .ends_with("::type_fully_qualified_name")
+            {
+                continue;
+            }
+            if let Ok(graph) = super::lower_fun_decl(ctx, fd) {
+                flatten_caller_calls += option_core_regular_call_count(&graph, "flatten");
+            }
+        }
+        assert!(
+            flatten_caller_calls >= 1,
+            "type_fully_qualified_name keeps a regular call to the core flatten body, got {flatten_caller_calls}"
+        );
+    });
+}
+
+fn raw_store_struct(def_id: u64) -> serde_json::Value {
+    let mut decl = struct_decl(
+        def_id,
+        ident_path(&["fixture", "RawStore"]),
+        serde_json::json!([
+            {
+                "name": "ptr",
+                "ty": {"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "len",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    decl
+}
+
+fn raw_storage_enum(def_id: u64, payload_id: u64) -> serde_json::Value {
+    let mut decl = serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "RawEnum"])),
+        "kind": {"Enum": [{
+            "name": "Mapped",
+            "fields": [{
+                "name": null,
+                "ty": adt_node(payload_id),
+                "attr_info": null
+            }],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    });
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    decl
+}
+
+fn nested_option_raw_enum_nodes() -> (serde_json::Value, serde_json::Value) {
+    let inner = option_adt_node(0, option_shared_ref(adt_node(2)));
+    let outer = option_adt_node(0, inner.clone());
+    (inner, outer)
+}
+
+/// rustc layout of `Option<Option<&RawEnum>>` is inner pointer-niche
+/// (one word) plus an outer tag (two words). The outer cannot reuse the
+/// inner None (`rclass.py` `InstanceRepr.convert_const(None)` /
+/// `rnone.py` `rtype_is_None`).
+#[test]
+fn tagged_outer_option_of_niche_raw_enum_borrow_is_not_raw_address() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), raw_store_struct(1), raw_storage_enum(2, 1)],
+        vec![],
+    );
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let tomb = super::no_tombstoned_leaves();
+    let (inner_node, outer_node) = nested_option_raw_enum_nodes();
+    let inner = TyRef::Other(inner_node);
+    let outer = TyRef::Other(outer_node);
+    let mut stack = Vec::new();
+    assert!(
+        super::adt_def_is_raw_storage(
+            2,
+            &llbc,
+            &empty_gc,
+            super::no_immutable_fields(),
+            &mut stack
+        ),
+        "RawEnum with a raw-struct payload is storage-raw"
+    );
+    assert!(
+        super::tyref_is_niche_option(&inner, &llbc),
+        "Option<&RawEnum> is the pointer niche"
+    );
+    assert!(
+        !super::tyref_is_niche_option(&outer, &llbc),
+        "Option<Option<&RawEnum>> keeps the outer tag"
+    );
+    assert!(
+        super::ty_is_raw_address(&inner, &llbc, &empty_gc, &empty_s),
+        "inner Option<&RawEnum> is the int-bank null word"
+    );
+    assert!(
+        !super::ty_is_raw_address(&outer, &llbc, &empty_gc, &empty_s),
+        "tagged outer Option must not inherit the inner raw-address bank"
+    );
+    assert_eq!(
+        super::tyref_niche_option_gc_payload_spelling(&inner, &llbc, &empty_gc, &empty_s),
+        None,
+        "raw-enum borrow Option is not a GC payload stamp"
+    );
+    assert_eq!(
+        super::tyref_niche_option_gc_payload_spelling(&outer, &llbc, &empty_gc, &empty_s),
+        None,
+        "tagged outer Option is not a GC payload stamp"
+    );
+    let inner_vt = super::tyref_to_value_type_with(&inner, &llbc, tomb, &empty_gc, &empty_s);
+    let outer_vt = super::tyref_to_value_type_with(&outer, &llbc, tomb, &empty_gc, &empty_s);
+    assert!(
+        matches!(inner_vt, ValueType::Int),
+        "inner Option<&RawEnum> paints Int, got {inner_vt:?}"
+    );
+    match &outer_vt {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.contains("Option"),
+                "outer tagged Option class root names Option, got {root}"
+            );
+        }
+        other => panic!("outer Option<Option<&RawEnum>> paints Ref(class), got {other:?}"),
+    }
+}
+
+/// Extracted `flatten` body for `Option<Option<&RawEnum>>`: match the
+/// outer tag, yield the inner niche word. Self is the tagged Option
+/// class (`Ref`), not the inner address (`Int`), so the match must not
+/// `__cast_instance_intrinsic` an Integer onto `Option<Option<RawEnum>>`.
+#[test]
+fn flatten_of_tagged_option_of_raw_enum_borrow_keeps_ref_self() {
+    let (inner, outer) = nested_option_raw_enum_nodes();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &outer);
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &inner);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let some_payload = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [opt_place.clone(), {"Downcast": 1}]}),
+                &outer
+            ),
+            {"Field": [1, 0]}
+        ]}),
+        &inner,
+    );
+    let none_aggregate = serde_json::json!({
+        "Aggregate": [
+            {"Adt": [
+                {"id": 0, "generics": {
+                    "regions": [],
+                    "types": [option_shared_ref(adt_node(2))],
+                    "const_generics": [],
+                    "trait_refs": []
+                }},
+                0,
+                null
+            ]},
+            []
+        ]
+    });
+    let flatten = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "flatten"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [outer.clone()],
+            "output": inner.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &inner),
+                window_local(1, &outer),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            disc_place.clone(),
+                            {"Discriminant": opt_place.clone()}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Read": disc_place.clone()},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                            ],
+                            2
+                        ]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Read": some_payload}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            none_aggregate
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), raw_store_struct(1), raw_storage_enum(2, 1)],
+        vec![flatten],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "flatten")
+        .unwrap_or_else(|err| panic!("lower flatten of Option<Option<&RawEnum>>: {err}"));
+    assert!(
+        option_core_body_matches_tag(&graph),
+        "flatten matches the outer Option tag; graph={}",
+        graph.dump()
+    );
+    let self_input = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .find_map(|op| match &op.kind {
+            OpKind::Input { name, ty, .. } if name == "arg1" || name == "self" => Some(ty.clone()),
+            _ => None,
+        });
+    let self_ty = self_input.expect("flatten stamps an Input for self");
+    assert!(
+        matches!(self_ty, ValueType::Ref(Some(ref root)) if root.contains("Option")),
+        "flatten self of tagged Option<Option<&RawEnum>> is Ref(Option class), got {self_ty:?}; graph={}",
+        graph.dump()
+    );
+    let pos0_int = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Int, .. } if field.name == "__pos_0"
+            )
+        })
+    });
+    assert!(
+        pos0_int,
+        "Some.__pos_0 of the tagged outer is the inner niche Int word; graph={}",
+        graph.dump()
+    );
+    let w_root_cast = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind).is_some_and(|root| root.contains("PyObject"))
+        })
+    });
+    assert!(
+        !w_root_cast,
+        "inner niche word must not recast through W_ROOT; graph={}",
+        graph.dump()
     );
 }
 

@@ -4727,8 +4727,13 @@ unsafe fn tuple_concat_type_error(rhs: PyObjectRef) -> PyError {
 /// their own `tp_name`, so a `bytes` subclass reports itself on the right of
 /// `to`.
 unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError {
+    // `concat_operand_name` reaches a dict lookup that can collect, so the
+    // operand named second stays on the shadow stack across the first.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let rhs_root = pyre_object::gc_roots::pin_roots(&[rhs]);
     let lhs_name = unsafe { concat_operand_name(lhs) };
-    let rhs_name = unsafe { concat_operand_name(rhs) };
+    let rhs_name =
+        unsafe { concat_operand_name(pyre_object::gc_roots::shadow_stack_get(rhs_root)) };
     PyError::type_error(format!("can't concat {rhs_name} to {lhs_name}"))
 }
 

@@ -8913,6 +8913,46 @@ fn clone_lookalike_path_stays_residual() {
     );
 }
 
+#[test]
+fn nonnull_new_unchecked_is_identity_not_a_host_call() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let llbc = std_extern_call_fixture(
+        "nonnull_new_unchecked",
+        &["core", "ptr", "non_null", "NonNull", "new_unchecked"],
+        &[ptr_ty.clone()],
+        ptr_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "nonnull_new_unchecked")
+        .expect("lower NonNull::new_unchecked");
+    let ops = graph_ops(&graph);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "new_unchecked"),
+        "NonNull::new_unchecked must not residualize as a host call; ops={ops:?}"
+    );
+}
+
+#[test]
+fn nonnull_as_ptr_is_identity_not_a_host_call() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let llbc = std_extern_call_fixture(
+        "nonnull_as_ptr",
+        &["core", "ptr", "non_null", "NonNull", "as_ptr"],
+        &[ptr_ty.clone()],
+        ptr_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "nonnull_as_ptr")
+        .expect("lower NonNull::as_ptr");
+    let ops = graph_ops(&graph);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "as_ptr"),
+        "NonNull::as_ptr must not residualize as a host call; ops={ops:?}"
+    );
+}
+
 pub(in crate::front::mir) fn named_adt(
     id: u64,
     types: Vec<serde_json::Value>,
@@ -12469,6 +12509,387 @@ fn an_object_array_literal_unsize_is_newlist() {
             } if name == "Array" || majit_ir::descr::is_shaped_array_name(name)
         )),
         "the array literal must not remain an Array synthetic ctor; ops={ops:?}"
+    );
+}
+
+/// `vec![e0, …, eN-1]`: `new_uninit<[T; N]>` + Array store into
+/// `(*box).Field(1).Field(0)` + `box_assume_init_into_vec_unsafe`.
+fn vec_literal_into_vec_fixture(
+    caller: &str,
+    item_ty: serde_json::Value,
+    n: u64,
+    extra_type_decls: Vec<serde_json::Value>,
+) -> Llbc {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let empty_generics = generics(Vec::new());
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let named = |path: &[&str], def_id: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta(path, false),
+            "kind": {"Struct": []}
+        })
+    };
+    let n_lit = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]
+    });
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [item_ty.clone(), array_len, null]});
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics(vec![item_ty.clone()])}
+    });
+    let box_ty = serde_json::json!({
+        "Adt": {"id": 2, "generics": generics(vec![array_ty.clone()])}
+    });
+    let place =
+        |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty});
+    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "span": span(), "comments_before": []});
+    let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
+    let box_local = n + 1;
+    let mut locals = vec![local(0, &vec_ty)];
+    for i in 1..=n {
+        locals.push(local(i, &item_ty));
+    }
+    locals.push(local(box_local, &box_ty));
+    let elements: Vec<serde_json::Value> = (1..=n).map(|i| mv(i, &item_ty)).collect();
+    let deref = serde_json::json!({
+        "kind": {"Projection": [place(box_local, &box_ty), "Deref"]},
+        "ty": array_ty
+    });
+    let field1 = serde_json::json!({
+        "kind": {"Projection": [deref, {"Field": [null, 1]}]},
+        "ty": array_ty
+    });
+    let field0 = serde_json::json!({
+        "kind": {"Projection": [field1, {"Field": [null, 0]}]},
+        "ty": array_ty
+    });
+    let array_store = stmt(serde_json::json!({
+        "Assign": [field0, {
+            "Aggregate": [
+                {"Array": [item_ty.clone(), n_lit]},
+                elements
+            ]
+        }]
+    }));
+    let opaque =
+        |def_id: u64, path: &[&str], inputs: Vec<serde_json::Value>, output: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "signature": {
+                    "is_unsafe": true,
+                    "inputs": inputs,
+                    "output": output
+                },
+                "body": "Opaque"
+            })
+        };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", caller], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": vec![item_ty.clone(); n as usize],
+            "output": vec_ty.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": n,
+                    "locals": locals
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": empty_generics.clone()
+                                            }
+                                        },
+                                        "args": []}, "dest": place(box_local, &box_ty),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [array_store],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 2},
+                                                "generics": empty_generics.clone()
+                                            }
+                                        },
+                                        "args": [mv(box_local, &box_ty)]}, "dest": place(0, &vec_ty),
+                                    "target": 4,
+                                    "on_unwind": 3
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let mut type_decls = vec![
+        named(&["alloc", "vec", "Vec"], 0),
+        named(&["PyObject"], 1),
+        named(&["alloc", "boxed", "Box"], 2),
+    ];
+    type_decls.extend(extra_type_decls);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": type_decls,
+            "fun_decls": [
+                caller,
+                opaque(1, &["alloc", "boxed", "Box", "new_uninit"], vec![], box_ty.clone()),
+                opaque(
+                    2,
+                    &["alloc", "boxed", "box_assume_init_into_vec_unsafe"],
+                    vec![box_ty],
+                    vec_ty
+                )
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("vec! fixture parses")
+}
+
+fn assert_vec_literal_lowers(
+    llbc: &Llbc,
+    caller: &str,
+    n: usize,
+    newlist_leaf: &str,
+    setitem_leaf: &str,
+) {
+    let graph = crate::test_support::lower_function(llbc, caller)
+        .unwrap_or_else(|e| panic!("{caller}: {e}"));
+    let ops = graph_ops(&graph);
+    let leaves: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "new_uninit" || *leaf == "box_assume_init_into_vec_unsafe"),
+        "{caller}: residual new_uninit/into_vec survived; leaves={leaves:?} ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "Field_0"
+        )),
+        "{caller}: FieldWrite Field_0 survived; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::NewList { .. })),
+        "{caller}: must not emit OpKind::NewList; ops={ops:?}"
+    );
+    let newlist = ops.iter().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some(newlist_leaf)
+        )
+    });
+    let Some(newlist) = newlist else {
+        panic!("{caller}: missing {newlist_leaf}; leaves={leaves:?} ops={ops:?}");
+    };
+    let header = newlist
+        .result
+        .as_ref()
+        .expect("{newlist_leaf} produces a value");
+    let inputs = graph.block(graph.startblock).inputargs.clone();
+    assert_eq!(inputs.len(), n, "{caller}: inputargs");
+    let setitems: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some(setitem_leaf) => Some(args),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setitems.len(),
+        n,
+        "{caller}: expected {n} {setitem_leaf}; leaves={leaves:?} ops={ops:?}"
+    );
+    for (i, args) in setitems.iter().enumerate() {
+        assert_eq!(args.len(), 3, "{caller} setitem {i} arity");
+        assert_eq!(
+            args[0].as_variable(),
+            Some(header),
+            "{caller} setitem {i} header"
+        );
+        let elem = args[2]
+            .as_variable()
+            .unwrap_or_else(|| panic!("{caller} setitem {i} element"));
+        assert_eq!(
+            traces_to_start_input(&graph, elem),
+            Some(&inputs[i]),
+            "{caller} setitem {i} element"
+        );
+    }
+}
+
+fn traces_to_start_input<'a>(
+    graph: &'a crate::model::FunctionGraph,
+    mut var: &'a crate::flowspace::model::Variable,
+) -> Option<&'a crate::flowspace::model::Variable> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(var.id()) {
+            return None;
+        }
+        let start = graph.block(graph.startblock);
+        if let Some(found) = start.inputargs.iter().find(|v| *v == var) {
+            return Some(found);
+        }
+        let mut next = None;
+        'blocks: for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() == Some(var)
+                    && let OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } = &op.kind
+                    && name == "same_as"
+                {
+                    next = Some(operand);
+                    break 'blocks;
+                }
+            }
+            if let Some(idx) = block.inputargs.iter().position(|v| v == var) {
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target == block.id
+                            && let Some(arg) = link.args.get(idx).and_then(|a| a.as_variable())
+                            && arg != var
+                        {
+                            next = Some(arg);
+                            break 'blocks;
+                        }
+                    }
+                }
+            }
+        }
+        match next {
+            Some(v) => var = v,
+            None => return None,
+        }
+    }
+}
+
+#[test]
+fn vec_literal_object_ptr_lowers_to_newlist_r() {
+    let objptr = serde_json::json!({
+        "RawPtr": [{"Adt": {"id": 1, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}}, "Mut"]
+    });
+    let llbc = vec_literal_into_vec_fixture("vec_literal_object_ptr", objptr, 1, vec![]);
+    assert_vec_literal_lowers(
+        &llbc,
+        "vec_literal_object_ptr",
+        1,
+        "ll_vec_newlist_r",
+        "ll_vec_setitem_fast_r",
+    );
+}
+
+#[test]
+fn vec_literal_i64_lowers_to_newlist_i() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = vec_literal_into_vec_fixture("vec_literal_i64", i64_ty, 2, vec![]);
+    assert_vec_literal_lowers(
+        &llbc,
+        "vec_literal_i64",
+        2,
+        "ll_vec_newlist_i",
+        "ll_vec_setitem_fast_i",
     );
 }
 
@@ -19422,7 +19843,7 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
 /// arm, so the resulting graph directly exposes whether the classifier
 /// chose aggregate construction or the nullable-pointer identities.
 fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, false, false, false, None)
+    lower_option_fn_retyped("option_source", payload, false, false, false, None, false)
 }
 
 fn lower_option_source_with_payload_ext(
@@ -19436,11 +19857,16 @@ fn lower_option_source_with_payload_ext(
         inject_layoutless_nominal,
         false,
         None,
+        false,
     )
 }
 
 fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, true, false, false, None)
+    lower_option_fn_retyped("option_source", payload, true, false, false, None, false)
+}
+
+fn lower_option_source_with_transparent_newtype(field: serde_json::Value) -> FunctionGraph {
+    lower_option_fn_retyped("option_source", field, false, false, false, None, true)
 }
 
 fn lower_option_fn_retyped(
@@ -19450,6 +19876,7 @@ fn lower_option_fn_retyped(
     inject_layoutless_nominal: bool,
     inject_string: bool,
     option_layout_size: Option<u64>,
+    wrap_transparent_newtype: bool,
 ) -> FunctionGraph {
     fn replace_dedup(
         value: &mut serde_json::Value,
@@ -19665,6 +20092,147 @@ fn lower_option_fn_retyped(
         payload = serde_json::json!({
             "Adt": {
                 "id": hole,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+    }
+    if wrap_transparent_newtype {
+        let decls = translated
+            .get_mut("type_decls")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("corpus type_decls");
+        let occupy = |decls: &mut Vec<serde_json::Value>| -> usize {
+            if let Some(hole) = decls.iter().position(serde_json::Value::is_null) {
+                hole
+            } else {
+                let id = decls.len();
+                decls.push(serde_json::Value::Null);
+                id
+            }
+        };
+        let is_non_null_decl = |decl: &serde_json::Value| -> bool {
+            let Some(names) = decl
+                .get("item_meta")
+                .and_then(|meta| meta.get("name"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+            let path: Vec<&str> = names
+                .iter()
+                .filter_map(|seg| seg.get("Ident")?.get(0)?.as_str())
+                .collect();
+            path == ["core", "ptr", "non_null", "NonNull"]
+        };
+        let existing_non_null = decls.iter().find_map(|decl| {
+            is_non_null_decl(decl)
+                .then(|| decl.get("def_id")?.as_u64())
+                .flatten()
+        });
+        let payload_is_generic_adt = payload
+            .get("Adt")
+            .and_then(|adt| adt.get("generics")?.get("types")?.as_array())
+            .is_some_and(|types| !types.is_empty());
+        // Dummy Adt-id 4 with a type argument is the NonNull stand-in
+        // (`non_null_payload`). Do not retarget a different generic
+        // (Box, Vec) onto NonNull.
+        let payload_adt_id = payload
+            .get("Adt")
+            .and_then(|adt| adt.get("id"))
+            .and_then(serde_json::Value::as_u64);
+        if payload_is_generic_adt && payload_adt_id == Some(4) {
+            let non_null_id = if let Some(id) = existing_non_null {
+                id
+            } else {
+                let id = occupy(decls) as u64;
+                let mut nn = decls
+                    .iter()
+                    .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+                    .expect("sized nominal def-id 5")
+                    .clone();
+                nn["def_id"] = serde_json::json!(id);
+                if let Some(meta) = nn.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+                    meta.insert(
+                        "name".to_string(),
+                        serde_json::json!([
+                            {"Ident": ["core", 0]},
+                            {"Ident": ["ptr", 0]},
+                            {"Ident": ["non_null", 0]},
+                            {"Ident": ["NonNull", 0]}
+                        ]),
+                    );
+                }
+                // rustc `NonNull<T>` is `repr(transparent)` over `*const T`.
+                nn["kind"] = serde_json::json!({
+                    "Struct": [{
+                        "name": "_0",
+                        "is_positional": true,
+                        "ty": {
+                            "RawPtr": [
+                                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                                "Const"
+                            ]
+                        }
+                    }]
+                });
+                nn["layout"] = serde_json::json!([{
+                    "key": "",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"transparent": true}
+                    }
+                }]);
+                decls[id as usize] = nn;
+                id
+            };
+            if let Some(adt) = payload.get_mut("Adt").and_then(|a| a.as_object_mut()) {
+                adt.insert("id".to_string(), serde_json::json!(non_null_id));
+            }
+        }
+        let wrapper_id = occupy(decls);
+        let template = decls
+            .iter()
+            .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+            .expect("sized nominal def-id 5")
+            .clone();
+        let mut wrapper = template;
+        wrapper["def_id"] = serde_json::json!(wrapper_id);
+        if let Some(meta) = wrapper.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+            meta.insert(
+                "name".to_string(),
+                serde_json::json!([
+                    {"Ident": ["charon_corpus", 0]},
+                    {"Ident": ["TransparentHandle", 0]}
+                ]),
+            );
+        }
+        wrapper["kind"] = serde_json::json!({
+            "Struct": [{
+                "name": "_0",
+                "is_positional": true,
+                "ty": payload.clone()
+            }]
+        });
+        wrapper["layout"] = serde_json::json!([{
+            "key": "",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": true}
+            }
+        }]);
+        decls[wrapper_id] = wrapper;
+        payload = serde_json::json!({
+            "Adt": {
+                "id": wrapper_id,
                 "generics": {
                     "regions": [],
                     "types": [],
@@ -20777,7 +21345,8 @@ fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone(
     // record; `option_source` constructs `None` so that dest hits
     // `aggregate_shape`.
     for (fn_name, layout) in [("option_source", None), ("option_source", Some(0u64))] {
-        let graph = lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout);
+        let graph =
+            lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout, false);
         let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
         let as_value = const_none_link_args(&graph);
         assert!(
@@ -20795,7 +21364,15 @@ fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone(
              (NoneRepr leak), got {as_value:?}"
         );
     }
-    let graph = lower_option_fn_retyped("option_question_mark", payload, false, false, false, None);
+    let graph = lower_option_fn_retyped(
+        "option_question_mark",
+        payload,
+        false,
+        false,
+        false,
+        None,
+        false,
+    );
     let (_null_muts, transparent_ctors) = niche_ctor_shape(&graph);
     let as_value = const_none_link_args(&graph);
     let from_residuals = option_core_leaf_call_count(&graph, "from_residual");
@@ -22882,6 +23459,63 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
     }
 }
 
+fn non_null_payload() -> serde_json::Value {
+    // Adt id is rewritten onto `core::ptr::non_null::NonNull` when the
+    // transparent wrapper is injected (`wrap_transparent_newtype`).
+    serde_json::json!({
+        "Adt": {
+            "id": 4,
+            "generics": {
+                "regions": [],
+                "types": [{
+                    "Adt": {
+                        "id": 4,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                }],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+/// `Option<Newtype(NonNull<T>)>` is rustc's pointer niche: `None` is
+/// `null_mut()`, `Some` is the payload, discriminant is a pointer
+/// compare, no `SyntheticTransparentCtor`.
+#[test]
+fn niche_option_transparent_newtype_over_non_null_is_null() {
+    let graph = lower_option_source_with_transparent_newtype(non_null_payload());
+    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    assert!(
+        null_muts >= 1,
+        "Option<Newtype(NonNull<T>)>::None is push_niche_null_ptr, got {null_muts}"
+    );
+    assert_eq!(
+        transparent_ctors, 0,
+        "no SyntheticTransparentCtor None/Some for Option<Newtype(NonNull<T>)>"
+    );
+}
+
+/// A `repr(transparent)` newtype over a raw pointer has no rustc niche
+/// (`Some(null)` is distinct from `None`), so the Option stays tagged.
+#[test]
+fn niche_option_transparent_newtype_over_raw_ptr_stays_tagged() {
+    let graph = lower_option_source_with_transparent_newtype(object_ref_payload());
+    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    assert_eq!(
+        null_muts, 0,
+        "Option<Newtype(*mut T)> must not collapse None to the payload null word"
+    );
+    assert!(
+        transparent_ctors >= 2,
+        "Option<Newtype(*mut T)> must retain the tagged Some and None aggregates"
+    );
+}
+
 /// `option_question_mark` with a String payload: Option `?` is a regular
 /// call of the extracted `branch` body plus a ControlFlow discriminant
 /// switch. The rewrite used to inline a niche null-test (`null_muts >= 1`,
@@ -22897,6 +23531,7 @@ fn niche_option_string_match_is_none_identity() {
         false,
         true,
         None,
+        false,
     );
     assert_eq!(
         option_core_leaf_call_count(&graph, "branch"),
@@ -32710,6 +33345,54 @@ pub(in crate::front::mir) fn interior_opaque(
     })
 }
 
+/// Opaque FunDecl whose `"<Impl>"` segment is a trait impl
+/// (`{"Impl": {"Ty": {"skip_binder": {"Value": [0, self_ty]}}, "Trait": trait_id}}`).
+/// [`interior_opaque`] keeps the inherent-impl shape.
+pub(in crate::front::mir) fn interior_trait_opaque(
+    def_id: u64,
+    path: &[&str],
+    self_ty: serde_json::Value,
+    trait_id: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_trait_meta(path, self_ty, trait_id, false),
+        "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
+        "body": "Opaque"
+    })
+}
+
+fn interior_trait_meta(
+    path: &[&str],
+    self_ty: serde_json::Value,
+    trait_id: u64,
+    is_local: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": path.iter().map(|segment| {
+            if *segment == "<Impl>" {
+                serde_json::json!({"Impl": {
+                    "Ty": {"skip_binder": {"Value": [0, self_ty.clone()]}},
+                    "Trait": trait_id
+                }})
+            } else {
+                serde_json::json!({"Ident": [segment, 0]})
+            }
+        }).collect::<Vec<_>>(),
+        "span": interior_span(),
+        "source_text": null,
+        "attr_info": {
+            "attributes": [],
+            "inline": null,
+            "rename": null,
+            "public": true
+        },
+        "is_local": is_local
+    })
+}
+
 pub(in crate::front::mir) fn interior_local(
     index: u64,
     name: Option<&str>,
@@ -33041,6 +33724,874 @@ fn interior_field_read_of_ptr_add() {
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
         "ops={ops:?}"
+    );
+}
+
+fn copy_pair_u8() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+}
+
+fn copy_pair_struct() -> serde_json::Value {
+    type_decl_struct(
+        0,
+        &["fixture", "CodePair"],
+        vec![
+            serde_json::json!({"name": "op", "ty": copy_pair_u8(), "attr_info": null}),
+            serde_json::json!({"name": "arg", "ty": copy_pair_u8(), "attr_info": null}),
+        ],
+    )
+}
+
+fn tag_op_kind_adt() -> serde_json::Value {
+    interior_adt(3)
+}
+
+fn tag_op_kind_enum() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 3,
+        "item_meta": interior_meta(&["fixture", "TagOpKind"], true),
+        "kind": {"Enum": [
+            {"name": "Nop", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+            {"name": "Load", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 1,
+                "align": 1,
+                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": []}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    })
+}
+
+fn tag_op_unit_struct() -> serde_json::Value {
+    type_decl_struct(
+        0,
+        &["fixture", "TagOpUnit"],
+        vec![
+            serde_json::json!({"name": "op", "ty": tag_op_kind_adt(), "attr_info": null}),
+            serde_json::json!({"name": "arg", "ty": copy_pair_u8(), "attr_info": null}),
+        ],
+    )
+}
+
+fn copy_pair_ref(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["_", pair, "Shared"]})
+}
+
+fn copy_pair_option_ty(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [copy_pair_ref(pair)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn copy_pair_slice_ty(pair: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["_", {"Slice": [pair, null]}, "Shared"]})
+}
+
+fn slice_get_call(
+    fun: u64,
+    args: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+    target: u64,
+    unwind: u64,
+    elem: &serde_json::Value,
+    index: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": interior_span(),
+        "kind": {
+            "Call": {
+                "call": {
+                    "func": {
+                        "Regular": {
+                            "kind": {"Fun": fun},
+                            "generics": {
+                                "regions": [],
+                                "types": [elem, index],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    },
+                    "args": args}, "dest": dest,
+                "target": target,
+                "on_unwind": unwind
+            }
+        }
+    })
+}
+
+fn copy_pair_get_callee(
+    dest_ty: &serde_json::Value,
+    slice_ty: &serde_json::Value,
+    usize_ty: &serde_json::Value,
+) -> serde_json::Value {
+    interior_opaque(
+        1,
+        &["core", "slice", "<Impl>", "get"],
+        vec![slice_ty.clone(), usize_ty.clone()],
+        dest_ty.clone(),
+    )
+}
+
+/// `get(i)?.field` of a Copy struct is a bounds `lt` plus
+/// `getinteriorfield`. The Option dest is never a tagged aggregate.
+#[test]
+fn copy_struct_slice_get_field_is_bounds_and_interior_read() {
+    let u8_ty = copy_pair_u8();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(3, &option_ty);
+    let cf_place = interior_place(4, &cf_ty);
+    let disc_place = interior_place(5, &disc_ty);
+    let payload_place = interior_place(6, &ref_ty);
+    let ret_place = interior_place(0, &u8_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let caller = interior_caller(
+        "get_pair_field",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("opt"), &option_ty),
+            interior_local(4, Some("cf"), &cf_ty),
+            interior_local(5, Some("disc"), &disc_ty),
+            interior_local(6, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(3, &option_ty))],
+                    cf_place.clone(),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 5],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 6]
+                            ],
+                            6
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(6, &ref_ty, &pair_ty, &u8_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Unsigned": ["U8", "0"]}}, u8_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let branch = interior_opaque(
+        2,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![copy_pair_struct(), option_enum(1), control_flow_enum(2)],
+        vec![caller, get, branch],
+    );
+    let graph = lower_interior(&llbc, "get_pair_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch"),
+        "Copy-struct get(i)?.field must not residualize; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )),
+        "bounds check is unsigned lt; ops={ops:?}"
+    );
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(array_type_id.as_deref(), Some("[CodePair]"));
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } | OpKind::FieldRead { field, .. }
+                if field.name == "__discriminant" || field.name == "__pos_0"
+        )),
+        "fused get must not materialise a tagged Option; ops={ops:?}"
+    );
+}
+
+/// `get(i)?.op` of a Copy struct whose `op` is a `#[repr(u8)]` fieldless
+/// enum is `getinteriorfield` of the stored unsigned tag, then
+/// `rarithmetic.intmask` so the value that flows is the signed Int.
+#[test]
+fn copy_struct_slice_get_fieldless_enum_field_intmasks() {
+    let enum_ty = tag_op_kind_adt();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), enum_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(3, &option_ty);
+    let cf_place = interior_place(4, &cf_ty);
+    let disc_place = interior_place(5, &disc_ty);
+    let payload_place = interior_place(6, &ref_ty);
+    let ret_place = interior_place(0, &enum_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let caller = interior_caller(
+        "get_tag_op_unit_field",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        enum_ty.clone(),
+        vec![
+            interior_local(0, None, &enum_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("opt"), &option_ty),
+            interior_local(4, Some("cf"), &cf_ty),
+            interior_local(5, Some("disc"), &disc_ty),
+            interior_local(6, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(3, &option_ty))],
+                    cf_place.clone(),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 5],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 6]
+                            ],
+                            6
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(6, &ref_ty, &pair_ty, &enum_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Signed": ["I8", "0"]}}, enum_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let branch = interior_opaque(
+        2,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            tag_op_unit_struct(),
+            option_enum(1),
+            control_flow_enum(2),
+            tag_op_kind_enum(),
+        ],
+        vec![caller, get, branch],
+    );
+    let graph = lower_interior(&llbc, "get_tag_op_unit_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch"),
+        "Copy-struct get(i)?.op must not residualize; ops={ops:?}"
+    );
+    let block = interior_read_block(&graph);
+    let read_idx = block
+        .operations
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .expect("InteriorFieldRead");
+    let read = &block.operations[read_idx];
+    let OpKind::InteriorFieldRead {
+        field,
+        item_ty,
+        array_type_id,
+        ..
+    } = &read.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(item_ty, &ValueType::Unsigned);
+    assert_eq!(array_type_id.as_deref(), Some("[TagOpUnit]"));
+    let read_res = read.result.as_ref().expect("InteriorFieldRead result");
+    assert!(
+        read_idx + 1 < block.operations.len(),
+        "intmask must follow InteriorFieldRead; ops={:?}",
+        block.operations
+    );
+    let intmask = &block.operations[read_idx + 1];
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        result_ty,
+    } = &intmask.kind
+    else {
+        panic!("expected intmask after InteriorFieldRead; op={intmask:?}");
+    };
+    assert_eq!(
+        segments.as_slice(),
+        ["rpython", "rlib", "rarithmetic", "intmask"],
+        "intmask path; op={intmask:?}"
+    );
+    assert_eq!(result_ty, &ValueType::Int);
+    assert_eq!(args[0].as_variable(), Some(read_res));
+    let signed = intmask.result.as_ref().expect("intmask result");
+    let flows_on = graph.blocks.iter().any(|b| {
+        b.exits.iter().any(|link| {
+            link.target == graph.returnblock
+                && matches!(&link.args[..], [LinkArg::Value(v)] if v == signed)
+        })
+    });
+    assert!(
+        flows_on,
+        "intmask result must be the Some-path return; graph={}",
+        graph.dump()
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
+    match signed.annotation.borrow().as_deref() {
+        Some(crate::annotator::model::SomeValue::Integer(i)) => {
+            assert!(
+                !i.unsigned,
+                "intmask result annotates as signed SomeInteger, got {i:?}"
+            );
+        }
+        other => panic!("intmask result annotates as signed SomeInteger, got {other:?}"),
+    }
+}
+
+/// `get(i)?.field` through an `UnsafeCell<Box<[T]>>` Deref is the same
+/// bounds `lt` plus `getinteriorfield`. Deref is `getfield` of that
+/// unique cell field, not a residual `deref` getattr.
+#[test]
+fn copy_struct_slice_get_through_unsafecell_deref_is_bounds_and_interior_read() {
+    let u8_ty = copy_pair_u8();
+    let usize_ty = interior_usize();
+    let pair_ty = interior_adt(0);
+    let ref_ty = copy_pair_ref(&pair_ty);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let box_slice_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [pair_ty.clone(), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unsafecell_ty = serde_json::json!({
+        "Adt": {
+            "id": 3,
+            "generics": {
+                "regions": [],
+                "types": [box_slice_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let holder_ty = interior_adt(4);
+    let holder_ref = interior_shared(holder_ty.clone());
+    let cf_ty = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [ref_ty.clone(), u8_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let opt_place = interior_place(4, &option_ty);
+    let cf_place = interior_place(5, &cf_ty);
+    let disc_place = interior_place(6, &disc_ty);
+    let payload_place = interior_place(7, &ref_ty);
+    let ret_place = interior_place(0, &u8_ty);
+    let slice_place = interior_place(3, &slice_ty);
+    let payload_field = serde_json::json!({
+        "kind": {"Projection": [cf_place.clone(), {"Field": [0, 0]}]},
+        "ty": ref_ty
+    });
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafecell = transparent_unique_field_decl(3, &["core", "cell", "UnsafeCell"], typevar);
+    let holder = interior_struct(
+        4,
+        &["fixture", "CellPairUnits"],
+        &[("units", unsafecell_ty), ("pad", u8_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "get_cell_pair_field",
+        2,
+        vec![holder_ref.clone(), usize_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("holder"), &holder_ref),
+            interior_local(2, Some("index"), &usize_ty),
+            interior_local(3, Some("slice"), &slice_ty),
+            interior_local(4, Some("opt"), &option_ty),
+            interior_local(5, Some("cf"), &cf_ty),
+            interior_local(6, Some("disc"), &disc_ty),
+            interior_local(7, Some("payload"), &ref_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &holder_ref))],
+                    slice_place.clone(),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    2,
+                    vec![
+                        interior_copy(slice_place),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    opt_place,
+                    4,
+                    3,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(4, &option_ty))],
+                    cf_place.clone(),
+                    6,
+                    5,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    disc_place.clone(),
+                    serde_json::json!({"Discriminant": cf_place}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": disc_place},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 7],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 8]
+                            ],
+                            8
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(payload_place, interior_use(payload_field)),
+                    interior_assign(
+                        ret_place.clone(),
+                        interior_use(interior_field(7, &ref_ty, &pair_ty, &u8_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    ret_place,
+                    serde_json::json!({"Use": [
+                        {"Const": [{"Integer": {"Unsigned": ["U8", "0"]}}, u8_ty]},
+                        "No"
+                    ]}),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let deref = interior_trait_opaque(
+        1,
+        &["core", "ops", "deref", "<Impl>", "deref"],
+        holder_ty.clone(),
+        0,
+        vec![holder_ref],
+        slice_ty.clone(),
+    );
+    let get = interior_opaque(
+        2,
+        &["core", "slice", "<Impl>", "get"],
+        vec![slice_ty, usize_ty],
+        option_ty.clone(),
+    );
+    let branch = interior_opaque(
+        3,
+        &["core", "option", "<Impl>", "branch"],
+        vec![option_ty],
+        cf_ty,
+    );
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![
+            copy_pair_struct(),
+            option_enum(1),
+            control_flow_enum(2),
+            unsafecell,
+            holder,
+        ],
+        vec![caller, deref, get, branch],
+        vec![ops_deref_trait_decl()],
+        vec![serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [holder_ty]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [0, 0]},
+                "skip_binder": {"id": 1}
+            }]
+        })],
+    );
+    let graph = lower_interior(&llbc, "get_cell_pair_field");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "get" || *leaf == "branch" || *leaf == "deref"),
+        "UnsafeCell Deref get(i)?.field must not residualize; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "deref" || name == "deref_mut"
+        )),
+        "UnsafeCell Deref must not emit Method getattr deref; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "units"
+        )),
+        "Deref is getfield of the unique UnsafeCell-wrapping field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )),
+        "bounds check is unsigned lt; ops={ops:?}"
+    );
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "op");
+    assert_eq!(array_type_id.as_deref(), Some("[CodePair]"));
+}
+
+/// An escaping `get(i)` result stays the residual `core::slice::<Impl>::get`.
+#[test]
+fn copy_struct_slice_get_escape_stays_residual() {
+    let pair_ty = interior_adt(0);
+    let option_ty = copy_pair_option_ty(&pair_ty);
+    let slice_ty = copy_pair_slice_ty(&pair_ty);
+    let usize_ty = interior_usize();
+    let caller = interior_caller(
+        "get_pair_escape",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(0, &option_ty),
+                    2,
+                    1,
+                    &pair_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![copy_pair_struct(), option_enum(1)],
+        vec![caller, get],
+    );
+    let graph = lower_interior(&llbc, "get_pair_escape");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| *leaf == "get"),
+        "escaping get must stay residual; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "escaping get must not emit getinteriorfield; ops={ops:?}"
+    );
+}
+
+/// `AtomicU64` is interior-mutable; `<[AtomicU64]>::get` stays residual.
+#[test]
+fn atomic_slice_get_stays_a_residual_core_call() {
+    let atomic = type_decl_struct(
+        0,
+        &["core", "sync", "atomic", "AtomicU64"],
+        vec![serde_json::json!({
+            "name": "v",
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+            "attr_info": null
+        })],
+    );
+    let atomic_ty = interior_adt(0);
+    let option_ty = copy_pair_option_ty(&atomic_ty);
+    let slice_ty = copy_pair_slice_ty(&atomic_ty);
+    let usize_ty = interior_usize();
+    let caller = interior_caller(
+        "get_atomic",
+        2,
+        vec![slice_ty.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("slice"), &slice_ty),
+            interior_local(2, Some("index"), &usize_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                slice_get_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &slice_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(0, &option_ty),
+                    2,
+                    1,
+                    &atomic_ty,
+                    &usize_ty,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let get = copy_pair_get_callee(&option_ty, &slice_ty, &usize_ty);
+    let llbc = llbc_with_types("fixture", vec![atomic, option_enum(1)], vec![caller, get]);
+    let graph = lower_interior(&llbc, "get_atomic");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| *leaf == "get"),
+        "AtomicU64 get must stay residual; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "AtomicU64 get must not copy the slot; ops={ops:?}"
     );
 }
 

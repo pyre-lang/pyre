@@ -93,6 +93,430 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
     overrides
 }
 
+/// Crate-stripped paths of the `ProfileFunc` family in this artefact.
+///
+/// `setllprofile` / `store_profilefunc` / `setprofile` `FnDef` arguments,
+/// `FnDef` values stored into a `profilefunc` field or a `ProfileFunc`-typed
+/// place, and every `FunDecl` whose signature equals that `fn` type.
+/// Callers in another crate see the store as an external `FunDecl`; the
+/// translator unions the lists before lowering.
+///
+/// Keys on the `ProfileFunc` type (`executioncontext.py` `setllprofile` /
+/// `_trace`), not on member names: `app_profile_call` / `lsprof_call` are
+/// discovered, not baked.
+pub(crate) fn discover_profilefunc_graphs(llbc: &Llbc) -> Vec<String> {
+    let info = profilefunc_type_info(llbc);
+    let store_ids = profilefunc_store_fun_ids(llbc);
+    let mut graphs = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured_shared() else {
+            continue;
+        };
+        let mut bound = vec![None; body.locals.locals.len()];
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let funs = rvalue_fundefs(llbc, rvalue);
+                if let PlaceKind::Local(index) = place.kind
+                    && (index as usize) < bound.len()
+                    && let Some(&fun) = funs.last()
+                {
+                    bound[index as usize] = Some(fun);
+                }
+                if tyref_is_profilefunc_family_with(&place.ty, llbc, &info)
+                    || place_is_profilefunc_field(place, llbc)
+                {
+                    for fun in funs {
+                        push_registered_fun_path(llbc, fun, &mut graphs);
+                    }
+                }
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                continue;
+            };
+            if !store_ids.contains(id) {
+                continue;
+            }
+            for arg in &call.args {
+                if let Some(fun) = operand_bound_fundef(llbc, arg, &bound) {
+                    push_registered_fun_path(llbc, fun, &mut graphs);
+                }
+            }
+        }
+    }
+    if let Some(skip_binder) = info.skip_binder.as_ref() {
+        for fd in llbc.iter_fun_decls() {
+            if fun_decl_signature_matches_fnptr(fd, skip_binder, llbc) {
+                push_registered_fun_path(llbc, fd.def_id, &mut graphs);
+            }
+        }
+    }
+    graphs
+}
+
+/// Type spellings of the `ProfileFunc` slot in this artefact: the alias
+/// leaf, `Option<ProfileFunc>`, and the expanded `fn(...)` Charon renders
+/// after peeling `TypeDeclKind::Alias`.
+pub(crate) fn discover_profilefunc_spellings(llbc: &Llbc) -> Vec<String> {
+    profilefunc_type_info(llbc).spellings
+}
+
+/// Whether `ty` is `ProfileFunc` / `Option<ProfileFunc>` or a published
+/// expanded `fn(...)` spelling of that slot.
+pub(in crate::front::mir) fn tyref_is_profilefunc_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    let spellings = profilefunc_spellings_of(llbc);
+    tyref_matches_profilefunc_spellings(ty, llbc, &spellings)
+        || tyref_is_profilefunc_family_with(ty, llbc, &profilefunc_type_info(llbc))
+}
+
+fn profilefunc_spellings_of(llbc: &Llbc) -> Vec<String> {
+    let published = llbc.profilefunc_spellings();
+    if !published.is_empty() {
+        return published;
+    }
+    let tls = crate::profilefunc_family::profilefunc_spellings();
+    if !tls.is_empty() {
+        return tls;
+    }
+    discover_profilefunc_spellings(llbc)
+}
+
+fn tyref_matches_profilefunc_spellings(ty: &TyRef, llbc: &Llbc, spellings: &[String]) -> bool {
+    let rendered = tyref_to_ast_string(ty, llbc);
+    if spelling_matches_profilefunc(&rendered, spellings) {
+        return true;
+    }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        let inner = tyref_to_ast_string(&payload, llbc);
+        if spelling_matches_profilefunc(&inner, spellings) {
+            return true;
+        }
+    }
+    false
+}
+
+fn spelling_matches_profilefunc(spelling: &str, published: &[String]) -> bool {
+    if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
+        return true;
+    }
+    let inner = peel_option_spelling(spelling);
+    published.iter().any(|known| {
+        known == spelling
+            || known == inner
+            || peel_option_spelling(known) == inner
+            || peel_option_spelling(known) == spelling
+    })
+}
+
+fn peel_option_spelling(spelling: &str) -> &str {
+    let t = spelling.trim();
+    t.strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+        .map(str::trim)
+        .unwrap_or(t)
+}
+
+struct ProfileFuncTypeInfo {
+    alias_def_ids: Vec<u64>,
+    type_dedup_ids: Vec<u64>,
+    skip_binder: Option<serde_json::Value>,
+    spellings: Vec<String>,
+}
+
+fn profilefunc_type_info(llbc: &Llbc) -> ProfileFuncTypeInfo {
+    let mut info = ProfileFuncTypeInfo {
+        alias_def_ids: Vec::new(),
+        type_dedup_ids: Vec::new(),
+        skip_binder: None,
+        spellings: Vec::new(),
+    };
+    for td in llbc.iter_type_decls() {
+        if !path_leaf_is(&td.item_meta.name_path(), "ProfileFunc") {
+            continue;
+        }
+        push_unique_u64(&mut info.alias_def_ids, td.def_id);
+        push_unique_spelling(&mut info.spellings, "ProfileFunc".to_string());
+        push_unique_spelling(&mut info.spellings, "Option<ProfileFunc>".to_string());
+        let path = td.item_meta.name_path();
+        if path != "ProfileFunc" {
+            push_unique_spelling(&mut info.spellings, path.clone());
+            push_unique_spelling(&mut info.spellings, format!("Option<{path}>"));
+        }
+        let TypeDeclKind::Alias(body) = &td.kind else {
+            continue;
+        };
+        let node = body.get("aliased_ty").unwrap_or(body);
+        if let Some(skip) = fnptr_skip_binder_node(node, llbc) {
+            info.skip_binder.get_or_insert_with(|| skip.clone());
+        }
+        let alias_ty = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": td.def_id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }));
+        let rendered = tyref_to_ast_string(&alias_ty, llbc);
+        push_unique_spelling(&mut info.spellings, rendered.clone());
+        push_unique_spelling(&mut info.spellings, format!("Option<{rendered}>"));
+    }
+    for td in llbc.iter_type_decls() {
+        let Some(fields) = type_decl_struct_fields(td, llbc) else {
+            continue;
+        };
+        for field in fields {
+            if field.name.as_deref() != Some("profilefunc") {
+                continue;
+            }
+            absorb_profilefunc_ty(&field.ty, llbc, &mut info);
+        }
+    }
+    for fd in llbc.iter_fun_decls() {
+        if !is_profilefunc_store_fun(fd) {
+            continue;
+        }
+        for input in &fd.signature.inputs {
+            if tyref_is_profilefunc_family_with(input, llbc, &info)
+                || tyref_option_payload_is_fn_ptr(input, llbc)
+                || tyref_node(input, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+            {
+                absorb_profilefunc_ty(input, llbc, &mut info);
+            }
+        }
+    }
+    info
+}
+
+fn absorb_profilefunc_ty(ty: &TyRef, llbc: &Llbc, info: &mut ProfileFuncTypeInfo) {
+    if let Some(id) = tyref_dedup_id(ty) {
+        push_unique_u64(&mut info.type_dedup_ids, id);
+    }
+    let rendered = tyref_to_ast_string(ty, llbc);
+    push_unique_spelling(&mut info.spellings, rendered.clone());
+    let inner = peel_option_spelling(&rendered);
+    if inner != rendered {
+        push_unique_spelling(&mut info.spellings, inner.to_string());
+    }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        if let Some(id) = tyref_dedup_id(&payload) {
+            push_unique_u64(&mut info.type_dedup_ids, id);
+        }
+        if let Some(def_id) = tyref_node(&payload, llbc).and_then(adt_node_def_id) {
+            push_unique_u64(&mut info.alias_def_ids, def_id);
+        }
+        let payload_rendered = tyref_to_ast_string(&payload, llbc);
+        push_unique_spelling(&mut info.spellings, payload_rendered);
+        if info.skip_binder.is_none()
+            && let Some(node) = tyref_node(&payload, llbc)
+            && let Some(skip) = fnptr_skip_binder_node(node, llbc)
+        {
+            info.skip_binder = Some(skip.clone());
+        }
+    } else if let Some(def_id) = tyref_node(ty, llbc).and_then(adt_node_def_id) {
+        push_unique_u64(&mut info.alias_def_ids, def_id);
+        if info.skip_binder.is_none()
+            && let Some(node) = tyref_node(ty, llbc)
+            && let Some(skip) = fnptr_skip_binder_node(node, llbc)
+        {
+            info.skip_binder = Some(skip.clone());
+        }
+    } else if info.skip_binder.is_none()
+        && let Some(node) = tyref_node(ty, llbc)
+        && let Some(skip) = fnptr_skip_binder_node(node, llbc)
+    {
+        info.skip_binder = Some(skip.clone());
+    }
+}
+
+fn fnptr_skip_binder_node<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let peeled = type_node_peel_aliases(node, llbc).unwrap_or(node);
+    peeled
+        .as_object()
+        .and_then(|obj| obj.get("FnPtr"))
+        .and_then(|fnptr| fnptr.get("skip_binder"))
+}
+
+fn tyref_is_profilefunc_family_with(ty: &TyRef, llbc: &Llbc, info: &ProfileFuncTypeInfo) -> bool {
+    if let Some(id) = tyref_dedup_id(ty)
+        && info.type_dedup_ids.contains(&id)
+    {
+        return true;
+    }
+    if let Some(def_id) = tyref_node(ty, llbc).and_then(adt_node_def_id)
+        && info.alias_def_ids.contains(&def_id)
+    {
+        return true;
+    }
+    if tyref_matches_profilefunc_spellings(ty, llbc, &info.spellings) {
+        return true;
+    }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        return tyref_is_profilefunc_family_with(&payload, llbc, info);
+    }
+    if let Some(skip) = info.skip_binder.as_ref()
+        && let Some(node) = tyref_node(ty, llbc)
+        && let Some(got) = fnptr_skip_binder_node(node, llbc)
+    {
+        return skip_binder_eq(skip, got, llbc);
+    }
+    false
+}
+
+fn place_is_profilefunc_field(place: &Place, llbc: &Llbc) -> bool {
+    let PlaceKind::Projection(base, elem) = &place.kind else {
+        return false;
+    };
+    let Some(field) = elem.field_payload() else {
+        return false;
+    };
+    let Some(index) = field
+        .as_array()
+        .and_then(|arr| arr.get(1).or_else(|| arr.first()))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| field.as_u64())
+    else {
+        return false;
+    };
+    let Some(node) = tyref_node(&base.ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+    else {
+        return false;
+    };
+    let Some(decl) = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(decl, llbc) else {
+        return false;
+    };
+    fields.get(index as usize).and_then(|f| f.name.as_deref()) == Some("profilefunc")
+}
+
+fn is_profilefunc_store_fun(fd: &FunDecl) -> bool {
+    let path = fd.item_meta.name_path();
+    path.ends_with("::setllprofile")
+        || path.ends_with("::store_profilefunc")
+        || path.ends_with("::setprofile")
+}
+
+fn profilefunc_store_fun_ids(llbc: &Llbc) -> Vec<u64> {
+    llbc.iter_fun_decls()
+        .filter(|fd| is_profilefunc_store_fun(fd))
+        .map(|fd| fd.def_id)
+        .collect()
+}
+
+fn fun_decl_signature_matches_fnptr(
+    fd: &FunDecl,
+    skip_binder: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    let Some(sig) = skip_binder.as_object() else {
+        return false;
+    };
+    let is_unsafe = sig.get("is_unsafe").and_then(serde_json::Value::as_bool) == Some(true);
+    if fd.signature.is_unsafe != is_unsafe {
+        return false;
+    }
+    let Some(inputs) = sig.get("inputs").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if fd.signature.inputs.len() != inputs.len() {
+        return false;
+    }
+    for (decl_ty, expected) in fd.signature.inputs.iter().zip(inputs) {
+        if tyref_to_ast_string(decl_ty, llbc) != charon_type_value_to_ast_string(expected, llbc, 0)
+        {
+            return false;
+        }
+    }
+    let output = sig
+        .get("output")
+        .map(|ty| charon_type_value_to_ast_string(ty, llbc, 0))
+        .unwrap_or_else(|| "()".to_string());
+    tyref_to_ast_string(&fd.signature.output, llbc) == output
+}
+
+fn skip_binder_eq(left: &serde_json::Value, right: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(l) = left.as_object() else {
+        return left == right;
+    };
+    let Some(r) = right.as_object() else {
+        return false;
+    };
+    let l_unsafe = l.get("is_unsafe").and_then(serde_json::Value::as_bool) == Some(true);
+    let r_unsafe = r.get("is_unsafe").and_then(serde_json::Value::as_bool) == Some(true);
+    if l_unsafe != r_unsafe {
+        return false;
+    }
+    let l_in = l.get("inputs").and_then(serde_json::Value::as_array);
+    let r_in = r.get("inputs").and_then(serde_json::Value::as_array);
+    match (l_in, r_in) {
+        (Some(a), Some(b)) if a.len() == b.len() => {
+            if a.iter().zip(b).any(|(x, y)| {
+                charon_type_value_to_ast_string(x, llbc, 0)
+                    != charon_type_value_to_ast_string(y, llbc, 0)
+            }) {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    let l_out = l
+        .get("output")
+        .map(|ty| charon_type_value_to_ast_string(ty, llbc, 0))
+        .unwrap_or_default();
+    let r_out = r
+        .get("output")
+        .map(|ty| charon_type_value_to_ast_string(ty, llbc, 0))
+        .unwrap_or_default();
+    l_out == r_out
+}
+
+fn rvalue_fundefs(llbc: &Llbc, rvalue: &Rvalue) -> Vec<u64> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
+            operand_fundef(llbc, operand).into_iter().collect()
+        }
+        Rvalue::Aggregate(_, operands) => operands
+            .iter()
+            .filter_map(|operand| operand_fundef(llbc, operand))
+            .collect(),
+        Rvalue::Repeat { operand, .. } => operand_fundef(llbc, operand).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn push_unique_u64(out: &mut Vec<u64>, id: u64) {
+    if !out.contains(&id) {
+        out.push(id);
+    }
+}
+
+fn push_unique_spelling(out: &mut Vec<String>, spelling: String) {
+    if !spelling.is_empty() && !out.contains(&spelling) {
+        out.push(spelling);
+    }
+}
+
 /// `register_eval_override`'s parameter type: the `EvalFn` pointer.
 ///
 /// Resolved once per artefact, from every `FunDecl` including an external
@@ -2980,6 +3404,46 @@ pub(in crate::front::mir) fn promoted_const_copied_const(
     Some(value)
 }
 
+/// `Option::branch` behind `?`. Charon records `core::option::<Impl>::branch`.
+/// A trait `Try::branch` is the same operator only when Self is `Option<_>`.
+pub(in crate::front::mir) fn regular_call_is_option_try_branch(
+    reg: &RegularCall,
+    llbc: &Llbc,
+) -> bool {
+    if let Some(path) = regular_call_name_path(reg, llbc) {
+        return path == "core::option::<Impl>::branch";
+    }
+    let CallKind::Trait(payload) = &reg.kind else {
+        return false;
+    };
+    trait_payload_path_and_method(payload, llbc).is_some_and(|(trait_path, method)| {
+        method == "branch" && trait_path == "core::ops::try_trait::Try"
+    }) && trait_payload_self_is_option(payload, llbc)
+}
+
+/// `Try`'s Self, the same `generics.types[0]` slot `trait_clone_self_node`
+/// reads. `tyref_is_option` is the Option counterpart of
+/// `tyref_is_result` on `recognize_result_try_site`.
+fn trait_payload_self_is_option(payload: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(arr) = payload.as_array() else {
+        return false;
+    };
+    let Some(tref) = arr.first().and_then(|tref| traitref_unwrap(tref, llbc, 0)) else {
+        return false;
+    };
+    let Some(ty) = crate::front::clause_spec::trait_decl_pred(tref)
+        .and_then(|pred| pred.pointer("/generics/types"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+    else {
+        return false;
+    };
+    let Some(node) = strip_ty_indirections(ty, llbc) else {
+        return false;
+    };
+    crate::front::result_exc::tyref_is_option(&TyRef::Other(node.clone()), llbc)
+}
+
 /// `Result::branch` behind `?`. Charon records the impl method
 /// `core::result::<Impl>::branch`. A trait `Try::branch` is the same
 /// operator. `Result::expect` is a different leaf and stays out.
@@ -4066,6 +4530,184 @@ pub(in crate::front::mir) fn add_dest_used_only_as_struct_field(
 ) -> bool {
     let census = struct_field_census(llbc, body, dest);
     census.defs == 1 && census.fields >= 1 && census.other == 0
+}
+
+fn place_enum_payload_of(place: &Place, dest: usize) -> Option<(u64, usize)> {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return None;
+    };
+    if !matches!(inner.kind, PlaceKind::Local(i) if i as usize == dest) {
+        return None;
+    }
+    let arr = v.get("Field")?.as_array()?;
+    Some((arr.first()?.as_u64()?, arr.get(1)?.as_u64()? as usize))
+}
+
+fn place_is_deref_field_of(place: &Place, dest: usize) -> bool {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return false;
+    };
+    v.get("Field").is_some() && place_is_immediate_deref_of(inner, dest)
+}
+
+/// `<[T]>::get` dest is only the Option disc / `?` / match, and the Some
+/// payload is only `(*p).field` Copy reads (`ll_getitem_nonneg` +
+/// `getinteriorfield`). Any other use keeps the residual call.
+pub(in crate::front::mir) fn copy_struct_slice_get_fusable(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> bool {
+    let mut cf = Vec::new();
+    let mut payloads = Vec::new();
+    // role 0 = Option dest, 1 = ControlFlow dest, 2 = `&T` payload.
+    if !fused_get_local_ok(llbc, body, dest, 0, &mut cf, &mut payloads, &mut 0) {
+        return false;
+    }
+    for local in std::mem::take(&mut cf) {
+        if !fused_get_local_ok(llbc, body, local, 1, &mut cf, &mut payloads, &mut 0) {
+            return false;
+        }
+    }
+    let mut fields = 0;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(local) = payloads.pop() {
+        if !seen.insert(local) {
+            continue;
+        }
+        if !fused_get_local_ok(llbc, body, local, 2, &mut cf, &mut payloads, &mut fields) {
+            return false;
+        }
+    }
+    fields >= 1
+}
+
+fn fused_get_local_ok(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+    role: u8,
+    cf: &mut Vec<usize>,
+    payloads: &mut Vec<usize>,
+    fields: &mut usize,
+) -> bool {
+    let forward = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if !fused_get_assign_ok(place, rvalue, dest, role, payloads, fields) {
+                        return false;
+                    }
+                }
+                Ok(StmtKind::Assert(assert))
+                    if operand_place(&assert.cond)
+                        .is_some_and(|p| place_references_local(p, dest)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. })
+                if operand_place(discr).is_some_and(|p| place_references_local(p, dest)) =>
+            {
+                return false;
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                    continue;
+                }
+                if !call
+                    .args
+                    .iter()
+                    .any(|arg| operand_place(arg).is_some_and(|p| place_references_local(p, dest)))
+                {
+                    continue;
+                }
+                let PlaceKind::Local(bind) = call.dest.kind else {
+                    return false;
+                };
+                let is_branch = matches!(&call.func, CallFunc::Regular(reg)
+                    if regular_call_is_option_try_branch(reg, llbc))
+                    && call.args.len() == 1
+                    && operand_local(Some(&call.args[0])) == Some(dest);
+                if role == 0 && is_branch {
+                    cf.push(bind as usize);
+                } else {
+                    return false;
+                }
+            }
+            Ok(TermKind::Return) if dest == 0 => return false,
+            Ok(TermKind::Assert { assert, .. })
+                if operand_place(&assert.cond).is_some_and(|p| place_references_local(p, dest)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn fused_get_assign_ok(
+    place: &Place,
+    rvalue: &Rvalue,
+    dest: usize,
+    role: u8,
+    payloads: &mut Vec<usize>,
+    fields: &mut usize,
+) -> bool {
+    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
+        return true;
+    }
+    if matches!(rvalue, Rvalue::Discriminant(p) if matches!(p.kind, PlaceKind::Local(i) if i as usize == dest))
+    {
+        return role < 2;
+    }
+    if let Rvalue::Use(op, _) = rvalue
+        && let Some(src) = operand_place(op)
+    {
+        if let Some((variant, field)) = place_enum_payload_of(src, dest) {
+            let PlaceKind::Local(bind) = place.kind else {
+                return false;
+            };
+            if field != 0 {
+                return false;
+            }
+            let some_or_continue = (role == 0 && variant == 1) || (role == 1 && variant == 0);
+            let none_or_break = (role == 0 && variant == 0) || (role == 1 && variant == 1);
+            if some_or_continue {
+                payloads.push(bind as usize);
+                return true;
+            }
+            return none_or_break;
+        }
+        if place_is_deref_field_of(src, dest) {
+            *fields += 1;
+            return role == 2;
+        }
+        if matches!(src.kind, PlaceKind::Local(i) if i as usize == dest) {
+            let PlaceKind::Local(bind) = place.kind else {
+                return false;
+            };
+            payloads.push(bind as usize);
+            return role == 2;
+        }
+        if place_references_local(src, dest) {
+            return false;
+        }
+    }
+    if place_is_deref_field_of(place, dest) || place_references_local(place, dest) {
+        return false;
+    }
+    let mut other = 0;
+    scan_rvalue_struct_field(rvalue, dest, &mut 0, &mut other);
+    other == 0
 }
 
 /// Header recovered from the add's base before any flowspace Variable exists.

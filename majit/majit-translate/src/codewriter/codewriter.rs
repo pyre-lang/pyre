@@ -279,6 +279,10 @@ impl CodeWriter {
                 panic!("populate_call_registry_from_call_graphs failed: {msg}");
             }
         }
+        // After populate: family members are already interned
+        // `FunctionDesc`s (`bookkeeper.getdesc`). Dummy register would
+        // panic on a `Signature` conflict.
+        registry.intern_profilefunc_family();
         // Issue #346: register the just-seeded impl-subclass methods into
         // their ClassDef attr sources (`classdesc.py ClassDesc.find_source_for`)
         // so a family-base / `dyn Trait` receiver getattr resolves the impl

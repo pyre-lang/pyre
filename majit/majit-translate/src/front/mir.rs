@@ -283,6 +283,40 @@ pub(crate) fn prelink_crate(
     if !eval_hook_graphs.is_empty() && llbc.eval_hook_graphs() != eval_hook_graphs {
         llbc.set_eval_hook_graphs(eval_hook_graphs);
     }
+    let published_profilefunc = llbc.profilefunc_graphs();
+    let profilefunc_paths = if published_profilefunc.is_empty() {
+        discover_profilefunc_graphs(llbc)
+    } else {
+        published_profilefunc
+    };
+    let mut profilefunc_graphs = Vec::new();
+    for path in profilefunc_paths {
+        if !profilefunc_graphs.contains(&path) {
+            profilefunc_graphs.push(path);
+        }
+    }
+    if !profilefunc_graphs.is_empty() && llbc.profilefunc_graphs() != profilefunc_graphs {
+        llbc.set_profilefunc_graphs(profilefunc_graphs);
+    }
+    let published_spellings = llbc.profilefunc_spellings();
+    let spelling_paths = if published_spellings.is_empty() {
+        discover_profilefunc_spellings(llbc)
+    } else {
+        published_spellings
+    };
+    let mut profilefunc_spellings = Vec::new();
+    for spelling in spelling_paths {
+        if !profilefunc_spellings.contains(&spelling) {
+            profilefunc_spellings.push(spelling);
+        }
+    }
+    if !profilefunc_spellings.is_empty() && llbc.profilefunc_spellings() != profilefunc_spellings {
+        llbc.set_profilefunc_spellings(profilefunc_spellings);
+    }
+    crate::profilefunc_family::register_profilefunc_family(
+        llbc.profilefunc_graphs(),
+        llbc.profilefunc_spellings(),
+    );
     paint_tombstones
 }
 
@@ -561,6 +595,58 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             }
         }
     }
+    let mut profilefunc_graphs = Vec::new();
+    let mut profilefunc_spellings = Vec::new();
+    for llbc in llbcs {
+        let published = llbc.profilefunc_graphs();
+        let paths = if published.is_empty() {
+            if function_filter.is_some() {
+                Vec::new()
+            } else {
+                discover_profilefunc_graphs(llbc)
+            }
+        } else {
+            published
+        };
+        for path in paths {
+            if !profilefunc_graphs.contains(&path) {
+                profilefunc_graphs.push(path);
+            }
+        }
+        let published_spellings = llbc.profilefunc_spellings();
+        let spellings = if published_spellings.is_empty() {
+            if function_filter.is_some() {
+                Vec::new()
+            } else {
+                discover_profilefunc_spellings(llbc)
+            }
+        } else {
+            published_spellings
+        };
+        for spelling in spellings {
+            if !profilefunc_spellings.contains(&spelling) {
+                profilefunc_spellings.push(spelling);
+            }
+        }
+    }
+    if !profilefunc_graphs.is_empty() {
+        for llbc in llbcs {
+            if llbc.profilefunc_graphs() != profilefunc_graphs {
+                llbc.set_profilefunc_graphs(profilefunc_graphs.clone());
+            }
+        }
+    }
+    if !profilefunc_spellings.is_empty() {
+        for llbc in llbcs {
+            if llbc.profilefunc_spellings() != profilefunc_spellings {
+                llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
+            }
+        }
+    }
+    crate::profilefunc_family::register_profilefunc_family(
+        profilefunc_graphs,
+        profilefunc_spellings,
+    );
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `trait_impl_id` (Charon's function-object identity for a trait
@@ -3950,6 +4036,7 @@ fn int_type_byte_width(int_ty: &str) -> u64 {
         "i8" | "u8" => 1,
         "i16" | "u16" => 2,
         "i32" | "u32" => 4,
+        "i64" | "u64" | "isize" | "usize" => 8,
         _ => 8,
     }
 }
@@ -7562,7 +7649,8 @@ pub(crate) use self::consteval::{
     register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, release_declared_vable_array_address,
+    discover_eval_hook_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
+    release_declared_vable_array_address,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,
@@ -7587,14 +7675,15 @@ pub(crate) use self::lltype::{
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
-    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
-    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
-    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
-    nonzero_option_zero, output_type_is_objectptr, push_unichr,
-    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
-    strip_crate_prefix, struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id,
-    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
+    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
+    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
+    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
+    seed_program_exception_class_hints, strip_crate_prefix,
+    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -9225,7 +9314,8 @@ fn op_vec_alloc_kind(op: &SpaceOperation) -> Option<majit_ir::rvec::VecItemKind>
         Some((
             majit_ir::rvec::VecOp::NewEmpty
             | majit_ir::rvec::VecOp::NewHint
-            | majit_ir::rvec::VecOp::AllocAndSet,
+            | majit_ir::rvec::VecOp::AllocAndSet
+            | majit_ir::rvec::VecOp::NewFixed,
             kind,
         )) => Some(kind),
         _ => None,

@@ -497,6 +497,16 @@ pub struct Bookkeeper {
     /// program declares a handful, and lookup walks it. Lives on the
     /// bookkeeper next to `exception_carrier`.
     exception_class_hierarchies: RefCell<Vec<MintedExceptionHierarchy>>,
+    /// `FunctionDesc`s of the closed `ProfileFunc` family stored into
+    /// `ExecutionContext.profilefunc` (`executioncontext.py` `setllprofile`).
+    /// Empty until [`Self::set_profilefunc_family`]. The field annotates as
+    /// a nullable `SomePBC` of these descs (`description.py` `CallFamily`).
+    profilefunc_family: RefCell<Vec<super::description::DescEntry>>,
+    /// Crate-stripped call paths of [`Self::profilefunc_family`].
+    profilefunc_paths: RefCell<Vec<String>>,
+    /// Type spellings of that slot (`ProfileFunc`, `Option<ProfileFunc>`,
+    /// expanded `fn(...)` after alias peel).
+    profilefunc_spellings: RefCell<Vec<String>>,
 }
 
 /// One `_exception_class_<Enum>` hierarchy after mint.
@@ -1858,6 +1868,9 @@ impl Bookkeeper {
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
             immutable_fields_structs: RefCell::new(HashMap::new()),
             exception_class_hierarchies: RefCell::new(Vec::new()),
+            profilefunc_family: RefCell::new(Vec::new()),
+            profilefunc_paths: RefCell::new(Vec::new()),
+            profilefunc_spellings: RefCell::new(Vec::new()),
         }
     }
 
@@ -1964,6 +1977,70 @@ impl Bookkeeper {
             .map(|(field, rank)| ConstValue::byte_str(format!("{field}{}", rank.suffix())))
             .collect();
         host.class_set("_immutable_fields_", ConstValue::List(Arc::new(items)));
+    }
+
+    /// Install the closed `ProfileFunc` family (`setllprofile` /
+    /// `_trace`). `descriptions` are the interned `FunctionDesc`s
+    /// `CallRegistry` already holds for those paths — a second
+    /// `HostObject::new_user_function` would be a distinct callable
+    /// (`HostObject` Arc identity).
+    pub fn set_profilefunc_family(
+        &self,
+        descriptions: Vec<super::description::DescEntry>,
+        paths: Vec<String>,
+        spellings: Vec<String>,
+    ) {
+        *self.profilefunc_family.borrow_mut() = descriptions;
+        *self.profilefunc_paths.borrow_mut() = paths;
+        *self.profilefunc_spellings.borrow_mut() = spellings;
+    }
+
+    /// Nullable PBC of the published `ProfileFunc` family, or `s_None`
+    /// when no member is interned yet so a later store can union in.
+    pub(crate) fn profilefunc_pbc_or_none(&self) -> SomeValue {
+        let descs = self.profilefunc_family.borrow().clone();
+        if descs.is_empty() {
+            super::model::s_none()
+        } else {
+            SomeValue::PBC(super::model::SomePBC::new(descs, true))
+        }
+    }
+
+    /// Whether `spelling` names the `ProfileFunc` slot. Matches the alias
+    /// leaf and published expanded `fn(...)` spellings; generic `fn` /
+    /// `Option<fn>` stay `SomePtr`.
+    pub(crate) fn is_profilefunc_type_spelling(&self, spelling: &str) -> bool {
+        if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
+            return true;
+        }
+        let inner = strip_generic_one(spelling.trim(), "Option<")
+            .map(str::trim)
+            .unwrap_or(spelling.trim());
+        self.profilefunc_spellings.borrow().iter().any(|known| {
+            let known_inner = strip_generic_one(known.trim(), "Option<")
+                .map(str::trim)
+                .unwrap_or(known.trim());
+            known == spelling
+                || known == inner
+                || known_inner == inner
+                || known_inner == spelling.trim()
+        })
+    }
+
+    /// Whether `segments` name a published `ProfileFunc` family member.
+    pub(crate) fn is_profilefunc_graph_path(&self, segments: &[String]) -> bool {
+        if crate::profilefunc_family::is_profilefunc_graph_path(segments) {
+            return true;
+        }
+        if segments.is_empty() {
+            return false;
+        }
+        let key = segments.join("::");
+        self.profilefunc_paths.borrow().iter().any(|path| {
+            path == &key
+                || path.ends_with(&format!("::{key}"))
+                || key.ends_with(&format!("::{path}"))
+        })
     }
 
     /// Name the interpreter's error carrier object (see the
@@ -2109,9 +2186,51 @@ impl Bookkeeper {
     /// str-family pointee. GC instance-ness is the pointee's harvested
     /// layout gckind (`lltype.py` `Struct._first_struct`), never the
     /// spelling. No layouts answers not-GC for the instance arm.
+    /// A by-value one-field rustc pointer-niche payload is reconstructed
+    /// from the owner's declared field row.
     pub fn is_niche_option_gc_payload_spelling(&self, ty: &str) -> bool {
+        {
+            let layouts = self.struct_layouts.borrow();
+            if crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref()) {
+                return true;
+            }
+        }
+        let Some(inner) = majit_ir::descr::option_payload_spelling(ty.trim()) else {
+            return false;
+        };
+        if inner.starts_with("*mut ")
+            || inner.starts_with("*const ")
+            || inner.starts_with('&')
+            || crate::front::mir::is_rustc_pointer_niche_spelling(inner)
+        {
+            return false;
+        }
+        let Some(row_ty) = self.niche_option_one_field_pointer_payload(inner) else {
+            return false;
+        };
         let layouts = self.struct_layouts.borrow();
-        crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref())
+        crate::front::mir::is_niche_option_gc_payload_spelling(
+            &format!("Option<{}>", row_ty.trim()),
+            layouts.as_ref(),
+        )
+    }
+
+    /// Stamp `registered_gc_ptr_payload_root` peels one
+    /// `#[repr(transparent)]` rustc pointer-niche field so a by-value
+    /// `Option` of that newtype is the nullable GC word. Intern
+    /// reconstructs that from the payload's declared field row.
+    /// `rclass.py` `InstanceRepr.convert_const(None)` is `null_instance`.
+    fn niche_option_one_field_pointer_payload(&self, inner: &str) -> Option<String> {
+        let key = self.intern_class_key(inner);
+        let row_ty = {
+            let guard = self.struct_fields.borrow();
+            let rows = guard.as_ref()?.fields.get(&key)?;
+            if rows.len() != 1 {
+                return None;
+            }
+            rows[0].ty.clone()
+        };
+        crate::front::mir::is_rustc_pointer_niche_spelling(&row_ty).then_some(row_ty)
     }
 
     /// Intern of a by-value payload of type `ty`.
@@ -4467,6 +4586,15 @@ impl Bookkeeper {
                         &crate::model::ValueType::Int,
                     )
                     .is_some_and(|shell| shell == attr.s_value);
+                // `ProfileFunc` / `Option<ProfileFunc>` may still FORCE as
+                // the Int-bank shell (`Ptr(FuncType)` getkind) or the
+                // untyped instance shell. Replace with the PBC projection.
+                let is_profilefunc_force_shell = self.is_profilefunc_type_spelling(&row.ty)
+                    && (is_untyped_force_shell
+                        || crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value));
                 // `tyref_to_attr_value_type` banks `&[u8]` as Int, so FORCE
                 // shells a window field as the Int-bank shell. The layout
                 // spelling is still `{data: CCHARP, len: Signed}`
@@ -4493,6 +4621,7 @@ impl Bookkeeper {
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
+                    || is_profilefunc_force_shell
                     || is_window_integer_force_shell
                     || is_raw_boxed_slice_integer_force_shell
                 {
@@ -5324,6 +5453,8 @@ impl Bookkeeper {
                         .trim();
                     if crate::front::mir::is_str_family_class_root(inner)
                         || crate::front::mir::is_str_family_class_root(pointee)
+                        || crate::front::mir::is_cow_str_family_class_root(inner)
+                        || crate::front::mir::is_cow_str_family_class_root(pointee)
                         || crate::front::mir::is_raw_ptr_to_str_family_spelling(inner)
                     {
                         super::model::s_str0()
@@ -5425,6 +5556,12 @@ impl Bookkeeper {
         // class has no common base with `PyObject`.
         if t == "IdentityKey" || t.ends_with("::IdentityKey") {
             return self.project_struct_field_type("PyObjectRef");
+        }
+        // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
+        // function family `setllprofile` stores (`description.py`
+        // `CallFamily`). Generic `fn` / `Option<fn>` stay `SomePtr`.
+        if self.is_profilefunc_type_spelling(t) {
+            return self.profilefunc_pbc_or_none();
         }
         // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
         // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
@@ -5589,7 +5726,8 @@ impl Bookkeeper {
             // (`op_gc_restore_root`) and `LLHelpers.ll_strlen` read it as
             // the string itself.
             _ if crate::front::mir::is_str_family_class_root(stripped)
-                || crate::front::mir::is_rstr_str_layout_declaration(stripped) =>
+                || crate::front::mir::is_rstr_str_layout_declaration(stripped)
+                || crate::front::mir::is_cow_str_family_class_root(stripped) =>
             {
                 return super::model::s_str0();
             }
@@ -5659,6 +5797,13 @@ impl Bookkeeper {
             return SomeValue::Impossible;
         }
         if let Some(inner) = strip_generic_leaf(stripped, "Option") {
+            // `executioncontext.py` `profilefunc`: `Option<ProfileFunc>` is
+            // a nullable PBC, not the generic `Option<fn>` `Ptr(FuncType)`.
+            if self.is_profilefunc_type_spelling(inner.trim())
+                || self.is_profilefunc_type_spelling(stripped)
+            {
+                return self.profilefunc_pbc_or_none();
+            }
             // `Option<fn>` is the nullable `Ptr(FuncType)`, not
             // `union(SomePtr, s_None)`. `s_None` is `SomeNone`
             // (`annotator/model.py` `s_None`); `pairtype(SomeObject,
@@ -5757,6 +5902,13 @@ impl Bookkeeper {
         // float.
         if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
             return self.project_struct_field_type(&format!("*mut {inner}"));
+        }
+        // `cell::UnsafeCell<T>` is the cell word (`lltype.py` `getfield`).
+        // `field_row_struct_identity` qualifies the leaf, so the
+        // prefix-only `UnsafeCell<` peel below would miss and mint
+        // `SomeInstance(cell::UnsafeCell)`.
+        if let Some(inner) = strip_generic_leaf(stripped, "UnsafeCell") {
+            return self.project_struct_field_type(inner);
         }
         for wrapper in [
             "Rc<",
@@ -9311,6 +9463,20 @@ mod tests {
     }
 
     #[test]
+    fn project_struct_field_type_qualified_unsafecell_box_slice_is_somelist() {
+        let bk = bk();
+        for spelling in [
+            "cell::UnsafeCell<Box<[CodePair]>>",
+            "UnsafeCell<Box<[CodePair]>>",
+        ] {
+            match bk.project_struct_field_type(spelling) {
+                SomeValue::List(_) => {}
+                other => panic!("{spelling} must project to SomeList, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn project_struct_field_type_qualified_utf8str_is_s_str0() {
         let bk = bk();
         assert_eq!(
@@ -9359,6 +9525,33 @@ mod tests {
             panic!("owned String is SomeString");
         };
         assert!(!owned_string.inner.can_be_none);
+        let SomeValue::String(cow_str) = bk.project_struct_field_type("borrow::Cow<str>") else {
+            panic!("borrow::Cow<str> is SomeString");
+        };
+        assert!(!cow_str.inner.can_be_none);
+        let SomeValue::String(cow_static) = bk.project_struct_field_type("Cow<'static, str>")
+        else {
+            panic!("Cow<'static, str> is SomeString");
+        };
+        assert!(!cow_static.inner.can_be_none);
+        let SomeValue::String(opt_cow) = bk.project_struct_field_type("Option<borrow::Cow<str>>")
+        else {
+            panic!("Option<borrow::Cow<str>> is nullable SomeString");
+        };
+        assert!(
+            opt_cow.inner.can_be_none,
+            "Option<Cow<str>> is SomeString(can_be_None=True)"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("borrow::Cow<[u8]>"),
+            crate::annotator::model::s_str0(),
+            "Cow<[u8]> is not rstr"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("Option<borrow::Cow<[u8]>>"),
+            crate::annotator::model::s_str0(),
+            "Option<Cow<[u8]>> is not rstr"
+        );
     }
 
     #[test]
@@ -9877,6 +10070,89 @@ mod tests {
             s_none(),
             "Option of an unregistered payload is s_None"
         );
+    }
+
+    fn bk_with_owner_rows_and_pointee_layout(
+        owner: &str,
+        rows: Vec<crate::front::semantic::FieldRow>,
+        pointee: &str,
+        gc: bool,
+    ) -> (Rc<Bookkeeper>, parking_lot::MutexGuard<'static, ()>) {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(owner.to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let (layouts, ids) = if gc {
+            crate::test_support::gc_layout_table_for(&[pointee])
+        } else {
+            crate::test_support::raw_layout_table_for(&[pointee])
+        };
+        bk.set_struct_layouts(layouts);
+        (bk, ids)
+    }
+
+    #[test]
+    fn niche_option_one_field_pointer_payload_is_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "NonNull<object::PyObject>",
+            )],
+            "object::PyObject",
+            true,
+        );
+        assert!(bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_one_field_raw_ptr_payload_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "*mut object::PyObject",
+            )],
+            "object::PyObject",
+            true,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_two_field_owner_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![
+                crate::front::semantic::FieldRow::positional(
+                    "__pos_0",
+                    "NonNull<object::PyObject>",
+                ),
+                crate::front::semantic::FieldRow::named("extra", "i64"),
+            ],
+            "object::PyObject",
+            true,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_one_field_pointer_payload_raw_layout_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "NonNull<object::PyObject>",
+            )],
+            "object::PyObject",
+            false,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
     }
 
     #[test]
@@ -18326,6 +18602,64 @@ mod tests {
             matches!(t.items[0], SomeValue::Integer(_)),
             "slots().0 is *mut usize, got {:?}",
             t.items[0]
+        );
+    }
+
+    #[test]
+    fn profilefunc_field_projects_as_nullable_pbc_not_fn_ptr() {
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let empty = bk.project_struct_field_type("Option<ProfileFunc>");
+        assert!(
+            matches!(empty, SomeValue::None_(_)),
+            "empty family seeds s_None so a later store can union in, got {empty:?}"
+        );
+
+        let host = HostObject::new_user_function(compiled_graph_func(
+            "def hook_a():\n    return None\n",
+            Vec::new(),
+        ));
+        let desc = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(host),
+            "hook_a",
+            Signature::new(Vec::<String>::new(), None, None),
+            None,
+            None,
+        )));
+        bk.set_profilefunc_family(
+            vec![DescEntry::function(desc)],
+            vec!["hook_a".into()],
+            vec!["ProfileFunc".into(), "Option<ProfileFunc>".into()],
+        );
+        let SomeValue::PBC(pbc) = bk.project_struct_field_type("Option<ProfileFunc>") else {
+            panic!(
+                "executioncontext.py profilefunc is a nullable PBC, got {:?}",
+                bk.project_struct_field_type("Option<ProfileFunc>")
+            );
+        };
+        assert!(pbc.can_be_none, "Option<ProfileFunc> is can_be_None");
+        assert_eq!(pbc.descriptions.len(), 1);
+        let SomeValue::PBC(bare) = bk.project_struct_field_type("ProfileFunc") else {
+            panic!(
+                "ProfileFunc itself is the same family, got {:?}",
+                bk.project_struct_field_type("ProfileFunc")
+            );
+        };
+        assert!(bare.can_be_none);
+        let builtin =
+            bk.project_struct_field_type("fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>");
+        assert!(
+            matches!(builtin, SomeValue::Ptr(_)),
+            "BuiltinCodeFn stays SomePtr, got {builtin:?}"
+        );
+        let generic = bk.project_struct_field_type("Option<fn()>");
+        assert!(
+            matches!(generic, SomeValue::Ptr(_)),
+            "generic Option<fn> stays SomePtr, got {generic:?}"
         );
     }
 }

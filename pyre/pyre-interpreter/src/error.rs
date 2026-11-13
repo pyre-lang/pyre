@@ -662,9 +662,14 @@ pub fn minted_exception_classes() -> &'static [MintedExceptionClass] {
 }
 
 /// One-word handle to [`PyErrorObject`]. `Clone` aliases the pointer, which is
-/// `OperationError` semantics.
+/// `OperationError` semantics. `NonNull` so `Option<PyError>` is rustc's
+/// pointer niche (`None` = null): `rclass.py` `InstanceRepr.convert_const(None)`
+/// is `null_instance`, `rnone.py` `rtype_is_None` is `ptr_iszero`.
 #[repr(transparent)]
-pub struct PyError(pub(crate) pyre_object::PyObjectRef);
+pub struct PyError(pub(crate) std::ptr::NonNull<pyre_object::PyObject>);
+// SAFETY: every constructor wraps a live, non-null handle.
+
+const _: () = assert!(std::mem::size_of::<Option<PyError>>() == std::mem::size_of::<*mut u8>());
 
 impl Clone for PyError {
     fn clone(&self) -> Self {
@@ -675,7 +680,7 @@ impl Clone for PyError {
 impl std::ops::Deref for PyError {
     type Target = PyErrorObject;
     fn deref(&self) -> &PyErrorObject {
-        unsafe { &*(self.0 as *mut PyErrorObject) }
+        unsafe { &*(self.0.as_ptr() as *mut PyErrorObject) }
     }
 }
 
@@ -771,7 +776,7 @@ fn make_pyerror(
     let message_str = message_str_from_wtf8(&message);
     err.reload(&roots, slot);
     err.set_message_ptr(message_str);
-    err.0
+    err.0.as_ptr()
 }
 
 /// The [`DisplayMessage::FromExcObject`] form.
@@ -797,6 +802,7 @@ fn make_pyerror_from_exc_object(
         w_type,
     )
     .0
+    .as_ptr()
 }
 
 fn alloc_pyerror_object(
@@ -836,7 +842,7 @@ fn alloc_pyerror_object(
         fmt_valuefmt_ptr: std::ptr::null(),
         fmt_valuefmt_len: 0,
     });
-    PyError(obj as pyre_object::PyObjectRef)
+    PyError(unsafe { std::ptr::NonNull::new_unchecked(obj as pyre_object::PyObjectRef) })
 }
 
 /// `error.py get_operrcls2.OpErrFmt.__init__` for a single operand (`%T` or
@@ -878,7 +884,7 @@ fn make_pyerror_deferred_t(
         fmt_valuefmt_ptr,
         fmt_valuefmt_len,
     });
-    PyError(obj as pyre_object::PyObjectRef)
+    PyError(unsafe { std::ptr::NonNull::new_unchecked(obj as pyre_object::PyObjectRef) })
 }
 
 /// `error.py OpErrFmtNoArgs.__init__`: `self._value = value;
@@ -912,7 +918,7 @@ fn make_pyerror_noargs(
         fmt_valuefmt_ptr: std::ptr::null(),
         fmt_valuefmt_len: 0,
     });
-    PyError(obj as pyre_object::PyObjectRef)
+    PyError(unsafe { std::ptr::NonNull::new_unchecked(obj as pyre_object::PyObjectRef) })
 }
 
 impl PyError {
@@ -932,11 +938,11 @@ impl PyError {
     }
 
     fn write_barrier(&self) {
-        pyre_object::gc_hook::try_gc_write_barrier(self.0 as pyre_object::gc_hook::GCREF);
+        pyre_object::gc_hook::try_gc_write_barrier(self.0.as_ptr() as pyre_object::gc_hook::GCREF);
     }
 
     fn raw(&self) -> *mut PyErrorObject {
-        self.0 as *mut PyErrorObject
+        self.0.as_ptr() as *mut PyErrorObject
     }
 
     pub fn set_kind(&mut self, kind: PyErrorKind) {
@@ -1005,7 +1011,7 @@ impl PyError {
 
     /// Rebuild a handle from a `pin_root` word.
     pub(crate) fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
-        PyError(raw)
+        PyError(unsafe { std::ptr::NonNull::new_unchecked(raw) })
     }
 
     /// Pin this handle on `roots` and return that slot.
@@ -1017,7 +1023,7 @@ impl PyError {
     #[inline(always)]
     pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> usize {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        self.0 = roots.pin_root(self.0);
+        self.0 = unsafe { std::ptr::NonNull::new_unchecked(roots.pin_root(self.0.as_ptr())) };
         slot
     }
 
@@ -1025,7 +1031,7 @@ impl PyError {
     /// before a nested bracket is filled with `RootScope::set` and this
     /// word so that bracket's `pop_roots` cannot discard it.
     pub fn as_gc_ref(&self) -> pyre_object::PyObjectRef {
-        self.0
+        self.0.as_ptr()
     }
 
     /// Write the forwarded handle out of `slot`.
@@ -1034,7 +1040,7 @@ impl PyError {
     /// after the call is the slot, not the word from before the call.
     #[inline(always)]
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
-        self.0 = roots.get(slot);
+        self.0 = unsafe { std::ptr::NonNull::new_unchecked(roots.get(slot)) };
     }
 
     /// `error.py OperationError.w_type`, resolving from [`kind`] when the
@@ -1103,7 +1109,12 @@ fn traceback_frame_names_module(co_filename: &str, module_names: &[&str]) -> boo
 /// `err` must be a live `PyErrorObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyObject {
-    unsafe { PyError(err as *mut PyErrorObject as PyObjectRef).to_exc_object() }
+    unsafe {
+        PyError(std::ptr::NonNull::new_unchecked(
+            err as *mut PyErrorObject as PyObjectRef,
+        ))
+        .to_exc_object()
+    }
 }
 
 /// [`PyError::from_exc_object`] behind the residual-call ABI:
@@ -1130,15 +1141,17 @@ pub unsafe fn pyerror_from_exc_object(obj: *mut pyre_object::PyObject) -> *mut P
         // raise propagation, and stringifying the args eagerly would
         // execute their `__str__` at raise time instead of at
         // display time.
-        PyError(make_pyerror_from_exc_object(
-            PyError::kind_from_exc(kind),
-            obj,
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            crate::baseobjspace::exception_getclass(obj),
+        PyError(std::ptr::NonNull::new_unchecked(
+            make_pyerror_from_exc_object(
+                PyError::kind_from_exc(kind),
+                obj,
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::baseobjspace::exception_getclass(obj),
+            ),
         ))
         .raw()
     }
@@ -1245,11 +1258,14 @@ impl PyError {
     /// `walk_raw_exception_roots` stays: those offsets do not cover the
     /// off-GC `malloc_typed` children of the W exception.
     pub fn walk_gc_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        if self.0.is_null() {
-            return;
-        }
+        // SAFETY: `NonNull<T>` is `repr(transparent)` over `*mut T`, so
+        // `&mut self.0` is the handle word. The visitor may rewrite it in
+        // place when the collector moves the object.
         unsafe {
-            visitor(&mut *(&mut self.0 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef));
+            visitor(
+                &mut *(&mut self.0 as *mut std::ptr::NonNull<pyre_object::PyObject>
+                    as *mut majit_ir::GcRef),
+            );
         }
         // `exc_object` is read through the handle the visitor just forwarded.
         let exc = self.exc_object;
@@ -1363,17 +1379,19 @@ pub enum PyErrorKind {
 impl PyError {
     pub fn new(kind: PyErrorKind, message: impl Into<Wtf8Buf>) -> Self {
         let text = message.into();
-        PyError(make_pyerror(
-            kind,
-            &text,
-            std::ptr::null_mut(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror(
+                kind,
+                &text,
+                std::ptr::null_mut(),
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// `error.py OperationError(w_type, w_value)`.
@@ -1416,16 +1434,18 @@ impl PyError {
         } else {
             pyre_object::gc_roots::shadow_stack_get(value_slot)
         };
-        PyError(make_pyerror_from_exc_object(
-            kind,
-            w_value,
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            w_type,
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror_from_exc_object(
+                kind,
+                w_value,
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                w_type,
+            ))
+        })
     }
 
     /// Bool view of [`Self::display_message`]. The `Wtf8Buf` match stays
@@ -1606,7 +1626,7 @@ impl PyError {
             return true;
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let handle = pyre_object::gc_roots::pin_root(self.0.as_ptr());
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
         if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             return false;
@@ -1619,7 +1639,7 @@ impl PyError {
             return true;
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let handle = pyre_object::gc_roots::pin_root(self.0.as_ptr());
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
         if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             return false;
@@ -1632,7 +1652,7 @@ impl PyError {
     pub fn matches_stop_iteration_keep(self) -> (bool, Self) {
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let handle = pyre_object::gc_roots::pin_root(self.0.as_ptr());
         let tagged =
             unsafe { (*(handle as *mut PyErrorObject)).kind } == PyErrorKind::StopIteration;
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
@@ -1643,7 +1663,12 @@ impl PyError {
         } else {
             exception_object_matches_stop_iteration(exc)
         };
-        (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
+        (
+            stop,
+            PyError(unsafe {
+                std::ptr::NonNull::new_unchecked(pyre_object::gc_roots::shadow_stack_get(slot))
+            }),
+        )
     }
 
     /// Same answer as [`matches_stop_async_iteration`], plus the handle
@@ -1653,7 +1678,7 @@ impl PyError {
     pub fn matches_stop_async_iteration_keep(self) -> (bool, Self) {
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let handle = pyre_object::gc_roots::pin_root(self.0.as_ptr());
         let tagged =
             unsafe { (*(handle as *mut PyErrorObject)).kind } == PyErrorKind::StopAsyncIteration;
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
@@ -1664,7 +1689,12 @@ impl PyError {
         } else {
             exception_object_matches_stop_async_iteration(exc)
         };
-        (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
+        (
+            stop,
+            PyError(unsafe {
+                std::ptr::NonNull::new_unchecked(pyre_object::gc_roots::shadow_stack_get(slot))
+            }),
+        )
     }
 
     pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {
@@ -1925,16 +1955,18 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it from
         // `exc_object` via the SyntaxError `descr_str`, which appends the
         // `(filename, line N)` suffix.
-        PyError(make_pyerror_from_exc_object(
-            PyErrorKind::SyntaxError,
-            exc,
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror_from_exc_object(
+                PyErrorKind::SyntaxError,
+                exc,
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// Replace the filename in a located `SyntaxError` with an already-built
@@ -2377,16 +2409,18 @@ impl PyError {
         // `exc_object` via `W_OSError.descr_str`, which appends the
         // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
         // it and the uncaught-traceback header would drop the filename.
-        PyError(make_pyerror_from_exc_object(
-            kind,
-            exc(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror_from_exc_object(
+                kind,
+                exc(),
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// Raise the structured OSError for `errno` (no filename). The caller's
@@ -2427,16 +2461,18 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it
         // from `exc_object`, whose `descr_str` renders the two-element
         // `args` as a tuple repr rather than as a bare string.
-        PyError(make_pyerror_from_exc_object(
-            kind,
-            exc(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror_from_exc_object(
+                kind,
+                exc(),
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
@@ -2496,17 +2532,19 @@ impl PyError {
             pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
         }
         let text = message;
-        PyError(make_pyerror(
-            kind,
-            &text,
-            exc(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror(
+                kind,
+                &text,
+                exc(),
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// `error.py:new_import_error` — `ImportError(msg, name=name, path=path)`.
@@ -2572,17 +2610,19 @@ impl PyError {
             pyre_object::interp_exceptions::w_exception_set_import_name_from(exc(), w_name_from);
         }
         let text = message;
-        PyError(make_pyerror(
-            PyErrorKind::ImportError,
-            &text,
-            exc(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror(
+                PyErrorKind::ImportError,
+                &text,
+                exc(),
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     /// pypy/module/_weakref/interp__weakref.py — raised by `force()`
@@ -3720,7 +3760,11 @@ impl PyError {
     /// # Safety
     /// `obj` must point to a valid `W_BaseException`.
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
-        unsafe { PyError(pyerror_from_exc_object(obj) as PyObjectRef) }
+        unsafe {
+            PyError(std::ptr::NonNull::new_unchecked(
+                pyerror_from_exc_object(obj) as PyObjectRef,
+            ))
+        }
     }
 }
 
@@ -6085,17 +6129,19 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_type);
     let text = message;
-    PyError(make_pyerror(
-        kind,
-        &text,
-        std::ptr::null_mut(),
-        true,
-        false,
-        -1,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        _roots.get(type_slot),
-    ))
+    PyError(unsafe {
+        std::ptr::NonNull::new_unchecked(make_pyerror(
+            kind,
+            &text,
+            std::ptr::null_mut(),
+            true,
+            false,
+            -1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            _roots.get(type_slot),
+        ))
+    })
 }
 
 /// pypy/interpreter/error.py `oefmt`.

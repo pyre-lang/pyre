@@ -197,6 +197,13 @@ pub enum OpKind {
     /// `Unsigned`, `Float`, or `GCREF`). An optional argument 1 is the
     /// capacity hint; arguments 1 and 2 are the fill count and value.
     NewRustVec,
+    /// Construction of a Rust `Vec<T>` of length N — `ll_vec_newlist_*`
+    /// (`VecOp::NewFixed`), the way `newlist` of N items stands for
+    /// `rlist.py` `rtype_newlist` / `ll_newlist(N)`. Argument 0 is the
+    /// constant item lowleveltype; argument 1 is the length. Distinct from
+    /// [`NewRustVec`] so a round-trip through `opname()` cannot collapse
+    /// `len=N` into the hint constructor (`len=0`).
+    NewRustVecFixed,
     /// `ll_copy` (`rlist.py`) of a one-word slice into a raw `Vec`.
     /// Argument 0 is the constant item lowleveltype. Argument 1 is
     /// `self`. A `FixedSizeListRepr` self is
@@ -375,6 +382,7 @@ impl OpKind {
             "newlist_hint" => OpKind::NewListHint,
             "newstringbuilder" => OpKind::NewStringBuilder,
             "newrustvec" => OpKind::NewRustVec,
+            "newrustvec_fixed" => OpKind::NewRustVecFixed,
             "ll_vec_copy_from_slice" => OpKind::LlVecCopyFromSlice,
             "pow" => OpKind::Pow,
             "iter" => OpKind::Iter,
@@ -485,6 +493,7 @@ impl OpKind {
             OpKind::NewListHint => "newlist_hint",
             OpKind::NewStringBuilder => "newstringbuilder",
             OpKind::NewRustVec => "newrustvec",
+            OpKind::NewRustVecFixed => "newrustvec_fixed",
             OpKind::LlVecCopyFromSlice => "ll_vec_copy_from_slice",
             OpKind::Pow => "pow",
             OpKind::Iter => "iter",
@@ -606,6 +615,7 @@ impl OpKind {
             | OpKind::NewList
             | OpKind::NewStringBuilder
             | OpKind::NewRustVec
+            | OpKind::NewRustVecFixed
             | OpKind::LlVecCopyFromSlice
             | OpKind::SimpleCall
             | OpKind::CallArgs
@@ -744,6 +754,7 @@ impl OpKind {
             | OpKind::NewListHint
             | OpKind::NewStringBuilder
             | OpKind::NewRustVec
+            | OpKind::NewRustVecFixed
             | OpKind::LlVecCopyFromSlice
             | OpKind::Iter
             | OpKind::Next
@@ -881,6 +892,7 @@ impl OpKind {
             | OpKind::NewListHint
             | OpKind::NewStringBuilder
             | OpKind::NewRustVec
+            | OpKind::NewRustVecFixed
             | OpKind::LlVecCopyFromSlice
             | OpKind::Pow => Dispatch::None,
         }
@@ -2990,7 +3002,7 @@ impl HLOperation {
                     // `SomeInteger()`. Float and reference items stay
                     // `SomeRustVec::for_kind`. The result concretetype is
                     // not an annotation input.
-                    OpKind::NewRustVec | OpKind::LlVecCopyFromSlice => {
+                    OpKind::NewRustVec | OpKind::NewRustVecFixed | OpKind::LlVecCopyFromSlice => {
                         let bad_item = || {
                             AnnotatorError::new(format!(
                                 "{}: argument 0 must be a constant item lowleveltype",
@@ -5287,6 +5299,8 @@ mod tests {
             OpKind::NewTuple,
             OpKind::Pow,
             OpKind::GetAttr,
+            OpKind::NewRustVec,
+            OpKind::NewRustVecFixed,
         ] {
             let name = kind.opname();
             assert_eq!(

@@ -4444,28 +4444,8 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().ends_with("::from_utf8_lossy") && self.tyref_is_cow_str(dest_ty)
-    }
-
-    /// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
-    /// (`Cow<str>` / `Cow<&str>`).
-    ///
-    /// `Deref` takes `&self`, so the receiver is `&Cow<str>`.
-    /// [`Self::tyref_adt_type_arg`] reads the Adt node and does not peel
-    /// `Ref`; [`adt_path_of_tyref`] already does, which is why the path
-    /// check would pass and the payload check would not.
-    pub(in crate::front::mir) fn tyref_is_cow_str(&self, ty: &TyRef) -> bool {
-        let Some(path) = adt_path_of_tyref(ty, self.llbc) else {
-            return false;
-        };
-        if !path.ends_with("::Cow") {
-            return false;
-        }
-        let peeled = self.tyref_peel_ref_to_pointee(ty);
-        let adt_ty = peeled.as_ref().unwrap_or(ty);
-        self.tyref_adt_type_arg(adt_ty, 0).is_some_and(|payload| {
-            tyref_is_string_family(&payload, self.llbc) || tyref_strips_to_str(&payload, self.llbc)
-        })
+        fd.item_meta.name_path().ends_with("::from_utf8_lossy")
+            && tyref_is_cow_str(dest_ty, self.llbc)
     }
 
     pub(in crate::front::mir) fn fun_decl_id_path_ends_with(&self, suffix: &[&str]) -> Option<u64> {
@@ -6099,6 +6079,9 @@ impl<'a> Lowering<'a> {
         // [`tyref_to_value_type_with`] gives. A ref null copied into that
         // inputarg is the `Move` from Ref to Int.
         let value_ty = self.value_type_of(dest_ty);
+        if tyref_is_profilefunc_family(dest_ty, self.llbc) {
+            return Some(self.graph.push_const_none(bb_id));
+        }
         if matches!(value_ty, ValueType::Int)
             && (type_node_is_fn_ptr(node, self.llbc)
                 || tyref_option_payload_is_fn_ptr(dest_ty, self.llbc))
@@ -8730,6 +8713,8 @@ impl<'a> Lowering<'a> {
     ///   represents `None` as null and `Some(p)` as the pointer, so the
     ///   constructed value *is* `p`.  Gated on the destination being that
     ///   niche `Option<NonNull>` (`tyref_is_niche_option_ptr`).
+    /// - `NonNull::new_unchecked(p) -> NonNull<T>` — the same word as `p`.
+    ///   RPython has no `NonNull`; this is `same_as` / `cast_pointer`.
     /// - `NonNull::as_ptr(self) -> *mut T` — reads the pointer back out, which
     ///   is the receiver itself.
     ///
@@ -8750,7 +8735,9 @@ impl<'a> Lowering<'a> {
         {
             return Some(arg.clone());
         }
-        if fmt_path_ends_with(segments, &["non_null", "NonNull", "as_ptr"]) {
+        if fmt_path_ends_with(segments, &["non_null", "NonNull", "new_unchecked"])
+            || fmt_path_ends_with(segments, &["non_null", "NonNull", "as_ptr"])
+        {
             return Some(arg.clone());
         }
         None

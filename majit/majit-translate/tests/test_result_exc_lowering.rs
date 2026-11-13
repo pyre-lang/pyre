@@ -1206,8 +1206,11 @@ fn a_dont_look_inside_by_value_adt_return_declares_its_class() {
         .expect("take_call_error lowers");
     assert_eq!(
         graph.return_class_root.as_deref(),
-        Some("core::option::Option<PyError>"),
-        "the stub result is SomeInstance of the declared Option<PyError>"
+        Some("Option<PyError>"),
+        "Option<PyError> is rustc's pointer niche (`PyError` wraps NonNull); \
+         dont_look_inside seeds the nullable payload stamp, not the tagged \
+         Option enum class. rclass.py InstanceRepr.convert_const(None) is \
+         null_instance."
     );
 }
 

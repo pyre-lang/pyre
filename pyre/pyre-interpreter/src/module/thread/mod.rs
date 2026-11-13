@@ -214,11 +214,13 @@ impl Drop for RuntimeThread {
 /// Upstream reaches every RPython thread through `rpython_startup_code` or
 /// rffi's callback path, both of which acquire before the first RPython
 /// instruction (entrypoint.c:49,78). pyre is entered from Rust at several
-/// points instead — the launcher, a spawned Python thread, and the unit tests
-/// that drive the interpreter directly — so the acquire is idempotent per
-/// thread and each entry point names it. The registration is given back by
-/// `RUNTIME_THREAD`'s destructor when the thread exits, which is what lets a
-/// second thread run pyre code afterwards.
+/// points instead — `init_gc_subsystem` (launcher/wasm), the `_thread`
+/// bootstrap, rffi WrapFor callbacks (`rgil.acquire_maybe_in_new_thread`),
+/// cpyext `PyGILState_Ensure`, and the compile / `install_hash_hook` test
+/// doors — so the acquire is idempotent per thread and each entry point
+/// names it. The registration is given back by `RUNTIME_THREAD`'s destructor
+/// when the thread exits, which is what lets a second thread run pyre code
+/// afterwards.
 ///
 /// `dont_look_inside`: the body reads `thread_local!` `RUNTIME_THREAD_ENTERED`
 /// (`LocalKey::with`). Charon extracts that static as a `PlaceKind::Global`

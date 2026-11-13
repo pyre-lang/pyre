@@ -369,6 +369,16 @@ impl<'a> Lowering<'a> {
         &self,
         option_ty: &TyRef,
     ) -> Option<String> {
+        // An int-bank niche (`Option<&RawEnum>`, `Option<&RawStruct>`,
+        // `Option<fn>`) is Address / SomePtr (`ty_is_raw_address` /
+        // `tyref_niche_option_payload_paint`). `rclass.py`
+        // `InstanceRepr.convert_const(None)` is `null_instance` of a GC
+        // class; `rnone.py` `rtype_is_None` is `ptr_iszero` of that
+        // pointer. Promoting the Address to Instance is the
+        // `Ptr ∪ Instance` union (`project_struct_rows`).
+        if self.option_niche_is_int_bank(option_ty) {
+            return None;
+        }
         let payload = strip_ty_indirections(
             type_decl_ref_generics(
                 tyref_node(option_ty, self.llbc)?
@@ -614,6 +624,14 @@ impl<'a> Lowering<'a> {
         &self,
         place_ty: &TyRef,
     ) -> bool {
+        // Tagged `Option<Option<&Raw>>::__pos_0` is the inner int-bank
+        // niche word. Recasting it through `W_ROOT` is
+        // `Int ∪ Ref(PyObject)` at the flatten return (`rnone.py`
+        // `rtype_is_None` / `rclass.py` `convert_const(None)`: one None
+        // per pointer, the outer tag cannot reuse it).
+        if self.option_niche_is_int_bank(place_ty) {
+            return false;
+        }
         if self
             .option_niche_null_cast(place_ty)
             .is_some_and(|(root, ty)| {
@@ -1971,6 +1989,12 @@ impl<'a> Lowering<'a> {
         option_ty: &TyRef,
     ) -> Option<crate::model::NicheIntNull> {
         if self.option_niche_is_int_bank(option_ty) {
+            // `executioncontext.py` `profilefunc`: `None` is `s_None`, not
+            // `lltype.nullptr(FuncType)`. A null_fn `SomePtr` cannot union
+            // with the field's `SomePBC`.
+            if tyref_is_profilefunc_family(option_ty, self.llbc) {
+                return None;
+            }
             if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
                 || tyref_node(option_ty, self.llbc)
                     .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
@@ -2277,9 +2301,10 @@ impl<'a> Lowering<'a> {
     /// multi-word item becomes a nullable `SomeList`, a shared
     /// `Option<&[PyObjectRef]>` is the same nullable GcArray list
     /// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`), and
-    /// `Option<&str>` / `Option<String>` (and the other string-family
-    /// payloads [`node_is_string_value`] already projects) become a
-    /// nullable `SomeString`.
+    /// `Option<&str>` / `Option<Cow<str-family>>` (and the other
+    /// string-family payloads [`node_is_string_value`] /
+    /// [`tyref_is_cow_str`] already project) become a nullable
+    /// `SomeString`. A rust-heap `Option<String>` paints `Ref`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -2406,7 +2431,8 @@ impl<'a> Lowering<'a> {
     /// `true` when `option_ty` is a niche nullable `Option<P>` whose
     /// paint is `ValueType::Str` ([`tyref_is_option_of_string_value`]):
     /// builtin `str`, `Utf8Str` / `BytesBlock`, shared `&str` /
-    /// `&Wtf8` / `&Wtf8Buf`, or by-value `Wtf8Buf` / `Utf8Str`.
+    /// `&Wtf8` / `&Wtf8Buf`, by-value `Wtf8Buf` / `Utf8Str`, or
+    /// `Cow<str-family>`.
     /// `Option<&[u8]>` is the two-word `tyref_is_u8_window`, not a niche,
     /// so it stays out. Under the niche model `None` is the null string
     /// and `Some(c)` is the string `c` itself, so derived equality is
@@ -2444,8 +2470,8 @@ impl<'a> Lowering<'a> {
     ///   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
     ///   → `ptr_eq` / `ptr_ne`; `rptr.py` `PtrRepr.rtype_eq`.
     /// * String-value paint (`tyref_is_option_of_string_value`:
-    ///   `Option<&str>` / `Option<Wtf8Buf>` and
-    ///   the other `Str` Options) — `rstr.py`
+    ///   `Option<&str>` / `Option<Wtf8Buf>` / `Option<Cow<str>>`
+    ///   and the other `Str` Options) — `rstr.py`
     ///   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
     ///   `ll_streq`, which already treats a null operand
     ///   (`if not s1 or not s2: return s1 == s2`).
@@ -3329,6 +3355,11 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|payload| tyref_is_raw_c_void_ptr(&payload, self.llbc))
         {
             return emit_voidp_nullptr(&mut self.graph, bb_id);
+        }
+        // `executioncontext.py` `profilefunc`: `None` is `Constant(None)`
+        // (`s_None`), not `null_fn` / `null_mut`.
+        if tyref_is_profilefunc_family(option_ty, self.llbc) {
+            return self.graph.push_const_none(bb_id);
         }
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own

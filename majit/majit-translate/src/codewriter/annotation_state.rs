@@ -200,7 +200,10 @@ fn ref_fallback_instance() -> SomeValue {
 /// `rlib/rstring.py` `assert_str0`.
 fn str_family_ref_shell(payload: Option<&str>) -> Option<SomeValue> {
     payload
-        .filter(|root| crate::front::mir::is_str_family_class_root(root))
+        .filter(|root| {
+            crate::front::mir::is_str_family_class_root(root)
+                || crate::front::mir::is_cow_str_family_class_root(root)
+        })
         .map(|_| s_str())
 }
 

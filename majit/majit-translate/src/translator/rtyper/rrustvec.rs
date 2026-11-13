@@ -600,6 +600,35 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
     }
 }
 
+/// `newrustvec_fixed(ITEM, n)` — `rlist.py` `rtype_newlist` / `ll_newlist(N)`.
+/// Length and capacity are both N. Distinct from [`rtype_newrustvec`]'s
+/// 2-arg `newrustvec(ITEM, hint)` path (`ll_newlist_hint`, len=0).
+pub fn rtype_newrustvec_fixed(hop: &HighLevelOp) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newrustvec_fixed: r_result missing"))?;
+    if r_result.repr_class_id() != super::pairtype::ReprClassId::RustVecRepr {
+        return Err(TyperError::message(
+            "rtype_newrustvec_fixed: hop.r_result is not a RustVecRepr",
+        ));
+    }
+    let lltype = r_result.lowleveltype().clone();
+    let kind = rust_vec_item_kind(&lltype).ok_or_else(|| {
+        TyperError::message("rtype_newrustvec_fixed: result is not a RustVec header")
+    })?;
+    hop.exception_cannot_occur()?;
+    let v_len = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 1)?;
+    genop_helper_call(
+        hop,
+        vec_helper_path(VecOp::NewFixed, kind),
+        vec![v_len],
+        vec![LowLevelType::Signed],
+        lltype,
+    )
+}
+
 /// `ll_vec_copy_from_slice(ITEM, self)` — `ll_copy` (`rlist.py`) into a
 /// raw `Vec`. `ll_copy` has no oopspec and is inlined by the JIT.
 ///
@@ -884,7 +913,8 @@ mod tests {
 
     /// `newrustvec(ITEM)` and `newrustvec(ITEM, hint)` go through the
     /// rtyper's `translate_operation` to `ll_vec_newemptylist_*` /
-    /// `ll_vec_newlist_hint_*`.
+    /// `ll_vec_newlist_hint_*`. `newrustvec_fixed(ITEM, n)` is
+    /// `ll_vec_newlist_*` (len=N, cap=N), not the hint helper.
     #[test]
     fn translate_operation_newrustvec_calls_the_ctor_helpers() {
         use crate::flowspace::model::{SpaceOperation, Variable};
@@ -892,7 +922,11 @@ mod tests {
         let (_ann, rtyper) = setup_rtyper();
         for kind in VecItemKind::ALL {
             let r = rust_vec_repr(&rtyper, kind);
-            for with_hint in [false, true] {
+            for (opname, op) in [
+                ("newrustvec", VecOp::NewEmpty),
+                ("newrustvec", VecOp::NewHint),
+                ("newrustvec_fixed", VecOp::NewFixed),
+            ] {
                 let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
                     rtyper.clone(),
                     None,
@@ -906,7 +940,7 @@ mod tests {
                     ConstValue::LowLevelType(Box::new(item)),
                 ));
                 let mut args = vec![item_const];
-                if with_hint {
+                if op != VecOp::NewEmpty {
                     args.push(crate::translator::rtyper::rtyper::constant_with_lltype(
                         ConstValue::Int(8),
                         LowLevelType::Signed,
@@ -914,11 +948,7 @@ mod tests {
                 }
                 let hop = HighLevelOp::new(
                     rtyper.clone(),
-                    SpaceOperation::new(
-                        "newrustvec".to_string(),
-                        args,
-                        Hlvalue::Variable(v_result),
-                    ),
+                    SpaceOperation::new(opname.to_string(), args, Hlvalue::Variable(v_result)),
                     Vec::new(),
                     llops.clone(),
                 );
@@ -926,15 +956,77 @@ mod tests {
                 *hop.r_result.borrow_mut() = Some(r.clone());
                 rtyper
                     .translate_operation(&hop)
-                    .unwrap_or_else(|err| panic!("translate_operation newrustvec: {err:?}"));
-                let op = if with_hint {
-                    VecOp::NewHint
-                } else {
-                    VecOp::NewEmpty
-                };
+                    .unwrap_or_else(|err| panic!("translate_operation {opname}: {err:?}"));
                 assert_only_direct_call_to(&llops, vec_helper_path(op, kind));
             }
         }
+    }
+
+    /// A `newrustvec_fixed` SpaceOperation rebuilt as `HLOperation` still
+    /// has opname `newrustvec_fixed` after `into_space_operation`, and
+    /// rtypes to `ll_vec_newlist_*` (`VecOp::NewFixed`), not
+    /// `ll_vec_newlist_hint_*`.
+    #[test]
+    fn newrustvec_fixed_survives_hlop_round_trip_and_rtypes_newlist() {
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let (_ann, rtyper) = setup_rtyper();
+        let item_kind = VecItemKind::Int;
+        let r = rust_vec_repr(&rtyper, item_kind);
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(r.lowleveltype().clone()));
+        let item = rust_vec_item_lltype(r.lowleveltype())
+            .expect("header item lltype")
+            .clone();
+        let item_const = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            ConstValue::LowLevelType(Box::new(item)),
+        ));
+        let v_len = crate::translator::rtyper::rtyper::constant_with_lltype(
+            ConstValue::Int(8),
+            LowLevelType::Signed,
+        );
+        let spaceop = SpaceOperation::new(
+            "newrustvec_fixed".to_string(),
+            vec![item_const, v_len],
+            Hlvalue::Variable(v_result),
+        );
+        let kind =
+            OpKind::from_opname(&spaceop.opname).expect("newrustvec_fixed is a registered op");
+        assert_eq!(kind, OpKind::NewRustVecFixed);
+        let result = match &spaceop.result {
+            Hlvalue::Variable(v) => v.clone(),
+            other => panic!("result must be Variable, got {other:?}"),
+        };
+        let hl = HLOperation {
+            kind,
+            args: spaceop.args.clone(),
+            result,
+            offset: spaceop.offset,
+        };
+        let spaceop = hl.into_space_operation();
+        assert_eq!(spaceop.opname, "newrustvec_fixed");
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops.clone());
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        *hop.r_result.borrow_mut() = Some(r);
+        rtyper
+            .translate_operation(&hop)
+            .unwrap_or_else(|err| panic!("translate_operation newrustvec_fixed: {err:?}"));
+        let path = vec_helper_path(VecOp::NewFixed, item_kind);
+        assert_only_direct_call_to(&llops, path);
+        let hint = vec_helper_path(VecOp::NewHint, item_kind);
+        let ops = llops.borrow();
+        let dbg = format!("{:?}", ops.ops[0].args[0]);
+        assert!(
+            !dbg.contains(&format!("\"{hint}\"")),
+            "rtyping newrustvec_fixed must not call {hint}, got {dbg}"
+        );
     }
 
     /// `newrustvec(ITEM, count, item)` converts the fill value through the

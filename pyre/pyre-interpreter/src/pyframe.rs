@@ -5490,11 +5490,9 @@ impl PyFrame {
     /// PyPy-compatible execution entrypoint with optional inbound values.
     #[inline]
     pub fn execute_frame(&mut self, w_arg_or_err: Option<PyObjectRef>) -> crate::PyResult {
-        // A frame can be executed by a thread that has not run pyre code
-        // before — the launcher's interpreter thread, and the Rust tests that
-        // drive a frame directly — so this is one of the entry points that
-        // takes the GIL (rgil.py:186-193).
-        crate::module::thread::ensure_runtime_thread();
+        // `pyframe.py execute_frame` takes no GIL: a thread acquires once at
+        // its entry (`init_gc_subsystem`, the `_thread` bootstrap, or the
+        // rffi callback wrapper's `rgil.acquire_maybe_in_new_thread`).
         // pyframe.py `execute_frame.insert_stack_check_here = True`.
         // RPython's transform inserts the check at this graph entry, so
         // builtin/object-space calls remain usable while an existing frame is

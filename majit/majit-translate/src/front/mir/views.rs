@@ -6833,6 +6833,259 @@ pub(in crate::front::mir) fn rust_vec_helper_segments(
         .collect()
 }
 
+/// `alloc::boxed::box_assume_init_into_vec_unsafe`, the `vec![e0, …]` tail.
+pub(in crate::front::mir) fn is_box_assume_init_into_vec_unsafe_path(segments: &[String]) -> bool {
+    segments.last().map(String::as_str) == Some("box_assume_init_into_vec_unsafe")
+        && segments.iter().any(|s| s == "boxed")
+}
+
+/// MIR `alloc::boxed::Box::new_uninit` / `alloc::boxed::<Impl>::new_uninit`.
+pub(in crate::front::mir) fn is_mir_box_new_uninit_segments(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [.., b, c, d] if b == "boxed" && (c == "Box" || c == "<Impl>") && d == "new_uninit"
+    )
+}
+
+/// Place of the `vec!` array store: `(*box).Field(null, 1).Field(null, 0)`
+/// (`MaybeUninit.value` → `ManuallyDrop.0`).
+pub(in crate::front::mir) fn vec_literal_uninit_array_place(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(manually_drop, field0) = &place.kind else {
+        return None;
+    };
+    let (None, 0) = indexed_field_parts(field0.field_payload()?)? else {
+        return None;
+    };
+    let PlaceKind::Projection(maybe_uninit, field1) = &manually_drop.kind else {
+        return None;
+    };
+    let (None, 1) = indexed_field_parts(field1.field_payload()?)? else {
+        return None;
+    };
+    let PlaceKind::Projection(boxed, ProjectionElem::Atom(atom)) = &maybe_uninit.kind else {
+        return None;
+    };
+    if atom != "Deref" {
+        return None;
+    }
+    match boxed.kind {
+        PlaceKind::Local(i) => Some(i as usize),
+        _ => None,
+    }
+}
+
+fn array_aggregate_operands(rvalue: &Rvalue) -> Option<&[Operand]> {
+    let Rvalue::Aggregate(kind, operands) = rvalue else {
+        return None;
+    };
+    if kind.get("Array").is_none() || operands.is_empty() {
+        return None;
+    }
+    Some(operands.as_slice())
+}
+
+/// Whole-local copy component of `start` (undirected).
+fn vec_literal_box_aliases(llbc: &Llbc, body: &Unstructured, start: usize) -> Vec<usize> {
+    let forward = forward_reachable_mask(llbc, body);
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dst) = place.kind else {
+                continue;
+            };
+            let Some(src) = whole_local_copy_source(rvalue) else {
+                continue;
+            };
+            edges.push((dst as usize, src));
+        }
+    }
+    let mut alias = vec![start];
+    let mut i = 0;
+    while i < alias.len() {
+        let cur = alias[i];
+        for &(a, b) in &edges {
+            let other = if a == cur {
+                b
+            } else if b == cur {
+                a
+            } else {
+                continue;
+            };
+            if !alias.contains(&other) {
+                alias.push(other);
+            }
+        }
+        i += 1;
+    }
+    alias
+}
+
+fn call_path_segments(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+    Some(
+        regular_call_name_path(reg, llbc)?
+            .split("::")
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// `vec![e0, …, eN-1]` cluster: Array operands and the item kind of the
+/// `box_assume_init_into_vec_unsafe` destination `Vec`.
+pub(in crate::front::mir) struct VecLiteralCluster<'a> {
+    pub operands: &'a [Operand],
+    pub item_kind: majit_ir::rvec::VecItemKind,
+}
+
+/// `vec![e0, …, eN-1]`: `new_uninit<[T; N]>` whose only uses are the Array
+/// store into `(*box).Field(_,1).Field(_,0)` and the move into
+/// `box_assume_init_into_vec_unsafe`. `rlist.py` `rtype_newlist` /
+/// `ll_newlist` + `ll_setitem_fast`; the 2026-09-27 raw-repr decision.
+pub(in crate::front::mir) fn vec_literal_cluster<'a>(
+    llbc: &Llbc,
+    body: &'a Unstructured,
+    into_vec_arg: usize,
+) -> Option<VecLiteralCluster<'a>> {
+    let alias = vec_literal_box_aliases(llbc, body, into_vec_arg);
+    let forward = forward_reachable_mask(llbc, body);
+    let mut saw_new_uninit = false;
+    let mut array_ops: Option<&[Operand]> = None;
+    let mut into_vec_dest: Option<&TyRef> = None;
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(kind) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            match kind {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::Borrowck(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Unknown => {}
+                StmtKind::Assert(assert) => {
+                    if operand_mentions_alias(&assert.cond, &alias) {
+                        return None;
+                    }
+                }
+                StmtKind::Assign(place, rvalue) => {
+                    if rvalue_is_alias_copy(rvalue, &alias)
+                        && matches!(place.kind, PlaceKind::Local(_))
+                    {
+                        continue;
+                    }
+                    if let Some(box_local) = vec_literal_uninit_array_place(place)
+                        && alias.contains(&box_local)
+                    {
+                        let Some(ops) = array_aggregate_operands(rvalue) else {
+                            return None;
+                        };
+                        if array_ops.is_some() {
+                            return None;
+                        }
+                        array_ops = Some(ops);
+                        continue;
+                    }
+                    if rvalue_mentions_alias(rvalue, &alias)
+                        || (place_root_in_alias(place, &alias)
+                            && !matches!(place.kind, PlaceKind::Local(_)))
+                    {
+                        return None;
+                    }
+                    if matches!(place.kind, PlaceKind::Local(dst) if alias.contains(&(dst as usize)))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        let Ok(term) = bb.term_ref(llbc) else {
+            continue;
+        };
+        match term {
+            TermKind::Call { call, .. } => {
+                if let PlaceKind::Local(dst) = call.dest.kind
+                    && alias.contains(&(dst as usize))
+                    && call.args.is_empty()
+                    && let CallFunc::Regular(reg) = &call.func
+                    && let Some(segs) = call_path_segments(reg, llbc)
+                    && is_mir_box_new_uninit_segments(&segs)
+                {
+                    if saw_new_uninit {
+                        return None;
+                    }
+                    saw_new_uninit = true;
+                    continue;
+                }
+                let into_vec_here = call.args.len() == 1
+                    && operand_local(Some(&call.args[0]))
+                        .is_some_and(|local| alias.contains(&local))
+                    && matches!(&call.func, CallFunc::Regular(reg)
+                        if call_path_segments(reg, llbc)
+                            .is_some_and(|segs| is_box_assume_init_into_vec_unsafe_path(&segs)));
+                if into_vec_here {
+                    if into_vec_dest.is_some() {
+                        return None;
+                    }
+                    into_vec_dest = Some(&call.dest.ty);
+                    continue;
+                }
+                if call
+                    .args
+                    .iter()
+                    .any(|op| operand_mentions_alias(op, &alias))
+                    || place_root_in_alias(&call.dest, &alias)
+                    || matches!(
+                        &call.func,
+                        CallFunc::Dynamic(op, _) if operand_mentions_alias(op, &alias)
+                    )
+                {
+                    return None;
+                }
+            }
+            TermKind::Drop { place, .. } => {
+                if place_root_in_alias(place, &alias) && !matches!(place.kind, PlaceKind::Local(_))
+                {
+                    return None;
+                }
+            }
+            TermKind::Switch { discr, .. } => {
+                if operand_mentions_alias(discr, &alias) {
+                    return None;
+                }
+            }
+            TermKind::Assert { assert, .. } => {
+                if operand_mentions_alias(&assert.cond, &alias) {
+                    return None;
+                }
+            }
+            TermKind::Return
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::Panic { .. }
+            | TermKind::UndefinedBehavior
+            | TermKind::Goto { .. }
+            | TermKind::Unknown => {}
+        }
+    }
+    if !saw_new_uninit {
+        return None;
+    }
+    let item_kind = tyref_rust_vec_item_kind(into_vec_dest?, llbc)?;
+    Some(VecLiteralCluster {
+        operands: array_ops?,
+        item_kind,
+    })
+}
+
 /// Kind-independent `ll_items`: the header's buffer pointer word, for a
 /// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`). The call site
 /// converts the Vec with `cast_ptr_to_int` then `r_uint` before this

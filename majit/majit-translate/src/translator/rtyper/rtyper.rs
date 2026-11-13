@@ -2685,7 +2685,14 @@ impl RPythonTyper {
             // `specialize_call` (`hop.r_result.rtyper_new(hop)`).  Routes
             // to the result builder repr's `ll_new` helper graph.
             "newstringbuilder" => super::lltypesystem::rbuilder::rtype_newstringbuilder(hop),
+            // `newrustvec(ITEM)` / `newrustvec(ITEM, hint)` / 3-arg fill —
+            // `ll_newemptylist` / `ll_newlist_hint` / `ll_alloc_and_set`.
             "newrustvec" => super::rrustvec::rtype_newrustvec(hop),
+            // `newrustvec_fixed(ITEM, n)` — `rlist.py rtype_newlist` /
+            // `ll_newlist(N)` (`VecOp::NewFixed`). Distinct from the 2-arg
+            // `newrustvec` hint path so a round-trip cannot collapse len=N
+            // into len=0.
+            "newrustvec_fixed" => super::rrustvec::rtype_newrustvec_fixed(hop),
             // `ll_copy` (`rlist.py`) of a `FixedSizeListRepr` self into a
             // raw `Vec`: `gendirectcall` of
             // `ll_vec_copy_from_fixed_list_{segment}`. Any other self stays

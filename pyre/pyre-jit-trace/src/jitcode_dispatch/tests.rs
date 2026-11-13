@@ -10924,15 +10924,20 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         // `opimpl_record_quasiimmut_field` (`is_quasi_immut_known`),
         // `_opimpl_getfield_gc_any_pureornot` (heapcache field box), and
         // `implement_guard_value` (Const after the first promote) record
-        // nothing on the second walk. `profilefunc is not None` is
-        // `ptr_iszero` of the cached GetfieldGcI box (`rmodel.py rtype_is_`
-        // -> `jtransform.py _rewrite_equality` / `_rewrite_cmp_ptrs`:
-        // non-gc `ptr_iszero` is `int_is_zero`), fused into
-        // `goto_if_not_int_is_zero` with the exits swapped
-        // (`opimpl_goto_if_not_int_is_zero`: `execute(INT_IS_ZERO)` then
-        // `opimpl_goto_if_not(..., replace=False)`); `execute_and_record`
-        // folds only `_all_constants`, so a non-Const field box re-records
-        // INT_IS_ZERO and GuardTrue.
+        // nothing on the second walk. `profilefunc` is a nullable
+        // FunctionsPBC (`rpbc.py` `FunctionsPBCRepr`, `setllprofile`
+        // stores `app_profile_call` / `lsprof_call`). `rnone.py`
+        // `rtype_is_None` is `ptr_iszero`; `jtransform.py`
+        // `rewrite_op_ptr_iszero` / `_rewrite_cmp_ptrs` rewrite a non-GC
+        // function Ptr to `int_is_zero`; `optimize_goto_if_not` fuses
+        // that into the exitswitch. `pyjitpl.py`
+        // `opimpl_goto_if_not_int_is_zero` does `execute(INT_IS_ZERO)`
+        // then `opimpl_goto_if_not(..., replace=False)`. An unarmed EC
+        // takes the true (`is None`) exit, so the guard is GuardTrue —
+        // `pypy/module/pypyjit/test_pypy_c/test_call.py` records
+        // `getfield_gc_i(...inst_profilefunc)` + `int_is_zero` +
+        // `guard_true`. `execute_and_record` folds only `_all_constants`,
+        // so a non-Const field box re-records INT_IS_ZERO and GuardTrue.
         assert!(
             !leftover.iter().any(|op| matches!(
                 *op,

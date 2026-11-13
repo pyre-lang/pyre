@@ -112,10 +112,13 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// identity (`flowspace/model.rs`). Identity correspondence is
 /// preserved out-of-band by [`LegacyToTyped`].
 /// The high-level operations one `ll_vec_*` helper call stands for:
-/// `newrustvec(ITEM[, hint])`, `len`, `getitem`, `setitem`, or a
-/// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
-/// `extend_from_slice` / `extend` / `insert` method. `ITEM` is a constant item
-/// lowleveltype (`lltype.py` `malloc` / `ann_malloc`).
+/// `newrustvec(ITEM[, hint])`, `newrustvec_fixed(ITEM, n)`, `len`,
+/// `getitem`, `setitem`, or a `getattr` + `simple_call` of the `append` /
+/// `reverse` / `free` / `items` / `extend_from_slice` / `extend` / `insert` method.
+/// `ITEM` is a constant item lowleveltype (`lltype.py` `malloc` /
+/// `ann_malloc`). `newrustvec_fixed` is `rlist.py` `rtype_newlist` /
+/// `ll_newlist(N)`: len=N and cap=N. `newrustvec(ITEM, n)` stays
+/// `ll_newlist_hint` (len=0, cap=n).
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
     kind: majit_ir::rvec::VecItemKind,
@@ -127,7 +130,12 @@ fn rust_vec_helper_ops(
     let path = majit_ir::rvec::vec_helper_path(op, kind);
     let arity = match op {
         VecOp::NewEmpty => 0,
-        VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
+        VecOp::NewHint
+        | VecOp::NewFixed
+        | VecOp::Length
+        | VecOp::Reverse
+        | VecOp::Free
+        | VecOp::Items => 1,
         VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend | VecOp::Prepend => 2,
         VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
     };
@@ -138,14 +146,19 @@ fn rust_vec_helper_ops(
         )));
     }
     let (opname, method) = match op {
-        VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+        VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet | VecOp::NewFixed => {
             let item = newrustvec_item_lltype(kind, legacy_result);
             let item_const =
                 Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))));
             let mut args = Vec::with_capacity(arg_hls.len() + 1);
             args.push(item_const);
             args.extend(arg_hls);
-            return Ok(vec![FlowspaceOp::new("newrustvec", args, result)]);
+            let opname = if matches!(op, VecOp::NewFixed) {
+                "newrustvec_fixed"
+            } else {
+                "newrustvec"
+            };
+            return Ok(vec![FlowspaceOp::new(opname, args, result)]);
         }
         VecOp::Length => ("len", None),
         VecOp::GetItem => ("getitem", None),
@@ -5292,6 +5305,19 @@ fn legacy_const_define_hlvalue(
                     key.segments()
                 ))
             })?;
+            // `executioncontext.py` `setllprofile`: a `ProfileFunc` family
+            // member is a `FunctionDesc` PBC (`bookkeeper.py` `getdesc`),
+            // not `getfunctionptr` / `SomePtr`. Both the field annotation
+            // and this constant must be `SomePBC` or the store unions
+            // `SomePtr` with `SomePBC`.
+            if call_registry
+                .bookkeeper()
+                .is_profilefunc_graph_path(segments)
+            {
+                return Ok(Some(Hlvalue::Constant(Constant::new(
+                    ConstValue::HostObject(entry.host_object.clone()),
+                ))));
+            }
             // A fn-const is address-taken data for a static method table
             // (`typedef` `[(name, fn, arity)]`).  Its LL carrier is
             // unconditionally `ConstFnAddr` (the const-define arm below),
@@ -5758,6 +5784,15 @@ pub(crate) fn derive_subject_inputcells(
                 cells.push(s_vec);
                 continue;
             }
+            // `executioncontext.py` `setllprofile`: `Option<ProfileFunc>`
+            // is a nullable PBC. Seed it before the generic `fn` arm so
+            // the parameter does not union `SomePtr` with the field.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && bk.is_profilefunc_type_spelling(root)
+            {
+                cells.push(bk.profilefunc_pbc_or_none());
+                continue;
+            }
             // A function pointer is the same Int bank (`history.getkind` of
             // `Ptr(FuncType)`) named `fn(inputs) -> output` /
             // `Option<fn(inputs) -> output>`. `valuetype_to_someshell` would
@@ -5913,10 +5948,10 @@ pub(crate) fn derive_subject_inputcells(
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
-                if class_root
-                    .as_deref()
-                    .is_some_and(crate::front::mir::is_str_family_class_root)
-                {
+                if class_root.as_deref().is_some_and(|root| {
+                    crate::front::mir::is_str_family_class_root(root)
+                        || crate::front::mir::is_cow_str_family_class_root(root)
+                }) {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
@@ -7963,6 +7998,72 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_cow_str_class_root_as_somestring() {
+        // `Option::map` mergeinputargs slot 0 is the Cow payload. A
+        // `from_utf8_lossy` dest is already SomeString (`stamp_as_rstr_str`);
+        // the classdef instance of `borrow::Cow<str>` must seed the same
+        // shell (`unicodehelper.py str_decode_utf8`).
+        use crate::annotator::model::{SomeString, union};
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        for (name, ty, class_root) in [
+            (
+                "class_root",
+                ValueType::Ref(Some("borrow::Cow<str>".to_string())),
+                Some("borrow::Cow<str>".to_string()),
+            ),
+            (
+                "payload_only",
+                ValueType::Ref(Some("borrow::Cow<str>".to_string())),
+                None,
+            ),
+            (
+                "bytes_stays_instance",
+                ValueType::Ref(Some("borrow::Cow<[u8]>".to_string())),
+                Some("borrow::Cow<[u8]>".to_string()),
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "s".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("Cow Input must project to a definite SomeValue cell");
+            assert_eq!(cells.len(), 1);
+            if name == "bytes_stays_instance" {
+                assert!(
+                    matches!(cells[0], SomeValue::Instance(_)),
+                    "{name}: Cow<[u8]> stays Instance, got {:?}",
+                    cells[0]
+                );
+                continue;
+            }
+            let SomeValue::String(_) = &cells[0] else {
+                panic!(
+                    "{name}: Cow<str> Input must seed SomeString, got {:?}",
+                    cells[0]
+                );
+            };
+            let joined = union(&cells[0], &s_new).unwrap_or_else(|e| {
+                panic!("{name}: Cow<str> Input must union with String::new(): {e}")
+            });
+            assert!(
+                matches!(joined, SomeValue::String(_)),
+                "{name}: Cow<str> Input ∪ String::new() must stay SomeString, got {joined:?}"
+            );
+        }
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_raw_ptr_to_str_as_nullable_somestring() {
         for (name, ty, class_root, expect_none) in [
             (
@@ -8055,6 +8156,16 @@ mod tests {
                 "opt_rstr",
                 ValueType::Str,
                 Some("Option<unicodeobject::Utf8Str>".to_string()),
+            ),
+            (
+                "opt_cow_str",
+                ValueType::Str,
+                Some("Option<borrow::Cow<str>>".to_string()),
+            ),
+            (
+                "opt_cow_static",
+                ValueType::Str,
+                Some("option::Option<Cow<'static, str>>".to_string()),
             ),
         ] {
             let mut graph = LegacyGraph::new(name);
@@ -12797,6 +12908,7 @@ mod tests {
                 let nargs = match op {
                     VecOp::NewEmpty => 0,
                     VecOp::NewHint
+                    | VecOp::NewFixed
                     | VecOp::Length
                     | VecOp::Reverse
                     | VecOp::Free
@@ -12844,9 +12956,14 @@ mod tests {
                 let last = translated.last().expect("at least one op");
                 assert_eq!(last.result, result_var, "{path}");
                 match op {
-                    VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+                    VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet | VecOp::NewFixed => {
                         assert_eq!(translated.len(), 1);
-                        assert_eq!(last.opname, "newrustvec");
+                        let expected_opname = if matches!(op, VecOp::NewFixed) {
+                            "newrustvec_fixed"
+                        } else {
+                            "newrustvec"
+                        };
+                        assert_eq!(last.opname, expected_opname);
                         let Hlvalue::Constant(item) = &last.args[0] else {
                             panic!("{path}: item lowleveltype must be a Constant");
                         };
@@ -12964,6 +13081,63 @@ mod tests {
         assert_eq!(ll.as_ref(), &LowLevelType::Unsigned);
         assert_eq!(flow_result.concretetype(), None);
         assert_eq!(translated[0].result, result_var);
+    }
+
+    /// `ll_vec_newlist_*` (`VecOp::NewFixed`) is `newrustvec_fixed`, which
+    /// annotates as `SomeRustVec`. Distinct from `newrustvec(ITEM, n)`
+    /// (`NewHint` / `ll_newlist_hint`).
+    #[test]
+    fn translate_op_ll_vec_newlist_annotates_as_somerustvec() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::operation::{HLOperation, OpKind as HlOpKind};
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let result_var = Hlvalue::Variable(Variable::new());
+        let n_hl = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::Int(2),
+        ));
+        value_map.insert(vars[1].clone(), result_var.clone());
+        value_map.insert(vars[2].clone(), n_hl.clone());
+        let path = vec_helper_path(VecOp::NewFixed, VecItemKind::Ref);
+        let spaceop = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: path.split("::").map(String::from).collect(),
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[2].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
+            .unwrap_or_else(|err| panic!("{path} must lower: {err:?}"));
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newrustvec_fixed");
+        assert_eq!(translated[0].result, result_var);
+        assert_eq!(translated[0].args.len(), 2);
+        let Hlvalue::Constant(item) = &translated[0].args[0] else {
+            panic!("item lowleveltype must be a Constant");
+        };
+        let ConstValue::LowLevelType(ll) = &item.value else {
+            panic!("item must be a constant lowleveltype, got {:?}", item.value);
+        };
+        assert_eq!(
+            ll.as_ref(),
+            &crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        );
+        assert_eq!(translated[0].args[1], n_hl);
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let hl = HLOperation::new(HlOpKind::NewRustVecFixed, translated[0].args.clone());
+        let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
+            panic!("newrustvec_fixed must type as SomeRustVec");
+        };
+        assert_eq!(s_vec.item_kind(), Some(VecItemKind::Ref));
     }
 
     #[test]
@@ -17056,6 +17230,60 @@ mod tests {
             Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed),
             "legacy Variable cell must stay Int/Signed"
         );
+    }
+
+    #[test]
+    fn profilefunc_family_fn_const_folds_to_hostobject_not_llptr() {
+        use crate::flowspace::argument::Signature;
+        use crate::model::CallTarget;
+
+        struct RestoreFamily;
+        impl Drop for RestoreFamily {
+            fn drop(&mut self) {
+                crate::profilefunc_family::register_profilefunc_family(Vec::new(), Vec::new());
+            }
+        }
+        let _restore = RestoreFamily;
+
+        let registry = empty_call_registry();
+        let family_key =
+            crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(["hook_a"]);
+        let empty_sig = Signature::new(Vec::<String>::new(), None, None);
+        let family_entry = registry.get_or_register(family_key, empty_sig);
+        crate::profilefunc_family::register_profilefunc_family(
+            vec!["hook_a".into()],
+            vec!["ProfileFunc".into()],
+        );
+        registry.intern_profilefunc_family();
+
+        let family_define = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    crate::model::FN_CONST_HEAD.to_string(),
+                    "hook_a".to_string(),
+                ],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Int,
+        };
+        let family_op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: family_define,
+        };
+        match legacy_const_define_hlvalue(&family_op, Some(&registry))
+            .expect("family fn const folds")
+        {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(
+                    c.value,
+                    ConstValue::HostObject(family_entry.host_object.clone()),
+                    "setllprofile stores a FunctionDesc, not getfunctionptr"
+                );
+            }
+            other => panic!("expected HostObject FunctionDesc, got {other:?}"),
+        }
     }
 
     #[test]
