@@ -8770,6 +8770,12 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
 ) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+    // Same dispatch-loop head rule as [`live_py_pc_from_snapshot`].
+    if !ctx.fbw_mode.transparent_helper_subwalk
+        && let Some(py_pc) = super::vstack_mirror::dispatch_head_py_pc(ctx, &pjc, jit_pc)
+    {
+        return Some(py_pc);
+    }
     Some(executing_py_pc(&pjc, jit_pc))
 }
 
@@ -8786,6 +8792,16 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    // The shared dispatch-loop head (`interp_jit.py PyFrame.dispatch`) runs
+    // `bytecode_only_trace` for the instruction the `next_instr` green names
+    // (`pyopcode.py dispatch_bytecode` stores it into `last_instr` first); a
+    // static table only knows where flatten laid the head out. A transparent
+    // helper sub-walk's registers are the helper's, not this jitcode's.
+    if !ctx.fbw_mode.transparent_helper_subwalk
+        && let Some(py_pc) = super::vstack_mirror::dispatch_head_py_pc(ctx, &jc.payload, jit_pc)
+    {
+        return Some(py_pc);
+    }
     Some(executing_py_pc(&jc.payload, jit_pc))
 }
 

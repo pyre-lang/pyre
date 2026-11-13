@@ -1232,6 +1232,12 @@ pub(crate) fn vstack_step_py_pc(
     jit_pc: usize,
     current_py_pc: u32,
 ) -> u32 {
+    // The shared dispatch-loop head lowers no Python opcode of its own; its
+    // coordinate is the `next_instr` green ([`dispatch_head_py_pc`]), which
+    // the caller passes as `current_py_pc`.
+    if metadata.dispatch_head_contains(jit_pc) {
+        return current_py_pc;
+    }
     // A block-head entry is a control-flow marker, not the lowering of a
     // Python opcode.  Keep the current mirror coordinate until the first
     // actual operation in the destination block.  In particular, the floor
@@ -1335,6 +1341,46 @@ fn vstack_operand_shadow_occupied<Sym: WalkSym>(
     }
 }
 
+/// `pyopcode.py dispatch_bytecode`: `self.last_instr = intmask(next_instr)`
+/// opens every dispatch. Bytes of the shared `interp_jit.py PyFrame.dispatch`
+/// head (`PyJitCodeMetadata.dispatch_head_by_jit_pc`) run for whichever
+/// instruction the `next_instr` green names; their static floor names an
+/// unrelated opcode (the `bytecode_only_trace` arm lays out after the last
+/// opcode body). The green is the first Int green of the head's
+/// `jit_merge_point` and stays in that register across the whole head.
+/// Trivia-normalized like the executing coordinate the per-opcode
+/// `last_instr` store names. `None` outside the head or when the register
+/// holds no concrete value.
+pub(crate) fn dispatch_head_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    jit_pc: usize,
+) -> Option<u32> {
+    if !pjc.metadata.dispatch_head_contains(jit_pc) {
+        return None;
+    }
+    // SAFETY: `code_ptr` is the CodeObject this jitcode was built from; it
+    // outlives the published jitcode.
+    let code = unsafe { pjc.code_ptr.as_ref() }?;
+    let merge_pc = *pjc.loop_scan().merge_points.first()?;
+    let green_regs =
+        crate::trace::merge_point_int_green_regs(pjc.jitcode.code.as_slice(), merge_pc)?;
+    let color = usize::from(*green_regs.first()?);
+    let next_instr = match ctx.concrete_registers_i.get(color) {
+        Some(ConcreteValue::Int(value)) => *value,
+        _ => match ctx
+            .registers_i
+            .get(color)
+            .and_then(|op| ctx.trace_ctx.concrete_of_opref(op))
+        {
+            Some(Value::Int(value)) => value,
+            _ => return None,
+        },
+    };
+    let next_instr = usize::try_from(next_instr).ok()?;
+    Some(skip_python_trivia_forward(code, next_instr) as u32)
+}
+
 /// #73: step the walk-level operand-stack box mirror at
 /// the top of every jitcode `step`.  Detects a Python-opcode boundary by
 /// mapping the current `jit_pc` back to its containing Python opcode; when
@@ -1365,8 +1411,9 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         // `resume.py rebuild_from_resumedata` being driven forward after guard
         // failure. Its per-frame operand stack must read the exact boxes the
         // reconstructed frame owns, just like an ordinary inline sub-walk.
-        let Some(coord) = frame.vstack_step_coordinate_for_jitcode_pc(jit_pc, ctx.vstack_cur_pypc)
-        else {
+        let current_py_pc =
+            dispatch_head_py_pc(ctx, &frame.0, jit_pc).unwrap_or(ctx.vstack_cur_pypc);
+        let Some(coord) = frame.vstack_step_coordinate_for_jitcode_pc(jit_pc, current_py_pc) else {
             ctx.vstack_valid = false;
             return;
         };
@@ -1388,7 +1435,9 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             if jc.payload.code_ptr.is_null() {
                 return;
             }
-            let py_pc = vstack_step_py_pc(&jc.payload.metadata, jit_pc, ctx.vstack_cur_pypc);
+            let current_py_pc =
+                dispatch_head_py_pc(ctx, &jc.payload, jit_pc).unwrap_or(ctx.vstack_cur_pypc);
+            let py_pc = vstack_step_py_pc(&jc.payload.metadata, jit_pc, current_py_pc);
             let depth = vstack_step_depth(&jc.payload, jit_pc, py_pc);
             // Stage gate for the per-emission exact segmentation.  The
             // boundary the mirror acts on is currently INFERRED — `py_pc` is

@@ -1524,9 +1524,8 @@ pub struct MissingLiveness {
 /// ```
 ///
 /// Used by the assembler to encode `switch` ops as a side-table mapping
-/// integer values to bytecode positions. Currently a placeholder — pyre
-/// has no `switch` op users yet, but the type lives here so the
-/// codewriter::jitcode module shape stays parity-aligned with RPython.
+/// integer values to bytecode positions. Generator yield-resume and the
+/// non-generator `interp_jit.py PyFrame.dispatch` loop both emit `switch`.
 #[derive(Debug, Clone, Default)]
 pub struct SwitchDictDescr {
     /// RPython `attach`: integer key → bytecode position map.

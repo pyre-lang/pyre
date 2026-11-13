@@ -15444,6 +15444,8 @@ mod tests {
                 resume_entry_by_py_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
+                dispatch_switch_pc: None,
+                dispatch_head_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 1)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],

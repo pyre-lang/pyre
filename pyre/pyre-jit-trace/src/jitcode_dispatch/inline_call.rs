@@ -852,6 +852,26 @@ fn helper_resume_descr_at(payload_descrs: Option<&[DescrRef]>, index: usize) -> 
     }
 }
 
+/// The dispatch-loop `switch` on `next_instr` (`interp_jit.py
+/// PyFrame.dispatch`, recorded as `PyJitCodeMetadata.dispatch_switch_pc`).
+/// `dispatch_switch_id` takes the Const key at walk time, so a seeded
+/// callee is still straight-line through that switch. A later MATCH /
+/// computed switch still declines. Generator bodies leave the field
+/// `None`.
+fn is_dispatch_loop_next_instr_switch(
+    ops: &[DecodedOp],
+    idx: usize,
+    dispatch_switch_pc: Option<usize>,
+) -> bool {
+    let Some(d) = ops.get(idx) else {
+        return false;
+    };
+    if !d.opname.starts_with("switch") {
+        return false;
+    }
+    dispatch_switch_pc == Some(d.pc)
+}
+
 /// The FBW fast-path inline convention (`try_walker_inline_user_call`) first
 /// checks whether the callee body can be followed, before the full inline path
 /// seeds the callee's positional arguments and its own frame/ec reds. A callee
@@ -869,6 +889,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
     debugdata: FreshFrameDebugdata,
+    dispatch_switch_pc: Option<usize>,
 ) -> bool {
     let Some(ops) = decoded_ops_on_fresh_frame_kind(body_code, callee_descr_refs, debugdata) else {
         // Undecodable reachable op — be conservative and decline the fast path.
@@ -876,6 +897,9 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     };
     for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            if is_dispatch_loop_next_instr_switch(&ops, idx, dispatch_switch_pc) {
+                continue;
+            }
             if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
                 if fbw_strict_diag_enabled() {
                     eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
@@ -1051,6 +1075,55 @@ mod seeded_frame_op_tests {
         }
     }
 
+    fn decoded(opname: &'static str) -> DecodedOp {
+        DecodedOp {
+            key: "",
+            opname,
+            argcodes: "",
+            pc: 0,
+            next_pc: 1,
+        }
+    }
+
+    fn decoded_at(opname: &'static str, pc: usize) -> DecodedOp {
+        DecodedOp {
+            key: "",
+            opname,
+            argcodes: "",
+            pc,
+            next_pc: pc + 1,
+        }
+    }
+
+    #[test]
+    fn dispatch_loop_switch_matches_the_recorded_jitcode_pc() {
+        let ops = [
+            decoded_at("live", 0),
+            decoded_at("jit_merge_point", 10),
+            decoded_at("int_guard_value", 20),
+            decoded_at("switch", 30),
+            decoded_at("getarrayitem_vable_r", 40),
+        ];
+        assert!(is_dispatch_loop_next_instr_switch(&ops, 3, Some(30)));
+        assert!(!is_dispatch_loop_next_instr_switch(&ops, 3, Some(99)));
+        assert!(!is_dispatch_loop_next_instr_switch(&ops, 3, None));
+        let two_switches = [
+            decoded_at("jit_merge_point", 0),
+            decoded_at("switch", 10),
+            decoded_at("switch", 20),
+        ];
+        assert!(is_dispatch_loop_next_instr_switch(
+            &two_switches,
+            1,
+            Some(10)
+        ));
+        assert!(!is_dispatch_loop_next_instr_switch(
+            &two_switches,
+            2,
+            Some(10)
+        ));
+    }
+
     #[test]
     fn seeded_frame_accepts_int_and_float_getfield_off_the_callee_frame() {
         let code = [0u8, 3, 0, 0, 0];
@@ -1127,7 +1200,9 @@ mod seeded_frame_op_tests {
         let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
         assert_eq!(names, ["getfield_vable_r", "live", "int_return"]);
         assert!(!callee_body_contains_raise(&code, &descrs));
-        assert!(exception_string_override_straight_line(&code, &descrs));
+        assert!(exception_string_override_straight_line(
+            &code, &descrs, None
+        ));
     }
 
     #[test]
@@ -1236,7 +1311,9 @@ mod seeded_frame_op_tests {
             ]
         );
         assert!(callee_body_contains_raise(&code, &descrs));
-        assert!(!exception_string_override_straight_line(&code, &descrs));
+        assert!(!exception_string_override_straight_line(
+            &code, &descrs, None
+        ));
     }
 }
 
@@ -1382,6 +1459,7 @@ fn body_sample_safe_with(
     pure_helpers: &[majit_ir::RuntimeHelperKind],
     num_regs_i: usize,
     constants_i: &[i64],
+    dispatch_switch_pc: Option<usize>,
 ) -> bool {
     let mut flags_get: Option<(u8, u8)> = None;
     let mut finished_or: Option<(u8, u8)> = None;
@@ -1393,6 +1471,9 @@ fn body_sample_safe_with(
     };
     for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            if is_dispatch_loop_next_instr_switch(&ops, idx, dispatch_switch_pc) {
+                continue;
+            }
             if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
                 return false;
             }
@@ -1452,6 +1533,7 @@ pub(crate) fn exception_string_override_sample_safe(
     callee_descr_refs: &[DescrRef],
     num_regs_i: usize,
     constants_i: &[i64],
+    dispatch_switch_pc: Option<usize>,
 ) -> bool {
     body_sample_safe_with(
         body_code,
@@ -1462,6 +1544,7 @@ pub(crate) fn exception_string_override_sample_safe(
         ],
         num_regs_i,
         constants_i,
+        dispatch_switch_pc,
     )
 }
 
@@ -1483,6 +1566,7 @@ pub(crate) fn index_inline_sample_safe(
     callee_descr_refs: &[DescrRef],
     num_regs_i: usize,
     constants_i: &[i64],
+    dispatch_switch_pc: Option<usize>,
 ) -> bool {
     body_sample_safe_with(
         body_code,
@@ -1494,6 +1578,7 @@ pub(crate) fn index_inline_sample_safe(
         ],
         num_regs_i,
         constants_i,
+        dispatch_switch_pc,
     )
 }
 
@@ -1503,12 +1588,14 @@ pub(crate) fn index_inline_sample_safe(
 pub(crate) fn exception_string_override_straight_line(
     body_code: &[u8],
     descr_refs: &[DescrRef],
+    dispatch_switch_pc: Option<usize>,
 ) -> bool {
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, descr_refs) else {
         return false;
     };
     ops.iter().enumerate().all(|(idx, d)| {
-        !(d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch"))
+        is_dispatch_loop_next_instr_switch(&ops, idx, dispatch_switch_pc)
+            || !(d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch"))
             || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d)
     })
 }
@@ -6267,19 +6354,23 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
             has_abort_permanent: decoded_ops_on_fresh_frame(body.code, descr_refs)
                 .is_some_and(|ops| ops.iter().any(|op| op.opname == "abort_permanent")),
             exc_override_straight_line: exception_string_override_straight_line(
-                body.code, descr_refs,
+                body.code,
+                descr_refs,
+                pjc.metadata.dispatch_switch_pc,
             ),
             exc_override_sample_safe: exception_string_override_sample_safe(
                 body.code,
                 descr_refs,
                 body.num_regs_i,
                 body.constants_i,
+                pjc.metadata.dispatch_switch_pc,
             ),
             index_sample_safe: index_inline_sample_safe(
                 body.code,
                 descr_refs,
                 body.num_regs_i,
                 body.constants_i,
+                pjc.metadata.dispatch_switch_pc,
             ),
             exc_override_has_nested_call: exception_string_override_has_nested_call(
                 body.code, descr_refs,
@@ -9984,12 +10075,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
     let fresh_debugdata = fresh_frame_debugdata_for_callee(w_code, live_callable());
+    let dispatch_switch_pc =
+        crate::state::pyjitcode_for_code(w_code).and_then(|pjc| pjc.metadata.dispatch_switch_pc);
     let strict_inlinable = callee_fast_path_inlinable(
         body.code,
         callee_descr_refs,
         ctx,
         callee_portal_frame_reg,
         fresh_debugdata,
+        dispatch_switch_pc,
     );
     // #68: a forward-branch-bearing callee is inlinable with a multi-frame
     // guard snapshot (its in-callee branch
@@ -11049,8 +11143,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
     }
 
-    let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
+    let (callee_regs_r, mut callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
         allocate_callee_register_banks(&body, ctx.trace_ctx);
+    // `warmspot.py split_before_jit_merge_point`: the inlined walk starts
+    // at the portal `jit_merge_point`, past the startblock `ref_copy`s
+    // that would read unbound r0. Seed the Int greens
+    // `[next_instr=0, is_being_profiled=0]` the merge lists (`gi`).
+    let inline_merge_pc = crate::state::pyjitcode_for_code(w_code).and_then(|pjc| {
+        crate::trace::static_entry_merge_point(body.code, pjc.loop_scan(), 0).map(|op| op.pc)
+    });
+    if let Some(pjc) = crate::state::pyjitcode_for_code(w_code)
+        && let Some(gi) =
+            crate::trace::static_entry_merge_point_green_regs(body.code, pjc.loop_scan(), 0)
+    {
+        for (&color, value) in gi.iter().zip([0i64, 0]) {
+            let color = color as usize;
+            if color < body.num_regs_i && color < callee_regs_i.len() {
+                callee_regs_i[color] = ctx.trace_ctx.const_int(value);
+                if color < callee_concrete_i.len() {
+                    callee_concrete_i[color] = ConcreteValue::Int(value);
+                }
+            }
+        }
+    }
     let callee_regs_r = RegisterBank::with_constants(callee_regs_r, body.num_regs_r);
     let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
     // MIFrame.setup_call owns the concrete halves before frame construction
@@ -12011,9 +12126,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // no image is what `try_adopt_single_frame_blackhole` rejects.
             // `sub_wc` is the callee `newframe` just opened.
             // `build_multi_frame_miframe` stamps `resume_pc` onto that
-            // callee's jitcode, so the coordinate is the body's entry
-            // (`walk` starts at 0), not the caller's `op.pc`.
-            let latched = super::residual_call::latch_abort_blackhole(&sub_wc, 0, "pre-callee");
+            // callee's jitcode, so the coordinate is the portal
+            // `jit_merge_point` the inlined walk starts at
+            // (`warmspot.py split_before_jit_merge_point`), not the
+            // caller's `op.pc`.
+            let latched = super::residual_call::latch_abort_blackhole(
+                &sub_wc,
+                inline_merge_pc.unwrap_or(0),
+                "pre-callee",
+            );
             if !latched && fbw_executed_effect_count() != 0 {
                 bump_keep_recording_too_long_once(sub_wc.session);
             } else {
@@ -12046,7 +12167,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `sym.registers_r`.
             let _callee_bank_guard =
                 crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
-            walk(body.code, 0, &mut sub_wc)
+            walk(body.code, inline_merge_pc.unwrap_or(0), &mut sub_wc)
         };
         // `blackhole_if_trace_too_long` raises out of `_interpret`. `popframe`
         // and `ExecutionContext.leave` are after that point and must not run.
@@ -16219,12 +16340,15 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
         .filter(|&jc| crate::state::built_as_portal_at(jc))
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
+    let dispatch_switch_pc =
+        crate::state::pyjitcode_for_code(w_code).and_then(|pjc| pjc.metadata.dispatch_switch_pc);
     if !callee_fast_path_inlinable(
         body.code,
         callee_descr_refs,
         ctx,
         callee_frame_reg,
         fresh_frame_debugdata_for_callee(w_code, method),
+        dispatch_switch_pc,
     ) {
         index_prepare_diag("fast-path");
         return None;

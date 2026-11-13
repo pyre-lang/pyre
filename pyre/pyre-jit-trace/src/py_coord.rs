@@ -18,6 +18,11 @@
 /// PC last opened a segment. The coordinate is the one the per-bytecode
 /// `last_instr` store in `pyopcode.py dispatch_bytecode` would have left in
 /// the frame.
+///
+/// Dispatch-loop head bytes (`interp_jit.py PyFrame.dispatch`) sit before
+/// any opcode case; the floor starts at `(0, 0)`, so those bytes resolve to
+/// the entry green. A blackhole resumed at the merge point uses the live
+/// `next_instr` register for the `switch` case.
 pub(crate) fn containing_py_pc_for_jitcode_pc(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,
