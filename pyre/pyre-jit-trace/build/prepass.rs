@@ -82,6 +82,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "ei_descr_lookups.bin",
     "field_mint_census.bin",
     "liveness.bin",
+    "callinfo_rows.bin",
     "fnaddr_bindings.bin",
     "symbolic_fnaddr_paths.bin",
     "static_pytype_bindings.bin",
@@ -105,6 +106,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// `jitcodes.bin` directly, `descrs.bin` through `BhDescr::JitCode.fnaddr`
 /// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`),
 /// `indirectcalltargets.bin` through its `(index, jitcode.fnaddr)` pairs, and
+/// `callinfo_rows.bin` through `CallInfoRow.func` (`export_callinfo_rows`,
+/// same host word `JitCode.fnaddr` / residual `constants_i` carry).
 /// `jit_metadata.json` through the same pipeline serialized as JSON.
 /// `descr_layouts.bin` carries the parent `BhSizeSpec.vtable` word.
 ///
@@ -141,6 +144,7 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "descr_layouts.bin",
     "effect_infos.bin",
     "fnaddr_bindings.bin",
+    "callinfo_rows.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
 ];
@@ -2197,6 +2201,14 @@ fn real_main() {
         // `metainterp_sd.liveness_info` and resolve those offsets.
         let liveness_bin = bincode::serialize(&pipeline.all_liveness).unwrap();
         std::fs::write(format!("{out_dir}/liveness.bin"), &liveness_bin).unwrap();
+
+        // `pyjitpl.py MetaInterpStaticData.finish_setup`:
+        // `self.callinfocollection = codewriter.callcontrol.callinfocollection`.
+        // `export_callinfo_rows` already filled `pipeline.callinfo_rows`.
+        // `func` is a build-process host address (or symbolic path hash),
+        // same class of word as `JitCode.fnaddr`.
+        let callinfo_rows_bin = bincode::serialize(&pipeline.callinfo_rows).unwrap();
+        std::fs::write(format!("{out_dir}/callinfo_rows.bin"), &callinfo_rows_bin).unwrap();
 
         // RPython's translator AOT-compiles every helper into a single binary, so
         // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable

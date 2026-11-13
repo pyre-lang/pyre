@@ -9824,6 +9824,11 @@ fn install_build_time_liveness_before_trace(
         pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
         pyre_jit_trace::jitcode_runtime::all_liveness(),
     );
+    // `pyjitpl.py` `MetaInterpStaticData.finish_setup`:
+    // `self.callinfocollection = codewriter.callcontrol.callinfocollection`.
+    // `CallInfoCollection.add` overwrites, so a codewriter row replaces a
+    // walker seed for the same oopspec.
+    pyre_jit_trace::jitcode_runtime::add_codewriter_callinfo_rows(meta);
     // `intern_liveness` publishes onto this thread's lock. Capture reads
     // the clone of `staticdata` taken at trace start, so that field has to
     // be the same lock. The baked bytes above are its prefix.

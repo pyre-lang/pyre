@@ -6204,6 +6204,22 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
+        self.add_oopspec_callinfo(oopspec, calldescr, func_addr, name);
+    }
+
+    /// `jtransform.py _handle_oopspec_call`:
+    /// `effectinfo.py CallInfoCollection.add(oopspecindex, calldescr, func)`.
+    /// Always inserts (overwrites). Codewriter rows use this so a
+    /// walker seed for the same oopspec cannot hide the residual's
+    /// own calldescr. [`Self::ensure_oopspec_callinfo`] stays
+    /// skip-if-present for oopspecs that never pass the codewriter.
+    pub fn add_oopspec_callinfo(
+        &mut self,
+        oopspec: majit_ir::OopSpecIndex,
+        calldescr: majit_ir::DescrRef,
+        func_addr: u64,
+        name: &str,
+    ) {
         let mut cic = self
             .callinfocollection
             .as_ref()
@@ -6215,7 +6231,7 @@ impl<M: Clone> MetaInterp<M> {
         // leave `staticdata.callinfocollection` without the row the
         // per-MetaInterp copy has, and nothing downstream could tell.
         let sd = std::sync::Arc::get_mut(&mut self.staticdata)
-            .expect("ensure_oopspec_callinfo must run before staticdata is shared");
+            .expect("add_oopspec_callinfo must run before staticdata is shared");
         sd.callinfocollection.add(oopspec, calldescr, func_addr);
         sd.callinfocollection
             .register_func_name(func_addr, name.to_string());
