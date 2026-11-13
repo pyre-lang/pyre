@@ -4588,12 +4588,19 @@ impl OptUnroll {
     }
 
     /// resoperation.py `OpHelpers.inputarg_from_tp` — a fresh typed InputArg
-    /// box. The `Operand` owns the `InputArgRc`; no parallel position-only
-    /// registry is required.
+    /// box.
+    ///
+    /// The box is registered as the host of its position. Virtual field lists
+    /// and resume numbering still name it by `OpRef`, and an unregistered
+    /// InputArg position resolves to a freshly minted box on every lookup.
+    /// `register_box` and `_gettagged` would then key two different objects,
+    /// and the guard's resume data would carry `UNASSIGNED` for the field.
     pub(crate) fn inputarg_from_tp(ctx: &mut OptContext, tp: Type) -> Operand {
         let pos = ctx.alloc_op_position_typed(tp).raw();
         let inputarg = majit_ir::InputArg::from_type_rc(tp, pos);
-        Operand::from_bound_inputarg(&inputarg)
+        let operand = Operand::from_bound_inputarg(&inputarg);
+        ctx.register_carried_host(&operand);
+        operand
     }
 
     pub fn import_short_preamble_state(
