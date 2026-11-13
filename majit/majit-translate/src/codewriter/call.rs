@@ -3135,15 +3135,23 @@ impl StoreCore {
         Some(self.slot_mut(&key)?.attrs_mut().func())
     }
 
-    /// The attributes of the funcobj `path` names when its build produced
-    /// no graph: it is an external funcobj, and what was written onto it
-    /// before and after the build is its record. Builds the graph.
+    /// The attributes of the funcobj `path` names when it has no graph: an external funcobj, or
+    /// one whose build produced none. What was written onto it before and after the build is its
+    /// record. Never builds: a funcobj whose build has not run is not external yet
+    /// (`Self::funcobj_attrs` reads it).
     pub(crate) fn external_func(&self, path: &CallPath) -> Option<crate::model::FuncEffects> {
         let slot = self.slot_for(path)?;
-        if slot.building.get() || self.slot_graph(&slot).is_some() {
+        if slot.building.get() {
             return None;
         }
-        Some(slot.attrs.func.clone())
+        let graphless = match slot.graph.get() {
+            Some(built) => built.is_none(),
+            None => slot
+                .source
+                .as_ref()
+                .is_none_or(|source| source.graph.is_external() || source.graph.is_graphless()),
+        };
+        graphless.then(|| slot.attrs.func.clone())
     }
 
     /// Add `hints` to the funcobj `path` names without building its graph.
@@ -3210,6 +3218,27 @@ impl StoreCore {
         let slot = self.slot_for(path)?;
         if let Some(header) = self.slot_declaration(&slot) {
             return Some(header);
+        }
+        Self::slot_header(&slot).map(std::rc::Rc::new)
+    }
+
+    /// The funcobj `path` names, as its attributes read it, without building its graph:
+    /// `call.py` reads `_elidable_function_`, `oopspec` and `_jit_look_inside_` off the funcobj.
+    /// The built graph when the build already ran; the declared header (`slot_header`) of a
+    /// funcobj whose build has not run. `None` for a path with no funcobj, an external funcobj,
+    /// one whose build produced no graph, and one whose build is running: those read as the
+    /// external funcobj (`Self::external_func`).
+    pub(crate) fn funcobj_attrs(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        if slot.building.get() {
+            return None;
+        }
+        if let Some(built) = slot.graph.get() {
+            return built.as_ref().map(|built| built.graph.clone());
+        }
+        let source = slot.source.as_ref()?;
+        if source.graph.is_external() || source.graph.is_graphless() {
+            return None;
         }
         Self::slot_header(&slot).map(std::rc::Rc::new)
     }
@@ -7109,15 +7138,16 @@ impl CallControl {
     }
 
     /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
-    /// the graph's own `graph.func` when a graph is registered, otherwise
-    /// the graph-less external funcobj record. `None` when neither exists.
+    /// the funcobj's own `graph.func` (the built graph, or the declared header of one not
+    /// built yet; never builds), otherwise the graph-less external funcobj record.
+    /// `None` when neither exists.
     ///
     /// This is the `graph.func` / external-`funcobj` read RPython does
     /// directly off the call op's target — every per-function effect is
     /// carried here rather than in a separate per-effect side table.
     fn func_effects(&self, path: &CallPath) -> Option<FuncRef<'_>> {
         self.function_graphs
-            .get(path)
+            .funcobj_attrs(path)
             .map(FuncRef::Graph)
             .or_else(|| self.external_funcobj(path))
     }
@@ -9945,9 +9975,9 @@ impl CallControl {
     }
 
     /// `call.py` `get_jitcode_calldescr`: non-void `FUNC.ARGS` kind chars.
-    /// `None` when this path has no registered function graph.
+    /// `None` when this path names no funcobj with a graph or declared header.
     pub(crate) fn declared_non_void_arg_classes(&self, path: &CallPath) -> Option<String> {
-        let graph = self.function_graphs.get(path)?;
+        let graph = self.function_graphs.funcobj_attrs(path)?;
         let mut classes = String::new();
         for ty in graph_arg_types(&graph) {
             // `descr.py map_type_to_argclass`: `getkind(SingleFloat)=='int'`
@@ -11721,7 +11751,7 @@ impl CallControl {
 
     fn path_marked_cannot_raise(&self, path: &CallPath) -> bool {
         self.function_graphs
-            .get(path)
+            .funcobj_attrs(path)
             .is_some_and(|graph| graph.func.cannot_raise_assertion)
             || self
                 .external_funcobj(path)
@@ -11730,7 +11760,7 @@ impl CallControl {
 
     fn path_marked_may_force(&self, path: &CallPath) -> bool {
         self.function_graphs
-            .get(path)
+            .funcobj_attrs(path)
             .is_some_and(|graph| graph.func.may_force_assertion)
             || self
                 .external_funcobj(path)
@@ -28829,6 +28859,31 @@ mod tests {
         assert_eq!(builds.get(), 0, "signature must not build the body");
         assert!(cc.function_graphs.get(&path).is_some());
         assert_eq!(builds.get(), 1);
+    }
+
+    /// Attribute readers (`call.py` getattr on the funcobj) must not build
+    /// the callee's graph; the declared header is the record until then.
+    #[test]
+    fn funcobj_attrs_reads_the_declared_header_without_building() {
+        let built = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = built.clone();
+        let path = CallPath::from_segments(["helper"]);
+        let mut store = GraphStore::new();
+        store.insert_deferred(
+            path.clone(),
+            (None, "helper".to_string(), GraphSpecialization::Regular),
+            move || {
+                flag.set(true);
+                Some(FunctionGraph::new("helper"))
+            },
+        );
+        assert!(store.funcobj_attrs(&path).is_some());
+        assert!(!built.get());
+        assert!(store.external_func(&path).is_none());
+        assert!(!built.get());
+        assert!(store.get(&path).is_some());
+        assert!(built.get());
+        assert!(store.funcobj_attrs(&path).is_some());
     }
 
     /// `graphs_from(op)` for an `OpKind::IndirectCall` must filter by
