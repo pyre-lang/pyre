@@ -391,9 +391,7 @@ impl<'a> FieldUpdater<'a> {
             Some(pair) => pair,
             None => return,
         };
-        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.read_now_known(ref_box, fieldbox, cache, boxes, oracle);
-        cache.heap_cache.insert(descr_index, entry);
+        cache.getfield_now_known(ref_box, descr_index, fieldbox, oracle, boxes);
     }
 
     /// heapcache.py setfield
@@ -408,9 +406,7 @@ impl<'a> FieldUpdater<'a> {
             Some(pair) => pair,
             None => return,
         };
-        let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.do_write_with_aliasing(ref_box, fieldbox, cache, boxes, oracle);
-        cache.heap_cache.insert(descr_index, entry);
+        cache.setfield_cached(ref_box, descr_index, fieldbox, oracle, boxes);
     }
 
     fn cache_and_descr(&mut self) -> Option<(&mut HeapCache, &mut (dyn HeapcBoxes + 'a), u32)> {
@@ -797,10 +793,8 @@ impl HeapCache {
     ///
     /// `CacheEntry.read` (heapcache.py) handles the
     /// `_unique_const_heuristic` ConstPtr canonicalisation and the
-    /// `maybe_replace_with_const` forwarding internally.  We take the
-    /// entry out of `heap_cache` for the duration of the call so the
-    /// borrow checker accepts `&mut entry` and `&self.heap_cache`'s
-    /// neighbour fields simultaneously, then put it back.
+    /// `maybe_replace_with_const` forwarding internally.  The entry is
+    /// looked up in place (`self.heap_cache[descr]`).
     pub fn getfield_cached(
         &mut self,
         obj: OpRef,
@@ -811,10 +805,18 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return None;
         }
-        let mut entry = self.heap_cache.remove(&field_index)?;
-        let result = entry.read(obj, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
-        result
+        // `CacheEntry.read` looks up `self.heap_cache[descr]` in place.
+        // `_seen_alloc` is independent of `_unique_const_heuristic` (the
+        // heuristic only rewrites ConstPtr, which is never a
+        // RefFrontendOp, so `_seen_alloc` stays False).
+        if self.heap_cache.get(&field_index).is_none() {
+            return None;
+        }
+        let seen_alloc = self.saw_allocation(obj, boxes);
+        let entry = self.heap_cache.get_mut(&field_index)?;
+        let ref_box = entry._unique_const_heuristic(obj, oracle);
+        let fieldbox = *entry._getdict(seen_alloc).get(&ref_box)?;
+        Some(self.maybe_replace_with_const(fieldbox, boxes))
     }
 
     /// heapcache.py `setfield(self, box, fieldbox, descr)`.
@@ -844,9 +846,19 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return;
         }
-        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.do_write_with_aliasing(obj, value, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
+        // `CacheEntry.do_write_with_aliasing` mutates the descr's entry
+        // in place (`self.heap_cache[descr][box] = fieldbox`).
+        let seen_alloc = self.saw_allocation(obj, boxes);
+        if self.heap_cache.get(&field_index).is_none() {
+            self.heap_cache.insert(field_index, CacheEntry::default());
+        }
+        let entry = self
+            .heap_cache
+            .get_mut(&field_index)
+            .expect("field CacheEntry just inserted");
+        let ref_box = entry._unique_const_heuristic(obj, oracle);
+        entry._clear_cache_on_write(seen_alloc);
+        entry._getdict_mut(seen_alloc).insert(ref_box, value);
     }
 
     /// heapcache.py `getfield_now_known(self, box, descr,
@@ -872,9 +884,17 @@ impl HeapCache {
         if declines_unnumbered_field(field_index) {
             return;
         }
-        let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.read_now_known(obj, value, self, boxes, oracle);
-        self.heap_cache.insert(field_index, entry);
+        // `CacheEntry.read_now_known` writes the descr's entry in place.
+        let seen_alloc = self.saw_allocation(obj, boxes);
+        if self.heap_cache.get(&field_index).is_none() {
+            self.heap_cache.insert(field_index, CacheEntry::default());
+        }
+        let entry = self
+            .heap_cache
+            .get_mut(&field_index)
+            .expect("field CacheEntry just inserted");
+        let ref_box = entry._unique_const_heuristic(obj, oracle);
+        entry._getdict_mut(seen_alloc).insert(ref_box, value);
     }
 
     /// heapcache.py: invalidate_unescaped — clear cached values for
@@ -1723,10 +1743,8 @@ impl HeapCache {
         oracle: &dyn SameConstantOracle,
         boxes: &'a mut dyn HeapcBoxes,
     ) -> FieldUpdater<'a> {
-        let fieldbox = if let Some(mut entry) = self.heap_cache.remove(&descr_index) {
-            let result = entry.read(obj, self, boxes, oracle);
-            self.heap_cache.insert(descr_index, entry);
-            result
+        let fieldbox = if self.heap_cache.get(&descr_index).is_some() {
+            self.getfield_cached(obj, descr_index, oracle, boxes)
         } else {
             // heapcache.py `cache = self.heap_cache[descr] = CacheEntry(self)`.
             self.heap_cache.insert(descr_index, CacheEntry::new());

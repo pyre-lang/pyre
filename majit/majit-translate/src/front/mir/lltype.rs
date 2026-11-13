@@ -470,9 +470,7 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
             continue;
         };
         let impl_id = i as u64;
-        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
-            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
-        else {
+        let Some(fn_id) = impl_or_default_method_fn_id(llbc, impl_id, method_idx) else {
             continue;
         };
         let Some(fd) = llbc.fn_by_id(fn_id) else {
@@ -514,13 +512,31 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
 ) -> Option<(u64, Vec<String>, serde_json::Value)> {
     let ty = first_arg_ty?;
     let (_, fn_id, impl_generics) = trait_impl_match_for_receiver(ty, payload, llbc)?;
+    let (fn_id, segments) = fun_decl_call_segments(llbc, fn_id)?;
+    Some((fn_id, segments, impl_generics))
+}
+
+/// `spec_segments` path of an impl (or inherited default) FunDecl, the
+/// same `CallTarget::FunctionPath` the concrete-receiver path emits.
+pub(in crate::front::mir) fn impl_method_call_segments(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<(u64, Vec<String>)> {
+    fun_decl_call_segments(
+        llbc,
+        impl_or_default_method_fn_id(llbc, impl_id, method_idx)?,
+    )
+}
+
+fn fun_decl_call_segments(llbc: &Llbc, fn_id: u64) -> Option<(u64, Vec<String>)> {
     let fd = llbc.fn_by_id(fn_id)?;
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
     let path = fd.item_meta.name_path();
     let leaf = path.rsplit("::").next().unwrap_or("fn");
-    Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
+    Some((fn_id, spec_segments(llbc, fd, leaf)))
 }
 
 /// Unique trait declaration whose `name_path` is `path`.
@@ -1692,15 +1708,19 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
         .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
-    // Only source-local traits participate: std/core trait impls
-    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
-    // are host machinery, not translated-program classes, and keep
-    // their inherent classification.
-    if !td.item_meta.is_local {
-        return None;
-    }
+    // Host traits (`core` / `alloc` / `std` `Drop` / `FnOnce` /
+    // `PartialEq`, …) stay inherent. Charon `item_meta.is_local` is
+    // this artefact's crate, not "translated-program trait": a TraitDecl
+    // imported into a later artefact is `is_local = false` while still a
+    // translated-crate class. `rpbc.py FunctionReprBase.call` /
+    // `row_of_graphs.values()` puts every implementation in the family;
+    // the crate a trait was declared in is an extraction boundary.
     let trait_path = td.item_meta.name_path();
     if trait_path.is_empty() {
+        return None;
+    }
+    let crate_root = trait_path.split("::").next().unwrap_or("");
+    if !td.item_meta.is_local && !crate::local_crates::is_local_crate_root(crate_root) {
         return None;
     }
     Some(trait_path)
@@ -1735,7 +1755,7 @@ pub(in crate::front::mir) fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u
 /// (`CallControl.getcalldescr`). A GC strategy stays a GC root
 /// (`walk_bh_regs` / `drag_out_root`). By-value ZST (`From::from`) stays
 /// `Void`. Core/std impls stay peeled
-/// (`trait_impl_trait_path_for_fundecl` is `None` for non-local traits).
+/// (`trait_impl_trait_path_for_fundecl` is `None` for host traits).
 pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -1786,6 +1806,13 @@ pub(in crate::front::mir) fn input_param_value_type(
     is_first_param: bool,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> ValueType {
+    // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+    // Keep the Input bank `ref` even when a later peel would treat the
+    // transparent `usize` field as a scalar pointee (`jtransform.py`
+    // `getkind` of a GC pointer is `'ref'`).
+    if tyref_is_frame_anchor(local_ty, llbc) {
+        return ValueType::Ref(None);
+    }
     if matches!(ty, ValueType::Ref(None))
         && tyref_is_void_zst(local_ty, llbc)
         && !tyref_keeps_empty_class_instance(local_ty, llbc, tombstoned_leaves)
@@ -2390,6 +2417,8 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
 
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
 /// address pointing at those. A `Vec` / `String` / other GC field is not.
+/// Compiler ADTs (`Tuple` / `Box` / `str`) are GC storage (`rtuple.py`
+/// `GcStruct`): their items may be scalars, but the allocation is `new`.
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
@@ -2423,6 +2452,14 @@ fn adt_def_is_raw_storage_at(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // Tuple / Box / str are compiler ADTs with no `GcType` impl, but
+    // `rtuple.py` lays each tuple out as a `GcStruct` and `new` allocates
+    // them as GC. Walking their scalar items would stamp the tuple — and
+    // every Option/enum that boxes one — Raw, which `rewrite_op_setfield`
+    // then replaces with Abort.
+    if type_decl_is_builtin_adt(td) {
+        return false;
+    }
     // A marked exception-class enum is the minted class, not a raw word
     // bag. `&E` must stay `Ref` so the parameter carries the class root.
     // An unmarked enum keeps the raw-storage answer below.
@@ -2976,6 +3013,16 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         && let Some(kind) = scalar_value_type(scalar)
     {
         return kind;
+    }
+    // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+    // By value, `&FrameAnchor`, `&mut FrameAnchor`, and `Self::Anchor`
+    // are that word (`pyframe.py` / `pyopcode.py`: one red GC reference;
+    // `jtransform.py` `getkind` of a GC pointer is `'ref'`). Checked
+    // before the transparent peel: the Rust field is `usize`, which
+    // would otherwise bank the parameter as `'int'` and make `live()`'s
+    // identity alias disagree with a `*mut PyFrame` `FUNC.RESULT`.
+    if tyref_is_frame_anchor(ty, llbc) {
+        return ValueType::Ref(None);
     }
     // A trait associated-type projection (`Self::Truth`) has no
     // representation of its own — it is whatever the selected impl binds
@@ -4902,6 +4949,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             ) {
                 return Some(format!("raw:{root}"));
             }
+            // `direct_arrayitems` (`lltype.py`) of a GC array is a raw
+            // `Ptr` (`history.py` `getkind` `'int'`). Stamp `raw:<Item>`
+            // so `FUNC.RESULT` matches the CFG `int_return` and callers
+            // emit `inline_call_*_i` (`call.py` `getcalldescr`).
+            if let Some(root) = gc_array_item_struct_ptr_owner_root(kind_src, llbc, gc_struct_ids) {
+                return Some(format!("raw:{root}"));
+            }
             // `llmemory.GCREF` / `*mut GCREFOpaque` is `SomePtr(GCREF)`.
             // A registered GC pointer (`PyObjectRef`) stays `"ref"` so
             // `declared_return_annotation` intern's `annotationoftype`
@@ -4941,6 +4995,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    // FrameAnchor is the frame GCREF, not an interned instance. A class
+    // root here would let `declared_graph_result_type` flip the `"ref"`
+    // FUNC.RESULT token to Int via a raw-struct layout.
+    if tyref_is_frame_anchor(ty, llbc) {
         return None;
     }
     if let Some(root) =
@@ -6357,7 +6417,9 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// [`tyref_one_word_handle_payload_field`], the Field-projection
 /// identity); `all_fielddescrs` does not recurse, so
 /// `PyreDecodeContext.pos_delta` is one
-/// `getfield(PyreDecodeContext, "pos_delta")`.
+/// `getfield(PyreDecodeContext, "pos_delta")`. A `repr(transparent)` scalar
+/// wrapper is that word ([`tyref_transparent_inner_value_type`]); copying its
+/// fields would getattr them on Integer and `getfield_raw_r` a marker.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -6411,16 +6473,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     }
     // A transparent wrapper over a scalar is that scalar's one-word field
     // (`lltype.py` has no substruct for it), so it is not an inlined struct.
-    if matches!(
-        tyref_transparent_inner_value_type(
-            ty,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        ),
-        Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
-    ) {
+    if let Some(inner) = tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) && value_type_is_transparent_scalar_word(&inner)
+    {
         return None;
     }
     Some(td)
@@ -7219,6 +7279,9 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     tombstoned: &std::collections::HashSet<String>,
     generics: Option<&FunGenerics>,
 ) -> Option<String> {
+    if tyref_is_frame_anchor(ty, llbc) {
+        return None;
+    }
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
         return Some(spelling);
@@ -8111,6 +8174,19 @@ fn one_word_integer_scalar_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
     } else {
         None
     }
+}
+
+pub(in crate::front::mir) fn value_type_is_transparent_scalar_word(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+            | ValueType::Int128
+            | ValueType::UInt128
+    )
 }
 
 pub(in crate::front::mir) fn transparent_scalar_value_type(
@@ -13783,8 +13859,9 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// …) off the two-phase rtyper.
 
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
-/// `CallTarget::Indirect` vtable pipeline instead of the synthetic
-/// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
+/// `{vtable}.method_*` FieldRead plus `IndirectCall { family_key }`
+/// instead of the synthetic `__dyn_call` residual (see the
+/// `(CallClass::Dynamic, ..)` arm).
 ///
 /// `__dyn_call` is not a lowering, it is a placeholder: an unregistered
 /// synthetic path that stops whatever graph reaches it.  Routing through
@@ -13830,7 +13907,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// of its members.  **The `on` column has not been re-measured since**; the
 /// `off` column is unaffected by construction, since this arm emits nothing
 /// with the switch off.  Nothing else moved in the original census: the
-/// vtable-slot calls already on `CallTarget::Indirect` held at 47 / 24, and
+/// vtable-slot calls already on `IndirectCall { family_key }` held at 47 / 24, and
 /// `pyre-interpreter`'s 203 `BuiltinCodeFn` sites kept the `Some([])`
 /// marker in both states.
 ///
@@ -13959,6 +14036,73 @@ pub(in crate::front::mir) fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) ->
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone()), llbc);
     (!suffix.is_empty()).then(|| format!("Tuple{suffix}"))
+}
+
+/// ADT def id of the element of a `[T; N]` / `Array` field, after
+/// wrapper peel. `None` when `ty` is not a fixed array of a nominal
+/// struct (`GcEntries.items: [Entry; 0]`).
+pub(in crate::front::mir) fn tyref_array_elem_adt_def_id(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let arr = node.get("Array")?.as_array()?;
+    let elem = arr.first()?;
+    let elem = strip_ty_wrappers(elem, llbc).unwrap_or(elem);
+    adt_node_def_id(elem)
+}
+
+/// True when a declared GC struct has a `[item; N]` field whose
+/// element ADT is `item_def_id` (`lltype.py` `GcArray(ITEM)`,
+/// `direct_arrayitems`).
+pub(in crate::front::mir) fn gc_array_carries_item_struct(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    item_def_id: u64,
+) -> bool {
+    llbc.iter_type_decls().any(|td| {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return false;
+        };
+        let name = strip_crate_prefix(&td.item_meta.name_path());
+        let sid = majit_ir::descr::StructId::from_canonical(&name);
+        if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+            return false;
+        }
+        fields
+            .iter()
+            .any(|field| tyref_array_elem_adt_def_id(&field.ty, llbc) == Some(item_def_id))
+    })
+}
+
+/// Class root of a `*mut Item` whose `Item` is a raw `lltype.Struct`
+/// stored as the `[T; N]` tail of a declared GC array (`GcEntries.items:
+/// [Entry; 0]`). `history.py` `getkind` of that `Ptr` is `'int'`.
+/// `None` for a vtable (`PyType`), rstr `STR` (`Utf8Str`), or a
+/// declared-GC pointee — those stay GC/STR refs.
+pub(in crate::front::mir) fn gc_array_item_struct_ptr_owner_root(
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let pointee = tyref_peel_one_raw_ptr_node(dest_ty, llbc)?;
+    if node_is_string_value(pointee, llbc) {
+        return None;
+    }
+    let id = adt_node_def_id(pointee)?;
+    let td = llbc.type_by_id(id)?;
+    if type_decl_is_builtin_adt(td) {
+        return None;
+    }
+    if !matches!(&td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let name = strip_crate_prefix(&td.item_meta.name_path());
+    let sid = majit_ir::descr::StructId::from_canonical(&name);
+    if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+        return None;
+    }
+    if !gc_array_carries_item_struct(llbc, gc_struct_ids, id) {
+        return None;
+    }
+    Some(adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves()).unwrap_or(name))
 }
 
 /// The per-shape suffix for a fixed-size array destination
@@ -15146,6 +15290,17 @@ pub(in crate::front::mir) fn trait_payload_path_and_method(
         .to_string();
     let trait_path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     Some((trait_path, method_leaf))
+}
+
+/// Fully-qualified trait declaration path from a `CallKind::Trait` payload.
+/// Sibling of [`trait_payload_owner`]: that helper returns only the leaf.
+pub(in crate::front::mir) fn trait_payload_decl_path(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let arr = v.as_array()?;
+    let decl_id = trait_ref_decl_id(arr.first()?, llbc)?;
+    Some(llbc.trait_by_id(decl_id)?.item_meta.name_path())
 }
 
 /// `Vec<T>` as trait `Clone::clone` → the `list` builtin

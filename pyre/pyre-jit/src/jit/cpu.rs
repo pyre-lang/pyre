@@ -601,6 +601,9 @@ pub struct Cpu {
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
     pub unary_not_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
+    /// `bh_to_bool_fn(truth)` — `space.newbool` (`baseobjspace.py newbool`).
+    /// Raw truth Int 0/1 → `w_False` / `w_True`. Cannot raise.
+    pub to_bool_fn: extern "C" fn(i64) -> pyre_object::PyObjectRef,
     /// `bh_load_fast_check_fn(value, code, name_idx)` — LOAD_FAST_CHECK
     /// unbound-local guard (returns `value`, or raises `NameError`).
     pub load_fast_check_fn: extern "C" fn(
@@ -997,6 +1000,7 @@ impl Cpu {
             match_keys_fn: cpu_word!(2, crate::call_jit::bh_match_keys_fn),
             match_class_fn: cpu_word!(4, crate::call_jit::bh_match_class_fn),
             unary_not_fn: cpu_word!(1, crate::call_jit::bh_unary_not_fn),
+            to_bool_fn: cpu_word!(1, crate::call_jit::bh_to_bool_fn),
             load_fast_check_fn: cpu_word!(3, crate::call_jit::bh_load_fast_check_fn),
             unbound_local_error_fn: cpu_word!(2, crate::call_jit::bh_unbound_local_error_fn),
             compare_fn: cpu_word!(3, pyre_interpreter::opcode_ops::jit_compare_value_from_tag),

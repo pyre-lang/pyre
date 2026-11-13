@@ -84,11 +84,11 @@ impl<'a> Lowering<'a> {
         glue: Option<&RegularCall>,
     ) -> Result<bool, LowerError> {
         if drop_place_is_frame_anchor(place, self.body, self.llbc) {
-            self.emit_one_word_guard_release(
-                mir_bb,
-                place,
-                ["pyre_interpreter", "eval", "frame_anchor_release"],
-            )?;
+            // RPython roots `frame` as a GC local (`bytecode_only_trace` /
+            // `_trace`); `keepalive_until_here` is that local's liveness
+            // end. A residual `frame_anchor_release` would pop an absolute
+            // shadow-stack depth under the blackhole `ListRootGuard`.
+            self.emit_frame_anchor_keepalive(mir_bb, place)?;
             return Ok(true);
         }
         if drop_place_is_object_lock_guard(place, self.llbc) {
@@ -196,15 +196,35 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Drop a one-word guard local by passing its word to the bound release
-    /// residual `release`. The caller continues to the drop's successor.
-    ///
-    /// A [`FrameAnchor`] is one such guard. `front::mir` aliases that local
-    /// to its depth `Int`. `FrameAnchor::drop` takes `&mut self` (`Ref`), so
-    /// emitting that path as the residual made the containing graph fail to
-    /// look-inside (`opcode_compare_op` residualized as unbound `ri`).
-    /// `frame_anchor_release` is already `dont_look_inside` and takes the
-    /// depth as `usize`.
+    /// `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+    /// Its Drop is `objectmodel.keepalive_until_here` of that word, the
+    /// same liveness end `gctransform` plants for a GC local.
+    pub(in crate::front::mir) fn emit_frame_anchor_keepalive(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<(), LowerError> {
+        let PlaceKind::Local(local) = place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: FrameAnchor Drop over a projection place"
+            )));
+        };
+        if let Some(arg) = self.local_var[local as usize]
+            .as_ref()
+            .and_then(|value| value.one().ok())
+        {
+            crate::model::FunctionGraph::set_concretetype_of_inline(
+                &arg,
+                crate::model::ConcreteType::GcRef,
+            );
+            self.emit_keepalive(mir_bb, arg);
+        }
+        Ok(())
+    }
+
+    /// Drop a one-word lock-guard local by passing its word to the bound
+    /// release residual `release`. The caller continues to the drop's
+    /// successor. `ListGuard` / `SetGuard` take the lock token as `usize`.
     pub(in crate::front::mir) fn emit_one_word_guard_release(
         &mut self,
         mir_bb: usize,
@@ -257,6 +277,65 @@ impl<'a> Lowering<'a> {
             },
         };
         self.lower_call(mir_bb, call, target, on_unwind)
+    }
+
+    /// Lower `FrameAnchor::{from_raw,new,live}` and the `frame_anchor_*`
+    /// slot ops as a GC-local keepalive, not as residual shadow-stack
+    /// push/get/pop.
+    ///
+    /// `from_raw` / `push` / `new` are the identity of the frame GCREF;
+    /// `live` is that same word interned as the dest pointee instance;
+    /// Drop / `release` is `keepalive_until_here`. `#[repr(transparent)]`
+    /// FieldRead of `.depth` then stays that GCREF (`resolve_place`
+    /// identity of the sized field), so a later `live()` still names
+    /// the frame.
+    pub(in crate::front::mir) fn try_lower_frame_anchor_call(
+        &mut self,
+        mir_bb: usize,
+        name: &str,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(kind) = frame_anchor_lowering(name) else {
+            return Ok(false);
+        };
+        let Some(owner) = args.first() else {
+            return Ok(false);
+        };
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            owner,
+            crate::model::ConcreteType::GcRef,
+        );
+        match kind {
+            FrameAnchorLowering::IdentityFrame | FrameAnchorLowering::IdentityLive => {
+                self.alias_dest_to_arg0(dest_local, owner.clone(), false);
+            }
+            FrameAnchorLowering::KeepaliveRelease => {
+                self.emit_keepalive(mir_bb, owner.clone());
+                let void = self.emit_unit(self.emit_bb(mir_bb));
+                self.local_var[dest_local] = Some(LocalValue::One(void));
+            }
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        // `live` / `frame_anchor_live` dest is `*mut PyFrame`. The alias
+        // is the frame GCREF (classdef-less `SomeInstance`); intern it as
+        // the pointee (`rgc.py` `cast_gcref_to_instance`, `signature.py`
+        // `annotationoftype`, `bookkeeper.py` `getuniqueclassdef`) so
+        // `getattr` of `push` / `next_instr` is `SomeInstance.getattr`.
+        // At jitcode the recast is `cast_pointer` → `same_as`.
+        if kind == FrameAnchorLowering::IdentityLive
+            && let Some(LocalValue::One(value)) = self.local_var[dest_local].clone()
+        {
+            let narrowed = self.recast_gcref_word_to_registered_dest(bb_id, dest_ty, value.clone());
+            copy_concretetype(&value, &narrowed);
+            self.local_var[dest_local] = Some(LocalValue::One(narrowed));
+        }
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// Lower one call of a bracket [`RootBracketPlan`] erased, and report
@@ -917,6 +996,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// `RootScope` is the exception: it *is* the save-point word
+    /// (`framework.py push_roots` / `pop_roots` livevars length,
+    /// `shadowstack.py gc_push_roots`). `Rvalue::Ref` aliases that word, and
+    /// the residual ABI takes it by value (`WordAbi` / `ResidualRet`).
     pub(in crate::front::mir) fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -932,9 +1016,18 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        // Charon names inherent methods `gc_roots::<Impl>::pin_roots`.
+        // After `repr(transparent)` the declared receiver is already
+        // `&usize`, so `tyref_is_root_scope` misses it. The residual ABI
+        // takes the save-point word by value (`framework.py push_roots`
+        // livevars length / `WordAbi`). Skip the whole call: later args
+        // (`&[PyObjectRef]`) must not trip the same refusal.
+        if gc_root_scope_residual_method_path(&fd.item_meta.name_path()) {
+            return Ok(());
+        }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
-            if std::iter::once(declared).chain(passed).any(|ty| {
+            let Some(ty) = std::iter::once(declared).chain(passed).find(|ty| {
                 tyref_is_borrowed_transparent_scalar(
                     ty,
                     self.llbc,
@@ -942,13 +1035,17 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 )
-            }) {
-                return Err(LowerError::Unsupported(format!(
-                    "bb{mir_bb}: residual `{}` argument {index} borrows a \
-                     repr(transparent) scalar; the word is not an address",
-                    fd.item_meta.name_path()
-                )));
+            }) else {
+                continue;
+            };
+            if tyref_is_root_scope(ty, self.llbc) {
+                continue;
             }
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: residual `{}` argument {index} borrows a \
+                 repr(transparent) scalar; the word is not an address",
+                fd.item_meta.name_path()
+            )));
         }
         Ok(())
     }
@@ -985,6 +1082,37 @@ pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
+/// Charon names an inherent method `gc_roots::<Impl>::leaf` or
+/// `gc_roots::RootScope::leaf`. The residual ABI takes the save-point
+/// word by value (`WordAbi` / `ResidualRet`), so
+/// `refuse_borrowed_transparent_scalar_residual` must not reject these
+/// callees after `repr(transparent)` peels the receiver to `&usize`.
+/// Looking inside emits `getfield_raw_i` of that word as a struct
+/// pointer (`root_scope_close` of save-point 4 SIGSEGVs at address 4).
+/// Every `dont_look_inside_cannot_raise` RootScope helper is a residual,
+/// including `set` / `normalize_moved` / Drop and the free
+/// `root_scope_close`.
+pub(in crate::front::mir) fn gc_root_scope_residual_method_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    if !segments.contains(&ROOT_SCOPE_MODULE) {
+        return false;
+    }
+    if segments.contains(&ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<')) {
+        return true;
+    }
+    matches!(segments.last().copied(), Some(ROOT_SCOPE_CLOSE))
+}
+
+/// `RootScope` or `&RootScope`: `strip_ty_wrappers` peels the borrow, and
+/// the transparent wrapper is the save-point word.
+pub(in crate::front::mir) fn tyref_is_root_scope(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+}
+
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 pub(in crate::front::mir) fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
@@ -1019,17 +1147,65 @@ pub(in crate::front::mir) fn root_scope_drop_glue_template(
     }))
 }
 
+/// How a `FrameAnchor` constructor, reload, or Drop lowers.
+///
+/// RPython never residualizes a shadow-stack push for `frame`: the
+/// gctransform plants `gc_push_roots` / `gc_pop_roots` around collecting
+/// calls (`shadowstack.py`), and `keepalive_until_here` holds the local
+/// live until the matching end. pyre's `FrameAnchor` is that local
+/// spelled as a guard; the translator must not turn the guard into a
+/// residual `frame_anchor_push` / `live` / `release` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::front::mir) enum FrameAnchorLowering {
+    /// `from_raw` / `new` / `frame_anchor_push`: dest is the frame GCREF.
+    IdentityFrame,
+    /// `live` / `frame_anchor_live`: dest is the same GCREF interned as
+    /// the dest pointee instance (`cast_gcref_to_instance`).
+    IdentityLive,
+    /// Drop / `frame_anchor_release`: `keepalive_until_here` of the GCREF.
+    KeepaliveRelease,
+}
+
+/// Classify a callee as a `FrameAnchor` identity or keepalive.
+///
+/// Method paths must contain `FrameAnchor` so a generic `new` /
+/// `from_raw` / `live` on another type is left alone. Free functions
+/// and jit_abi bridges match on the `frame_anchor_*` leaf only.
+pub(in crate::front::mir) fn frame_anchor_lowering(name: &str) -> Option<FrameAnchorLowering> {
+    let segments: Vec<&str> = name.split("::").collect();
+    let last = *segments.last()?;
+    if segments.contains(&"FrameAnchor") {
+        return match last {
+            "from_raw" | "new" => Some(FrameAnchorLowering::IdentityFrame),
+            "live" => Some(FrameAnchorLowering::IdentityLive),
+            "drop" | "drop_in_place" => Some(FrameAnchorLowering::KeepaliveRelease),
+            _ => None,
+        };
+    }
+    match last {
+        "frame_anchor_push" | "frame_anchor_push_jit_abi" | "frame_anchor_new_jit_abi" => {
+            Some(FrameAnchorLowering::IdentityFrame)
+        }
+        "frame_anchor_live" | "frame_anchor_live_jit_abi" | "frame_anchor_live_method_jit_abi" => {
+            Some(FrameAnchorLowering::IdentityLive)
+        }
+        "frame_anchor_release" | "frame_anchor_release_jit_abi" => {
+            Some(FrameAnchorLowering::KeepaliveRelease)
+        }
+        _ => None,
+    }
+}
+
 /// Match Charon's `eval::FrameAnchor::<Impl>::drop_in_place` path.
 ///
-/// `frame_anchor_new_jit_abi` publishes the slot and forgets `Drop`;
-/// the matching `drop_in_place` must become a residual
-/// `frame_anchor_release` or compiled loops leak every iteration.
+/// The Drop glue is `keepalive_until_here` of the frame GCREF, so
+/// liveness still treats this block as a use of the local.
 pub(in crate::front::mir) fn frame_anchor_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     let last = segments.last().copied();
     // Charon names the Drop impl `FrameAnchor::drop`; the MIR
-    // terminator glue is `drop_in_place`. Either must close the
-    // `frame_anchor_new_jit_abi` slot.
+    // terminator glue is `drop_in_place`. Either is a use of the
+    // frame GCREF (`keepalive_until_here`).
     (last == Some("drop_in_place") || last == Some("drop")) && segments.contains(&"FrameAnchor")
 }
 
@@ -1047,7 +1223,11 @@ pub(in crate::front::mir) fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> b
     {
         return true;
     }
-    false
+    // `live_handler` takes `&Self::Anchor`. The unique-impl binding is
+    // `FrameAnchor`; `strip_ty_wrappers` leaves a `TraitType`, so the
+    // ADT walk above does not see the name.
+    trait_assoc_projection_target(node, llbc)
+        .is_some_and(|resolved| tyref_is_frame_anchor(&resolved, llbc))
 }
 
 pub(in crate::front::mir) fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
@@ -2192,6 +2372,24 @@ pub(in crate::front::mir) fn trait_default_method_id(
         .methods
         .get(method as usize)?
         .default_id
+}
+
+/// The impl's own body for `method_idx`, or the trait default when the
+/// impl does not override it (`ClassDesc.lookup` /
+/// [`trait_method_on_known_receiver`]).
+pub(in crate::front::mir) fn impl_or_default_method_fn_id(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<u64> {
+    let trait_id = llbc
+        .trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("impl_trait")?
+        .get("id")?
+        .as_u64()?;
+    crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
+        .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
 }
 
 /// The function item a `FnDef` node names, spelled as the `RegularCall`

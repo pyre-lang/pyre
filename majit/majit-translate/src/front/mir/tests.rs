@@ -146,6 +146,198 @@ mod reachable_mask_tests {
     }
 }
 
+mod cell_scope_liveness_tests {
+    use super::super::{
+        CellScalarPlan, cell_scope_extra_live, compute_mir_liveness, forward_reachable_mask,
+    };
+    use majit_charon_reader::{Llbc, ullbc::Unstructured};
+    use serde_json::{Value, json};
+
+    fn span() -> Value {
+        json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 0, "col": 0},
+                "end": {"line": 0, "col": 0}
+            },
+            "generated_from_span": null
+        })
+    }
+
+    fn ty() -> Value {
+        json!({"Deduplicated": 0})
+    }
+
+    fn place(i: u64) -> Value {
+        json!({"kind": {"Local": i}, "ty": ty()})
+    }
+
+    fn local(i: u64) -> Value {
+        json!({"index": i, "name": null, "span": span(), "ty": ty()})
+    }
+
+    fn stmt(kind: Value) -> Value {
+        json!({"kind": kind, "comments_before": [], "span": span()})
+    }
+
+    fn bb(statements: Vec<Value>, kind: Value) -> Value {
+        json!({
+            "statements": statements,
+            "terminator": {"span": span(), "kind": kind},
+            "kind": "Regular"
+        })
+    }
+
+    /// `StorageLive` of a cell, then a join with a path that never
+    /// allocated it. The cell pointer is live only on the allocated
+    /// side (`ScopedAlloc.__enter__`); extra-live must not treat the
+    /// join as a use, or the backward fixpoint demands the cell on
+    /// the `bb0`→`bb1` edge.
+    #[test]
+    fn cell_storage_live_join_is_not_live_in_at_start() {
+        // bb0: goto bb1
+        // bb1: switch → bb2 (allocate) | bb3 (skip)
+        // bb2: StorageLive _2; _2 = const; goto bb4
+        // bb3: goto bb5
+        // bb4: goto bb5
+        // bb5: return
+        let body_json = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": [local(0), local(1), local(2)]
+            },
+            "body": [
+                bb(vec![], json!({"Goto": {"target": 1}})),
+                bb(vec![], json!({
+                    "Switch": {
+                        "discr": {"Read": place(1)},
+                        "targets": {"If": [2, 3]}
+                    }
+                })),
+                bb(
+                    vec![
+                        stmt(json!({"StorageLive": 2})),
+                        stmt(json!({
+                            "Assign": [place(2), {"Use": [{"Const": null}, "No"]}]
+                        })),
+                    ],
+                    json!({"Goto": {"target": 4}}),
+                ),
+                bb(vec![], json!({"Goto": {"target": 5}})),
+                bb(vec![], json!({"Goto": {"target": 5}})),
+                bb(vec![], json!("Return")),
+            ]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
+        let llbc = Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .expect("empty artefact");
+        let forward = forward_reachable_mask(&llbc, &body);
+        let mut locals = bit_set::BitSet::with_capacity(3);
+        locals.insert(2);
+        let mut has_storage_live = bit_set::BitSet::with_capacity(3);
+        has_storage_live.insert(2);
+        let plan = CellScalarPlan {
+            locals: locals.clone(),
+            descr: vec![None, None, None],
+            has_storage_live,
+        };
+        let extra = cell_scope_extra_live(&llbc, &body, &plan, &forward);
+        assert!(
+            extra[2].contains(&2) && extra[4].contains(&2),
+            "the allocated path keeps the cell pointer: extra={extra:?}"
+        );
+        assert!(
+            extra[1].is_empty() && extra[3].is_empty() && extra[5].is_empty(),
+            "the skip path and the join are not a cell use: extra={extra:?}"
+        );
+        let live = compute_mir_liveness(&llbc, &body, &extra, &bit_set::BitSet::new(), &locals);
+        assert!(
+            !live[1].contains(2),
+            "cell allocated in bb2 must not be live-in at bb1"
+        );
+        assert!(
+            live[4].contains(2),
+            "the successor of StorageLive must take the cell pointer"
+        );
+        assert!(
+            !live[5].contains(2),
+            "the join with the skip path must not demand the cell"
+        );
+    }
+
+    /// `StorageLive` before a loop. The latch is a predecessor of the
+    /// header, so growing only when every predecessor is already in
+    /// the set would stall and drop the cell inside the loop.
+    /// `ScopedAlloc.__enter__` still holds it; extra-live keeps the
+    /// header, the latch, and the exit.
+    #[test]
+    fn cell_storage_live_before_a_loop_stays_live_in_the_loop() {
+        // bb0: StorageLive _2; _2 = const; goto bb1
+        // bb1: switch → bb2 (latch) | bb3 (exit)
+        // bb2: goto bb1
+        // bb3: return
+        let body_json = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": [local(0), local(1), local(2)]
+            },
+            "body": [
+                bb(
+                    vec![
+                        stmt(json!({"StorageLive": 2})),
+                        stmt(json!({
+                            "Assign": [place(2), {"Use": [{"Const": null}, "No"]}]
+                        })),
+                    ],
+                    json!({"Goto": {"target": 1}}),
+                ),
+                bb(vec![], json!({
+                    "Switch": {
+                        "discr": {"Read": place(1)},
+                        "targets": {"If": [2, 3]}
+                    }
+                })),
+                bb(vec![], json!({"Goto": {"target": 1}})),
+                bb(vec![], json!("Return")),
+            ]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
+        let llbc = Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .expect("empty artefact");
+        let forward = forward_reachable_mask(&llbc, &body);
+        let mut locals = bit_set::BitSet::with_capacity(3);
+        locals.insert(2);
+        let mut has_storage_live = bit_set::BitSet::with_capacity(3);
+        has_storage_live.insert(2);
+        let plan = CellScalarPlan {
+            locals: locals.clone(),
+            descr: vec![None, None, None],
+            has_storage_live,
+        };
+        let extra = cell_scope_extra_live(&llbc, &body, &plan, &forward);
+        assert!(
+            extra[0].contains(&2)
+                && extra[1].contains(&2)
+                && extra[2].contains(&2)
+                && extra[3].contains(&2),
+            "the loop after StorageLive keeps the cell pointer: extra={extra:?}"
+        );
+        let live = compute_mir_liveness(&llbc, &body, &extra, &bit_set::BitSet::new(), &locals);
+        assert!(
+            live[1].contains(2) && live[2].contains(2),
+            "the loop header and latch must take the cell pointer"
+        );
+    }
+}
+
 /// The unsubstituted generic `entries_item_ptr` has TypeVars and no
 /// Charon layout. Translation stops rather than guess the items
 /// offset (`array_field_items_offset`).
@@ -156,6 +348,98 @@ fn unsubstituted_entries_item_ptr_stops_without_guessing_offset() {
     let err = crate::test_support::lower_function(llbc, "entries_item_ptr")
         .expect_err("generic entries_item_ptr has no items offset");
     assert!(err.to_string().contains("direct_arrayitems"), "{err}");
+}
+
+fn lower_substituted_entries_item_ptr() -> crate::model::FunctionGraph {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let name_path = "pyre_object::rordereddict_entries::entries_item_ptr";
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == name_path)
+        .unwrap_or_else(|| panic!("{name_path} in pyre-object LLBC"));
+    let gcref_id = llbc
+        .iter_type_decls()
+        .find(|td| td.item_meta.name_path() == "pyre_object::pyobject::PyObject")
+        .unwrap_or_else(|| panic!("PyObject in pyre-object LLBC"))
+        .def_id;
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let gcref_ty = serde_json::json!({
+        "RawPtr": [
+            {
+                "Adt": {
+                    "id": gcref_id,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    },
+                    "builtin": null
+                }
+            },
+            "Mut"
+        ]
+    });
+    let body = crate::front::clause_spec::substituted_unstructured(
+        fd,
+        &llbc,
+        &[],
+        &[i64_ty, gcref_ty],
+        &[],
+    )
+    .expect("substituted entries_item_ptr body");
+    let context = super::LowerContext::new(&llbc);
+    let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    super::lower_unstructured_with_static_addrs_and_attrs(
+        &llbc,
+        fd,
+        &body,
+        crate::HostStaticAddrs::default(),
+        &jitdriver_receiver_roots,
+        None,
+        &context.struct_field_attrs,
+        &struct_fields,
+        &context.dont_look_inside,
+        &std::collections::HashSet::new(),
+        &context.tombstoned_leaves,
+        &context.gc_struct_ids,
+        &context.immutable_fields,
+        &context.raw_alloc_flavor_structs,
+        accum.has_builder,
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        None,
+        true,
+        None,
+        None,
+    )
+    .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"))
+}
+
+/// `direct_arrayitems` of `GcEntries<i64, PyObjectRef>` is a raw item
+/// pointer (`history.py` `getkind` of a raw `Ptr` is `'int'`). The
+/// flattened jitcode is `int_return`, never `cast_int_to_ptr/i>r`.
+#[test]
+fn substituted_entries_item_ptr_flattens_to_int_return() {
+    let graph = lower_substituted_entries_item_ptr();
+    assert_array_tail_item_ptr_is_raw_int(&graph);
+    let (text, keys) = flatten_jitcode_text_and_keys(&graph);
+    assert!(
+        text.contains("int_return"),
+        "entries_item_ptr returns kind i: {text}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.contains("cast_int_to_ptr/i>r")),
+        "raw item pointer is not recast to GCREF; keys={keys:?} text={text}"
+    );
+    assert!(
+        !text.contains("ref_return"),
+        "entries_item_ptr must not ref_return a GCREF into the array; {text}"
+    );
 }
 
 /// A one-word-item Vec header pointer is int-banked, matching
@@ -7672,6 +7956,231 @@ fn unsize_of_unregistered_ptr_metadata_is_unsupported() {
     );
 }
 
+/// `SetStrategy::{add,remove,has_key}` Dynamic rewrite targets the word
+/// trampoline, except when that trampoline's own body is being lowered.
+#[test]
+fn set_strategy_add_dynamic_does_not_rewrite_the_trampoline_to_itself() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+    });
+    let vtable_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+    });
+    let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+    let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+    let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+    let fn_ptr = serde_json::json!({
+        "FnPtr": {"inputs": [fat_ty.clone(), holder_ref.clone()], "output": {"Tuple": []}}
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let field_attr = serde_json::json!({
+        "attributes": [], "inline": null, "rename": null, "public": true
+    });
+    let holder = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Holder"]),
+        "kind": {"Struct": [{
+            "name": "slot",
+            "ty": fat_ty,
+            "attr_info": field_attr
+        }]}
+    });
+    let vtable = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "SetStrategy", "{vtable}"]),
+        "kind": {"Struct": [{
+            "name": "method_add",
+            "ty": fn_ptr,
+            "attr_info": field_attr
+        }]}
+    });
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let slot_place = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 1}), &holder_ref),
+                "Deref"
+            ]}), &holder_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &fat_ty,
+    );
+    let metadata_place = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Local": 2}), &fat_ty),
+            "PtrMetadata"
+        ]}),
+        &vtable_ptr,
+    );
+    let slot_field = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Projection": [
+                metadata_place,
+                "Deref"
+            ]}), &vtable_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &fn_ptr,
+    );
+    let fun_decl = |def_id: u64, path: &[&str]| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &holder_ref),
+                    local(2, &fat_ty),
+                    local(3, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                {"Use": [{"Read": slot_place}, "No"]}
+                            ]}},
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 3}), &fn_ptr),
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": fn_ptr.clone()}},
+                                    {"Read": slot_field}
+                                ]}
+                            ]}}
+                        ],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": [{"Read": place(
+                                    serde_json::json!({"Local": 3}),
+                                    &fn_ptr
+                                )}, {"regions": []}]},
+                                "args": [
+                                    {"Move": place(
+                                        serde_json::json!({"Local": 2}),
+                                        &fat_ty
+                                    )},
+                                    {"Read": place(
+                                        serde_json::json!({"Local": 1}),
+                                        &holder_ref
+                                    )}
+                                ]
+                            },
+                            "dest": place(serde_json::json!({"Local": 0}), &unit),
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "pyre_object",
+            "type_decls": [holder, vtable],
+            "fun_decls": [
+                fun_decl(0, &["pyre_object", "setobject", "set_strategy_add_key_ptr"]),
+                fun_decl(1, &["pyre_object", "setobject", "call_add"])
+            ],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["fixture", "SetStrategy"]),
+                "methods": [{"skip_binder": {"name": "add"}}]
+            }],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+    let trampoline = super::lower_function(&llbc, "set_strategy_add_key_ptr")
+        .expect("lower set_strategy_add_key_ptr");
+    let trampoline_indirect: Vec<_> = trampoline
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::IndirectCall {
+                graphs: None,
+                family_key: Some(family),
+                ..
+            } => Some(family.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        trampoline_indirect,
+        vec![("SetStrategy".to_string(), "add".to_string())],
+        "trampoline body keeps unknown-graph IndirectCall: {trampoline_indirect:?}"
+    );
+    let trampoline_self_calls: Vec<_> = trampoline
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.as_slice() == ["pyre_object", "setobject", "set_strategy_add_key_ptr"],
+            _ => false,
+        })
+        .collect();
+    assert!(
+        trampoline_self_calls.is_empty(),
+        "trampoline must not Call itself: {trampoline_self_calls:?}"
+    );
+
+    let caller = super::lower_function(&llbc, "call_add").expect("lower call_add");
+    let caller_rewrites: Vec<_> = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice()
+                == ["pyre_object", "setobject", "set_strategy_add_key_ptr"] =>
+            {
+                Some(segments.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        caller_rewrites.len(),
+        1,
+        "other caller still rewrites to the trampoline: {caller_rewrites:?}"
+    );
+}
+
 /// `w_dict_getitem_str_hashed` reads `imp` on two strategy arms, merges,
 /// then reads `method_*` after a passthrough. The FatMeta metadata word
 /// must be an inputarg of the method_* block: a dominating use of the
@@ -12987,6 +13496,132 @@ pub(in crate::front::mir) fn graph_ops(
         .iter()
         .flat_map(|block| block.operations.iter())
         .collect()
+}
+
+fn stamp_authoritative_concretetypes(graph: &mut crate::model::FunctionGraph) {
+    let empty = Default::default();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(res) = op.result.as_ref() else {
+                continue;
+            };
+            let Some(ct) =
+                crate::codewriter::type_state::authoritative_result_type_from_op(&op.kind, &empty)
+            else {
+                continue;
+            };
+            crate::model::FunctionGraph::set_concretetype_of_inline(res, ct);
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target = &graph.blocks[link.target.0];
+                for (arg, dst) in link.args.iter().zip(&target.inputargs) {
+                    if dst.concretetype.borrow().is_some() {
+                        continue;
+                    }
+                    let Some(src) = arg.as_variable() else {
+                        continue;
+                    };
+                    let src_ct = src.concretetype.borrow().clone();
+                    let Some(ct) = src_ct else {
+                        continue;
+                    };
+                    dst.set_concretetype(Some(ct));
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+fn flatten_jitcode_text_and_keys(graph: &crate::model::FunctionGraph) -> (String, Vec<String>) {
+    use crate::assembler::{Assembler, AssemblerExt};
+    use crate::flatten::flatten_graph;
+    let mut graph = graph.clone();
+    stamp_authoritative_concretetypes(&mut graph);
+    let mut transformed = crate::jtransform::transform_graph(
+        &graph,
+        &crate::jtransform::GraphTransformConfig::default(),
+    )
+    .graph;
+    stamp_authoritative_concretetypes(&mut transformed);
+    crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transformed);
+    let mut regallocs = crate::regalloc::perform_all_register_allocations(&transformed);
+    let mut flat = flatten_graph(&transformed, &mut regallocs);
+    let text = crate::codewriter::format::format_assembler(&flat);
+    let mut asm = Assembler::new();
+    let _ = asm.assemble(&mut flat, &regallocs);
+    let keys: Vec<String> = asm.insns.keys().cloned().collect();
+    (text, keys)
+}
+
+fn assert_array_tail_item_ptr_is_raw_int(graph: &crate::model::FunctionGraph) {
+    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    let ops = graph_ops(graph);
+    let mut item_ptrs = Vec::new();
+    for op in &ops {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("cast_int_to_ptr") {
+            continue;
+        }
+        assert_eq!(
+            result_ty,
+            &ValueType::Int,
+            "direct_arrayitems recast is kind i; ops={ops:?}"
+        );
+        let has_ptr_ty = args.iter().any(|arg| {
+            matches!(
+                arg,
+                LinkArg::Const(c)
+                    if matches!(
+                        c.value,
+                        crate::flowspace::model::ConstValue::LowLevelType(_)
+                    )
+            )
+        });
+        assert!(
+            has_ptr_ty,
+            "direct_arrayitems uses 2-arg cast_int_to_ptr(raw Ptr, int); ops={ops:?}"
+        );
+        if let Some(res) = op.result.clone() {
+            item_ptrs.push(res);
+        }
+    }
+    assert!(
+        !item_ptrs.is_empty(),
+        "direct_arrayitems must emit 2-arg cast_int_to_ptr; ops={ops:?}"
+    );
+    for op in &ops {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::runtime_names::shims::CAST_INSTANCE] {
+            continue;
+        }
+        let recasts_item = args.iter().any(
+            |arg| matches!(arg, LinkArg::Value(v) if item_ptrs.iter().any(|p| p.id() == v.id())),
+        );
+        assert!(
+            !recasts_item,
+            "item pointer is not recast to a GC class (result_ty={result_ty:?}); ops={ops:?}"
+        );
+    }
 }
 
 fn startblock_op_kind_names(graph: &crate::model::FunctionGraph) -> Vec<String> {
@@ -20553,6 +21188,221 @@ fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
     );
 }
 
+/// `std::ptr::null_mut::<*mut Utf8Str>()` is a GC STR nullptr
+/// (`rstr.py` `GcStruct('rpy_string')`), not `lltype.nullptr` of a
+/// raw item pointer. `Utf8Str` has no `GcType` impl, so
+/// `gc_struct_ids` misses it; `node_is_string_value` still keeps it
+/// a STR ref (`history.py` `getkind` of `Ptr(STR)` is `'ref'`).
+#[test]
+fn null_mut_of_utf8str_is_str_null_not_raw_item_ptr() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt);
+    let caller = interior_caller(
+        "null_str_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            &[
+                ("hash", interior_i64()),
+                ("length", interior_usize()),
+                (
+                    "chars",
+                    serde_json::json!({"Array": [
+                        {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                        [{"Integer": {"Unsigned": ["Usize", "0"]}}, {"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                        null
+                    ]}),
+                ),
+            ],
+            16,
+            &[0, 8, 16],
+            false,
+        )],
+        vec![caller, null_mut],
+    );
+    let graph = lower_interior(&llbc, "null_str_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_raw"
+            )
+        }),
+        "STR null_mut must not become null_raw; ops={ops:?}"
+    );
+    let typed_raw_nullptr = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: crate::model::ValueType::Int,
+            } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                && args.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        LinkArg::Const(c)
+                            if matches!(
+                                c.value,
+                                crate::flowspace::model::ConstValue::LowLevelType(_)
+                            )
+                    )
+                })
+        )
+    });
+    assert!(
+        !typed_raw_nullptr,
+        "STR null_mut must not recast as 2-arg raw cast_int_to_ptr; ops={ops:?}"
+    );
+    let str_null = ops.iter().any(|op| {
+        matches!(&op.kind, OpKind::ConstRefNull)
+            || matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut"
+                        || target.to_string() == "std::ptr::null_mut"
+            )
+    });
+    assert!(str_null, "STR null_mut stays a GC/STR nullptr; ops={ops:?}");
+}
+
+/// `std::ptr::null()` of `*const PyType` (`rpy_type_of`) is a GC/vtable
+/// nullptr, not `direct_arrayitems`. `PyType` has no `GcType` impl, but
+/// it is not an element of a GC `[T; N]` field, so `null_mut` stays
+/// `ConstRefNull` and joins `(*obj).ob_type`.
+#[test]
+fn null_mut_of_vtable_struct_is_gcref_not_raw_item_ptr() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let caller = interior_caller(
+        "null_vtable_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr.clone());
+    let gcref = interior_raw_mut(interior_adt(1));
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![
+            interior_struct(
+                0,
+                &["pyre_object", "pyobject", "PyType"],
+                &[
+                    ("subclassrange_min", interior_i64()),
+                    ("instantiate", gcref),
+                ],
+                16,
+                &[0, 8],
+                false,
+            ),
+            interior_struct(
+                1,
+                &["pyre_object", "pyobject", "PyObject"],
+                &[("ob_type", ptr)],
+                8,
+                &[0],
+                false,
+            ),
+        ],
+        vec![caller, null_mut],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+        })],
+        vec![serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{"Value": [0, interior_adt(1)]}]}
+            }
+        })],
+    );
+    let graph = lower_interior(&llbc, "null_vtable_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_raw"
+            )
+        }),
+        "vtable null_mut must not become null_raw; ops={ops:?}"
+    );
+    let typed_raw_nullptr = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: crate::model::ValueType::Int,
+            } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                && args.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        LinkArg::Const(c)
+                            if matches!(
+                                c.value,
+                                crate::flowspace::model::ConstValue::LowLevelType(_)
+                            )
+                    )
+                })
+        )
+    });
+    assert!(
+        !typed_raw_nullptr,
+        "vtable null_mut must not recast as 2-arg raw cast_int_to_ptr; ops={ops:?}"
+    );
+    let gcref_null = ops.iter().any(|op| {
+        matches!(&op.kind, OpKind::ConstRefNull)
+            || matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut"
+                        || target.to_string() == "std::ptr::null_mut"
+            )
+    });
+    assert!(
+        gcref_null,
+        "vtable null_mut stays a GC nullptr; ops={ops:?}"
+    );
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;
@@ -22880,6 +23730,394 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
         assert_eq!(null_muts, 0, "case {name}: {none_msg}");
         assert!(transparent_ctors >= 2, "case {name}: {agg_msg}");
     }
+}
+
+/// rustc coerces `&mut keyhash` to `*mut i64` before the call:
+/// `_t = &mut h; _a = &raw mut (*_t)`, or `_a = copy _t as *mut i64`
+/// (`PtrToPtr`). The passed type is already a raw pointer; the spill
+/// still materializes an address so the residual does not store through
+/// the i64 word.
+///
+/// `h` is a function-local primitive, so that address is
+/// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')`: one Char-varsize
+/// cell for the storage scope (`jtransform.py` `_rewrite_raw_malloc` /
+/// `OS_RAW_MALLOC_VARSIZE_CHAR`). A per-call `Tuple<i64>` spill was the
+/// pre-#2491 shape.
+#[test]
+fn raw_scalar_coerced_mut_borrow_spills_the_word() {
+    for coerce in [RawScalarCoerce::RawMutDeref, RawScalarCoerce::PtrToPtr] {
+        let graph = lower_coerced_raw_scalar_spill(coerce);
+        assert_coerced_raw_scalar_spill(&graph, coerce);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawScalarCoerce {
+    /// `_t = &mut h; _a = &raw mut (*_t)` — the measured product MIR.
+    RawMutDeref,
+    /// `_t = &mut h; _a = copy _t as *mut i64`.
+    PtrToPtr,
+}
+
+fn lower_coerced_raw_scalar_spill(coerce: RawScalarCoerce) -> FunctionGraph {
+    let span = fixture_span();
+    let word = i64_ty();
+    let borrowed = serde_json::json!({"Ref": ["Erased", word, "Mut"]});
+    let raw = serde_json::json!({"RawPtr": [word, "Mut"]});
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index, "name": name, "span": span, "ty": ty
+        })
+    };
+    let h = place(2, &word);
+    let borrow = place(3, &borrowed);
+    let raw_place = place(4, &raw);
+    let word_arg = place(5, &word);
+    let dest = place(6, &word);
+    let coerce_assign = match coerce {
+        RawScalarCoerce::RawMutDeref => serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [raw_place.clone(), {"RawPtr": {
+                "place": {
+                    "kind": {"Projection": [borrow.clone(), "Deref"]},
+                    "ty": word
+                },
+                "kind": "Mut",
+                "ptr_metadata": null
+            }}]}
+        }),
+        RawScalarCoerce::PtrToPtr => serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [raw_place.clone(), {"Cast": [
+                "PtrToPtr",
+                {"Move": borrow.clone()},
+                raw.clone()
+            ]}]}
+        }),
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["probe", "write_hash"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word.clone()],
+            "output": word.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                local(0, None, &word),
+                local(1, Some("x"), &word),
+                local(2, Some("h"), &word),
+                local(3, None, &borrowed),
+                local(4, None, &raw),
+                local(5, None, &word),
+                local(6, None, &word)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            h.clone(),
+                            {"Use": [{"Read": place(1, &word)}, "Yes"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            word_arg.clone(),
+                            {"Use": [{"Read": h.clone()}, "Yes"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                            "place": h.clone(),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }}]}},
+                        coerce_assign
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": generics
+                            }},
+                            "args": [
+                                {"Move": word_arg},
+                                {"Move": raw_place}
+                            ]
+                        },
+                        "dest": dest,
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}
+                },
+                {
+                    "statements": [{"span": span, "kind": {"Assign": [
+                        place(0, &word),
+                        {"Use": [{"Read": h}, "Yes"]}
+                    ]}}],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let sink_locals = vec![
+        local(0, None, &word),
+        local(1, None, &word),
+        local(2, None, &raw),
+    ];
+    let sink = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["probe", "sink"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word.clone(), raw.clone()],
+            "output": word.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": sink_locals},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    super::lower_function(&llbc, "write_hash")
+        .unwrap_or_else(|err| panic!("lower write_hash ({coerce:?}): {err}"))
+}
+
+fn assert_coerced_raw_scalar_spill(graph: &FunctionGraph, coerce: RawScalarCoerce) {
+    let ops: Vec<&SpaceOperation> = graph_ops(graph);
+    let dump = ops
+        .iter()
+        .map(|op| format!("{:?}", op.kind))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mallocs: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::RawMalloc { .. }))
+        .copied()
+        .collect();
+    assert_eq!(mallocs.len(), 1, "{coerce:?}: one RawMalloc\n{dump}");
+    let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
+    let length = match &mallocs[0].kind {
+        OpKind::RawMalloc {
+            owner,
+            zero: false,
+            length: Some(length),
+            ..
+        } if owner == super::address::RAW_SCALAR_CELL_OWNER => length,
+        other => {
+            panic!("{coerce:?}: spill owner is Array(Char) scoped_alloc, got {other:?}\n{dump}")
+        }
+    };
+    let length_n = ops.iter().find_map(|op| {
+        if op.result.as_ref() != Some(length) {
+            return None;
+        }
+        match &op.kind {
+            OpKind::ConstUInt(n) => Some(*n),
+            OpKind::ConstInt(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+    });
+    assert_eq!(
+        length_n,
+        Some(8),
+        "{coerce:?}: i64 cell is eight bytes\n{dump}"
+    );
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::RawMalloc { owner, .. } if owner == super::address::RAW_SCALAR_SPILL_OWNER
+        )),
+        "{coerce:?}: the local is not a per-call Tuple<i64> spill\n{dump}"
+    );
+    let malloc_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(ptr))
+        })
+        .expect("cell malloc block");
+    assert_eq!(
+        malloc_block.id, graph.startblock,
+        "{coerce:?}: the cell is allocated on function entry\n{dump}"
+    );
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::RawStore {
+                base,
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+                ..
+            } if base == ptr => true,
+            _ => false,
+        }),
+        "{coerce:?}: store must write the i64 through the cell\n{dump}"
+    );
+    let call = ops
+        .iter()
+        .map(|op| &op.kind)
+        .find(|kind| match kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("sink"),
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("{coerce:?}: missing sink call\n{dump}"));
+    let OpKind::Call { args, .. } = call else {
+        unreachable!("sink is a Call");
+    };
+    let call_arg = |index: usize| {
+        args.get(index)
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("{coerce:?}: call arg {index} is not a variable: {call:?}"))
+    };
+    assert_ne!(
+        call_arg(0),
+        ptr,
+        "{coerce:?}: the i64 word must stay the word, not the spill address\n{dump}"
+    );
+    assert_eq!(
+        call_arg(1),
+        ptr,
+        "{coerce:?}: hash_out receives the malloc address, not the word\n{dump}"
+    );
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| std::ptr::eq(&op.kind, call))
+        })
+        .expect("call block");
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "{coerce:?}: the cell is not freed right after the call\n{dump}"
+    );
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawLoad { .. })),
+        "{coerce:?}: the cell has no copy-out RawLoad after the call\n{dump}"
+    );
+    let frees: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::RawFree { .. }))
+        .copied()
+        .collect();
+    assert!(
+        !frees.is_empty(),
+        "{coerce:?}: the cell is freed at function exit\n{dump}"
+    );
+    for free in &frees {
+        match &free.kind {
+            OpKind::RawFree { ptr: freed } if aliases_scoped_raw_cell(graph, freed, ptr) => {}
+            other => panic!("{coerce:?}: RawFree must release the cell, got {other:?}\n{dump}"),
+        }
+    }
+}
+
+/// `scoped_alloc` frees the cell at `StorageDead` / function exit, after
+/// the pointer has crossed a block as an inputarg (`compute_lifetimes`
+/// unions `IDENTITY_OPS` and `Block.inputargs`).
+fn aliases_scoped_raw_cell(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    cell: &crate::flowspace::model::Variable,
+) -> bool {
+    fn visit(
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+        cell: &crate::flowspace::model::Variable,
+        seen: &mut std::collections::HashSet<u64>,
+    ) -> bool {
+        if var == cell {
+            return true;
+        }
+        if !seen.insert(var.id()) {
+            return false;
+        }
+        if let Some(op) = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(var))
+        {
+            return match &op.kind {
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "same_as" || op == "cast_int_to_ptr" || op == "cast_ptr_to_int" =>
+                {
+                    visit(graph, operand, cell, seen)
+                }
+                _ => false,
+            };
+        }
+        let Some((target_id, slot)) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|arg| arg == var)
+                .map(|slot| (block.id, slot))
+        }) else {
+            return false;
+        };
+        let mut any = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != target_id {
+                    continue;
+                }
+                let Some(src) = link.args.get(slot).and_then(LinkArg::as_variable) else {
+                    return false;
+                };
+                any = true;
+                if !visit(graph, src, cell, seen) {
+                    return false;
+                }
+            }
+        }
+        any
+    }
+    visit(graph, var, cell, &mut std::collections::HashSet::new())
 }
 
 /// `option_question_mark` with a String payload: Option `?` is a regular
@@ -32664,6 +33902,10 @@ fn interior_shared(inner: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Ref": [null, inner, "Shared"]})
 }
 
+fn interior_mut(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, inner, "Mut"]})
+}
+
 fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
     serde_json::json!([{
         "key": "fixture-target",
@@ -32821,7 +34063,8 @@ fn interior_unwind() -> serde_json::Value {
     serde_json::json!({"span": interior_span(), "kind": "UnwindResume"})
 }
 
-pub(in crate::front::mir) fn interior_caller(
+fn interior_fun(
+    def_id: u64,
     name: &str,
     arg_count: u64,
     inputs: Vec<serde_json::Value>,
@@ -32830,7 +34073,7 @@ pub(in crate::front::mir) fn interior_caller(
     body: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "def_id": 0,
+        "def_id": def_id,
         "item_meta": interior_meta(&["fixture", name], true),
         "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
         "body": {
@@ -32843,6 +34086,17 @@ pub(in crate::front::mir) fn interior_caller(
     })
 }
 
+pub(in crate::front::mir) fn interior_caller(
+    name: &str,
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+    locals: Vec<serde_json::Value>,
+    body: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    interior_fun(0, name, arg_count, inputs, output, locals, body)
+}
+
 fn interior_point() -> serde_json::Value {
     let i64_ty = interior_i64();
     interior_struct(
@@ -32853,6 +34107,304 @@ fn interior_point() -> serde_json::Value {
         &[0, 8],
         false,
     )
+}
+
+fn interior_e() -> serde_json::Value {
+    let i64_ty = interior_i64();
+    interior_struct(
+        0,
+        &["fixture", "E"],
+        &[("f", i64_ty.clone()), ("g", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    )
+}
+
+/// `fn items(a: *mut Arr) -> *mut E { addr_of_mut!((*a).items).cast() }`
+/// is `direct_arrayitems`: a raw item pointer of kind `i` (`history.py`
+/// `getkind` of a raw `Ptr`), flattened as `int_return` with no
+/// `cast_int_to_ptr/i>r`.
+#[test]
+fn array_tail_item_ptr_cast_returns_int_kind() {
+    let usize_ty = interior_usize();
+    let e_adt = interior_adt(0);
+    let arr_adt = interior_adt(1);
+    let e_ptr = interior_raw_mut(e_adt.clone());
+    let arr_ptr = interior_raw_mut(arr_adt.clone());
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [e_adt.clone(), array_len, null]});
+    let array_ptr = interior_raw_mut(array_ty.clone());
+    let items_field = interior_field(1, &arr_ptr, &arr_adt, &array_ty, 1);
+    let caller = interior_caller(
+        "items",
+        1,
+        vec![arr_ptr.clone()],
+        e_ptr.clone(),
+        vec![
+            interior_local(0, None, &e_ptr),
+            interior_local(1, Some("a"), &arr_ptr),
+            interior_local(2, Some("items"), &array_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(2, &array_ptr),
+                    serde_json::json!({
+                        "RawPtr": {
+                            "place": items_field,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &array_ptr))],
+                    interior_place(0, &e_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let cast = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "cast"],
+        vec![array_ptr],
+        e_ptr,
+    );
+    let arr = interior_struct(
+        1,
+        &["fixture", "Arr"],
+        &[("length", usize_ty), ("items", array_ty)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [0, e_adt]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![interior_e(), arr],
+        vec![caller, cast],
+        vec![gctype],
+        vec![impl_row],
+    );
+    let graph =
+        super::lower_function(&llbc, "items").unwrap_or_else(|err| panic!("lower items: {err:?}"));
+    assert_array_tail_item_ptr_is_raw_int(&graph);
+    let (text, keys) = flatten_jitcode_text_and_keys(&graph);
+    assert!(
+        text.contains("int_return"),
+        "array-tail item pointer returns kind i: {text}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.contains("cast_int_to_ptr/i>r")),
+        "raw item pointer is not recast to GCREF; keys={keys:?} text={text}"
+    );
+}
+
+/// `direct_arrayitems` FUNC.RESULT is a raw `Ptr` (`history.py`
+/// `getkind` `'int'`). Stamp `raw:<E>` so a looked-inside caller
+/// emits `inline_call_*_i` against the CFG `int_return`.
+#[test]
+fn array_tail_item_ptr_stamps_raw_func_result() {
+    use std::collections::{HashMap, HashSet};
+    let usize_ty = interior_usize();
+    let e_adt = interior_adt(0);
+    let arr_adt = interior_adt(1);
+    let e_ptr = interior_raw_mut(e_adt.clone());
+    let arr_ptr = interior_raw_mut(arr_adt);
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [e_adt, array_len, null]});
+    let items = interior_opaque(0, &["fixture", "items"], vec![arr_ptr], e_ptr);
+    let arr = interior_struct(
+        1,
+        &["fixture", "Arr"],
+        &[("length", usize_ty), ("items", array_ty)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [0, interior_adt(1)]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![interior_e(), arr],
+        vec![items],
+        vec![gctype],
+        vec![impl_row],
+    );
+    let mut gc = HashSet::new();
+    gc.insert(majit_ir::descr::StructId::from_canonical("Arr"));
+    let fd = llbc.fn_by_id(0).expect("items");
+    let token = super::dont_look_inside_return_token(
+        &fd.signature.output,
+        &llbc,
+        crate::ErrorCarrierSpec::default(),
+        &gc,
+        &HashSet::new(),
+    );
+    assert!(
+        token
+            .as_deref()
+            .is_some_and(|s| s.starts_with("raw:") && s.ends_with("E")),
+        "direct_arrayitems FUNC.RESULT is raw:E, got {token:?}"
+    );
+    let empty_names: HashSet<String> = HashSet::new();
+    let empty_hints: HashMap<String, Vec<String>> = HashMap::new();
+    let header = super::SemanticFunctionHeader::new(
+        &llbc,
+        fd,
+        "items".into(),
+        "fixture".into(),
+        &fd.signature,
+        &empty_names,
+        &empty_names,
+        &empty_names,
+        &empty_hints,
+        crate::ErrorCarrierSpec::default(),
+        &gc,
+        &HashSet::new(),
+        &empty_names,
+        "fixture::items",
+    );
+    assert_eq!(
+        header.return_type, token,
+        "looked-inside direct_arrayitems stamps FUNC.RESULT"
+    );
+}
+
+/// `fn at(p, i) -> &E { unsafe { &*p.add(i) } }` (or `&mut`).
+///
+/// `p` is already the items pointer (`header_producer` EntriesItem).
+fn interior_at_fun(def_id: u64, name: &str, exclusive: bool) -> serde_json::Value {
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let usize_ty = interior_usize();
+    let ret = if exclusive {
+        interior_mut(adt.clone())
+    } else {
+        interior_shared(adt.clone())
+    };
+    let kind = if exclusive { "Mut" } else { "Shared" };
+    interior_fun(
+        def_id,
+        name,
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        ret.clone(),
+        vec![
+            interior_local(0, None, &ret),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &ret),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(3, &ptr, &adt),
+                            "kind": kind,
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    )
+}
+
+fn interior_add_opaque() -> serde_json::Value {
+    let ptr = interior_raw_mut(interior_adt(0));
+    interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), interior_usize()],
+        ptr,
+    )
+}
+
+#[test]
+fn interior_ptr_size_descr_enters_cache_size() {
+    let mut known = Default::default();
+    let mut fields = crate::front::semantic::StructFieldRegistry::default();
+    let mut attrs = Default::default();
+    let mut layouts = Default::default();
+    let mut ids = Default::default();
+    super::register_interior_ptr_type(&mut known, &mut fields, &mut attrs, &mut layouts, &mut ids);
+    let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("Interior"));
+    let gc = majit_ir::descr::gc_cache().lock();
+    let sd = gc
+        ._cache_size
+        .get(&key)
+        .expect("Interior SizeDescr in _cache_size")
+        .as_size_descr()
+        .expect("Interior is a SizeDescr");
+    assert_eq!(sd.size(), 2 * crate::layout::target_word_size());
+    assert!(sd.is_gc_managed());
+    assert!(!sd.headerless());
+    let offs: Vec<_> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+    assert_eq!(offs, vec![0]);
+}
+
+fn assert_interior_malloc(ops: &[&SpaceOperation]) {
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior")),
+        "Gate A malloc Interior; ops={ops:?}"
+    );
+    let (writes, _) = field_read_write_names(ops);
+    assert!(
+        writes.iter().any(|name| *name == "ptr") && writes.iter().any(|name| *name == "index"),
+        "setfield ptr + setfield index; writes={writes:?} ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(ops).iter().any(|leaf| leaf == "add"),
+        "no residual ptr::add; ops={ops:?}"
+    );
 }
 
 fn lower_interior(llbc: &Llbc, name: &str) -> FunctionGraph {
@@ -33993,6 +35545,582 @@ fn interior_field_address_of_stays_direct_ptradd() {
     let ops = graph_ops(&graph);
     assert_no_interior(&ops);
     assert_direct_ptradd_not_residual_add(&ops);
+}
+
+/// `fn at(p, i) -> &E { unsafe { &*p.add(i) } }` is `PtrRepr.rtype_getitem`
+/// InteriorPtr (`rptr.py`). The caller `at(p, i).f` is
+/// `InteriorPtrRepr.rtype_getattr` → `getinteriorfield`.
+#[test]
+fn interior_ptr_reborrow_of_ptr_add() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let e_ref = interior_shared(adt.clone());
+    let caller = interior_caller(
+        "read_e",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("e"), &e_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &e_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_field(3, &e_ref, &adt, &i64_ty, 0)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_e()],
+        vec![
+            caller,
+            interior_add_opaque(),
+            interior_at_fun(2, "at", false),
+        ],
+    );
+    let at_graph = lower_interior(&llbc, "at");
+    let at_ops = graph_ops(&at_graph);
+    assert_interior_malloc(&at_ops);
+    let graph = lower_interior(&llbc, "read_e");
+    let ops = graph_ops(&graph);
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        item_ty,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "f");
+    assert_eq!(field.owner_root.as_deref(), Some("E"));
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<E>"));
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
+        "ops={ops:?}"
+    );
+}
+
+fn interior_header_of<'a>(
+    llbc: &'a Llbc,
+    fd: &'a majit_charon_reader::ullbc::FunDecl,
+    gc: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> super::SemanticFunctionHeader {
+    use std::collections::{HashMap, HashSet};
+    let empty_names: HashSet<String> = HashSet::new();
+    let empty_hints: HashMap<String, Vec<String>> = HashMap::new();
+    let leaf = fd
+        .item_meta
+        .name_path()
+        .rsplit("::")
+        .next()
+        .unwrap()
+        .to_string();
+    let module = fd
+        .item_meta
+        .name_path()
+        .rsplit_once("::")
+        .map(|(module, _)| module.to_string())
+        .unwrap_or_default();
+    let policy = if module.is_empty() {
+        leaf.clone()
+    } else {
+        format!("{module}::{leaf}")
+    };
+    super::SemanticFunctionHeader::new(
+        llbc,
+        fd,
+        leaf,
+        module,
+        &fd.signature,
+        &empty_names,
+        &empty_names,
+        &empty_names,
+        &empty_hints,
+        crate::ErrorCarrierSpec::default(),
+        gc,
+        &HashSet::new(),
+        &empty_names,
+        &policy,
+    )
+}
+
+/// A function whose body lowers as InteriorPtr (`rptr.py`
+/// `InteriorPtrRepr`; `history.getkind` of `Ptr(Interior)`) stamps
+/// FUNC.RESULT `'ref'`. `*mut Entry` would otherwise stamp `'i'`
+/// (`gc_array_item_struct_ptr_owner_root` / `by_value_payload_annotation`).
+#[test]
+fn interior_ptr_return_stamps_func_result_ref() {
+    use std::collections::HashSet;
+    let at_llbc = llbc_with_types(
+        "fixture",
+        vec![interior_e()],
+        vec![interior_at_fun(0, "at", false), interior_add_opaque()],
+    );
+    let at = at_llbc.fn_by_id(0).expect("at");
+    let at_header = interior_header_of(&at_llbc, at, &HashSet::new());
+    assert_eq!(
+        at_header.return_type.as_deref(),
+        Some("ref"),
+        "Gate A InteriorPtr FUNC.RESULT is r, got {:?}",
+        at_header.return_type
+    );
+    assert!(
+        at_header.return_class_root.is_none(),
+        "InteriorPtr has no interned class root, got {:?}",
+        at_header.return_class_root
+    );
+
+    let usize_ty = interior_usize();
+    let e_adt = interior_adt(0);
+    let arr_adt = interior_adt(1);
+    let e_ptr = interior_raw_mut(e_adt.clone());
+    let arr_ptr = interior_raw_mut(arr_adt);
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [e_adt, array_len, null]});
+    let items = interior_opaque(
+        0,
+        &["fixture", "items"],
+        vec![arr_ptr.clone()],
+        e_ptr.clone(),
+    );
+    let entry_ptr = interior_opaque(
+        1,
+        &["pyre_object", "rordereddict", "<Impl>", "entry_ptr"],
+        vec![arr_ptr],
+        e_ptr,
+    );
+    let arr = interior_struct(
+        1,
+        &["fixture", "Arr"],
+        &[("length", usize_ty), ("items", array_ty)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [0, interior_adt(1)]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![interior_e(), arr],
+        vec![items, entry_ptr],
+        vec![gctype],
+        vec![impl_row],
+    );
+    let mut gc = HashSet::new();
+    gc.insert(majit_ir::descr::StructId::from_canonical("Arr"));
+    let items_fd = llbc.fn_by_id(0).expect("items");
+    let items_header = interior_header_of(&llbc, items_fd, &gc);
+    assert!(
+        items_header
+            .return_type
+            .as_deref()
+            .is_some_and(|s| s.starts_with("raw:") && s.ends_with("E")),
+        "direct_arrayitems stays raw:E, got {:?}",
+        items_header.return_type
+    );
+    let entry_ptr_fd = llbc.fn_by_id(1).expect("entry_ptr");
+    let entry_ptr_header = interior_header_of(&llbc, entry_ptr_fd, &gc);
+    assert_eq!(
+        entry_ptr_header.return_type.as_deref(),
+        Some("ref"),
+        "RDict::entry_ptr InteriorPtr FUNC.RESULT is r, got {:?}",
+        entry_ptr_header.return_type
+    );
+    assert!(
+        entry_ptr_header.return_class_root.is_none(),
+        "entry_ptr InteriorPtr has no interned class root, got {:?}",
+        entry_ptr_header.return_class_root
+    );
+}
+
+/// Same-graph `let e = &*p.add(i); e.f` (inlined `entry_at`): Gate A malloc
+/// plus `InteriorPtrRepr.rtype_getattr` on the reborrow dest.
+#[test]
+fn interior_ptr_reborrow_field_read_same_graph() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let e_ref = interior_shared(adt.clone());
+    let caller = interior_caller(
+        "read_at",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+            interior_local(4, Some("e"), &e_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(4, &e_ref),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": interior_deref(3, &ptr, &adt),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(4, &e_ref, &adt, &i64_ty, 0)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_e()],
+        vec![caller, interior_add_opaque()],
+    );
+    let graph = lower_interior(&llbc, "read_at");
+    let ops = graph_ops(&graph);
+    assert_interior_malloc(&ops);
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "same-graph getinteriorfield; ops={ops:?}");
+    let OpKind::InteriorFieldRead {
+        field,
+        array_type_id,
+        ..
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "f");
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<E>"));
+}
+
+/// Real `RDict::entry_at` is Gate A; `ll_dict_lookup_orig` reads `.f_hash`
+/// / `.key` through `InteriorPtrRepr.rtype_getattr`.
+#[test]
+fn interior_ptr_real_entry_at_and_lookup() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+    let matches: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            fd.item_meta.name_path().ends_with("::entry_at")
+                && super::impl_owner_path(&llbc, fd).is_some_and(|owner| owner.contains("RDict"))
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "exactly one RDict::entry_at; paths={:?}",
+        matches
+            .iter()
+            .map(|fd| fd.item_meta.name_path())
+            .collect::<Vec<_>>()
+    );
+    let fd = matches[0];
+    assert!(
+        fd.item_meta.name_path().ends_with("::entry_at"),
+        "FunDecl is lookup's entry_at; path={}",
+        fd.item_meta.name_path()
+    );
+    let empty = std::collections::HashSet::new();
+    let inspect = super::desugar::callee::callee_returns_interior_array_type_id(fd, &llbc, &empty);
+    assert!(
+        inspect
+            .as_deref()
+            .is_some_and(|id| id.starts_with("GcArray<")),
+        "FUNC.RESULT of entry_at is Ptr(Interior); inspect={inspect:?} path={}",
+        fd.item_meta.name_path()
+    );
+    let context = super::LowerContext::new(&llbc);
+    let at = super::lower_fun_decl(&context, fd).expect("lower RDict::entry_at");
+    assert_interior_malloc(&graph_ops(&at));
+
+    let lookup =
+        super::lower_function(&llbc, "ll_dict_lookup_orig").expect("lower ll_dict_lookup_orig");
+    let ops = graph_ops(&lookup);
+    let interior_reads: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::InteriorFieldRead { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        interior_reads.contains(&"f_hash") && interior_reads.contains(&"key"),
+        "lookup must getinteriorfield f_hash/key; interior={interior_reads:?}"
+    );
+}
+
+/// `&mut *p.add(i)` then a field store is `InteriorPtrRepr.rtype_setattr`
+/// (`rptr.py`) → `setinteriorfield`.
+#[test]
+fn interior_ptr_mut_reborrow_field_write() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let e_mut = interior_mut(adt.clone());
+    let caller = interior_caller(
+        "store_e",
+        3,
+        vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("value"), &i64_ty),
+            interior_local(4, Some("e"), &e_mut),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &e_mut),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field(4, &e_mut, &adt, &i64_ty, 0),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_e()],
+        vec![
+            caller,
+            interior_add_opaque(),
+            interior_at_fun(2, "at_mut", true),
+        ],
+    );
+    let at_graph = lower_interior(&llbc, "at_mut");
+    assert_interior_malloc(&graph_ops(&at_graph));
+    let graph = lower_interior(&llbc, "store_e");
+    let ops = graph_ops(&graph);
+    let writes: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        .copied()
+        .collect();
+    assert_eq!(writes.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldWrite {
+        field,
+        item_ty,
+        array_type_id,
+        ..
+    } = &writes[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "f");
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<E>"));
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
+        "ops={ops:?}"
+    );
+}
+
+/// `ptr::write(p.add(i), E{..})` is `_ll_dict_setitem_lookup_done` field
+/// stores (`rordereddict.py`): one `setinteriorfield` per field.
+#[test]
+fn interior_aggregate_ptr_write_of_ptr_add() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "write_e",
+        4,
+        vec![
+            ptr.clone(),
+            usize_ty.clone(),
+            i64_ty.clone(),
+            i64_ty.clone(),
+        ],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("f"), &i64_ty),
+            interior_local(4, Some("g"), &i64_ty),
+            interior_local(5, Some("slot"), &ptr),
+            interior_local(6, Some("agg"), &adt),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(5, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(6, &adt),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [
+                                interior_copy(interior_place(3, &i64_ty)),
+                                interior_copy(interior_place(4, &i64_ty))
+                            ]
+                        ]
+                    }),
+                )],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(5, &ptr)),
+                        interior_copy(interior_place(6, &adt)),
+                    ],
+                    interior_place(0, &unit),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let write = interior_opaque(2, &["core", "ptr", "write"], vec![ptr.clone(), adt], unit);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_e()],
+        vec![caller, interior_add_opaque(), write],
+    );
+    let graph = lower_interior(&llbc, "write_e");
+    let ops = graph_ops(&graph);
+    let writes: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::InteriorFieldWrite { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writes, ["f", "g"], "ops={ops:?}");
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "add" || leaf == "write"),
+        "ops={ops:?}"
+    );
+}
+
+/// Real `ll_dict_setitem_lookup_done_orig` (`rordereddict.py`
+/// `_ll_dict_setitem_lookup_done`): one `setinteriorfield` per Entry field.
+#[test]
+fn interior_aggregate_ptr_write_real_setitem() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+    let graph = super::lower_function(&llbc, "ll_dict_setitem_lookup_done_orig")
+        .expect("lower ll_dict_setitem_lookup_done_orig");
+    let ops = graph_ops(&graph);
+    let writes: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        .collect();
+    assert!(
+        writes.len() >= 4,
+        "setinteriorfield per Entry field; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "add" || leaf == "write"),
+        "no residual ptr::add/write; ops={ops:?}"
+    );
 }
 
 /// A `repr(transparent)` pointee is the inner word, not a GcArray of

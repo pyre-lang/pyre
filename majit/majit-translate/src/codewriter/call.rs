@@ -4232,7 +4232,6 @@ fn call_target_variant_name(target: &CallTarget) -> &'static str {
         CallTarget::Method { .. } => "Method",
         CallTarget::FunctionPath { .. } => "FunctionPath",
         CallTarget::SyntheticTransparentCtor { .. } => "SyntheticTransparentCtor",
-        CallTarget::Indirect { .. } => "Indirect",
         CallTarget::UnsupportedExpr => "UnsupportedExpr",
     }
 }
@@ -4717,9 +4716,13 @@ pub struct StructLayout {
     pub align: usize,
     /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
     /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
-    /// `Gc` (`Struct._note_inlined_into`). The three clauses are a fixpoint
-    /// on the field-0 chain. `Raw` otherwise. Set when the layout is
-    /// registered; readers must not treat a missing layout as either kind.
+    /// `Gc` (`Struct._note_inlined_into`), **or** any enumerated field is a
+    /// GC pointer (`FLAG_POINTER`), **or** an inlined by-value nested
+    /// struct transitively holds one: an ADT that holds a GC pointer is a
+    /// `GcStruct` (`declared_raw_adt_node`), matching the `new` Size descr
+    /// which defaults to GC. A nested raw `Struct` of only scalars stays
+    /// `Raw`. Set when the layout is registered; readers must not treat a
+    /// missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
@@ -4827,6 +4830,222 @@ fn outer_type_leaf(type_name: &str) -> &str {
     base.rsplit("::").next().unwrap_or(base)
 }
 
+/// Spellings under which `nested_fields` may store `type_str`'s rows:
+/// the exact field type, the generic-stripped template, and the unique
+/// leaf (`Fmt`, `DictKeyError`).
+fn nested_struct_name_keys(type_str: &str) -> Vec<String> {
+    let mut keys = vec![type_str.to_string()];
+    let stripped = majit_ir::descr::strip_generic_args(type_str);
+    if stripped.as_ref() != type_str {
+        keys.push(stripped.into_owned());
+    }
+    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
+    let leaf = majit_ir::descr::strip_generic_args(leaf);
+    if leaf.as_ref() != type_str && keys.iter().all(|key| key != leaf.as_ref()) {
+        keys.push(leaf.into_owned());
+    }
+    keys
+}
+
+/// Field rows of a nested by-value type. Exact spelling first, then the
+/// generic-stripped template (`core::option::Option<*mut PyObject>` →
+/// `core::option::Option`) so an instantiated field still finds the
+/// template's registered rows.
+fn nested_struct_field_rows<'a>(
+    type_str: &str,
+    nested_fields: &'a std::collections::HashMap<String, Vec<(String, String)>>,
+) -> Option<&'a [(String, String)]> {
+    for key in nested_struct_name_keys(type_str) {
+        if let Some(fields) = nested_fields.get(&key) {
+            return Some(fields.as_slice());
+        }
+    }
+    None
+}
+
+/// True when `key` is a variant subclass of `type_str` (`LoopResult::Done`,
+/// `pyre_jit::eval::LoopResult::Done`). The enum base's own rows are only
+/// the tag; payload FLAG_POINTER fields live on the variant keys.
+fn nested_fields_key_is_variant_of(key: &str, type_str: &str) -> bool {
+    for prefix in nested_struct_name_keys(type_str) {
+        let rest = match key.strip_prefix(&prefix) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        if let Some(variant) = rest.strip_prefix("::")
+            && !variant.is_empty()
+            && !variant.contains("::")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rows that are only the synthetic enum-base tag (`rclass.py` sum-type
+/// base). Payload fields are on the variant subclasses, not here.
+fn rows_are_enum_base_tag(rows: &[(String, String)]) -> bool {
+    let mut saw_tag = false;
+    for (name, _) in rows {
+        if name == "__discriminant" {
+            saw_tag = true;
+            continue;
+        }
+        if name == "typeptr" || name.starts_with("c__pad") {
+            continue;
+        }
+        return false;
+    }
+    saw_tag
+}
+
+/// Type arguments of a nested spelling (`Option<T>`, `Result<T, E>`,
+/// `Tuple<A,B>`, `[T; N]`). The nested field list is not always in hand
+/// at [`StructLayout::from_type_strings`]; the argument strings are on
+/// the field's own type and classify with the same [`field_metadata`]
+/// helper as a nested layout's rows.
+fn type_string_generic_args(type_str: &str) -> Vec<&str> {
+    let type_str = type_str.trim();
+    if let Some((elem, _)) = crate::front::mir::shaped_array_parts(type_str) {
+        return vec![elem];
+    }
+    let Some(open) = type_str.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, b) in type_str.bytes().enumerate().skip(open) {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Vec::new();
+    };
+    crate::front::mir::split_top_level_type_args(&type_str[open + 1..close])
+        .into_iter()
+        .filter(|arg| {
+            let arg = arg.trim();
+            // A lifetime (`'a`) or const generic (`12`) is not a field type.
+            !arg.is_empty()
+                && !arg.starts_with('\'')
+                && arg.starts_with(|c: char| {
+                    c.is_alphabetic() || c == '_' || c == '*' || c == '&' || c == '[' || c == '('
+                })
+        })
+        .collect()
+}
+
+/// True when `type_str` is a GC pointer (`FLAG_POINTER`), or a by-value
+/// nested struct that (transitively, through inlined substructs) holds
+/// one. `lltype.Struct` inlining another raw `Struct` of only scalars
+/// stays `_gckind='raw'`; a GC pointer inside a raw container is
+/// refused (`jtransform.py` `setfield_raw_r`).
+fn type_str_holds_gc_pointer(
+    type_str: &str,
+    known_structs: &std::collections::HashSet<String>,
+    known_struct_sizes: &std::collections::HashMap<String, usize>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    nested_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
+    visiting: &mut std::collections::HashSet<String>,
+) -> bool {
+    let type_str = type_str.trim();
+    let (flag, _, _) = field_metadata(
+        type_str,
+        known_structs,
+        known_struct_sizes,
+        raw_alloc_flavor_structs,
+    );
+    if flag == majit_ir::descr::ArrayFlag::Pointer {
+        return true;
+    }
+    if flag != majit_ir::descr::ArrayFlag::Struct {
+        return false;
+    }
+    if !visiting.insert(type_str.to_string()) {
+        return false;
+    }
+    let args_hold = type_string_generic_args(type_str).iter().any(|arg| {
+        type_str_holds_gc_pointer(
+            arg,
+            known_structs,
+            known_struct_sizes,
+            raw_alloc_flavor_structs,
+            nested_fields,
+            visiting,
+        )
+    });
+    let rows = nested_struct_field_rows(type_str, nested_fields);
+    let rows_hold = rows.into_iter().flatten().any(|(name, nested_ty)| {
+        name != "typeptr"
+            && !name.starts_with("c__pad")
+            && type_str_holds_gc_pointer(
+                nested_ty,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+                nested_fields,
+                visiting,
+            )
+    });
+    let mut saw_variant = false;
+    let variants_hold = nested_fields.iter().any(|(key, variant_rows)| {
+        if !nested_fields_key_is_variant_of(key, type_str) {
+            return false;
+        }
+        saw_variant = true;
+        variant_rows.iter().any(|(name, nested_ty)| {
+            name != "typeptr"
+                && !name.starts_with("c__pad")
+                && type_str_holds_gc_pointer(
+                    nested_ty,
+                    known_structs,
+                    known_struct_sizes,
+                    raw_alloc_flavor_structs,
+                    nested_fields,
+                    visiting,
+                )
+        })
+    });
+    let holds = if is_known_by_value_struct(known_structs, type_str) {
+        match rows {
+            // Nested layout rows are not in hand: the field is still a
+            // by-value ADT (`FLAG_STRUCT`). Carry that up — Field descrs
+            // mint a GCREF word via `type_flag_from_str`'s unknown-name
+            // fallback (`Option<DictKeyError>`, `Result::Err` payload).
+            None => true,
+            Some(rows) if rows.is_empty() => {
+                args_hold
+                    || variants_hold
+                    || get_type_flag(type_str, raw_alloc_flavor_structs).0
+                        == majit_ir::descr::ArrayFlag::Pointer
+            }
+            Some(rows) if rows_are_enum_base_tag(rows) => {
+                // Payload FLAG_POINTER fields live on the variant
+                // subclasses. Missing variant rows is an incomplete
+                // nested layout, not a scalar-only Struct.
+                args_hold || if saw_variant { variants_hold } else { true }
+            }
+            Some(_) => rows_hold || args_hold || variants_hold,
+        }
+    } else {
+        // `Vec<T>` is `FLAG_STRUCT` (`get_type_flag`) but not a known
+        // by-value struct. Walk `T`: `Vec<*mut PyObject>` holds a pointer;
+        // `Vec<u8>` does not.
+        rows_hold || args_hold || variants_hold
+    };
+    visiting.remove(type_str);
+    holds
+}
+
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
 /// the same bytes as `i64`; `AtomicPtr<T>` the same as a pointer word.
 /// OBJECT_VTABLE spells `instantiate` as a function pointer, not a nested
@@ -4864,6 +5083,28 @@ pub(crate) fn atomic_wrapper_leaf(
 }
 
 impl StructLayout {
+    /// True when any enumerated field is a GC pointer (`descr.py`
+    /// `FLAG_POINTER`). Nested by-value structs are `FLAG_STRUCT` and do
+    /// not count: they are not a `getfield` of a Ref.
+    pub fn holds_gc_pointer(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.flag == majit_ir::descr::ArrayFlag::Pointer)
+    }
+
+    /// `_gckind` as `rewrite_op_{get,set}field` and `new` agree on it.
+    /// A stored `Gc`, or a `Raw` layout that still holds a GC pointer
+    /// field: `jtransform.py` refuses `setfield_raw_r` / non-pure
+    /// `getfield_raw_r`, and the Size descr for that ADT is GC.
+    pub fn effective_gckind(&self) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        if self.gckind == GcKind::Gc || self.holds_gc_pointer() {
+            GcKind::Gc
+        } else {
+            self.gckind
+        }
+    }
+
     /// Build a StructLayout from type-string heuristic.
     /// Used at pipeline init to populate struct_layouts from struct_fields.
     /// The runtime can later override with actual layout via set_struct_layout().
@@ -4872,6 +5113,11 @@ impl StructLayout {
     /// every entry in the owning class's `_immutable_fields_` declaration.
     /// RPython `STRUCT._immutable_field(fieldname)` returns the matching
     /// `ImmutableRanking` for these; fields not in the map are mutable.
+    ///
+    /// `nested_fields`: field rows of by-value nested types, keyed by the
+    /// same spelling `field_metadata` uses. Empty when the nested layout
+    /// is not in hand; generic arguments of the nested type string still
+    /// classify with [`field_metadata`].
     pub fn from_type_strings(
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
@@ -4879,6 +5125,7 @@ impl StructLayout {
         known_struct_aligns: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        nested_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
     ) -> Self {
         // `symbolic.get_array_token` / `get_field_token` size the STRUCT
         // including nested members. `heaptracker.all_interiorfielddescrs`
@@ -4886,6 +5133,38 @@ impl StructLayout {
         // not for the struct's own `_names`. Keep every named row so
         // `getattr(STRUCT, fieldname)` can still resolve it; nested
         // members stay `FLAG_STRUCT` and `all_fielddescrs` recurses.
+        // `_gckind` is Gc when a FLAG_POINTER field is present on this
+        // layout or (recursively) inside an inlined nested Struct. A
+        // nested FLAG_STRUCT is not itself a pointer; a nested raw
+        // Struct of only scalars stays Raw.
+        let mut visiting = std::collections::HashSet::new();
+        let nested_holds_gc_pointer = fields.iter().any(|(name, type_str)| {
+            if name == "typeptr" || name.starts_with("c__pad") {
+                return false;
+            }
+            let (flag, _, _) = field_metadata(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+            );
+            // Explicit sum-shell / positional payload (`rclass.py`
+            // variant subclass, `rtuple.py` item): the nested ADT is a
+            // GCREF word (`explicit_sum_shell` 8-byte slot; Field descrs
+            // mint FLAG_POINTER). Recursing into a scalar pointee would
+            // miss the pointer on this layout.
+            if name.starts_with("__pos_") && flag == majit_ir::descr::ArrayFlag::Struct {
+                return true;
+            }
+            type_str_holds_gc_pointer(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+                nested_fields,
+                &mut visiting,
+            )
+        });
         let mut offset: usize = 0;
         let mut layout_fields = Vec::new();
         for (name, type_str) in fields {
@@ -4944,6 +5223,20 @@ impl StructLayout {
             });
             offset += field_size;
         }
+        // Flat FLAG_POINTER rows, plus a nested by-value struct that
+        // itself holds a GC pointer (`Result<Option<*mut PyObject>, _>`).
+        // Nested rows stay on the owner (`all_fielddescrs` recurses);
+        // a nested FLAG_STRUCT is not itself a pointer, so gckind still
+        // walks the nested type. A nested scalar-only Struct stays Raw.
+        let gckind = if nested_holds_gc_pointer
+            || layout_fields
+                .iter()
+                .any(|field| field.flag == majit_ir::descr::ArrayFlag::Pointer)
+        {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        } else {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        };
         let max_align = fields
             .iter()
             .map(|(_, ty)| {
@@ -4978,7 +5271,7 @@ impl StructLayout {
         StructLayout {
             size,
             align,
-            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            gckind,
             fields: layout_fields,
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -5596,6 +5889,7 @@ impl CallControl {
             &HashMap::new(),
             &HashMap::new(),
             &self.raw_alloc_flavor_structs,
+            &HashMap::new(),
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
@@ -5603,11 +5897,16 @@ impl CallControl {
 
     /// `Struct._gckind` for a type whose layout was registered.
     /// `None` when `name` is not one analysed struct or enum.
+    ///
+    /// Uses [`StructLayout::effective_gckind`]: a layout stored as `Raw`
+    /// that still holds a `FLAG_POINTER` field is a GC owner, the same
+    /// fact `new`'s Size descr defaults to and `declared_raw_adt_node`
+    /// records.
     pub fn declared_gckind_for(
         &self,
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-        Some(self.struct_layout_for(name)?.gckind)
+        Some(self.struct_layout_for(name)?.effective_gckind())
     }
 
     /// Host layout of `owner`, when Charon recorded one.
@@ -8572,10 +8871,10 @@ impl CallControl {
         // Resolve the FunctionPath spelling before the mutable graph borrow.
         // `from` is the graph identity `call_op_callees` already resolved;
         // the op may still spell `crate::m::f` / a local-crate root.
-        // Trait `CallTarget::Indirect` and empty `IndirectCall` families
-        // expand here too (`all_impls_for_indirect` / builtin wrappers),
-        // the same rows `call_op_callees` would yield, so the selected
-        // graph can be written onto the op (`row_of_graphs.values()`).
+        // Trait `IndirectCall { family_key }` and empty `IndirectCall`
+        // families expand here too (`all_impls_for_indirect` / builtin
+        // wrappers), the same rows `call_op_callees` would yield, so the
+        // selected graph can be written onto the op (`row_of_graphs.values()`).
         let from_aliases = self.function_graphs.alias_paths(from);
         enum ExpandFamily {
             Trait(String, String),
@@ -8597,13 +8896,9 @@ impl CallControl {
                     target: target @ CallTarget::FunctionPath { .. },
                     ..
                 } => (target.function_call_path(), None),
-                OpKind::Call {
-                    target:
-                        CallTarget::Indirect {
-                            graphs: None,
-                            trait_root,
-                            method_name,
-                        },
+                OpKind::IndirectCall {
+                    graphs: None,
+                    family_key: Some((trait_root, method_name)),
                     ..
                 } => (
                     None,
@@ -8655,20 +8950,15 @@ impl CallControl {
                         *resolved_path = Some(to.clone());
                     }
                 }
-                CallTarget::Indirect { graphs, .. } => {
-                    let family = graphs.get_or_insert_with(|| expanded.take().unwrap_or_default());
-                    replace_family_member(family, from, to);
-                }
                 _ => {}
             },
-            OpKind::IndirectCall {
-                graphs: Some(graphs),
-                ..
-            } => {
-                if graphs.is_empty() {
-                    *graphs = expanded.take().unwrap_or_default();
+            OpKind::IndirectCall { graphs, .. } => {
+                if graphs.as_deref().is_none_or(<[_]>::is_empty) {
+                    *graphs = Some(expanded.take().unwrap_or_default());
                 }
-                replace_family_member(graphs, from, to);
+                if let Some(family) = graphs {
+                    replace_family_member(family, from, to);
+                }
             }
             _ => {}
         }
@@ -8795,55 +9085,26 @@ impl CallControl {
             // `call.py CallControl.graphs_from` indirect_call — the attached
             // `c_graphs` family, `None` meaning "unknown
             // family" and classifying the site as residual.
-            OpKind::IndirectCall { graphs, .. } => match graphs {
+            OpKind::IndirectCall {
+                graphs, family_key, ..
+            } => match graphs {
                 Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
                 Some(graphs) => graphs.clone(),
-                None => {
-                    if bfs_phase {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "indirect-family-unknown",
-                            format_args!("in {caller}"),
-                        );
+                None => match family_key {
+                    Some((trait_root, method_name)) => {
+                        self.all_impls_for_indirect(trait_root, method_name)
                     }
-                    Vec::new()
-                }
-            },
-            // Same indirect_call site, spelled the way it
-            // exists *before* `rpbc::lower_indirect_calls`
-            // rewrites it into `VtableMethodPtr` +
-            // `IndirectCall`.  That lowering runs inside
-            // `transform_graph_to_jitcode`, i.e. strictly
-            // after `find_all_graphs`, so this is the shape
-            // the BFS actually sees.
-            //
-            // This is not a second family resolver: the arm
-            // below and `lower_indirect_calls` both call
-            // `all_impls_for_indirect`, and the lowering only
-            // folds an empty answer into `graphs = None`,
-            // which the arm above skips exactly as an empty
-            // `callees` does here.  The two arms therefore
-            // enumerate the same callees
-            // (`rpbc.py c_graphs = row_of_graphs.values()`).
-            //
-            // Running the lowering before graph discovery so
-            // only the post-rtyper shape reaches the BFS would
-            // match RPython's phase order, but it forces every
-            // registered graph to be lowered up front, which is
-            // the eager pass on-demand body lowering replaced
-            // when the prepass peak RSS came down from 7.71 GB
-            // to 4.25 GB.
-            OpKind::Call {
-                target:
-                    CallTarget::Indirect {
-                        trait_root,
-                        method_name,
-                        graphs,
-                    },
-                ..
-            } => match graphs {
-                Some(graphs) => graphs.clone(),
-                None => self.all_impls_for_indirect(trait_root, method_name),
+                    None => {
+                        if bfs_phase {
+                            crate::decline::record(
+                                BFS_GATE,
+                                "indirect-family-unknown",
+                                format_args!("in {caller}"),
+                            );
+                        }
+                        Vec::new()
+                    }
+                },
             },
             // `call.py CallControl.guess_call_kind` direct_call.  These three
             // classifications are attached to the single
@@ -10015,8 +10276,16 @@ impl CallControl {
         let Some((_, graph)) = self.target_to_path_and_graph(target) else {
             return false;
         };
-        graph.return_type.as_deref() == Some("ref")
-            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+        let Some(s) = graph.return_type.as_deref() else {
+            return false;
+        };
+        // `dont_look_inside_return_token` stamps `raw:<owner>` for a
+        // raw `Ptr` (`history.py` `getkind` `'int'`), including
+        // `direct_arrayitems`. `call.py` `getcalldescr` uses FUNC.RESULT.
+        if s.starts_with("raw:") && s.len() > 4 {
+            return true;
+        }
+        s == "ref" && self.declared_graph_result_type(&graph) == Some(Type::Int)
     }
 
     /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's
@@ -10852,7 +11121,7 @@ impl CallControl {
             CallTarget::SyntheticTransparentCtor {
                 is_struct: true, ..
             } => None,
-            CallTarget::SyntheticTransparentCtor { .. } | CallTarget::Indirect { .. } => None,
+            CallTarget::SyntheticTransparentCtor { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -13080,29 +13349,6 @@ impl CallControl {
     ///         return True
     /// ```
     pub fn _canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
-        if let CallTarget::Indirect {
-            trait_root,
-            method_name,
-            graphs,
-        } = target
-        {
-            // Same fold as `rpbc.rs`'s `lower_indirect_calls` and as `getcalldescr`'s
-            // `CallShape::Indirect` above: `all_impls_for_indirect` returns
-            // an empty vector both when the family is genuinely empty and
-            // when its impls live outside the analyzed sources, and this
-            // side cannot tell those apart.  `Some(&[])` would reach
-            // `cached_can_raise_family`'s `No` initialiser without the loop
-            // body ever running, i.e. "an unregistered family cannot
-            // raise".  `None` is the honest answer and gives `Yes`.
-            // A specialized row stamped on the op is the family the
-            // annotator selected (`row_of_graphs.values()`).
-            let graphs = match graphs {
-                Some(graphs) if !graphs.is_empty() => graphs.clone(),
-                _ => self.all_impls_for_indirect(trait_root, method_name),
-            };
-            let graphs = (!graphs.is_empty()).then_some(graphs);
-            return self.cached_can_raise_family(graphs.as_deref(), cache);
-        }
         self.cached_can_raise(target, cache)
     }
 
@@ -16084,13 +16330,8 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         // be conservative.
         OpKind::Call { .. } => RaiseClass::Yes,
 
-        // ── vtable entry extraction: pure memory load, no raise ──
-        // RPython: op.args[0] in indirect_call is a plain Variable,
-        // the address extraction itself has no raising analogue.
-        OpKind::VtableMethodPtr { .. } => RaiseClass::No,
         // ── indirect_call canraise comes from the family's calldescr ──
-        // (analyze() dispatch, not here). Not yet emitted; arm reserved
-        // for Phase B.
+        // (analyze() dispatch, not here).
         OpKind::IndirectCall { .. } => RaiseClass::Yes,
 
         // ── Abort placeholders: canraise.py:18 → True (conservative) ─
@@ -18286,6 +18527,7 @@ mod tests {
             &std::collections::HashMap::from([("PyError".to_string(), 8)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "value");
@@ -18317,6 +18559,7 @@ mod tests {
             &aligns,
             &empty_ranks,
             &empty_raw,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "__pos_0");
@@ -18330,6 +18573,7 @@ mod tests {
             &aligns,
             &empty_ranks,
             &empty_raw,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(by_value.fields[0].flag, ArrayFlag::Struct);
         assert_eq!(by_value.fields[0].size, 200);
@@ -18354,6 +18598,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         let must_advance = layout
             .fields
@@ -19398,6 +19643,43 @@ mod tests {
             },
         });
         hinted
+    }
+
+    fn push_vtable_slot_indirect_call(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        receiver: crate::flowspace::model::Variable,
+        extra_args: Vec<crate::flowspace::model::Variable>,
+        trait_root: &str,
+        method_name: &str,
+        result_ty: ValueType,
+        result: Option<crate::flowspace::model::Variable>,
+    ) {
+        let funcptr = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(funcptr.clone()),
+            kind: OpKind::FieldRead {
+                base: receiver.clone(),
+                field: FieldDescriptor::new(
+                    format!("method_{method_name}"),
+                    Some(format!("{trait_root}::{{vtable}}")),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+        let mut args = vec![receiver];
+        args.extend(extra_args);
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: None,
+                family_key: Some((trait_root.to_string(), method_name.to_string())),
+                result_ty,
+            },
+        });
     }
 
     fn push_hint_fresh_virtualizable(
@@ -23249,14 +23531,16 @@ mod tests {
         let frame = caller.alloc_value_var();
         let hinted = push_hint_access_directly(&mut caller, entry, frame);
         let result = caller.alloc_value_var();
-        caller.block_mut(entry).operations.push(SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args([hinted]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
+        push_vtable_slot_indirect_call(
+            &mut caller,
+            entry,
+            hinted,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Ref(None),
+            Some(result.clone()),
+        );
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::Call {
@@ -23272,19 +23556,20 @@ mod tests {
 
         let ad = access_directly_path(&impl_path);
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
-        match &caller.block(caller.startblock).operations[1].kind {
-            OpKind::Call {
-                target: CallTarget::Indirect { graphs, .. },
-                ..
-            } => {
-                assert_eq!(
-                    graphs.as_ref(),
-                    Some(&vec![ad.clone()]),
-                    "trait call must name the AccessDirect implementation"
-                );
-            }
-            other => panic!("expected CallTarget::Indirect, got {other:?}"),
-        }
+        let graphs = caller
+            .block(caller.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { graphs, .. } => Some(graphs),
+                _ => None,
+            })
+            .expect("trait IndirectCall");
+        assert_eq!(
+            graphs.as_ref(),
+            Some(&vec![ad.clone()]),
+            "trait call must name the AccessDirect implementation"
+        );
         assert!(
             cc.is_candidate(&ad),
             "discovery must reach the AccessDirect implementation"
@@ -23362,14 +23647,16 @@ mod tests {
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
         let plain = caller.alloc_value_var();
-        caller.block_mut(entry).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args([plain.clone()]),
-                result_ty: ValueType::Void,
-            },
-        });
+        push_vtable_slot_indirect_call(
+            &mut caller,
+            entry,
+            plain.clone(),
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
+            None,
+        );
         let funcptr = caller.alloc_value_var();
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: None,
@@ -23386,35 +23673,50 @@ mod tests {
         cc.annotate_access_directly(&[caller_path.clone()]);
 
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
-        match &caller.block(caller.startblock).operations[0].kind {
-            OpKind::Call {
-                target: CallTarget::Indirect { graphs, .. },
-                ..
-            } => {
-                assert!(
-                    graphs.is_none()
-                        || graphs.as_ref().is_some_and(|family| {
-                            family.contains(&impl_path)
-                                && !family.iter().any(is_access_directly_path)
-                        }),
-                    "unflagged trait family must stay regular: {graphs:?}"
-                );
+        let mut trait_graphs = None;
+        let mut wrapper_graphs = None;
+        for op in &caller.block(caller.startblock).operations {
+            match &op.kind {
+                OpKind::IndirectCall {
+                    graphs,
+                    family_key: Some((root, method)),
+                    ..
+                } if root == "Handler" && method == "run" => {
+                    trait_graphs = Some(graphs);
+                }
+                OpKind::IndirectCall {
+                    graphs,
+                    family_key: None,
+                    ..
+                } => {
+                    wrapper_graphs = Some(graphs);
+                }
+                OpKind::IndirectCall { graphs, .. }
+                    if graphs
+                        .as_ref()
+                        .is_some_and(|family| family.contains(&impl_path)) =>
+                {
+                    trait_graphs = Some(graphs);
+                }
+                _ => {}
             }
-            other => panic!("expected CallTarget::Indirect, got {other:?}"),
         }
-        match &caller.block(caller.startblock).operations[1].kind {
-            OpKind::IndirectCall { graphs, .. } => {
-                assert!(
-                    graphs.as_ref().is_some_and(|family| {
-                        family.is_empty()
-                            || (family.contains(&wrapper)
-                                && !family.iter().any(is_access_directly_path))
-                    }),
-                    "unflagged wrapper family must stay regular: {graphs:?}"
-                );
-            }
-            other => panic!("expected IndirectCall, got {other:?}"),
-        }
+        let graphs = trait_graphs.expect("trait IndirectCall");
+        assert!(
+            graphs.is_none()
+                || graphs.as_ref().is_some_and(|family| {
+                    family.contains(&impl_path) && !family.iter().any(is_access_directly_path)
+                }),
+            "unflagged trait family must stay regular: {graphs:?}"
+        );
+        let graphs = wrapper_graphs.expect("wrapper IndirectCall");
+        assert!(
+            graphs.as_ref().is_some_and(|family| {
+                family.is_empty()
+                    || (family.contains(&wrapper) && !family.iter().any(is_access_directly_path))
+            }),
+            "unflagged wrapper family must stay regular: {graphs:?}"
+        );
         assert_regular_not_access_directly(&cc, &impl_path);
         assert_no_access_directly_copy(&cc, &impl_path);
         assert_regular_not_access_directly(&cc, &wrapper);
@@ -23897,6 +24199,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields[0].size, 8);
 
@@ -23959,6 +24262,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         let value_offset = layout
             .fields
@@ -24064,6 +24368,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields[0].name, "stack");
         assert_eq!(layout.fields[0].offset, 0);
@@ -24082,6 +24387,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(vec_only.fields.len(), 1);
         assert_eq!(vec_only.fields[0].size, 3 * word);
@@ -24094,6 +24400,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
         assert_eq!(vec_then_flag.size, 4 * word);
@@ -24109,6 +24416,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(triple.align, 4);
         assert_eq!(triple.size, 12);
@@ -24121,6 +24429,7 @@ mod tests {
             &std::collections::HashMap::from([("Triple".to_string(), 4)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
         assert_eq!(nested.size, 12);
@@ -24156,6 +24465,276 @@ mod tests {
             Some(0),
             "the address of an inline Vec is the field, not a load of cap"
         );
+    }
+
+    /// `rtuple.py` `GcStruct`: a positional tuple that holds a GC pointer
+    /// is a GC owner. A scalar-only tuple stays Raw (`Tuple<i64>` spill).
+    #[test]
+    fn from_type_strings_gckind_follows_pointer_fields() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let empty = std::collections::HashSet::new();
+        let sizes = std::collections::HashMap::new();
+        let aligns = std::collections::HashMap::new();
+        let ranks = std::collections::HashMap::new();
+        let none = std::collections::HashMap::new();
+        let gc = StructLayout::from_type_strings(
+            &[
+                ("__pos_0".into(), "*mut PyObject".into()),
+                ("__pos_1".into(), "i64".into()),
+            ],
+            &empty,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &none,
+        );
+        assert_eq!(gc.gckind, GcKind::Gc);
+        assert!(gc.holds_gc_pointer());
+        assert_eq!(gc.effective_gckind(), GcKind::Gc);
+
+        let raw = StructLayout::from_type_strings(
+            &[("__pos_0".into(), "i64".into())],
+            &empty,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &none,
+        );
+        assert_eq!(raw.gckind, GcKind::Raw);
+        assert!(!raw.holds_gc_pointer());
+        assert_eq!(raw.effective_gckind(), GcKind::Raw);
+
+        // Nested by-value ADT: the pointer is on the inner type, classified
+        // with the same field_metadata walk the nested layout uses.
+        let nested_known = std::collections::HashSet::from(["InnerPayload".to_string()]);
+        let nested_fields = std::collections::HashMap::from([(
+            "InnerPayload".to_string(),
+            vec![("cell".into(), "*mut PyObject".into())],
+        )]);
+        let nested = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerPayload".into())],
+            &nested_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(nested.gckind, GcKind::Gc);
+        assert_eq!(nested.fields.len(), 1);
+        assert_eq!(nested.fields[0].name, "payload");
+        assert_eq!(nested.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(nested.effective_gckind(), GcKind::Gc);
+
+        let mut cc = CallControl::new();
+        let owner = "from_type_gckind::Slice";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "cell".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        assert_eq!(
+            cc.declared_gckind_for(owner),
+            Some(GcKind::Gc),
+            "a Raw-stored layout with a FLAG_POINTER field is a GC owner"
+        );
+    }
+
+    /// Inlined nested Struct: Gc only when a FLAG_POINTER field is
+    /// reachable through the nested layout's own `field_metadata` rows.
+    /// A nested raw Struct of only scalars stays Raw (`lltype.Struct`).
+    #[test]
+    fn from_type_strings_gckind_follows_nested_pointer_fields() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let sizes = std::collections::HashMap::new();
+        let aligns = std::collections::HashMap::new();
+        let ranks = std::collections::HashMap::new();
+        let known = std::collections::HashSet::from([
+            "InnerPtr".to_string(),
+            "InnerScalars".to_string(),
+            "core::option::Option<*mut PyObject>".to_string(),
+        ]);
+        let nested_fields = std::collections::HashMap::from([
+            (
+                "InnerPtr".to_string(),
+                vec![("cell".into(), "*mut PyObject".into())],
+            ),
+            (
+                "InnerScalars".to_string(),
+                vec![("a".into(), "i64".into()), ("b".into(), "u32".into())],
+            ),
+        ]);
+
+        let with_ptr = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerPtr".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(with_ptr.gckind, GcKind::Gc);
+        assert_eq!(with_ptr.fields.len(), 1);
+        assert_eq!(with_ptr.fields[0].name, "payload");
+        assert_eq!(with_ptr.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(with_ptr.effective_gckind(), GcKind::Gc);
+
+        let scalars = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerScalars".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(scalars.gckind, GcKind::Raw);
+        assert_eq!(scalars.fields.len(), 1);
+        assert_eq!(scalars.fields[0].name, "payload");
+        assert_eq!(scalars.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(scalars.effective_gckind(), GcKind::Raw);
+
+        // Nested field list not in hand: the pointer is one type-argument
+        // down (`Result<Option<*mut PyObject>, _>` / similar).
+        let option_nested = StructLayout::from_type_strings(
+            &[(
+                "payload".into(),
+                "core::option::Option<*mut PyObject>".into(),
+            )],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(option_nested.gckind, GcKind::Gc);
+        assert_eq!(option_nested.effective_gckind(), GcKind::Gc);
+
+        // Unit nested ADT (`Option<DictKeyError>`): Field descrs mint a
+        // GCREF word (`type_flag_from_str` unknown → FLAG_POINTER). Empty
+        // rows still count; so does a known struct whose rows are absent.
+        let unit_known = std::collections::HashSet::from(["DictKeyError".to_string()]);
+        let unit_empty = std::collections::HashMap::from([("DictKeyError".to_string(), vec![])]);
+        let unit = StructLayout::from_type_strings(
+            &[("payload".into(), "DictKeyError".into())],
+            &unit_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &unit_empty,
+        );
+        assert_eq!(unit.gckind, GcKind::Gc);
+        assert_eq!(unit.effective_gckind(), GcKind::Gc);
+
+        let unit_missing = StructLayout::from_type_strings(
+            &[("payload".into(), "DictKeyError".into())],
+            &unit_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(unit_missing.gckind, GcKind::Gc);
+        assert_eq!(unit_missing.effective_gckind(), GcKind::Gc);
+
+        // Enum base rows are the tag; FLAG_POINTER payloads live on the
+        // variant subclasses (`LoopResult::Done(PyResult)`).
+        let enum_known = std::collections::HashSet::from([
+            "LoopLike".to_string(),
+            "Enc".to_string(),
+            "InnerScalars".to_string(),
+        ]);
+        let enum_fields = std::collections::HashMap::from([
+            (
+                "LoopLike".to_string(),
+                vec![("__discriminant".into(), "u8".into())],
+            ),
+            (
+                "LoopLike::Done".to_string(),
+                vec![("__pos_0".into(), "*mut PyObject".into())],
+            ),
+            (
+                "Enc".to_string(),
+                vec![("__discriminant".into(), "u8".into())],
+            ),
+            ("Enc::A".to_string(), vec![]),
+            (
+                "Enc::B".to_string(),
+                vec![("__pos_0".into(), "InnerScalars".into())],
+            ),
+            (
+                "InnerScalars".to_string(),
+                vec![("a".into(), "i64".into()), ("b".into(), "u32".into())],
+            ),
+        ]);
+        let loop_like = StructLayout::from_type_strings(
+            &[("inner".into(), "LoopLike".into())],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(loop_like.gckind, GcKind::Gc);
+        assert_eq!(loop_like.effective_gckind(), GcKind::Gc);
+
+        let enc = StructLayout::from_type_strings(
+            &[("inner".into(), "Enc".into())],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(enc.gckind, GcKind::Raw);
+        assert_eq!(enc.effective_gckind(), GcKind::Raw);
+
+        // Sum-shell payload word: the nested scalar ADT is stored as a
+        // GCREF (`Option<Utf16Or32Form>::Some.__pos_0`).
+        let shell = StructLayout::from_type_strings(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "InnerScalars".into()),
+            ],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(shell.gckind, GcKind::Gc);
+        assert_eq!(shell.effective_gckind(), GcKind::Gc);
     }
 
     /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
@@ -27685,6 +28264,7 @@ mod tests {
                     &known_aligns,
                     &HashMap::new(),
                     &HashSet::new(),
+                    &HashMap::new(),
                 );
                 if known_sizes.get(*name) != Some(&layout.size)
                     || known_aligns.get(*name) != Some(&layout.align)
@@ -27827,6 +28407,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
         );
         assert_eq!(layout.size, crate::layout::target_word_size());
         assert_eq!(layout.fields.len(), 1);
@@ -27988,6 +28569,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);
@@ -29064,14 +29646,12 @@ mod tests {
         assert!(no_members.extra_info._write_descrs_fields.is_none());
     }
 
-    /// `_canraise`'s `CallTarget::Indirect` arm resolves the family itself
-    /// through `all_impls_for_indirect`, so it meets the same question one
-    /// step earlier than `getcalldescr` does — and must answer it the same
-    /// way: a family it cannot enumerate can raise.
+    /// `getcalldescr` of an `IndirectCall { graphs: None }` is the unknown
+    /// family: a family it cannot enumerate can raise.
     ///
     /// The two registered families are the non-vacuity control: they show
-    /// `cached_can_raise_family` reaching both `No` and `Yes` off the
-    /// members it was handed, so the unregistered family's `Yes` is the
+    /// family analysis reaching both `CannotRaise` and `CanRaise` off the
+    /// members it was handed, so the unregistered family's top is the
     /// unknown-family rule and not a constant.
     #[test]
     fn unenumerable_indirect_family_canraise_is_top() {
@@ -29080,15 +29660,31 @@ mod tests {
         cc.register_trait_method("run", Some("Loud"), "B", raising_graph("B::run"));
         cc.find_all_graphs_for_tests();
 
-        let mut cache = AnalysisCache::default();
+        let descr_of = |graphs: Option<Vec<CallPath>>| {
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &indirect_call_op(graphs),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+        };
+
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Quiet", "run"), &mut cache),
-            CanRaise::No,
+            descr_of(Some(cc.all_impls_for_indirect("Quiet", "run")))
+                .extra_info
+                .extraeffect,
+            ExtraEffect::CannotRaise,
             "control: an enumerated non-raising family reaches bottom"
         );
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Loud", "run"), &mut cache),
-            CanRaise::Yes,
+            descr_of(Some(cc.all_impls_for_indirect("Loud", "run")))
+                .extra_info
+                .extraeffect,
+            ExtraEffect::CanRaise,
             "control: an enumerated raising member is seen"
         );
 
@@ -29097,8 +29693,8 @@ mod tests {
             "the invariant below needs a family with no registered impls"
         );
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Unheard", "run"), &mut cache),
-            CanRaise::Yes,
+            descr_of(None).extra_info.extraeffect,
+            ExtraEffect::RandomEffects,
             "a family with no enumerable members is unknown, not proven empty"
         );
     }

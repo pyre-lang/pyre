@@ -9245,14 +9245,13 @@ impl<S: JitState> JitDriver<S> {
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
+                // The compiled entry's own vable (`compile.py`
+                // `execute_assembler` / `vinfo.reset_vable_token`).  The
+                // recording context's virtualizable is the trace's own vable
+                // box (`virtualizable.py` `tracing_before_residual_call` /
+                // `tracing_after_residual_call`); entering compiled code for
+                // another frame must not retarget `TraceCtx.virtualizable_heap_ptr`.
                 self.meta.set_vable_ptr(ptr.cast_const());
-                // The entry names the frame this run executes.  The exits
-                // put the caller's frame back through
-                // `restore_trace_vable_ptr`: `sync_after` for the ones that
-                // take it, the decline and finish exits directly.
-                if let Some(ctx) = self.meta.tracing.as_mut() {
-                    ctx.set_virtualizable_heap_ptr(ptr.cast_const());
-                }
             }
             // Fallback cache for layouts that cannot expose array length on
             // the heap object alone (header-less embedded arrays). Unused in

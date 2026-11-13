@@ -686,9 +686,8 @@ impl CodeWriter {
 
         // Indirect calls were lowered in place on the graphs `CallControl`
         // owns (`CallControl::lower_registered_indirect_calls`), before this
-        // clone. That pass leaves a family with no registered impl as a
-        // `CallTarget::Indirect` marker; the clone jtransform rewrites takes
-        // it as the unknown family (`indirect_call` with `graphs=None`).
+        // clone. A family with no registered impl stays `OpKind::IndirectCall`
+        // with `graphs=None` (the unknown family).
         // Match may have cut the GraphStore graph (`transform_dead_code`);
         // the drain clone was taken before publish, so re-read after accept.
         let mut graph_owned = if published.is_some() {
@@ -724,8 +723,6 @@ impl CodeWriter {
             &|name| belongs_bk.exception_class_name_belongs(name),
         );
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
-        #[cfg(debug_assertions)]
-        crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         // Pre-jtransform rtyper fold of unit-variant ctors to singleton
         // instance constants (`rtyper/rpbc.py::SingleFrozenPBCRepr`).
         // Catches both the Match-arm and Skip-arm graphs; the

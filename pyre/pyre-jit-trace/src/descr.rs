@@ -144,6 +144,12 @@ pub struct PyreFieldDescr {
 /// is a distinct ARRAY from the plain twin of the same width, so the
 /// registry returns one Arc per `(shape, acquire)` the way
 /// `descr.py` `cache[ARRAY]` returns one object per ARRAY.
+///
+/// `is_gc_managed` is likewise ARRAY identity: `descr.py`
+/// `get_array_descr(gccache, ARRAY_OR_STRUCT)` caches per ARRAY
+/// object and derives gc-ness from `ARRAY._gckind` (`rffi.CArray`
+/// is raw). Two ARRAYs that share a structural shape but disagree
+/// on `_gckind` are distinct cache keys.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct ArrayDescrKey {
     base_size: usize,
@@ -252,9 +258,19 @@ fn get_or_create_array_descr(
     item_type: Type,
     signed: bool,
     len_offset: Option<usize>,
+    is_gc_managed: bool,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
-        base_size, item_size, type_id, item_type, signed, len_offset, None, false, true, 0,
+        base_size,
+        item_size,
+        type_id,
+        item_type,
+        signed,
+        len_offset,
+        None,
+        false,
+        is_gc_managed,
+        0,
     )
 }
 
@@ -302,9 +318,10 @@ fn get_or_create_array_descr_with_full_id(
             .get(&gc_key)
             .cloned()
             .filter(|existing| {
-                existing
-                    .as_array_descr()
-                    .is_some_and(|ad| ad.load_is_acquire() == key.load_is_acquire)
+                existing.as_array_descr().is_some_and(|ad| {
+                    ad.load_is_acquire() == key.load_is_acquire
+                        && ad.is_gc_managed() == key.is_gc_managed
+                })
             })
         {
             if !majit_ir::descr::array_tid_is_unresolved(type_id)
@@ -375,14 +392,7 @@ fn get_or_create_array_descr_with_full_id(
     // `ptr - GcHeader::SIZE`.  The jitcode intern path is
     // `Assembler::add_raw_int_array_descr_signed` (`is_gc_managed: false`).
     // A producer that shipped `is_gc_managed: false` keeps it as well.
-    if !key.is_gc_managed
-        || key
-            .array_type_id
-            .as_deref()
-            .is_some_and(|s| s.starts_with("majit::raw_carray_"))
-    {
-        array_descr.set_is_gc_managed(false);
-    }
+    array_descr.set_is_gc_managed(key.is_gc_managed);
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
@@ -1526,6 +1536,37 @@ static RLIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 pub fn rlist_size_descr() -> DescrRef {
     RLIST_DESCR_GROUP.size_descr.clone()
+}
+
+/// `lltype.py` `Ptr._interior_ptr_type_with_index`:
+/// `GcStruct("Interior", ('ptr', GCREF), ('index', Signed),
+/// hints={'interior_ptr_type': True})`.
+///
+/// Assembler `OpKind::New { owner: "Interior" }` serializes
+/// `BhDescr::Size { type_id: path_hash("Interior"), owner: "" }`.
+/// `force_declared_object_groups` publishes this group into `_cache_size`
+/// before `register_unresolved_struct_tids` (`descr.py` `get_size_descr` /
+/// `gc.py` `init_size_descr`). The mint tid is the truncated cache key
+/// (`struct_tid_is_unresolved`); the census stamps a dense collector tid
+/// whose `TypeInfo` is size 16 with gc-pointer offset `[0]`.
+static INTERIOR_PTR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    let cache_key = majit_ir::descr::path_hash("Interior");
+    build_bare_gcstruct_descr_group(
+        2 * WORD,
+        cache_key as u32,
+        &[
+            ("ptr", 0, WORD, Type::Ref, false, false, false),
+            ("index", WORD, 8, Type::Int, true, false, false),
+        ],
+        "Interior",
+    )
+});
+
+/// Force + return the Interior bare-GcStruct size descriptor, keyed at
+/// `path_hash("Interior")` so `New{"Interior"}` / `BhDescr::resolve_gc_tid`
+/// resolve it.
+pub fn interior_ptr_size_descr() -> DescrRef {
+    INTERIOR_PTR_DESCR_GROUP.size_descr.clone()
 }
 
 pub fn rlist_length_descr() -> DescrRef {
@@ -3659,8 +3700,7 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
             ),
             // `pyframe.py FrameDebugData.is_being_profiled`. Mutable:
             // `executioncontext.py setprofile` writes it on every live
-            // frame. Appended at the tail so existing accessors that
-            // resolve by position keep their slots.
+            // frame.
             (
                 "is_being_profiled",
                 std::mem::offset_of!(FrameDebugData, is_being_profiled),
@@ -4142,8 +4182,17 @@ pub fn make_array_descr_with_type(
     len_offset: Option<usize>,
     item_type: Type,
     signed: bool,
+    is_gc_managed: bool,
 ) -> DescrRef {
-    get_or_create_array_descr(base_size, item_size, type_id, item_type, signed, len_offset)
+    get_or_create_array_descr(
+        base_size,
+        item_size,
+        type_id,
+        item_type,
+        signed,
+        len_offset,
+        is_gc_managed,
+    )
 }
 
 /// Bridge-only factory that threads the codewriter's `array_type_id`
@@ -4152,6 +4201,9 @@ pub fn make_array_descr_with_type(
 /// identical structural fields but different lltype spellings receive
 /// distinct registry slots — matching upstream
 /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py get_array_descr`).
+///
+/// `is_gc_managed` is `ARRAY._gckind` (`cpu.arraydescrof(rffi.CArray(TYPE))`
+/// is raw).
 pub fn make_array_descr_with_full_id(
     base_size: usize,
     item_size: usize,
@@ -4161,6 +4213,7 @@ pub fn make_array_descr_with_full_id(
     signed: bool,
     array_type_id: Option<String>,
     load_is_acquire: bool,
+    is_gc_managed: bool,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
         base_size,
@@ -4171,7 +4224,7 @@ pub fn make_array_descr_with_full_id(
         len_offset,
         array_type_id,
         load_is_acquire,
-        true,
+        is_gc_managed,
         0,
     )
 }
@@ -4668,6 +4721,7 @@ pub fn dict_lookup_entries_array_descr() -> DescrRef {
             false,
             Some("dict.lookup.entries".to_string()),
             false,
+            true,
         )
     });
     DESCR.clone()
@@ -9754,6 +9808,18 @@ pub fn ec_mutate_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET)
 }
 
+/// `ExecutionContext.is_tracing`, the counter `bytecode_only_trace`
+/// tests before `run_trace_func`.  Standalone so it does not restamp
+/// `EC_DESCR_GROUP` `index_in_parent` ranks.
+pub fn ec_is_tracing_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(pyre_interpreter::ExecutionContext, is_tracing),
+        std::mem::size_of::<i32>(),
+        Type::Int,
+        true,
+    )
+}
+
 /// Field descr for `ExecutionContext::profilefunc`, the slot
 /// `executioncontext.py` lists as `profilefunc?` next to `w_tracefunc?`.
 ///
@@ -12541,6 +12607,7 @@ mod tests {
             false,
             Some("pyre::test_singleton_id".to_string()),
             false,
+            true,
         );
         let b = crate::descr::make_array_descr_with_full_id(
             0,
@@ -12551,6 +12618,7 @@ mod tests {
             false,
             Some("pyre::test_singleton_id".to_string()),
             false,
+            true,
         );
         assert!(
             std::sync::Arc::ptr_eq(&a, &b),
@@ -13963,6 +14031,36 @@ mod tests {
                 .type_id(),
             published_tid
         );
+    }
+
+    #[test]
+    fn interior_ptr_descr_is_published_under_path_hash() {
+        force_declared_object_groups();
+        let size = interior_ptr_size_descr();
+        let sd = size.as_size_descr().expect("Interior is a SizeDescr");
+        assert_eq!(sd.size(), 2 * WORD);
+        assert!(sd.is_gc_managed());
+        assert!(!sd.headerless());
+        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(traced, vec![0]);
+        assert_eq!(sd.cache_key(), majit_ir::descr::path_hash("Interior"));
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("Interior"));
+        let resolved = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_size
+            .get(&key)
+            .cloned()
+            .expect("Interior descr registered under path_hash(\"Interior\")");
+        let resolved = resolved
+            .as_size_descr()
+            .expect("Interior resolved entry is a SizeDescr");
+        assert_eq!(resolved.size(), 2 * WORD);
+        let resolved_traced: Vec<usize> = resolved
+            .gc_fielddescrs()
+            .iter()
+            .map(|f| f.offset())
+            .collect();
+        assert_eq!(resolved_traced, vec![0]);
     }
 
     #[test]
@@ -15759,6 +15857,65 @@ mod tests {
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
     /// second identity for a field merely because a different graph read it.
+    /// Flatten's shared we_are_jitted block reads `FrameDebugData.w_f_trace`
+    /// through `flatten_descr_by_ptr`.  Reconstruct that BhDescr here and
+    /// require `make_descr_from_bh` to return the declared group Arc — heap
+    /// CSE keys on descr identity, and a parallel mint (`T{cache_key}.…`)
+    /// records a getfield at every opcode instead of one GuardFalse.
+    #[test]
+    fn make_descr_from_bh_roundtrips_flatten_w_f_trace_to_declared_group() {
+        use majit_jitcode::jitcode::{BhDescr, bh_field_specs_from_size_descr};
+
+        let canonical = frame_debug_data_w_f_trace_descr();
+        let field = canonical
+            .as_field_descr()
+            .expect("w_f_trace is a FieldDescr");
+        let display_name = field.field_name();
+        let field_key = field.field_key();
+        let owner = if display_name == field_key {
+            ""
+        } else {
+            display_name
+                .strip_suffix(field_key)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .unwrap_or("")
+        };
+        let parent = field.get_parent_descr().and_then(|parent| {
+            parent.as_size_descr().map(|size| {
+                std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
+                    size: size.size(),
+                    type_id: size.cache_key(),
+                    vtable: size.vtable() as u64,
+                    owner: owner.to_string(),
+                    is_gc_managed: size.is_gc_managed(),
+                    headerless: size.headerless(),
+                    all_fielddescrs: bh_field_specs_from_size_descr(size),
+                })
+            })
+        });
+        let descr = make_descr_from_bh(&BhDescr::Field {
+            offset: field.offset(),
+            field_size: field.field_size(),
+            field_type: field.field_type(),
+            field_flag: field.field_flag(),
+            is_field_signed: field.is_field_signed(),
+            is_immutable: field.is_immutable(),
+            is_quasi_immutable: canonical.is_quasi_immutable(),
+            index_in_parent: Some(field.index_in_parent()),
+            parent,
+            name: display_name.to_string(),
+            owner: owner.to_string(),
+            load_is_acquire: field.stored_load_is_acquire(),
+            store_is_release: field.stored_store_is_release(),
+        });
+        let got = descr.as_field_descr().expect("FieldDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "flatten w_f_trace BhDescr must rebuild as the declared group Arc, got {}",
+            got.field_name(),
+        );
+    }
+
     #[test]
     fn make_descr_from_bh_bridges_execution_context_fields_to_declared_group() {
         use majit_ir::descr::ArrayFlag;
@@ -16553,6 +16710,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
             LazyLock::force(&SPECIALISED_TUPLE_OO_DESCR_GROUP);
         },
     ),
+    ("Interior", || {
+        LazyLock::force(&INTERIOR_PTR_DESCR_GROUP);
+    }),
     ("object_array::ItemsBlock", || {
         LazyLock::force(&ITEMS_BLOCK_DESCR_GROUP);
     }),
@@ -17742,31 +17902,6 @@ mod switch_descr_tests {
     }
 }
 
-/// Trace-side adapter for pyre's Rust-vtable method descriptor.
-#[derive(Debug)]
-pub struct PyreVtableMethodDescr {
-    trait_root: String,
-    method_name: String,
-}
-
-impl PyreVtableMethodDescr {
-    pub fn new(trait_root: String, method_name: String) -> Self {
-        Self {
-            trait_root,
-            method_name,
-        }
-    }
-}
-
-impl Descr for PyreVtableMethodDescr {
-    fn repr(&self) -> String {
-        format!(
-            "VtableMethodDescr({}::{})",
-            self.trait_root, self.method_name
-        )
-    }
-}
-
 /// `assembler.py Assembler.descrs` parity adapter — translate one
 /// codewriter-side `BhDescr` slot (`majit-jitcode/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
@@ -17796,9 +17931,9 @@ impl Descr for PyreVtableMethodDescr {
 ///   `make_call_descr_with_effect`, preserving RPython `call.py:320`
 ///   effectinfo_from_writeanalyze parity for descr cache keys and
 ///   residual-call classification.
-/// * `Switch` / `VableField` / `VableArray` / `VtableMethod` — trace-side
-///   adapters preserve the descriptor slot instead of substituting a
-///   fail-descr placeholder.
+/// * `Switch` / `VableField` / `VableArray` — trace-side adapters
+///   preserve the descriptor slot instead of substituting a fail-descr
+///   placeholder.
 pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
     use majit_jitcode::jitcode::BhDescr;
     match bh {
@@ -17920,9 +18055,10 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // vtable-less SizeDescr and mints
             // `T{cache_key}.FrameDebugData.w_f_trace`. Heap CSE keys on
             // descr identity, so that parallel mint keeps two reads of one
-            // field apart. One field is one descr (`descr.py
-            // get_field_descr`); bridge to the declared group before that
-            // mint, same as ExecutionContext above.
+            // field apart and records a getfield at every opcode. One field
+            // is one descr (`descr.py get_field_descr`); bridge to the
+            // declared group before that mint, same as ExecutionContext
+            // above.
             //
             // Flatten stores the display name (`FrameDebugData.w_f_trace`)
             // and the owner separately. The packed parent may spell the
@@ -18900,13 +19036,6 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
         BhDescr::VableArray { index } => {
             crate::frame_layout::pyframe_array_field_descr(*index as u16)
         }
-        BhDescr::VtableMethod {
-            trait_root,
-            method_name,
-        } => Arc::new(PyreVtableMethodDescr::new(
-            trait_root.clone(),
-            method_name.clone(),
-        )),
     }
 }
 

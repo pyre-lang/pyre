@@ -22,9 +22,45 @@ use crate::{TraceAction, TraceCtx};
 const CALL_INLINE: usize = 8;
 type CallOpRefs = SmallVec<[OpRef; CALL_INLINE]>;
 type CallI64s = SmallVec<[i64; CALL_INLINE]>;
-type CallTypes = SmallVec<[Type; CALL_INLINE]>;
 type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
 type CallValues = SmallVec<[Value; CALL_INLINE]>;
+
+/// `_build_allboxes` `allboxes = [None] * n` — one pre-sized list, not
+/// six heap vectors. Width is `MAX_HOST_CALL_ARITY` (the bh_call
+/// dispatch table).
+struct CanonicalCallArgs {
+    args_buf: [OpRef; MAX_HOST_CALL_ARITY],
+    concrete_buf: [i64; MAX_HOST_CALL_ARITY],
+    types_buf: [Type; MAX_HOST_CALL_ARITY],
+    raw_i_buf: [i64; MAX_HOST_CALL_ARITY],
+    raw_r_buf: [i64; MAX_HOST_CALL_ARITY],
+    raw_f_buf: [i64; MAX_HOST_CALL_ARITY],
+    n: u8,
+    ni: u8,
+    nr: u8,
+    nf: u8,
+}
+
+impl CanonicalCallArgs {
+    fn args(&self) -> &[OpRef] {
+        &self.args_buf[..self.n as usize]
+    }
+    fn concrete_args(&self) -> &[i64] {
+        &self.concrete_buf[..self.n as usize]
+    }
+    fn arg_types(&self) -> &[Type] {
+        &self.types_buf[..self.n as usize]
+    }
+    fn raw_i(&self) -> &[i64] {
+        &self.raw_i_buf[..self.ni as usize]
+    }
+    fn raw_r(&self) -> &[i64] {
+        &self.raw_r_buf[..self.nr as usize]
+    }
+    fn raw_f(&self) -> &[i64] {
+        &self.raw_f_buf[..self.nf as usize]
+    }
+}
 
 /// One `pyjitpl.py` `_get_opimpl_method` handler.
 /// `MetaInterpStaticData.opcode_implementations` is a table of these,
@@ -2603,16 +2639,7 @@ where
         };
         match descr {
             Some(descr) => Some((vable_opref, descr)),
-            None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.static_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.static_field_descrs().len())
-                };
-                self.report_absent_vable_descr("static field", field_idx, declared);
-                None
-            }
+            None => None,
         }
     }
 
@@ -2626,32 +2653,6 @@ where
             .jitdrivers_sd
             .get(jd)
             .and_then(|jd| jd.virtualizable_info.as_ref())
-    }
-
-    /// Name the reason a vable descriptor lookup declined, under
-    /// `MAJIT_VABLE_READ_PROBE`.
-    ///
-    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
-    /// index past the declared list — return `None` here and abort the walk
-    /// identically, and the abort is reported by jitcode and cursor alone.
-    /// Without this the two are indistinguishable from outside, and they call
-    /// for opposite fixes: the first is a trace that was started without
-    /// `initialize_virtualizable`, the second a codewriter index that does not
-    /// match the runtime declaration.
-    fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
-        if !crate::vable_read_probe_enabled() {
-            return;
-        }
-        let depth = self.frames.len();
-        let frame = self.frames.current_mut();
-        let cause = match declared {
-            None => "no vinfo bound to the trace".to_owned(),
-            Some(n) => format!("declared {n}"),
-        };
-        eprintln!(
-            "[vable-read-probe] no {kind} descr jitcode={} depth={} cursor={} index={index} {cause}",
-            frame.jitcode.name, depth, frame.code_cursor,
-        );
     }
 
     /// Print one control-flow edge under `MAJIT_PCSEQ`
@@ -2709,16 +2710,7 @@ where
         };
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
-            None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.array_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.array_field_descrs().len())
-                };
-                self.report_absent_vable_descr("array", array_idx, declared);
-                None
-            }
+            None => None,
         }
     }
 
@@ -4311,7 +4303,7 @@ where
                         majit_jitcode::jitcode::read_label_at(code, pc + 1)
                     };
                     frame.code_cursor = target;
-                    self.optrace_step();
+                    // `opimpl_goto` is `self.pc = target`; no debug print.
                     continue;
                 }
                 _ => {}
@@ -4328,22 +4320,31 @@ where
     }
 
     /// Print the current opcode when `optrace_enabled`. Never aborts the walk.
+    /// Idle path is one relaxed load (`have_debug_prints` /
+    /// `OP_HAVE_DEBUG_PRINTS`).
+    #[inline(always)]
     fn optrace_step(&mut self) {
         if crate::optrace_enabled() {
-            let fr = self.frames.current_mut();
-            let cur = fr.code_cursor;
-            let anchor_pc = fr.pc;
-            let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
-            let name = fr.jitcode.name.clone();
-            eprintln!(
-                "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
-                self.frames.len(),
-                cur,
-                anchor_pc,
-                opcode,
-                name
-            );
+            self.optrace_step_print();
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn optrace_step_print(&mut self) {
+        let fr = self.frames.current_mut();
+        let cur = fr.code_cursor;
+        let anchor_pc = fr.pc;
+        let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+        let name = fr.jitcode.name.clone();
+        eprintln!(
+            "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+            self.frames.len(),
+            cur,
+            anchor_pc,
+            opcode,
+            name
+        );
     }
 
     /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
@@ -4746,6 +4747,18 @@ where
         }
     }
 
+    /// `prepare_list_of_boxes` + `_build_allboxes` fused: one pre-sized
+    /// list of boxes in descr argument order.
+    ///
+    /// `prepare_list_of_boxes` reads `self.registers_{i,r,f}[index]` into
+    /// one list. `_build_allboxes` then fills `allboxes = [None] *
+    /// (len(argboxes)+1)` by walking `descr.get_arg_types()`. Residual
+    /// recording prepends `funcbox` later (`_record_helper` /
+    /// `_record_helper_varargs`). Concrete bits sit in parallel slots
+    /// because `bh_call_*_by_classes` is the typed-bank form of
+    /// `executor.execute_varargs` reading `box.getint()` at execute
+    /// time. The storage is a stack array of `MAX_HOST_CALL_ARITY`
+    /// (the dispatch table's width), not six heap `SmallVec`s.
     fn read_canonical_call_args(
         &mut self,
         ctx: &TraceCtx,
@@ -4753,67 +4766,99 @@ where
         args_i: &[JitCallArg],
         args_r: &[JitCallArg],
         args_f: &[JitCallArg],
-    ) -> (
-        CallOpRefs,
-        CallI64s,
-        CallTypes,
-        CallI64s,
-        CallI64s,
-        CallI64s,
-    ) {
-        // pyjitpl.py `_build_allboxes`: one walk over the calldescr's
-        // argument classes, taking the next encoded register of that kind.
-        let mut raw_i = CallI64s::with_capacity(args_i.len());
-        let mut raw_r = CallI64s::with_capacity(args_r.len());
-        let mut raw_f = CallI64s::with_capacity(args_f.len());
+    ) -> CanonicalCallArgs {
+        let n = arg_classes.len();
+        assert!(
+            n <= MAX_HOST_CALL_ARITY,
+            "BC_RESIDUAL_CALL arg_classes length {n} exceeds MAX_HOST_CALL_ARITY \
+             ({MAX_HOST_CALL_ARITY})"
+        );
+        let mut call = CanonicalCallArgs {
+            args_buf: [OpRef::NONE; MAX_HOST_CALL_ARITY],
+            concrete_buf: [0; MAX_HOST_CALL_ARITY],
+            types_buf: [Type::Int; MAX_HOST_CALL_ARITY],
+            raw_i_buf: [0; MAX_HOST_CALL_ARITY],
+            raw_r_buf: [0; MAX_HOST_CALL_ARITY],
+            raw_f_buf: [0; MAX_HOST_CALL_ARITY],
+            n: 0,
+            ni: 0,
+            nr: 0,
+            nf: 0,
+        };
         let mut next_i = 0usize;
         let mut next_r = 0usize;
         let mut next_f = 0usize;
-        let mut args = CallOpRefs::with_capacity(arg_classes.len());
-        let mut concrete_args = CallI64s::with_capacity(arg_classes.len());
-        let mut arg_types = CallTypes::with_capacity(arg_classes.len());
         for class in arg_classes.chars() {
-            let (bank, next, raw, kind) = match class {
-                'i' | 'S' => (args_i, &mut next_i, &mut raw_i, "int"),
-                'r' => (args_r, &mut next_r, &mut raw_r, "ref"),
-                'f' | 'L' => (args_f, &mut next_f, &mut raw_f, "float"),
+            let idx = call.n as usize;
+            let (opref, concrete, arg_type) = match class {
+                'i' | 'S' => {
+                    let arg = *args_i.get(next_i).unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL calldescr arg_classes \
+                             expected int arg #{next_i}, only {} encoded",
+                            args_i.len()
+                        )
+                    });
+                    next_i += 1;
+                    let pair = self.read_int_reg(ctx, arg.reg as usize);
+                    call.raw_i_buf[call.ni as usize] = pair.1;
+                    call.ni += 1;
+                    (pair.0, pair.1, Type::Int)
+                }
+                'r' => {
+                    let arg = *args_r.get(next_r).unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL calldescr arg_classes \
+                             expected ref arg #{next_r}, only {} encoded",
+                            args_r.len()
+                        )
+                    });
+                    next_r += 1;
+                    let pair = self.read_ref_reg(ctx, arg.reg as usize);
+                    call.raw_r_buf[call.nr as usize] = pair.1;
+                    call.nr += 1;
+                    (pair.0, pair.1, Type::Ref)
+                }
+                'f' | 'L' => {
+                    let arg = *args_f.get(next_f).unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL calldescr arg_classes \
+                             expected float arg #{next_f}, only {} encoded",
+                            args_f.len()
+                        )
+                    });
+                    next_f += 1;
+                    let pair = self.read_float_reg(ctx, arg.reg as usize);
+                    call.raw_f_buf[call.nf as usize] = pair.1;
+                    call.nf += 1;
+                    (pair.0, pair.1, Type::Float)
+                }
                 other => panic!(
-                    "BC_RESIDUAL_CALL_*_V calldescr has unsupported \
+                    "BC_RESIDUAL_CALL calldescr has unsupported \
                      arg class {other:?}"
                 ),
             };
-            let arg = *bank.get(*next).unwrap_or_else(|| {
-                panic!(
-                    "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
-                     expected {kind} arg #{}, only {} encoded",
-                    *next,
-                    bank.len()
-                )
-            });
-            *next += 1;
-            let (opref, concrete, arg_type) = self.read_call_arg(ctx, arg);
-            raw.push(concrete);
-            args.push(opref);
-            concrete_args.push(concrete);
-            arg_types.push(arg_type);
+            call.args_buf[idx] = opref;
+            call.concrete_buf[idx] = concrete;
+            call.types_buf[idx] = arg_type;
+            call.n += 1;
         }
-
         assert_eq!(
             next_i,
             args_i.len(),
-            "BC_RESIDUAL_CALL_*_V encoded extra int args not present in calldescr"
+            "BC_RESIDUAL_CALL encoded extra int args not present in calldescr"
         );
         assert_eq!(
             next_r,
             args_r.len(),
-            "BC_RESIDUAL_CALL_*_V encoded extra ref args not present in calldescr"
+            "BC_RESIDUAL_CALL encoded extra ref args not present in calldescr"
         );
         assert_eq!(
             next_f,
             args_f.len(),
-            "BC_RESIDUAL_CALL_*_V encoded extra float args not present in calldescr"
+            "BC_RESIDUAL_CALL encoded extra float args not present in calldescr"
         );
-        (args, concrete_args, arg_types, raw_i, raw_r, raw_f)
+        call
     }
 
     fn trace_binop_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {

@@ -1093,67 +1093,17 @@ where
             (offset, field_size, is_field_signed, fielddescr)
         };
         let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
-        // blackhole.py bhimpl_getfield_gc_i reads the field through the fielddescr,
-        // which carries the field's byte width; a sub-word integer field
-        // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
-        // width, not as a full word — otherwise adjacent bytes leak into
-        // the value. Ref fields are always word-sized pointers.
-        let loaded = if struct_ptr == 0 {
-            0
-        } else if is_ref {
-            // llmodel.py bh_getfield_gc_r / read_ref_at_mem use GCREF,
-            // whose width is the target pointer width, not FLOATSTORAGE.
-            self.cpu
-                .bh_getfield_gc_r(
-                    struct_ptr as usize,
-                    fielddescr
-                        .as_field_descr()
-                        .expect("GC ref field descriptor"),
-                )
-                .0 as i64
-        } else {
-            let acquire = fielddescr
-                .as_field_descr()
-                .map(|f| f.load_is_acquire())
-                .unwrap_or(false);
-            // `llmodel.py read_int_at_mem`; acquire is
-            // `AtomicU*::load(Acquire)` at the field width.
-            unsafe {
-                majit_backend::llmodel::read_int_at_mem(
-                    struct_ptr as usize,
-                    offset,
-                    field_size,
-                    is_field_signed,
-                    acquire,
-                )
-            }
-        };
         let kind = if is_ref {
             OpCode::GetfieldGcR
         } else {
             OpCode::GetfieldGcI
         };
-        let value = if is_ref {
-            Value::Ref(majit_ir::GcRef(loaded as usize))
-        } else {
-            Value::Int(loaded)
-        };
-        // `is_pure_with_descr` admits GETFIELD_GC_{I,R} only for a
-        // descr that answers `is_always_pure`, so only an immutable
-        // field off a constant struct folds. The null case hands the
-        // funnel no concrete: `loaded` is a fabricated 0 rather than a
-        // real load, and `llmodel.py protect_speculative_field` rejects
-        // a null gcptr before any fold — the executor row would
-        // dereference it.
         // `_opimpl_getfield_gc_any_pureornot` opens on
         // `upd = heapcache.get_field_updater(box, fielddescr)` and
         // returns `upd.currfieldbox` without recording when the cache
         // answers; only the miss path reaches `execute_with_descr`,
         // and it stores the result back with
-        // `upd.getfield_now_known(resbox)`.  The sibling
-        // `BC_GETARRAYITEM_GC_*` arms carry both halves already, and
-        // `BC_SETFIELD_GC` fills this very cache — without the two
-        // halves here that cache is written and never read.
+        // `upd.getfield_now_known(resbox)`.
         //
         // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
         // updater: a constant struct's always-pure field bypasses the
@@ -1171,18 +1121,6 @@ where
             heapcache_field_key(&fielddescr)
         };
         let cached = field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
-        let cached_payload = cached.and_then(|cached| match ctx.box_value(cached) {
-            Some(Value::Int(n)) => Some(n),
-            Some(Value::Ref(r)) => Some(r.0 as i64),
-            _ => None,
-        });
-        // Parentless placeholder descrs can share `field_key`, so a
-        // Position word and a frame `base` collide. A hit whose
-        // payload is not the live load is that collision: take the
-        // miss path and record a fresh op.
-        let cached = cached.filter(|_| {
-            struct_ptr == 0 || cached_payload.is_none() || cached_payload == Some(loaded)
-        });
         let (op, reg_concrete) = if let Some(cached) = cached {
             // `profiler.count_ops(rop.GETFIELD_GC_I,
             // Counters.HEAPCACHED_OPS)` — folded-away op
@@ -1195,16 +1133,6 @@ where
                 OpCode::GetfieldGcI,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
             );
-            // The sanity check compares the freshly executed load
-            // against the cached box's own payload
-            // (`currfieldbox.getint()` / `.getref_base()`), read
-            // here through `box_value` — the const pool,
-            // standard-virtualizable shadow and frontend value
-            // slot composed into one answer.  A `None` payload is
-            // an entry seeded without a live concrete and skips
-            // the check.  A null struct fabricated `loaded` rather
-            // than reading, so it has nothing to compare either.
-            //
             // RPython runs `executor.execute(cpu, metainterp,
             // opnum, fielddescr, box)` for this compare
             // (`_opimpl_getfield_gc_any_pureornot`). That is
@@ -1216,9 +1144,9 @@ where
                 Some(Value::Ref(r)) => Some(r.0 as i64),
                 _ => None,
             };
-            let kind = if is_ref { Type::Ref } else { Type::Int };
+            let load_kind = if is_ref { Type::Ref } else { Type::Int };
             let executed = if struct_ptr != 0 {
-                ctx.field_sanity_load(struct_ptr, &fielddescr, kind)
+                ctx.field_sanity_load(struct_ptr, &fielddescr, load_kind)
                     .and_then(|v| match v {
                         Value::Ref(r) => Some(r.0 as i64),
                         Value::Int(n) => Some(n),
@@ -1227,18 +1155,56 @@ where
             } else {
                 None
             };
-            let compare = executed.unwrap_or(loaded);
             assert!(
-                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
+                struct_ptr == 0
+                    || !matches!((expected, executed), (Some(exp), Some(got)) if exp != got),
                 "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                     loaded {compare} != cached {expected:?} \
+                     loaded {executed:?} != cached {expected:?} \
                      (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                 if is_ref { "ref" } else { "int" },
             );
-            // The cached box is returned even on a mismatch, so
-            // the register takes its payload, not the fresh load.
-            (cached, expected.unwrap_or(loaded))
+            (cached, expected.or(executed).unwrap_or(0))
         } else {
+            // blackhole.py bhimpl_getfield_gc_i reads the field through the fielddescr,
+            // which carries the field's byte width; a sub-word integer field
+            // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
+            // width, not as a full word — otherwise adjacent bytes leak into
+            // the value. Ref fields are always word-sized pointers.
+            let loaded = if struct_ptr == 0 {
+                0
+            } else if is_ref {
+                // llmodel.py bh_getfield_gc_r / read_ref_at_mem use GCREF,
+                // whose width is the target pointer width, not FLOATSTORAGE.
+                self.cpu
+                    .bh_getfield_gc_r(
+                        struct_ptr as usize,
+                        fielddescr
+                            .as_field_descr()
+                            .expect("GC ref field descriptor"),
+                    )
+                    .0 as i64
+            } else {
+                let acquire = fielddescr
+                    .as_field_descr()
+                    .map(|f| f.load_is_acquire())
+                    .unwrap_or(false);
+                // `llmodel.py read_int_at_mem`; acquire is
+                // `AtomicU*::load(Acquire)` at the field width.
+                unsafe {
+                    majit_backend::llmodel::read_int_at_mem(
+                        struct_ptr as usize,
+                        offset,
+                        field_size,
+                        is_field_signed,
+                        acquire,
+                    )
+                }
+            };
+            let value = if is_ref {
+                Value::Ref(majit_ir::GcRef(loaded as usize))
+            } else {
+                Value::Int(loaded)
+            };
             let op = ctx.execute_and_record(
                 Some(self.cpu.as_ref()),
                 kind,
@@ -1350,28 +1316,16 @@ where
             )
         };
         let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
-        let loaded = if struct_ptr != 0 {
-            unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
-        } else {
-            0
-        };
         // See the `BC_GETFIELD_GC_I` arm on the descr gate, the null
         // case, and the two heapcache halves
         // `_opimpl_getfield_gc_any_pureornot` brackets the load with.
+        // Lookup first; the hit path's one `executor.execute` is the
+        // sanity load, the miss path is the only `execute_with_descr`.
         // The float sanity check is the one upstream spells
         // `ConstFloat(resvalue).same_constant(upd.currfieldbox
         // .constbox())` rather than `==`, so that two NaNs compare
         // equal; comparing the raw bit patterns is that same
-        // predicate, and `loaded` is already the bits.
-        // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
-        // updater: a constant struct's always-pure field bypasses the
-        // heapcache completely, executing and returning a Const
-        // without reading, writing, or recording anything.  Spelling
-        // it as "this load has no cache key" reaches the miss path
-        // below, whose `execute_and_record` performs that very fold —
-        // `is_pure_with_descr` admits GETFIELD_GC only through
-        // `descr.is_always_pure()`, the same predicate — and the key
-        // being `None` is what then skips both cache halves.
+        // predicate.
         let bypasses_heapcache = fielddescr.is_always_pure() && struct_opref.is_constant();
         let field_key = if bypasses_heapcache {
             None
@@ -1391,14 +1345,29 @@ where
                 Some(Value::Float(f)) => Some(f.to_bits() as i64),
                 _ => None,
             };
+            let executed = if struct_ptr != 0 {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Float)
+                    .and_then(|v| match v {
+                        Value::Float(f) => Some(f.to_bits() as i64),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
             assert!(
-                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                struct_ptr == 0
+                    || !matches!((expected, executed), (Some(exp), Some(got)) if exp != got),
                 "_opimpl_getfield_gc_any_pureornot sanity check (float): \
-                     loaded {loaded:#x} != cached {expected:?} \
+                     loaded {executed:?} != cached {expected:?} \
                      (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
             );
-            (cached, expected.unwrap_or(loaded))
+            (cached, expected.or(executed).unwrap_or(0))
         } else {
+            let loaded = if struct_ptr != 0 {
+                unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
+            } else {
+                0
+            };
             let op = ctx.execute_and_record(
                 Some(self.cpu.as_ref()),
                 OpCode::GetfieldGcF,
@@ -2434,25 +2403,6 @@ where
             let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
             (opcode_pc, vable_reg, array_idx, index_reg, dest)
         };
-        if crate::vable_read_probe_enabled() {
-            let depth = self.frames.len();
-            let frame = self.frames.current_mut();
-            eprintln!(
-                "[vable-read-probe] reg jitcode={} depth={} vable_reg={} \
-                 reg_opref={:?} reg_value={:?}",
-                frame.jitcode.name,
-                depth,
-                vable_reg,
-                frame.ref_regs[vable_reg],
-                frame
-                    .ref_regs
-                    .get(vable_reg)
-                    .copied()
-                    .flatten()
-                    .and_then(|op| ctx.box_bits(op))
-                    .map(|v| format!("0x{v:x}")),
-            );
-        }
         let Some((vable_opref, fdescr, adescr)) =
             self.vable_array_descrs(ctx, vable_reg, array_idx)
         else {
@@ -2610,7 +2560,6 @@ where
             adescr,
             value,
             Value::Int(concrete),
-            false,
         ) {
             // Promoted index falls outside the standard virtualizable
             // array (e.g. a transient out-of-bounds state-field index);
@@ -2677,7 +2626,6 @@ where
             adescr,
             value,
             Value::Ref(majit_ir::GcRef(concrete as usize)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}
@@ -2741,7 +2689,6 @@ where
             adescr,
             value,
             Value::Float(f64::from_bits(concrete as u64)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}
@@ -5761,8 +5708,14 @@ where
             (target, args_i, args_r, args_f, calldescr, trace_descr)
         };
 
-        let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
+        let call =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
+        let args = call.args();
+        let concrete_args = call.concrete_args();
+        let arg_types = call.arg_types();
+        let raw_i = call.raw_i();
+        let raw_r = call.raw_r();
+        let raw_f = call.raw_f();
 
         let trace_ptr = target.trace_ptr;
         let concrete_ptr = target.concrete_ptr;
@@ -6116,8 +6069,14 @@ where
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
-        let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
+        let call =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
+        let args = call.args();
+        let concrete_args = call.concrete_args();
+        let arg_types = call.arg_types();
+        let raw_i = call.raw_i();
+        let raw_r = call.raw_r();
+        let raw_f = call.raw_f();
 
         let trace_ptr = target.trace_ptr;
         let concrete_ptr = target.concrete_ptr;
@@ -6467,8 +6426,14 @@ where
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
-        let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
+        let call =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
+        let args = call.args();
+        let concrete_args = call.concrete_args();
+        let arg_types = call.arg_types();
+        let raw_i = call.raw_i();
+        let raw_r = call.raw_r();
+        let raw_f = call.raw_f();
 
         let trace_ptr = target.trace_ptr;
         let concrete_ptr = target.concrete_ptr;
@@ -6770,8 +6735,14 @@ where
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
-        let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
+        let call =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
+        let args = call.args();
+        let concrete_args = call.concrete_args();
+        let arg_types = call.arg_types();
+        let raw_i = call.raw_i();
+        let raw_r = call.raw_r();
+        let raw_f = call.raw_f();
 
         let trace_ptr = target.trace_ptr;
         let concrete_ptr = target.concrete_ptr;
@@ -7215,8 +7186,14 @@ where
                 dst,
             )
         };
-        let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
+        let call =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &[]);
+        let args = call.args();
+        let concrete_args = call.concrete_args();
+        let arg_types = call.arg_types();
+        let raw_i = call.raw_i();
+        let raw_r = call.raw_r();
+        let raw_f = call.raw_f();
         let trace_ptr = target.trace_ptr;
         let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);

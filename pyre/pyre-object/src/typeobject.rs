@@ -1400,10 +1400,11 @@ pub unsafe fn w_type_read_version_tag_field(obj: PyObjectRef) -> u64 {
 /// invariant required by the object and pointer arguments for the entire call.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
-    w_type_notify_mutate_version_tag(obj);
-    (*(obj as *const W_TypeObject))
-        .version_tag
-        .store(v, std::sync::atomic::Ordering::Release);
+    let t = obj as *const W_TypeObject;
+    crate::quasi_immut_store!((*t).mutate_version_tag() =>
+        (*t).version_tag
+            .store(v, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for this type's
@@ -1860,37 +1861,49 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::Fixe
 }
 
 /// True when `cls` occurs in `w_type`'s MRO — the pointer-identity subtype
-/// membership scan `W_TypeObject.issubtype` / `_issubtype` performs
-/// (typeobject.py:603/1640).  The single home for the MRO subtype check;
-/// interpreter-level subtype guards and reflected-binop dispatch delegate
-/// here rather than each re-scanning the MRO.
+/// membership scan `_issubtype` performs (typeobject.py).  The single home
+/// for the MRO subtype check; interpreter-level subtype guards and
+/// reflected-binop dispatch delegate here rather than each re-scanning
+/// the MRO.
 ///
-/// Under the JIT `issubtype` runs this scan inside `_pure_issubtype`
-/// (`@elidable_promote`, typeobject.py:1657), so the MRO membership walk
-/// is not traced — its result is promoted.  The `dont_look_inside` marker
-/// is the equivalent boundary: the JIT residualises the call instead of
-/// tracing the per-type MRO read the tracer cannot model.
-#[majit_macros::dont_look_inside]
+/// `W_TypeObject.issubtype` is the look-inside wrapper: it promotes both
+/// types and, under the JIT with two live version tags, calls
+/// `_pure_issubtype` (`@elidable_promote`).  This function is `_issubtype`
+/// itself — the elidable wrapper is the boundary, so the scan stays
+/// look-inside for the non-elidable path.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if mro_ptr.is_null() {
-        // typeobject.py _issubtype_slow_and_wrong — a partially
-        // initialised type (custom metaclass mro()) has no mro yet; walk
-        // find_best_base up the base chain (single inheritance, deliberately
-        // wrong for multiple inheritance).
-        let mut w_cls = w_type;
-        while !w_cls.is_null() {
-            if std::ptr::eq(w_cls, cls) {
-                return true;
-            }
-            w_cls = find_best_base(w_cls);
-        }
-        return false;
+        return w_type_issubtype_slow_and_wrong(w_type, cls);
     }
+    // typeobject.py `_issubtype`: `w_type in w_sub.mro_w`
+    // (`rlist.py` `ll_listcontains`). Items are `W_TypeObject`.
     (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls))
+}
+
+/// typeobject.py `_issubtype_slow_and_wrong`. A partially initialised
+/// type (custom metaclass `mro()`) has no MRO yet; walk `find_best_base`
+/// up the base chain (single inheritance, deliberately wrong for
+/// multiple inheritance).
+///
+/// `dont_look_inside`: PyPy's `bases_w` is an RPython list of
+/// `W_TypeObject` (`find_best_base`); pyre's `__bases__` is a Python
+/// tuple whose `w_tuple_items_copy_as_vec` (`RootedItems::take`) fails
+/// `mergeinputargs` (`Ptr(RootedItems) ∪ Instance`). The hot
+/// `_issubtype` MRO scan stays look-inside (`w_type in w_sub.mro_w`).
+#[majit_macros::dont_look_inside]
+unsafe fn w_type_issubtype_slow_and_wrong(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    let mut w_cls = w_type;
+    while !w_cls.is_null() {
+        if std::ptr::eq(w_cls, cls) {
+            return true;
+        }
+        w_cls = find_best_base(w_cls);
+    }
+    false
 }
 
 /// Whether a class pattern with one positional sub-pattern receives the
@@ -1930,6 +1943,11 @@ unsafe fn find_best_base(w_type: PyObjectRef) -> PyObjectRef {
     if bases.is_null() {
         return PY_NULL;
     }
+    // typeobject.py `find_best_base(bases_w)`: `for w_candidate in bases_w`.
+    // `__bases__` may be a specialised 1-/2-tuple (`Cls_oo`); walk through
+    // `w_tuple_items_copy_as_vec` so those layouts are dispatched. The
+    // null-MRO caller `_issubtype_slow_and_wrong` is `dont_look_inside`,
+    // so this Vec walk is not inlined into `_issubtype`.
     let mut w_bestbase = PY_NULL;
     let mut best_layout: *const Layout = std::ptr::null();
     for w_cand in crate::tupleobject::w_tuple_items_copy_as_vec(bases) {

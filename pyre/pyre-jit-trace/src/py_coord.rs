@@ -9,6 +9,17 @@
 //! the only Python-coordinate sources; runtime consumers never project a
 //! JitCode PC through a Python-keyed map.
 
+pub(crate) fn first_floor_boundary_for_py(
+    metadata: &crate::PyJitCodeMetadata,
+    py_pc: u32,
+) -> Option<(usize, u32)> {
+    metadata
+        .py_floor_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py == py_pc)
+        .map(|&(off, py)| (off as usize, py))
+}
+
 /// Resolve a JitCode offset to the Python instruction coordinate containing it.
 ///
 /// Exact block-head marker matches win first. Otherwise the per-emission-run

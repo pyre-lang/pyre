@@ -1995,6 +1995,7 @@ fn builtin_modules_get(
         );
         return Ok(Some(w_builtin));
     }
+    let _ = execution_context;
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
         let Some((static_name, def)) = table.get_key_value(name) else {
@@ -3768,9 +3769,10 @@ pub(crate) fn sys_modules_finditem_str_exact(
     }
     let hash = unsafe { pyre_object::w_str_hash_memoized(w_name) };
     if majit_metainterp::jit::we_are_jitted() {
+        let key_str = unsafe { pyre_object::unicodeobject::w_str_storage(w_name) };
         return unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(dict)
-                .getitem_str_hashed(dict, key, hash)
+                .getitem_str_hashed(dict, key_str, hash)
         };
     }
     match unsafe {
@@ -6852,7 +6854,7 @@ unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
 /// Miss and a non-module dict are null. The checked raising arm of
 /// [`sys_modules_finditem_str_exact`] stays out: this reader cannot raise.
 unsafe fn sys_modules_exact_str(name: &str) -> PyObjectRef {
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if dict.is_null() {
         return pyre_object::PY_NULL;
     }
@@ -6862,7 +6864,10 @@ unsafe fn sys_modules_exact_str(name: &str) -> PyObjectRef {
             .getitem_str(dict, name)
             .unwrap_or(pyre_object::PY_NULL);
     }
-    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name)
+    let name_str = pyre_object::with_roots!(dict => {
+        pyre_object::unicodeobject::prebuilt_str_storage(name)
+    });
+    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name_str)
 }
 
 /// `space.call_method` of a three-argument callable, as five words.
@@ -9722,6 +9727,27 @@ mod tests {
         assert!(
             matches!(normalized.components().next(), Some(Component::Prefix(_))),
             "{normalized:?}"
+        );
+    }
+
+    #[test]
+    fn space_builtin_is_the_builtins_module() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let _ = crate::baseobjspace::ensure_space_builtin();
+        install_builtin_modules();
+        let space = crate::baseobjspace::space_builtin();
+        let table = builtin_modules_get("builtins", std::ptr::null())
+            .expect("builtins table lookup")
+            .expect("builtins table entry");
+        assert!(
+            std::ptr::eq(space, table),
+            "space.builtin is the builtins table entry"
+        );
+        let ec = crate::PyExecutionContext::default();
+        assert!(
+            std::ptr::eq(space, ec.get_builtin()),
+            "ExecutionContext::get_builtin is space.builtin"
         );
     }
 }

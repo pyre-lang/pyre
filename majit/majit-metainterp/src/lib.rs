@@ -577,21 +577,6 @@ pub fn vable_idx_probe_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_VABLE_IDX_PROBE").is_some())
 }
 
-/// Which exit of `TraceCtx::vable_getarrayitem_ref_checked` answered, and
-/// whether it carried a concrete.
-///
-/// A `getarrayitem_vable_r` that returns `(opref, None)` leaves the reading
-/// register concrete-less, and the next opcode that demands the value —
-/// `ref_return` in the three-op `load_local_value` jitcode — panics in
-/// `read_ref_reg` with "jitcode concrete ref register was uninitialized".
-/// Four different exits produce that `None`, and the panic names none of
-/// them, so the probe prints on every exit including the answering ones:
-/// silence on an exit must mean "not reached", never "reached and fine".
-pub fn vable_read_probe_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_VABLE_READ_PROBE").is_some())
-}
-
 pub fn mptrace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_MPTRACE").is_some())
@@ -623,9 +608,15 @@ pub fn pcseq_enabled() -> bool {
 /// Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode).
 /// Diagnostic for pinpointing the op that faults a hardware-signal crash
 /// (SIGBUS/SIGSEGV) which `catch_unwind` cannot capture.
+///
+/// Same load shape as `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`.
+static OPTRACE_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline(always)]
 pub fn optrace_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_OPTRACE").is_some())
+    env_presence_flag(&OPTRACE_FLAG, || {
+        std::env::var_os("MAJIT_OPTRACE").is_some()
+    })
 }
 
 pub fn diag_enabled() -> bool {

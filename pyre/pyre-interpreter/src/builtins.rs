@@ -30701,4 +30701,27 @@ mod tests {
             "type.__new__() argument 3 must be dict or frozendict, not mappingproxy"
         );
     }
+
+    #[test]
+    fn exec_empty_builtins_dict_raises_nameerror() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        crate::importing::install_builtin_modules();
+        let ec = crate::alloc_execution_context();
+        crate::call::set_last_exec_ctx(ec.as_ptr());
+        let roots = pyre_object::gc_roots::push_roots();
+        let source_slot = roots.pin_roots(&[pyre_object::w_str_new("x = len")]);
+        let globals_slot = roots.pin_roots(&[pyre_object::w_dict_new()]);
+        let empty_slot = roots.pin_roots(&[pyre_object::w_dict_new()]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(globals_slot),
+                "__builtins__",
+                roots.get(empty_slot),
+            );
+        }
+        let err = builtin_exec(&[roots.get(source_slot), roots.get(globals_slot)])
+            .expect_err("exec with empty __builtins__ must miss len");
+        assert_eq!(err.kind, crate::PyErrorKind::NameError);
+    }
 }

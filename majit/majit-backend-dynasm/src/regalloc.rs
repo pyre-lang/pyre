@@ -823,7 +823,7 @@ impl RegisterManager {
         Loc::Reg(reg)
     }
 
-    /// regalloc.py:696
+    /// llsupport/regalloc.py `_sync_var_to_stack`.
     pub fn _sync_var_to_stack(
         &mut self,
         v: &Operand,
@@ -832,19 +832,25 @@ impl RegisterManager {
         fm: &mut FrameManager,
     ) {
         if fm.get(v, longevity).is_none() {
-            // regalloc.py:696-704: allocate frame slot and emit move.
-            let reg = self.reg_bindings_get(v, longevity);
+            // llsupport/regalloc.py `_sync_var_to_stack`: `reg =
+            // self.reg_bindings[v]` (KeyError if the box is not in a
+            // register), then `to = self.frame_manager.loc(v)` and
+            // `assembler.regalloc_mov(reg, to)`. Binding a frame slot
+            // without the store leaves a live Ref's gcmap bit covering
+            // stale bits.
+            let r = self.reg_bindings_get(v, longevity).unwrap_or_else(|| {
+                panic!(
+                    "_sync_var_to_stack: box not bound to a register (llsupport/regalloc.py reg_bindings[v])"
+                )
+            });
             let to = fm.loc(v, tp, false, longevity);
-            if let Some(r) = reg {
-                // RPython: self.assembler.regalloc_mov(reg, to)
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
-                        v, r, to.position
-                    );
-                }
-                self.spill_moves.push((Loc::Reg(r), Loc::Frame(to)));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
+                    v, r, to.position
+                );
             }
+            self.spill_moves.push((Loc::Reg(r), Loc::Frame(to)));
         }
         // otherwise it's clean (already on stack)
     }

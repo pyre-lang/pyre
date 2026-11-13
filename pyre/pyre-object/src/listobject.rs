@@ -1804,6 +1804,29 @@ pub unsafe fn switch_to_correct_strategy(
     crate::gc_roots::shadow_stack_get(root_base)
 }
 
+/// Residual-call target for [`switch_to_correct_strategy`].
+///
+/// `call.py getfunctionptr(graph)` gives every jitcode a real `fnaddr`;
+/// `blackhole.py bhimpl_inline_call_*` then
+/// `cpu.bh_call_*(adr2int(jitcode.fnaddr), ...)`. The picker is crate-private,
+/// so this wrapper is the address `jit_trace_fnaddrs` publishes under that
+/// graph's path (`pyre_object::listobject::switch_to_correct_strategy`).
+///
+/// # Safety
+/// `list` must point to a valid `W_ListObject`.
+#[inline(never)]
+pub unsafe fn switch_to_correct_strategy_word(
+    list: PyObjectRef,
+    w_item: PyObjectRef,
+) -> PyObjectRef {
+    majit_ir::icf_identity!(concat!(
+        module_path!(),
+        "::",
+        "switch_to_correct_strategy_word"
+    ));
+    switch_to_correct_strategy(&mut *(list as *mut W_ListObject), w_item)
+}
+
 /// The strategy `w_list_new` picks for a given item set.
 ///
 /// `listobject.py UNROLL_CUTOFF`.
@@ -4274,11 +4297,11 @@ pub unsafe fn ll_list_obj_resize_le(obj: PyObjectRef, newsize: usize, empty_clea
 /// strategy and bounds guards of [`w_list_getitem_inner`], then the release;
 /// a guard failing between the two resumes at the opcode boundary, which runs
 /// the whole subscript again and leaves the traced acquire unreleased.
-/// `getitem_list` calls the inner while `gil_ready` is still 0, and the
-/// getitem fold descends that lock-free body by name
-/// (`list_getitem_jitcode`). The locked iterator arm
-/// (`list_iter_getitem_locked`) is a separate opaque residual for the same
-/// reason.
+/// `getitem_list` calls the inner while `gil_ready` is still 0. The getitem
+/// fold descends `getitem_list` (`list_getitem_jitcode`) so the IndexError
+/// is in the walked PyResult graph; the inner remains the lock-free leaf.
+/// The locked iterator arm (`list_iter_getitem_locked`) is a separate
+/// opaque residual for the same reason.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
@@ -4329,7 +4352,7 @@ fn list_boxed_getitem(wrapped: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 /// `#[inline(never)]` keeps a unique Charon leaf so
-/// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
+/// `array_descr_identity` can name `w_list_getitem_inner` the way
 /// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
 #[inline(never)]
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {

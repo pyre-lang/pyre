@@ -4159,7 +4159,8 @@ pub struct AuditHolder {
     /// never freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
     /// unreachable and its inner box is reclaimed only through `invalidate`.
     pub mutate_hooks_armed: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
-    pub mutate_hooks_armed_lock: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmutLock>,
+    pub mutate_hooks_armed_lock:
+        std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmutLock>,
     /// A boxed slice rather than a `Vec` because `vm.py
     /// debug.make_sure_not_resized` is the other half of that declaration:
     /// [`sys_addaudithook`] replaces the list, never grows it in place.
@@ -4177,11 +4178,13 @@ impl Drop for AuditHolder {
     }
 }
 
-
 impl AuditHolder {
     #[inline]
     pub fn mutate_hooks_armed(&self) -> pyre_object::quasiimmut::QuasiImmutField<'_> {
-        pyre_object::quasiimmut::QuasiImmutField::new(&self.mutate_hooks_armed, &self.mutate_hooks_armed_lock)
+        pyre_object::quasiimmut::QuasiImmutField::new(
+            &self.mutate_hooks_armed,
+            &self.mutate_hooks_armed_lock,
+        )
     }
 
     /// Empty holder (`vm.py AuditHolder.__init__` `hooks_w = None`).
@@ -4191,6 +4194,27 @@ impl AuditHolder {
             mutate_hooks_armed: pyre_object::quasiimmut::null_mutate_word(),
             mutate_hooks_armed_lock: pyre_object::quasiimmut::null_mutate_lock(),
             hooks_w: Box::new([]),
+        }
+    }
+
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_hooks_armed" => {
+                if !self.mutate_hooks_armed().is_installed() {
+                    return;
+                }
+                unsafe {
+                    pyre_object::quasiimmut::sweep_quasi_immut_field(&self.mutate_hooks_armed);
+                }
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
         }
     }
 }
@@ -4533,11 +4557,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         let next = next.into_boxed_slice();
         // Notification precedes the store, as `rclass.py:1010-1012
         // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
-        // The `is_installed()` fast path is `quasiimmut.py invalidation`'s
-        // null test, so an unwatched install stays lock-free.
-        if (*holder).mutate_hooks_armed().is_installed() {
-            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).mutate_hooks_armed);
-        }
+        (*holder).jit_force_quasi_immutable("mutate_hooks_armed");
         (*holder).hooks_w = next;
         (*holder).hooks_armed.set(true);
     }

@@ -2184,6 +2184,11 @@ pub(crate) struct CrateLowering<'l> {
     jitdriver_receiver_roots: &'l [String],
     state: &'l CrateLoweringState,
     root_stack: RootStackAnalyzer<'l>,
+    /// Lower a fat-`&dyn` return whose callee body lives in an earlier crate.
+    /// Whole-program graph visibility the per-crate extraction splits apart.
+    /// Filled by `ProvidedCrate::lowering`; `None` on every other
+    /// [`CrateLowering::new`] path.
+    prior_fat_dyn_callee: Option<&'l dyn Fn(&str) -> Option<FunctionGraph>>,
 }
 
 impl CrateLoweringState {
@@ -2330,6 +2335,13 @@ impl CrateLoweringState {
             &mut known_struct_names,
             &mut struct_fields,
             gc_struct_ids,
+        );
+        register_interior_ptr_type(
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut struct_field_attrs,
+            &mut exact_layouts,
+            &mut struct_ids,
         );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
@@ -2486,6 +2498,7 @@ impl<'l> CrateLowering<'l> {
         static_addrs: crate::HostStaticAddrs<'l>,
         jitdriver_receiver_roots: &'l [String],
         state: &'l CrateLoweringState,
+        prior_fat_dyn_callee: Option<&'l dyn Fn(&str) -> Option<FunctionGraph>>,
     ) -> Self {
         Self {
             llbc,
@@ -2493,7 +2506,35 @@ impl<'l> CrateLowering<'l> {
             jitdriver_receiver_roots,
             state,
             root_stack: RootStackAnalyzer::new(llbc, &state.root_stack),
+            prior_fat_dyn_callee,
         }
+    }
+
+    /// Lower a local fat-`&dyn` callee of this crate for a later splice.
+    pub(crate) fn lower_fat_dyn_callee_local(&self, def_id: u64) -> Option<FunctionGraph> {
+        let CrateLoweringState {
+            struct_field_attrs,
+            struct_fields,
+            tombstoned_leaves,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            dont_look_inside,
+            ..
+        } = self.state;
+        lower_fat_dyn_callee(
+            self.llbc,
+            def_id,
+            self.static_addrs,
+            self.jitdriver_receiver_roots,
+            struct_field_attrs,
+            struct_fields,
+            dont_look_inside,
+            tombstoned_leaves,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+        )
     }
 
     /// Lower every declaration the filters admit, then every clause
@@ -2797,6 +2838,7 @@ impl<'l> CrateLowering<'l> {
             llbc,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             ref root_stack,
             ..
         } = *self;
@@ -2826,6 +2868,7 @@ impl<'l> CrateLowering<'l> {
             &body,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
@@ -3061,6 +3104,7 @@ impl<'l> CrateLowering<'l> {
             llbc,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             ref root_stack,
             ..
         } = *self;
@@ -3076,6 +3120,7 @@ impl<'l> CrateLowering<'l> {
             body,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
@@ -3232,7 +3277,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         module_filter,
         function_filter,
     );
-    let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
+    let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state, None)
         .lower_all(module_filter, function_filter);
     let program = state.finish(functions);
     report_lowering_skips(&skips);
@@ -3530,7 +3575,25 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        let return_type = if stamp_return_token {
+        // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+        // `jtransform.py` `getkind` of a GC pointer is `'ref'`. Stamp
+        // FUNC.RESULT as that kind so the signature matches the CFG
+        // (`func_result_kind`); the Rust field is `usize` and would
+        // otherwise leave a scalar token.
+        // An InteriorPtr return (`rptr.py` `InteriorPtrRepr`;
+        // `history.getkind` of `Ptr(Interior)` of a GcArray) is the
+        // same kind. The signature is `*mut Entry` / `&Entry`; the
+        // pointee declaration would stamp `'i'`
+        // (`gc_array_item_struct_ptr_owner_root`,
+        // `by_value_payload_annotation`). Body lowering is Gate A
+        // (`callee_returns_interior_array_type_id`) or
+        // `RDict::entry_ptr` (`path_is_rordereddict_entry_ptr`).
+        let frame_anchor_result = tyref_is_frame_anchor(&signature.output, llbc);
+        let interior_ptr_result =
+            fun_decl_result_is_interior_ptr(fd, &signature.output, llbc, tombstoned_leaves);
+        let return_type = if frame_anchor_result || interior_ptr_result {
+            Some("ref".to_string())
+        } else if stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token)
             && !output_is_raw_address_word(
@@ -3542,17 +3605,34 @@ impl SemanticFunctionHeader {
             )
         {
             signature_token
+        } else if gc_array_item_struct_ptr_owner_root(&signature.output, llbc, gc_struct_ids)
+            .is_some()
+        {
+            // CFG of `direct_arrayitems` is int (`jtransform.py`
+            // `rewrite_op_direct_ptradd` → `int_return`). Stamp
+            // `FUNC.RESULT` so a looked-inside caller does not emit
+            // `inline_call_r_r` against that `int_return`.
+            signature_token
         } else {
             None
         };
-        let return_class_root = dont_look_inside_return_class_root(
-            &signature.output,
-            llbc,
-            error_carrier,
-            tombstoned_leaves,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        );
+        let residual_return_type = if frame_anchor_result || interior_ptr_result {
+            Some("ref".to_string())
+        } else {
+            residual_return_type
+        };
+        let return_class_root = if frame_anchor_result || interior_ptr_result {
+            None
+        } else {
+            dont_look_inside_return_class_root(
+                &signature.output,
+                llbc,
+                error_carrier,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        };
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
             llbc,
@@ -4313,6 +4393,115 @@ fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
 /// stripped (so the value matches the runtime def-path convention).
 /// `struct_field_attrs` maps the crate-stripped qualified struct name to
 /// its declaration-ordered `(field, ValueType)` register classes.
+/// `lltype.py` `Ptr._interior_ptr_type_with_index`: the translator-minted
+/// `GcStruct("Interior", ptr, index, hints={'interior_ptr_type': True})`.
+/// Assembler `OpKind::New { owner: "Interior" }` needs this Size descr.
+fn register_interior_ptr_type(
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    let rows = vec![
+        crate::front::semantic::FieldRow::named("ptr", "GCREF"),
+        crate::front::semantic::FieldRow::named("index", "i64"),
+    ];
+    struct_fields.fields.insert("Interior".to_string(), rows);
+    known_struct_names.insert("Interior".to_string());
+    let sid = majit_ir::descr::StructId::from_canonical("Interior");
+    record_struct_id(
+        struct_ids,
+        &mut struct_fields.class_identity,
+        "Interior".to_string(),
+        sid,
+        "Interior",
+    );
+    struct_field_attrs.insert(
+        "Interior".to_string(),
+        vec![
+            ("ptr".to_string(), ValueType::Ref(None)),
+            ("index".to_string(), ValueType::Int),
+        ],
+    );
+    let word = crate::layout::target_word_size() as u64;
+    let mut field_offsets = std::collections::HashMap::new();
+    field_offsets.insert("ptr".to_string(), 0);
+    field_offsets.insert("index".to_string(), word);
+    exact_layouts.insert(
+        sid,
+        crate::front::semantic::ExactLayout {
+            size: Some(2 * word),
+            align: Some(word),
+            field_offsets,
+            host: None,
+        },
+    );
+    intern_interior_ptr_size_descr();
+}
+
+/// `descr.py` `get_size_descr` + `gc.py` `GcLLDescr_framework.init_size_descr`
+/// for the translator-minted Interior GcStruct.
+///
+/// `make_simple_descr_group_keyed_with_headerless` is the declared-group
+/// mint: it interns `_cache_size[LLType::Struct(path_hash("Interior"))]`
+/// and `_cache_field` the same way a W_* group is published, then
+/// `register_keyed_size` runs `init_size_descr`. Assembler
+/// `OpKind::New { owner: "Interior" }` / `BhDescr::resolve_gc_tid` look
+/// that key up.
+fn intern_interior_ptr_size_descr() {
+    let word = crate::layout::target_word_size();
+    let cache_key = majit_ir::descr::path_hash("Interior");
+    let specs = [
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "ptr".to_string(),
+            name: "Interior.ptr".to_string(),
+            offset: 0,
+            field_size: word,
+            field_type: majit_ir::Type::Ref,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Pointer,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "index".to_string(),
+            name: "Interior.index".to_string(),
+            offset: word,
+            field_size: word,
+            field_type: majit_ir::Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 1,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+    ];
+    let _group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        2 * word,
+        0,
+        cache_key,
+        0,
+        true,
+        false,
+        &specs,
+        &[],
+    );
+}
+
 /// Record a `name → StructId` mapping in the resolver table, collapsing
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
@@ -6215,6 +6404,14 @@ fn derive_program_metadata(
         );
     }
 
+    register_interior_ptr_type(
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut exact_layouts,
+        &mut struct_ids,
+    );
+
     // Opaque TypeDecls are declared ADTs (`lltype.py` `OpaqueType` /
     // `Struct._first_struct`). Harvest them after the named field-row
     // special cases so Constants / Vec / Layout keep their sids.
@@ -7393,6 +7590,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &u,
         static_addrs,
         jitdriver_receiver_roots,
+        None,
         struct_field_attrs,
         struct_fields,
         dont_look_inside,
@@ -7431,7 +7629,7 @@ fn lower_fat_dyn_callee(
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<FunctionGraph> {
-    if crate::front::dyn_fat::splice_in_progress(def_id) {
+    if crate::front::dyn_fat::splice_in_progress(llbc, def_id) {
         return None;
     }
     let decl = llbc.fn_by_id(def_id)?;
@@ -7469,6 +7667,7 @@ fn splice_recorded_fat_dyn_returns(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
+    prior_fat_dyn_callee: Option<&dyn Fn(&str) -> Option<FunctionGraph>>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
@@ -7484,10 +7683,10 @@ fn splice_recorded_fat_dyn_returns(
         if let Some(cached) = cache.borrow().get(&def_id).cloned() {
             return cached;
         }
-        if crate::front::dyn_fat::splice_in_progress(def_id) {
+        if crate::front::dyn_fat::splice_in_progress(llbc, def_id) {
             return None;
         }
-        let lowered = lower_fat_dyn_callee(
+        let mut lowered = lower_fat_dyn_callee(
             llbc,
             def_id,
             static_addrs,
@@ -7500,6 +7699,14 @@ fn splice_recorded_fat_dyn_returns(
             immutable_fields,
             raw_alloc_flavor_structs,
         );
+        if lowered.is_none()
+            && let Some(decl) = llbc.fn_by_id(def_id)
+            && !decl.has_unstructured_body()
+        {
+            if let Some(lookup) = prior_fat_dyn_callee {
+                lowered = lookup(&decl.item_meta.name_path());
+            }
+        }
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
     };
@@ -7556,10 +7763,11 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+#[cfg(any(test, feature = "mir-frontend"))]
+pub(crate) use self::consteval::register_ambiguous_impl_foldable_const_lits;
 pub(crate) use self::consteval::{
     attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
-    register_foldable_const_lits,
+    harvest_named_const_folds, push_named_const_folds, register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, release_declared_vable_array_address,
@@ -7780,6 +7988,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
+    prior_fat_dyn_callee: Option<&dyn Fn(&str) -> Option<FunctionGraph>>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
@@ -8655,6 +8864,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             fd,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,

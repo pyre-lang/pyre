@@ -244,24 +244,6 @@ impl<'a> QuasiImmutField<'a> {
     }
 
     fn lock(&self) -> parking_lot::MutexGuard<'static, ()> {
-        let existing = self.lock.load(Ordering::Acquire);
-        let mutex = if existing.is_null() {
-            let fresh = Box::into_raw(Box::new(QuasiImmutLock(parking_lot::Mutex::new(()))));
-            match self.lock.compare_exchange(
-                std::ptr::null_mut(),
-                fresh,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => fresh,
-                Err(winner) => {
-                    drop(unsafe { Box::from_raw(fresh) });
-                    winner
-                }
-            }
-        } else {
-            existing
-        };
         // The mutex is the out-of-line heap box, not the borrowed field view, so
         // the guard must not keep `QuasiImmutField` borrowed across the caller's
         // store (`quasi_immut_store!` `$mutate` is often a temporary, and the
@@ -270,8 +252,34 @@ impl<'a> QuasiImmutField<'a> {
         // lock box) is alive, not reclaimed. Every internal caller drops the
         // guard before returning, while `self` is borrowed; `begin_store` is
         // `unsafe` so its caller inherits that obligation.
-        let mutex: &'static QuasiImmutLock = unsafe { &*mutex };
-        mutex.0.lock()
+        loop {
+            let existing = self.lock.load(Ordering::Acquire);
+            // A word below a page is a descr index or tagged immediate
+            // stored into this field; locking it SIGSEGVs. CAS from that
+            // word — rewriting it to null locally and then
+            // compare_exchange(null) loses to the occupant and locks 0x2.
+            if !existing.is_null() && (existing as usize) >= 4096 {
+                let mutex: &'static QuasiImmutLock = unsafe { &*existing };
+                return mutex.0.lock();
+            }
+            let fresh = Box::into_raw(Box::new(QuasiImmutLock(parking_lot::Mutex::new(()))));
+            match self
+                .lock
+                .compare_exchange(existing, fresh, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let mutex: &'static QuasiImmutLock = unsafe { &*fresh };
+                    return mutex.0.lock();
+                }
+                Err(winner) => {
+                    drop(unsafe { Box::from_raw(fresh) });
+                    if !winner.is_null() && (winner as usize) >= 4096 {
+                        let mutex: &'static QuasiImmutLock = unsafe { &*winner };
+                        return mutex.0.lock();
+                    }
+                }
+            }
+        }
     }
 
     /// Whether any read has been recorded since the last invalidation — the
@@ -294,7 +302,9 @@ impl<'a> QuasiImmutField<'a> {
     pub fn get_current_qmut_instance(&self) -> Arc<QuasiImmut> {
         let _guard = self.lock();
         let qmut_ptr = self.ptr.load(Ordering::Acquire);
-        if qmut_ptr.is_null() {
+        // Same page-floor as `lock`: a tagged immediate in the instance
+        // word is not an `Arc<QuasiImmut>`. Treat it as uninstalled.
+        if qmut_ptr.is_null() || (qmut_ptr as usize) < 4096 {
             let fresh = Arc::new(QuasiImmut::new());
             let raw = Arc::into_raw(fresh).cast_mut();
             // One reference stays in the field, one goes to the caller.

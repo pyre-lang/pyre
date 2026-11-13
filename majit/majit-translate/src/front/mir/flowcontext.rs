@@ -685,13 +685,18 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Arrays that received a [`Self::pointer_word_vars`] store. A later
     /// `getitem` is that same word, not the wrapper's inner integer.
     pub(in crate::front::mir) pointer_word_arrays: std::collections::HashSet<Variable>,
+    /// Unsize `VTable(TraitImpl { id }, _)` recorded against the data-word
+    /// [`Variable`] the dest aliases. `local_var` Use / Ref(Deref) copies
+    /// share that Variable, so the key is enough; block-input copies walk
+    /// [`Self::input_copied_from`] (and are copied in
+    /// [`Self::note_copied_block_inputs`]).
+    pub(in crate::front::mir) unsize_vtable_impl: std::collections::HashMap<u64, u64>,
 }
 
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
 /// declared function, one named inputarg per formal parameter, built from
 /// the code object's locals alone. Returns the local-to-Variable table
 /// with the parameters bound.
-#[cfg(any(test, feature = "mir-frontend"))]
 pub(in crate::front::mir) fn pygraph_initial_block(
     graph: &mut FunctionGraph,
     locals: &majit_charon_reader::ullbc::Locals,
@@ -839,7 +844,14 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
-        let class_root = if let Some(root) = &cell_root {
+        // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+        // Kind `'ref'` (`jtransform.py` `getkind`); no interned class —
+        // a class root would seed `SomeInstance` of the transparent
+        // `usize` wrapper, and `raw_address_owner_root` would disagree
+        // with the body Input that already declined it.
+        let class_root = if tyref_is_frame_anchor(&local.ty, llbc) {
+            None
+        } else if let Some(root) = &cell_root {
             Some(root.clone())
         } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
@@ -1599,7 +1611,14 @@ impl<'a> Lowering<'a> {
             } else {
                 None
             };
-            let class_root = if let Some(root) = &cell_root {
+            // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+            // Kind `'ref'` (`jtransform.py` `getkind`); no interned class —
+            // a class root would seed `SomeInstance` of the transparent
+            // `usize` wrapper, and `raw_address_owner_root` would disagree
+            // with the body Input that already declined it.
+            let class_root = if tyref_is_frame_anchor(&local.ty, llbc) {
+                None
+            } else if let Some(root) = &cell_root {
                 Some(root.clone())
             } else if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
@@ -2181,6 +2200,7 @@ impl<'a> Lowering<'a> {
             pointer_word_vars: std::collections::HashSet::new(),
             guard_word_vars: std::collections::HashSet::new(),
             pointer_word_arrays: std::collections::HashSet::new(),
+            unsize_vtable_impl: std::collections::HashMap::new(),
             root_scope_moved_locals,
             root_bracket,
             owner_root: analyze_owner_roots(body, llbc),
@@ -2456,6 +2476,9 @@ impl<'a> Lowering<'a> {
                 self.input_copied_from.insert(dst.id(), src.id());
                 // `Variable.copy` (`flowspace/model.py`) keeps `concretetype`.
                 copy_concretetype(src, dst);
+                if let Some(&impl_id) = self.unsize_vtable_impl.get(&src.id()) {
+                    self.unsize_vtable_impl.insert(dst.id(), impl_id);
+                }
             }
             if self.var_is_object_vec_header(src) {
                 self.object_vec_headers.insert(dst.id());
@@ -3534,7 +3557,19 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                let unsize_impl = match &rvalue {
+                    Rvalue::UnaryOp(op, _) if cast_kind_is_unsize(op) => {
+                        unsize_cast_vtable_impl_id(op, self.llbc)
+                    }
+                    Rvalue::Cast(kind, _, _) if cast_kind_is_unsize(kind) => {
+                        unsize_cast_vtable_impl_id(kind, self.llbc)
+                    }
+                    _ => None,
+                };
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                if let Some(impl_id) = unsize_impl {
+                    self.unsize_vtable_impl.insert(result_var.id(), impl_id);
+                }
                 if let Some(op) = op {
                     let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3835,10 +3870,10 @@ impl<'a> Lowering<'a> {
             // `root_scope_close` residual so a crate that only imports the
             // opaque guard can still name it.  Emit the named residual, not
             // both — a second close would truncate an already-rewound stack.
-            // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
-            // matching it here keeps that glue residual live.  Other drops
-            // keep the legacy goto until their glue bodies and residual
-            // callees are available to the translator.
+            // FrameAnchor drop is `keepalive_until_here` of the frame GCREF
+            // (`emit_frame_anchor_keepalive`). Other drops keep the legacy
+            // goto until their glue bodies and residual callees are
+            // available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
