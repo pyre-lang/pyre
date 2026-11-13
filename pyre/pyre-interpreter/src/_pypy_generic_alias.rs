@@ -1034,10 +1034,17 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
             buf
         })
         .collect();
-    let n = unsafe { w_list_len(dir_origin) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let origin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dir_origin);
+    let n = unsafe { w_list_len(pyre_object::gc_roots::shadow_stack_get(origin_slot)) };
     for i in 0..n {
-        if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) }
-            && unsafe { is_str(item) }
+        if let Some(item) = unsafe {
+            w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(origin_slot),
+                i as i64,
+            )
+        } && unsafe { is_str(item) }
         {
             // `dir(origin)` can name a lone surrogate. Keep the WTF-8 bytes;
             // their order matches code-point order, so `sorted` stays exact.
@@ -1260,9 +1267,11 @@ impl UnionBuilder {
             [slot] => Ok(pyre_object::gc_roots::shadow_stack_get(*slot)),
             _ => {
                 let hashable_args = pyre_object::w_frozenset_new();
+                let hashable_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(hashable_args);
                 unsafe {
                     pyre_object::w_set_copy_storage_from(
-                        hashable_args,
+                        pyre_object::gc_roots::shadow_stack_get(hashable_slot),
                         pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot),
                     )
                 };
@@ -1288,7 +1297,7 @@ impl UnionBuilder {
                     .collect();
                 Ok(pyre_object::w_union_from_parts(
                     members,
-                    hashable_args,
+                    pyre_object::gc_roots::shadow_stack_get(hashable_slot),
                     unhashable_args,
                     pyre_object::gc_roots::shadow_stack_get(parameters_slot),
                 ))

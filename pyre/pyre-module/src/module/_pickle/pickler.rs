@@ -209,12 +209,24 @@ impl PickleCtx {
     }
 
     fn memo_get(&self, w_obj: PyObjectRef) -> Option<usize> {
-        let h = pyre_object::gc_hook::gc_identity_hash(w_obj as usize);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let h = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
+            obj_slot,
+        ) as usize);
         let list = self.memo_list();
+        let list_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(list);
         for &idx in self.index.get(&h)? {
-            let memoized =
-                unsafe { pyre_object::listobject::w_list_getitem(list, idx as i64) }.unwrap();
-            if memoized == w_obj {
+            let memoized = unsafe {
+                pyre_object::listobject::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(list_slot),
+                    idx as i64,
+                )
+            }
+            .unwrap();
+            if memoized == pyre_object::gc_roots::shadow_stack_get(obj_slot) {
                 return Some(idx);
             }
         }
@@ -1123,7 +1135,20 @@ fn pickle_core_impl(
     reducer_override: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let file_slot = if w_file.is_null() {
+        None
+    } else {
+        let _ = pyre_object::gc_roots::pin_root(w_file);
+        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+    };
+    let write_slot = if w_write.is_null() {
+        None
+    } else {
+        let _ = pyre_object::gc_roots::pin_root(w_write);
+        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+    };
     let pers_func = PinnedRef::new(pers_func, !pers_func.is_null());
     let buffer_callback = PinnedRef::new(
         buffer_callback,
@@ -1142,18 +1167,31 @@ fn pickle_core_impl(
     let mut str_memo: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut bytes_memo: HashMap<Vec<u8>, usize> = HashMap::new();
     let n = unsafe { pyre_object::listobject::w_list_len(w_memo) };
+    let o_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     for i in 0..n {
-        let o = unsafe { pyre_object::listobject::w_list_getitem(w_memo, i as i64) }.unwrap();
+        let o = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(memo_slot),
+                i as i64,
+            )
+        }
+        .unwrap();
         // Gap slots from a sparse `set_memo` hold `PY_NULL`; they are not real
         // memo entries, so leave them out of the identity index.
         if o.is_null() {
             continue;
         }
+        pyre_object::gc_roots::shadow_stack_set(o_slot, o);
         index
-            .entry(pyre_object::gc_hook::gc_identity_hash(o as usize))
+            .entry(pyre_object::gc_hook::gc_identity_hash(
+                pyre_object::gc_roots::shadow_stack_get(o_slot) as usize,
+            ))
             .or_default()
             .push(i);
-        if let Some((is_str, key)) = PickleCtx::value_memo_key(o) {
+        if let Some((is_str, key)) =
+            PickleCtx::value_memo_key(pyre_object::gc_roots::shadow_stack_get(o_slot))
+        {
             let memo = if is_str {
                 &mut str_memo
             } else {
@@ -1179,20 +1217,8 @@ fn pickle_core_impl(
         dispatch_table,
         reducer_override,
     };
-    // Pin the destination file so the framer can re-read it across each
-    // streaming `write` (which can relocate it). `None` selects accumulate mode.
-    let file_slot = if w_file.is_null() {
-        None
-    } else {
-        let _ = pyre_object::gc_roots::pin_root(w_file);
-        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
-    };
-    let write_slot = if w_write.is_null() {
-        None
-    } else {
-        let _ = pyre_object::gc_roots::pin_root(w_write);
-        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
-    };
+    // Destination file and write callable were pinned with `w_obj` so the
+    // memo walk cannot leave them unrooted. `None` selects accumulate mode.
     let mut fr = Framer::new(file_slot, write_slot);
     if proto >= 2 {
         fr.push(op::PROTO);
@@ -1201,7 +1227,11 @@ fn pickle_core_impl(
     if framing {
         fr.start_framing();
     }
-    save(&mut ctx, &mut fr, w_obj)?;
+    save(
+        &mut ctx,
+        &mut fr,
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    )?;
     fr.push(op::STOP);
     fr.end_framing()?;
     // Flush the unframed residual (the whole pickle for protocol < 4, a no-op
@@ -1238,16 +1268,20 @@ fn fast_save_enter(ctx: &mut PickleCtx, obj_slot: usize) -> Result<Option<usize>
     if ctx.fast_nesting < FAST_NESTING_LIMIT {
         return Ok(None);
     }
-    let w_cur = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let h = pyre_object::gc_hook::gc_identity_hash(w_cur as usize);
+    let h = pyre_object::gc_hook::gc_identity_hash(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
+    );
     let is_cycle = ctx.fast_memo.get(&h).is_some_and(|slots| {
-        slots
-            .iter()
-            .any(|&anc| pyre_object::gc_roots::shadow_stack_get(anc) == w_cur)
+        slots.iter().any(|&anc| {
+            pyre_object::gc_roots::shadow_stack_get(anc)
+                == pyre_object::gc_roots::shadow_stack_get(obj_slot)
+        })
     });
     if is_cycle {
         ctx.fast_nesting -= 1;
-        let type_name = pyre_interpreter::baseobjspace::object_functionstr_type_name(w_cur);
+        let type_name = pyre_interpreter::baseobjspace::object_functionstr_type_name(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        );
         let w_cur = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         return Err(PyError::value_error(format!(
             "fast mode: can't pickle cyclic objects including object type {} at {}",
@@ -1335,7 +1369,11 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Resul
 /// [`dispatch_save`].  The memo is consulted before `reducer_override` (a
 /// repeated reference becomes a GET, matching CPython 3.14: a second
 /// occurrence of the same object never re-enters the hook).
-fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_object(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    mut w_obj: PyObjectRef,
+) -> Result<(), PyError> {
     // Only EXACT atoms skip the memo; an `int`/`float` subclass is a regular
     // object (memoized, saved through the reduce protocol).
     let is_atom = unsafe {
@@ -1346,9 +1384,18 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
     };
     // Value memo, then identity memo — a repeated reference becomes a GET
     // back-reference.
-    if !is_atom && let Some(idx) = ctx.value_memo_get(w_obj).or_else(|| ctx.memo_get(w_obj)) {
-        write_get(ctx, buf, idx);
-        return Ok(());
+    if !is_atom {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        if let Some(idx) = ctx
+            .value_memo_get(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+            .or_else(|| ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(obj_slot)))
+        {
+            write_get(ctx, buf, idx);
+            return Ok(());
+        }
+        w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     }
     dispatch_save(ctx, buf, w_obj)
 }
@@ -2070,9 +2117,13 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         // `w_list_new` collects, so publish the set and every already-live
         // member first and rebuild the list from the forwarded slots.
         let _roots = pyre_object::gc_roots::push_roots();
-        let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let items = unsafe {
+            pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        };
         let mut live = Vec::with_capacity(items.len() + 1);
-        live.push(w_obj);
+        live.push(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         live.extend_from_slice(&items);
         let base = pyre_object::gc_roots::publish_roots(&live);
         pyre_object::gc_roots::normalize_roots(base, live.len());
@@ -2172,9 +2223,13 @@ fn save_frozenset(
     if ctx.proto < 4 {
         // save_reduce(frozenset, (list(obj),)).
         let _roots = pyre_object::gc_roots::push_roots();
-        let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let items = unsafe {
+            pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        };
         let mut live = Vec::with_capacity(items.len() + 1);
-        live.push(w_obj);
+        live.push(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         live.extend_from_slice(&items);
         let base = pyre_object::gc_roots::publish_roots(&live);
         pyre_object::gc_roots::normalize_roots(base, live.len());
@@ -2520,6 +2575,7 @@ fn batch_appends(
     slot: usize,
     obj_slot: Option<usize>,
 ) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     if !ctx.bin {
         // proto 0 — no APPENDS, one APPEND per item. PyPy snapshots through
         // space.listview before the first recursive save.
@@ -2692,6 +2748,7 @@ fn batch_setitems(
     slot: usize,
     obj_slot: Option<usize>,
 ) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     // `_batch_setitems` keeps `w_it` as a local of this operation.
     // `ShadowStackFrameworkGCTransformer.push_roots` already covers the
     // caller's live set; pin the iterator there. The inner pair and batch
@@ -2772,13 +2829,27 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
     if ctx.fast {
         return;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let list = ctx.memo_list();
-    let idx = unsafe { pyre_object::listobject::w_list_len(list) };
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let idx = unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(list_slot))
+    };
     // Compute the move-stable hash before the append, whose growth could
     // relocate `w_obj` and leave the local stale.
-    let h = pyre_object::gc_hook::gc_identity_hash(w_obj as usize);
-    let value_key = PickleCtx::value_memo_key(w_obj);
-    unsafe { pyre_object::listobject::w_list_append(list, w_obj) };
+    let h = pyre_object::gc_hook::gc_identity_hash(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
+    );
+    let value_key = PickleCtx::value_memo_key(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    unsafe {
+        pyre_object::listobject::w_list_append(
+            pyre_object::gc_roots::shadow_stack_get(list_slot),
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        )
+    };
     ctx.index.entry(h).or_default().push(idx);
     if let Some((is_str, key)) = value_key {
         let memo = if is_str {

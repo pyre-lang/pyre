@@ -22728,12 +22728,21 @@ fn _hash_frozenset(items: &[i64]) -> i64 {
 /// never again for `hash(frozenset)`.
 fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
     unsafe {
-        if let Some(hash) = pyre_object::w_frozenset_cached_hash(obj) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        if let Some(hash) =
+            pyre_object::w_frozenset_cached_hash(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        {
             return hash;
         }
-        let hashes = pyre_object::w_set_stored_hashes(obj);
+        let hashes =
+            pyre_object::w_set_stored_hashes(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let hash = _hash_frozenset(&hashes);
-        pyre_object::w_frozenset_set_cached_hash(obj, hash);
+        pyre_object::w_frozenset_set_cached_hash(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            hash,
+        );
         hash
     }
 }

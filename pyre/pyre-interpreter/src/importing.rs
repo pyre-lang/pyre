@@ -3559,9 +3559,13 @@ pub fn add_sys_path(dir: &Path) {
     if !unsafe { pyre_object::is_list(w_path) } {
         return;
     }
-    let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+    let path_slot = shadow_stack_len();
+    let _ = pin_root(w_path);
+    let n = unsafe { pyre_object::listobject::w_list_len(shadow_stack_get(path_slot)) };
     for i in 0..n {
-        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
+        if let Some(item) = unsafe {
+            pyre_object::listobject::w_list_getitem(shadow_stack_get(path_slot), i as i64)
+        } {
             // Both spellings can hold a surrogate escape, so the two are
             // compared as the WTF-8 they are rather than through `&str`.
             if unsafe { pyre_object::is_str(item) }
@@ -3571,7 +3575,9 @@ pub fn add_sys_path(dir: &Path) {
             }
         }
     }
-    unsafe { pyre_object::listobject::w_list_append(w_path, shadow_stack_get(slot)) };
+    unsafe {
+        pyre_object::listobject::w_list_append(shadow_stack_get(path_slot), shadow_stack_get(slot))
+    };
 }
 
 /// `pymain_sys_path_add_path0` — prepend the startup `sys.path[0]` entry staged
@@ -4741,15 +4747,24 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     if let Some(mut w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }
         && unsafe { pyre_object::is_list(w_path) }
     {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let path_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_path);
+        w_path = pyre_object::gc_roots::shadow_stack_get(path_slot);
         let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
         dirs.reserve(n);
         for i in 0..n {
-            if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) }
-            {
+            if let Some(item) = unsafe {
+                pyre_object::listobject::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(path_slot),
+                    i as i64,
+                )
+            } {
                 // Non-str entries are skipped: pyre's only path hook is the
                 // native filesystem probe, and CPython also skips an entry no
                 // hook accepts.
                 if unsafe { pyre_object::is_str(item) } {
+                    w_path = pyre_object::gc_roots::shadow_stack_get(path_slot);
                     dirs.push(
                         pyre_object::with_roots!(w_path => crate::gateway::fspath_buf(item))?,
                     );
@@ -4848,10 +4863,18 @@ fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crat
     }
     let n = unsafe { pyre_object::listobject::w_list_len(path_obj) };
     let mut dirs = Vec::with_capacity(n);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let path_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(path_obj);
     for i in 0..n {
-        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) }
-            && unsafe { pyre_object::is_str(item) }
+        if let Some(item) = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(path_slot),
+                i as i64,
+            )
+        } && unsafe { pyre_object::is_str(item) }
         {
+            path_obj = pyre_object::gc_roots::shadow_stack_get(path_slot);
             dirs.push(pyre_object::with_roots!(path_obj => crate::gateway::fspath_buf(item))?);
         }
     }

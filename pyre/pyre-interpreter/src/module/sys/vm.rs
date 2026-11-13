@@ -3846,8 +3846,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ),
             1,
         );
-        let _ = unsafe { crate::function::function_set_doc(function, w_str_new(GETSIZEOF_DOC)) };
-        function
+        let function_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(function);
+        let _ = unsafe {
+            crate::function::function_set_doc(
+                roots.get(function_slot),
+                w_str_new(GETSIZEOF_DOC),
+            )
+        };
+        roots.get(function_slot)
     });
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
     // tests only require the strong-reference delta created by a c_char_p

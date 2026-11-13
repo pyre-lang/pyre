@@ -919,18 +919,6 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // and needs no `try_hash_value` first. The helper reads the
             // strategy under the set's stripe lock and answers -1 for any
             // other.
-            if pyre_object::listobject::is_plain_int1(value) {
-                let status = pyre_object::setobject::jit_int_set_add(
-                    set,
-                    pyre_object::listobject::plain_int_w(value),
-                );
-                if status >= 0 {
-                    return Ok(());
-                }
-                if status == pyre_object::setobject::JIT_INT_SET_ADD_MEMORY {
-                    return Err(crate::runtime_ops::fetch_memory_error());
-                }
-            }
             // `try_hash_value` may run a user `__hash__` that allocates and
             // triggers a moving minor collection; `set`/`value` must be
             // shadow-stack roots across it, then reloaded, or the store
@@ -939,10 +927,24 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // slots are read back as `base + <literal>` through the scope,
             // and the error arm is a `match`, not a closure, so the
             // codewriter erases the bracket and the JIT inlines the body.
+            // `jit_int_set_add` takes the set stripe, whose identity hash
+            // is `canmallocgc`.
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
             let _ = roots.pin_root(set);
             let _ = roots.pin_root(value);
+            if pyre_object::listobject::is_plain_int1(roots.get(base + 1)) {
+                let status = pyre_object::setobject::jit_int_set_add(
+                    roots.get(base),
+                    pyre_object::listobject::plain_int_w(roots.get(base + 1)),
+                );
+                if status >= 0 {
+                    return Ok(());
+                }
+                if status == pyre_object::setobject::JIT_INT_SET_ADD_MEMORY {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
+            }
             let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
                 Ok(hash) => hash,
                 Err(err) => {

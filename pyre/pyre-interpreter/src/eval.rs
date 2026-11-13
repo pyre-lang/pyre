@@ -4082,9 +4082,14 @@ impl IterOpcodeHandler for PyFrame {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
                 let iter_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(iter);
+                let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(self_ref);
                 let (stop, mut e) = e.matches_stop_iteration_keep();
                 if stop {
-                    unsafe { &mut *(self_ref as *mut PyFrame) }._report_stopiteration_sometimes(
+                    unsafe {
+                        &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut PyFrame)
+                    }
+                    ._report_stopiteration_sometimes(
                         pyre_object::gc_roots::shadow_stack_get(iter_slot),
                         &mut e,
                     )?;

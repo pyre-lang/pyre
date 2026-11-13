@@ -346,8 +346,17 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
             Some(stored) => w_value = stored,
         }
     }
-    crate::baseobjspace::mutated_wtf8(w_type, name);
-    crate::type_dict_store_wtf8(w_type, name, w_value);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_value);
+    crate::baseobjspace::mutated_wtf8(pyre_object::gc_roots::shadow_stack_get(type_slot), name);
+    crate::type_dict_store_wtf8(
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        name,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+    );
     Ok(())
 }
 

@@ -13,10 +13,17 @@
 //! reads that impl's `implied_trait_refs`. Each concrete instantiation is
 //! its own node (`FunctionDesc.cachedgraph`). The unspecialized body is
 //! left unchanged and stays `indirect`.
+//!
+//! A Regular `Fun` or resolved trait method whose declaration has no
+//! Unstructured body is `GraphAnalyzer.analyze_external_call` when the
+//! decl's crate is not a workspace crate: `bottom_result` (a leaf, not
+//! unresolved) unless `_callbacks` names workspace `TraitImpl` methods.
 
 use std::collections::{HashMap, HashSet};
 
-use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind, Unstructured};
+use majit_charon_reader::ullbc::{
+    CallFunc, CallKind, FunId, TermKind, TypeDeclSrc, Unstructured, is_closure_leaf,
+};
 use majit_charon_reader::{FunDecl, Llbc};
 use serde_json::Value;
 
@@ -25,8 +32,8 @@ use super::framework::{
 };
 
 /// Nesting bound on Regular → spec → Regular instantiation.
-/// A clause the caller cannot resolve, a `dyn`, a bodyless impl method,
-/// or a walk past this bound falls back to the generic node.
+/// A clause the caller cannot resolve, a `dyn`, a bodyless workspace
+/// method, or a walk past this bound falls back to the generic node.
 pub(crate) const MAX_INSTANTIATION_DEPTH: usize = 8;
 
 /// Outcome of substituting a `CallKind::Trait` payload through the
@@ -38,8 +45,15 @@ pub(crate) enum TraitCallRes {
     /// `BuiltinOrAuto` — a selected empty implementation (`NoopDestruct`
     /// and the other auto traits), not an unresolved clause.
     Empty,
-    /// Still a clause, a `Dyn`, a bodyless impl method, or a ref this
-    /// caller cannot resolve.
+    /// `GraphAnalyzer.analyze_external_call`: a bodiless callee whose crate
+    /// is not a workspace crate. `callbacks` are `_callbacks` method
+    /// graphs. The leaf is not unresolved.
+    External {
+        fn_id: u64,
+        callbacks: Vec<(u64, Value)>,
+    },
+    /// Still a clause, a `Dyn`, a bodyless workspace method, a blocked
+    /// external call, or a ref this caller cannot resolve.
     Unresolved,
 }
 
@@ -164,7 +178,13 @@ pub(crate) fn binding_key(llbc: &Llbc, bindings: &[Value]) -> Option<String> {
 }
 
 /// Resolve a `CallKind::Trait` payload under `bindings`.
-pub(crate) fn resolve_trait_call(llbc: &Llbc, payload: &Value, bindings: &[Value]) -> TraitCallRes {
+pub(crate) fn resolve_trait_call(
+    llbc: &Llbc,
+    payload: &Value,
+    bindings: &[Value],
+    call_generics: &Value,
+    workspace_crates: &HashSet<String>,
+) -> TraitCallRes {
     let Some(arr) = payload.as_array() else {
         return TraitCallRes::Unresolved;
     };
@@ -199,11 +219,13 @@ pub(crate) fn resolve_trait_call(llbc: &Llbc, payload: &Value, bindings: &[Value
         Some((fn_id, generics)) => {
             if llbc
                 .fn_by_id(fn_id)
-                .is_some_and(crate::front::clause_spec::decl_has_unstructured_body)
+                .is_some_and(|fd| fd.has_unstructured_body())
             {
                 TraitCallRes::Method { fn_id, generics }
             } else {
-                TraitCallRes::Unresolved
+                analyze_external_call(llbc, fn_id, call_generics, &[bound], workspace_crates)
+                    .map(|callbacks| TraitCallRes::External { fn_id, callbacks })
+                    .unwrap_or(TraitCallRes::Unresolved)
             }
         }
         None => TraitCallRes::Unresolved,
@@ -228,8 +250,12 @@ fn impl_method_from_row(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u6
 /// Build the resolved ULLBC call graph, specializing Regular calls whose
 /// callee body has a clause-bound Trait call that the call site binds to
 /// a `TraitImpl` method.
-pub(crate) fn build_call_graph(llbc: &Llbc) -> CallGraph {
-    let mut builder = Builder::new(llbc);
+///
+/// `workspace_crates` are cargo workspace package names (`-` → `_`). An
+/// empty set classifies no callee as external (`GraphAnalyzer.analyze_external_call`
+/// is not applied).
+pub(crate) fn build_call_graph(llbc: &Llbc, workspace_crates: &HashSet<String>) -> CallGraph {
+    let mut builder = Builder::new(llbc, workspace_crates);
     for fd in llbc.iter_fun_decls() {
         builder.install_generic(fd);
     }
@@ -245,10 +271,11 @@ struct Builder<'a> {
     graph: CallGraph,
     next_id: u64,
     open_trait: HashMap<u64, bool>,
+    workspace_crates: &'a HashSet<String>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(llbc: &'a Llbc) -> Self {
+    fn new(llbc: &'a Llbc, workspace_crates: &'a HashSet<String>) -> Self {
         let next_id = llbc
             .iter_fun_decls()
             .map(|fd| fd.def_id)
@@ -268,6 +295,7 @@ impl<'a> Builder<'a> {
             },
             next_id,
             open_trait: HashMap::new(),
+            workspace_crates,
         }
     }
 
@@ -384,9 +412,7 @@ impl<'a> Builder<'a> {
             match &call.func {
                 CallFunc::Regular(reg) => match &reg.kind {
                     CallKind::Fun(FunId::Regular { id: callee }) => {
-                        let node =
-                            self.callee_node_for_call(bindings, *callee, &reg.generics, depth);
-                        self.graph.callees.entry(id).or_default().insert(node);
+                        self.add_regular_fun_call(id, *callee, &reg.generics, bindings, depth);
                     }
                     CallKind::Fun(FunId::Other(v)) => {
                         unresolved = true;
@@ -413,13 +439,22 @@ impl<'a> Builder<'a> {
                             unresolved = true;
                             self.note_opaque(Some(v), "Trait");
                         } else {
-                            match resolve_trait_call(self.llbc, v, bindings) {
+                            match resolve_trait_call(
+                                self.llbc,
+                                v,
+                                bindings,
+                                &reg.generics,
+                                self.workspace_crates,
+                            ) {
                                 TraitCallRes::Method { fn_id, generics } => {
                                     let node =
                                         self.callee_node_for_call(&[], fn_id, &generics, depth);
                                     self.graph.callees.entry(id).or_default().insert(node);
                                 }
                                 TraitCallRes::Empty => {}
+                                TraitCallRes::External { fn_id, callbacks } => {
+                                    self.add_external_edges(id, fn_id, callbacks, depth);
+                                }
                                 TraitCallRes::Unresolved => {
                                     if let Some(c) = v.get(2).and_then(Value::as_u64)
                                         && self
@@ -513,6 +548,44 @@ impl<'a> Builder<'a> {
         known
     }
 
+    /// Regular `Fun` to a bodiless decl: `GraphAnalyzer.analyze_external_call`
+    /// when the callee is external and has no blocker (leaf plus `_callbacks`).
+    /// A blocker, or a workspace-crate bodiless decl, keeps today's edge:
+    /// a leaf for a bodiless callee, and the caller is not unresolved.
+    fn add_regular_fun_call(
+        &mut self,
+        caller: u64,
+        callee: u64,
+        generics: &Value,
+        bindings: &[Value],
+        depth: usize,
+    ) {
+        if is_external_callee(self.llbc, callee, self.workspace_crates)
+            && let Some(refs) = subst_call_trait_refs(self.llbc, bindings, generics)
+            && let Some(callbacks) =
+                analyze_external_call(self.llbc, callee, generics, &refs, self.workspace_crates)
+        {
+            self.add_external_edges(caller, callee, callbacks, depth);
+            return;
+        }
+        let node = self.callee_node_for_call(bindings, callee, generics, depth);
+        self.graph.callees.entry(caller).or_default().insert(node);
+    }
+
+    fn add_external_edges(
+        &mut self,
+        caller: u64,
+        fn_id: u64,
+        callbacks: Vec<(u64, Value)>,
+        depth: usize,
+    ) {
+        self.graph.callees.entry(caller).or_default().insert(fn_id);
+        for (cb, generics) in callbacks {
+            let node = self.callee_node_for_call(&[], cb, &generics, depth);
+            self.graph.callees.entry(caller).or_default().insert(node);
+        }
+    }
+
     fn finish(mut self) -> CallGraph {
         self.graph.apply_hook_call_families();
         for (&caller, cs) in &self.graph.callees {
@@ -549,8 +622,14 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     if matches!(
-                        resolve_trait_call(self.llbc, v, bindings),
-                        TraitCallRes::Method { .. }
+                        resolve_trait_call(
+                            self.llbc,
+                            v,
+                            bindings,
+                            &reg.generics,
+                            self.workspace_crates,
+                        ),
+                        TraitCallRes::Method { .. } | TraitCallRes::External { .. }
                     ) {
                         return true;
                     }
@@ -727,4 +806,271 @@ fn first_trait_id(v: &Value) -> Option<u64> {
         }
     }
     None
+}
+
+fn crate_of_path(name: &str) -> Option<&str> {
+    let seg = name.split("::").next()?;
+    if seg.is_empty() { None } else { Some(seg) }
+}
+
+fn crate_of_fun(fd: &FunDecl) -> Option<&str> {
+    crate_of_path(fd.item_meta.name_path_str())
+}
+
+/// A fun decl with no Unstructured body whose crate is not a workspace crate.
+/// An empty workspace list classifies nothing as external.
+fn is_external_callee(llbc: &Llbc, fn_id: u64, workspace: &HashSet<String>) -> bool {
+    if workspace.is_empty() {
+        return false;
+    }
+    let Some(fd) = llbc.fn_by_id(fn_id) else {
+        return false;
+    };
+    if fd.has_unstructured_body() {
+        return false;
+    }
+    crate_of_fun(fd).is_some_and(|crate_name| !workspace.contains(crate_name))
+}
+
+/// `GraphAnalyzer.analyze_external_call` / `_callbacks`.
+///
+/// `None` is a blocker (`Clause` / `ParentClause` / `Dyn`, a dyn type, a
+/// fn pointer, a closure type, or a by-value workspace ADT). `Some` is
+/// `bottom_result` joined with `analyze_direct_call` over each callback
+/// method graph.
+fn analyze_external_call(
+    llbc: &Llbc,
+    fn_id: u64,
+    call_generics: &Value,
+    trait_refs: &[Value],
+    workspace: &HashSet<String>,
+) -> Option<Vec<(u64, Value)>> {
+    if !is_external_callee(llbc, fn_id, workspace) {
+        return None;
+    }
+    let types = generic_arg_types(call_generics);
+    collect_external_effects(llbc, &types, trait_refs, workspace, 0).ok()
+}
+
+fn generic_arg_types(generics: &Value) -> Vec<Value> {
+    peel_generic_args(generics)
+        .get("types")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn collect_external_effects(
+    llbc: &Llbc,
+    types: &[Value],
+    trait_refs: &[Value],
+    workspace: &HashSet<String>,
+    depth: usize,
+) -> Result<Vec<(u64, Value)>, ()> {
+    if depth > MAX_INSTANTIATION_DEPTH {
+        return Err(());
+    }
+    let mut callbacks = Vec::new();
+    for ty in types {
+        type_has_blocker(ty, llbc, workspace, false, depth)?;
+    }
+    for tref in trait_refs {
+        walk_trait_ref_effects(tref, llbc, workspace, depth, Some(&mut callbacks))?;
+    }
+    Ok(callbacks)
+}
+
+fn walk_trait_ref_effects(
+    tref: &Value,
+    llbc: &Llbc,
+    workspace: &HashSet<String>,
+    depth: usize,
+    mut callbacks: Option<&mut Vec<(u64, Value)>>,
+) -> Result<(), ()> {
+    if depth > MAX_INSTANTIATION_DEPTH {
+        return Err(());
+    }
+    let Some(bound) = bind_trait_ref(llbc, tref, &[], 0) else {
+        return Err(());
+    };
+    let Some(tag) = kind_tag(&bound) else {
+        return Err(());
+    };
+    match tag.as_str() {
+        "Dyn" | "Clause" | "ParentClause" => Err(()),
+        "BuiltinOrAuto" => Ok(()),
+        "TraitImpl" => {
+            let generics = bound
+                .pointer("/kind/TraitImpl/generics")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            let g = peel_generic_args(&generics);
+            if let Some(types) = g.get("types").and_then(Value::as_array) {
+                for ty in types {
+                    type_has_blocker(ty, llbc, workspace, false, depth + 1)?;
+                }
+            }
+            if let Some(refs) = g.get("trait_refs").and_then(Value::as_array) {
+                for nested in refs {
+                    walk_trait_ref_effects(
+                        nested,
+                        llbc,
+                        workspace,
+                        depth + 1,
+                        callbacks.as_deref_mut(),
+                    )?;
+                }
+            }
+            let Some(impl_id) = trait_impl_id(&bound, llbc) else {
+                return Ok(());
+            };
+            if let Some(out) = callbacks.as_deref_mut()
+                && impl_in_workspace(llbc, impl_id, workspace)
+            {
+                if let Some(methods) = llbc.trait_impl_methods_of_def(impl_id) {
+                    for method in methods.iter().flatten() {
+                        if let Some(fn_id) = method.fn_id {
+                            out.push((fn_id, generics.clone()));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn impl_in_workspace(llbc: &Llbc, impl_id: u64, workspace: &HashSet<String>) -> bool {
+    let Some(methods) = llbc.trait_impl_methods_of_def(impl_id) else {
+        return false;
+    };
+    methods.iter().flatten().any(|method| {
+        method.fn_id.is_some_and(|fn_id| {
+            llbc.fn_by_id(fn_id)
+                .and_then(crate_of_fun)
+                .is_some_and(|crate_name| workspace.contains(crate_name))
+        })
+    })
+}
+
+fn type_has_blocker(
+    ty: &Value,
+    llbc: &Llbc,
+    workspace: &HashSet<String>,
+    behind_pointer: bool,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > MAX_INSTANTIATION_DEPTH {
+        return Err(());
+    }
+    let Some(node) = peel_ty(ty, llbc) else {
+        return Err(());
+    };
+    if node.as_str().is_some() || node.get("Scalar").is_some() || node.get("TypeVar").is_some() {
+        return Ok(());
+    }
+    if node.get("FnPtr").is_some()
+        || node.get("DynTrait").is_some()
+        || node.get("Dynamic").is_some()
+    {
+        return Err(());
+    }
+    if node.get("FnDef").is_some() {
+        return Ok(());
+    }
+    if let Some(arr) = node.get("Ref").and_then(Value::as_array) {
+        return match arr.get(1) {
+            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1),
+            None => Ok(()),
+        };
+    }
+    if let Some(arr) = node.get("RawPtr").and_then(Value::as_array) {
+        return match arr.first() {
+            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1),
+            None => Ok(()),
+        };
+    }
+    if let Some(adt) = node.get("Adt") {
+        return adt_has_blocker(adt, llbc, workspace, behind_pointer, depth);
+    }
+    if let Some(parts) = node.get("Tuple").and_then(Value::as_array) {
+        for part in parts {
+            type_has_blocker(part, llbc, workspace, behind_pointer, depth + 1)?;
+        }
+        return Ok(());
+    }
+    if let Some(element) = node.get("Array").or_else(|| node.get("Slice")) {
+        if let Some(parts) = element.as_array() {
+            if let Some(inner) = parts.first() {
+                type_has_blocker(inner, llbc, workspace, behind_pointer, depth + 1)?;
+            }
+        } else {
+            type_has_blocker(element, llbc, workspace, behind_pointer, depth + 1)?;
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn adt_has_blocker(
+    adt: &Value,
+    llbc: &Llbc,
+    workspace: &HashSet<String>,
+    behind_pointer: bool,
+    depth: usize,
+) -> Result<(), ()> {
+    if let Some(id) = adt_def_id(adt)
+        && let Some(td) = llbc.type_by_id(id)
+    {
+        if matches!(td.src, TypeDeclSrc::Closure(_)) {
+            return Err(());
+        }
+        let path = td.item_meta.name_path_str();
+        let leaf = path.rsplit("::").next().unwrap_or(path);
+        if is_closure_leaf(leaf) {
+            return Err(());
+        }
+        if !behind_pointer && crate_of_path(path).is_some_and(|c| workspace.contains(c)) {
+            return Err(());
+        }
+    }
+    let generics = adt.get("generics").unwrap_or(adt);
+    if let Some(types) = generics.get("types").and_then(Value::as_array) {
+        for ty in types {
+            type_has_blocker(ty, llbc, workspace, behind_pointer, depth + 1)?;
+        }
+    }
+    if let Some(refs) = generics.get("trait_refs").and_then(Value::as_array) {
+        for tref in refs {
+            walk_trait_ref_effects(tref, llbc, workspace, depth + 1, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn adt_def_id(adt: &Value) -> Option<u64> {
+    adt.get("id")
+        .and_then(Value::as_u64)
+        .or_else(|| adt.as_array()?.first()?.as_u64())
+}
+
+fn peel_ty<'a>(ty: &'a Value, llbc: &'a Llbc) -> Option<&'a Value> {
+    peel_ty_at(ty, llbc, 0)
+}
+
+fn peel_ty_at<'a>(ty: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Value> {
+    if depth > MAX_INSTANTIATION_DEPTH {
+        return None;
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(Value::as_u64) {
+        return peel_ty_at(llbc.dedup_body(id)?, llbc, depth + 1);
+    }
+    if let Some(pair) = ty.get("Value").and_then(Value::as_array) {
+        return peel_ty_at(pair.get(1)?, llbc, depth + 1);
+    }
+    if let Some(inner) = ty.get("skip_binder") {
+        return peel_ty_at(inner, llbc, depth + 1);
+    }
+    Some(ty)
 }

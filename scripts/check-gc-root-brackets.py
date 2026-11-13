@@ -207,13 +207,32 @@ def merge_counts(left: dict, right: dict) -> dict:
     return merged
 
 
-def run_one(subject: str, donors: list[str]) -> str:
+def workspace_crates() -> str:
+    """Cargo workspace package names, with `-` folded to `_` as FunDecl crates."""
+    proc = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=ROOT,
+        capture_output=True,
+        encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        sys.exit(
+            "error: cargo metadata --no-deps failed\n"
+            f"{proc.stderr}"
+        )
+    meta = json.loads(proc.stdout)
+    names = sorted({pkg["name"].replace("-", "_") for pkg in meta["packages"]})
+    return ",".join(names)
+
+
+def run_one(subject: str, donors: list[str], crates: str) -> str:
     # Option<PyObjectRef> and &[PyObjectRef] locals count as GC pointers.
     env = dict(
         os.environ,
         GC_JOIN_WITH=",".join(donors),
         GC_OPTION_REFS="1",
         GC_SLICE_ARGS="1",
+        GC_WORKSPACE_CRATES=crates,
     )
     proc = subprocess.run(
         [str(EXAMPLE), subject],
@@ -242,10 +261,11 @@ def run_analysis() -> dict:
             "  python3 scripts/extract-llbc.py majit-rlib pyre-object "
             "pyre-interpreter pyre-module pyre-jit"
         )
+    crates = workspace_crates()
     got: dict | None = None
     for subject in SUBJECTS:
         donors = [path for path in LLBC if path != subject]
-        part = parse(run_one(subject, donors))
+        part = parse(run_one(subject, donors, crates))
         got = part if got is None else merge_counts(got, part)
     assert got is not None
     return got

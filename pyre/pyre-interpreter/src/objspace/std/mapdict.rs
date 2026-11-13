@@ -62,8 +62,13 @@ pub(crate) fn class_stripe_order(a: PyObjectRef, b: PyObjectRef) -> bool {
     if !pyre_object::objlock::stripes_taken() {
         return true;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let b_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(b);
     pyre_object::objlock::stable_stripe_index(a as usize)
-        <= pyre_object::objlock::stable_stripe_index(b as usize)
+        <= pyre_object::objlock::stable_stripe_index(
+            pyre_object::gc_roots::shadow_stack_get(b_slot) as usize,
+        )
 }
 
 fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
@@ -88,17 +93,23 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let mut obj = pyre_object::gc_roots::pin_root(obj);
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     loop {
         let w_class = unsafe { instance_getclass(obj) };
+        pyre_object::gc_roots::shadow_stack_set(class_slot, w_class);
         // Hash before the wait: the pre-wait pointer may be stale afterwards.
-        let class_key = pyre_object::objlock::stripes_taken()
-            .then(|| pyre_object::gc_hook::gc_identity_hash(w_class as usize));
-        let guard = lock_class_stripe(w_class);
+        let class_key = pyre_object::objlock::stripes_taken().then(|| {
+            pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
+                class_slot,
+            ) as usize)
+        });
+        let guard = lock_class_stripe(pyre_object::gc_roots::shadow_stack_get(class_slot));
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_class_now = unsafe { instance_getclass(obj) };
         let same_class = match class_key {
             Some(k) => pyre_object::gc_hook::gc_identity_hash(w_class_now as usize) == k,
-            None => w_class_now == w_class,
+            None => w_class_now == pyre_object::gc_roots::shadow_stack_get(class_slot),
         };
         if same_class {
             return (guard, obj);

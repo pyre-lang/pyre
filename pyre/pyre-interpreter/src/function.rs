@@ -2197,9 +2197,11 @@ pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(
     unsafe {
         // Contended stripe wait may collect: the stored value is rooted across it and reloaded.
         let _roots = pyre_object::gc_roots::push_roots();
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(value);
-        let _guard = function_attr_lock(obj);
+        let pair = pyre_object::gc_roots::pin_roots(&[obj, value]);
+        let obj_slot = pair;
+        let value_slot = pair + 1;
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_func_dict = value;
@@ -2253,9 +2255,11 @@ pub unsafe fn function_set_annotate(
 pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(value);
-        let _guard = function_attr_lock(obj);
+        let pair = pyre_object::gc_roots::pin_roots(&[obj, value]);
+        let obj_slot = pair;
+        let value_slot = pair + 1;
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
@@ -2414,9 +2418,11 @@ pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(
             return Ok(());
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(value);
-        let _guard = function_attr_lock(obj);
+        let pair = pyre_object::gc_roots::pin_roots(&[obj, value]);
+        let obj_slot = pair;
+        let value_slot = pair + 1;
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = value;
@@ -2444,7 +2450,11 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
         if obj.is_null() {
             return Ok(());
         }
-        let _guard = function_attr_lock(obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = pyre_object::w_none();
         Ok(())
@@ -2548,9 +2558,11 @@ pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
             return;
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_ann);
-        let _guard = function_attr_lock(obj);
+        let pair = pyre_object::gc_roots::pin_roots(&[obj, w_ann]);
+        let obj_slot = pair;
+        let value_slot = pair + 1;
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_ann = pyre_object::gc_roots::shadow_stack_get(value_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
@@ -2592,9 +2604,11 @@ pub unsafe fn fset_func_annotations(
             return Err(crate::PyError::type_error("__annotations__ must be a dict"));
         };
         let _roots = pyre_object::gc_roots::push_roots();
-        let stored_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(stored);
-        let _guard = function_attr_lock(obj);
+        let pair = pyre_object::gc_roots::pin_roots(&[obj, stored]);
+        let obj_slot = pair;
+        let stored_slot = pair + 1;
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let stored = pyre_object::gc_roots::shadow_stack_get(stored_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
@@ -2622,7 +2636,11 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
         if obj.is_null() {
             return Ok(());
         }
-        let _guard = function_attr_lock(obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let _guard = function_attr_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_ann = PY_NULL;
@@ -4078,8 +4096,12 @@ pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError>
     let obj = require_method(obj, "__hash__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(function);
     let x = pyre_object::gc_hook::gc_identity_hash(instance as usize) as i64;
-    let y = crate::baseobjspace::hash_w_strict(function)?;
+    let y =
+        crate::baseobjspace::hash_w_strict(pyre_object::gc_roots::shadow_stack_get(function_slot))?;
     let value = x ^ y;
     Ok(if value == -1 { -2 } else { value })
 }
