@@ -10108,12 +10108,14 @@ fn run_compiled_tuple_hash_from_frame(
                 );
                 match resolution {
                     crate::call_jit::BridgeResolution::CompiledContinueLive(live) => {
-                        if let Some((len, acc, i, obj)) = tuple_hash_continue_reds(&live) {
-                            live_buf =
-                                Some(pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
-                                    len, acc, i, obj,
-                                ));
-                            continue;
+                        // `raise_continue_running_normally` ignores the failing
+                        // loop_token and re-enters through the cell
+                        // (`warmspot.py handle_jitexception` → `portal_ptr` →
+                        // `execute_assembler`). `compile_loop` attaches a new
+                        // token (`attach_procedure_to_interp`); the captured
+                        // `token` is the failing FINISH-ending entry.
+                        if tuple_hash_continue_reds(&live).is_some() {
+                            return run_compiled_tuple_hash(green_key, &live);
                         }
                     }
                     crate::call_jit::BridgeResolution::CompiledContinue => {}
