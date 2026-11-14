@@ -435,9 +435,9 @@ pub const CALL_RESULT_SIZE_OFS: u64 = CALL_ARGS_OFS + (MAX_CALL_ARGS as u64) * S
 /// [`MAX_SRET_BYTES`].
 pub const CALL_SRET_OFS: u64 = CALL_RESULT_SIZE_OFS + SLOT_SIZE;
 
-/// Arguments the call area has room for. A residual call with more arguments
-/// than this has nowhere to put them, so a caller checks its arity against
-/// this bound rather than writing past the end of the frame.
+/// Arguments the module-static residual-call scratch has room for. A residual
+/// call with more arguments than this has nowhere to put them, so a caller
+/// checks its arity against this bound rather than writing past the scratch.
 pub const MAX_CALL_ARGS: usize = 16;
 
 /// One-word sret blob. A descr whose `result_size` exceeds a word is an
@@ -450,17 +450,18 @@ const STATIC_CALL_NARGS_OFS: u64 = 2 * SLOT_SIZE;
 const STATIC_CALL_ARGS_OFS: u64 = 3 * SLOT_SIZE;
 const STATIC_CALL_RESULT_SIZE_OFS: u64 = STATIC_CALL_ARGS_OFS + (MAX_CALL_ARGS as u64) * SLOT_SIZE;
 
-/// Minimum frame allocation size in bytes to accommodate the call area.
+/// Byte size of the historical in-object call area (`FrameGeometry::fixed`,
+/// host residual scratch). Compact frames do not include this region.
 ///
 /// Derived from where the arguments start and how many fit, so raising
-/// [`MAX_CALL_ARGS`] cannot leave the frame one argument short of the area it
-/// is sized to hold.
+/// [`MAX_CALL_ARGS`] cannot leave the scratch one argument short of the area
+/// it is sized to hold.
 pub const MIN_FRAME_BYTES: usize = CALL_SRET_OFS as usize + MAX_SRET_BYTES;
 
-/// Per-token layout of a wasm execution frame. Every frozen geometry retains
-/// the historical host-trampoline call area even though emitted code uses the
-/// module-static scratch area. Host entry and CALL_ASSEMBLER allocate the
-/// full `frame_bytes` (`jfi_frame_depth`).
+/// Per-token layout of a wasm execution frame. Residual calls use the
+/// module-static scratch at [`crate::jit_call_area_addr`]; the historical
+/// trampoline offsets stay on the struct for [`Self::fixed`]. Host entry and
+/// CALL_ASSEMBLER allocate `frame_bytes` (`jfi_frame_depth`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
     /// Number of value slots before the dispatch key (including frame[0]).
@@ -476,25 +477,27 @@ pub struct FrameGeometry {
     pub home_slot_base: u64,
     /// Number of Ref-home slots the layout reserves.
     pub home_slots: usize,
-    /// Number of slots at the END of the Ref-home region reserved for
-    /// resume-at-LABEL live-ins.  Ordinary per-trace Ref homes grow upward
-    /// from `home_slot_base`; these captures grow from the frozen boundary and
-    /// therefore survive execution of a chained bridge, whose own home map may
-    /// use the low slots.  The published `jf_gcmap` marks the used ordinary
-    /// prefix plus these captures, not the unused reserved tail.
+    /// Number of slots at the END of the Ref-home prefix reserved for
+    /// resume-at-LABEL live-ins. Ordinary per-trace Ref homes grow upward
+    /// from `home_slot_base`; these captures sit past the frozen ordinary-home
+    /// boundary so a chained bridge's own home map may reuse the low slots
+    /// without overwriting them. Extra ordinary homes from `extend` go to
+    /// the tail. The published `jf_gcmap` marks the used ordinary homes plus
+    /// these captures.
     pub label_ref_slots: usize,
     /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
-    /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
-    /// the residual-call area.
+    /// i64 slot per prefix value slot and is disjoint from exits, dispatch,
+    /// and homes. Residual calls use the module-static scratch
+    /// (`jit_call_area_addr`), not this object.
     pub force_slot_base: u64,
-    /// Bytes through the end of Ref homes. The residual-call area and any
-    /// extend tail sit past this prefix; `jfi_frame_depth` covers them.
+    /// Bytes through the end of the force region. Equals [`Self::frame_bytes`]
+    /// on a compact geometry (no in-object call area). An extend tail sits
+    /// past this prefix; `jfi_frame_depth` covers it.
     pub ca_frame_bytes: u32,
-    /// Full bytes in the frame layout, including the tail call area. Host
-    /// entry, CALL_ASSEMBLER, and chained bridges allocate this many item
-    /// bytes (`ca_frame_depth` / `jfi_frame_depth`).
-    /// An extended geometry keeps the source bytes through [`Self::tail_base`]
-    /// and stores the grown total here.
+    /// Full bytes in the frame layout. Host entry, CALL_ASSEMBLER, and
+    /// chained bridges allocate this many item bytes (`ca_frame_depth` /
+    /// `jfi_frame_depth`). An extended geometry keeps the source bytes through
+    /// [`Self::tail_base`] and stores the grown total here.
     pub frame_bytes: u32,
     /// Value slots addressed at [`FRAME_SLOT_BASE`]. Equals [`Self::value_slots`]
     /// until [`Self::extend`] appends the overflow past [`Self::tail_base`].
@@ -537,11 +540,17 @@ impl FrameGeometry {
         }
     }
 
-    /// Compact frozen geometry for one token:
-    /// `[value slots | dispatch key | Ref homes | force slots | call area]`.
-    /// `value_slots` includes frame[0].  The trailing call area is always
-    /// present, even for direct-only source traces, because later bridges are
-    /// compiled against this immutable geometry.
+    /// Compact geometry for one token:
+    /// `[value slots | dispatch key | Ref homes | force slots]`.
+    /// `value_slots` includes frame[0]. Force prefix length equals
+    /// `value_slots` because `emit_force_arm` / `force_arg_word` share the
+    /// compact fail-loc index space; a later `GUARD_NOT_FORCED` that writes
+    /// more fail args also raises `frame_value_slots`, and `extend` tails the
+    /// overflow. Residual calls use the module-static scratch, so this object
+    /// does not reserve a call area. A later bridge that needs more slots
+    /// keeps these offsets and appends a tail (`extend`);
+    /// `_check_frame_depth` / `wasm_realloc_frame` grow the live frame
+    /// (`assembler.py` `_check_frame_depth`, `llmodel.py` `realloc_frame`).
     pub fn compact(value_slots: usize, home_slots: usize, label_ref_slots: usize) -> Self {
         debug_assert!(label_ref_slots <= home_slots);
         let value_slots = value_slots.max(1);
@@ -553,7 +562,7 @@ impl FrameGeometry {
         let call_func_ofs = call_result_ofs + SLOT_SIZE;
         let call_nargs_ofs = call_func_ofs + SLOT_SIZE;
         let call_args_ofs = call_nargs_ofs + SLOT_SIZE;
-        let frame_bytes = call_result_ofs + Self::CALL_AREA_SLOTS as u64 * SLOT_SIZE;
+        let frame_bytes = ca_frame_bytes;
         Self {
             value_slots,
             call_result_ofs,
@@ -608,11 +617,12 @@ impl FrameGeometry {
     }
 
     /// Frame depth, in Signed items, that `compile_loop` installs on the
-    /// token's `frame_info`. `assembler.py` `update_frame_depth` publishes
-    /// the assembled depth; `rewrite.py` `gen_malloc_frame` / CALL_ASSEMBLER
-    /// and `llmodel.py` `malloc_jitframe` allocate from that same
-    /// `jfi_frame_depth`. The running `jf_frame` must cover every offset
-    /// this geometry stores, including the tail and the residual-call area.
+    /// token's `frame_info`. `assembler.py` `assemble_loop` /
+    /// `update_frame_depth` publishes the assembled depth; `rewrite.py`
+    /// `handle_call_assembler` / `gen_malloc_frame` and `llmodel.py`
+    /// `malloc_jitframe` allocate from that same `jfi_frame_depth`. The
+    /// running `jf_frame` must cover every offset this geometry stores,
+    /// including an `extend` tail.
     pub const fn ca_frame_depth(self) -> usize {
         self.signed_item_count()
     }
@@ -738,7 +748,7 @@ impl FrameGeometry {
 /// movement transparent without rooting Refs that never cross a collection.
 ///
 /// In compact geometries this region follows the dispatch key and precedes the
-/// trailing call area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
+/// force slots. Inert while `wasm_jit_alloc` is no-collect (epic B): the
 /// extra stores write a region nothing reads until the allocator collects.
 pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64 + SLOT_SIZE;
 
@@ -747,7 +757,7 @@ pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64 + SLOT_SIZE;
 /// frame is always 0 here on a fresh `execute_token`); non-zero = a
 /// loop-closing bridge re-entering a single-label peeled loop at its LABEL,
 /// skipping the preamble. Compact geometries derive this offset from their
-/// value-slot count and put the call area after the homes.
+/// value-slot count.
 pub const DISPATCH_KEY_OFS: u64 = MIN_FRAME_BYTES as u64;
 const _: () = assert!(HOME_SLOT_BASE == DISPATCH_KEY_OFS + SLOT_SIZE);
 
@@ -1394,7 +1404,7 @@ fn emit_residual_trampoline_call(
 ) -> Result<(), BackendError> {
     if call_args.len() > MAX_CALL_ARGS {
         return Err(BackendError::Unsupported(format!(
-            "wasm codegen: residual call has {} arguments; the call area holds {MAX_CALL_ARGS}",
+            "wasm codegen: residual call has {} arguments; the static call area holds {MAX_CALL_ARGS}",
             call_args.len()
         )));
     }
@@ -1799,9 +1809,10 @@ enum LabelCaptureStorage {
 }
 
 /// Backend-only preservation plan for values that remain live across a peeled
-/// LABEL without appearing in that LABEL's semantic argument list.  RPython's
-/// assembler keeps such values in the frozen frame; wasm locals disappear on
-/// a tail-call re-entry, so we explicitly mirror that storage shape here.
+/// LABEL without appearing in that LABEL's semantic argument list. The x86
+/// assembler keeps such values in the JITFRAME; wasm locals disappear on a
+/// tail-call re-entry, so we store them in the source prefix that
+/// `FrameGeometry::extend` keeps.
 struct LabelResumeData {
     per_label: Vec<Vec<OpRef>>,
     uncapturable: Vec<bool>,
@@ -1887,7 +1898,7 @@ impl LabelResumeData {
 
         // Only the labels the entry dispatch can land on need a capture plan;
         // an in-body label is never resumed, so reserving frame slots for its
-        // live-ins would only inflate the frozen geometry.
+        // live-ins would only inflate the published frame.
         let resumable = resumable_label_count(ops);
         for (label_pos, label) in ops
             .iter()
@@ -1953,7 +1964,7 @@ impl LabelResumeData {
             // branch assigns them. Nothing the entry dispatch can land on
             // reaches a region's first read without passing it, so those ids
             // are dead until written here. Treating them as live would reserve
-            // one frozen-frame slot per region live-in at every resumable
+            // one frame slot per region live-in at every resumable
             // label, and the resume loader would reload a value the guard
             // overwrites before anything reads it.
             for region in regions {
@@ -1970,7 +1981,7 @@ impl LabelResumeData {
             let mut missing = Vec::new();
             let mut bad = false;
             // An appended region is not a predecessor of this label's
-            // resume. Its body reads would only reserve frozen slots
+            // resume. Its body reads would only reserve extra slots
             // the resume loader never reloads — the guard-fail branch
             // is the region's sole predecessor.
             let scan_end = regions
@@ -2107,10 +2118,9 @@ pub fn label_ref_capture_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
 }
 
 /// Mark the homes this module initializes: the used ordinary prefix and the
-/// LABEL-capture tail. Frozen geometry reserves extra ordinary slots so a
-/// later bridge can fit; those unused reserved words stay unmarked so
-/// recycled nursery bytes are not traced. assembler.py writes `jf_gcmap`
-/// for live slots only.
+/// LABEL-capture tail. Unused reserved words stay unmarked so recycled
+/// nursery bytes are not traced. assembler.py writes `jf_gcmap` for live
+/// slots only.
 pub fn build_home_gcmap(
     frame: FrameGeometry,
     used_ordinary: usize,
@@ -4070,7 +4080,7 @@ fn has_trampoline_calls(inputargs: &[InputArgRc], ops: &[Op], emit_ca: bool) -> 
     ops.iter().any(|op| match op.opcode {
         // `build_function` handles an enabled CALL_ASSEMBLER before the generic
         // CALL arm, lowering it directly to the callee-loop table slot. It
-        // therefore never uses the host call area.
+        // therefore never uses the residual trampoline.
         opcode if opcode.is_call_assembler() && emit_ca => false,
         // These live in resoperation's CALL range for effect classification,
         // but neither emission arm calls anything: CheckMemoryError is an
@@ -4087,7 +4097,7 @@ fn has_trampoline_calls(inputargs: &[InputArgRc], ops: &[Op], emit_ca: bool) -> 
         }
         // `CallMallocNursery*` and `CondCallGcWb*` are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
-        // the frame call area.
+        // the static call area.
         _ => false,
     })
 }
@@ -4214,7 +4224,8 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
 /// Merged analysis concatenates region InputArgs into one id namespace; those
 /// ids are not simultaneous entry slots. The physical slot and the stamp
 /// index are the owner's function-entry arity, the same width
-/// `normal_frame_value_slots` reserved when the token froze.
+/// `normal_frame_value_slots` reserved when the token published its prefix
+/// (`extend` keeps that width).
 fn park_guard_value_counters(guards: &mut [GuardExit], entry_arity: usize) {
     if guards.iter().all(|g| g.counter_value_spill.is_none()) {
         return;
@@ -5304,9 +5315,8 @@ pub(crate) fn build_wasm_module_reporting_shortage(
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
     // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
-    // Ref homes, and the always-present tail call area; a chained bridge must
-    // fit the source token's frozen value-slot count before it can share that
-    // frame.
+    // Ref homes, and the force region; a chained bridge that needs more keeps
+    // those offsets and appends a tail (`FrameGeometry::extend`).
     let label_resume = LabelResumeData::collect_with_regions(
         &analysis_inputargs,
         &analysis_ops,
@@ -5327,12 +5337,12 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         }
         *shortage_out = Some(shortage);
         return Err(BackendError::Unsupported(format!(
-            "wasm backend: {} frame value slots exceed frozen frame layout ({})",
+            "wasm backend: {} frame value slots exceed compiled frame layout ({})",
             shortage.needed, shortage.available,
         )));
     }
 
-    let label_param_entry = has_label_param_entry(inputargs, ops, *frame, *bridge_entry_arity);
+    let label_param_entry = has_label_param_entry(inputargs, ops, *bridge_entry_arity);
     let entry_param_count = 1 + if label_param_entry {
         crate::FROZEN_LABEL_PARAM_ARITY
     } else {
@@ -5436,7 +5446,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         *shortage_out = Some(shortage);
         let reason = match shortage.kind {
             super::FrameShortageKind::OrdinaryRefHomes => format!(
-                "wasm backend: {} ordinary ref homes exceed frozen frame layout ({})",
+                "wasm backend: {} ordinary ref homes exceed compiled frame layout ({})",
                 shortage.needed, shortage.available,
             ),
             super::FrameShortageKind::LabelResumeRefSlots => format!(
@@ -5454,14 +5464,17 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         return Err(BackendError::Unsupported(reason));
     }
 
-    // CA frames execute the source loop and this bridge on the same frozen
-    // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
-    // no global floor or speculative slack is needed here.
+    // CA frames execute the source loop and this bridge on the source token's
+    // offsets. A bridge that needs more slots keeps those offsets and appends
+    // a tail (`FrameGeometry::extend`); `_check_frame_depth` /
+    // `wasm_realloc_frame` grow the live frame (`assembler.py`
+    // `_check_frame_depth`, `llmodel.py` `realloc_frame`). No global floor or
+    // speculative slack is needed here.
 
     // This exact lowering census controls the host-trampoline import. Direct
     // residual helpers, including the CA arm's inline fast path, use
-    // `call_indirect` and need no import, although their frozen frame still
-    // keeps the tail call area for future bridges.
+    // `call_indirect` and need no import. Residual trampoline stores go to
+    // the module-static scratch (`jit_call_area_addr`).
     let needs_call = has_trampoline_calls(&analysis_inputargs, &analysis_ops, ca.emit_ca);
     // In-module residual calls: the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
@@ -5968,10 +5981,19 @@ fn build_label_param_shim(frame: FrameGeometry, wide_func_idx: u32) -> Function 
     let mut sink = PeepSink::new(&mut raw_sink);
 
     sink.local_get(0);
+    let key = frame.dispatch_key_ofs;
     for k in 0..crate::FROZEN_LABEL_PARAM_ARITY {
-        sink.local_get(0);
-        // The narrow entry reloads what a JUMP stored with `spill_slot_ofs`.
-        sink.i64_load(mem64(frame.spill_slot_ofs(k as u64)));
+        let ofs = frame.spill_slot_ofs(k as u64);
+        // The wide type is process-wide (`FROZEN_LABEL_PARAM_ARITY`); this
+        // frame may be narrower. Load only slots that end at or before the
+        // dispatch key (`debug_assert_dispatch_entry_slots`) and zero-pad
+        // the rest so `jfi_frame_size` need not follow the type arity.
+        if ofs + SLOT_SIZE <= key {
+            sink.local_get(0);
+            sink.i64_load(mem64(ofs));
+        } else {
+            sink.i64_const(0);
+        }
     }
     sink.return_call(wide_func_idx);
     sink.end();
@@ -7023,9 +7045,10 @@ fn build_function(
             // (resume path only), and close B_j. From inside C_j, `br 1`
             // targets B_j's end, skipping the loader.
             // Preserve every non-argument live-in while its pre-LABEL local is
-            // still available. Scalar bits use frozen value slots; Refs use
-            // the high, GC-rooted capture region so a chained bridge cannot
-            // overwrite them with its own low home mapping.
+            // still available. Scalar bits use prefix value slots (`extend`
+            // keeps those offsets); Refs use the high, GC-rooted capture
+            // region so a chained bridge cannot overwrite them with its own
+            // low home mapping.
             for &r in &label_resume.per_label[labels_passed] {
                 let storage = label_resume
                     .storage(r)
@@ -7283,11 +7306,11 @@ fn build_function(
                 if let Some((wide_slot, wide_type_idx)) = external_jump_wide
                     .filter(|_| jump_args.len() <= crate::FROZEN_LABEL_PARAM_ARITY)
                 {
-                    // The target's narrow entry is a shim that loads
-                    // `FROZEN_LABEL_PARAM_ARITY` frame slots and tail-calls the
-                    // wide one, so storing the args here only to have them read
-                    // straight back is a round trip through memory. Both its
-                    // entry input loader and every LABEL resume loader read the
+                    // The target's narrow entry is a shim that loads the
+                    // in-bounds label parameters and tail-calls the wide one,
+                    // so storing the args here only to have them read straight
+                    // back is a round trip through memory. Both its entry
+                    // input loader and every LABEL resume loader read the
                     // parameters, so hand the values over directly.
                     store_dispatch_key(&mut sink);
                     sink.local_get(0); // frame_ptr argument to the loop
@@ -10859,7 +10882,6 @@ pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
 pub fn has_label_param_entry(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    frame: FrameGeometry,
     bridge_entry_arity: Option<usize>,
 ) -> bool {
     if bridge_entry_arity.is_some() || !is_resumable_peeled(ops) {
@@ -10870,20 +10892,20 @@ pub fn has_label_param_entry(
         .into_iter()
         .take(resumable)
         .all(|arity| arity <= crate::FROZEN_LABEL_PARAM_ARITY);
-    labels_fit
-        && inputargs.len() <= crate::FROZEN_LABEL_PARAM_ARITY
-        // The shim loads from `FRAME_SLOT_BASE`, so its `FROZEN_LABEL_PARAM_ARITY`
-        // reads occupy slots 1..=FROZEN_LABEL_PARAM_ARITY — slot 0 is the
-        // dispatch key. A frame with exactly that many slots would let the last
-        // load run off the end.
-        && frame.value_slots > crate::FROZEN_LABEL_PARAM_ARITY
+    // The wide type is process-wide (`FROZEN_LABEL_PARAM_ARITY`).
+    // `build_label_param_shim` zero-pads parameters whose spill slots would
+    // reach this frame's dispatch key, so a compact frame smaller than that
+    // arity still publishes the same type (`jfi_frame_size` does not follow
+    // the type width).
+    labels_fit && inputargs.len() <= crate::FROZEN_LABEL_PARAM_ARITY
 }
 
 /// Per-label `(resume_safe, requires_own_frame)` metadata in ordinal order.
-/// Missing pre-LABEL live-ins are safe when the frozen geometry contains the
-/// capture plan. Such a plan is tied to the physical frame on which the owning
-/// loop populated it; a sibling specialization may share the same geometry
-/// but not those values, so bridge chaining must then stay on the owner.
+/// Missing pre-LABEL live-ins are safe when the source prefix contains the
+/// capture plan (`extend` keeps those offsets). Such a plan is tied to the
+/// physical frame on which the owning loop populated it; a sibling
+/// specialization may share the same geometry but not those values, so bridge
+/// chaining must then stay on the owner.
 pub fn label_resume_info(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -13923,8 +13945,9 @@ mod tests {
     fn ca_frame_depth_covers_compact_home_gcmap() {
         let frame = FrameGeometry::compact(32, 18, 2);
         assert_eq!(frame.ca_frame_depth(), frame.signed_item_count());
-        assert!(
-            frame.ca_frame_depth() > frame.ca_frame_bytes as usize / std::mem::size_of::<isize>()
+        assert_eq!(
+            frame.ca_frame_depth(),
+            frame.ca_frame_bytes as usize / std::mem::size_of::<isize>()
         );
         let map = build_home_gcmap(frame, frame.ordinary_home_slots(), 2);
         let bits = usize::BITS as usize;
@@ -13987,7 +14010,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
+    fn compact_geometry_omits_the_residual_call_area() {
         let _cpu = cpu();
         let frame = FrameGeometry::compact(32, 16, 0);
         assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
@@ -13995,12 +14018,11 @@ mod tests {
         assert_eq!(frame.force_slot_base, 49 * SLOT_SIZE);
         assert_eq!(frame.ca_frame_bytes, 648);
         assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
-        assert_eq!(frame.call_args_ofs, 672);
+        assert_eq!(frame.frame_bytes, frame.ca_frame_bytes);
         assert_eq!(
             frame.frame_bytes as u64,
-            frame.call_result_ofs + FrameGeometry::CALL_AREA_SLOTS as u64 * SLOT_SIZE
+            frame.force_slot_ofs(31) + SLOT_SIZE
         );
-        assert_eq!(frame.frame_bytes, 816);
     }
 
     /// The constant-operand bound must answer exactly what the wrapping

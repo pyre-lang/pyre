@@ -1,15 +1,6 @@
 # pyre-check: max-pypy-ratio=2.8
 # Overflowing integer operations must resume with the values that were loaded
 # from local slots, including values produced by recursive calls and unpacking.
-# pyre-check: jitstats-band=guard_failures=8
-# The fibpair_total loop's class guard reaches trace_eagerness (200) with no
-# decay on a 64-bit native build, 200 failures. JitCounter decays every counter
-# by 0.96 once per 32 minor collections (counter.py decay_all_counters via
-# invoke_after_minor_collection); when one decay step lands while that counter
-# is still below the threshold it fires 7 or 8 failures later. The wasm guest
-# runs more minor collections over this fixture (784 against 516) and takes
-# exactly one such step: 654 against 647. The count follows the collection
-# schedule, and the band is the size of one decay step.
 
 MODULUS = 1000000007
 

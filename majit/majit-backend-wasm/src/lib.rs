@@ -118,8 +118,8 @@ use std::sync::{Arc, Weak};
 /// 32 = a loop-closing bridge region was inlined; 33 = inlining declined
 /// because the source guard belongs to an already chained trace; 34 = the
 /// bridge is not loop-closing; 35 = the owner has no retained module inputs;
-/// 36 = that guard already owns a region; 37 = the merged stream exceeds the
-/// owner's frozen frame geometry; 38 = unused since the non-header gate was
+/// 36 = that guard already owns a region; 37 = the merged module declined
+/// to emit; 38 = unused since the non-header gate was
 /// removed; 39 = the merged stream has no local loop LABEL for the wasm back
 /// edge. 40-43 split a rejected inline trial into value-layout,
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
@@ -131,7 +131,7 @@ use std::sync::{Arc, Weak};
 /// mutually exclusive: `bridge_param_dispatch_for` selects one for the
 /// module from its guard count); 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
-/// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
+/// 48 = an inline trial's LABEL-resume storage does not fit the source prefix; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
 /// the owner is already invalidated, so a merged region would inherit its set
 /// flag instead of starting valid; 51 = a region retained for a deferred merge
@@ -278,7 +278,7 @@ impl FrameShortage {
 }
 
 /// The first three inline geometry failures, packed as
-/// `(kind: u8, needed: u24, available: u24)`. They expose a frozen-layout
+/// `(kind: u8, needed: u24, available: u24)`. They expose a frame-layout
 /// shortage without changing the compile result.
 static INLINE_GEOMETRY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -379,7 +379,7 @@ fn classify_inline_install_error(error: &BackendError) {
         return;
     }
     diag_bump(37);
-    if reason.contains("frame value slots exceed frozen frame layout") {
+    if reason.contains("frame value slots exceed compiled frame layout") {
         diag_bump(40);
     } else if reason.contains("ordinary ref homes") {
         diag_bump(41);
@@ -666,21 +666,6 @@ fn diag_bump(i: usize) {
 // (`FrameGeometry::extend`); its prologue grows the live frame
 // (`emit_check_frame_depth`, `wasm_realloc_frame`; upstream
 // `assembler.py` `_check_frame_depth`, `llmodel.py` `realloc_frame`).
-const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
-/// Slots a frozen layout is rounded up to.
-///
-/// Sibling loops through the same interpreter differ by a slot or two.
-/// Rounding lands those siblings on one layout so a chained bridge and its
-/// target share spill and home offsets. A layout that still differs is
-/// entered at the target's offsets (`remap_frame_layout`) after
-/// `_check_frame_depth` grows the frame. The cost is the rounded-away
-/// slots, bounded by this constant per compiled token.
-const FROZEN_CHAIN_SLOT_GRANULARITY: usize = 16;
-
-/// `n` rounded up to a whole number of [`FROZEN_CHAIN_SLOT_GRANULARITY`] slots.
-fn frozen_slot_count(n: usize) -> usize {
-    n.div_ceil(FROZEN_CHAIN_SLOT_GRANULARITY) * FROZEN_CHAIN_SLOT_GRANULARITY
-}
 
 /// Words a label-parameter entry accepts after `frame_ptr`. One value for
 /// every such entry in the process: a loop-closing JUMP reaches its target
@@ -690,8 +675,10 @@ fn frozen_slot_count(n: usize) -> usize {
 ///
 /// A peeled preamble's LABEL is the header live set plus the prefix's extra
 /// values, so the JUMP that resumes there is that wide. 16 left a 17-arg JUMP
-/// on the frame-slot path; 24 covers it and still rounds `ARITY + 1` to the
-/// same 32-slot frozen granule (`frozen_slot_count`).
+/// on the frame-slot path; 24 covers it. This is the wasm function TYPE
+/// arity, not a JITFRAME byte-size floor: `compile_loop` publishes
+/// `frame_value_slots` / `count_ref_homes`, and `build_label_param_shim`
+/// zero-pads parameters the compact frame does not hold.
 pub const FROZEN_LABEL_PARAM_ARITY: usize = 24;
 
 /// An op whose result advances loop-carried state. A value produced inside the
@@ -908,13 +895,12 @@ fn stamp_and_publish_label_targets(
     // `func_handle` is 0 — a native build, which has no host at all —
     // `func_handle + 1` would name slot 1, another trace's entry rather than
     // an absent one, so both fields share the 0-means-absent encoding.
-    let wide_slot = if func_handle != 0
-        && codegen::has_label_param_entry(inputargs, ops, frame, bridge_entry_arity)
-    {
-        func_handle + 1
-    } else {
-        0
-    };
+    let wide_slot =
+        if func_handle != 0 && codegen::has_label_param_entry(inputargs, ops, bridge_entry_arity) {
+            func_handle + 1
+        } else {
+            0
+        };
     let mut published_descrs: Vec<majit_ir::DescrRef> = Vec::new();
     // A parameter entry with no fail values remains structurally `(i32) ->
     // i32`, so type-0 indirect calls may enter it. Only a nonzero parameter
@@ -5494,8 +5480,7 @@ impl majit_backend::Backend for WasmBackend {
         // geometry for both the loop and each nursery-allocated self callee.
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
-        let label_ref_slots =
-            codegen::label_ref_capture_slots(inputargs, ops).max(FROZEN_CHAIN_LABEL_REF_SLOTS);
+        let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
         // An entry bridge (`compile.py ResumeFromInterpDescr`) is sent
         // to the backend through `compile_loop` like any loop, but it is not one:
         // it has no LABEL of its own and ends in a JUMP into an
@@ -5506,13 +5491,18 @@ impl majit_backend::Backend for WasmBackend {
         // merely in size. Compiling against the target's geometry makes them
         // agree by construction. `_check_frame_depth`: a trace that needs more
         // than that layout keeps it and appends the overflow.
+        //
+        // A fresh loop publishes the slots this trace uses
+        // (`assembler.py` `assemble_loop` `update_frame_depth(frame_depth)`).
+        // The label-parameter TYPE stays `FROZEN_LABEL_PARAM_ARITY` wide;
+        // `jfi_frame_size` does not follow that arity.
         let frame = match entry_bridge_target {
             Some(target) => target
                 .frame
                 .extend(raw_frame_value_slots, raw_num_ref_homes),
             None => codegen::FrameGeometry::compact(
-                frozen_slot_count(raw_frame_value_slots.max(FROZEN_LABEL_PARAM_ARITY + 1)),
-                frozen_slot_count(raw_num_ref_homes) + label_ref_slots,
+                raw_frame_value_slots,
+                raw_num_ref_homes + label_ref_slots,
                 label_ref_slots,
             ),
         };
@@ -5954,7 +5944,7 @@ impl majit_backend::Backend for WasmBackend {
         // (unpublished `CALL_ASSEMBLER`, an unchainable closing `JUMP`,
         // a loop-closing bridge that does not advance state, a
         // `COND_CALL` without a direct residual signature, a residual
-        // call with more arguments than the call area, a headerless
+        // call with more arguments than the static call area, a headerless
         // nursery allocation, a read of an unproduced value, a
         // `GuardFutureCondition`, a `VirtualRef` the optimizer did
         // not lower, a raw load or store that missed the GC rewrite,
@@ -5999,7 +5989,7 @@ impl majit_backend::Backend for WasmBackend {
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
-        // Lift the CALL_ASSEMBLER decline when every callee target has frozen,
+        // Lift the CALL_ASSEMBLER decline when every callee target has published,
         // directly-enterable geometry; the CA arm lowers each operation to its
         // own in-module `call_indirect` target.
         // The CA arm must be able to complete a callee deopt; without the
@@ -6615,7 +6605,7 @@ impl majit_backend::Backend for WasmBackend {
         let wb = wasm_write_barrier_helpers();
 
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
-        // token's frozen geometry.
+        // token's published geometry (`jfi_frame_depth`).
         // A keyed tail-call back into the source skips that module's
         // fresh-entry publish, so this map must cover the source trace's
         // already-initialized homes (the root loop, or the parent
@@ -7009,8 +6999,9 @@ impl majit_backend::Backend for WasmBackend {
             .materialize_func_handle()
             .expect("wasm backend failed to materialize a runnable trace");
 
-        // Host entry allocates the complete frozen geometry, including the
-        // tail call area. CALL_ASSEMBLER uses the same `jfi_frame_depth`.
+        // Host entry allocates `jfi_frame_depth` (`assembler.py`
+        // `assemble_loop` / `update_frame_depth`). CALL_ASSEMBLER uses the
+        // same depth (`rewrite.py` `handle_call_assembler`).
         let frame_size = entry_frame_bytes(token, compiled.frame.frame_bytes).div_ceil(8);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -7023,9 +7014,9 @@ impl majit_backend::Backend for WasmBackend {
             // `jitframe.py` `JITFRAME.allocate`). A collecting allocation
             // forwards Ref homes through `jf_gcmap` on the jitframe shadow
             // stack. The data region (fail_index at 0, inputs/outputs at
-            // FRAME_SLOT_BASE, call area, dispatch key, Ref homes) lives in
-            // the `jf_frame` items area; passing `jf + FIRST_ITEM_OFFSET` as
-            // the wasm frame pointer keeps every local-0-relative codegen
+            // FRAME_SLOT_BASE, dispatch key, Ref homes, force slots) lives
+            // in the `jf_frame` items area; passing `jf + FIRST_ITEM_OFFSET`
+            // as the wasm frame pointer keeps every local-0-relative codegen
             // access unchanged. (See `build_home_gcmap` for the wasm32
             // Signed-item layout.) After `glue::execute`, resolve the shadow
             // slot before the write barrier: the nursery frame may have moved.
@@ -8491,10 +8482,14 @@ mod tests {
             compiled.frame.signed_item_count()
         );
         assert_eq!(depth, compiled.frame.signed_item_count());
-        assert!(
-            depth > compiled.frame.ca_frame_bytes as usize / std::mem::size_of::<isize>(),
-            "CALL_ASSEMBLER / execute_token must allocate the full assembled depth, \
-             not the homes prefix"
+        assert_eq!(
+            compiled.frame.frame_bytes, compiled.frame.ca_frame_bytes,
+            "CALL_ASSEMBLER / execute_token allocate the assembled depth; residual \
+             calls use the module-static scratch, not an in-object call area"
+        );
+        assert_eq!(
+            depth * std::mem::size_of::<isize>(),
+            compiled.frame.frame_bytes as usize
         );
         let map = codegen::build_home_gcmap(
             compiled.frame,

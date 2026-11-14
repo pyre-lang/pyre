@@ -372,6 +372,18 @@ struct KwonlyDefaultInline {
     slot: usize,
     stored: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
+    /// Interned unicode name for the ordinary-dict `finditem_str_named`
+    /// descent. `PY_NULL` on the module-dict arm.
+    name: pyre_object::PyObjectRef,
+}
+
+/// Which `Function.w_kw_defs` mapping `kwonly_defaults_for_inline` resolved.
+/// The ordinary-dict arm does not carry a baked lookup value: emit walks
+/// `finditem_str_named` and the residual probe reads the slot live.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KwonlyDefaultsKind {
+    ModuleDict,
+    PlainDict,
 }
 
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
@@ -379,13 +391,15 @@ struct KwonlyDefaultInline {
 struct KwonlyDefaultsInline {
     mapping: pyre_object::PyObjectRef,
     strategy: *mut pyre_object::celldict::ModuleDictStrategy,
+    kind: KwonlyDefaultsKind,
     values: Vec<KwonlyDefaultInline>,
 }
 
 /// The `w_kw_defs` entry `_match_signature` fills each keyword-only
-/// parameter, in slot order.  A parameter the mapping holds no entry for has
-/// no default at all and the call would raise `TypeError`, so the whole inline
-/// declines rather than reproduce a raise.
+/// parameter, in slot order.  A name `finditem_str` misses is
+/// `ArgErrMissing`; the walker cannot yet record that argument-binding
+/// raise on an inlined call, so the whole inline declines rather than
+/// leave a residual CALL with leftover probes.
 ///
 /// A definition installs these through `function.py init_kwdefaults_dict`,
 /// which builds the namespace mapping precisely so each entry is normally
@@ -395,9 +409,12 @@ struct KwonlyDefaultsInline {
 /// `f.__kwdefaults__[name] = ...` is absorbed by the cell and stays visible
 /// because the fold reads the cell's field live.
 ///
-/// An ordinary dict here is an assigned `f.__kwdefaults__` — the setter leaves
-/// what it is given unconverted, matching `fset_func_kwdefaults` — and has no
-/// version to pin, so it declines.
+/// An ordinary dict here is an assigned `f.__kwdefaults__` — the setter
+/// (`fset_func_kwdefaults`) stores any `is_dict` value unconverted.  It has
+/// no version to pin.  Emit walks `finditem_str_named` the way
+/// `_match_signature` calls `objspace.py finditem_str`; on a heap dict
+/// `rordereddict.py ll_call_lookup_function` stays residual
+/// (`look_inside_iff(isvirtual(d))`) and the value is read live.
 ///
 /// # Safety
 /// `callable` must be the live `Function` and `w_code` its code object.
@@ -414,13 +431,6 @@ unsafe fn kwonly_defaults_for_inline(
     // The version lives on the strategy box, so that is what the pin names and
     // what has to exist.  An ordinary dict has none.
     let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
-    // The emit records `record_quasiimmut_field` against this strategy box.
-    // `QuasiImmutDescr.struct_ptr` is a GCREF `walk_const_ptr_refs` forwards,
-    // the same way `quasiimmut.py self.struct` is.  Movability does not
-    // decide the pin.
-    if strategy.is_null() {
-        return None;
-    }
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
@@ -429,34 +439,152 @@ unsafe fn kwonly_defaults_for_inline(
     if varnames.len() < arg_count + kwonly_count {
         return None;
     }
-    let mut out = Vec::with_capacity(kwonly_count);
-    for slot in arg_count..arg_count + kwonly_count {
-        let Some(cell_slot) =
-            crate::state::module_dict_cell_slot_direct(dict, varnames[slot].as_str())
-        else {
-            return None;
-        };
-        let Some(stored) = crate::state::module_dict_cell_value_direct(dict, cell_slot) else {
-            return None;
-        };
-        if stored.is_null() {
-            return None;
+    if !strategy.is_null() {
+        // The emit records `record_quasiimmut_field` against this strategy box.
+        // `QuasiImmutDescr.struct_ptr` is a GCREF `walk_const_ptr_refs` forwards,
+        // the same way `quasiimmut.py self.struct` is.  Movability does not
+        // decide the pin.
+        let mut out = Vec::with_capacity(kwonly_count);
+        for slot in arg_count..arg_count + kwonly_count {
+            let Some(cell_slot) =
+                crate::state::module_dict_cell_slot_direct(dict, varnames[slot].as_str())
+            else {
+                return None;
+            };
+            let Some(stored) = crate::state::module_dict_cell_value_direct(dict, cell_slot) else {
+                return None;
+            };
+            if stored.is_null() {
+                return None;
+            }
+            let value = unsafe { pyre_object::celldict::unwrap_cell(stored) };
+            if value.is_null() {
+                return None;
+            }
+            out.push(KwonlyDefaultInline {
+                slot: cell_slot,
+                stored,
+                value,
+                name: pyre_object::PY_NULL,
+            });
         }
-        let value = unsafe { pyre_object::celldict::unwrap_cell(stored) };
-        if value.is_null() {
-            return None;
-        }
-        out.push(KwonlyDefaultInline {
-            slot: cell_slot,
-            stored,
-            value,
+        return Some(KwonlyDefaultsInline {
+            mapping: dict,
+            strategy,
+            kind: KwonlyDefaultsKind::ModuleDict,
+            values: out,
         });
     }
+    // `fset_func_kwdefaults` stores any `is_dict` mapping; a dict subclass
+    // is a `W_ObjectObject` with `DICT_DATA_SLOT`, so `is_dict` is false
+    // there and `finditem_str_named` takes `finditem_str_generic`. That
+    // generic arm is `dont_look_inside`, not a proven descent wall — the
+    // walk residualises it the way `ObjSpace.finditem_str` does. No
+    // exact-type screen: the interpreter lookup dispatches itself.
+    //
+    // Record-time `finditem_str` of every kwonly name must still hit.
+    // `_match_signature` does `w_def = space.finditem_str(w_kw_defs, name)`
+    // and on `None` appends to `missing_kwonly` then raises `ArgErrMissing`.
+    // The walker has no path that records an argument-binding raise on an
+    // inlined call (too-few / too-many positional and unknown keywords
+    // decline the same way), so a miss here declines instead of leaving a
+    // `GUARD_ISNULL` plus a raise the emit cannot yet record.
+    let names: Vec<String> = varnames[arg_count..arg_count + kwonly_count]
+        .iter()
+        .map(|name| name.as_str().to_string())
+        .collect();
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let _ = roots.pin_root(dict);
+    let mut name_slots = Vec::with_capacity(kwonly_count);
+    let mut out = Vec::with_capacity(kwonly_count);
+    for (offset, name) in names.iter().enumerate() {
+        let dict = roots.get(dict_slot);
+        match pyre_interpreter::finditem_str(dict, name) {
+            Ok(Some(_)) => {}
+            _ => return None,
+        }
+        let Some(name_obj) = pyre_object::get_interned_wtf8(Wtf8::new(name.as_str())) else {
+            return None;
+        };
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(name_obj);
+        name_slots.push(name_slot);
+        out.push(KwonlyDefaultInline {
+            slot: arg_count + offset,
+            stored: pyre_object::PY_NULL,
+            value: pyre_object::PY_NULL,
+            name: name_obj,
+        });
+    }
+    for (entry, slot) in out.iter_mut().zip(&name_slots) {
+        entry.name = roots.get(*slot);
+    }
     Some(KwonlyDefaultsInline {
-        mapping: dict,
+        mapping: roots.get(dict_slot),
         strategy,
+        kind: KwonlyDefaultsKind::PlainDict,
         values: out,
     })
+}
+
+/// `_match_signature` `space.finditem_str(w_kw_defs, name)` for an assigned
+/// ordinary dict. Walk `finditem_str_named` so the table probe records; the
+/// result box is the live lookup, not a baked `ConstPtr`.
+fn emit_plain_dict_kwonly_finditems<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    mapping: pyre_object::PyObjectRef,
+    names: &[pyre_object::PyObjectRef],
+) -> Result<Option<Vec<OpRef>>, DispatchError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(1 + names.len());
+    live.push(mapping);
+    live.extend(names.iter().copied());
+    let base = roots.pin_roots(&live);
+    let mapping = roots.get(base);
+    let dict_op = ctx.trace_ctx.const_ref(mapping as i64);
+    let pycode_op = ctx.trace_ctx.const_ref(0);
+    let nameindex_op = ctx.trace_ctx.const_int(0);
+    let mut out = Vec::with_capacity(names.len());
+    for offset in 0..names.len() {
+        let mapping = roots.get(base);
+        ctx.trace_ctx.set_opref_concrete(
+            dict_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(mapping as usize)),
+        );
+        let name = roots.get(base + 1 + offset);
+        if name.is_null() {
+            return Ok(None);
+        }
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(name) };
+        let key_op = ctx.trace_ctx.const_ref(storage as i64);
+        let Some(hit_op) = super::specialize::try_walker_orthodox_finditem_str_named(
+            ctx,
+            op_pc,
+            dict_op,
+            mapping,
+            key_op,
+            storage as pyre_object::PyObjectRef,
+            pycode_op,
+            pyre_object::PY_NULL,
+            nameindex_op,
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        match establish_nullity_of_box(ctx, op_pc, hit_op)? {
+            Some(true) => out.push(hit_op),
+            Some(false) => {
+                // Record-time `finditem_str` already hit; a null box here is
+                // a race, not `_match_signature`'s `ArgErrMissing` miss.
+                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op_pc });
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
@@ -4074,6 +4202,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // callable (`op` in `op(value)`) is not pinned by LOAD_GLOBAL, so a later
     // function must fail this guard instead of entering the traced callee.
     // Same `GuardValue` the inline path records on a non-constant callable.
+    // Residual-call fallthrough (`Ok(None)`) after this point rewinds here:
+    // the GuardValue, the `w_kw_defs?` pin, the flush, and any
+    // `finditem_str_named` probes would otherwise stay on the generic residual.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     if !r_args[0].is_constant() {
         ctx.trace_ctx.set_opref_concrete(
             r_args[0],
@@ -4123,25 +4255,38 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
                 resolved.mapping as i64,
             )?;
         }
-        let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
-        let version_mutate = crate::descr::module_dict_mutate_version_descr();
-        crate::state::record_quasiimmut_field(
-            ctx.trace_ctx,
-            strategy_const,
-            crate::descr::module_dict_version_descr(),
-            Some(&version_mutate),
-        );
-        walker_flush_guard_not_invalidated(ctx, op.pc)?;
-        for kwonly in &resolved.values {
-            if crate::state::module_dict_cell_value_direct(resolved.mapping, kwonly.slot)
-                != Some(kwonly.stored)
-            {
-                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
-            }
-            let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)? else {
-                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+        if resolved.kind == KwonlyDefaultsKind::PlainDict {
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            let names: Vec<_> = resolved.values.iter().map(|kwonly| kwonly.name).collect();
+            let Some(hits) =
+                emit_plain_dict_kwonly_finditems(ctx, op.pc, resolved.mapping, &names)?
+            else {
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                return Ok(None);
             };
-            param_boxes.push(value_op);
+            param_boxes.extend(hits);
+        } else {
+            let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+            let version_mutate = crate::descr::module_dict_mutate_version_descr();
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                strategy_const,
+                crate::descr::module_dict_version_descr(),
+                Some(&version_mutate),
+            );
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            for kwonly in &resolved.values {
+                if crate::state::module_dict_cell_value_direct(resolved.mapping, kwonly.slot)
+                    != Some(kwonly.stored)
+                {
+                    return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+                }
+                let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)?
+                else {
+                    return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+                };
+                param_boxes.push(value_op);
+            }
         }
     }
     if let Some(slot) = empty_vararg_slot {
@@ -4155,6 +4300,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // residual helper standing in for it.
         let Some(dict_op) = super::specialize::try_walker_orthodox_kwargs_dict_new(ctx, op.pc)?
         else {
+            cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         };
         param_boxes.push(dict_op);
@@ -4165,10 +4311,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // app-level frame object.
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
         return Ok(None);
     }
     let ec = unsafe { &*sym_ptr }.execution_context();
     if ec.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
         return Ok(None);
     }
 
@@ -9714,6 +9862,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .collect()
         })
         .unwrap_or_default();
+    let mut kwonly_name_slots = Vec::new();
+    if let Some(resolved) = kwonly_defaults.as_ref() {
+        for kwonly in &resolved.values {
+            if kwonly.name.is_null() {
+                kwonly_name_slots.push(None);
+            } else {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = _arg_roots.pin_root(kwonly.name);
+                kwonly_name_slots.push(Some(slot));
+            }
+        }
+    }
     let vararg_surplus = if vararg_slot.is_some() {
         // `_match_signature` (`argument.py:194-201`) prepends a receiver to
         // `args_w` — and so to the vararg tuple — when the callee has no
@@ -10843,13 +11003,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `scope_w[i] = space.finditem_str(w_kw_defs, name)` (`_match_signature`),
     // replacing the keyword-only placeholders pushed above.
     //
-    // Nothing is read at run time.  Two pins stand in for the read: the
-    // callee's `w_kw_defs` slot, which a `f.__kwdefaults__ = {...}` rebind
-    // fails, and the mapping's own strategy version, which a `del`, a new
-    // key, a replaced entry or a storage switch revokes.  What is left --
+    // A module dict reads nothing at run time.  Two pins stand in for the
+    // read: the callee's `w_kw_defs` slot, which a `f.__kwdefaults__ = {...}`
+    // rebind fails, and the mapping's own strategy version, which a `del`, a
+    // new key, a replaced entry or a storage switch revokes.  What is left --
     // storing over an entry that is already there -- is absorbed by the cell
     // without a version bump, and the fold below reads that cell's field live,
     // so it is observed on the very next call the way every runtime does it.
+    //
+    // An ordinary dict has no version.  The same `w_kw_defs?` pin stands, then
+    // emit walks `finditem_str_named` per name (`objspace.py finditem_str`,
+    // `rordereddict.py ll_call_lookup_function` residual on a heap table).
     if let Some(resolved) = kwonly_defaults {
         // Taken off `callable_guard_op`, which the resolve proved names
         // `callable`.
@@ -10877,6 +11041,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // stricter than the hint and sound for the reason the marker is: the
         // cells baked below belong to one mapping, and only pinning the slot
         // that holds it makes that true on every later execution.
+        //
+        // Residual CALL fallthrough after this point rewinds here: the
+        // `w_kw_defs?` pin, the flush, and any `finditem_str_named` probes
+        // would otherwise stay on the generic residual. Same protocol as
+        // `try_walker_call_assembler_self_recursive` `pre_fold_pos`.
+        let kwonly_emit_pos = ctx.trace_ctx.get_trace_position();
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if callable_guard_op.is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(live_callable() as i64);
@@ -10897,36 +11067,60 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 pinned_obj(&kwonly_mapping_pin, resolved.mapping) as i64,
             )?;
         }
-        // `walker_pin_namespace_version`'s body, opened up: the resolve already
-        // read the strategy box, and there is no way back from here to act on
-        // the `Ok(false)` the wrapper would return.  The marker names that
-        // box through `QuasiImmutDescr.struct_ptr`, which is forwarded.
-        let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
-        let version_mutate = crate::descr::module_dict_mutate_version_descr();
-        crate::state::record_quasiimmut_field(
-            ctx.trace_ctx,
-            strategy_const,
-            crate::descr::module_dict_version_descr(),
-            Some(&version_mutate),
-        );
-        // One guard drains both markers: it asks whether anything recorded
-        // this epoch was invalidated, not which.
-        walker_flush_guard_not_invalidated(ctx, op.pc)?;
-        let mapping = pinned_obj(&kwonly_mapping_pin, resolved.mapping);
-        for (offset, kwonly) in resolved.values.into_iter().enumerate() {
-            let stored = pinned_obj(&kwonly_pins[offset].1, kwonly.stored);
-            // The resolve read this cell before the markers above stood, so a
-            // store from another thread in between bumped a version nothing
-            // was watching and owes no invalidation for it.  Ask the mapping
-            // again now that the watcher is installed: agreeing means the
-            // markers answer for what is about to be baked.
-            if crate::state::module_dict_cell_value_direct(mapping, kwonly.slot) != Some(stored) {
-                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
-            }
-            let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, stored)? else {
-                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+        if resolved.kind == KwonlyDefaultsKind::PlainDict {
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            let mapping = pinned_obj(&kwonly_mapping_pin, resolved.mapping);
+            let names: Vec<_> = resolved
+                .values
+                .iter()
+                .enumerate()
+                .map(
+                    |(offset, kwonly)| match kwonly_name_slots.get(offset).copied().flatten() {
+                        Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                        None => kwonly.name,
+                    },
+                )
+                .collect();
+            let Some(hits) = emit_plain_dict_kwonly_finditems(ctx, op.pc, mapping, &names)? else {
+                cut_declined_subwalk(ctx, kwonly_emit_pos);
+                return resolved_inline_decline(op.pc, line!());
             };
-            callee_args[nparams + offset] = value_op;
+            for (offset, hit) in hits.into_iter().enumerate() {
+                callee_args[nparams + offset] = hit;
+            }
+        } else {
+            // `walker_pin_namespace_version`'s body, opened up: the resolve already
+            // read the strategy box, and there is no way back from here to act on
+            // the `Ok(false)` the wrapper would return.  The marker names that
+            // box through `QuasiImmutDescr.struct_ptr`, which is forwarded.
+            let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+            let version_mutate = crate::descr::module_dict_mutate_version_descr();
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                strategy_const,
+                crate::descr::module_dict_version_descr(),
+                Some(&version_mutate),
+            );
+            // One guard drains both markers: it asks whether anything recorded
+            // this epoch was invalidated, not which.
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            let mapping = pinned_obj(&kwonly_mapping_pin, resolved.mapping);
+            for (offset, kwonly) in resolved.values.into_iter().enumerate() {
+                let stored = pinned_obj(&kwonly_pins[offset].1, kwonly.stored);
+                // The resolve read this cell before the markers above stood, so a
+                // store from another thread in between bumped a version nothing
+                // was watching and owes no invalidation for it.  Ask the mapping
+                // again now that the watcher is installed: agreeing means the
+                // markers answer for what is about to be baked.
+                if crate::state::module_dict_cell_value_direct(mapping, kwonly.slot) != Some(stored)
+                {
+                    return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+                }
+                let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, stored)? else {
+                    return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+                };
+                callee_args[nparams + offset] = value_op;
+            }
         }
     }
 
