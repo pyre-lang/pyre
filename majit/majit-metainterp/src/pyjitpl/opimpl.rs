@@ -459,7 +459,7 @@ where
         // wires the check itself).
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let (opref, value) = ctx.vable_getfield_int_checked(
             nonstandard,
             self.cpu.as_ref(),
@@ -492,7 +492,7 @@ where
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let (opref, value) = ctx.vable_getfield_ref_checked(
             nonstandard,
             self.cpu.as_ref(),
@@ -525,7 +525,7 @@ where
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let (opref, value) = ctx.vable_getfield_float_checked(
             nonstandard,
             self.cpu.as_ref(),
@@ -1484,7 +1484,7 @@ where
             return TraceAction::Abort;
         };
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let imm_box = ctx.const_int(imm);
         let _write = ctx.vable_setfield_checked(
             nonstandard,
@@ -1517,7 +1517,7 @@ where
         };
         let (value, concrete) = self.read_int_reg(ctx, src);
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let _write = ctx.vable_setfield_checked(
             nonstandard,
             vable_opref,
@@ -1549,7 +1549,7 @@ where
         };
         let (value, concrete) = self.read_ref_reg(ctx, src);
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let _write = ctx.vable_setfield_checked(
             nonstandard,
             vable_opref,
@@ -1581,7 +1581,7 @@ where
         };
         let (value, concrete) = self.read_float_reg(ctx, src);
         let nonstandard =
-            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+            self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fielddescr);
         let _write = ctx.vable_setfield_checked(
             nonstandard,
             vable_opref,
@@ -2400,11 +2400,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (opref, value) = ctx.vable_getarrayitem_int_checked(
             nonstandard,
@@ -2477,11 +2477,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (opref, value) = ctx.vable_getarrayitem_ref_checked(
             nonstandard,
@@ -2535,11 +2535,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (opref, value) = ctx.vable_getarrayitem_float_checked(
             nonstandard,
@@ -2593,11 +2593,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_int_reg(ctx, src);
         match ctx.vable_setarrayitem_checked(
@@ -2660,11 +2660,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_ref_reg(ctx, src);
         match ctx.vable_setarrayitem_checked(
@@ -2724,11 +2724,11 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
-            self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
+            self.implement_guard_value(ctx, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_float_reg(ctx, src);
         match ctx.vable_setarrayitem_checked(
@@ -2770,7 +2770,7 @@ where
             return TraceAction::Abort;
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
-        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let nonstandard = self.nonstandard_virtualizable(ctx, opcode_pc, vable_opref, &fdescr);
         let result = ctx.vable_arraylen_vable_checked(
             nonstandard,
             self.cpu.as_ref(),
@@ -2926,7 +2926,7 @@ where
         )) as majit_ir::DescrRef;
         ctx.record_op_with_descr(OpCode::QuasiimmutField, &[struct_opref], descr);
         if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-            self.record_state_guard(ctx, sym, OpCode::GuardNotInvalidated, &[], opcode_pc, false);
+            self.record_state_guard(ctx, OpCode::GuardNotInvalidated, &[], opcode_pc, false);
         }
         TraceAction::Continue
     }
@@ -2935,28 +2935,27 @@ where
     fn opimpl_jit_force_quasi_immutable(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
+        _sym: &mut S,
         runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, false)
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, runtime, bytecode, false)
     }
 
     #[inline(never)]
     fn opimpl_jit_force_quasi_immutable_i(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
+        _sym: &mut S,
         runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, true)
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, runtime, bytecode, true)
     }
 
     fn opimpl_jit_force_quasi_immutable_kind(
         &mut self,
         ctx: &mut TraceCtx,
-        sym: &mut S,
         _runtime: &R,
         _bytecode: u8,
         owner_is_raw: bool,
@@ -3066,7 +3065,6 @@ where
         }
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardIsnull,
             &[mutatebox],
             opcode_pc,
@@ -3123,7 +3121,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntAddOvf);
+        self.trace_int_binop_jump_if_ovf(ctx, OpCode::IntAddOvf);
         TraceAction::Continue
     }
 
@@ -3136,7 +3134,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntSubOvf);
+        self.trace_int_binop_jump_if_ovf(ctx, OpCode::IntSubOvf);
         TraceAction::Continue
     }
 
@@ -3149,7 +3147,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntMulOvf);
+        self.trace_int_binop_jump_if_ovf(ctx, OpCode::IntMulOvf);
         TraceAction::Continue
     }
 
@@ -3585,7 +3583,7 @@ where
             cond_value,
             (cond_value == 0).then_some(target),
         );
-        self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
+        self.goto_if_not(ctx, opcode_pc, cond, cond_value, target, true);
         TraceAction::Continue
     }
 
@@ -3623,7 +3621,7 @@ where
             Some(majit_ir::Value::Int(cond_value)),
             self.last_exception_value,
         );
-        self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
+        self.goto_if_not(ctx, opcode_pc, cond, cond_value, target, false);
         TraceAction::Continue
     }
 
@@ -3662,7 +3660,7 @@ where
         } else {
             OpCode::GuardTrue
         };
-        self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
+        self.record_state_guard(ctx, guard, &[cond], opcode_pc, false);
         if cond_value == 0 {
             self.frames.current_mut().code_cursor = target;
         }
@@ -3703,7 +3701,6 @@ where
         let cond_value = eval_binop_i(opcode, lhs_value, rhs_value);
         self.record_or_fold_fused_guard(
             ctx,
-            sym,
             opcode,
             lhs,
             rhs,
@@ -3747,7 +3744,7 @@ where
             jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GE => (OpCode::FloatGe, a >= b),
             _ => unreachable!(),
         };
-        self.record_or_fold_fused_guard(ctx, sym, opcode, lhs, rhs, taken, opcode_pc, target);
+        self.record_or_fold_fused_guard(ctx, opcode, lhs, rhs, taken, opcode_pc, target);
         TraceAction::Continue
     }
 
@@ -3778,7 +3775,7 @@ where
             jitcode::insns::BC_GOTO_IF_NOT_PTR_NE => (OpCode::PtrNe, lhs_value != rhs_value),
             _ => unreachable!(),
         };
-        self.record_or_fold_fused_guard(ctx, sym, opcode, lhs, rhs, taken, opcode_pc, target);
+        self.record_or_fold_fused_guard(ctx, opcode, lhs, rhs, taken, opcode_pc, target);
         TraceAction::Continue
     }
 
@@ -3821,7 +3818,6 @@ where
             let const_ref = ctx.const_int(concrete_value);
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardValue,
                 &[value_box, const_ref],
                 opcode_pc,
@@ -3852,7 +3848,7 @@ where
                     Some(majit_ir::Value::Int(cond_value)),
                     self.last_exception_value,
                 );
-                self.record_state_guard(ctx, sym, OpCode::GuardFalse, &[cond], opcode_pc, false);
+                self.record_state_guard(ctx, OpCode::GuardFalse, &[cond], opcode_pc, false);
             }
         }
         TraceAction::Continue
@@ -3874,7 +3870,7 @@ where
             (opcode_pc, frame.next_reg() as usize, frame.next_label())
         };
         let (src, src_value) = self.read_ref_reg(ctx, src_idx);
-        let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
+        let nonnull = self.establish_nullity(ctx, src, src_value, opcode_pc);
         // pyjitpl.py:
         //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
         //   opimpl_goto_if_not_ptr_iszero:  if     nonnull: self.pc = target
@@ -4414,7 +4410,7 @@ where
             // (pyjitpl.py MIFrame._create_segmented_trace_and_blackhole) — the check reached here segments
             // whatever trace it is in, exactly as
             // `_create_segmented_trace_and_blackhole` does.
-            return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
+            return self.create_segmented_trace(ctx, mp_opcode_pc, mp_green_pc);
         }
         // `opimpl_jit_merge_point` takes its driver from
         // `staticdata.jitdrivers_sd[jdindex]`.
@@ -4739,7 +4735,6 @@ where
             // `capture_resumedata` (pyjitpl.py).
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardFutureCondition,
                 &[],
                 mp_opcode_pc,
@@ -5772,8 +5767,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &calldescr.arg_classes,
+                        &calldescr.arg_classes,
         ) {
             return action;
         }
@@ -6008,12 +6002,12 @@ where
             //    upstream order is GUARD_NOT_FORCED first, then
             //    GUARD_NO_EXCEPTION.
             if is_forces {
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
             }
-            match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+            match self.finish_residual_call_exception_path(ctx, effectinfo) {
                 TraceAction::Continue => {}
                 action => return action,
             }
@@ -6127,8 +6121,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &calldescr.arg_classes,
+                        &calldescr.arg_classes,
         ) {
             return action;
         }
@@ -6378,7 +6371,7 @@ where
                         frame.jitcode.code.get(frame.code_cursor),
                     );
                 }
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
@@ -6391,7 +6384,7 @@ where
             // op still needs GUARD_NO_EXCEPTION/EXCEPTION based on
             // effectinfo.check_can_raise() — same as non-pure.
             if !(pure && traced.is_constant()) {
-                match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                match self.finish_residual_call_exception_path(ctx, effectinfo) {
                     TraceAction::Continue => {}
                     action => return action,
                 }
@@ -6478,8 +6471,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &calldescr.arg_classes,
+                        &calldescr.arg_classes,
         ) {
             return action;
         }
@@ -6692,13 +6684,13 @@ where
             let concrete = residual_ref.word(concrete);
             self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
             if is_forces {
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
             }
             if !(pure && traced.is_constant()) {
-                match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                match self.finish_residual_call_exception_path(ctx, effectinfo) {
                     TraceAction::Continue => {}
                     action => return action,
                 }
@@ -6781,8 +6773,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &calldescr.arg_classes,
+                        &calldescr.arg_classes,
         ) {
             return action;
         }
@@ -6971,13 +6962,13 @@ where
             // (`execute_and_record_varargs` → `history.record(..., resvalue)`).
             self.set_float_reg(ctx, dst, Some(traced), Some(concrete.to_bits() as i64));
             if is_forces {
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
             }
             if !(pure && traced.is_constant()) {
-                match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                match self.finish_residual_call_exception_path(ctx, effectinfo) {
                     TraceAction::Continue => {}
                     action => return action,
                 }
@@ -7082,8 +7073,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &arg_classes,
+                        &arg_classes,
         ) {
             return action;
         }
@@ -7119,7 +7109,7 @@ where
         // 6. vable_after_residual_call + GUARD_NOT_FORCED
         //    (pyjitpl.py)
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
         if !matches!(action, TraceAction::Continue) {
             return action;
         }
@@ -7134,7 +7124,7 @@ where
             ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
         }
         // 8. handle_possible_exception (pyjitpl.py)
-        match self.finish_call_assembler_exception_path(ctx, sym) {
+        match self.finish_call_assembler_exception_path(ctx) {
             TraceAction::Continue => {}
             action => return action,
         }
@@ -7257,8 +7247,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &calldescr.arg_classes,
+                                                        &calldescr.arg_classes,
                         ) {
                             return action;
                         }
@@ -7289,7 +7278,7 @@ where
                             return action;
                         }
                     }
-                    match self.finish_residual_call_exception_path(ctx, sym, &calldescr.extra_info)
+                    match self.finish_residual_call_exception_path(ctx, &calldescr.extra_info)
                     {
                         TraceAction::Continue => {}
                         action => return action,
@@ -7316,8 +7305,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &calldescr.arg_classes,
+                                                        &calldescr.arg_classes,
                         ) {
                             return action;
                         }
@@ -7409,7 +7397,6 @@ where
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(
                             ctx,
-                            sym,
                             &calldescr.extra_info,
                         ) {
                             TraceAction::Continue => {}
@@ -7436,8 +7423,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &calldescr.arg_classes,
+                                                        &calldescr.arg_classes,
                         ) {
                             return action;
                         }
@@ -7527,7 +7513,6 @@ where
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(
                             ctx,
-                            sym,
                             &calldescr.extra_info,
                         ) {
                             TraceAction::Continue => {}
@@ -7687,8 +7672,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &arg_classes,
+                                                        &arg_classes,
                         ) {
                             return action;
                         }
@@ -7717,7 +7701,7 @@ where
                             return action;
                         }
                     }
-                    match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
+                    match self.finish_residual_call_exception_path(ctx, &extra_info) {
                         TraceAction::Continue => {}
                         action => return action,
                     }
@@ -7739,8 +7723,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &arg_classes,
+                                                        &arg_classes,
                         ) {
                             return action;
                         }
@@ -7826,7 +7809,7 @@ where
                         self.set_int_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
+                        match self.finish_residual_call_exception_path(ctx, &extra_info) {
                             TraceAction::Continue => {}
                             action => return action,
                         }
@@ -7850,8 +7833,7 @@ where
                             concrete_ptr as usize,
                             &raw_i,
                             &raw_r,
-                            &args,
-                            &arg_classes,
+                                                        &arg_classes,
                         ) {
                             return action;
                         }
@@ -7938,7 +7920,7 @@ where
                         self.set_ref_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
+                        match self.finish_residual_call_exception_path(ctx, &extra_info) {
                             TraceAction::Continue => {}
                             action => return action,
                         }
@@ -8150,8 +8132,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &arg_classes,
+                        &arg_classes,
         ) {
             return action;
         }
@@ -8178,7 +8159,7 @@ where
         let traced = ctx.call_assembler_int_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
         if !matches!(action, TraceAction::Continue) {
             return action;
         }
@@ -8186,7 +8167,7 @@ where
         if let Some(vbox) = vable_opref {
             ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
         }
-        match self.finish_call_assembler_exception_path(ctx, sym) {
+        match self.finish_call_assembler_exception_path(ctx) {
             TraceAction::Continue => {}
             action => return action,
         }
@@ -8295,8 +8276,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &arg_classes,
+                        &arg_classes,
         ) {
             return action;
         }
@@ -8324,7 +8304,7 @@ where
         let traced = ctx.call_assembler_ref_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
         if !matches!(action, TraceAction::Continue) {
             return action;
         }
@@ -8332,7 +8312,7 @@ where
         if let Some(vbox) = vable_opref {
             ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
         }
-        match self.finish_call_assembler_exception_path(ctx, sym) {
+        match self.finish_call_assembler_exception_path(ctx) {
             TraceAction::Continue => {}
             action => return action,
         }
@@ -8441,8 +8421,7 @@ where
             concrete_ptr as usize,
             &raw_i,
             &raw_r,
-            &args,
-            &arg_classes,
+                        &arg_classes,
         ) {
             return action;
         }
@@ -8471,7 +8450,7 @@ where
             ctx.call_assembler_float_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_float_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
         if !matches!(action, TraceAction::Continue) {
             return action;
         }
@@ -8479,7 +8458,7 @@ where
         if let Some(vbox) = vable_opref {
             ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
         }
-        match self.finish_call_assembler_exception_path(ctx, sym) {
+        match self.finish_call_assembler_exception_path(ctx) {
             TraceAction::Continue => {}
             action => return action,
         }
@@ -8766,7 +8745,6 @@ where
         let const_ref = ctx.const_int(concrete);
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardValue,
             &[opref, const_ref],
             opcode_pc,
@@ -8944,7 +8922,6 @@ where
         let const_ref = ctx.const_ref(concrete);
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardValue,
             &[opref, const_ref],
             opcode_pc,
@@ -8976,7 +8953,6 @@ where
         let const_ref = ctx.const_float(concrete);
         self.record_state_guard(
             ctx,
-            sym,
             OpCode::GuardValue,
             &[opref, const_ref],
             opcode_pc,
@@ -9026,7 +9002,6 @@ where
         if !ctx.heap_cache().is_class_known(opref) {
             self.record_state_guard(
                 ctx,
-                sym,
                 majit_ir::OpCode::GuardClass,
                 &[opref, cls_const],
                 opcode_pc,
@@ -9094,7 +9069,6 @@ where
             // pins it to the BC_RAISE byte.
             self.record_state_guard(
                 ctx,
-                sym,
                 majit_ir::OpCode::GuardClass,
                 &[opref, cls_const],
                 opcode_pc,

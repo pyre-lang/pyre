@@ -15,30 +15,30 @@ use majit_translate::front::mir::lower_fun_decl;
 use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
 
 /// Lower `pyframe::<Impl>::<leaf>` out of the shipped interpreter LLBC.
-fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
-    let llbc = interpreter_llbc()?;
+fn lower_pyframe_method(leaf: &str) -> FunctionGraph {
+    let llbc = interpreter_llbc();
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
-    Some(common::with_shared_lowering(llbc, |context| {
+    common::with_shared_lowering(llbc, |context| {
         lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
-    }))
+    })
 }
 
 /// Every graph in the LLBC whose name path ends with `::<leaf>`.  Five
 /// distinct functions in `pyframe` render as `pyframe::<Impl>::new`, so a
 /// test that wants one of them has to pick it out by shape.
-fn lower_all_named(leaf: &str) -> Option<Vec<FunctionGraph>> {
-    let llbc = interpreter_llbc()?;
+fn lower_all_named(leaf: &str) -> Vec<FunctionGraph> {
+    let llbc = interpreter_llbc();
     let suffix = format!("::{leaf}");
-    Some(common::with_shared_lowering(llbc, |context| {
+    common::with_shared_lowering(llbc, |context| {
         llbc.iter_local_fns()
             .filter(|fd| fd.item_meta.name_path().ends_with(&suffix))
             .filter_map(|fd| lower_fun_decl(context, fd).ok())
             .collect()
-    }))
+    })
 }
 
 /// The `locals_cells_stack_w` read and the block it happens in.
@@ -96,9 +96,7 @@ fn link_aliases(graph: &FunctionGraph, seed: &Variable) -> Vec<Variable> {
 /// consumer is `len`.
 #[test]
 fn vable_array_len_lowers_to_arraylen_not_a_call() {
-    let Some(graph) = lower_pyframe_method("_check_stack_index") else {
-        return;
-    };
+    let graph = lower_pyframe_method("_check_stack_index");
     let (array_var, defining_block) = virtualizable_array_read(&graph);
 
     let mut len_block = None;
@@ -150,9 +148,7 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
 /// freshening moves.
 #[test]
 fn vable_array_never_rides_a_link_out_of_its_defining_block() {
-    let Some(graph) = lower_pyframe_method("_check_stack_index") else {
-        return;
-    };
+    let graph = lower_pyframe_method("_check_stack_index");
     let (array_var, defining_block) = virtualizable_array_read(&graph);
 
     for (index, block) in graph.blocks.iter().enumerate() {
@@ -202,9 +198,7 @@ fn vable_array_never_rides_a_link_out_of_its_defining_block() {
 /// virtualizable path from turning that into a dropped operand.
 #[test]
 fn address_of_the_vable_array_slot_is_marked_not_a_read() {
-    let Some(graphs) = lower_all_named("new") else {
-        return;
-    };
+    let graphs = lower_all_named("new");
 
     let mut checked = 0;
     for graph in &graphs {
@@ -270,9 +264,7 @@ fn address_of_the_vable_array_slot_is_marked_not_a_read() {
 /// so it is where both have to hold.
 #[test]
 fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
-    let Some(graph) = lower_pyframe_method("fast2locals") else {
-        return;
-    };
+    let graph = lower_pyframe_method("fast2locals");
 
     let mut checked = 0;
     for (index, block) in graph.blocks.iter().enumerate() {
@@ -330,9 +322,7 @@ fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
 /// closures included, so reintroducing one cannot hide from it.
 #[test]
 fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     let graphs: Vec<FunctionGraph> = common::with_shared_lowering(llbc, |context| {
         let mut graphs: Vec<FunctionGraph> = Vec::new();
         for fd in llbc.iter_local_fns() {

@@ -550,18 +550,11 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`
 /// since it was introduced and appears in every recorded cache snapshot, so
-/// its absence means the artefact is too old to say anything — skip loudly
-/// rather than pass on a read that proves nothing.
+/// its absence means the artefact is too old to say anything — the test
+/// fails rather than pass on a read that proves nothing.
 const CONTROL: &str = "leading_non_null_count";
 
-fn harvested_unroll_safe() -> Option<Vec<String>> {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-interpreter`"
-        );
-        return None;
-    }
+fn harvested_unroll_safe() -> Vec<String> {
     let llbc = load_llbc(INTERPRETER_LLBC);
     let hints = harvest_hints_from_llbcs(std::slice::from_ref(llbc));
     let mut paths: Vec<String> = hints
@@ -571,12 +564,11 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
         .collect();
     paths.sort();
     if !paths.iter().any(|p| leaf(p) == CONTROL) {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} carries no `unroll_safe` on {CONTROL}, \
+        panic!(
+            "{INTERPRETER_LLBC} carries no `unroll_safe` on {CONTROL}, \
              so it predates the hint inventory entirely; re-extract to exercise \
-             this test (harvested: {paths:?})"
+             this test (harvested: {paths:?}); re-run `python3 scripts/extract-llbc.py`"
         );
-        return None;
     }
 
     // `REVIEWED_UNROLL_SAFE` and the subset check below both match on the
@@ -597,7 +589,7 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
             );
         }
     }
-    Some(paths)
+    paths
 }
 
 fn leaf(path: &str) -> &str {
@@ -606,9 +598,7 @@ fn leaf(path: &str) -> &str {
 
 #[test]
 fn every_unroll_safe_in_the_shipped_llbc_is_a_reviewed_one() {
-    let Some(paths) = harvested_unroll_safe() else {
-        return;
-    };
+    let paths = harvested_unroll_safe();
     for path in &paths {
         assert!(
             REVIEWED_UNROLL_SAFE
@@ -629,9 +619,7 @@ fn every_unroll_safe_in_the_shipped_llbc_is_a_reviewed_one() {
 /// reached from `unpackiterable_unroll`.  The shim must stay unhinted.
 #[test]
 fn the_known_length_unpack_shim_stays_unhinted() {
-    let Some(paths) = harvested_unroll_safe() else {
-        return;
-    };
+    let paths = harvested_unroll_safe();
     assert!(
         !paths
             .iter()

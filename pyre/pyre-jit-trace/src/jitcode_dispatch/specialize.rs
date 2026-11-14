@@ -104,7 +104,6 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     let exc = pyre_object::gc_roots::pin_root(exc);
     // The typeptr is a static. Capture it before later allocations move `exc`.
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
-    let exc_type = unsafe { (*exc).ob_type } as *const _ as i64;
     let args_storage = unsafe {
         pyre_object::interp_exceptions::w_exception_get_args_storage(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -127,7 +126,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
         };
         let arg_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(arg);
-        concrete_args.push(unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slot) });
+        concrete_args.push(pyre_object::gc_roots::shadow_stack_get(arg_slot));
     }
     let args = concrete_args
         .iter()
@@ -171,7 +170,6 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 const TRUTH_VALUE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::truth_value",
     commit_label: "truth_value_commit",
-    call_site_label: "truth_value_call_site",
     decline_tag: "TRUTH-VALUE-SUBWALK",
 };
 
@@ -968,7 +966,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     if field == TracebackWalkField::CoFirstlineno {
         let live =
             i64::from(unsafe { pyre_interpreter::pycode::w_code_firstlineno_raw(concrete_obj) });
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type)?;
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
         let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
@@ -1013,7 +1011,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     // so `walker_guard_stamped_nonnull` stamps `history.py *FrontendOp.value`
     // with the forwarded address.
     let stored_pin = residual_call::owner_root_if_gc(stored as usize);
-    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type)?;
     if code_receiver {
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
@@ -1434,7 +1432,7 @@ fn walker_guard_frame_attr_receiver<Sym: WalkSym>(
     {
         return Ok(false);
     }
-    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type)?;
     Ok(true)
 }
 
@@ -1734,7 +1732,6 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
 pub(crate) struct ApparentSuperClass {
     pub(crate) objtype: pyre_object::PyObjectRef,
     receiver_type: pyre_object::PyObjectRef,
-    receiver_version_tag: u64,
     receiver_map: pyre_interpreter::objspace::std::mapdict::MapRef,
 }
 
@@ -1742,12 +1739,11 @@ pub(crate) fn walker_apparent_super_class(
     start_type: pyre_object::PyObjectRef,
     obj: pyre_object::PyObjectRef,
 ) -> Option<ApparentSuperClass> {
-    let (receiver_type, receiver_version_tag, receiver_map, objtype) =
+    let (receiver_type, _receiver_version_tag, receiver_map, objtype) =
         unsafe { pyre_interpreter::baseobjspace::super_check_apparent_fast_path(start_type, obj) }?;
     Some(ApparentSuperClass {
         objtype,
         receiver_type,
-        receiver_version_tag,
         receiver_map,
     })
 }
@@ -1767,7 +1763,6 @@ pub(crate) fn walker_guard_apparent_super_class<Sym: WalkSym>(
         obj_op,
         concrete_obj,
         apparent.receiver_type,
-        apparent.receiver_version_tag,
         apparent.receiver_map,
     )?;
     let objtype_const = ctx.trace_ctx.const_ref(apparent.objtype as i64);
@@ -2197,7 +2192,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // The guard and the call below append to `opencoder.py Trace._ops`
         // and can minor-collect.
         let proxy_pin = residual_call::owner_root_if_gc(concrete_proxy as usize);
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_frame, w_type, version_tag)?;
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_frame, w_type)?;
         let proxy = ctx.trace_ctx.call_ref_typed_with_effect(
             pyre_interpreter::residual_word_addr!(1, jit_inline_frame_locals_proxy_new),
             &[obj],
@@ -2237,18 +2232,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
     // `mapdict.py` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    if let Some((w_type, version_tag, map, storageindex, attr)) =
+    if let Some((w_type, _, map, storageindex, attr)) =
         unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name) }
     {
-        walker_guard_mapdict_instance_shape(
-            ctx,
-            op_pc,
-            obj,
-            concrete_obj,
-            w_type,
-            version_tag,
-            map,
-        )?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
 
         // mapdict.py `PlainAttribute._pure_direct_read`, the `@jit.elidable`
         // read `AbstractAttribute.read` picks when the attribute has never been
@@ -2306,20 +2293,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // declines it. `class_descr_fast_path` is that getter: `space.type(w_obj)`,
     // guarded like any other mapdict attribute read.
     if name == "__class__"
-        && let Some((w_type, version_tag, map)) =
+        && let Some((w_type, _, map)) =
             unsafe { pyre_interpreter::objspace::std::mapdict::class_descr_fast_path(concrete_obj) }
     {
         // The shape guard can minor-collect: box `w_type` before it.
         let value = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_guard_mapdict_instance_shape(
-            ctx,
-            op_pc,
-            obj,
-            concrete_obj,
-            w_type,
-            version_tag,
-            map,
-        )?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2329,7 +2308,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // instance-slot fold above needs a mapdict storage index; a name that
     // lives only on the type has none and would otherwise residualize
     // `space.getattr`.
-    if let Some((w_type, version_tag, map, w_value)) = unsafe {
+    if let Some((w_type, _, map, w_value)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::class_attr_fast_path(concrete_obj, name)
     } {
         // Movability does not decide this fold.  A recorded `ConstPtr` is
@@ -2342,15 +2321,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // The raw `w_value` is not one of those holders: box it before the
         // shape guard, which can minor-collect.
         let value = ctx.trace_ctx.const_ref(w_value as i64);
-        walker_guard_mapdict_instance_shape(
-            ctx,
-            op_pc,
-            obj,
-            concrete_obj,
-            w_type,
-            version_tag,
-            map,
-        )?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2506,7 +2477,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         .as_ref()
         .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
         .unwrap_or(concrete_obj);
-    if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
+    if let Some((slot, kind, w_type, _, stored)) = unsafe {
         pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, name, false)
     } {
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args && stored.is_null() {
@@ -2561,7 +2532,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let obj_pin = residual_call::owner_root_if_gc(concrete_obj as usize);
         let stored_pin = residual_call::owner_root_if_gc(stored as usize);
         let frame_pin = traceback_frame.and_then(|f| residual_call::owner_root_if_gc(f as usize));
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type)?;
         let concrete_obj = pinned_obj(&obj_pin, concrete_obj);
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let raw_value = crate::state::opimpl_getfield_gc_r(
@@ -2726,12 +2697,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
-    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = (unsafe {
+    let Some((w_type, _, map, storageindex, listindex, unbox_type, attr)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
     let terminator = unsafe { (*map).terminator() };
     let term = unsafe { (*terminator).as_terminator() as *const _ };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
@@ -3162,7 +3133,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     if name.contains("__") {
         return Ok(None);
     }
-    let Some((w_type, version_tag, w_descr, w_func)) =
+    let Some((w_type, _, w_descr, w_func)) =
         (unsafe { pyre_interpreter::classmethod_on_type_fast_path(concrete_obj, &name) })
     else {
         return Ok(None);
@@ -3245,8 +3216,7 @@ fn walker_read_object_mutable_cell_stamped<Sym: WalkSym>(
 fn object_mutable_cell_payload_is_guardable(cell: pyre_object::PyObjectRef) -> bool {
     let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
     !live.is_null()
-        && !(pyre_object::tagged_int::CAN_BE_TAGGED
-            && unsafe { pyre_object::tagged_int::is_tagged_int(live) })
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(live))
 }
 
 fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
@@ -3586,7 +3556,7 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_descr, owes_shadow_guard)) = (unsafe {
+    let Some((w_type, _, w_descr, owes_shadow_guard)) = (unsafe {
         pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -4216,7 +4186,6 @@ fn walker_emit_super_attr_binding<Sym: WalkSym>(
     }
     // The physical layout is `Method` either way: `restamped_bound_method_new`
     // restamps the Python-visible `w_class`, not `ob_type`.
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     ctx.trace_ctx.heap_cache_mut().class_now_known(method_op);
     // The concrete bound method the walker's own execution must observe; a
     // fresh `Method` per evaluation is what `getattribute` produces anyway, so
@@ -4729,7 +4698,6 @@ fn walker_emit_super_proxy_storage<Sym: WalkSym>(
         obj_op,
         header_w_class,
     );
-    let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
     ctx.trace_ctx.heap_cache_mut().class_now_known(proxy_op);
     // `emit_super_inline` appends to `opencoder.py Trace._ops` and can
     // minor-collect. Reload every pointer the constructor will deref.
@@ -4845,7 +4813,7 @@ fn store_attr_add_value_pin(
         None => Some(StoreAttrAddValuePin::Boxed),
         Some(pyre_interpreter::objspace::std::mapdict::UnboxType::Int) => {
             if pyre_object::tagged_int::CAN_BE_TAGGED
-                && unsafe { pyre_object::tagged_int::is_tagged_int(concrete_value) }
+                && pyre_object::tagged_int::is_tagged_int(concrete_value)
             {
                 return Some(StoreAttrAddValuePin::UnboxedInt(None));
             }
@@ -4877,7 +4845,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
+    if let Some((w_type, _, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
     } {
         match unbox_type {
@@ -4903,15 +4871,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             }
         }
 
-        walker_guard_mapdict_instance_shape(
-            ctx,
-            op_pc,
-            obj,
-            concrete_obj,
-            w_type,
-            version_tag,
-            map,
-        )?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
         unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
         let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
         let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
@@ -4995,7 +4955,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    if let Some((slot, kind, w_type, version_tag, _stored)) = unsafe {
+    if let Some((slot, kind, w_type, _, _stored)) = unsafe {
         pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, true)
     } {
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
@@ -5009,7 +4969,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // forwarded receiver and value.
         let obj_pin = residual_call::owner_root_if_gc(concrete_obj as usize);
         let value_pin = residual_call::owner_root_if_gc(concrete_value as usize);
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type)?;
         let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&obj_pin, concrete_obj));
         let concrete_value = live_box_ref(ctx, value, pinned_obj(&value_pin, concrete_value));
         let (stored_value, stored_pin, concrete_stored) =
@@ -5169,15 +5129,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         }
         && let Some(value_pin) = store_attr_add_value_pin(&add, concrete_value)
     {
-        walker_guard_mapdict_instance_shape(
-            ctx,
-            op_pc,
-            obj,
-            concrete_obj,
-            add.w_type,
-            add.version_tag,
-            add.map,
-        )?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, add.w_type, add.map)?;
         walker_pin_holder_typ(ctx, op_pc, add.holder)?;
         // This marker is not redundant with the instance-map GuardValue. The
         // fold bakes `add.new_map`, the transition target, as a green
@@ -5314,12 +5266,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    let Some((w_type, version_tag, map, storageindex, attr)) = (unsafe {
+    let Some((w_type, _, map, storageindex, attr)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_boxed_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
     unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
     // The shape guard can minor-collect. `concrete_obj` is a copy of `obj`.
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
@@ -5744,7 +5696,6 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 const SPECIALISED_TUPLE2_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::tupleobject::makespecialisedtuple2",
     commit_label: "specialised_tuple2_commit",
-    call_site_label: "specialised_tuple2_call_site",
     decline_tag: "TUPLE2-SUBWALK",
 };
 
@@ -6797,7 +6748,6 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
 const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::tupleobject::w_tuple_getitem",
     commit_label: "subscr_tuple_item_commit",
-    call_site_label: "w_tuple_getitem_known_call_site",
     decline_tag: "SUBSCR-TUPLE-SUBWALK",
 };
 
@@ -6808,7 +6758,6 @@ pub(crate) struct HelperDescent {
     /// `opcode_ops::binary_value_from_tag` -- not a split of it.
     pub(crate) path: &'static str,
     pub(crate) commit_label: &'static str,
-    pub(crate) call_site_label: &'static str,
     pub(crate) decline_tag: &'static str,
 }
 
@@ -6817,7 +6766,6 @@ pub(crate) struct HelperDescent {
 const W_DICT_NEW_KWARGS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::dictmultiobject::w_dict_new_kwargs",
     commit_label: "w_dict_new_kwargs_commit",
-    call_site_label: "w_dict_new_kwargs_call_site",
     decline_tag: "KWARGS-DICT-NEW-SUBWALK",
 };
 
@@ -6826,7 +6774,6 @@ const W_DICT_NEW_KWARGS_DESCENT: HelperDescent = HelperDescent {
 const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::dictmultiobject::w_dict_store",
     commit_label: "w_dict_store_commit",
-    call_site_label: "w_dict_store_call_site",
     decline_tag: "KWARGS-DICT-SETITEM-SUBWALK",
 };
 
@@ -6835,7 +6782,6 @@ const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
 const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::binary_value_from_tag",
     commit_label: "binary_op_commit",
-    call_site_label: "binary_op_call_site",
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
@@ -6858,7 +6804,6 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
 const BINARY_SLICE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::runtime_ops::binary_slice_values_inner",
     commit_label: "binary_slice_commit",
-    call_site_label: "binary_slice_call_site",
     decline_tag: "BINARY-SLICE-SUBWALK",
 };
 
@@ -6915,7 +6860,6 @@ pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
 const GET_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_range_iter",
     commit_label: "get_iter_commit",
-    call_site_label: "get_iter_call_site",
     decline_tag: "GET-ITER-SUBWALK",
 };
 
@@ -6970,7 +6914,6 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
 const NEWLIST_EMPTY_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::listobject::w_list_make_empty",
     commit_label: "newlist_empty_commit",
-    call_site_label: "newlist_empty_call_site",
     decline_tag: "NEWLIST-EMPTY-SUBWALK",
 };
 
@@ -7009,14 +6952,12 @@ pub(crate) fn try_walker_orthodox_empty_newlist<Sym: WalkSym>(
 const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "write_cell",
     commit_label: "write_cell_commit",
-    call_site_label: "write_cell_call_site",
     decline_tag: "WRITE-CELL-SUBWALK",
 };
 
 const UNWRAP_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "unwrap_cell",
     commit_label: "unwrap_cell_commit",
-    call_site_label: "unwrap_cell_call_site",
     decline_tag: "UNWRAP-CELL-SUBWALK",
 };
 
@@ -7070,7 +7011,6 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         descent.commit_label,
-        descent.call_site_label,
         &[],
         &[],
         &ref_oprefs,
@@ -7259,7 +7199,6 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
 const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_truediv",
     commit_label: "int_truediv_commit",
-    call_site_label: "int_truediv_call_site",
     decline_tag: "INT-TRUEDIV-SUBWALK",
 };
 
@@ -7269,7 +7208,6 @@ const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
 const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_add",
     commit_label: "float_add_commit",
-    call_site_label: "float_add_call_site",
     decline_tag: "FLOAT-ADD-SUBWALK",
 };
 
@@ -7280,7 +7218,6 @@ const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
 const INT_ADD_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_add",
     commit_label: "int_add_commit",
-    call_site_label: "int_add_call_site",
     decline_tag: "INT-ADD-SUBWALK",
 };
 
@@ -7290,7 +7227,6 @@ const INT_ADD_DESCENT: HelperDescent = HelperDescent {
 const INT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_sub",
     commit_label: "int_sub_commit",
-    call_site_label: "int_sub_call_site",
     decline_tag: "INT-SUB-SUBWALK",
 };
 
@@ -7300,28 +7236,24 @@ const INT_SUB_DESCENT: HelperDescent = HelperDescent {
 const INT_MUL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_mul",
     commit_label: "int_mul_commit",
-    call_site_label: "int_mul_call_site",
     decline_tag: "INT-MUL-SUBWALK",
 };
 
 const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_sub",
     commit_label: "float_sub_commit",
-    call_site_label: "float_sub_call_site",
     decline_tag: "FLOAT-SUB-SUBWALK",
 };
 
 const FLOAT_MUL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_mul",
     commit_label: "float_mul_commit",
-    call_site_label: "float_mul_call_site",
     decline_tag: "FLOAT-MUL-SUBWALK",
 };
 
 const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_truediv",
     commit_label: "float_truediv_commit",
-    call_site_label: "float_truediv_call_site",
     decline_tag: "FLOAT-TRUEDIV-SUBWALK",
 };
 
@@ -7330,7 +7262,6 @@ const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
 const FLOAT_DESCR_POW_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::float_pow_impl",
     commit_label: "float_descr_pow_commit",
-    call_site_label: "float_descr_pow_call_site",
     decline_tag: "FLOAT-DESCR-POW-SUBWALK",
 };
 
@@ -7338,42 +7269,36 @@ const FLOAT_DESCR_POW_DESCENT: HelperDescent = HelperDescent {
 const FLOAT_LT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_lt",
     commit_label: "float_lt_commit",
-    call_site_label: "float_lt_call_site",
     decline_tag: "FLOAT-LT-SUBWALK",
 };
 
 const FLOAT_LE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_le",
     commit_label: "float_le_commit",
-    call_site_label: "float_le_call_site",
     decline_tag: "FLOAT-LE-SUBWALK",
 };
 
 const FLOAT_GT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_gt",
     commit_label: "float_gt_commit",
-    call_site_label: "float_gt_call_site",
     decline_tag: "FLOAT-GT-SUBWALK",
 };
 
 const FLOAT_GE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_ge",
     commit_label: "float_ge_commit",
-    call_site_label: "float_ge_call_site",
     decline_tag: "FLOAT-GE-SUBWALK",
 };
 
 const FLOAT_EQ_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_eq",
     commit_label: "float_eq_commit",
-    call_site_label: "float_eq_call_site",
     decline_tag: "FLOAT-EQ-SUBWALK",
 };
 
 const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_ne",
     commit_label: "float_ne_commit",
-    call_site_label: "float_ne_call_site",
     decline_tag: "FLOAT-NE-SUBWALK",
 };
 
@@ -7381,7 +7306,6 @@ const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
 const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_invert",
     commit_label: "int_invert_commit",
-    call_site_label: "int_invert_call_site",
     decline_tag: "INT-INVERT-SUBWALK",
 };
 
@@ -7826,7 +7750,6 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "list_getitem_commit",
-        "w_list_getitem_call_site",
         &[raw_index],
         &[ConcreteValue::Int(index)],
         &[list_op],
@@ -7960,7 +7883,6 @@ fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
 const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::compare_value_from_tag",
     commit_label: "compare_op_commit",
-    call_site_label: "compare_op_call_site",
     decline_tag: "COMPARE-OP-SUBWALK",
 };
 
@@ -8147,7 +8069,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
         &prep.body,
         prep.nested,
         descent.commit_label,
-        descent.call_site_label,
         &int_oprefs,
         &int_concretes,
         &ref_oprefs,
@@ -10157,7 +10078,6 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "str_getitem_commit",
-        "getitem_str_call_site",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10279,7 +10199,6 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "bytes_getitem_commit",
-        "getitem_bytes_call_site",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10414,7 +10333,6 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "frame_locals_getitem_commit",
-        "frame_locals_getitem_call_site",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10544,7 +10462,6 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "frame_locals_setitem_commit",
-        "frame_locals_setitem_call_site",
         &[],
         &[],
         &[seq_op, key_op, value_op],
@@ -10651,7 +10568,6 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "list_iter_descr_next_commit",
-        "list_iter_descr_next_call_site",
         &[],
         &[],
         &[iter_op],
@@ -11067,7 +10983,6 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     }
     // Static typeptr: read it before `emit_rlist_inline` can collect.
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete) };
-    let exc_type = unsafe { (*concrete).ob_type } as *const _ as i64;
     let kind = pyre_object::interp_exceptions::ExcKind::KeyError;
     // `emit_rlist_inline` / `const_ref` / `emit_exception_new_inline` append
     // to `Trace._ops` and can collect. The exception is a Rust local;
@@ -11543,9 +11458,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !(3..=5).contains(&r_args.len()) {
@@ -11606,9 +11519,8 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         let (arg_op, arg_obj) = match plan {
             BoundPlan::Exact { op, concrete } => (op, concrete),
             BoundPlan::UserIndex(candidate) => {
-                let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
-                    ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
-                )?
+                let Some((result, ConcreteValue::Ref(concrete))) =
+                    try_walker_inline_index(ctx, op, code, dst, candidate)?
                 else {
                     return walker_range_decline(ctx, pre_emit_pos);
                 };
@@ -11676,7 +11588,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         }
         // The step guard below appends to `opencoder.py Trace._ops` and can
         // minor-collect; the raise takes the forwarded exception.
-        let exc_pin = residual_call::owner_root_if_gc(exc as usize);
+        let _exc_pin = residual_call::owner_root_if_gc(exc as usize);
         let Some(ec) = walker_ensure_execution_context(ctx) else {
             return walker_range_decline(ctx, pre_emit_pos);
         };
@@ -12421,7 +12333,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         let _ = pyre_object::gc_roots::pin_root(if frame_owned {
             frame_ref.get_w_locals()
         } else {
-            unsafe { pyre_object::w_dict_new() }
+            pyre_object::w_dict_new()
         });
         let value_roots: Vec<usize> = slots
             .iter()
@@ -13175,7 +13087,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
             })
             .collect();
         let locals_root = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
         let mut result = pyre_object::PY_NULL;
         let mut slot_failed = false;
         for (&i, &value_root) in bound.iter().zip(&value_roots) {
@@ -14915,7 +14827,6 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
     // not fix its address: a minor collection moves the object and rewrites
     // the slot, which leaves this local naming a forwarded corpse. Read the
     // address back out of the slot the pin claimed.
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
     let msg_const = ctx.trace_ctx.const_ref(msg as i64);
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
     let class_const = ctx
@@ -14957,7 +14868,6 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
-    call_site_label: "newfloat_call_site",
     decline_tag: "NEWFLOAT-SUBWALK",
 };
 
@@ -15049,21 +14959,18 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
 const NEWCOMPLEX_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::newcomplex",
     commit_label: "newcomplex_commit",
-    call_site_label: "newcomplex_call_site",
     decline_tag: "NEWCOMPLEX-SUBWALK",
 };
 
 const COMPLEX_REAL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::complex_descr_get_real",
     commit_label: "complex_real_commit",
-    call_site_label: "complex_real_call_site",
     decline_tag: "COMPLEX-REAL-SUBWALK",
 };
 
 const COMPLEX_IMAG_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::complex_descr_get_imag",
     commit_label: "complex_imag_commit",
-    call_site_label: "complex_imag_call_site",
     decline_tag: "COMPLEX-IMAG-SUBWALK",
 };
 
@@ -15126,9 +15033,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     let Some((concrete_callable, [arg_obj, _])) =
@@ -15222,9 +15127,8 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
             descend_newcomplex(ctx, op.pc, raw, val, dst, pre)
         }
         Plan::Index(candidate) => {
-            let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
-                ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
-            )?
+            let Some((result, ConcreteValue::Ref(concrete))) =
+                try_walker_inline_index(ctx, op, code, dst, candidate)?
             else {
                 return walker_complex_decline(ctx, pre);
             };
@@ -15284,7 +15188,6 @@ pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
 const TRACEBACK_LINENO_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::pytraceback::descr_get_tb_lineno",
     commit_label: "tb_lineno_commit",
-    call_site_label: "tb_lineno_call_site",
     decline_tag: "TB-LINENO-SUBWALK",
 };
 
@@ -15341,7 +15244,6 @@ pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(
 const FRAME_F_BACK_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::pyframe::descr_get_f_back",
     commit_label: "f_back_commit",
-    call_site_label: "f_back_call_site",
     decline_tag: "F-BACK-SUBWALK",
 };
 
@@ -15478,7 +15380,6 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
 const INT_DESCR_STR_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::intobject::descr_str",
     commit_label: "int_descr_str_commit",
-    call_site_label: "int_descr_str_call_site",
     decline_tag: "INT-DESCR-STR-SUBWALK",
 };
 
@@ -15537,7 +15438,6 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
 const NEWUTF8_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::unicodeobject::w_str_from_storage_and_length",
     commit_label: "newutf8_commit",
-    call_site_label: "newutf8_call_site",
     decline_tag: "NEWUTF8-SUBWALK",
 };
 
@@ -15596,7 +15496,6 @@ fn spec_is_decimal_int_format(spec: &str) -> bool {
 const FORMAT_INT_DECIMAL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::intobject::format_int_decimal",
     commit_label: "format_int_decimal_commit",
-    call_site_label: "format_int_decimal_call_site",
     decline_tag: "FORMAT-INT-DECIMAL-SUBWALK",
 };
 
@@ -16662,8 +16561,6 @@ pub(super) fn collapsed_parent_resume_marker(
 /// before the walk, for a caller that has to reason about which ops the callee
 /// contributed.
 ///
-/// `call_site_label` names this site in the active-box collection.
-///
 /// `nested_entry` is [`orthodox_helper_nested_entry`]'s answer for `op_pc`:
 /// call-site box inheritance stays `Root` vs nested, and the helper level
 /// [`helper_subwalk_level`] names for its `HelperReturn` is pushed. Resolving
@@ -16677,7 +16574,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     sub_body: &SubJitCodeBody,
     nested_entry: HelperEntry,
     _fallback_label: &'static str,
-    call_site_label: &'static str,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
@@ -16714,7 +16610,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             call_site_word,
             op_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            call_site_label,
             vstack,
         )
     };
@@ -16914,7 +16809,6 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         sub_body,
         nested_entry,
         "codewriter_helper_inline_commit",
-        "codewriter_helper_inline_call_site",
         int_args,
         int_arg_concretes,
         ref_args,
@@ -17117,7 +17011,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         sub_body,
         nested_entry,
         "list_append_commit",
-        "w_list_append_call_site",
         &[],
         &[],
         &[self_ref, value_op],
@@ -17411,7 +17304,6 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         sub_body,
         nested_entry,
         "list_pop_commit",
-        "w_list_pop_end_call_site",
         &[],
         &[],
         &[self_ref],
@@ -18919,7 +18811,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 
     let w_type =
         unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) };
-    let Some(descr_type) = (unsafe { pyre_interpreter::typedef::r#type(descr) }) else {
+    let Some(descr_type) = pyre_interpreter::typedef::r#type(descr) else {
         return Ok(None);
     };
     let descr_type = descr_type.as_ptr();
@@ -19332,8 +19224,6 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     key_op: OpRef,
     value_op: OpRef,
     list_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    value_obj: pyre_object::PyObjectRef,
     sid: i64,
     index: i64,
 ) -> Result<Option<()>, DispatchError> {
@@ -19426,7 +19316,6 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "list_setitem_commit",
-        "w_list_setitem_call_site",
         &[raw_index],
         &[ConcreteValue::Int(index)],
         &[list_op, value_op],
@@ -19589,9 +19478,7 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
         (sid, index)
     };
 
-    try_walker_orthodox_list_setitem(
-        ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj, sid, index,
-    )
+    try_walker_orthodox_list_setitem(ctx, op_pc, list_op, key_op, value_op, list_obj, sid, index)
 }
 
 /// Walker-native `GetIter` for an exact machine-word `range`.
@@ -19778,7 +19665,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op_pc, start_guard, &[starts_at_zero])?;
     }
 
-    let (size_descr, iter_type_addr) = if !concrete_promote_step {
+    let (size_descr, _) = if !concrete_promote_step {
         (
             crate::descr::w_range_iter_size_descr(),
             &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64,
@@ -19932,7 +19819,6 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "for_iter_range_step_one_commit",
-        "range_iter_next_call_site",
         &[],
         &[],
         &[iter_op],
@@ -20739,7 +20625,6 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
 const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
     path: "pyframe::PyFrame::get_w_globals",
     commit_label: "get_w_globals_commit",
-    call_site_label: "get_w_globals_call_site",
     decline_tag: "GET-W-GLOBALS-SUBWALK",
 };
 

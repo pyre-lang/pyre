@@ -42,7 +42,6 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
     }
 }
 
-use indexmap::{IndexMap, IndexSet};
 use majit_ir::{
     DescrRef, IndexMapExt, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value, descr::descr_identity,
 };
@@ -443,9 +442,9 @@ impl CachedField {
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
-            let mut op = Op::with_descr(opcode, &[structbox_box.clone()], descr.clone());
+            let op = Op::with_descr(opcode, &[structbox_box.clone()], descr.clone());
             op.pos().set(cached_val);
-            sb.add_heap_op(ctx, cached_box, op);
+            sb.add_heap_op(cached_box, op);
         }
     }
 }
@@ -667,9 +666,9 @@ impl ArrayCachedItem {
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
                 .unwrap_or(OpCode::GetarrayitemGcI);
             let idx_b = Operand::const_(majit_ir::Const::Int(self.index));
-            let mut op = Op::with_descr(opcode, &[arraybox_box.clone(), idx_b], descr.clone());
+            let op = Op::with_descr(opcode, &[arraybox_box.clone(), idx_b], descr.clone());
             op.pos().set(cached_val);
-            sb.add_heap_op(ctx, cached_box, op);
+            sb.add_heap_op(cached_box, op);
         }
     }
 }
@@ -1435,7 +1434,7 @@ impl OptHeapState {
                 (*idx, descr.clone(), indexes)
             })
             .collect();
-        for (descr_idx, descr, indexes) in entries {
+        for (descr_idx, _, indexes) in entries {
             for index in indexes {
                 // heap.py cf.force_lazy_set(self, None, can_cache=True)
                 self.force_lazy_set_array(descr_idx, index, true, opt, ctx);
@@ -2264,7 +2263,6 @@ impl OptHeapState {
 
         let field_idx = Self::field_slot_index(&descr);
         let descr_id = descr_ptr(&descr);
-        let raw_obj = op.arg_ref(0).to_opref();
         // heap.py:645
         //     structinfo = self.ensure_ptr_info_arg0(op)
         //
@@ -2385,7 +2383,7 @@ impl OptHeapState {
         // can_cache=False and does NOT restore the value.)
         if force_lazy {
             let lazy_data = self.cached_fields[pos].2.lazy_set.take();
-            if let Some(mut lazy_op) = lazy_data {
+            if let Some(lazy_op) = lazy_data {
                 // heap.py invalidate(descr) — purity self-gate
                 // inside the method.
                 {
@@ -2512,7 +2510,7 @@ impl OptHeapState {
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
             let cmp_arg0 = Operand::from_bound_op(op_rc);
             let cmp_arg1 = Operand::const_(majit_ir::Const::Int(0));
-            let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
+            let cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos().set(cmp_pos);
             let cmp_rc = OpRc::new(cmp_op);
             ctx.emit_rc(cmp_rc.clone());
@@ -2542,11 +2540,9 @@ impl OptHeapState {
         let Some(descr) = op.getdescr() else {
             return OptimizationResult::PassOn;
         };
-        let raw_obj = op.arg_ref(0).to_opref();
         // heap.py:78 ensure_ptr_info_arg0 — install structinfo as a
         // side effect; canonical OpRef for the cache key.
         let obj_box = ctx.resolve_operand_operand(op.arg_ref(0));
-        let obj = obj_box.to_opref();
         let _ = ctx.ensure_ptr_info_arg0(op);
         // heapcache.py _escape_from_write — pyre-specific
         // escape tracking outside the do_setfield contract.
@@ -2676,7 +2672,7 @@ impl OptHeapState {
             .and_then(|s| s.const_get_mut(const_index))
             .and_then(|cai| cai.lazy_set.take());
         match lazy_data {
-            Some(mut lazy_op) => {
+            Some(lazy_op) => {
                 // heap.py self.invalidate(descr) — cai.invalidate +
                 // parent.clear_varindex (lifted into submap.invalidate_index).
                 if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
@@ -2843,7 +2839,7 @@ impl OptHeapState {
         // heap.py:123 op = self._lazy_set
         let lazy_data = self.cached_fields[pos].2.lazy_set.take();
         match lazy_data {
-            Some(mut lazy_op) => {
+            Some(lazy_op) => {
                 let field_idx = self.cached_fields[pos].0;
                 // heap.py self.invalidate(descr) — purity self-gate
                 // inside CachedField::invalidate.
@@ -3015,7 +3011,7 @@ impl OptHeapState {
                     .get_cached_array_submap_mut(descr_idx)
                     .and_then(|s| s.const_get_mut(const_index))
                     .and_then(|cai| cai.lazy_set.take());
-                if let Some(mut lazy_op) = lazy_data {
+                if let Some(lazy_op) = lazy_data {
                     if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
                         submap.invalidate_index(const_index, ctx);
                     }
@@ -4907,7 +4903,7 @@ mod tests {
 
         let w_class_ref: DescrRef = w_class.clone() as DescrRef;
         let map_ref: DescrRef = map.clone() as DescrRef;
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
         ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
@@ -5012,7 +5008,7 @@ mod tests {
 
         let w_class_ref: DescrRef = w_class.clone() as DescrRef;
         let tracefunc_ref: DescrRef = tracefunc.clone() as DescrRef;
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
         ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
@@ -5078,7 +5074,7 @@ mod tests {
             OptHeapState::field_cache_identity(&descr_b)
         );
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         heap.state
             .borrow_mut()
             .as_mut()
@@ -5112,13 +5108,13 @@ mod tests {
         use majit_ir::GcRef;
 
         let descr = object_descr(3);
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
         ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(None, None));
         let const_code = Operand::from_opref(OpRef::const_ptr(GcRef(0xaaa)));
-        let mut replay = Op::with_descr(
+        let replay = Op::with_descr(
             OpCode::GetfieldGcR,
             std::slice::from_ref(&obj),
             descr.clone(),
@@ -5174,7 +5170,7 @@ mod tests {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
         ctx.seed_boxes_canonical(std::slice::from_ref(object));
-        let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
+        let preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
         preamble_op.pos().set(source);
         let resolved_box = bound_arg(resolved);
         ctx.initialize_imported_short_preamble_builder(
@@ -5349,7 +5345,7 @@ mod tests {
         );
 
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0_box.clone()], d);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[p0_box.clone()], d);
         op.pos().set(pos2);
 
         let op_rc = OpRc::new(op.clone());
@@ -5397,12 +5393,12 @@ mod tests {
                 },
             )
         };
-        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], object_descr(1));
+        let outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], object_descr(1));
         outer.pos().set(outer_pos);
         let outer_entry = heap_entry(outer, &outer_box);
         // `HeapOp.add_op_to_short` stores `sb.produce_arg(sop.getarg(0))` on
         // the replay op: a dependent getfield names the producer's replay box.
-        let mut inner = Op::with_descr(
+        let inner = Op::with_descr(
             OpCode::GetfieldGcR,
             &[outer_entry.0.clone()],
             object_descr(2),
@@ -5464,7 +5460,7 @@ mod tests {
 
         // First getfield on head: consumes the import, caches the value.
         let pos2 = ctx.reserve_pos_typed(Type::Ref);
-        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d_head.clone());
+        let op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d_head.clone());
         op1.pos().set(pos2);
         let op1_rc = OpRc::new(op1.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
@@ -5487,7 +5483,7 @@ mod tests {
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
-        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
+        let op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
         op2.pos().set(pos3);
         let result2 = heap
             .state
@@ -5514,14 +5510,14 @@ mod tests {
         // strict-orthodoxy parity the optimizer panics instead of
         // emitting a defensive fallback.
         let d = immutable_descr(77);
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Int]);
         // The receiver is a ConstInt. A SameAs stand-in made constant by
         // position would be a different object from the arg the op carries.
         let const_base = Operand::const_from_value(majit_ir::Value::Int(1));
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[const_base], d);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[const_base], d);
         op.pos().set(pos1);
         op.setarg(
             0,
@@ -5613,7 +5609,7 @@ mod tests {
     /// a given `PtrInfo`, and report whether the second folded.
     fn second_getfield_folds_with_receiver_info(seed: crate::optimizeopt::info::PtrInfo) -> bool {
         let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
         ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
@@ -5622,7 +5618,7 @@ mod tests {
         let mut folded = false;
         for _ in 0..2 {
             let pos = ctx.reserve_pos_typed(Type::Ref);
-            let mut op = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d.clone());
+            let op = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d.clone());
             op.pos().set(pos);
             let op_rc = OpRc::new(op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -6260,11 +6256,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, val]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -6338,10 +6334,10 @@ mod tests {
             op.setarg(1, b.clone());
         }
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
                 let rb = match ctx.resolve_operand_operand_opt(&arg) {
@@ -6391,7 +6387,7 @@ mod tests {
     fn arrayitem_key_rejects_a_negative_constant_index() {
         let d = descr(0);
         let idx = OpRef::int_op(50);
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::GetarrayitemGcPureI,
             &[
                 rooted_resop_operand(Type::Int, 100),
@@ -6435,10 +6431,10 @@ mod tests {
         ];
         assign_positions(&mut ops);
         let mut ctx = OptContext::new(ops.len());
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
                 let rb = match ctx.resolve_operand_operand_opt(&arg) {
@@ -6526,11 +6522,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, new_val_box.clone()]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
                 let rb = match ctx.resolve_operand_operand_opt(&arg) {
@@ -6620,11 +6616,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, idx, new_val_box]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
                 let rb = match ctx.resolve_operand_operand_opt(&arg) {
@@ -6681,7 +6677,7 @@ mod tests {
         let idx = OpRef::int_op(50);
         let array_box = rooted_resop_operand(Type::Ref, 100);
         let index_box = rooted_resop_operand(Type::Int, idx.raw());
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::GetarrayitemGcI,
             &[array_box.clone(), index_box.clone()],
             d.clone(),
@@ -6692,7 +6688,7 @@ mod tests {
         ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
         ctx.set_ptr_info(&array_box, PtrInfo::virtual_array(d, 8, false));
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
@@ -6717,7 +6713,7 @@ mod tests {
         let arr = rooted_resop_operand(Type::Int, 100);
         let rhs = rooted_resop_operand(Type::Int, 101);
         let idx = Operand::const_from_value(majit_ir::Value::Int(3));
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[arr.clone(), idx, rhs.clone()],
             d.clone(),
@@ -6727,7 +6723,7 @@ mod tests {
         ctx.seed_boxes_canonical(&[arr.clone(), rhs]);
         ctx.set_ptr_info(&arr, PtrInfo::virtual_array(d.clone(), 8, false));
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
@@ -7073,11 +7069,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, val1, val2]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -7392,7 +7388,7 @@ mod tests {
     fn test_short_preamble_ref_field_preserves_getfield_opcode() {
         let descr =
             majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, majit_ir::ArrayFlag::Pointer);
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         // history.py:182 PtrInfo applies to ref-typed boxes; the field
         // descr is Type::Ref so the field source is ref-typed too.
         let pos100 = rooted_resop_operand(Type::Ref, 100);
@@ -7791,11 +7787,11 @@ mod tests {
         // live synthetic so emit forwards that same object to the emitted op.
         ctx.bind_input_resops(std::slice::from_ref(&new_array));
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -8797,14 +8793,14 @@ mod tests {
         assign_positions(&mut ops);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         ctx.snapshot_boxes = snapshots;
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
         // The variable index is the operand the ops carry, so getintbound
         // installs its IntBound on that same object.
         ctx.seed_boxes_canonical(&[arr, idx_box, func]);
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -8884,12 +8880,12 @@ mod tests {
         assign_positions(&mut ops);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         ctx.snapshot_boxes = snapshots;
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
         ctx.seed_boxes_canonical(&[arr, idx_box, func]);
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -9112,11 +9108,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, val]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -9184,11 +9180,11 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.seed_boxes_canonical(&[arr, val]);
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for op in &ops {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -9266,11 +9262,11 @@ mod tests {
         ctx.make_equal_to(&positional_array, &array_box);
         ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
 
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
 
         for (op_index, op) in ops.iter().enumerate() {
-            let mut resolved = op.clone();
+            let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
@@ -9334,12 +9330,12 @@ mod tests {
         let array = rooted_inputarg_operand(Type::Ref, 100);
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[array.clone()]);
+                let op = Op::new(OpCode::ArraylenGc, &[array.clone()]);
                 op.setdescr(d.clone());
                 op
             },
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[array]);
+                let op = Op::new(OpCode::ArraylenGc, &[array]);
                 op.setdescr(d);
                 op
             },
@@ -9466,7 +9462,7 @@ mod tests {
             majit_ir::descr::descr_identity(&array2)
         );
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         heap.state
             .borrow_mut()
             .as_mut()
@@ -9523,7 +9519,7 @@ mod tests {
         let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         // Bind the dict/key InputArg slots so they resolve to canonical
         // boxes (production binds these via main-trace bind-at-alloc); the
         // box-identity dict cache key needs a bound box per arg.
@@ -9541,7 +9537,7 @@ mod tests {
 
         // First lookup — not cached yet, should return false (emit).
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9564,7 +9560,7 @@ mod tests {
 
         // Second lookup with same dict+key — should be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op2 = Op::new(
+        let op2 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9602,7 +9598,7 @@ mod tests {
         let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         // Bind the dict/key InputArg slots so they resolve to canonical
         // boxes (production binds these via main-trace bind-at-alloc); the
         // box-identity dict cache key needs a bound box per arg.
@@ -9617,7 +9613,7 @@ mod tests {
 
         // Seed cache with FLAG_LOOKUP, then try FLAG_STORE.
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9648,7 +9644,7 @@ mod tests {
 
         // FLAG_STORE with known non-negative cached value → reuse.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op2 = Op::new(
+        let op2 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9679,7 +9675,7 @@ mod tests {
         let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         // Bind the dict/key InputArg slots so they resolve to canonical
         // boxes (production binds these via main-trace bind-at-alloc); the
         // box-identity dict cache key needs a bound box per arg.
@@ -9693,7 +9689,7 @@ mod tests {
 
         // Seed cache.
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9737,7 +9733,7 @@ mod tests {
 
         // Second lookup after clean — should NOT be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op2 = Op::new(
+        let op2 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9770,7 +9766,7 @@ mod tests {
         let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         // Bind the dict InputArg slot so it resolves to a canonical box
         // (production binds these via main-trace bind-at-alloc); the
         // box-identity dict cache key needs a bound box per arg.
@@ -9796,7 +9792,7 @@ mod tests {
         );
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9819,7 +9815,7 @@ mod tests {
 
         // Same value via a different const slot — must hit the cache.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
-        let mut op2 = Op::new(
+        let op2 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
@@ -9852,7 +9848,7 @@ mod tests {
     /// — otherwise the guard is wrongly removed across an intervening op.
     #[test]
     fn test_pass_on_clears_last_emitted_removed_flag() {
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         heap.setup();
         let mut ctx = OptContext::new(256);
 
@@ -9865,7 +9861,7 @@ mod tests {
 
         // OpCode::New is a PassOn arm in heap.rs (allocation tracking only).
         let new_pos = ctx.reserve_pos_typed(Type::Ref);
-        let mut new_op = Op::new(OpCode::New, &[]);
+        let new_op = Op::new(OpCode::New, &[]);
         new_op.pos().set(new_pos);
         let result =
             heap.propagate_forward(&new_op, &OpRc::new(new_op.clone()), &mut None, &mut ctx);
@@ -9881,7 +9877,7 @@ mod tests {
         );
 
         // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
-        let mut guard = Op::new(OpCode::GuardNoException, &[]);
+        let guard = Op::new(OpCode::GuardNoException, &[]);
         guard.pos().set(ctx.reserve_pos_typed(Type::Void));
         let guard_result =
             heap.propagate_forward(&guard, &OpRc::new(guard.clone()), &mut None, &mut ctx);
@@ -9898,7 +9894,7 @@ mod tests {
         let extra_array: DescrRef = descr(81);
         let descr = dict_lookup_descr(90, extra_field, extra_array);
 
-        let mut heap = OptHeap::new();
+        let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
 
         let func_addr = ctx.make_constant_int(0xDEAD);
@@ -9908,7 +9904,7 @@ mod tests {
         let flag_delete = ctx.make_constant_int(2); // FLAG_DELETE
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
-        let mut op1 = Op::new(
+        let op1 = Op::new(
             OpCode::CallI,
             &[
                 bound_arg(func_addr),

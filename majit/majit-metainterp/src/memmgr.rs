@@ -28,7 +28,6 @@
 //! (`send_loop_to_backend`) and `compile.py`
 //! (`compile_tmp_callback`) are the two places upstream discharges it.
 
-use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;

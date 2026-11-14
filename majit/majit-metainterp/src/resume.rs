@@ -6,10 +6,9 @@
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/resume.py`.
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
-use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -4648,7 +4647,7 @@ mod tests {
     fn test_memo_number_simple() {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
+        let env = SimpleBoxEnv::new();
         let snapshot = Snapshot::single_frame(
             0,
             8,
@@ -4748,7 +4747,7 @@ mod tests {
     fn test_number_rebuild_roundtrip() {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
+        let env = SimpleBoxEnv::new();
         let snapshot = Snapshot::single_frame(
             0,
             8,

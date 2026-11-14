@@ -99,12 +99,6 @@ fn named_body_erases(llbc: &Llbc, suffix: &str) -> Option<bool> {
 
 #[test]
 fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let touching = harvest_root_stack_touching_paths(object);
     assert!(
@@ -147,12 +141,6 @@ fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
 
 #[test]
 fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let owning = harvest_scope_owning_identities(object);
     assert!(
@@ -163,7 +151,11 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
         owning.iter().any(|p| p.contains("DictOperationGuard")),
         "DictOperationGuard::new returns the bracket it opened: {owning:?}"
     );
-    let mut interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let mut interpreter = Llbc::load(INTERPRETER_LLBC).unwrap_or_else(|err| {
+        panic!(
+            "{INTERPRETER_LLBC} is missing or unreadable; run `python3 scripts/extract-llbc.py`: {err}"
+        )
+    });
     let external_id = interpreter
         .iter_fun_decls()
         .find(|fd| {
@@ -197,12 +189,6 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
 
 #[test]
 fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file()
-        || !std::path::Path::new(MODULE_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     // `PyError` is a one-field tuple over the raised value. The named
     // fields live on `PyErrorObject`, which `Deref` exposes. `parse_filter_spec`
     // reads `error.kind` as that struct's field.

@@ -414,7 +414,7 @@ impl JitProfiler {
             _ => 0.0,
         };
         crate::debug::debug_print(&format!("TOTAL:      \t\t{total:.6}"));
-        let mut intline = |label: &str, value: usize| {
+        let intline = |label: &str, value: usize| {
             crate::debug::debug_print(&fmt_intline(label, value));
         };
         intline("ops", snap.ops);

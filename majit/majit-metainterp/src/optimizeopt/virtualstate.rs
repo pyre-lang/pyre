@@ -23,8 +23,6 @@ use std::cell::Cell;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use indexmap::IndexSet;
-
 use majit_ir::descr::descr_identity;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
@@ -2398,7 +2396,7 @@ impl GuardRequirement {
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
                 let class_b = Operand::const_from_value(Value::Int(*expected_class));
-                let mut op = Op::new(OpCode::GuardClass, &[box_.clone(), class_b]);
+                let op = Op::new(OpCode::GuardClass, &[box_.clone(), class_b]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
             }
@@ -2411,12 +2409,12 @@ impl GuardRequirement {
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
                 let class_b = Operand::const_from_value(Value::Int(*expected_class));
-                let mut op = Op::new(OpCode::GuardNonnullClass, &[box_.clone(), class_b]);
+                let op = Op::new(OpCode::GuardNonnullClass, &[box_.clone(), class_b]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
             }
             GuardRequirement::GuardNonnull { box_, .. } => {
-                let mut op = Op::new(OpCode::GuardNonnull, std::slice::from_ref(box_));
+                let op = Op::new(OpCode::GuardNonnull, std::slice::from_ref(box_));
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
             }
@@ -2435,7 +2433,7 @@ impl GuardRequirement {
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                     v => Operand::const_from_value(*v),
                 };
-                let mut op = Op::new(OpCode::GuardValue, &[box_.clone(), val_b]);
+                let op = Op::new(OpCode::GuardValue, &[box_.clone(), val_b]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
             }

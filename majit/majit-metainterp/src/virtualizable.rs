@@ -14,14 +14,13 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock, Weak};
 
 use majit_jitcode::jitcode::BhDescr;
 
 use majit_ir::{
     DescrRef, Type, Value,
-    descr::{FieldDescr, cache_fieldname, descr_identity},
+    descr::{cache_fieldname, descr_identity},
 };
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
@@ -1927,8 +1926,7 @@ unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::Descr;
-
+    use majit_ir::descr::FieldDescr;
     /// Test helper: add an array field with a fresh descriptor.
     /// Production code should use GcCache-sourced descriptors.
     fn test_add_array_field(

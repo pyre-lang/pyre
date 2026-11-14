@@ -9,6 +9,7 @@
     clippy::collapsible_if,
     clippy::cloned_ref_to_slice_refs,
     clippy::manual_range_contains,
+    unused_variables,
     reason = "this module is generated verbatim from real.rules; local rewrites would fail the freshness check, so lint cleanup belongs in the generator before the artifact can change"
 )]
 pub mod autogenintrules;
@@ -42,7 +43,6 @@ pub mod vstring;
 
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 use crate::resume::SnapshotBox;
-use indexmap::{IndexMap, IndexSet};
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
@@ -430,7 +430,7 @@ mod walk_live_op_quasiimmut_tests {
             &[],
             std::slice::from_ref(&short_input),
         );
-        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&short_input));
+        let replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&short_input));
         replay_op.pos().set(OpRef::ref_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
             op: used_box.clone(),
@@ -469,7 +469,7 @@ mod walk_live_op_quasiimmut_tests {
         let op_box = Operand::const_from_value(Value::Ref(old_op));
         let preamble_arg = Operand::const_from_value(Value::Ref(old_preamble));
         let same_as_source = Operand::const_from_value(Value::Ref(old_same));
-        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
+        let replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
         replay_op.pos().set(OpRef::ref_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
             op: op_box.clone(),
@@ -528,7 +528,7 @@ mod walk_live_op_quasiimmut_tests {
         let preamble_arg = Operand::const_from_value(Value::Ref(old_preamble));
         let same_as_source = Operand::const_from_value(Value::Ref(old_same));
         let cache_arg = Operand::const_from_value(Value::Ref(old_cache));
-        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
+        let replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
         replay_op.pos().set(OpRef::ref_op(14));
 
         let mut ctx = OptContext::new(0);
@@ -1432,7 +1432,7 @@ impl ImportedShortPureOp {
         invented_name: bool,
         same_as_source: Option<majit_ir::operand::Operand>,
     ) -> Self {
-        let mut replay = majit_ir::Op::new(opcode, &args);
+        let replay = majit_ir::Op::new(opcode, &args);
         // shortpreamble.py PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -4402,7 +4402,7 @@ impl OptContext {
                         .iter()
                         .map(|a| rebind_arg(&produced, a.clone()))
                         .collect();
-                    let mut op = Op::new(
+                    let op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_arg_boxes,
                     );
@@ -4452,7 +4452,7 @@ impl OptContext {
                             // those identities and emits guards on an exporting-
                             // phase box that a retrace cannot bind.
                             let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
-                            let mut op = Op::new(opcode, &[obj_b]);
+                            let op = Op::new(opcode, &[obj_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
                             let preamble_op = OpRc::new(op);
@@ -4481,7 +4481,7 @@ impl OptContext {
                             // The replay op keeps `preamble_op`'s own index arg.
                             let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                             let index_b = rebind_arg(&produced, produced_op.preamble_op.arg(1));
-                            let mut op = Op::new(opcode, &[obj_b, index_b]);
+                            let op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
                             let preamble_op = OpRc::new(op);
@@ -4514,7 +4514,7 @@ impl OptContext {
                         return false;
                     }
                     let func_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
-                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
+                    let op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos().set(produced_op.preamble_op.pos().get());
                     let preamble_op = OpRc::new(op);
                     let res = Operand::from_bound_op(&preamble_op);
@@ -7277,8 +7277,6 @@ impl OptContext {
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         mut pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
-        use crate::resume::{ResumeDataLoopMemo, Snapshot};
-
         // optimizer.py store_final_boxes_in_guard parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()
@@ -10083,7 +10081,6 @@ mod opt_context_pos_tests {
     use super::*;
     use majit_ir::OpRef;
     use majit_ir::resoperation::{Op, OpCode};
-    use std::rc::Rc;
 
     /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
     /// `allocate_next_pos_raw` must treat that as a claimed position.
@@ -10315,7 +10312,7 @@ mod boxref_forwarding_tests {
     /// `resolve_operand_operand` for an op chain, an inputarg, and a constant.
     #[test]
     fn with_resolved_operand_matches_resolve_operand_operand() {
-        let (mut ctx, inputarg, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, inputarg, _b1, _ia_holder) = ctx_with_two_int_boxes();
 
         let constant = Operand::const_from_value(Value::Int(7));
         ctx.with_resolved_operand(&constant, |got| {
@@ -10402,7 +10399,7 @@ mod boxref_forwarding_tests {
         let consumer_arg = ctx.materialize_operand_at(pos2);
 
         // The producer emits at pos 2.
-        let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
+        let producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
         producer.pos().set(pos2);
         ctx.emit(producer);
 
@@ -10606,7 +10603,7 @@ mod boxref_forwarding_tests {
     /// `setintbound(opref, bound)` mirrors `box.set_forwarded(IntBound)`.
     #[test]
     fn h3_1_setintbound_mirrors_box_info() {
-        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
         ctx.setintbound(&b0, &bound);
         match &b0.get_forwarded() {
@@ -10866,7 +10863,7 @@ mod boxref_forwarding_tests {
     /// PyPy `resoperation.py:60 isinstance(next, AbstractInfo)`.
     #[test]
     fn h3_2b_get_box_replacement_operand_opt_stops_at_info_terminal() {
-        let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
@@ -10899,7 +10896,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_is_virtual_matches_legacy_when_pool_plumbed() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         let info = PtrInfo::Virtual(crate::optimizeopt::info::VirtualInfo {
             descr: std::sync::Arc::new(DummySizeDescr),
             known_class: None,
@@ -10915,7 +10912,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_is_virtual_returns_false_for_nonnull_only() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(!ctx.is_virtual(&b));
     }
@@ -10928,7 +10925,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_is_nonnull_matches_set_info() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.peek_ptr_info(&b).is_some_and(|i| i.is_nonnull()));
         assert!(ctx.is_nonnull(&b));
@@ -10942,7 +10939,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_peek_intbound_box_matches_legacy_when_pool_plumbed() {
-        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(42));
         let legacy = ctx
             .peek_intbound(OpRef::input_arg_int(0))
@@ -10962,7 +10959,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_last_guard_pos_matches_legacy_when_pool_plumbed() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 5 });
         assert_eq!(ctx.last_guard_pos(&b), Some(5));
         assert_eq!(
@@ -10995,7 +10992,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_last_guard_pos_returns_none_when_no_recorded_guard() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         // info.py last_guard_pos == -1 → get_last_guard_pos returns None.
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.last_guard_pos(&b).is_none());
@@ -11003,7 +11000,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_is_virtualizable_via_box_matches_legacy_when_pool_plumbed() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
             &b,
             PtrInfo::Virtualizable(crate::optimizeopt::info::VirtualizableFieldState {
@@ -11023,7 +11020,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_is_virtualizable_returns_false_for_nonnull_only() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(!ctx.is_virtualizable(&b));
     }
@@ -11036,7 +11033,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_has_ptr_info_matches_set_info() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.has_ptr_info(&b));
         assert!(ctx.peek_ptr_info(&b).is_some());
@@ -11050,7 +11047,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_peek_ptr_info_returns_set_info() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 5 });
         let via_box = ctx.peek_ptr_info(&b).expect("box clone");
         assert!(matches!(via_box, PtrInfo::NonNull { last_guard_pos: 5 }));
@@ -11069,7 +11066,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_with_ptr_info_mut_mirrors_after_mutation_when_pool_plumbed() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         // Pre-condition: operand snapshot matches legacy at pos 0.
         assert_eq!(ctx.last_guard_pos(&b), Some(0));
@@ -11107,7 +11104,7 @@ mod boxref_forwarding_tests {
     /// mutations — Python `is`-equivalent semantics for non-ConstPtrInfo.
     #[test]
     fn ptr_info_handle_live_identity_propagates_mutation() {
-        let (mut ctx, b) = ctx_with_one_ref_box();
+        let (ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         let h1 = ctx
             .getptrinfo_handle(&b)
@@ -11176,7 +11173,7 @@ mod boxref_forwarding_tests {
     fn int_bound_handle_live_identity_propagates_mutation() {
         use majit_ir::Type;
 
-        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let ctx = OptContext::with_num_inputs(0, 0);
         let (b, _op) = bound_resop_operand(Type::Int, 0);
         let h1 = ctx.getintbound_handle(&b);
         let h2 = ctx.getintbound_handle(&b);
@@ -11205,7 +11202,7 @@ mod boxref_forwarding_tests {
     fn int_bound_handle_const_arms_are_not_ptr_eq() {
         use majit_ir::Value;
 
-        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let ctx = OptContext::with_num_inputs(0, 0);
         let c = Operand::const_from_value(Value::Int(7));
         let h1 = ctx.getintbound_handle(&c);
         let h2 = ctx.getintbound_handle(&c);
@@ -11227,7 +11224,7 @@ mod boxref_forwarding_tests {
     fn int_bound_handle_const_arm_is_locally_mutable() {
         use majit_ir::Value;
 
-        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let ctx = OptContext::with_num_inputs(0, 0);
         let c = Operand::const_from_value(Value::Int(7));
         let h = ctx.getintbound_handle(&c);
         // Direct field mutation through the RefMut — `make_ge_const`
@@ -11604,8 +11601,7 @@ mod constant_ptr_info_tests {
     //! with a `Type::Ref` override).
     use super::*;
     use crate::optimizeopt::info::{PtrInfo, RawBufferPtrInfo, RawSlicePtrInfo, VStringVariant};
-    use majit_ir::{GcRef, OpRef, Type, Value};
-    use std::borrow::Cow;
+    use majit_ir::{GcRef, OpRef, Value};
 
     /// info.py getptrinfo(ConstPtr) → ConstPtrInfo(op).
     /// A `Value::Ref` constant must be wrapped in `PtrInfo::Constant`.
@@ -11779,7 +11775,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRc, OpRef, SizeDescr, Type, Value};
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -11863,7 +11859,7 @@ mod ensure_ptr_info_arg0_tests {
         // history.py:182 GetfieldGc receiver is a Ref box; arg0 must
         // carry the Ref variant tag (resoperation.py RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::GetfieldGcI,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Ref,
@@ -11881,7 +11877,7 @@ mod ensure_ptr_info_arg0_tests {
             index: 7,
             is_object: false,
         });
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::ArraylenGc,
             &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Ref,
@@ -11950,7 +11946,7 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::Strlen,
                 &[crate::history::test_support::rooted_inputarg_operand(
                     Type::Ref,
@@ -11987,7 +11983,7 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::Strlen,
                 &[crate::history::test_support::rooted_inputarg_operand(
                     Type::Ref,
@@ -12928,7 +12924,7 @@ mod imported_short_preamble_fallback_tests {
         ];
         ctx.initialize_imported_short_preamble_builder(&labels, &shorts, &[]);
 
-        let mut replay_op = Op::new(
+        let replay_op = Op::new(
             OpCode::IntAdd,
             &[
                 crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 7),

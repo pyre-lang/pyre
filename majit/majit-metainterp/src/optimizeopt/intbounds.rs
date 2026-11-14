@@ -1,4 +1,3 @@
-use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 /// Integer bounds optimization pass.
 ///
@@ -2055,7 +2054,7 @@ mod tests {
         ops: &[Op],
         initial_bounds: &[(OpRef, IntBound)],
     ) -> (Vec<Op>, OptContext) {
-        let mut pass = OptIntBounds::new();
+        let pass = OptIntBounds::new();
         // Compute num_inputs as the highest OpRef referenced anywhere (as
         // arg, result pos, or initial bound key) plus one. With bounds now
         // living on `box._forwarded`, reserve_pos must skip past every
@@ -2100,7 +2099,7 @@ mod tests {
         }
 
         for op in ops.iter() {
-            let mut resolved_op = op.clone();
+            let resolved_op = op.clone();
             // Keep the op.pos as set by the test (not overriding with index)
             // optimizer.py:651-652 setarg loop parity. Mirror
             // `propagate_from_pass_range`'s dispatch-entry rebind: mint +
@@ -2190,7 +2189,7 @@ mod tests {
             .iter()
             .map(|a| crate::history::test_support::rooted_operand_from_opref(*a))
             .collect();
-        let mut op = Op::new(opcode, &op_args);
+        let op = Op::new(opcode, &op_args);
         op.pos().set(OpRef::op_typed(pos, op.result_type()));
         op
     }
@@ -2200,7 +2199,7 @@ mod tests {
     /// (optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`).
     /// Sharer guards (descrless) keep using `make_op`.
     fn make_guard_with_descr(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = make_op(opcode, args, pos);
+        let op = make_op(opcode, args, pos);
         assert!(
             opcode.is_guard(),
             "make_guard_with_descr requires a guard opcode"
@@ -2899,7 +2898,7 @@ mod tests {
 
     #[test]
     fn test_arraylen_nonneg() {
-        let mut op = make_op(OpCode::ArraylenGc, &[OpRef::int_op(0)], 1);
+        let op = make_op(OpCode::ArraylenGc, &[OpRef::int_op(0)], 1);
         op.setdescr(descr(1));
         let ops = vec![op];
 
@@ -3246,7 +3245,7 @@ mod tests {
         // OptIntBounds pass is stateless except for `last_emitted_*`
         // (everything else lives on `box._forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
-        let mut pass = OptIntBounds::new();
+        let pass = OptIntBounds::new();
         let i1_box = ctx.materialize_operand_at(OpRef::int_op(1));
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.state
@@ -3290,7 +3289,7 @@ mod tests {
         // RPython intbounds.py post_call_INT_PY_DIV:
         //   r.intersect(b1.py_div_bound(b2))
         // This must not use the modulo-style [0, divisor-1] bound.
-        let mut call = make_op(
+        let call = make_op(
             OpCode::CallPureI,
             &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
             2,
@@ -3314,7 +3313,7 @@ mod tests {
     fn test_call_int_py_mod_uses_mod_bound_for_negative_divisor() {
         // RPython intbounds.py post_call_INT_PY_MOD:
         //   r.intersect(b1.mod_bound(b2))
-        let mut call = make_op(
+        let call = make_op(
             OpCode::CallPureI,
             &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
             2,

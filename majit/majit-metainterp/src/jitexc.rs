@@ -3,7 +3,7 @@
 //! Mirrors RPython's `jitexc.py`: exceptions raised and caught within
 //! the JIT infrastructure, never exposed to user code.
 
-use majit_ir::{GcRef, GreenKey, GreenType, Value};
+use majit_ir::{GcRef, Value};
 
 /// jitexc.py JitException — base class for all JIT control flow.
 ///

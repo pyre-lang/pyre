@@ -248,17 +248,11 @@ fn with_shared_link_write<'a, R>(
 
 /// Parse `path` once per test binary and share the artefact.
 pub fn load_llbc(path: &'static str) -> &'static Llbc {
-    llbc_slot(path)
-        .get_or_init(|| Llbc::load(path).unwrap_or_else(|err| panic!("load {path}: {err}")))
-}
-
-/// `None` when the artefact has not been extracted, so the caller can skip.
-pub fn load_llbc_if_present(path: &'static str) -> Option<&'static Llbc> {
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
-        return None;
-    }
-    Some(load_llbc(path))
+    llbc_slot(path).get_or_init(|| {
+        Llbc::load(path).unwrap_or_else(|err| {
+            panic!("{path} is missing or unreadable; run `python3 scripts/extract-llbc.py`: {err}")
+        })
+    })
 }
 
 /// Lower one named declaration, reusing the artefact's shared context.
@@ -344,37 +338,26 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths<
     })
 }
 
-pub fn interpreter_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(INTERPRETER_LLBC)
+pub fn interpreter_llbc() -> &'static Llbc {
+    load_llbc(INTERPRETER_LLBC)
 }
 
-pub fn object_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(OBJECT_LLBC)
+pub fn object_llbc() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
-pub fn module_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(MODULE_LLBC)
+pub fn module_llbc() -> &'static Llbc {
+    load_llbc(MODULE_LLBC)
 }
 
-pub fn jit_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(JIT_LLBC)
+pub fn jit_llbc() -> &'static Llbc {
+    load_llbc(JIT_LLBC)
 }
 
 /// rbigint bodies live in `majit-rlib.ullbc`; their callers live in
 /// `pyre-object.ullbc`. Owner first, matching the front-end merge.
-pub fn rbigint_llbcs() -> Option<&'static [&'static Llbc]> {
-    static SLOT: OnceLock<Option<Vec<&'static Llbc>>> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        for path in [RLIB_LLBC, OBJECT_LLBC] {
-            if !std::path::Path::new(path).is_file() {
-                eprintln!(
-                    "skipping: {path} is missing; run \
-                     `python3 scripts/extract-llbc.py majit-rlib pyre-object`"
-                );
-                return None;
-            }
-        }
-        Some(vec![load_llbc(RLIB_LLBC), load_llbc(OBJECT_LLBC)])
-    })
-    .as_deref()
+pub fn rbigint_llbcs() -> &'static [&'static Llbc] {
+    static SLOT: OnceLock<Vec<&'static Llbc>> = OnceLock::new();
+    SLOT.get_or_init(|| vec![load_llbc(RLIB_LLBC), load_llbc(OBJECT_LLBC)])
+        .as_slice()
 }

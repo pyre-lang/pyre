@@ -23,16 +23,16 @@ mod common;
 use std::collections::HashSet;
 
 use common::{
-    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    load_llbc_if_present, lower_function, with_shared_lowering,
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    lower_function, with_shared_lowering,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_fun_decl;
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 use majit_translate::{HostStaticAddrs, SemanticProgram};
 
-fn object_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(OBJECT_LLBC)
+fn object_llbc() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
 fn dump_if_requested(name: &str, graph: &FunctionGraph) {
@@ -88,9 +88,7 @@ fn find_inst_leaf<'a>(leaves: &'a [(String, String)], needle: &str) -> Option<&'
 
 #[test]
 fn identity_and_module_lookup_residualize_distinct_instantiations() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
@@ -171,9 +169,7 @@ fn count_length_ops(graph: &FunctionGraph, live_reads: &mut usize, ll_vec_length
 
 #[test]
 fn identity_length_reads_num_live_items() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     with_shared_lowering(llbc, |context| {
         let graph = lower_function(llbc, "identitydict::<Impl>::length")
             .expect("lower identitydict::<Impl>::length");
@@ -216,9 +212,7 @@ fn identity_length_reads_num_live_items() {
 
 #[test]
 fn module_dict_len_reads_num_live_items() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     // Storage `len` used to live on `ModuleDictStorage` (`celldict::<Impl>::len`).
     // That type is now `type ModuleDictStorage = RDict<…>`, so the module-dict
     // length that remains in `celldict` is `ModuleDictStrategy::length`.

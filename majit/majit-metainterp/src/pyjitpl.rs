@@ -2,8 +2,6 @@ pub mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
-#[cfg(test)]
-pub use dispatch::call_float_function;
 pub use dispatch::implement_guard_value_on_frames;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
@@ -21,7 +19,6 @@ pub use dispatch::{
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
-use indexmap::IndexMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -155,23 +152,19 @@ use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::{
-    Const, FailDescr, GcRef, IndexMapExt, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type,
-    Value,
+    Const, FailDescr, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
 use crate::compile;
 use crate::compile::make_jitcell_token;
-pub use crate::compile::{CompileResult, ExitRawValues, ExitValues};
+pub use crate::compile::{CompileResult, ExitValues};
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 #[cfg(test)]
 use crate::optimizeopt::snapshot_get;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
-use crate::resume::{
-    MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
-    ResumeStorage, SnapshotBox,
-};
+use crate::resume::{ResumeStorage, SnapshotBox};
 use crate::trace_ctx::{ClearReplaceFrames, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
@@ -923,7 +916,6 @@ fn prepare_retrace_snapshot(
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    inputargs: &[majit_ir::InputArgRc],
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -1005,8 +997,7 @@ fn snapshot_maps_from_ctx(
     if ctx.recorder.has_byte_buffer() {
         return snapshot_map_from_byte_recorder(&ctx.recorder);
     }
-    let inputargs = ctx.recorder.inputargs().to_vec();
-    snapshot_map_from_trace_snapshots(ctx.snapshots(), &inputargs)
+    snapshot_map_from_trace_snapshots(ctx.snapshots())
 }
 
 /// `ResumeDataLoopMemo.number` source for an optimizer that walks the
@@ -1058,7 +1049,6 @@ fn snapshot_map_from_byte_recorder(
     let mut vref_map = Vec::with_capacity(n);
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
     frame_pcs_map.reserve_frames(recorder.captured_frame_count());
-    let inputargs = recorder.inputargs();
     let tagged_to_box =
         |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
     recorder.for_each_captured_snapshot_arrays(|offset, it| {
@@ -1151,7 +1141,7 @@ mod byte_snapshot_map_tests {
         }
         let decoded = rec.decode_captured_snapshots().unwrap();
         let actual = snapshot_map_from_byte_recorder(&rec);
-        let expected = snapshot_map_from_trace_snapshots(&decoded, rec.inputargs());
+        let expected = snapshot_map_from_trace_snapshots(&decoded);
         let values_at = |maps: &SnapshotBoxes, idx: usize| {
             maps.get(idx).and_then(|entry| {
                 entry
@@ -1292,7 +1282,7 @@ mod byte_snapshot_map_tests {
             &rec,
             cache.clone(),
         ));
-        let mut snapshot0 = (**guard).clone();
+        let snapshot0 = (**guard).clone();
         snapshot0.set_rd_resume_position(id0);
         other.store_final_boxes_in_guard(&snapshot0, None, Vec::new());
         assert_ne!(numbered, numb(&snapshot0));
@@ -1368,7 +1358,7 @@ mod byte_snapshot_map_tests {
         );
 
         let decoded = rec.decode_captured_snapshots().expect("byte snapshots");
-        let maps = snapshot_map_from_trace_snapshots(&decoded, rec.inputargs());
+        let maps = snapshot_map_from_trace_snapshots(&decoded);
         let ops = rec.materialize_ops();
         let guards: Vec<_> = ops.iter().filter(|op| op.opcode.is_guard()).collect();
         assert_eq!(guards.len(), 3);
@@ -1668,7 +1658,6 @@ fn prepare_bridge_trace_from_owned(
     }
     finish_prepared_bridge(
         bridge_ops,
-        bridge_inputargs,
         reminted_inputargs,
         cache,
         false,
@@ -1764,7 +1753,6 @@ fn prepare_bridge_from_byte_recorder(
         recorder.get_iter_for_optimizer(bridge_inputargs, bridge_inputarg_base)?;
     Some(finish_prepared_bridge(
         ops,
-        bridge_inputargs,
         reminted_inputargs,
         cache,
         true,
@@ -1780,7 +1768,6 @@ fn prepare_bridge_from_byte_recorder(
 
 fn finish_prepared_bridge(
     ops: Vec<majit_ir::OpRc>,
-    original_inputargs: &[InputArgRc],
     reminted_inputargs: Vec<majit_ir::InputArgRc>,
     cache: Vec<Option<majit_ir::operand::Operand>>,
     keep_unique_cache: bool,
@@ -7645,7 +7632,7 @@ impl<M: Clone> MetaInterp<M> {
             // one: `decide_recursive_inline` exists to keep this decision and
             // that resolver from drifting, which they would if one asked the
             // celltable about a cell the other never looked at.
-            let mut warm_state = Self::jd_warmstate(staticdata, jd_index);
+            let warm_state = Self::jd_warmstate(staticdata, jd_index);
             let green_key = warm_state
                 .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
                     majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
@@ -9382,7 +9369,7 @@ impl<M: Clone> MetaInterp<M> {
             .recorder
             .materialize_into_ops();
         self.capture_interpret_abort_values();
-        let mut ctx = self.compile_tracing.take().unwrap();
+        let ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
         // An uncut byte trace keeps its recorder until optimize has numbered
@@ -9611,7 +9598,7 @@ impl<M: Clone> MetaInterp<M> {
         ) = if let Some(ref rec) = snapshot_recorder {
             snapshot_map_from_byte_recorder(rec)
         } else {
-            snapshot_map_from_trace_snapshots(trace_snapshots, preamble_data.base.inputargs())
+            snapshot_map_from_trace_snapshots(trace_snapshots)
         };
         unroll_opt.snapshot_recorder = snapshot_recorder
             .as_ref()
@@ -9992,7 +9979,7 @@ impl<M: Clone> MetaInterp<M> {
             // (inputargs_cloned above); bind the label args to the
             // TreeLoop's canonical InputArgRc producers instead of
             // re-minting position-only boxes.
-            let mut label_op = majit_ir::Op::new(
+            let label_op = majit_ir::Op::new(
                 majit_ir::OpCode::Label,
                 &trace
                     .inputargs
@@ -10206,7 +10193,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         self.pending_green_key = None;
-        let mut token =
+        let token =
             make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -10232,7 +10219,7 @@ impl<M: Clone> MetaInterp<M> {
                 // Same canonical-producer bind as the Label synthesis
                 // above: the retry path's inputargs mirror
                 // `trace.inputargs` slot-for-slot.
-                let mut label_op = majit_ir::Op::new(
+                let label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
                     &trace
                         .inputargs
@@ -10886,7 +10873,7 @@ impl<M: Clone> MetaInterp<M> {
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to snapshot — this typed-constant map starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
         // Byte-mode bridges number each surviving guard from
         // `SnapshotIterator` inside `store_final_boxes_in_guard`. Building
@@ -11112,7 +11099,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py `compile_retrace` `greenkey = original_boxes[:num_green_args]`
         // is the MATCHED merge point's key, not the trace root.
         let (green_key, loop_jitcell_token) = {
-            let (mp_green_key, green_key_typed) = {
+            let (_, green_key_typed) = {
                 let Some(ctx) = self.tracing.as_ref() else {
                     return false;
                 };
@@ -11301,7 +11288,7 @@ impl<M: Clone> MetaInterp<M> {
             // Decode snapshots and copy `FrontendSlot.concrete` while
             // `walk_active_trace_refs` still forwards this recorder.
             let parked_trace = self.compile_tracing.as_mut().unwrap().snapshot_tree_loop();
-            let mut ctx = self.compile_tracing.take().unwrap();
+            let ctx = self.compile_tracing.take().unwrap();
             let mut trace = parked_trace;
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 let _cut_src = self.publish_tree_loop(&mut trace);
@@ -11469,7 +11456,7 @@ impl<M: Clone> MetaInterp<M> {
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &trace.inputargs);
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -12024,7 +12011,7 @@ impl<M: Clone> MetaInterp<M> {
                 // source JCT (compile.py:801), so every bridge-internal
                 // `ResumeDescr.rd_loop_token` inherits the source identity.
                 drop(_combined_live);
-                let mut combined_ops = combined_ops;
+                let combined_ops = combined_ops;
                 let _combined_live = self.publish_live_ops(&combined_ops);
                 self.record_loop_or_bridge(&source_jct, &combined_ops);
                 self.stats.retraces_compiled += 1;
@@ -12749,7 +12736,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         self.pending_green_key = None;
-        let mut token =
+        let token =
             make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -13214,7 +13201,7 @@ impl<M: Clone> MetaInterp<M> {
         // producers (the same slot-for-slot mirror used by the retry-path
         // Label synthesis above) instead of re-minting position-only boxes:
         // `inputargs` are value clones of `trace.inputargs`.
-        let mut label_op = majit_ir::Op::new(
+        let label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
             &trace
                 .inputargs
@@ -13800,7 +13787,6 @@ impl<M: Clone> MetaInterp<M> {
         // gated on the token holds it and calls the run directly.
         let token = self.get_procedure_token_on_driver(jd_no, green_key)?;
         Some(self.run_compiled_detailed_with_token_on_driver(
-            jd_no,
             green_key,
             &token,
             live_values,
@@ -13814,7 +13800,6 @@ impl<M: Clone> MetaInterp<M> {
     /// `execute_assembler` without consulting the cell again.
     pub fn run_compiled_detailed_with_token_on_driver(
         &mut self,
-        jd_no: usize,
         green_key: u64,
         token: &Arc<JitCellToken>,
         live_values: &[Value],
@@ -16255,7 +16240,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         drop(_live_pre_strip);
-        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let _live_ops = self.publish_live_ops(&optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
@@ -16808,21 +16793,20 @@ impl<M: Clone> MetaInterp<M> {
         };
         let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
         let all_liveness = all_liveness_bytes.as_ref();
-        let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
-            crate::resume::force_from_resumedata(
-                &self.staticdata.profiler,
-                rd_numb,
-                rd_consts,
-                all_liveness,
-                fail_values,
-                rd_virtuals.as_deref(),
-                storage.and_then(|s| s.rd_pendingfields()),
-                Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
-                vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
-                None, // ginfo — pyre has no greenfield mechanism
-                allocator,
-                numb_root,
-            );
+        let (all_virtuals_ptr, all_virtuals_int, _) = crate::resume::force_from_resumedata(
+            &self.staticdata.profiler,
+            rd_numb,
+            rd_consts,
+            all_liveness,
+            fail_values,
+            rd_virtuals.as_deref(),
+            storage.and_then(|s| s.rd_pendingfields()),
+            Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
+            vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
+            None, // ginfo — pyre has no greenfield mechanism
+            allocator,
+            numb_root,
+        );
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] forced {} ptr + {} int virtuals",
@@ -18016,7 +18000,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.capture_guard_resumedata_after_residual();
             }
             let last_exc_box = match guard_op {
-                Some(guard_op) if class_is_const => self
+                Some(_) if class_is_const => self
                     .tracing
                     .as_mut()
                     .expect("trace still active")
@@ -23175,7 +23159,7 @@ mod portal_resume_rebuild_tests {
     }
 
     fn rvmprof_jitcode() -> std::sync::Arc<crate::jitcode::JitCode> {
-        let bits = encode_liveness(&[0, 1]);
+        encode_liveness(&[0, 1]);
         let mut startpoints = indexmap::IndexSet::new();
         startpoints.insert(0);
         startpoints.insert(3);
@@ -23935,7 +23919,7 @@ mod metainterp_static_data_tests {
 
     #[test]
     fn bytecode_for_address_returns_none_when_empty() {
-        let mut sd = MetaInterpStaticData::new();
+        let sd = MetaInterpStaticData::new();
         assert!(sd.bytecode_for_address(0xdeadbeef).is_none());
     }
 
@@ -24859,7 +24843,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(0);
-        let action = meta.force_start_tracing(
+        meta.force_start_tracing(
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
@@ -24930,7 +24914,7 @@ mod metainterp_static_data_tests {
             meta.ensure_default_driver_sd();
             meta.finish_setup_descrs_for_jitdrivers();
             let key = gk(0);
-            let action = meta.force_start_tracing(
+            meta.force_start_tracing(
                 key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
@@ -25010,7 +24994,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(0);
-        let action = meta.force_start_tracing(
+        meta.force_start_tracing(
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
@@ -26145,7 +26129,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(0);
-        let action = meta.force_start_tracing(
+        meta.force_start_tracing(
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
@@ -28226,7 +28210,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(0);
-        let action = meta.force_start_tracing(
+        meta.force_start_tracing(
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
@@ -30172,9 +30156,8 @@ mod tests {
         );
     }
 
-    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use crate::test_greens::{gk, gk_with_uhash};
-    use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect, LoopTargetDescr};
+    use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -32436,7 +32419,7 @@ mod tests {
         let green_key = gk(30);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let descr = crate::compile::make_resume_guard_forced_descr_typed(vec![Type::Int], 0);
-        let mut guard = mk_op_with_descr(
+        let guard = mk_op_with_descr(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -32640,7 +32623,7 @@ mod tests {
         let green_key = gk(91);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let descr_arc = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
-        let mut guard = mk_op_with_descr(
+        let guard = mk_op_with_descr(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -35397,7 +35380,7 @@ mod tests {
         let green_key = gk(50);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let const_zero = OpRef::const_int(0);
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             bound_operand(OpRef::input_arg_int(0)),
             bound_operand(OpRef::input_arg_int(1)),
@@ -35415,7 +35398,7 @@ mod tests {
             ),
             mk_op(OpCode::IntGt, &[OpRef::int_op(2), const_zero], 3),
             {
-                let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
+                let g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
                 g.setfailargs(smallvec::smallvec![
                     bound_operand(OpRef::input_arg_int(0)),
                     bound_operand(OpRef::input_arg_int(1)),

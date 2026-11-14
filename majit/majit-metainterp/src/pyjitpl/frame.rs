@@ -1260,7 +1260,7 @@ impl MIFrame {
 
         if length_f > 0 {
             // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
-            let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
+            let it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
             for index in it {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_float_idx {
@@ -1662,12 +1662,12 @@ mod tests {
     /// LIVE op sits exactly at `self.pc` (pyjitpl.py).
     #[test]
     fn get_list_of_active_boxes_populates_trace_snapshot_array() {
-        use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
+        use crate::opencoder::TraceRecordBuffer;
         use majit_ir::OpRef;
         use std::sync::Arc;
 
         // 1 int reg + 1 ref reg + 0 float regs live at pc=0.
-        let mut builder = JitCodeBuilder::new();
+        let builder = JitCodeBuilder::new();
         let mut jitcode = builder.finish();
         jitcode.body_mut().c_num_regs_i = 1;
         jitcode.body_mut().c_num_regs_r = 1;
@@ -1736,7 +1736,7 @@ mod tests {
         use std::sync::Arc;
 
         const LIVE_OP: u8 = 0x42;
-        let mut builder = JitCodeBuilder::new();
+        let builder = JitCodeBuilder::new();
         let mut jitcode = builder.finish();
         jitcode.body_mut().c_num_regs_i = 0;
         jitcode.body_mut().c_num_regs_r = 2;

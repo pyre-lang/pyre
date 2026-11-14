@@ -120,7 +120,7 @@ fn assert_bracket_closes(llbc: &'static Llbc, leaf: &str) {
 
 #[test]
 fn bracket_closes_for_each_caller_shape() {
-    let cases: &[(&str, fn() -> Option<&'static Llbc>, &str)] = &[
+    let cases: &[(&str, fn() -> &'static Llbc, &str)] = &[
         ("owns_guard", object_llbc, "w_tuple_items_copy_as_vec"),
         (
             "imports_guard",
@@ -130,9 +130,7 @@ fn bracket_closes_for_each_caller_shape() {
         ("cffi", module_llbc, "do_call"),
     ];
     for (name, load, leaf) in cases {
-        let Some(llbc) = load() else {
-            continue;
-        };
+        let llbc = load();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_bracket_closes(llbc, leaf);
         }));
@@ -158,7 +156,7 @@ fn bracket_closes_for_each_caller_shape() {
 /// and a fixture list that goes empty asserts nothing while still passing.
 #[test]
 fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     with_shared_lowering(llbc, |context| {
         let mut bodies = 0usize;
         let root_stack_state = RootStackState::new(llbc);
@@ -231,7 +229,7 @@ fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<
 /// guards against, whatever it is called.
 #[test]
 fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     with_shared_lowering(llbc, |context| {
         let mut dropping = 0usize;
         let root_stack_state = RootStackState::new(llbc);
@@ -331,10 +329,7 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
 /// for this to prove anything.
 #[test]
 fn nearly_every_dropped_bracket_closes() {
-    let llbcs: Vec<&'static Llbc> = [object_llbc(), interpreter_llbc()]
-        .into_iter()
-        .flatten()
-        .collect();
+    let llbcs: Vec<&'static Llbc> = vec![object_llbc(), interpreter_llbc()];
     with_shared_lowering_many(&llbcs, |ctxs| {
         // Derive metadata once per program and share each context across workers.
         let mut work: Vec<(
@@ -620,7 +615,7 @@ fn reachable_closes(graph: &FunctionGraph) -> usize {
 /// `w_range_iter_one_arg_new` opens a scope around its allocation.
 #[test]
 fn a_constant_offset_bracket_is_scalar_replaced() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "w_range_iter_one_arg_new");
     for leaf in [
         "push_roots",
@@ -642,9 +637,7 @@ fn a_constant_offset_bracket_is_scalar_replaced() {
 /// BINARY_SLICE caller can erase its own bracket and walk this body.
 #[test]
 fn ll_listslice_inner_is_depth_neutral() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
@@ -659,9 +652,7 @@ fn ll_listslice_inner_is_depth_neutral() {
 /// strategy copy, not residual `push_roots`.
 #[test]
 fn ll_listslice_inner_bracket_is_scalar_replaced() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let graph = lower_named(llbc, "ll_listslice_inner");
@@ -687,9 +678,7 @@ fn ll_listslice_inner_bracket_is_scalar_replaced() {
 /// path-sensitive walk classifies that body as depth-neutral.
 #[test]
 fn eval_slice_index_is_depth_neutral() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
@@ -717,9 +706,7 @@ fn eval_slice_index_is_depth_neutral() {
 /// inside its Open is erasable, so the helper jitcode has no root bracket.
 #[test]
 fn zip_two_tuple_next_bracket_is_scalar_replaced() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let graph = lower_named(llbc, "zip_two_tuple_next");
@@ -746,9 +733,7 @@ fn zip_two_tuple_next_bracket_is_scalar_replaced() {
 /// to refuse the whole rewrite; the walker then aborted on `push_roots`.
 #[test]
 fn binary_slice_values_inner_bracket_is_scalar_replaced() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     let graph = lower_named(llbc, "binary_slice_values_inner");
     for leaf in [
         "push_roots",
@@ -773,11 +758,6 @@ fn binary_slice_values_inner_bracket_is_scalar_replaced() {
 /// Harvested strings are `scope_owner_identity`.
 #[test]
 fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(object, || {
@@ -838,9 +818,7 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
 #[test]
 fn stack_effect_identity_splits_impl_homonyms() {
     use majit_translate::front::mir::scope_owner_identity;
-    let Some(object) = object_llbc() else {
-        return;
-    };
+    let object = object_llbc();
     assert_scope_owner_identity_injective(object, "pyre-object");
     let get_ids: Vec<String> = object
         .iter_local_fns()
@@ -894,13 +872,9 @@ fn stack_effect_identity_splits_impl_homonyms() {
     assert_ne!(root_scope, rooted_items);
     assert_ne!(root_scope, rooted_once);
     assert_ne!(rooted_items, rooted_once);
-    let Some(interpreter) = interpreter_llbc() else {
-        return;
-    };
+    let interpreter = interpreter_llbc();
     assert_scope_owner_identity_injective(interpreter, "pyre-interpreter");
-    if let Some(module) = module_llbc() {
-        assert_scope_owner_identity_injective(module, "pyre-module");
-    }
+    assert_scope_owner_identity_injective(module_llbc(), "pyre-module");
     let release_ids: Vec<String> = interpreter
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
@@ -1117,11 +1091,6 @@ fn assert_scope_owner_identity_injective(llbc: &Llbc, crate_label: &str) {
 /// `call`, not a `gc_roots` leaf, so lowering answers it from `get_sites`.
 #[test]
 fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {
@@ -1145,7 +1114,7 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
 /// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.
 #[test]
 fn ll_listslice_new_int_list_bracket_is_scalar_replaced() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "ll_listslice_new_int_list");
     for leaf in [
         "push_roots",
@@ -1170,7 +1139,7 @@ fn ll_listslice_new_int_list_bracket_is_scalar_replaced() {
 /// shadow-stack calls the sub-walk cannot trace.
 #[test]
 fn format_int_decimal_bracket_is_scalar_replaced() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "format_int_decimal");
     for leaf in [
         "push_roots",
@@ -1197,9 +1166,7 @@ fn format_int_decimal_bracket_is_scalar_replaced() {
 /// calls makes the walker residualize the whole body through its fnaddr.
 #[test]
 fn set_add_value_bracket_is_scalar_replaced() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     let graph = lower_named(llbc, "set_add_value");
     for leaf in [
         "push_roots",
@@ -1224,7 +1191,7 @@ fn set_add_value_bracket_is_scalar_replaced() {
 /// `LIST_INT_ITEMS_ARRAY`, not a residual Call.
 #[test]
 fn ll_listslice_new_int_list_newlist_becomes_new_array() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "ll_listslice_new_int_list");
     let mut cc = CallControl::new();
     for op in graph.blocks.iter().flat_map(|b| &b.operations) {
@@ -1286,7 +1253,7 @@ fn ll_listslice_new_int_list_newlist_becomes_new_array() {
 /// `list_append_subscr_fresh`).
 #[test]
 fn ll_list_int_resize_hint_really_newlist_becomes_new_array() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
     let mut pre_calls: Vec<String> = Vec::new();
     let mut newlist_result_tys: Vec<String> = Vec::new();
@@ -1401,7 +1368,7 @@ fn ll_list_int_resize_hint_really_newlist_becomes_new_array() {
 /// `oopspec:` tokens, which is the path `list_append_subscr_fresh` takes.
 #[test]
 fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let harvested =
         majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
     let newlist_keys: Vec<(String, Vec<String>)> = harvested
@@ -1488,7 +1455,7 @@ fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
 /// the production `pyobject::LIST_TYPE` row (`jit_static_pytype_addrs`).
 #[test]
 fn w_list_adopt_int_items_fuses_to_new_with_vtable() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     const LIST_TYPE_ADDR: i64 = 0x00C0_FFEE;
     let graph = lower_named_with_pytypes(
         llbc,
@@ -1540,14 +1507,14 @@ fn w_list_adopt_int_items_fuses_to_new_with_vtable() {
 #[ignore]
 fn shadow_stack_erase_census() {
     for (name, load) in [
-        ("pyre-object", object_llbc as fn() -> Option<&'static Llbc>),
+        ("pyre-object", object_llbc as fn() -> &'static Llbc),
         ("pyre-interpreter", interpreter_llbc),
         ("pyre-module", module_llbc),
     ] {
         if std::env::var("CENSUS_ONLY").is_ok_and(|only| only != name) {
             continue;
         }
-        let Some(llbc) = load() else { continue };
+        let llbc = load();
         let census = majit_translate::front::mir::shadow_stack_erase_census(llbc);
         for (bucket, bodies) in &census {
             eprintln!("[census {name}] {bucket} {}", bodies.len());
@@ -1573,12 +1540,6 @@ fn shadow_stack_erase_census() {
 /// and [`RootBracketPlan`] erases the bracket, including the len call.
 #[test]
 fn slice_unpack_erases_the_len_named_free_pin_bracket() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {
@@ -1610,12 +1571,6 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
 /// after `make_jitcodes`).
 #[test]
 fn long_rshift_erases_the_closure_capture_bracket() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {
@@ -1644,12 +1599,6 @@ fn long_rshift_erases_the_closure_capture_bracket() {
 /// the bracket (`gctransform` `push_roots` runs after `make_jitcodes`).
 #[test]
 fn dict_descr_keys_erases_the_incoming_slice_bracket() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {
@@ -1682,13 +1631,6 @@ fn dict_descr_keys_erases_the_incoming_slice_bracket() {
 /// wrap's pins in the jitcode.
 #[test]
 fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-        || !std::path::Path::new(MODULE_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     let module = load_llbc(MODULE_LLBC);
@@ -1748,13 +1690,6 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
 /// loops `get(args_slot + i)` with a non-const index, so that bracket stays.
 #[test]
 fn do_call_erases_the_n1_incoming_elem_bracket() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-        || !std::path::Path::new(MODULE_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     let module = load_llbc(MODULE_LLBC);
@@ -1807,12 +1742,6 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
 /// `isinstance` gateway descent stops at a residual `push_roots`.
 #[test]
 fn isinstance_bracket_is_scalar_replaced() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file()
-        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
-    {
-        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let object = load_llbc(OBJECT_LLBC);
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {

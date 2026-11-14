@@ -53,10 +53,6 @@ impl OptEarlyForce {
         if Self::should_force_args(op) {
             for i in 0..op.num_args() {
                 let arg_opnd = ctx.resolve_operand_operand_opt(&op.arg(i));
-                let arg = arg_opnd
-                    .as_ref()
-                    .map(|o| o.to_opref())
-                    .unwrap_or_else(|| op.arg(i).to_opref());
                 // optimizer.py: force_box pops the arg's
                 // potential_extra_op and hands it to the short-preamble
                 // producer BEFORE (and independent of) the virtual check, so a
@@ -236,7 +232,7 @@ mod tests {
     #[test]
     fn test_earlyforce_guard_not_forced() {
         // GUARD_NOT_FORCED should have its fail_args resolved.
-        let mut guard = Op::new(OpCode::GuardNotForced, &[]);
+        let guard = Op::new(OpCode::GuardNotForced, &[]);
         guard.setfailargs(Default::default());
         let mut ops = vec![guard];
         assign_positions(&mut ops);

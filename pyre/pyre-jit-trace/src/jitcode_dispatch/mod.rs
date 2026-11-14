@@ -194,8 +194,7 @@
 //!    snapshot, the same source used for items 2 and 5.
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
-use crate::state::{ConcreteValue, MIFrame, WalkSym};
-use majit_ir::descr::FieldDescr;
+use crate::state::{ConcreteValue, WalkSym};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 
@@ -227,7 +226,7 @@ use majit_metainterp::{TraceCtx, VableArrayStore, default_effect_info};
 // items are re-exported so `crate::jitcode_dispatch::` paths stay stable.
 // __SUBMODULES__
 mod specialize;
-pub use specialize::*;
+pub(crate) use specialize::*;
 mod inline_call;
 pub use inline_call::*;
 mod residual_call;
@@ -241,11 +240,11 @@ mod symbolic_fold;
 pub use fbw_state::*;
 mod resume_snapshot;
 pub(crate) use resume_snapshot::jit_merge_point_pc_in_containing_floor;
-pub use resume_snapshot::*;
+pub(crate) use resume_snapshot::*;
 mod branch;
-pub use branch::*;
+pub(crate) use branch::*;
 mod vstack_mirror;
-pub use vstack_mirror::*;
+pub(crate) use vstack_mirror::*;
 mod vable_ops;
 
 mod frame_state;
@@ -258,13 +257,13 @@ use register_bank::RegisterValues;
 pub(crate) use register_bank::{FrontendBoxArea, RegisterBankRoot, walk_frontend_box};
 pub use register_list::RegisterList;
 pub(crate) use register_list::RegisterListRoot;
-pub use vable_ops::*;
+pub(crate) use vable_ops::*;
 mod heapcache_ops;
-pub use heapcache_ops::*;
+pub(crate) use heapcache_ops::*;
 mod bridge_subwalk;
 pub use bridge_subwalk::*;
 mod arith;
-pub use arith::*;
+pub(crate) use arith::*;
 mod diag;
 pub use diag::*;
 
@@ -8320,7 +8319,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
-    entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
 ) -> Vec<OpRef> {
     let mut active = Vec::new();
@@ -8334,7 +8332,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         carried_jitcode_pc,
         entry_jitcode_pc,
         entry_twin,
-        entry_caller,
         vstack,
         &mut active,
     );
@@ -8355,7 +8352,6 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
-    entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
     active: &mut Vec<OpRef>,
 ) {
@@ -10671,7 +10667,20 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // Same field list as `walk_parked_walk_tls_stack`: frame-address words
     // plus the slots those journals already forwarded
     // (`fbw_state::visit_journalled_frame_roots`).
+    // The escape-flush undo stays armed from force time until the abort
+    // epilogue consumes it. Its slots can be the only reference to the
+    // pre-walk locals the flush displaced, and the restore compares the live
+    // slots against `flush_image`, so both are forwarded on that window, as
+    // `walk_parked_walk_tls_stack` does for a parked undo.
     let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
+    if let Some(undo) = escape_undo.as_mut() {
+        for slot in undo.slots.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+        for slot in undo.flush_image.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+    }
     let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
     for entry in locals_mirror.iter_mut() {
         // The frame identity is a GC edge (`executioncontext.py topframeref`).
@@ -12729,7 +12738,7 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
     ctx.trace_ctx
         .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args);
-    if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
+    if let (Some(subject), Some(_)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
     // `_establish_nullity` (`pyjitpl.py`) calls
@@ -12860,7 +12869,7 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     ctx.trace_ctx
         .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args);
-    if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
+    if let (Some(subject), Some(_)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
     walker_capture_snapshot_for_last_guard_scoped(
@@ -13048,7 +13057,6 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
-    version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
 ) -> Result<(), DispatchError> {
     // `load/store_attr_*_fast_path` accepted this receiver only after
@@ -13072,8 +13080,6 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
-    let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
-
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
     // containing MapdictStorageMixin, and the GuardClass above already
     // separates it from the shorter builtin payload. Python subclasses of one
@@ -13176,7 +13182,6 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
-    version_tag: u64,
 ) -> Result<(), DispatchError> {
     let ob_type = unsafe { (*concrete_obj).ob_type };
     let physical_type = ob_type as i64;
@@ -15347,7 +15352,6 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "call_trace_commit",
-        "call_trace_call_site",
         &[],
         &[],
         &ref_args,
@@ -18106,8 +18110,7 @@ fn handle<Sym: WalkSym>(
             //
             // Operand layout `>i`: 1B dst register only; the dst byte sits
             // at `op.pc + 1`.
-            let exc = ctx
-                .last_exc_value()
+            ctx.last_exc_value()
                 .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
             let exc_ptr = match ctx.last_exc_value_concrete() {
                 ConcreteValue::Ref(p) if !p.is_null() => p,
@@ -18189,7 +18192,6 @@ fn handle<Sym: WalkSym>(
             // `pyjitpl.py MIFrame.opimpl_jit_merge_point` /
             // `History.any_operation`: snapshot before `debug_merge_point`
             // records `DEBUG_MERGE_POINT`.
-            let any_operation = ctx.trace_ctx.num_ops() > 0;
             let jdindex = if op.key == "jit_merge_point/iIRFIRF" {
                 let jd_opref = read_int_reg(code, op, 0, ctx)?;
                 match ctx.trace_ctx.concrete_of_opref(jd_opref) {
@@ -18248,8 +18250,6 @@ fn handle<Sym: WalkSym>(
             // empty history stays inert. Checking `num_ops()` after the
             // record (or after the portal debugdata/tracefunc/profilefunc
             // guards) would close a degenerate retrace at that merge.
-            let any_operation = ctx.trace_ctx.num_ops() != 0;
-
             // `MIFrame.debug_merge_point` records a real
             // `DEBUG_MERGE_POINT` operation before any loop-header decision.
             // It is debugging-only after optimization, but it remains part of

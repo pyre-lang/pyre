@@ -1243,9 +1243,7 @@ fn str_family_dict_key_newtype_constructs_as_str() {
 #[test]
 fn function_new_impl_reload_emits_cast_instance_str() {
     let interp = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(interp) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(interp);
     let graph =
         crate::test_support::lower_function(llbc, "pyre_interpreter::function::function_new_impl")
             .expect("lower function_new_impl");
@@ -11390,9 +11388,7 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
 fn option_map_or_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "get_or_create_extra_locals")
         .expect("lower get_or_create_extra_locals");
     let map_or_calls = caller
@@ -11485,9 +11481,7 @@ fn option_map_or_keeps_regular_call_to_core_body() {
 fn option_map_family_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     crate::test_support::with_lowering(llbc, |ctx| {
         let leaves = [
             "map",
@@ -11651,9 +11645,7 @@ fn option_core_body_calls_fnonce(graph: &crate::model::FunctionGraph) -> bool {
 #[test]
 fn option_map_or_else_and_flatten_keep_regular_call_to_core_body() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
 
     let map_or_else_caller = crate::test_support::lower_function(llbc, "concat_operand_name")
         .expect("lower concat_operand_name");

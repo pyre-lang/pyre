@@ -9,16 +9,8 @@
 use crate::state::*;
 use pyre_interpreter::locals_w;
 
-use std::borrow::Cow;
-
 use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
-use majit_metainterp::{
-    CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
-};
-
-use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
-
-use pyre_interpreter::eval::{get_current_exception, set_current_exception};
+use majit_metainterp::TraceCtx;
 
 /// Runtime helper for traced `RAISE_VARARGS`.
 ///
@@ -121,29 +113,13 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     final_exc
 }
 
+use pyre_interpreter::PyError;
+#[cfg(test)]
 use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
-use pyre_interpreter::truth_value as objspace_truth_value;
-use pyre_interpreter::{
-    PyError, call_function, decode_instruction_at, function_get_defaults, function_get_globals_obj,
-    is_builtin_code, is_function, range_iter_continues,
-};
 
+use pyre_object::PY_NULL;
 use pyre_object::PyObjectRef;
-use pyre_object::function::{is_method, w_method_get_func, w_method_get_self};
-use pyre_object::functional::RANGE_ITER_TYPE;
-use pyre_object::listobject::w_list_getitem;
-use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
-    is_int, is_list, is_long, is_tuple,
-};
-use pyre_object::specialisedtupleobject::{
-    SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
-};
-use pyre_object::tupleobject::w_tuple_getitem;
-use pyre_object::{
-    PY_NULL, w_list_len, w_list_uses_float_storage, w_list_uses_int_storage,
-    w_list_uses_object_storage, w_tuple_len,
-};
+use pyre_object::pyobject::{INT_TYPE, PyType};
 
 /// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
 /// only stays specialised for instances whose Python-level `w_class`
@@ -182,10 +158,7 @@ fn trace_guard_exact_w_class(
     ctx.heap_cache_mut().replace_box(actual, expected);
 }
 
-use crate::descr::{
-    float_floatval_descr, int_intval_descr, list_strategy_descr, slice_w_start_descr,
-    slice_w_step_descr, slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
-};
+use crate::descr::{float_floatval_descr, int_intval_descr, w_float_size_descr, w_int_size_descr};
 use crate::frame_layout::PYFRAME_PYCODE_OFFSET;
 
 /// pyjitpl.py `_opimpl_setfield_vable` parity helper.
@@ -928,28 +901,21 @@ impl MIFrame {
                         Vec::with_capacity((length_i + length_r + length_f) as usize);
                     use majit_jitcode::liveness::LivenessIterator;
                     if length_i != 0 {
-                        // SAFETY: `all_liveness` bank at `cursor` is a complete
-                        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
-                        let mut it =
-                            unsafe { LivenessIterator::new(cursor, length_i, &all_liveness) };
+                        let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Int, reg_idx as usize));
                         }
                         cursor = it.offset();
                     }
                     if length_r != 0 {
-                        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
-                        let mut it =
-                            unsafe { LivenessIterator::new(cursor, length_r, &all_liveness) };
+                        let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Ref, reg_idx as usize));
                         }
                         cursor = it.offset();
                     }
                     if length_f != 0 {
-                        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
-                        let mut it =
-                            unsafe { LivenessIterator::new(cursor, length_f, &all_liveness) };
+                        let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Float, reg_idx as usize));
                         }
@@ -1706,24 +1672,10 @@ impl MIFrame {
                 Type::Int => {
                     // Virtualizable slots are Ref — re-box raw Int for the
                     // loop header which expects boxed W_IntObject.
-                    let int_type_addr = &INT_TYPE as *const _ as i64;
-                    crate::trace_box_int(
-                        ctx,
-                        value,
-                        w_int_size_descr(),
-                        int_intval_descr(),
-                        int_type_addr,
-                    )
+                    crate::trace_box_int(ctx, value, w_int_size_descr(), int_intval_descr())
                 }
                 Type::Float => {
-                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    crate::trace_box_float(
-                        ctx,
-                        value,
-                        w_float_size_descr(),
-                        float_floatval_descr(),
-                        float_type_addr,
-                    )
+                    crate::trace_box_float(ctx, value, w_float_size_descr(), float_floatval_descr())
                 }
                 _ => value,
             },
@@ -2886,7 +2838,6 @@ impl MIFrame {
             None => (Vec::new(), None, None, 0),
         };
         let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
-            let resume_pc = self.orgpc;
             Some(self.pre_opcode_concrete_depth() as i64)
         } else {
             None

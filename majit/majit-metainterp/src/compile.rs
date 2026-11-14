@@ -13,7 +13,7 @@
 
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
@@ -285,7 +285,7 @@ impl<'a> PreambleCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [Operand],
         call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-        enable_opts: &'a [String],
+        _enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace),
@@ -304,9 +304,9 @@ pub struct SimpleCompileData<'a> {
 impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
-        resumestorage: Option<&'a ResumeStorage>,
+        _resumestorage: Option<&'a ResumeStorage>,
         call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-        enable_opts: &'a [String],
+        _enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace),
@@ -336,10 +336,10 @@ impl<'a> BridgeCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [Operand],
-        resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-        inline_short_preamble: bool,
-        enable_opts: &'a [String],
+        _resumestorage: Option<&'a ResumeStorage>,
+        _call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
+        _inline_short_preamble: bool,
+        _enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace),
@@ -739,7 +739,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             Type::Float => OpCode::GetfieldGcF,
             Type::Void => panic!("virtualizable static field {fi} has Void type"),
         };
-        let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
+        let op = Op::new(opcode, std::slice::from_ref(&vable_box));
         op.pos().set(fresh_pos(&mut next_opref, field.field_type));
         op.setdescr(descr);
         emit_op(&mut extra_ops, &OpRc::new(op));
@@ -762,7 +762,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // INVARIANT on this function.
         let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
-        let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
+        let arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
         arr_load.pos().set(fresh_pos(&mut next_opref, Type::Ref));
         arr_load.setdescr(array_field_descr.clone());
         emit_op(&mut extra_ops, &OpRc::new(arr_load));
@@ -804,7 +804,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // base-pointer indirection step is added. Convergence
                 // would require switching pyre's `FixedObjectArray` to
                 // RPython's flat GC-array layout — out of scope.
-                let mut ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
+                let ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
                 ptr_load.pos().set(fresh_pos(&mut next_opref, Type::Int));
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -832,7 +832,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         };
         for index in 0..array_len {
             // compile.py — ConstInt(index) for the array subscript.
-            let mut elem_op = Op::new(
+            let elem_op = Op::new(
                 item_opcode,
                 &[
                     item_base.clone(),
@@ -931,7 +931,7 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 // reaching them through `compile::DoneWithThisFrameDescr*` etc.
 pub use majit_backend::{
     DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
-    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+    DoneWithThisFrameDescrVoid, PropagateExceptionDescr,
 };
 
 pub use majit_backend::DescrContainer;
@@ -1166,7 +1166,7 @@ pub fn compile_tmp_callback(
     // `compile.py:1138-1144` operations = [call_op,
     //   GUARD_NO_EXCEPTION(descr=faildescr),
     //   FINISH(finishargs, descr=jd.portal_finishtoken)].
-    let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
+    let guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
@@ -1228,7 +1228,7 @@ mod tests {
 
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let build = |label_descr: majit_ir::DescrRef, jump_descr: majit_ir::DescrRef| {
-            let mut label = Op::new(
+            let label = Op::new(
                 OpCode::Label,
                 &[
                     rooted_resop_operand(Type::Ref, 20),
@@ -1237,7 +1237,7 @@ mod tests {
                 ],
             );
             label.setdescr(label_descr);
-            let mut jump = Op::new(
+            let jump = Op::new(
                 OpCode::Jump,
                 &[
                     rooted_resop_operand(Type::Ref, 50),
@@ -1336,7 +1336,7 @@ mod tests {
         rd_consts.push(majit_ir::Const::Int(123_456_789));
         let rd_consts_len = rd_consts.len();
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
+        let guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb_arc(Some(rd_numb));
@@ -1384,7 +1384,7 @@ mod tests {
         // per guard was an 8 B / 16 B class on the regex and/or row.
         let value = rooted_inputarg_operand(Type::Int, 0);
         let descr = make_fail_descr_typed(vec![Type::Int, Type::Ref]);
-        let mut guard = Op::with_descr(OpCode::GuardTrue, std::slice::from_ref(&value), descr);
+        let guard = Op::with_descr(OpCode::GuardTrue, std::slice::from_ref(&value), descr);
         guard.setfailargs(smallvec::smallvec![
             rooted_inputarg_operand(Type::Int, 0),
             rooted_inputarg_operand(Type::Ref, 1),
@@ -1405,7 +1405,7 @@ mod tests {
         let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let ia = |k: usize| majit_ir::operand::Operand::from_bound_inputarg(&inputargs[k]);
         let op0: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::SameAsR, &[ia(1)]);
+            let op = Op::new(OpCode::SameAsR, &[ia(1)]);
             op.pos().set(OpRef::ref_op(10));
             OpRc::new(op)
         };
@@ -1413,7 +1413,7 @@ mod tests {
         let op0_copy_source = op0.clone();
         let op1: majit_ir::OpRc = OpRc::new(Op::new(OpCode::Label, &[ia(0), op0_result.clone()]));
         let op2: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
+            let op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
             op.pos().set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,

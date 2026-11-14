@@ -158,7 +158,6 @@ pub fn trace_box_int(
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    int_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
@@ -213,7 +212,7 @@ pub fn trace_int_binop_ovf(
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
     // path is convergence to register-machine jitcode.
     ctx.record_guard(OpCode::GuardNoOverflow, &[]);
-    trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
+    trace_box_int(ctx, result, size_descr, intval_descr)
 }
 
 /// Emit a non-overflow binary int operation (bitwise ops, shifts).
@@ -235,7 +234,7 @@ pub fn trace_int_binop(
         _ => None,
     };
     let result = ctx.record_op_with_value(opcode, &[a_val, b_val], folded);
-    trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
+    trace_box_int(ctx, result, size_descr, intval_descr)
 }
 
 /// Emit a comparison between two Python ints.
@@ -393,7 +392,6 @@ pub fn trace_box_float(
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    float_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     // RPython parity: NEW_WITH_VTABLE + jtransform.py typeptr filter +
@@ -432,7 +430,7 @@ pub fn trace_float_binop(
         _ => None,
     };
     let result = ctx.record_op_with_value(opcode, &[a_val, b_val], folded);
-    trace_box_float(ctx, result, size_descr, floatval_descr, float_type_addr)
+    trace_box_float(ctx, result, size_descr, floatval_descr)
 }
 
 /// Emit a comparison between two Python floats.

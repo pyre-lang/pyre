@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use majit_ir::operand::Operand;
-use majit_ir::{Const, EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
+use majit_ir::{Const, EffectInfo, OopSpecIndex, Op, OpCode, OpRc, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::optimizer::{Optimizer, send_extra_operation_from};
@@ -851,7 +851,7 @@ impl OptString {
             } else {
                 OpCode::Strgetitem
             };
-            let mut getitem = Op::new(get_opcode, &[arg_s.clone(), arg_i.clone()]);
+            let getitem = Op::new(get_opcode, &[arg_s.clone(), arg_i.clone()]);
             getitem.pos().set(op.pos().get());
             // vstring.py `_strgetitem`: resbox = replace_op_with(resbox,
             // STRGETITEM, ...); emit_extra(resbox). emit_extra =
@@ -1416,7 +1416,7 @@ impl OptString {
                     // vstring.py: lengthbox = i1.getstrlen(arg1, self, mode)
                     let arg_len = ctx.getstrlen_with(opt, arg1, mode);
                     let arg_zero = Operand::const_(Const::Int(0));
-                    let mut eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
+                    let eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
                     eq_op.pos().set(op.pos().get());
                     // vstring.py OptString.handle_str_equal_level1: replace_op_with(INT_EQ, [len, 0]) then
                     // seo(op) = send_extra_operation(op, opt=None) restarts from
@@ -1439,7 +1439,7 @@ impl OptString {
                     // STRGETITEM, so both operands are always available.
                     let arg_ch1 = self.strgetitem_emit(opt, arg1, 0, mode, ctx);
                     let arg_ch2 = self.strgetitem_emit(opt, arg2, 0, mode, ctx);
-                    let mut eq_op = Op::new(OpCode::IntEq, &[arg_ch1.clone(), arg_ch2.clone()]);
+                    let eq_op = Op::new(OpCode::IntEq, &[arg_ch1.clone(), arg_ch2.clone()]);
                     eq_op.pos().set(op.pos().get());
                     // vstring.py OptString.handle_str_equal_level1: replace_op_with(INT_EQ, [c1, c2]) then
                     // seo(op) = send_extra_operation(op, opt=None) restarts from
@@ -1477,7 +1477,7 @@ impl OptString {
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let arg_null = Operand::const_(Const::from_gcref(majit_ir::GcRef::NULL));
-            let mut eq_op = Op::new(OpCode::PtrEq, &[arg1.clone(), arg_null]);
+            let eq_op = Op::new(OpCode::PtrEq, &[arg1.clone(), arg_null]);
             eq_op.pos().set(op.pos().get());
             // vstring.py:785-786: replace_op_with(PTR_EQ, ...) then self.emit(op)
             // (Optimization.emit) — the op flows on to the passes after OptString.
@@ -1605,7 +1605,7 @@ impl OptString {
         call_args_operand.push(Operand::const_(Const::Int(func_addr as i64)));
         call_args_operand.extend(args.iter().cloned());
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
-        let mut call_op = match calldescr {
+        let call_op = match calldescr {
             Some(d) => Op::with_descr(OpCode::CallI, &call_args_operand, d.clone()),
             None => Op::new(OpCode::CallI, &call_args_operand),
         };
@@ -1657,7 +1657,7 @@ impl OptString {
             // (replace_op_with) and a Restart result (send_extra_operation).
             let arg_char1 = self.strgetitem_emit(opt, &op.arg(1), 0, mode, ctx);
             let arg_char2 = self.strgetitem_emit(opt, &op.arg(2), 0, mode, ctx);
-            let mut sub_op = Op::new(OpCode::IntSub, &[arg_char1.clone(), arg_char2.clone()]);
+            let sub_op = Op::new(OpCode::IntSub, &[arg_char1.clone(), arg_char2.clone()]);
             sub_op.pos().set(op.pos().get());
             return OptimizationResult::Restart(sub_op);
         }
@@ -1858,7 +1858,7 @@ mod tests {
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };
     use crate::optimizeopt::optimizer::Optimizer;
-    use majit_ir::Type;
+    use majit_ir::{OpRef, Type};
 
     /// Bound drop-in for `from_opref(OpRef::int_op(n))` at an op-argument site:
     /// a rooted synthetic Int ResOp producer (sheds to `Operand::Op`, not the
@@ -1955,7 +1955,7 @@ mod tests {
             .collect();
         ctx.seed_boxes_canonical(&leaf_args);
 
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         pass.setup();
 
         for rc in &wrapped {
@@ -2196,7 +2196,7 @@ mod tests {
         // Build two virtual strings, create a concat in PtrInfo::Str, then
         // query length.
 
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         // Constant length refs
@@ -2269,7 +2269,7 @@ mod tests {
     fn test_slice_get_char_with_intbound_constant_start() {
         use crate::optimizeopt::intutils::IntBound;
 
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         let src_ref = OpRef::ref_op(10);
@@ -2422,7 +2422,7 @@ mod tests {
         let index_box = ctx.materialize_operand_at(index_ref);
         let slice_box = ctx.materialize_operand_at(slice_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
+        let getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2482,7 +2482,7 @@ mod tests {
         ctx.make_constant_box(&index_box, Value::Int(1));
         let slice_box = ctx.materialize_operand_at(slice_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
+        let getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2509,7 +2509,7 @@ mod tests {
 
     #[test]
     fn test_slice_strlen() {
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         let src_ref = OpRef::ref_op(10);
@@ -2802,7 +2802,7 @@ mod tests {
 
     #[test]
     fn test_nested_concat_length() {
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         let b = ctx.materialize_operand_at(OpRef::int_op(100));
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[test]
     fn test_concat_get_char() {
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         let b = ctx.materialize_operand_at(OpRef::int_op(100));
@@ -2912,13 +2912,13 @@ mod tests {
     #[test]
     fn test_concat_oopspec_creates_virtual() {
         // Verify that STR_CONCAT creates a virtual Concat.
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         pass.setup();
 
         let left = OpRef::ref_op(100);
 
         // Simulate: NEWSTR(2) for left
-        let mut left_op = Op::new(OpCode::Newstr, &[Operand::const_from_value(Value::Int(2))]);
+        let left_op = Op::new(OpCode::Newstr, &[Operand::const_from_value(Value::Int(2))]);
         left_op.pos().set(left);
         let mut ctx = OptContext::new(10);
 

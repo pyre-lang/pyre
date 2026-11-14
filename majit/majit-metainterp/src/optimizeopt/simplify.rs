@@ -73,7 +73,7 @@ impl OptSimplifyState {
 
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
-                let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
+                let new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
                 new_op.pos().set(op.pos().get());
                 OptimizationResult::Emit(new_op)
             }

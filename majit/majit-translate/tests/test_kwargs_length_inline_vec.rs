@@ -8,15 +8,15 @@
 mod common;
 
 use common::{
-    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    load_llbc_if_present, lower_function,
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    lower_function,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
 
-fn object_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(OBJECT_LLBC)
+fn object_llbc() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
 fn is_ll_vec_length(target: &CallTarget) -> bool {
@@ -30,9 +30,7 @@ fn is_ll_vec_length(target: &CallTarget) -> bool {
 
 #[test]
 fn kwargs_length_reads_the_inline_len_word() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "kwargsdict::<Impl>::length")
         .expect("lower kwargsdict::<Impl>::length");
     if let Ok(path) = std::env::var("DUMP_KWARGS_LENGTH") {
@@ -47,9 +45,7 @@ fn kwargs_length_reads_the_inline_len_word() {
 /// field whole for the same reason).
 #[test]
 fn kwargs_getitem_keeps_the_whole_field_and_reads_len() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "_orig_kwargs_getitem_correct_indirection")
         .expect("lower _orig_kwargs_getitem_correct_indirection");
     if let Ok(path) = std::env::var("DUMP_KWARGS_GETITEM") {
@@ -66,9 +62,7 @@ fn kwargs_getitem_keeps_the_whole_field_and_reads_len() {
 /// one setfield per empty `vec::Vec::new`.
 #[test]
 fn kwargs_get_empty_storage_is_newtuple_of_empty_vecs() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "kwargsdict::<Impl>::get_empty_storage")
         .expect("lower kwargsdict::<Impl>::get_empty_storage");
     if let Ok(path) = std::env::var("DUMP_KWARGS_GET_EMPTY_STORAGE") {
@@ -154,9 +148,7 @@ fn kwargs_get_empty_storage_is_newtuple_of_empty_vecs() {
 /// the unspecialized path.
 #[test]
 fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
         HostStaticAddrs::default(),
@@ -215,9 +207,7 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
 /// stays `None`.
 #[test]
 fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
         HostStaticAddrs::default(),

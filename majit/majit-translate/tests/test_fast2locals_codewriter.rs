@@ -46,13 +46,10 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
         .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
-/// Lower `pyframe::<Impl>::fast2locals` out of the shipped LLBC, or `None`
-/// when the artefact is absent so the tests degrade to a skip.
-fn lower_fast2locals() -> Option<FunctionGraph> {
-    let llbc = interpreter_llbc()?;
-    common::with_shared_lowering(llbc, |context| {
-        Some(lower_named(llbc, context, "fast2locals"))
-    })
+/// Lower `pyframe::<Impl>::fast2locals` out of the shipped LLBC.
+fn lower_fast2locals() -> FunctionGraph {
+    let llbc = interpreter_llbc();
+    common::with_shared_lowering(llbc, |context| lower_named(llbc, context, "fast2locals"))
 }
 
 fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
@@ -78,9 +75,7 @@ fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
 /// unfolded the marker would sit as a residual call on the type-lookup path.
 #[test]
 fn the_access_directly_marker_folds_out_of_the_type_lookup() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     common::with_shared_lowering(llbc, |context| {
         let graph = lower_named(llbc, context, "typedef::type");
         assert!(
@@ -98,9 +93,7 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
 /// method itself matches `pyframe.py fget_getdictscope`.
 #[test]
 fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     common::with_shared_lowering(llbc, |context| {
         let gateway = lower_named(
             llbc,
@@ -149,9 +142,7 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
 /// complement so that neither list can grow by accident.
 #[test]
 fn every_redirected_frame_getter_carries_a_deletable_force() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     common::with_shared_lowering(llbc, |context| {
         for leaf in [
             "__majit_wrap_descr_typecheck_get_w_globals",
@@ -202,9 +193,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
 /// `pyframe.rs`.
 #[test]
 fn the_gateways_outside_the_redirected_set_carry_no_force() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     common::with_shared_lowering(llbc, |context| {
         for leaf in [
             "__majit_wrap_descr_typecheck_fget_f_code",
@@ -263,13 +252,11 @@ fn config() -> GraphTransformConfig {
 /// prepass.
 #[test]
 fn fast2locals_assembles() {
-    let Some(graph) = lower_fast2locals() else {
-        return;
-    };
+    let graph = lower_fast2locals();
     // `co_flags()` reads the flags word. A `CodeFlags::bits` call must name a
     // translated compiler-core body rather than remain an unresolvable path
     // (`jtransform.py Transformer.handle_residual_call`).
-    let llbc = interpreter_llbc().expect("interpreter LLBC");
+    let llbc = interpreter_llbc();
     for op in graph
         .blocks
         .iter()
@@ -305,7 +292,7 @@ fn fast2locals_assembles() {
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();
-    let llbc = interpreter_llbc().expect("fast2locals_assembles already lowered from this LLBC");
+    let llbc = interpreter_llbc();
     callcontrol.set_struct_fields(with_shared_lowering(llbc, |ctx| {
         ctx.struct_field_registry()
     }));
@@ -352,9 +339,7 @@ fn fast2locals_assembles() {
 /// in.
 #[test]
 fn a_range_loops_next_yields_an_int_element() {
-    let Some(graph) = lower_fast2locals() else {
-        return;
-    };
+    let graph = lower_fast2locals();
 
     // The `range()` results, so an `[__iter_next]` can be attributed to a
     // range rather than to a slice/Vec iterator.

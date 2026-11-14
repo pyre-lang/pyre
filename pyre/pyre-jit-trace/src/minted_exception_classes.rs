@@ -865,7 +865,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn minted_instance_clears_header_class_word_on_a_dirty_nursery_body() {
-        use majit_ir::descr::{FieldDescr, SizeDescr};
+        use majit_ir::descr::SizeDescr;
 
         let _guard = MINTED_RAW_DESTRUCTOR_LOCK
             .lock()

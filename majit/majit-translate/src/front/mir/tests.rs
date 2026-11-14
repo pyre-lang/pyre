@@ -21129,9 +21129,7 @@ fn prepare_file_null_mut_emits_voidp_nullptr() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-module.ullbc"
     );
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let addrs = HostStaticAddrs {
         error_carrier: ErrorCarrierSpec {
             carrier_path: "pyre_interpreter::error::PyError",
@@ -21489,12 +21487,10 @@ fn null_mut_of_gc_struct_is_spelled_null_mut() {
 #[test]
 fn empty_dict_get_empty_storage_production_recasts_gcref() {
     use crate::model::{CallTarget, OpKind};
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(concat!(
+    let llbc = crate::test_support::load_ullbc(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
-    )) else {
-        return;
-    };
+    ));
     let ctx = crate::front::mir::LowerContext::new(llbc);
     let mut seen = 0usize;
     let mut recast = 0usize;

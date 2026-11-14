@@ -922,7 +922,7 @@ pub fn optimize_vector(
         // vector.py `teardown_vectorization()`) against that state
         // internally, stamping each op's VectorizationInfo into the
         // `_forwarded` equivalent that `forwarded_vecinfo` reads.
-        let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
+        let opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_, info, user_code)
     };
 
@@ -2308,7 +2308,7 @@ impl VectorLoop {
             // args track the rename state at this point.
             if align_unroll_once && u == 0 {
                 let label_args_ops: Vec<Operand> = label_args.iter().cloned().collect();
-                let mut minted = Op::new(OpCode::Label, &label_args_ops);
+                let minted = Op::new(OpCode::Label, &label_args_ops);
                 if let Some(descr) = self.label.getdescr() {
                     minted.setdescr(descr);
                 }
@@ -4026,17 +4026,17 @@ mod tests {
 
     #[test]
     fn test_unroll_loop_iterations() {
-        let mut label = Op::new(
+        let label = Op::new(
             OpCode::Label,
             &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
         );
         label.pos().set(OpRef::op_typed(0, majit_ir::Type::Void));
-        let mut body_op = Op::new(
+        let body_op = Op::new(
             OpCode::IntAdd,
             &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
         );
         body_op.pos().set(OpRef::int_op(1));
-        let mut jump = Op::new(
+        let jump = Op::new(
             OpCode::Jump,
             &[bx(OpRef::int_op(1)), bx(OpRef::input_arg_int(101))],
         );

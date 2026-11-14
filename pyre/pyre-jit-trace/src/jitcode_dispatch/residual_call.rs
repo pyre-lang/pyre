@@ -11425,7 +11425,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
         // descent: an `Err` from that descent aborts the trace.
         if let Some(inlined) =
-            try_walker_inline_isinstance_dunder(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
+            try_walker_inline_isinstance_dunder(ctx, op, code, &r_args, dst, dst_bank)?
         {
             return Ok(inlined);
         }
@@ -11457,10 +11457,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
         1,
         &r_args,
-        call_descr,
         foldable_runtime_helper,
         dst_bank,
         dst,
@@ -11503,9 +11501,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             op,
             code,
             1,
-            funcptr,
             &r_args,
-            call_descr,
             portal_user_call_helper(ctx, funcptr, foldable_runtime_helper),
             dst_bank,
             dst,
@@ -11518,21 +11514,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        if let Some(inlined) = try_walker_inline_exception_string_override(
-            ctx, op, code, funcptr, &r_args, call_descr, dst,
-        )? {
+        if let Some(inlined) =
+            try_walker_inline_exception_string_override(ctx, op, code, &r_args, dst)?
+        {
             return Ok(inlined);
         }
         // hash(x) over a user instance: inline __hash__ plus normalization.
-        if let Some(inlined) =
-            try_walker_inline_hash_builtin(ctx, op, code, funcptr, &r_args, call_descr, dst)?
-        {
+        if let Some(inlined) = try_walker_inline_hash_builtin(ctx, op, code, &r_args, dst)? {
             return Ok(inlined);
         }
         // A class is not a `Function`, so the user-call route above declined it.
-        if let Some(inlined) =
-            try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
-        {
+        if let Some(inlined) = try_walker_inline_type_call(ctx, op, code, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
@@ -11575,9 +11567,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // the helper tag, so every other `residual_call_r_r` falls straight
     // through.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatWithSpec {
-        if let Some(inlined) =
-            try_walker_inline_format(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
-        {
+        if let Some(inlined) = try_walker_inline_format(ctx, op, code, &r_args, dst, dst_bank)? {
             return Ok(inlined);
         }
     }
@@ -11767,9 +11757,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             // `is_true_lookup` is `dont_look_inside`. An overriding Python
             // `__bool__` is inlined here, the way `len` inlines `__len__`,
             // instead of recording the lookup as RandomEffects.
-            if let Some(routed) =
-                try_walker_inline_truth_bool(ctx, op, code, funcptr, &r_args, call_descr, dst)?
-            {
+            if let Some(routed) = try_walker_inline_truth_bool(ctx, op, code, &r_args, dst)? {
                 return Ok(routed);
             }
         }
@@ -11867,9 +11855,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // left residual it costs an interpreter frame and the virtualref
         // bracket that forces the caller's, once per `for` statement.
         if let Some(outcome) = spec_gate(SpecFold::InstanceIter, || {
-            try_walker_specialize_instance_iter(
-                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-            )
+            try_walker_specialize_instance_iter(ctx, op, code, &r_args, dst, dst_bank)
         })? {
             return Ok(outcome);
         }
@@ -11905,9 +11891,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         if let Some(inlined) = spec_gate(SpecFold::InstanceNext, || {
-            try_walker_specialize_instance_next(
-                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-            )
+            try_walker_specialize_instance_next(ctx, op, code, &r_args, dst, dst_bank)
         })? {
             return Ok(inlined);
         }
@@ -12091,7 +12075,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && let Some(inlined) =
-            try_walker_inline_builtin_getattr_property(ctx, op, code, &r_args, call_descr, dst)?
+            try_walker_inline_builtin_getattr_property(ctx, op, code, &r_args, dst)?
     {
         return Ok(inlined);
     }
@@ -12133,7 +12117,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
         if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
+            try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)
         })? {
             return Ok((outcome, op.next_pc));
         }
@@ -12211,8 +12195,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && try_walker_orthodox_complex_call(ctx, code, op, funcptr, &r_args, call_descr, dst)?
-            .is_some()
+        && try_walker_orthodox_complex_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -12248,9 +12231,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `__init__` are both builtin gateways descends `descr_call` like any
     // other class.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && let Some(inlined) = try_walker_inline_exception_type_call(
-            ctx, op, code, funcptr, 1, &r_args, call_descr, dst_bank, dst,
-        )?
+        && let Some(inlined) =
+            try_walker_inline_exception_type_call(ctx, op, code, 1, &r_args, dst_bank, dst)?
     {
         return Ok(inlined);
     }
@@ -12893,10 +12875,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
         1 + i_width,
         &r_args,
-        call_descr,
         foldable_runtime_helper,
         dst_bank,
         dst,
@@ -12921,9 +12901,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         op,
         code,
         1 + i_width,
-        funcptr,
         &r_args,
-        call_descr,
         portal_user_call_helper(ctx, funcptr, foldable_runtime_helper),
         dst_bank,
         dst,
@@ -12933,9 +12911,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 
     // A class is not a `Function`, so the user-call route above declined it.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
-        if let Some(inlined) =
-            try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
-        {
+        if let Some(inlined) = try_walker_inline_type_call(ctx, op, code, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
@@ -13211,8 +13187,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     w_code_ptr,
                     namei as usize,
@@ -13267,7 +13241,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // the Python-free super binding fold below declines it.
                 if let Some(attr_name) = attr_name.as_deref()
                     && let Some(inlined) = try_walker_inline_super_proxy_property_get(
-                        ctx, op, code, &r_args, call_descr, obj_opref, attr_name, dst, dst_bank,
+                        ctx, op, code, obj_opref, attr_name, dst, dst_bank,
                     )?
                 {
                     return Ok(inlined);
@@ -13291,8 +13265,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     w_code_ptr,
                     namei as usize,
@@ -13308,8 +13280,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     w_code_ptr,
                     namei as usize,
@@ -13325,8 +13295,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     w_code_ptr,
                     namei as usize,
@@ -13341,8 +13309,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     w_code_ptr,
                     namei as usize,
@@ -13413,8 +13379,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     ctx,
                     op,
                     code,
-                    &r_args,
-                    call_descr,
                     obj_opref,
                     value_opref,
                     w_code_ptr,
@@ -13533,8 +13497,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx,
                         op,
                         code,
-                        &r_args,
-                        call_descr,
                         global_super_opref,
                         self_opref,
                         cls_opref,
@@ -13699,16 +13661,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // below are for builtin containers, which this
                         // declines.
                         if let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
-                            try_walker_inline_subscr_getitem(
-                                ctx,
-                                op,
-                                code,
-                                Some(funcptr),
-                                &r_args,
-                                call_descr,
-                                dst,
-                                dst_bank,
-                            )
+                            try_walker_inline_subscr_getitem(ctx, op, code, &r_args, dst, dst_bank)
                         })? {
                             return Ok(inlined);
                         }
@@ -13806,15 +13759,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 if is_binary_op {
-                    if let Some(inlined) = try_walker_inline_user_binop(
-                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
-                    )? {
+                    if let Some(inlined) =
+                        try_walker_inline_user_binop(ctx, op, code, op_tag, &r_args, dst, dst_bank)?
+                    {
                         return Ok(inlined);
                     }
                 }
                 if is_compare_op {
                     if let Some(inlined) = try_walker_inline_user_compareop(
-                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                        ctx, op, code, op_tag, &r_args, dst, dst_bank,
                     )? {
                         return Ok(inlined);
                     }
@@ -13822,7 +13775,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     // rich-compare inline above declines it.
                     if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_tag) {
                         if let Some(inlined) = try_walker_inline_contains_dunder(
-                            ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                            ctx, op, code, op_tag, &r_args, dst, dst_bank,
                         )? {
                             return Ok(inlined);
                         }

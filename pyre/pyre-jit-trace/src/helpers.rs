@@ -9,11 +9,12 @@ use majit_ir::{
 };
 use majit_metainterp::{TraceCtx, default_effect_info};
 
+use pyre_interpreter::jit_bool_value_from_truth;
+#[cfg(test)]
 use pyre_interpreter::{
-    jit_binary_value_from_tag, jit_bool_value_from_truth, jit_compare_value_from_tag,
-    jit_unary_invert_value,
+    jit_binary_value_from_tag, jit_compare_value_from_tag, jit_range_iter_next_or_null,
+    jit_sequence_getitem, jit_unary_invert_value,
 };
-use pyre_interpreter::{jit_range_iter_next_or_null, jit_sequence_getitem};
 use pyre_object::*;
 
 pub use pyre_interpreter::{

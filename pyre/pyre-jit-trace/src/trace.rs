@@ -1476,7 +1476,6 @@ type PerfnWalkResult = Result<
 fn dispatch_perfn_frame<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
-    concrete_frame_addr: usize,
     orgpc: usize,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     pjc: &std::sync::Arc<crate::PyJitCode>,
@@ -1516,7 +1515,6 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
     let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
         ctx,
         sym,
-        concrete_frame_addr,
         orgpc,
         session,
         code,
@@ -2513,7 +2511,6 @@ fn drive_middles_finishframe<Sym: WalkSym>(
             root_pc,
             root_ec,
             root_ec_box,
-            root_frame_box,
             &middles[i],
             &middles[..i],
             result,
@@ -3178,7 +3175,6 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
-    root_frame_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
@@ -6126,7 +6122,6 @@ fn run_perfn_walk<Sym: WalkSym>(
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
         ctx,
         sym,
-        cf_addr,
         start_pc,
         &session,
         &pjc,

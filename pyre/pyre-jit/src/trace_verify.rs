@@ -72,7 +72,6 @@ mod tests {
             OpRef::input_arg_ref(0),
             w_int_size_descr(),
             intval_descr(),
-            FAKE_INT_TYPE,
         );
         let ops = get_ops(ctx);
         // rewrite.py:479-484 GC rewriter: NEW_WITH_VTABLE emits the vtable
@@ -152,7 +151,6 @@ mod tests {
             OpRef::input_arg_ref(0),
             w_float_size_descr(),
             floatval_descr(),
-            FAKE_FLOAT_TYPE,
         );
         let ops = get_ops(ctx);
         assert_eq!(ops, vec![OpCode::NewWithVtable, OpCode::SetfieldGc]);

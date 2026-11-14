@@ -12,10 +12,6 @@ use majit_translate::memory::gctransform::liveness;
 
 #[test]
 fn a_gc_pointer_slice_is_found_in_the_object_crate() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file() {
-        eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-        return;
-    }
     let llbc = load_llbc(OBJECT_LLBC);
     let gc_tys = liveness::gc_ptr_type_ids(llbc);
     assert!(!gc_tys.is_empty(), "no PyObjectRef type id");

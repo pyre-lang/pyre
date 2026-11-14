@@ -1097,7 +1097,7 @@ fn decode_merge_point_green_regs(code: &[u8], merge_offset: usize) -> (&[u8], &[
         "jit_merge_point_offset {merge_offset} is not BC_JIT_MERGE_POINT(_C)"
     );
     let mut q = merge_offset + 2;
-    let mut read_list = |q: &mut usize| -> &[u8] {
+    let read_list = |q: &mut usize| -> &[u8] {
         let offset = *q;
         let n = *code.get(offset).unwrap_or_else(|| {
             panic!("BC_JIT_MERGE_POINT green list length is truncated at {offset}")

@@ -721,11 +721,9 @@ fn option_ok_or_else_merged_return_has_no_undefined_link_args() {
 #[test]
 fn orig_parse_format_link_args_are_defined() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
-        return;
-    }
-    let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let llbc = majit_charon_reader::Llbc::load(path).unwrap_or_else(|err| {
+        panic!("{path} is missing or unreadable; run `python3 scripts/extract-llbc.py`: {err}")
+    });
     let spec = crate::ErrorCarrierSpec {
         carrier_path: "pyre_interpreter::error::PyError",
         carrier_class: "",

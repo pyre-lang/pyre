@@ -1,4 +1,3 @@
-use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
 /// Loop unrolling pass (peel one iteration).
@@ -4051,7 +4050,7 @@ impl OptUnroll {
             {
                 for (opcode, descr) in recipes {
                     let tp = opcode.result_type();
-                    let mut load = Op::new(opcode, std::slice::from_ref(&frame_operand));
+                    let load = Op::new(opcode, std::slice::from_ref(&frame_operand));
                     load.setdescr(descr);
                     load.pos().set(ctx.reserve_pos_typed(tp));
                     let load_rc = OpRc::new(load);
@@ -4062,7 +4061,7 @@ impl OptUnroll {
                     jump_args.push(ctx.resolve_operand_operand(&Operand::from_bound_op(&load_rc)));
                 }
             }
-            let mut jump = Op::new(OpCode::Jump, &jump_args);
+            let jump = Op::new(OpCode::Jump, &jump_args);
             jump.setdescr(target_token.as_jump_target_descr());
             // unroll.py:357 lets send_extra_operation raise InvalidLoop. This
             // function returns Option (flag convention); propagate consumed
@@ -4218,7 +4217,7 @@ impl OptUnroll {
                 let Some(sp_op) = current_short_op(short_preamble, ctx, replay_index) else {
                     break;
                 };
-                let mut new_op = sp_op.clone();
+                let new_op = sp_op.clone();
                 // unroll.py: _map_args(mapping, sop.getarglist())
                 // Const passes through unchanged, non-Const must be in mapping.
                 for i in 0..new_op.num_args() {
@@ -4954,7 +4953,7 @@ fn emit_alias_same_as_for_imports(
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
-        let mut op = Op::new(
+        let op = Op::new(
             alias.same_as_opcode,
             std::slice::from_ref(&alias.same_as_source),
         );
@@ -4996,7 +4995,7 @@ fn push_fallthrough_same_as(
         return;
     }
 
-    let mut same_as = Op::new(OpCode::same_as_for_type(tp), std::slice::from_ref(source));
+    let same_as = Op::new(OpCode::same_as_for_type(tp), std::slice::from_ref(source));
     same_as.pos().set(arg.to_opref());
     fallthrough_aliases.push(same_as);
 }
@@ -5078,7 +5077,7 @@ fn assemble_peeled_trace_with_jump_args(
     // producerless and `stream_defs` would hide the hole.
     let emit_start_label = start_label_descr.is_some();
     if let Some(start_label_descr) = start_label_descr {
-        let mut start_label = Op::new(OpCode::Label, start_label_args);
+        let start_label = Op::new(OpCode::Label, start_label_args);
         start_label.pos().set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
         result.push(OpRc::new(start_label));
@@ -5137,7 +5136,7 @@ fn assemble_peeled_trace_with_jump_args(
     //
     // resoperation.py InputArgInt/Float/Ref: preamble-defined
     // inputargs carry `box.type` intrinsically (`history.py` box.type).
-    let preamble_defs: crate::FxIndexSet<Operand> = {
+    {
         let mut defs = crate::FxIndexSet::default();
         for i in 0..body_num_inputs {
             defs.insert(
@@ -5287,8 +5286,7 @@ fn assemble_peeled_trace_with_jump_args(
                 // `forget_optimization_info` then clears `_forwarded`,
                 // so the backend only sees the SameAs + Const.
                 if let Some(const_op) = const_ref_replacement(arg) {
-                    let mut same_as =
-                        Op::new(OpCode::same_as_for_type(const_op.type_()), &[const_op]);
+                    let same_as = Op::new(OpCode::same_as_for_type(const_op.type_()), &[const_op]);
                     same_as.pos().set(arg.to_opref());
                     fallthrough_aliases.push(same_as);
                     return;
@@ -5385,14 +5383,14 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(const_op) = const_ref_replacement(arg) {
             let tp = const_op.type_();
             if tp != Type::Void {
-                let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
+                let same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
                 same_as.pos().set(arg.to_opref());
                 fallthrough_aliases.push(same_as);
             }
         }
     }
 
-    let mut label_op = Op::new(OpCode::Label, &full_label_args);
+    let label_op = Op::new(OpCode::Label, &full_label_args);
     // resoperation.py AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
     // a stray Int tag. `op_index` filters Void ops so this OpRef never
@@ -5474,7 +5472,7 @@ fn assemble_peeled_trace_with_jump_args(
         let source_result = (op.result_type() != Type::Void && !op.pos().get().is_none())
             .then(|| Operand::from_bound_op(op));
 
-        let mut new_op = (**op).clone();
+        let new_op = (**op).clone();
 
         if source_result.is_some() {
             new_op
@@ -5858,7 +5856,7 @@ impl OptUnrollState {
         let label_pos = ctx.reserve_pos_typed(OpCode::Label.result_type());
         let jump_label_args: Vec<majit_ir::operand::Operand> =
             (0..jump_op.num_args()).map(|i| jump_op.arg(i)).collect();
-        let mut label_op = Op::new(OpCode::Label, &jump_label_args);
+        let label_op = Op::new(OpCode::Label, &jump_label_args);
         label_op.pos().set(label_pos);
         ctx.emit(label_op);
 
@@ -6045,7 +6043,7 @@ impl OptUnrollState {
 
             // Emit the final Jump with remapped args pointing to the
             // body iteration's ops.
-            let mut jump = op.clone();
+            let jump = op.clone();
             // optimizer.py Optimizer._emit_operation setarg loop parity.
             for i in 0..jump.num_args() {
                 let arg = jump.arg(i);
@@ -6404,7 +6402,7 @@ mod tests {
     fn test_jump_to_preamble_preserves_jump_args() {
         let body_ops = vec![
             {
-                let mut op = Op::new(
+                let op = Op::new(
                     OpCode::IntAdd,
                     &[
                         rooted_resop_operand(Type::Int, 0),
@@ -6447,7 +6445,7 @@ mod tests {
     #[test]
     fn test_replace_terminal_jump_appends_when_body_prefix_has_no_jump() {
         let body_ops = vec![{
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     rooted_resop_operand(Type::Int, 0),
@@ -6457,7 +6455,7 @@ mod tests {
             op.pos().set(OpRef::int_op(2));
             op
         }];
-        let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
+        let jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         let preamble_descr = TargetToken::new_preamble(7).as_jump_target_descr();
         jump.setdescr(preamble_descr.clone());
 
@@ -6484,7 +6482,7 @@ mod tests {
     #[test]
     fn test_ensure_preamble_target_token_inserts_start_descr_first() {
         let mut unroll = UnrollOptimizer::new();
-        let mut regular = TargetToken::new_loop(3);
+        let regular = TargetToken::new_loop(3);
         regular.attrs().virtual_state =
             Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
                 crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
@@ -6909,7 +6907,7 @@ mod tests {
                 ],
             ),
             {
-                let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]);
+                let guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]);
                 guard.setfailargs(vec![rooted_resop_operand(Type::Int, 0)].into()); // refs op0
                 guard
             },
@@ -6977,7 +6975,7 @@ mod tests {
         // buffer. The JUMP arg is the emitted body producer
         // (`opencoder.py TraceIterator._cache`).
         let add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     rooted_resop_operand(Type::Int, 100),
@@ -6988,7 +6986,7 @@ mod tests {
             op
         };
         let jump = {
-            let mut op = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]);
+            let op = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]);
             op.pos().set(OpRef::void_op(1));
             op
         };
@@ -7410,12 +7408,12 @@ mod tests {
         let mut unroll_opt = UnrollOptimizer::new();
         let i0 = rooted_inputarg_operand(Type::Int, 0);
         unroll_opt.trace_inputargs = vec![i0.clone()];
-        let mut add = Op::new(OpCode::IntAdd, &[i0.clone(), i0]);
+        let add = Op::new(OpCode::IntAdd, &[i0.clone(), i0]);
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
         let add_rc = OpRc::new(add);
         let runtime_boxes = vec![Operand::from_bound_op(&add_rc)];
-        let mut jump = Op::new(OpCode::Jump, std::slice::from_ref(&runtime_boxes[0]));
+        let jump = Op::new(OpCode::Jump, std::slice::from_ref(&runtime_boxes[0]));
         jump.pos().set(OpRef::int_op(2));
         let ops = vec![add_rc.clone(), OpRc::new(jump)];
         let mut constants = majit_ir::ConstMap::default();
@@ -7647,7 +7645,7 @@ mod tests {
 
         let ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
         let op = {
-            let mut o = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 0)]);
+            let o = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 0)]);
             o.pos().set(OpRef::ref_op(99));
             OpRc::new(o)
         };
@@ -7785,7 +7783,7 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(128, &[Type::Int; 128]);
 
         let mask_op = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAnd,
                 &[
                     rooted_inputarg_operand(Type::Int, 8),
@@ -7796,7 +7794,7 @@ mod tests {
             OpRc::new(op)
         };
         let dep_op = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     Operand::from_bound_op(&mask_op),
@@ -7955,7 +7953,7 @@ mod tests {
             vec![ia0, ia1],
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::with_descr(
+                    let op = Op::with_descr(
                         OpCode::GetfieldGcI,
                         std::slice::from_ref(&si0),
                         field_descr.clone(),
@@ -7964,7 +7962,7 @@ mod tests {
                     OpRc::new(op)
                 },
                 source_op: Some({
-                    let mut op = Op::with_descr(
+                    let op = Op::with_descr(
                         OpCode::GetfieldGcI,
                         std::slice::from_ref(&source_receiver),
                         field_descr.clone(),
@@ -8076,7 +8074,7 @@ mod tests {
         ctx.exported_const_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::with_descr(
+                    let op = Op::with_descr(
                         OpCode::GetfieldGcI,
                         std::slice::from_ref(&si0),
                         field_descr.clone(),
@@ -8085,7 +8083,7 @@ mod tests {
                     OpRc::new(op)
                 },
                 source_op: Some({
-                    let mut op = Op::with_descr(
+                    let op = Op::with_descr(
                         OpCode::GetfieldGcI,
                         std::slice::from_ref(&source_receiver),
                         field_descr.clone(),
@@ -8172,7 +8170,7 @@ mod tests {
         // Phase-1 getfield, whose receiver is the const pointer.
         let const_arg = Operand::from_opref(OpRef::const_ptr(ptr));
         let getfield = {
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[const_arg.clone()],
                 field_descr.clone(),
@@ -8300,7 +8298,7 @@ mod tests {
         let (short_inputargs, short_inputarg_refs) =
             mint_short_inputargs(&mut ctx, &[Type::Int, Type::Int]);
         let call = {
-            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            let op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
             op.pos().set(OpRef::int_op(11));
             OpRc::new(op)
         };
@@ -8368,7 +8366,7 @@ mod tests {
         let source_box = rooted_resop_operand(Type::Int, 11);
         let phase2_result = rooted_resop_operand(Type::Int, 3);
         let call = {
-            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            let op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
             op.pos().set(source);
             OpRc::new(op)
         };
@@ -8448,7 +8446,7 @@ mod tests {
             rooted_inputarg_operand(Type::Int, 12),
         ];
         let add20 = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     rooted_resop_operand(Type::Int, 0),
@@ -8546,7 +8544,7 @@ mod tests {
             rooted_inputarg_operand(Type::Ref, 13),
         ];
         let getfield19 = {
-            let mut op = Op::with_descr(
+            let op = Op::with_descr(
                 OpCode::GetfieldGcR,
                 &[rooted_resop_operand(Type::Ref, 3)],
                 majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
@@ -8650,7 +8648,7 @@ mod tests {
             vec![ia0, ia1, ia2],
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
+                    let op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
                     op.pos().set(OpRef::int_op(30));
                     OpRc::new(op)
                 },
@@ -8715,14 +8713,14 @@ mod tests {
         let i1 = rooted_resop_operand(Type::Int, 1);
         let p10 = rooted_resop_operand(Type::Ref, 10);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
         let p1_box = Operand::from_bound_op(&p1_add);
         let mut p2_ops: Vec<OpRc> = (0..9)
             .map(|i| {
-                let mut op = Op::new(
+                let op = Op::new(
                     OpCode::SetfieldGc,
                     &[p10.clone(), rooted_resop_operand(Type::Int, 3 + i)],
                 );
@@ -8762,12 +8760,12 @@ mod tests {
         let i10 = rooted_resop_operand(Type::Int, 10);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
         let p2_mul = {
-            let mut op = Op::new(OpCode::IntMul, &[i50.clone(), i0.clone()]);
+            let op = Op::new(OpCode::IntMul, &[i50.clone(), i0.clone()]);
             op.pos().set(OpRef::int_op(1));
             OpRc::new(op)
         };
@@ -8812,13 +8810,13 @@ mod tests {
         let i1 = rooted_resop_operand(Type::Int, 1);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
         let p1_box = Operand::from_bound_op(&p1_add);
         let p2_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i50.clone(), i0.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i50.clone(), i0.clone()]);
             op.pos().set(OpRef::int_op(4));
             OpRc::new(op)
         };
@@ -8867,7 +8865,7 @@ mod tests {
         let i1 = rooted_resop_operand(Type::Int, 1);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
@@ -8915,7 +8913,7 @@ mod tests {
         let i1 = rooted_resop_operand(Type::Int, 1);
         let reminted = rooted_resop_operand(Type::Ref, 85);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
@@ -8963,13 +8961,13 @@ mod tests {
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i1 = rooted_resop_operand(Type::Int, 1);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(11));
             OpRc::new(op)
         };
         let label_box = Operand::from_bound_op(&p1_add);
         let p2_ge = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntGe,
                 &[label_box.clone(), Operand::from_opref(OpRef::const_int(2))],
             );
@@ -8977,7 +8975,7 @@ mod tests {
             OpRc::new(op)
         };
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[label_box.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9024,7 +9022,7 @@ mod tests {
         let i3 = rooted_resop_operand(Type::Int, 3);
         let i25 = rooted_resop_operand(Type::Int, 25);
         let p1_get = {
-            let mut op = Op::new(OpCode::GetfieldGcR, &[i3.clone()]);
+            let op = Op::new(OpCode::GetfieldGcR, &[i3.clone()]);
             op.pos().set(OpRef::int_op(19));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
@@ -9037,7 +9035,7 @@ mod tests {
         };
         let preamble_box = Operand::from_bound_op(&p1_get);
         let p2_set = {
-            let mut op = Op::new(OpCode::SetfieldGc, &[i25.clone(), preamble_box.clone()]);
+            let op = Op::new(OpCode::SetfieldGc, &[i25.clone(), preamble_box.clone()]);
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 57,
                 8,
@@ -9048,7 +9046,7 @@ mod tests {
             OpRc::new(op)
         };
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[i0.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9098,12 +9096,12 @@ mod tests {
         let i10 = rooted_resop_operand(Type::Int, 10);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p1_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
             OpRc::new(op)
         };
         let p2_mul = {
-            let mut op = Op::new(OpCode::IntMul, &[i50.clone(), i10.clone()]);
+            let op = Op::new(OpCode::IntMul, &[i50.clone(), i10.clone()]);
             op.pos().set(OpRef::int_op(1));
             OpRc::new(op)
         };
@@ -9151,14 +9149,14 @@ mod tests {
         let i850 = rooted_resop_operand(Type::Int, 850);
         let i853 = rooted_resop_operand(Type::Int, 853);
         let p1_same = {
-            let mut op = Op::new(OpCode::SameAsI, &[i37.clone()]);
+            let op = Op::new(OpCode::SameAsI, &[i37.clone()]);
             op.pos().set(OpRef::void_op(857));
             OpRc::new(op)
         };
         let v857 = Operand::from_bound_op(&p1_same);
         let const2 = Operand::from_opref(OpRef::const_int(2));
         let p2_guard = {
-            let mut op = Op::new(OpCode::GuardValue, &[v857.clone(), const2.clone()]);
+            let op = Op::new(OpCode::GuardValue, &[v857.clone(), const2.clone()]);
             op.setfailargs(vec![v857.clone()].into());
             OpRc::new(op)
         };
@@ -9215,7 +9213,7 @@ mod tests {
         let i10 = rooted_resop_operand(Type::Int, 10);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p2_get = {
-            let mut op = Op::new(OpCode::GetfieldGcI, &[i50.clone()]);
+            let op = Op::new(OpCode::GetfieldGcI, &[i50.clone()]);
             op.pos().set(OpRef::int_op(1));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 0,
@@ -9365,12 +9363,12 @@ mod tests {
         let i0 = rooted_resop_operand(Type::Int, 0);
         let label_box = rooted_resop_operand(Type::Int, 10);
         let p2_guard = {
-            let mut op = Op::new(OpCode::GuardTrue, &[label_box.clone()]);
+            let op = Op::new(OpCode::GuardTrue, &[label_box.clone()]);
             op.setfailargs(vec![label_box.clone()].into());
             OpRc::new(op)
         };
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[label_box.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9379,7 +9377,7 @@ mod tests {
         };
         let p2_add_box = Operand::from_bound_op(&p2_add);
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[p2_add_box.clone()]);
+            let jump = Op::new(OpCode::Jump, &[p2_add_box.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -9458,7 +9456,7 @@ mod tests {
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i10 = rooted_resop_operand(Type::Int, 10);
         let p1_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[i0.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9467,7 +9465,7 @@ mod tests {
         };
         let v20 = Operand::from_bound_op(&p1_add);
         let p2_ge = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntGe,
                 &[v20.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9476,12 +9474,12 @@ mod tests {
         };
         let v30 = Operand::from_bound_op(&p2_ge);
         let p2_guard = {
-            let mut op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
+            let op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
             op.setfailargs(vec![i10.clone()].into());
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i10.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -9533,7 +9531,7 @@ mod tests {
         let i10 = rooted_resop_operand(Type::Int, 10);
         let i50 = rooted_resop_operand(Type::Int, 50);
         let p1_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     Operand::from_opref(OpRef::const_int(0)),
@@ -9545,7 +9543,7 @@ mod tests {
         };
         let p1_box = Operand::from_bound_op(&p1_add);
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[i50.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9553,7 +9551,7 @@ mod tests {
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i10.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -9618,7 +9616,7 @@ mod tests {
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i10 = rooted_resop_operand(Type::Int, 10);
         let p1_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[
                     Operand::from_opref(OpRef::const_int(0)),
@@ -9630,7 +9628,7 @@ mod tests {
         };
         let v20 = Operand::from_bound_op(&p1_add);
         let p2_ge = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntGe,
                 &[v20.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9639,12 +9637,12 @@ mod tests {
         };
         let v30 = Operand::from_bound_op(&p2_ge);
         let p2_guard = {
-            let mut op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
+            let op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
             op.setfailargs(vec![i10.clone()].into());
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i10.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -9713,7 +9711,7 @@ mod tests {
         let i101 = rooted_resop_operand(Type::Int, 101);
         let i102 = rooted_resop_operand(Type::Int, 102);
         let p2_jump = {
-            let mut jump = Op::new(
+            let jump = Op::new(
                 OpCode::Jump,
                 &[i0.clone(), i1.clone(), i2.clone(), i3.clone(), i4.clone()],
             );
@@ -9766,12 +9764,12 @@ mod tests {
         let i100 = rooted_resop_operand(Type::Int, 100);
         let i101 = rooted_resop_operand(Type::Int, 101);
         let p2_add = {
-            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(2));
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i0.clone(), i1.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i0.clone(), i1.clone()]);
             jump.setdescr(start_descr.clone());
             OpRc::new(jump)
         };
@@ -9808,7 +9806,7 @@ mod tests {
         let i101 = rooted_resop_operand(Type::Int, 101);
         let i102 = rooted_resop_operand(Type::Int, 102);
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[i10.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -9816,7 +9814,7 @@ mod tests {
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i10.clone(), i50.clone(), i60.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i10.clone(), i50.clone(), i60.clone()]);
             jump.setdescr(start_descr.clone());
             OpRc::new(jump)
         };
@@ -9860,7 +9858,7 @@ mod tests {
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i10 = rooted_resop_operand(Type::Int, 10);
         let new_op = {
-            let mut op = Op::new(OpCode::New, &[]);
+            let op = Op::new(OpCode::New, &[]);
             op.pos().set(OpRef::ref_op(1));
             OpRc::new(op)
         };
@@ -9999,7 +9997,7 @@ mod tests {
         let i200 = rooted_resop_operand(Type::Int, 200);
         let i300 = rooted_resop_operand(Type::Int, 300);
         let p2_add = {
-            let mut op = Op::new(
+            let op = Op::new(
                 OpCode::IntAdd,
                 &[i200.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
@@ -10010,7 +10008,7 @@ mod tests {
             // `_jump_to_existing_trace` already emits `args + extra`.
             // Assembly does not invent a missing virtual-state slot
             // from the LABEL's own input.
-            let mut jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -10060,12 +10058,12 @@ mod tests {
         let start1 = rooted_inputarg_operand(Type::Ref, 1);
         let start = [start0.clone(), start1.clone()];
         let p2_same = {
-            let mut op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
+            let op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
             op.pos().set(OpRef::ref_op(200));
             OpRc::new(op)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
+            let jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -10132,17 +10130,17 @@ mod tests {
         let loop1 = rooted_resop_operand(Type::Ref, 11);
         let loop_label = [loop0.clone(), loop1.clone()];
         let p2_same = {
-            let mut op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
+            let op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
             op.pos().set(OpRef::ref_op(200));
             OpRc::new(op)
         };
         let p2_guard = {
-            let mut guard = Op::new(OpCode::GuardTrue, &[p2_i0.clone()]);
+            let guard = Op::new(OpCode::GuardTrue, &[p2_i0.clone()]);
             guard.setfailargs(vec![p2_i0.clone()].into());
             OpRc::new(guard)
         };
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
+            let jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
             jump.setdescr(loop_descr.clone());
             OpRc::new(jump)
         };
@@ -10212,7 +10210,7 @@ mod tests {
         let i300 = rooted_resop_operand(Type::Int, 300);
         let const1 = Operand::from_opref(OpRef::const_int(1));
         let p2_jump = {
-            let mut jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone(), const1.clone()]);
+            let jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone(), const1.clone()]);
             jump.setdescr(external_descr);
             OpRc::new(jump)
         };
@@ -10243,7 +10241,7 @@ mod tests {
     fn test_splice_redirected_tail_replaces_terminal_jump() {
         let body_ops = vec![
             {
-                let mut op = Op::new(
+                let op = Op::new(
                     OpCode::IntAdd,
                     &[
                         rooted_resop_operand(Type::Int, 0),
@@ -10257,7 +10255,7 @@ mod tests {
         ];
         let redirected_tail = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Void, 3)]);
+                let op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Void, 3)]);
                 op.setfailargs(vec![rooted_resop_operand(Type::Void, 3)].into());
                 op
             },
@@ -10320,7 +10318,7 @@ mod tests {
         let jump_arg_box = ctx.materialize_operand_at(jump_arg);
 
         // A guard carrying the PREAMBLE trace's resume coordinate.
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardTrue,
             std::slice::from_ref(&short_input_operand),
         );
@@ -10376,7 +10374,7 @@ mod tests {
         // `IntBound.make_guards`) rather than rejecting the target.
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
         let runtime_box = Operand::const_from_value(Value::Int(5));
-        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        let target_tokens = vec![TargetToken::new_loop(1)];
         target_tokens[0].attrs().virtual_state =
             Some(VirtualState::new(vec![VirtualStateInfo::IntBounded(
                 IntBound::bounded(0, 10),
@@ -10420,7 +10418,7 @@ mod tests {
         // The virtual states match exactly, so the only reason to decline is
         // the LABEL slot no close can deliver.
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
-        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        let target_tokens = vec![TargetToken::new_loop(1)];
         target_tokens[0].attrs().virtual_state =
             Some(VirtualState::new(vec![VirtualStateInfo::Unknown(
                 Type::Int,
@@ -10462,7 +10460,7 @@ mod tests {
         let func = Operand::const_from_value(Value::Int(0x1000));
         let one = Operand::const_from_value(Value::Int(1));
         let thousand = Operand::const_from_value(Value::Int(1000));
-        let mut call = Op::new(OpCode::CallPureR, &[func, passed.clone(), one]);
+        let call = Op::new(OpCode::CallPureR, &[func, passed.clone(), one]);
         call.setdescr(make_call_descr(
             vec![Type::Int, Type::Int, Type::Int],
             Type::Ref,
@@ -10605,13 +10603,13 @@ mod tests {
                 Operand::const_from_value(Value::Int(100)),
             ],
         );
-        let mut in_range = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 5)]);
+        let in_range = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 5)]);
         in_range.set_rd_resume_position(0);
         let next_index = Op::new(
             OpCode::IntAdd,
             &[index_arg, Operand::const_from_value(Value::Int(1))],
         );
-        let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
+        let future = Op::new(OpCode::GuardFutureCondition, &[]);
         future.set_rd_resume_position(1);
         let jump = Op::new(OpCode::Jump, &[obj_arg, rooted_resop_operand(Type::Int, 7)]);
         let mut ops = vec![
@@ -10780,7 +10778,7 @@ mod tests {
             ],
             field_descr,
         );
-        let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
+        let future = Op::new(OpCode::GuardFutureCondition, &[]);
         future.set_rd_resume_position(0);
         let jump = Op::new(OpCode::Jump, &[p2_arg, rooted_resop_operand(Type::Ref, 5)]);
         let mut ops = vec![get_p1, get_p2, sum, new_obj, setfield, future, jump];
@@ -10902,7 +10900,7 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int]);
         let passed = ctx.materialize_operand_at(OpRef::input_arg_int(0));
         let func = Operand::const_from_value(Value::Int(0x1000));
-        let mut call = Op::new(OpCode::CallR, &[func, passed]);
+        let call = Op::new(OpCode::CallR, &[func, passed]);
         call.pos().set(OpRef::ref_op(2));
         call.setdescr(make_call_descr(
             vec![Type::Int, Type::Int],
@@ -10911,7 +10909,7 @@ mod tests {
         ));
         let i0 = ctx.inputargs[0].clone();
         let mut sb = ShortBoxes::with_label_args(&[i0.clone()]);
-        sb.add_pure_op(&mut ctx, &OpRc::new(call));
+        sb.add_pure_op(&OpRc::new(call));
         let short_boxes = sb.create_short_boxes(&mut ctx, &[i0]);
         let pure = short_boxes
             .iter()
@@ -10976,7 +10974,7 @@ mod tests {
             }),
         );
 
-        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        let target_tokens = vec![TargetToken::new_loop(1)];
         let peeled = target_tokens[0].as_jump_target_descr();
         target_tokens[0].attrs().virtual_state = Some(target_vs);
 

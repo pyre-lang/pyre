@@ -3,7 +3,6 @@
 /// RPython codewriter/assembler.py: assembler that emits bytecodes into a
 /// JitCode object. This remains in metainterp only as transitional pyre ABI
 /// glue until callers consume `majit_jitcode::codewriter::assembler::Assembler`.
-use indexmap::{IndexMap, IndexSet};
 use std::cmp::max;
 
 use majit_backend::JitCellToken;

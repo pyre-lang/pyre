@@ -10,8 +10,7 @@
 //! ISNULL) lives in `OptRewrite` (`rewrite.rs`) and `OptIntBounds`
 //! (`intbounds.rs`), folding via box-attached `getptrinfo`/`getintbound` +
 //! `make_constant` — `rewrite.py` `optimize_GUARD_*`.
-use indexmap::IndexMap;
-use majit_ir::{Op, OpCode, OpRc, OpRef};
+use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::dependency::IndexVar;
@@ -262,7 +261,7 @@ impl Guard {
         // make_compile_loop_version_descr_from reference-shares each
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
-        let mut guard_op = Op::new(
+        let guard_op = Op::new(
             self.op.opcode,
             &[majit_ir::operand::Operand::bound_from_opref(
                 compare.pos().get(),
@@ -393,7 +392,7 @@ impl Guard {
         );
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
-        let mut guard = Op::new(
+        let guard = Op::new(
             self.op.opcode,
             &[majit_ir::operand::Operand::bound_from_opref(
                 cmp_op.pos().get(),

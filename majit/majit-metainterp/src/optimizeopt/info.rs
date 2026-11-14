@@ -8,7 +8,7 @@ pub use crate::optimizeopt::rawbuffer::{
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -1494,8 +1494,7 @@ fn force_box_emit(
                 }
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
-                let mut set_op =
-                    Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
+                let set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, &mut optimizer, set_op);
             }
@@ -1552,8 +1551,7 @@ fn force_box_emit(
                 }
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
-                let mut set_op =
-                    Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
+                let set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, &mut optimizer, set_op);
             }
@@ -1620,7 +1618,7 @@ fn force_box_emit(
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_idx = idx_ref.clone();
                 let arg_sub = ctx.resolve_operand_operand(&subbox);
-                let mut set_op = Op::new(
+                let set_op = Op::new(
                     OpCode::SetarrayitemGc,
                     &[arg_alloc.clone(), arg_idx.clone(), arg_sub.clone()],
                 );
@@ -1691,7 +1689,7 @@ fn force_box_emit(
                     let arg_alloc = Operand::from_bound_op(&alloc_rc);
                     let arg_idx = idx_ref.clone();
                     let arg_sub = ctx.resolve_operand_operand(&subbox);
-                    let mut set_op = Op::new(
+                    let set_op = Op::new(
                         OpCode::SetinteriorfieldGc,
                         &[arg_alloc.clone(), arg_idx.clone(), arg_sub.clone()],
                     );
@@ -1749,7 +1747,7 @@ fn force_box_emit(
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_offset = offset_ref.clone();
                 let arg_value = ctx.resolve_operand_operand(&value);
-                let mut store_op = Op::new(
+                let store_op = Op::new(
                     OpCode::RawStore,
                     &[arg_alloc.clone(), arg_offset.clone(), arg_value.clone()],
                 );
@@ -1848,7 +1846,7 @@ fn force_box_emit(
             //   optforce.emit_extra(newop)
             //   newop = optforce.optimizer.getlastop()
             //   newop.set_forwarded(self)
-            let fresh_rc = emit_op(ctx, &mut optimizer, newstr_op);
+            emit_op(ctx, &mut optimizer, newstr_op);
             let newop_rc = emitted_newop(ctx, &optimizer);
             let newop_box = Operand::from_bound_op(&newop_rc);
 
@@ -1918,7 +1916,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
     use majit_ir::descr::{SimpleArrayDescr, SimpleSizeDescr, gc_cache};
-    use majit_ir::{ArrayDescr, Descr, FieldDescr, LLType, OpCode, SizeDescr, Value};
+    use majit_ir::{Descr, FieldDescr, LLType, OpCode, OpRef, SizeDescr, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -2277,9 +2275,9 @@ mod tests {
 
         // The pure registration is descr-less (`pure_from_args` without a
         // descr), so the following ARRAYLEN_GC carries no descr either.
-        let mut pure = OptPure::new();
+        let pure = OptPure::new();
         let array_arg = forced.clone();
-        let mut len_op = Op::new(OpCode::ArraylenGc, &[array_arg]);
+        let len_op = Op::new(OpCode::ArraylenGc, &[array_arg]);
         len_op.pos().set(OpRef::int_op(40));
         let len_rc = OpRc::new(len_op);
         let result = pure.propagate_forward(len_rc.as_ref(), &len_rc, &mut None, &mut ctx);
@@ -3161,7 +3159,7 @@ mod tests {
             Some(OpRef::int_op(77))
         );
 
-        let mut replay = Op::new(
+        let replay = Op::new(
             OpCode::GetarrayitemGcI,
             &[
                 crate::history::test_support::rooted_resop_operand(Type::Int, 10),

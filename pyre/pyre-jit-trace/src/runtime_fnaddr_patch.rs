@@ -1862,7 +1862,7 @@ mod tests {
     fn publish_kind0_size_then_stamp(
         desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
     ) -> u32 {
-        use majit_ir::descr::{Descr, FieldDescr, SimpleSizeDescr, SizeDescr};
+        use majit_ir::descr::{SimpleSizeDescr, SizeDescr};
         let descr = crate::descr::make_descr_from_bh(&prebuilt_instance_size_descr(desc));
         let sd = descr
             .as_any()
