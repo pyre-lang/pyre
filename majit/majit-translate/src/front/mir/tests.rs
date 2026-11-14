@@ -37486,6 +37486,8 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
 
 /// Transitive harvest: a non-generic struct field of `RDict<K,V>` reaches
 /// `GcEntries` then `[Entry;0]`, and `f_valid` follows a 16-byte by-value key.
+/// A published copy of `Entry` may precede the defining TypeDecl; the scan
+/// still registers the instantiation named by the defining id.
 #[test]
 fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
     let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
@@ -37500,8 +37502,15 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
         {"Integer": {"Unsigned": ["Usize", "0"]}},
         {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
     ]);
-    let entry = serde_json::json!({
+    let entry_copy = serde_json::json!({
         "def_id": 0,
+        "item_meta": interior_meta(&["host", "rordereddict_entries", "Entry"], true),
+        "kind": {"Struct": [
+            {"name": "placeholder", "ty": bool_ty, "attr_info": null}
+        ]}
+    });
+    let entry = serde_json::json!({
+        "def_id": 5,
         "item_meta": interior_meta(&["host", "rordereddict_entries", "Entry"], true),
         "kind": {"Struct": [
             {"name": "key", "ty": tv0, "attr_info": null},
@@ -37536,7 +37545,7 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
         &["host", "rordereddict_entries", "GcEntries"],
         vec![serde_json::json!({
             "name": "items",
-            "ty": {"Array": [named_adt(0, vec![
+            "ty": {"Array": [named_adt(5, vec![
                 serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
                 serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
             ]), array_len, null]},
@@ -37564,11 +37573,14 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
             "attr_info": null
         })],
     );
-    let llbc = llbc_with_types(
+    let mut llbc = llbc_with_types(
         "host",
-        vec![entry, key16, gc_entries, rdict, holder],
+        vec![entry_copy, key16, gc_entries, rdict, holder, entry],
         vec![],
     );
+    if let Some(td) = llbc.type_decls_mut().find(|td| td.def_id == 0) {
+        td.published_struct_copy = true;
+    }
     let mut known = std::collections::HashSet::new();
     let mut fields = crate::front::semantic::StructFieldRegistry::default();
     let mut ids = std::collections::HashMap::new();

@@ -2076,8 +2076,8 @@ struct EntryInstantiation {
 
 struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
-    entry_id: u64,
-    gc_entries_id: Option<u64>,
+    entry_ids: std::collections::BTreeSet<u64>,
+    gc_entries_ids: std::collections::BTreeSet<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
     seen_inst: std::collections::HashSet<String>,
@@ -2194,7 +2194,7 @@ impl EntryInstantiationScan<'_> {
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
                 if let Some(id) = type_decl_ref_adt_id(adt) {
                     let args = render_adt_type_args(adt, self.llbc, depth);
-                    if (id == self.entry_id || self.gc_entries_id == Some(id))
+                    if (self.entry_ids.contains(&id) || self.gc_entries_ids.contains(&id))
                         && !args.is_empty()
                         && args
                             .iter()
@@ -2284,6 +2284,9 @@ impl EntryInstantiationScan<'_> {
 /// come from [`repr_c_struct_field_offset`] (resolved layout, else
 /// declaration order with [`instantiated_field_size_align`]). Qualified
 /// spellings only; the unsuffixed template keeps its TypeVar rows.
+/// Every TypeDecl spelling `rordereddict_entries::Entry` (a crate may
+/// hold a published copy) names the same entry, so the scan matches all
+/// of their ids; the result does not depend on TypeDecl order.
 fn register_ordereddict_entry_rows(
     llbc: &Llbc,
     known_struct_names: &mut std::collections::HashSet<String>,
@@ -2296,16 +2299,29 @@ fn register_ordereddict_entry_rows(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     let mut entry: Option<(u64, String)> = None;
-    let mut gc_entries_id = None;
+    let mut entry_is_copy = true;
+    let mut entry_ids = std::collections::BTreeSet::new();
+    let mut gc_entries_ids = std::collections::BTreeSet::new();
     for td in llbc.iter_type_decls() {
         let path = td.item_meta.name_path();
-        if entry.is_none()
-            && path.ends_with("rordereddict_entries::Entry")
+        if path.ends_with("rordereddict_entries::GcEntries") {
+            gc_entries_ids.insert(td.def_id);
+        }
+        if path.ends_with("rordereddict_entries::Entry")
             && matches!(td.kind, TypeDeclKind::Struct(_))
         {
-            entry = Some((td.def_id, path));
-        } else if gc_entries_id.is_none() && path.ends_with("rordereddict_entries::GcEntries") {
-            gc_entries_id = Some(td.def_id);
+            entry_ids.insert(td.def_id);
+            let better = match &entry {
+                None => true,
+                Some((id, _)) => {
+                    (!td.published_struct_copy && entry_is_copy)
+                        || (td.published_struct_copy == entry_is_copy && td.def_id < *id)
+                }
+            };
+            if better {
+                entry = Some((td.def_id, path));
+                entry_is_copy = td.published_struct_copy;
+            }
         }
     }
     let Some((entry_id, entry_path)) = entry else {
@@ -2313,8 +2329,8 @@ fn register_ordereddict_entry_rows(
     };
     let mut scan = EntryInstantiationScan {
         llbc,
-        entry_id,
-        gc_entries_id,
+        entry_ids,
+        gc_entries_ids,
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
         seen_inst: std::collections::HashSet::new(),
@@ -2349,6 +2365,7 @@ fn register_ordereddict_entry_rows(
     };
     let canonical_path = strip_crate_prefix(&entry_path);
     let template_sid = majit_ir::descr::StructId::from_canonical(&canonical_path);
+    scan.found.sort_by(|a, b| a.args.cmp(&b.args));
     for inst in scan.found {
         let args = inst.args;
         let subst = inst.subst;
