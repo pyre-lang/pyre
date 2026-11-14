@@ -15,8 +15,8 @@ use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::flowspace::model::Variable;
 use majit_translate::model::{
-    BlockId, CallFuncPtr, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation,
-    ValueType, VecFieldPart,
+    BlockId, CallFuncPtr, CallTarget, ConcreteType, FunctionGraph, IndirectFamilyKey, OpKind,
+    SpaceOperation, ValueType, VecFieldPart,
 };
 
 fn object_llbc() -> &'static Llbc {
@@ -360,9 +360,9 @@ fn first_input_kind(graph: &FunctionGraph) -> Option<(char, ValueType)> {
     None
 }
 
-fn first_indirect_call(
-    graph: &FunctionGraph,
-) -> Option<(BlockId, &[Variable], Option<&(String, String)>)> {
+fn first_indirect_call<'a>(
+    graph: &'a FunctionGraph,
+) -> Option<(BlockId, &'a [Variable], Option<&'a IndirectFamilyKey>)> {
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::IndirectCall {
@@ -402,8 +402,14 @@ fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
         caller.dump()
     );
     assert!(
-        family.is_some_and(|(trait_root, method)| {
-            trait_root.contains("DictStrategy") && method == "length"
+        family.is_some_and(|key| {
+            matches!(
+                key,
+                IndirectFamilyKey::DynTrait {
+                    trait_root,
+                    method_name
+                } if trait_root.contains("DictStrategy") && method_name == "length"
+            )
         }),
         "IndirectCall family must be DictStrategy::length, got {family:?}\n{}",
         caller.dump()

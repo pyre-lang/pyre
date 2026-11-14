@@ -32,23 +32,19 @@ use crate::pyobject::*;
 /// `gettypefor(typeptr)` (`W_Root.getclass`) once a live map is
 /// installed. RPython stores the typeptr on the object (`rclass.py`).
 ///
-/// `map` is an interned `MapNode` address held as a raw word. Node
-/// types live in this crate (`mapdict.rs`); intern/rewrite algorithms
-/// stay in the interpreter mapdict layer. A null `map`/`storage` is
-/// the `_mapdict_init_empty` state with `storage = None` (`mapdict.py`);
-/// the real terminator is installed by the mapdict layer on first
-/// attribute access.
+/// `map` is a GC [`crate::mapdict::MapRef`] (`mapdict.py`
+/// `MapdictStorageMixin.map`). Node types live in this crate
+/// (`mapdict.rs`); intern/rewrite algorithms stay in the interpreter
+/// mapdict layer. A null `map`/`storage` is the `_mapdict_init_empty`
+/// state with `storage = None` (`mapdict.py`); the real terminator is
+/// installed by the mapdict layer on first attribute access.
 #[repr(C)]
 pub struct W_ObjectObject {
     pub ob_header: PyObject,
-    /// `self.map` (`mapdict.py _set_mapdict_map`) — the interned map node's address held as
-    /// a raw word, not a pointer.  Map nodes are interned, shared per type and
-    /// never freed, so the GC neither owns nor traces this slot
-    /// (`object_object_custom_trace` walks only `storage`).  A pointer-typed
-    /// field would make the translator lower every read of it to a `Ref`,
-    /// which is what the JIT reserves for GC references; the word spelling
-    /// keeps the one field on one kind.  Cast to `MapRef` at each use.
-    pub map: usize,
+    /// `self.map` (`mapdict.py _set_mapdict_map`) — GC [`crate::mapdict::MapRef`].
+    /// `object_object_custom_trace` / `instance_walk_boxed_storage` visit this
+    /// slot. `_set_mapdict_map` writes it with a write barrier.
+    pub map: crate::mapdict::MapRef,
     /// `self.storage` (`mapdict.py _mapdict_init_empty`) — a `Ptr(GcArray(OBJECTPTR))` block of
     /// attribute values (`ItemsBlock`, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID`).
     /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py`).
@@ -62,9 +58,19 @@ pub struct W_ObjectObject {
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ObjectObject, storage)
-            == std::mem::offset_of!(W_ObjectObject, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ObjectObject, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    /// [`W_ObjectObjectUser`] is layout-identical, so both typeptrs share this
+    /// table (`MapdictStorageMixin._get_mapdict_map` / `BaseUserClassMapdict.getclass`).
+    /// `copy_getclass` is the `import_from_mixin` copy; other carriers share
+    /// [`crate::mapdict::base_user_class_mapdict_getclass`] (`_share_methods`).
+    pub static W_OBJECT_OBJECT_MAPDICT_ACCESS for W_ObjectObject, copy_getclass;
+}
 
 /// Fixed payload size of the `[ob_header | map | storage]` instance
 /// payload (`framework.py:811`).
@@ -185,7 +191,7 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     // `_mapdict_init_empty(w_subtype.terminator)`). The type owns that
     // word from `typeobject.py W_TypeObject.__init__`.
     //
-    // Zero stays legal: `_getusercls` allocators stamp `map: 0` because
+    // Null stays legal: `_getusercls` allocators stamp a null map because
     // `pyre-object` cannot call the interpreter mapdict layer. First
     // attribute access copies `w_subtype.terminator`. The `is_type` test
     // keeps the sentinel used by single-crate tests from being dereferenced
@@ -201,12 +207,15 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let map = unsafe {
         if crate::typeobject::is_type(w_class) {
-            crate::typeobject::w_type_get_terminator(w_class) as usize
+            crate::typeobject::w_type_get_terminator(w_class)
         } else {
-            0
+            std::ptr::null()
         }
     };
+    let map_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(map as crate::pyobject::PyObjectRef);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
     // Exact `object()` keeps `INSTANCE_TYPE`. Anything else — a user class,
     // a builtin that still allocates this attribute bag, a dict subclass, a
     // null sentinel — takes `INSTANCE_USER_TYPE` (`typedef.py`
@@ -224,16 +233,20 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
 /// [`INSTANCE_TYPE`]. `#[inline(never)]` so `fuse_boxing_alloc` sees
 /// `malloc_typed_managed` + constant `ob_type` and emits `new_with_vtable`.
 #[inline(never)]
-fn alloc_exact_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
+fn alloc_exact_object_instance(w_class: PyObjectRef, map: crate::mapdict::MapRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
+    let map_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(map as crate::pyobject::PyObjectRef);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
     let header_class =
         unsafe { layout_header_class(&INSTANCE_TYPE as *const PyType, w_class, map) };
     let header_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(header_class);
     let header_class = crate::gc_roots::shadow_stack_get(header_slot);
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
     crate::lltype::malloc_typed_managed(W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE,
@@ -247,16 +260,20 @@ fn alloc_exact_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef 
 /// `rclass.new_instance` graph for `_getusercls(W_ObjectObject)`: one
 /// STRUCT, constant [`INSTANCE_USER_TYPE`].
 #[inline(never)]
-fn alloc_user_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
+fn alloc_user_object_instance(w_class: PyObjectRef, map: crate::mapdict::MapRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
+    let map_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(map as crate::pyobject::PyObjectRef);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
     let header_class =
         unsafe { layout_header_class(&INSTANCE_USER_TYPE as *const PyType, w_class, map) };
     let header_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(header_class);
     let header_class = crate::gc_roots::shadow_stack_get(header_slot);
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
     crate::lltype::malloc_typed_managed(W_ObjectObjectUser {
         base: W_ObjectObject {
             ob_header: PyObject {

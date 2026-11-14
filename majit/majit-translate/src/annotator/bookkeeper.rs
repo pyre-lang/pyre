@@ -50,6 +50,7 @@ use crate::flowspace::argument::CallShape;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
+use crate::model::IndirectFamilyKey;
 use crate::tool::algo::unionfind::UnionFind;
 
 /// Key of `Bookkeeper.immutable_cache` (`bookkeeper.py`).
@@ -580,6 +581,19 @@ pub struct Bookkeeper {
     /// Type spellings of that slot (`ProfileFunc`, `Option<ProfileFunc>`,
     /// expanded `fn(...)` after alias peel).
     profilefunc_spellings: RefCell<Vec<String>>,
+    /// Harvested FnPtr-field families (`IndirectFamilyKey::FnPtrField`).
+    ///
+    /// The family object is the key (`FunctionReprBase.call` /
+    /// `description.py FunctionDesc`). Intern of a family field does not
+    /// project `SomePtr(FuncType)` (`project_struct_rows`); the attribute
+    /// starts as `s_ImpossibleValue` (`classdesc.py Attribute.__init__`).
+    fnptr_family_fields: RefCell<HashSet<IndirectFamilyKey>>,
+    /// Function objects that are members of a harvested FnPtr-field
+    /// family (`CallControl.fnptr_field_family_impls`). The set is the
+    /// `Bookkeeper.getdesc` domain (`bookkeeper.py`), not a field-keyed
+    /// table: `immutablevalue` of a FunDecl constant of a member is
+    /// `SomePBC([self.getdesc(x)])`.
+    fnptr_family_functions: RefCell<HashSet<HostObject>>,
 }
 
 /// One `_exception_class_<Enum>` hierarchy after mint.
@@ -1951,6 +1965,8 @@ impl Bookkeeper {
             profilefunc_family: RefCell::new(Vec::new()),
             profilefunc_paths: RefCell::new(Vec::new()),
             profilefunc_spellings: RefCell::new(Vec::new()),
+            fnptr_family_fields: RefCell::new(HashSet::new()),
+            fnptr_family_functions: RefCell::new(HashSet::new()),
         }
     }
 
@@ -2533,6 +2549,11 @@ impl Bookkeeper {
             && !self.field_ty_is_nullable_ptr(ty)
             && !self.struct_ty_has_raw_pointer_field(ty)
             && !self.ty_is_raw_word_owner(ty)
+            && !self
+                .struct_fields
+                .borrow()
+                .as_ref()
+                .is_some_and(|reg| struct_root_is_gcarray_item(reg, ty))
     }
 
     fn ty_is_raw_word_owner(&self, ty: &str) -> bool {
@@ -4053,6 +4074,10 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Option<Rc<RefCell<ClassDef>>> {
+        let registry = self.struct_fields.borrow().clone();
+        if struct_root_refuses_classdef_intern(root, registry.as_deref()) {
+            return None;
+        }
         if !self.struct_root_is_known(root) {
             return None;
         }
@@ -4070,7 +4095,7 @@ impl Bookkeeper {
         {
             let fields = self.struct_fields.borrow();
             if let Some(reg) = fields.as_ref()
-                && (reg.fields.contains_key(root) || reg.fields.contains_key(canonical.as_str()))
+                && (reg.struct_root_rows_known(root) || reg.struct_root_rows_known(&canonical))
             {
                 return true;
             }
@@ -4120,6 +4145,13 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // `IdentityKey` is the object pointer (`identitydict.py`); minting
+        // a sibling ClassDef makes `generalize_key` raise
+        // `PyObject ∪ IdentityKey` (`rclass.py` no common base).
+        if is_identity_key_spelling(root) {
+            return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
+        }
+        let registry = self.struct_fields.borrow().clone();
         // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
         // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
         // `SomePtr(GCREF)` and raises (`llannotation.py`
@@ -4129,6 +4161,11 @@ impl Bookkeeper {
                 "lltype.GcOpaqueType has no ClassDef: {root}"
             )));
         }
+        if struct_root_refuses_classdef_new(root, registry.as_deref()) {
+            return Err(AnnotatorError::new(format!(
+                "struct root {root} is not a ClassDef intern"
+            )));
+        }
         // rlist.py ListRepr / listdef.py ListDef: a list is not a
         // class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
         if crate::front::semantic::is_list_family_spelling(root) {
@@ -4136,6 +4173,7 @@ impl Bookkeeper {
                 "listdef.py ListDef has no ClassDef: {root}"
             )));
         }
+
         let determinism_trace = crate::determinism_trace_enabled();
         if determinism_trace {
             eprintln!("[DTRACE-CLASS] struct_root root={root}");
@@ -4162,7 +4200,7 @@ impl Bookkeeper {
             if graph.contains(&n) {
                 continue;
             }
-            if is_gcref_type_spelling(&n) {
+            if struct_root_refuses_classdef_new(&n, registry.as_deref()) {
                 continue;
             }
             if crate::front::semantic::is_list_family_spelling(&n) {
@@ -4195,7 +4233,7 @@ impl Bookkeeper {
             let referenced: Vec<String> = {
                 let guard = self.struct_fields.borrow();
                 if let Some(reg) = guard.as_ref() {
-                    if let Some(fields) = reg.fields.get(&n) {
+                    if let Some(fields) = reg.intern_field_rows(&n) {
                         let mut out: Vec<String> = Vec::new();
                         for row in fields {
                             if row.name == "__class__" {
@@ -4258,6 +4296,40 @@ impl Bookkeeper {
         self.getuniqueclassdef(&host)
     }
 
+    /// Class object for a generic core enum receiver whose annotation reads
+    /// the declaration's discriminant (`Bookkeeper.getuniqueclassdef` and
+    /// `ClassRepr.getclsfield`).
+    ///
+    /// Option/Result values normally have no instance `ClassDef`: a pointer
+    /// niche is `SomeInstance(can_be_None=True)`, and a tagged value is its
+    /// low-level struct.  A generic method receiver is different: Charon has
+    /// already resolved its `class_root` to the enum declaration, and the
+    /// class operation needs that declaration's discriminant-only vtable.
+    /// Select it by the harvested TypeDecl identity, never by its path.
+    pub fn getuniqueclassdef_for_core_enum_decl_receiver(
+        self: &Rc<Self>,
+        root: &str,
+    ) -> Option<Rc<RefCell<ClassDef>>> {
+        let identity = {
+            let registry = self.struct_fields.borrow();
+            let reg = registry.as_ref()?;
+            let identity = struct_root_declaration_identity(reg, root)?;
+            if !reg.option_struct_ids.contains(&identity.id)
+                && !reg.result_struct_ids.contains(&identity.id)
+            {
+                return None;
+            }
+            if !reg.is_enum_base(&identity.spelling) {
+                return None;
+            }
+            identity.clone()
+        };
+        let host = self.intern_class_by_qualname(&identity.spelling);
+        let classdef = self.getuniqueclassdef(&host).ok()?;
+        self.project_struct_rows(&identity.spelling).ok()?;
+        Some(classdef)
+    }
+
     /// TODO: no upstream equivalent.  The closest thing upstream,
     /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
     /// `:353-363`), keys identity on the Python object; pyre has no such
@@ -4285,7 +4357,18 @@ impl Bookkeeper {
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         // Base first — registers the discriminant-only root and publishes
         // its identity-keyed HostObject in the struct-root cache.
-        self.getuniqueclassdef_for_struct_root(enum_root)?;
+        // A generic core enum receiver uses the declaration class object
+        // (`Bookkeeper.getuniqueclassdef`); its variant still subclasses
+        // that object for `ClassRepr.getclsfield` knowntypedata narrowing.
+        if self.getuniqueclassdef_for_struct_root(enum_root).is_err()
+            && self
+                .getuniqueclassdef_for_core_enum_decl_receiver(enum_root)
+                .is_none()
+        {
+            return Err(AnnotatorError::new(format!(
+                "struct root {enum_root} is not a ClassDef intern"
+            )));
+        }
         // Variant subclass — interned WITH the base so ClassDesc::new
         // wires basedef. The SAME interning primitive the variant
         // CONSTRUCTOR path uses ([`Self::intern_enum_variant_host`]), so
@@ -4616,11 +4699,7 @@ impl Bookkeeper {
                     {
                         r.fields.get(n).cloned()
                     } else {
-                        r.fields.get(n).cloned().or_else(|| {
-                            r.fields
-                                .get(majit_ir::descr::strip_generic_args(n).as_ref())
-                                .cloned()
-                        })
+                        r.intern_field_rows(n).map(|rows| rows.to_vec())
                     }
                 }) {
                     Some(f) => f,
@@ -4842,7 +4921,22 @@ impl Bookkeeper {
                     self.transparent_scalar_annotation(&row.ty).is_some()
                         && matches!(&attr.s_value, SomeValue::Instance(_))
                         && matches!(s_value, SomeValue::Integer(_));
-                if matches!(attr.s_value, SomeValue::Impossible)
+                // A harvested FnPtr-field family does not intern a field
+                // type (`project_struct_field_type`). The attribute starts
+                // as `s_ImpossibleValue` (`classdesc.py Attribute.__init__`);
+                // `ClassDef.add_source_for_attribute` unions sources onto it.
+                // Drop only the FORCE Int-bank / untyped `SomePtr(FuncType)`
+                // shell of a `fn` spelling — not a real annotation.
+                if self.is_fnptr_family_field(n, &row.name) {
+                    let is_int_force_shell =
+                        crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value);
+                    if is_int_force_shell || is_fnptr_type_intern(&attr.s_value) {
+                        attr.s_value = SomeValue::Impossible;
+                    }
+                } else if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
                     || is_profilefunc_force_shell
@@ -5003,6 +5097,14 @@ impl Bookkeeper {
         if crate::front::semantic::is_list_family_spelling(name)
             || crate::front::semantic::is_list_family_spelling(&cur)
         {
+            return crate::flowspace::model::HostObject::new_opaque(cur);
+        }
+        // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct`, not a
+        // class (`bookkeeper.py` `getdesc`). A monomorph intern's under
+        // its own `<…>` key.
+        if self.struct_fields.borrow().as_ref().is_some_and(|reg| {
+            struct_root_is_gcarray_item(reg, name) || struct_root_is_gcarray_item(reg, &cur)
+        }) {
             return crate::flowspace::model::HostObject::new_opaque(cur);
         }
         loop {
@@ -5175,21 +5277,17 @@ impl Bookkeeper {
                         return None;
                     }
                 }
-                // `Entry<K,V>` is one struct body per monomorphization.
-                // Instantiations subclass the template so a phi can meet
-                // on the unsuffixed class while each `key` write stays on
-                // its own class (`bookkeeper.py` `getuniqueclassdef`).
+                // A `GcArray` ITEM template is `lltype.py` `Struct`
+                // (`rordereddict.py` `DICTENTRY`), not a class. Parenting
+                // a monomorph to it intern's `SomeInstance` of the same
+                // spelling dest stamps as `SomePtr`
+                // (`llannotation.py` `lltype_to_annotation`), and
+                // `mergeinputargs` raises Instance ∪ Ptr.
                 let stripped = majit_ir::descr::strip_generic_args(&lookup);
-                let template_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
-                let is_entry = template_leaf == "Entry"
-                    && (stripped.ends_with("rordereddict_entries::Entry")
-                        || stripped.as_ref() == "Entry");
                 if stripped.as_ref() != lookup.as_str()
-                    && is_entry
-                    && reg.fields.contains_key(stripped.as_ref())
-                    && !seen.contains(stripped.as_ref())
+                    && struct_root_is_gcarray_item(reg, stripped.as_ref())
                 {
-                    return Some(stripped.into_owned());
+                    return None;
                 }
                 // The registry publishes a full declaration path and a bare
                 // convenience alias.  `harden_duplicate_leaf_metadata`
@@ -5301,6 +5399,103 @@ impl Bookkeeper {
         self.stamp_immutable_fields(&host, &key);
         self.insert_struct_root_class(key, host.clone());
         host
+    }
+
+    /// Record a harvested FnPtr-field family (`IndirectFamilyKey::FnPtrField`)
+    /// and the member function objects (`Bookkeeper.getdesc` domain).
+    ///
+    /// Intern of this field does not project a field type
+    /// (`project_struct_rows`). A FunDecl constant of a member annotates
+    /// as `SomePBC([getdesc(func)])` (`bookkeeper.py immutablevalue`).
+    pub(crate) fn register_fnptr_family_field(
+        &self,
+        struct_path: &str,
+        field: &str,
+        hosts: Vec<HostObject>,
+    ) {
+        let mut spellings = vec![struct_path.to_string()];
+        let intern = self.intern_class_key(struct_path);
+        if intern != struct_path {
+            spellings.push(intern);
+        }
+        let dotted = struct_path.replace("::", ".");
+        if dotted != struct_path {
+            let intern_dotted = self.intern_class_key(&dotted);
+            if !spellings.contains(&intern_dotted) {
+                spellings.push(intern_dotted);
+            }
+        }
+        let mut fields = self.fnptr_family_fields.borrow_mut();
+        for spelling in spellings {
+            fields.insert(IndirectFamilyKey::fnptr_field(spelling, field));
+        }
+        let mut functions = self.fnptr_family_functions.borrow_mut();
+        for host in hosts {
+            functions.insert(host);
+        }
+    }
+
+    /// Whether `(owner, field)` is a harvested FnPtr-field family slot.
+    pub(crate) fn is_fnptr_family_field(&self, owner: &str, field: &str) -> bool {
+        let key = IndirectFamilyKey::fnptr_field(owner, field);
+        if self.fnptr_family_fields.borrow().contains(&key) {
+            return true;
+        }
+        let intern = self.intern_class_key(owner);
+        intern != owner
+            && self
+                .fnptr_family_fields
+                .borrow()
+                .contains(&IndirectFamilyKey::fnptr_field(intern, field))
+    }
+
+    /// `Bookkeeper.getdesc` of a FunDecl constant that is a harvested
+    /// family member (`bookkeeper.py immutablevalue` callable arm).
+    fn fnptr_family_member_host(
+        &self,
+        llptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    ) -> Option<HostObject> {
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, PtrObj};
+        let PtrObj::Strong(_ptr_obj::Func(func)) = &llptr._obj0 else {
+            return None;
+        };
+        let members = self.fnptr_family_functions.borrow();
+        if members.is_empty() {
+            return None;
+        }
+        if let Some(gid) = func.graph {
+            let mut graph_hits = Vec::new();
+            for host in members.iter() {
+                if let Some(entry) = self.descs.borrow().get(host)
+                    && function_desc_has_graph_id(entry, gid)
+                {
+                    graph_hits.push(host.clone());
+                }
+            }
+            if graph_hits.len() == 1 {
+                return Some(graph_hits[0].clone());
+            }
+        }
+        let name = func._name.as_str();
+        let last = name.rsplit("::").next().unwrap_or(name);
+        let mut exact = Vec::new();
+        let mut last_hits = Vec::new();
+        for host in members.iter() {
+            let q = host.qualname();
+            if q == name || name.strip_suffix(q).is_some_and(|p| p.ends_with("::")) {
+                exact.push(host.clone());
+            }
+            if q == last {
+                last_hits.push(host.clone());
+            }
+        }
+        if exact.len() == 1 {
+            return Some(exact[0].clone());
+        }
+        if last_hits.len() == 1 {
+            return Some(last_hits[0].clone());
+        }
+        None
     }
 
     /// Intern the harvested class object under its declaration key.
@@ -5779,7 +5974,7 @@ impl Bookkeeper {
         // identity). The constructor is that pointer, so the dict key
         // cell is the same nullable instance. A separate `IdentityKey`
         // class has no common base with `PyObject`.
-        if t == "IdentityKey" || t.ends_with("::IdentityKey") {
+        if is_identity_key_spelling(t) {
             return self.project_struct_field_type("PyObjectRef");
         }
         // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
@@ -6085,18 +6280,33 @@ impl Bookkeeper {
             // share one intern via `strip_generic_leaf`. The Option is the
             // one-word nullable payload exactly when `union(payload, s_None)`
             // succeeds (`model.py` `SomeObject.noneify` raising `UnionError`
-            // for annotations that cannot hold None); otherwise it is the
-            // split tagged enum instance (`getuniqueclassdef`).
+            // for annotations that cannot hold None); otherwise it is a
+            // low-level tagged struct value, not an instance ClassDef.
             let s_none = super::model::s_none();
             match super::model::unionof([&s_inner, &s_none]) {
                 Ok(s) => return s,
-                Err(_) => return self.project_tagged_enum_instantiation(stripped),
+                Err(_) => {
+                    if let Some(s_ptr) = self.raw_struct_ptr_annotation(stripped) {
+                        return s_ptr;
+                    }
+                    return self.project_tagged_enum_instantiation(stripped);
+                }
             }
         }
         // `Result<Never, E>` is still the Result ADT on a field
         // (`Try::branch` stores `Result::Err` in `ControlFlow::Break`).
         // Peeling the field to `E` unions `Result::Err ∪ PyErrorObject`.
         if strip_generic_leaf(stripped, "Result").is_some() {
+            let is_core_result = self
+                .struct_fields
+                .borrow()
+                .as_ref()
+                .is_some_and(|reg| struct_root_is_core_result(stripped, reg));
+            if is_core_result {
+                if let Some(s_ptr) = self.raw_struct_ptr_annotation(stripped) {
+                    return s_ptr;
+                }
+            }
             return self.project_tagged_enum_instantiation(stripped);
         }
         for dict_wrapper in ["HashMap<", "BTreeMap<", "IndexMap<"] {
@@ -6149,31 +6359,13 @@ impl Bookkeeper {
         if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
             return self.project_struct_field_type(&format!("*mut {inner}"));
         }
-        // `cell::UnsafeCell<T>` is the cell word (`lltype.py` `getfield`).
-        // `field_row_struct_identity` qualifies the leaf, so the
-        // prefix-only `UnsafeCell<` peel below would miss and mint
-        // `SomeInstance(cell::UnsafeCell)`.
-        if let Some(inner) = strip_generic_leaf(stripped, "UnsafeCell") {
+        // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested class
+        // (`nestedscope.py CellFamily.ever_mutated`). Charon spells the
+        // wrapper as `cell::UnsafeCell<RBigInt>`; a prefix-only peel
+        // intern's that name as ClassDef and setattr of the cell word
+        // unions `RBigInt ∪ UnsafeCell`.
+        if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
             return self.project_struct_field_type(inner);
-        }
-        for wrapper in [
-            "Rc<",
-            "Arc<",
-            "Box<",
-            "RefCell<",
-            "Cell<",
-            "Pin<",
-            "NonNull<",
-            "NonZero<",
-            "MaybeUninit<",
-            "ManuallyDrop<",
-            "UnsafeCell<",
-            "Wrapping<",
-            "Reverse<",
-        ] {
-            if let Some(inner) = strip_generic_one(stripped, wrapper) {
-                return self.project_struct_field_type(inner);
-            }
         }
         if let Some(inner) = strip_generic_one(stripped, "Cow<") {
             let parts = split_generic_args(inner);
@@ -6301,6 +6493,24 @@ impl Bookkeeper {
         // A Rust-repr aggregate is `rclass.py` `getinstancerepr` (default gc).
         if let Some(s_ptr) = self.raw_struct_ptr_annotation(named_root.as_ref()) {
             return s_ptr;
+        }
+        // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined in
+        // `GcArray` (`get_ll_dict`); `llannotation.py` `lltype_to_annotation`
+        // of `lltype.Ptr(DICTENTRY)` is SomePtr. A ClassDef intern of the
+        // unsuffixed template projects a `??TypeVar` field as Impossible
+        // (`ClassDef.about_attribute`).
+        {
+            let guard = self.struct_fields.borrow();
+            if let Some(reg) = guard.as_ref()
+                && struct_root_is_gcarray_item(reg, stripped)
+            {
+                if let Some(s_ptr) =
+                    crate::front::mir::gcarray_item_struct_ptr_annotation(reg, stripped)
+                {
+                    return s_ptr;
+                }
+                return SomeValue::Impossible;
+            }
         }
         {
             let guard = self.struct_fields.borrow();
@@ -7102,7 +7312,18 @@ impl Bookkeeper {
                 let entry = self.getdesc_for_const(x)?;
                 Ok(SomeValue::PBC(SomePBC::new(vec![entry], false)))
             }
-            ConstValue::LLPtr(_) => {
+            ConstValue::LLPtr(llptr) => {
+                // bookkeeper.py `immutablevalue`: `callable(x)` →
+                // `SomePBC([self.getdesc(x)])`. A FunDecl constant of a
+                // harvested family member is that function object
+                // (`CallControl.fnptr_field_family_impls`).
+                if let Some(host) = self.fnptr_family_member_host(llptr)
+                    && let Ok(desc) = self.getdesc(&host)
+                {
+                    let mut pbc = SomePBC::new(vec![desc], false);
+                    pbc.base.const_box = Some(Constant::new(x.clone()));
+                    return Ok(SomeValue::PBC(pbc));
+                }
                 assert!(crate::translator::rtyper::extregistry::is_registered(x));
                 let entry = crate::translator::rtyper::extregistry::lookup(x).expect(
                     "Bookkeeper.immutablevalue(LLPtr): extregistry.lookup must succeed after \
@@ -7781,21 +8002,27 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
-/// `lltype.GCREF` and the Rust pointee of `*mut GCREFOpaque`.
-/// `llannotation.py` `lltype_to_annotation` maps GCREF to `SomePtr`;
-/// `__cast_instance_intrinsic` must not mint a `GCREFOpaque` classdef
-/// (`pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr).
+/// `identitydict.py IdentityKey`: `repr(transparent)` over `PyObjectRef`.
+/// The key cell is the object (`rclass.py` identity hash); a sibling
+/// ClassDef has no common base with `PyObject`.
+pub(crate) fn is_identity_key_spelling(stripped: &str) -> bool {
+    stripped == "IdentityKey" || stripped.ends_with("::IdentityKey")
+}
+
+/// `lltype.GCREF` (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
+/// and the Rust pointee `majit_gc::header::GCREFOpaque`
+/// (`type GCREF = *mut GCREFOpaque`). Compared by declared path in
+/// [`spelling_is_declared_path`], not by a leaf suffix.
 ///
 /// Prefixes (`*mut`, `*const`, `&`) are peeled so one predicate covers
-/// `GCREF`, `GCREFOpaque`, `*mut GCREFOpaque`, `header::GCREFOpaque`,
-/// `gc_hook::GCREFOpaque`.
+/// the alias, the pointee, and a pointer onto that pointee.
 pub(crate) fn is_gcref_type_spelling(stripped: &str) -> bool {
     let stripped = peel_ref_and_ptr_prefixes(stripped);
-    stripped == "GCREF"
-        || stripped == "gcref"
-        || stripped == "GCREFOpaque"
-        || stripped.ends_with("::GCREF")
-        || stripped.ends_with("::GCREFOpaque")
+    const DECLARED_OPAQUE: &str = "majit_gc::header::GCREFOpaque";
+    const DECLARED_ALIAS: &str = "majit_gc::header::GCREF";
+    stripped == "gcref"
+        || spelling_is_declared_path(stripped, DECLARED_OPAQUE)
+        || spelling_is_declared_path(stripped, DECLARED_ALIAS)
 }
 
 /// `llmemory.py` `GCREF = lltype.Ptr(lltype.GcOpaqueType('GCREF'))`.
@@ -7803,6 +8030,381 @@ pub(crate) fn gcref_ptr_annotation() -> super::model::SomeValue {
     crate::translator::rtyper::llannotation::lltype_to_annotation(
         crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
     )
+}
+
+/// rstr `STR` / WTF-8 string-family class roots. Interning these as
+/// `SomeInstance(ClassDef)` makes `String ∪ Instance(Utf8Str)` fail
+/// and `jtransform.py Transformer._handle_stroruni_call` reject the
+/// receiver (`SoU.TO` must be `rstr.STR` or `UNICODE`).
+pub(crate) fn struct_root_is_string_family(root: &str) -> bool {
+    if is_string_spelling(root) {
+        return true;
+    }
+    if crate::front::mir::is_str_family_class_root(root)
+        || crate::front::mir::is_str_oopspec_class_root(root)
+    {
+        return true;
+    }
+    let canonical = majit_ir::descr::canonical_struct_name(root);
+    crate::front::mir::is_str_family_class_root(&canonical)
+        || crate::front::mir::is_str_oopspec_class_root(&canonical)
+}
+
+/// `spelling` is `declared` or a crate prefix of that path, or the intern
+/// leaf of that one declaration (`lltype.GcOpaqueType` name / TypeDecl leaf).
+fn spelling_is_declared_path(spelling: &str, declared: &str) -> bool {
+    if spelling == declared {
+        return true;
+    }
+    if spelling
+        .strip_suffix(declared)
+        .is_some_and(|prefix| prefix.ends_with("::"))
+    {
+        return true;
+    }
+    if spelling == declared.rsplit("::").next().unwrap_or(declared) {
+        return true;
+    }
+    declared.split_once("::").is_some_and(|(_, rest)| {
+        spelling == rest
+            || spelling
+                .strip_suffix(rest)
+                .is_some_and(|prefix| prefix.ends_with("::"))
+    })
+}
+
+/// GC-transform owner-root handle. Return dest and harvest skip ClassDef
+/// intern; `New` interns via [`Bookkeeper::getuniqueclassdef_for_struct_root`].
+fn is_owner_root_handle(root: &str) -> bool {
+    crate::front::mir::owner_root_type_path(root)
+        || root
+            == crate::front::mir::OWNER_ROOT_DECLARED_PATH
+                .rsplit("::")
+                .next()
+                .unwrap_or(crate::front::mir::OWNER_ROOT_DECLARED_PATH)
+}
+
+/// Harvested `StructId` of `root` when that spelling names a declaration
+/// this registry intern's (`intern_class_key_from_registry` / template
+/// peel). A hand-built fixture with no `class_identity` still matches
+/// the harvested Option/Result `StructId` set via the intern key.
+fn struct_root_declaration_id(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+) -> Option<majit_ir::descr::StructId> {
+    struct_root_declaration_identity(reg, root).map(|identity| identity.id)
+}
+
+fn struct_root_declaration_identity<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    root: &str,
+) -> Option<&'a crate::front::semantic::ClassIdentity> {
+    let lookup = normalize_class_qualname(root);
+    let key = intern_class_key_from_registry(reg, &lookup, true);
+    if let Some(Some(ci)) = reg.class_identity.get(&key) {
+        return Some(ci);
+    }
+    let template = majit_ir::descr::strip_generic_args(&key);
+    if let Some(Some(ci)) = reg.class_identity.get(template.as_ref()) {
+        return Some(ci);
+    }
+    if let Some(Some(ci)) = reg.class_identity.get(&lookup) {
+        return Some(ci);
+    }
+    None
+}
+
+fn struct_root_matches_struct_ids(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+    ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    if let Some(id) = struct_root_declaration_id(reg, root)
+        && ids.contains(&id)
+    {
+        return true;
+    }
+    let lookup = normalize_class_qualname(root);
+    let key = intern_class_key_from_registry(reg, &lookup, true);
+    let template = majit_ir::descr::strip_generic_args(&key);
+    ids.contains(&majit_ir::descr::StructId::from_canonical(
+        template.as_ref(),
+    )) || ids.contains(&majit_ir::descr::StructId::from_canonical(&key))
+}
+
+/// `core::option::Option` TypeDecl (`tyref_is_option`). Not a ClassDef.
+fn struct_root_is_core_option(root: &str, reg: &crate::front::StructFieldRegistry) -> bool {
+    struct_root_matches_struct_ids(reg, root, &reg.option_struct_ids)
+}
+
+/// `core::result::Result` TypeDecl (`tyref_is_result`). Not a ClassDef.
+fn struct_root_is_core_result(root: &str, reg: &crate::front::StructFieldRegistry) -> bool {
+    struct_root_matches_struct_ids(reg, root, &reg.result_struct_ids)
+}
+
+fn struct_root_is_core_option_or_result(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> bool {
+    registry.is_some_and(|reg| {
+        struct_root_is_core_option(root, reg) || struct_root_is_core_result(root, reg)
+    })
+}
+
+/// Declaration template (`option::Option`, `result::Result`), not a
+/// monomorph `Option<T>`. `CallRegistry::ensure_session` intern's
+/// `struct_root_names` (the TypeDecl `name_path`, Instantiated dropped),
+/// so refusing only this spelling keeps the prologue from minting one
+/// payload ClassDef that every instantiation would share. An
+/// instantiation intern's on first use; dest/harvest still refuse every
+/// Option/Result spelling via [`struct_root_refuses_classdef_intern`].
+fn struct_root_is_core_option_or_result_template(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> bool {
+    registry.is_some_and(|reg| {
+        if !struct_root_is_core_option(root, reg) && !struct_root_is_core_result(root, reg) {
+            return false;
+        }
+        let lookup = normalize_class_qualname(root);
+        let key = intern_class_key_from_registry(reg, &lookup, true);
+        !key.contains('<')
+    })
+}
+
+/// Declared two-field `{integer, [T; 0]}` (`lltype.py` `GcArray`).
+/// A primitive ITEM is `Ptr(GcArray)`; an object/struct ITEM is the
+/// `FixedSizeListRepr` list on `attrs[items]`. Neither is a ClassDef intern.
+fn struct_root_is_gcarray_ptr_wrapper(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> bool {
+    registry.is_some_and(|reg| {
+        if !crate::front::mir::spelling_is_declared_gc(&reg.gc_struct_ids, root) {
+            return false;
+        }
+        let Some(rows) = reg.intern_field_rows(root) else {
+            return false;
+        };
+        flexible_gcarray_wrapper_items_field(rows).is_some()
+    })
+}
+
+/// Non-GC `lltype.py` `Struct` inlined as `GcArray` ITEM (`rordereddict.py`
+/// `DICTENTRY` in `get_ll_dict`). `bookkeeper.py` `getuniqueclassdef`
+/// intern's classes; this layout is not one. A pointer ITEM stays the
+/// `FixedSizeListRepr` list.
+///
+/// Harvest dual-publishes the TypeDecl `name_path`, the crate-stripped
+/// identity, and the leaf (`derive_program_metadata`). Lookup uses
+/// [`intern_class_key_from_registry`] (`bookkeeper.py` `getdesc` /
+/// `getuniqueclassdef`) so those aliases share one ITEM key. Declared-GC
+/// membership is this declaration's identity
+/// ([`intern_key_is_declared_gc`]): `note_declared_gc_owner` also stores
+/// the leaf `StructId`, which is not this TypeDecl.
+///
+/// A monomorph `Entry<K, V>` keeps its own ClassDef
+/// (`bookkeeper.py` `getdesc` / `getuniqueclassdef` intern one class
+/// object per instantiation). Only the unsuffixed template is the
+/// inlined `lltype.py` `Struct`.
+pub(crate) fn struct_root_is_gcarray_item(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+) -> bool {
+    let mut spelling = root.trim();
+    if let Some(pointee) = crate::front::typestr::peel_pointer_prefix(spelling) {
+        spelling = pointee.trim().trim_start_matches("mut ");
+    }
+    let interned = intern_class_key_from_registry(reg, spelling, true);
+    if interned.contains('<') {
+        return false;
+    }
+    let Some(item_key) = gcarray_item_identity_key(reg, root) else {
+        return false;
+    };
+    gcarray_item_keys_contain(reg, &item_key)
+}
+
+/// Lowering recast skip: the unsuffixed template is ITEM, so an
+/// instantiation is too (`rordereddict.py` `DICTENTRY` is `lltype.py`
+/// `Struct` in `GcArray`). Intern of a monomorph still keeps its
+/// ClassDef ([`struct_root_is_gcarray_item`] is false when the intern
+/// key carries `<…>`).
+pub(crate) fn struct_root_template_is_gcarray_item(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+) -> bool {
+    let template = majit_ir::descr::strip_generic_args(root);
+    struct_root_is_gcarray_item(reg, template.as_ref())
+}
+
+/// Class-identity key of a non-GC `GcArray` ITEM spelling.
+fn gcarray_item_identity_key(
+    reg: &crate::front::StructFieldRegistry,
+    spelling: &str,
+) -> Option<String> {
+    let mut spelling = spelling.trim();
+    if let Some(pointee) = crate::front::typestr::peel_pointer_prefix(spelling) {
+        spelling = pointee.trim().trim_start_matches("mut ");
+    }
+    if spelling.is_empty() || spelling.starts_with("??") || spelling.starts_with('[') {
+        return None;
+    }
+    let key = intern_class_key_from_registry(reg, spelling, true);
+    let key = majit_ir::descr::strip_generic_args(&key).into_owned();
+    if key.starts_with("??") || key.starts_with('[') {
+        return None;
+    }
+    if intern_key_is_declared_gc(reg, &key) {
+        return None;
+    }
+    if reg.intern_field_rows(&key).is_none()
+        && reg.resolved_owner_key(spelling).is_none()
+        && !matches!(reg.class_identity.get(&key), Some(Some(_)))
+        && !matches!(reg.class_identity.get(spelling), Some(Some(_)))
+    {
+        return None;
+    }
+    Some(key)
+}
+
+/// Declared-`Gc` of this intern key (`lltype.py` `GcStruct`). Harvest's
+/// leaf `StructId` (`note_declared_gc_owner`) is another TypeDecl's
+/// token and is not read here. A unique `class_identity` hit uses that
+/// declaration's id; a clash (`None`) is not this TypeDecl. A miss uses
+/// path-identity GC so a bare leaf that collides with a harvested
+/// `StructId` is not this TypeDecl unless the spelling itself is that
+/// path.
+fn intern_key_is_declared_gc(reg: &crate::front::StructFieldRegistry, key: &str) -> bool {
+    match reg.class_identity.get(key) {
+        Some(Some(ci)) => {
+            crate::front::mir::struct_id_is_declared_gc(&reg.gc_struct_ids, ci.id, &ci.spelling)
+        }
+        Some(None) => false,
+        None => crate::front::mir::spelling_path_is_declared_gc(&reg.gc_struct_ids, key),
+    }
+}
+
+fn gcarray_item_keys_contain(reg: &crate::front::StructFieldRegistry, item_key: &str) -> bool {
+    let len = reg.fields.len();
+    let key_fp = reg.fields.key_fp();
+    let gc_len = reg.gc_struct_ids.len();
+    let identity_len = reg.class_identity.len();
+    {
+        let guard = reg.gcarray_item_index.borrow();
+        if let Some(idx) = guard.as_ref()
+            && idx.len == len
+            && idx.key_fp == key_fp
+            && idx.gc_len == gc_len
+            && idx.identity_len == identity_len
+        {
+            return idx.keys.contains(item_key);
+        }
+    }
+    let keys = collect_gcarray_item_keys(reg);
+    let hit = keys.contains(item_key);
+    *reg.gcarray_item_index.borrow_mut() = Some(crate::front::semantic::GcArrayItemIndex {
+        len,
+        key_fp,
+        gc_len,
+        identity_len,
+        keys,
+    });
+    hit
+}
+
+fn collect_gcarray_item_keys(
+    reg: &crate::front::StructFieldRegistry,
+) -> std::collections::HashSet<String> {
+    let mut item_tys = Vec::new();
+    for (owner, rows) in reg.fields.iter() {
+        let Some((_, items_ty)) = flexible_gcarray_wrapper_items_field(rows) else {
+            continue;
+        };
+        let owner_key = intern_class_key_from_registry(reg, owner, true);
+        if !intern_key_is_declared_gc(reg, &owner_key) {
+            continue;
+        }
+        item_tys.push(items_ty);
+    }
+    let mut keys = std::collections::HashSet::new();
+    for items_ty in item_tys {
+        let Some((elem, 0)) = crate::front::mir::shaped_array_parts(&items_ty) else {
+            continue;
+        };
+        if crate::front::typestr::peel_pointer_prefix(elem).is_some() {
+            continue;
+        }
+        if let Some(key) = gcarray_item_identity_key(reg, elem) {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
+/// Raw-word C struct with a layout (`ffi_cif`, `sem_t`). A ZST strategy
+/// singleton is a prebuilt instance (`rclass.py` `convert_const`) and
+/// intern's on New; dest/harvest still skip a laid-out raw-word owner.
+fn struct_root_is_raw_word_c_struct(root: &str, reg: &crate::front::StructFieldRegistry) -> bool {
+    if !reg.is_raw_word_struct_owner(root) {
+        return false;
+    }
+    match reg.intern_field_rows(root) {
+        Some(rows) if rows.is_empty() => false,
+        Some(_) => true,
+        None => true,
+    }
+}
+
+/// Struct roots that must not intern a `ClassDef` as a return dest or
+/// harvest: GCREF erasure, rstr `STR` / WTF-8 string family, owner-root
+/// handles, raw-storage C structs,
+/// core Option/Result, a `ListRepr.items` GcArray payload, a
+/// declared `GcArray` wrapper, and a non-GC `GcArray` ITEM Struct
+/// (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`). A monomorph
+/// `Entry<K, V>` intern's its own ClassDef (`bookkeeper.py`
+/// `getuniqueclassdef`); the unsuffixed template does not.
+pub(crate) fn struct_root_refuses_classdef_intern(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> bool {
+    is_gcref_type_spelling(root)
+        || struct_root_is_string_family(root)
+        || is_owner_root_handle(root)
+        || struct_root_is_core_option_or_result(root, registry)
+        || struct_root_is_gcarray_ptr_wrapper(root, registry)
+        || registry.is_some_and(|reg| {
+            struct_root_is_raw_word_c_struct(root, reg)
+                || reg.is_list_items_gcarray_owner(root)
+                || struct_root_is_gcarray_item(reg, root)
+        })
+}
+
+/// ClassDef intern of a `New` owner. Owner-root handles intern so
+/// `OpKind::New` can `instantiate`; return-stamp and harvest skip them
+/// via [`struct_root_refuses_classdef_intern`]. The Option/Result
+/// *template* has no instance ClassDef (`ensure_session` would otherwise
+/// mint one payload for every `T`); a monomorph intern's on first use
+/// so `Option<i64>::Some.__pos_0` getattr is that instantiation's
+/// ClassDef. A `GcArray` wrapper has no instance ClassDef on New either.
+/// A non-GC `GcArray` ITEM template (`rordereddict.py` `DICTENTRY`) is
+/// the same: `ensure_session` must not mint `SomeInstance` beside dest's
+/// `SomePtr`. A monomorph `Entry<K, V>` intern's (`struct_root_is_gcarray_item`
+/// is false when the intern key carries `<…>`). A raw-word owner with
+/// fields (`RootedSlotStore`, `PinnedResult`) intern's as a prebuilt
+/// instance on New; dest/harvest still skip it.
+fn struct_root_refuses_classdef_new(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> bool {
+    is_gcref_type_spelling(root)
+        || struct_root_is_string_family(root)
+        || struct_root_is_core_option_or_result_template(root, registry)
+        || struct_root_is_gcarray_ptr_wrapper(root, registry)
+        || registry.is_some_and(|reg| struct_root_is_gcarray_item(reg, root))
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -7831,7 +8433,7 @@ fn collect_referenced_struct_names(
         | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
         _ => {}
     }
-    if is_gcref_type_spelling(stripped) {
+    if struct_root_refuses_classdef_intern(stripped, Some(reg)) {
         return;
     }
     if let Some(inner) = strip_generic_leaf(stripped, "Option") {
@@ -7844,26 +8446,11 @@ fn collect_referenced_struct_names(
         }
         return;
     }
-    for wrapper in [
-        "Vec<",
-        "VecDeque<",
-        "Rc<",
-        "Arc<",
-        "Box<",
-        "RefCell<",
-        "Cell<",
-        "Pin<",
-        "NonNull<",
-        "NonZero<",
-        "MaybeUninit<",
-        "ManuallyDrop<",
-        "UnsafeCell<",
-        "Wrapping<",
-        "Reverse<",
-        "HashSet<",
-        "BTreeSet<",
-        "IndexSet<",
-    ] {
+    if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
+        collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    for wrapper in ["Vec<", "VecDeque<", "HashSet<", "BTreeSet<", "IndexSet<"] {
         if let Some(inner) = strip_generic_one(stripped, wrapper) {
             collect_referenced_struct_names(inner, reg, out);
             return;
@@ -7896,6 +8483,10 @@ fn collect_referenced_struct_names(
     if crate::front::semantic::is_list_family_spelling(stripped) {
         return;
     }
+    if struct_root_refuses_classdef_intern(stripped, Some(reg)) {
+        return;
+    }
+
     if reg.fields.contains_key(stripped) {
         out.push(stripped.to_string());
     }
@@ -8003,6 +8594,32 @@ pub(crate) fn exception_carrier_type_spelling_keys(
 #[cfg(test)]
 pub(crate) fn fn_ptr_somevalue_for_spelling(spelling: &str) -> Option<SomeValue> {
     fn_ptr_somevalue_for_spelling_in(spelling, getbookkeeper().as_deref())
+}
+
+/// `SomePtr(FuncType)` with no constant — FORCE / field-type intern,
+/// not a FunDecl store (`const_box` is the LLPtr).
+fn is_fnptr_type_intern(s: &SomeValue) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    matches!(
+        s,
+        SomeValue::Ptr(ptr)
+            if matches!(ptr.ll_ptrtype.TO, PtrTarget::Func(_))
+                && ptr.base.const_box.is_none()
+    )
+}
+
+fn function_desc_has_graph_id(entry: &DescEntry, gid: usize) -> bool {
+    let Some(fd) = entry.as_function() else {
+        return false;
+    };
+    let fd = fd.borrow();
+    let mut graphs = fd.getgraphs();
+    if let Some(g) = fd.built_source_template() {
+        graphs.push(g);
+    }
+    graphs
+        .iter()
+        .any(|g| GraphKey::of(&g.graph).as_usize() == gid)
 }
 
 pub(crate) fn fn_ptr_somevalue_for_spelling_in(
@@ -8342,6 +8959,30 @@ fn adt_generic_args<'a>(spelling: &'a str, leaf: &str) -> Option<Vec<&'a str>> {
 /// `>` of a `->` token in a fn-pointer spelling, not a generic closer.
 fn is_thin_arrow_gt(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'>') && i > 0 && bytes[i - 1] == b'-'
+}
+
+/// Inner of a one-arg transparent slot wrapper, including a qualified
+/// path (`cell::UnsafeCell<RBigInt>`). The wrapper is the slot, not a
+/// ClassDef (`nestedscope.py CellFamily.ever_mutated`).
+fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
+    crate::fat_ptr_layout::wrapper_inner(
+        field_ty,
+        &[
+            "Rc",
+            "Arc",
+            "Box",
+            "RefCell",
+            "Cell",
+            "Pin",
+            "NonNull",
+            "NonZero",
+            "MaybeUninit",
+            "ManuallyDrop",
+            "UnsafeCell",
+            "Wrapping",
+            "Reverse",
+        ],
+    )
 }
 
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
@@ -9056,6 +9697,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_struct_field_type_peels_qualified_cell_wrappers() {
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Cell<bool>"),
+                SomeValue::Bool(_)
+            ),
+            "Cell<bool> is the bool slot"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("cell::Cell<bool>"),
+                SomeValue::Bool(_)
+            ),
+            "cell::Cell<bool> is the bool slot"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("core::cell::UnsafeCell<i64>"),
+                SomeValue::Integer(_)
+            ),
+            "qualified UnsafeCell<i64> is the integer word"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("UnsafeCell<i64>"),
+                SomeValue::Integer(_)
+            ),
+            "UnsafeCell<i64> is the integer word"
+        );
+    }
+
     fn compiled_graph_func(src: &str, defaults: Vec<Constant>) -> GraphFunc {
         let code = rp_compile(src, Mode::Exec, "<test>", Default::default())
             .expect("compile should succeed");
@@ -9311,6 +9985,409 @@ mod tests {
     }
 
     #[test]
+    fn identity_key_spelling_matches_qualified_and_leaf() {
+        assert!(is_identity_key_spelling("IdentityKey"));
+        assert!(is_identity_key_spelling("identitydict::IdentityKey"));
+        assert!(!is_identity_key_spelling("ObjectKey"));
+        assert!(!is_identity_key_spelling("pyobject::PyObject"));
+    }
+
+    #[test]
+    fn gcref_type_spelling_is_the_declared_opaque_path() {
+        assert!(is_gcref_type_spelling("GCREF"));
+        assert!(is_gcref_type_spelling("GCREFOpaque"));
+        assert!(is_gcref_type_spelling("*mut GCREFOpaque"));
+        assert!(is_gcref_type_spelling("header::GCREFOpaque"));
+        assert!(is_gcref_type_spelling("majit_gc::header::GCREF"));
+        assert!(!is_gcref_type_spelling("gc_hook::GCREFOpaque"));
+        assert!(!is_gcref_type_spelling("eval::GCREF"));
+    }
+
+    #[test]
+    fn classdef_for_known_struct_root_interns_crate_stripped_against_crate_prefixed() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("storage".to_string(), "i64".to_string())];
+        reg.fields.insert(
+            "pyre_object::celldict::ModuleDictStrategy".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("ModuleDictStrategy".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .classdef_for_known_struct_root("celldict::ModuleDictStrategy")
+            .expect("crate-stripped intern of crate-prefixed harvest");
+        assert!(
+            cd.borrow().attrs.contains_key("storage"),
+            "intern_field_rows must project the crate-prefixed layout"
+        );
+    }
+
+    #[test]
+    fn classdef_for_known_struct_root_refuses_utf8str_harvest() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let str_rows = vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("length".to_string(), "i64".to_string()),
+        ];
+        for root in [
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+            "bytesobject::BytesBlock",
+            "pyre_object::bytesobject::BytesBlock",
+        ] {
+            reg.fields.insert(root.to_string(), str_rows.clone());
+        }
+        let owner_leaf = crate::front::mir::OWNER_ROOT_DECLARED_PATH
+            .rsplit("::")
+            .next()
+            .unwrap();
+        for root in [crate::front::mir::OWNER_ROOT_DECLARED_PATH, owner_leaf] {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("slot".to_string(), "usize".to_string())],
+            );
+        }
+        let sum_roots = [
+            "option::Option<NonNull<PyObject>>",
+            "result::Result<*mut PyObject,PyError>",
+        ];
+        for root in sum_roots {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        reg.note_core_option_struct("option::Option");
+        reg.note_core_result_struct("result::Result");
+        let raw_roots = ["libffi::raw::ffi_cif", "libffi::raw::ffi_type"];
+        for root in raw_roots {
+            let leaf = root.rsplit("::").next().unwrap();
+            reg.fields.insert(root.to_string(), str_rows.clone());
+            reg.fields.insert(leaf.to_string(), str_rows.clone());
+            reg.raw_word_owners.insert(root.to_string());
+            reg.raw_word_owners.insert(leaf.to_string());
+        }
+        let items_root = "object_array::FixedObjectArray";
+        {
+            let leaf = items_root.rsplit("::").next().unwrap();
+            let rows = vec![
+                ("len".to_string(), "usize".to_string()),
+                ("_items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ];
+            reg.fields.insert(items_root.to_string(), rows.clone());
+            reg.fields.insert(leaf.to_string(), rows);
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        let mut refused = vec![
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+            "bytesobject::BytesBlock",
+            "pyre_object::bytesobject::BytesBlock",
+            crate::front::mir::OWNER_ROOT_DECLARED_PATH,
+            owner_leaf,
+        ];
+        for root in sum_roots
+            .iter()
+            .copied()
+            .chain(raw_roots.iter().copied())
+            .chain(std::iter::once(items_root))
+        {
+            refused.push(root);
+            if let Some(leaf) = root.rsplit("::").next() {
+                refused.push(leaf);
+            }
+        }
+        for root in refused {
+            assert!(
+                bk.classdef_for_known_struct_root(root).is_none(),
+                "{root} harvest rows must not intern a ClassDef"
+            );
+        }
+    }
+
+    #[test]
+    fn classdef_intern_uses_declaration_kind_not_leaf_name() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // A GC instance whose intern leaf collides with a former name-list
+        // entry still intern's: the declaration is not raw-word storage.
+        reg.fields.insert(
+            "eval::ffi_cif".to_string(),
+            vec![
+                ("header".to_string(), "i64".to_string()),
+                ("storage".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("eval::ffi_cif").is_some(),
+            "a classed struct must intern even when its leaf matches a C type"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_owner_root_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "rbigint::gc::RBigIntGcRoot".to_string(),
+            vec![("slot".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("rbigint::gc::RBigIntGcRoot")
+                .is_none(),
+            "return-stamp harvest must still refuse the owner-root handle"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("rbigint::gc::RBigIntGcRoot")
+            .expect("New of an owner-root handle interns a ClassDef");
+        assert!(
+            cd.borrow().attrs.contains_key("slot"),
+            "New intern must project the owner-root layout"
+        );
+    }
+
+    #[test]
+    fn intern_owner_root_value_field_is_the_cell_word() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "rbigint::gc::RBigIntGcRoot".to_string(),
+            vec![
+                (
+                    "value".to_string(),
+                    "cell::UnsafeCell<rbigint::RBigInt>".to_string(),
+                ),
+                ("slot".to_string(), "usize".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "rbigint::RBigInt".to_string(),
+            vec![
+                ("_digits".to_string(), "*mut u8".to_string()),
+                ("_size".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "cell::UnsafeCell".to_string(),
+            vec![("value".to_string(), "??TypeVar".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("rbigint::gc::RBigIntGcRoot")
+            .expect("New of an owner-root handle interns a ClassDef");
+        let s_value = cd
+            .borrow()
+            .attrs
+            .get("value")
+            .expect("value attr")
+            .s_value
+            .clone();
+        let SomeValue::Instance(inst) = s_value else {
+            panic!("value must be the cell word SomeInstance, got {s_value:?}");
+        };
+        let value_cd = inst
+            .classdef
+            .as_ref()
+            .expect("cell word intern's RBigInt")
+            .clone();
+        let expected = bk
+            .getuniqueclassdef_for_struct_root("rbigint::RBigInt")
+            .expect("RBigInt intern");
+        assert!(
+            Rc::ptr_eq(&value_cd, &expected),
+            "setattr of the cell word unions with interned RBigInt, got {}",
+            value_cd.borrow().name
+        );
+        assert_ne!(
+            value_cd.borrow().name,
+            "cell::UnsafeCell",
+            "UnsafeCell is the slot, not the interned field class"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_fixed_object_array_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("_items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("object_array::FixedObjectArray")
+                .is_none(),
+            "return-stamp harvest must still refuse FixedObjectArray"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("object_array::FixedObjectArray")
+            .expect("New of FixedObjectArray interns a ClassDef");
+        assert!(
+            cd.borrow().attrs.contains_key("len"),
+            "New intern must project the FixedObjectArray layout"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_refuses_option_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<NonNull<PyObject>>".to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        harvest_class_identity(&mut reg, "option::Option", &["option::Option"]);
+        reg.note_core_option_struct("option::Option");
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("option::Option")
+                .is_none(),
+            "return-stamp harvest must still refuse the Option template"
+        );
+        assert!(
+            bk.classdef_for_known_struct_root("option::Option<NonNull<PyObject>>")
+                .is_none(),
+            "return-stamp harvest must still refuse an Option instantiation"
+        );
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("option::Option")
+                .is_err(),
+            "New of the Option template must not intern a ClassDef"
+        );
+        let declaration = bk
+            .getuniqueclassdef_for_core_enum_decl_receiver("option::Option")
+            .expect("the harvested TypeDecl identity resolves its declaration class");
+        assert_eq!(declaration.borrow().name, "option::Option");
+        assert!(declaration.borrow().attrs.contains_key("__discriminant"));
+        let variant = bk
+            .getuniqueclassdef_for_enum_variant("option::Option", "Some")
+            .expect("the variant subclasses the declaration receiver");
+        assert!(Rc::ptr_eq(
+            variant.borrow().basedef.as_ref().expect("variant base"),
+            &declaration,
+        ));
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("option::Option<NonNull<PyObject>>")
+                .is_ok(),
+            "New of an Option instantiation intern's a per-T ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_refuses_typed_items_block() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "lltypesystem::rlist::TypedItemsBlock".to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        reg.note_declared_gc_name("lltypesystem::rlist::TypedItemsBlock");
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("lltypesystem::rlist::TypedItemsBlock")
+                .is_err(),
+            "GcArray wrapper must not intern a ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_refuses_object_items_block() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::ItemsBlock".to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        reg.note_declared_gc_name("object_array::ItemsBlock");
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("object_array::ItemsBlock")
+                .is_none(),
+            "return-stamp harvest must not intern ItemsBlock"
+        );
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("object_array::ItemsBlock")
+                .is_err(),
+            "object-item GcArray wrapper must not intern a ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_zst_strategy_singleton() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "dictmultiobject::EmptyDictStrategy".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        reg.raw_word_owners
+            .insert("dictmultiobject::EmptyDictStrategy".to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("dictmultiobject::EmptyDictStrategy")
+            .expect("ZST strategy singleton intern's a prebuilt instance");
+        assert_eq!(cd.borrow().name, "dictmultiobject::EmptyDictStrategy");
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_raw_word_helper_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pycode::RootedSlotStore".to_string(),
+            vec![
+                ("scope".to_string(), "gc_roots::RootScope".to_string()),
+                ("base".to_string(), "usize".to_string()),
+            ],
+        );
+        reg.raw_word_owners
+            .insert("pycode::RootedSlotStore".to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("pycode::RootedSlotStore")
+                .is_none(),
+            "return-stamp harvest still skips a laid-out raw-word owner"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("pycode::RootedSlotStore")
+            .expect("New of RootedSlotStore intern's a ClassDef");
+        assert!(
+            cd.borrow().attrs.contains_key("base"),
+            "New intern must project the RootedSlotStore layout"
+        );
+    }
+
+    #[test]
     fn getuniqueclassdef_for_struct_root_registers_by_identity_and_projects_fields() {
         use crate::front::StructFieldRegistry;
         let bk = bk();
@@ -9448,6 +10525,90 @@ mod tests {
             names.iter().any(|n| n == "charon_corpus::ClassObject"),
             "crate-root qualified key is kept, got {names:?}"
         );
+    }
+
+    /// Harvest `class_identity` of one declaration: the crate-stripped
+    /// `mapdict::AbstractAttribute`, its crate-prefix spelling, and the
+    /// bare leaf intern as one ClassDef. `MapRef` = `*const
+    /// AbstractAttribute`; `pbc_call` of the harvested `get_map` family
+    /// unions those returns (`Bookkeeper.getdesc`).
+    #[test]
+    fn intern_class_unifies_abstract_attribute_spellings_via_class_identity() {
+        use crate::front::StructFieldRegistry;
+
+        let identity = "mapdict::AbstractAttribute";
+        let aliases = [
+            "AbstractAttribute",
+            "mapdict::AbstractAttribute",
+            "pyre_object::mapdict::AbstractAttribute",
+        ];
+        let rows = vec![("terminator".to_string(), "usize".to_string())];
+        for order in [
+            [aliases[0], aliases[1], aliases[2]],
+            [aliases[1], aliases[2], aliases[0]],
+            [aliases[2], aliases[0], aliases[1]],
+        ] {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            for alias in aliases {
+                reg.fields.insert(alias.to_string(), rows.clone());
+            }
+            harvest_class_identity(&mut reg, identity, &aliases);
+            bk.set_struct_fields(Rc::new(reg));
+
+            let first = bk.intern_class_by_qualname(order[0]);
+            let second = bk.intern_class_by_qualname(order[1]);
+            let third = bk.intern_class_by_qualname(order[2]);
+            assert_eq!(first, second, "one host, intern order {:?}", order);
+            assert_eq!(second, third, "one host, intern order {:?}", order);
+            for alias in aliases {
+                assert_eq!(
+                    bk.intern_class_key(alias),
+                    identity,
+                    "{alias} intern key is the declaration spelling"
+                );
+            }
+            let first_cd = bk.getuniqueclassdef(&first).expect("first classdef");
+            let second_cd = bk.getuniqueclassdef(&second).expect("second classdef");
+            let third_cd = bk.getuniqueclassdef(&third).expect("third classdef");
+            assert!(
+                Rc::ptr_eq(&first_cd, &second_cd) && Rc::ptr_eq(&second_cd, &third_cd),
+                "pbc_call union of MapRef returns needs one AbstractAttribute ClassDef, order {:?}",
+                order
+            );
+        }
+    }
+
+    /// Nested `module::struct::Code::Int` is a distinct declaration from
+    /// bare `Int`. Harvest writes two identities; intern must not merge them.
+    #[test]
+    fn intern_class_keeps_nested_code_int_apart_from_bare_int() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("n".to_string(), "i64".to_string())];
+        reg.fields.insert("Int".to_string(), rows.clone());
+        reg.fields
+            .insert("module::struct::Code::Int".to_string(), rows);
+        harvest_class_identity(&mut reg, "Int", &["Int"]);
+        harvest_class_identity(
+            &mut reg,
+            "module::struct::Code::Int",
+            &["module::struct::Code::Int"],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let bare = bk.intern_class_by_qualname("Int");
+        let nested = bk.intern_class_by_qualname("module::struct::Code::Int");
+        assert_ne!(bare, nested, "Code::Int must not steal Int");
+        assert_eq!(bk.intern_class_key("Int"), "Int");
+        assert_eq!(
+            bk.intern_class_key("module::struct::Code::Int"),
+            "module::struct::Code::Int"
+        );
+        let bare_cd = bk.getuniqueclassdef(&bare).expect("Int classdef");
+        let nested_cd = bk.getuniqueclassdef(&nested).expect("Code::Int classdef");
+        assert!(!Rc::ptr_eq(&bare_cd, &nested_cd));
     }
 
     #[test]
@@ -11162,6 +12323,504 @@ mod tests {
     }
 
     #[test]
+    fn unsuffixed_typevar_gc_entries_projects_to_gcarray_ptr() {
+        // Harvest of `GcEntries<K,V>` stores TypeVar items
+        // (`[Entry<??TypeVar#0,??TypeVar#1>;0]`). CAST dest of
+        // `entries_item_ptr` and `RDict.entries` intern that unsuffixed
+        // template. `rordereddict.py` `DICTENTRYARRAY` is
+        // `GcArray(DICTENTRY)` / `llannotation.py` `SomePtr`, not
+        // `FixedSizeListRepr`. A leftover `??` is one GCREF word
+        // (`gcarray_item_struct_ptr_annotation`). Harvest also stores
+        // the leaf `StructId` of every GC TypeDecl; a colliding `Entry`
+        // leaf is not this ITEM (`spelling_path_is_declared_gc`).
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::GcEntries",
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+            ],
+        );
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::Entry",
+            &[
+                "pyre_object::rordereddict_entries::Entry",
+                "rordereddict_entries::Entry",
+                "Entry",
+            ],
+        );
+        note_declared_gc(
+            &mut reg,
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+            ],
+        );
+        reg.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        // `entry_valid` is getattr(self, "entries") then getitem
+        // (`ll_getitem_fast` / `ll_valid_from_flag`). The field intern
+        // must be the same SomePtr, not SomeList of Impossible.
+        reg.fields.insert(
+            "rordereddict::RDict".to_string(),
+            vec![
+                (
+                    "entries".to_string(),
+                    "*mut rordereddict_entries::GcEntries".to_string(),
+                ),
+                ("num_live_items".to_string(), "usize".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["rordereddict::RDict", "RDict"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in [
+            "rordereddict_entries::GcEntries",
+            "*mut rordereddict_entries::GcEntries",
+            "GcEntries",
+            "pyre_object::rordereddict_entries::GcEntries",
+            "GcEntries<i64, *mut u8>",
+            "*mut GcEntries<i64, *mut u8>",
+            "rordereddict_entries::GcEntries<i64, *mut u8>",
+        ] {
+            assert_struct_item_gcarray_ptr(&bk.project_struct_field_type(spelling), spelling);
+        }
+
+        use crate::annotator::classdesc::ClassDef;
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("rordereddict::RDict")
+            .expect("RDict intern");
+        let interned = ClassDef::about_attribute(&classdef, "entries").expect("entries intern");
+        assert_struct_item_gcarray_ptr(&interned, "RDict.entries intern");
+    }
+
+    #[test]
+    fn gcarray_item_struct_projects_to_raw_ptr_and_getattr() {
+        // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined in
+        // `GcArray` (`get_ll_dict`); `bookkeeper.py` `getuniqueclassdef`
+        // intern's classes. A ClassDef of the unsuffixed template projects
+        // `??TypeVar` `key` as Impossible (`ClassDef.about_attribute`).
+        use crate::flowspace::model::ConstValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        // Harvest dual-publishes `name_path`, crate-stripped identity, and
+        // the leaf (`derive_program_metadata`).
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::GcEntries",
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+            ],
+        );
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::Entry",
+            &[
+                "pyre_object::rordereddict_entries::Entry",
+                "rordereddict_entries::Entry",
+                "Entry",
+            ],
+        );
+        reg.fields.insert(
+            "storage::SlotBlock".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                ("items".to_string(), "[storage::Slot; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Slot".to_string(),
+            vec![
+                ("f_valid".to_string(), "bool".to_string()),
+                ("key".to_string(), "i64".to_string()),
+                ("value".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Meta".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        note_declared_gc(
+            &mut reg,
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+                "storage::SlotBlock",
+                "SlotBlock",
+            ],
+        );
+        // `note_declared_gc_owner` also stores the leaf `StructId`. A
+        // different GC TypeDecl that shares the leaf must not make this
+        // ITEM a `GcStruct`.
+        reg.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        let fields = Rc::new(reg);
+        bk.set_struct_fields(Rc::clone(&fields));
+
+        for root in [
+            "rordereddict_entries::Entry",
+            "pyre_object::rordereddict_entries::Entry",
+            "Entry",
+            "&rordereddict_entries::Entry",
+            "*mut rordereddict_entries::Entry",
+        ] {
+            assert!(
+                struct_root_refuses_classdef_intern(root, Some(fields.as_ref())),
+                "{root} ITEM must refuse ClassDef intern"
+            );
+        }
+        assert!(struct_root_refuses_classdef_intern(
+            "storage::Slot",
+            Some(fields.as_ref()),
+        ));
+        assert!(!struct_root_refuses_classdef_intern(
+            "storage::Meta",
+            Some(fields.as_ref()),
+        ));
+        assert!(
+            !struct_root_refuses_classdef_intern(
+                "rordereddict_entries::Entry<StrKey, *mut PyObject>",
+                Some(fields.as_ref()),
+            ),
+            "a monomorph intern's its own ClassDef"
+        );
+
+        let _pos = bk.at_position(None);
+        let s_attr = bk
+            .immutablevalue(&ConstValue::byte_str("key"))
+            .expect("key const");
+        for spelling in [
+            "rordereddict_entries::Entry",
+            "pyre_object::rordereddict_entries::Entry",
+            "Entry",
+            "*mut rordereddict_entries::Entry",
+            "&rordereddict_entries::Entry",
+            "*mut pyre_object::rordereddict_entries::Entry",
+            "&pyre_object::rordereddict_entries::Entry",
+            "storage::Slot",
+            "*mut storage::Slot",
+        ] {
+            let SomeValue::Ptr(ptr) = bk.project_struct_field_type(spelling) else {
+                panic!(
+                    "{spelling} must be SomePtr of the inlined Struct, got {:?}",
+                    bk.project_struct_field_type(spelling)
+                );
+            };
+            match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => {
+                    assert_eq!(
+                        st._gckind,
+                        GcKind::Raw,
+                        "{spelling} ITEM is lltype.Struct, not GcStruct"
+                    );
+                    assert!(
+                        st.getattr_field_type("key").is_some(),
+                        "{spelling} STRUCT must have key"
+                    );
+                }
+                other => panic!("{spelling} must be Ptr(Struct), got {other:?}"),
+            }
+            let s_key = ptr
+                .getattr(&s_attr)
+                .unwrap_or_else(|err| panic!("{spelling}.key getattr: {err:?}"));
+            assert!(
+                !matches!(s_key, SomeValue::Impossible),
+                "{spelling}.key must not be Impossible, got {s_key:?}"
+            );
+        }
+        for root in [
+            "rordereddict_entries::Entry",
+            "pyre_object::rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            assert!(
+                bk.classdef_for_known_struct_root(root).is_none(),
+                "DICTENTRY must not intern a ClassDef ({root})"
+            );
+        }
+        // The unsuffixed template is `lltype.py` `Struct`. `ensure_session`
+        // must not mint a ClassDef (`Instance ∪ Ptr` at mergeinputargs).
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("rordereddict_entries::Entry")
+                .is_err(),
+            "New intern of the unsuffixed ITEM must refuse"
+        );
+        // A monomorph intern's its own ClassDef (`bookkeeper.py`
+        // `getuniqueclassdef`).
+        assert!(
+            bk.getuniqueclassdef_for_struct_root(
+                "rordereddict_entries::Entry<StrKey, *mut PyObject>"
+            )
+            .is_ok(),
+            "New intern of a monomorph must still succeed"
+        );
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("rordereddict_entries::Entry")
+                .is_err(),
+            "intern of a monomorph must not mint the template ClassDef"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("storage::Meta"),
+                SomeValue::Instance(ref inst) if inst.classdef.is_some()
+            ),
+            "a non-GcArray-item Struct still intern's as ClassDef"
+        );
+    }
+
+    #[test]
+    fn production_dictentry_item_is_someptr_not_classdef() {
+        // Production harvest of `rordereddict.py` `DICTENTRY` /
+        // `DICTENTRYARRAY`. The fixture above seeds two-field `GcEntries`
+        // rows by hand; Charon may add a header field, which would make
+        // `flexible_gcarray_wrapper_items_field` miss and intern the
+        // unsuffixed ITEM as SomeInstance beside dest's SomePtr
+        // (`mergeinputargs` Instance ∪ Ptr on `RDict::entry_at`).
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let Some(object) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
+        ) else {
+            return;
+        };
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object],
+            crate::HostStaticAddrs::default(),
+            &[],
+            &["entry_at", "get_slot"],
+        )
+        .expect("lower rordereddict entry_at/get_slot");
+
+        let dump_owner = |needle: &str| -> String {
+            let mut lines: Vec<String> = program
+                .struct_fields
+                .fields
+                .iter()
+                .filter(|(owner, _)| owner.contains(needle))
+                .map(|(owner, rows)| {
+                    let fields = rows
+                        .iter()
+                        .map(|row| format!("{}:{}", row.name, row.ty))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{owner} [{fields}]")
+                })
+                .collect();
+            lines.sort();
+            if lines.is_empty() {
+                format!("(no owner containing {needle})")
+            } else {
+                lines.join("\n")
+            }
+        };
+
+        let gc_entries_rows = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| {
+                majit_ir::descr::strip_generic_args(owner)
+                    .rsplit("::")
+                    .next()
+                    == Some("GcEntries")
+            })
+            .map(|(owner, rows)| (owner.clone(), rows.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            gc_entries_rows
+                .iter()
+                .any(|(_, rows)| { flexible_gcarray_wrapper_items_field(rows).is_some() }),
+            "production GcEntries must be the two-field GcArray wrapper\n{}",
+            dump_owner("GcEntries")
+        );
+
+        let fields = Rc::new(program.struct_fields.clone());
+        assert!(
+            struct_root_is_gcarray_item(fields.as_ref(), "rordereddict_entries::Entry"),
+            "unsuffixed DICTENTRY must be the inlined ITEM\n{}\n{}",
+            dump_owner("GcEntries"),
+            dump_owner("Entry")
+        );
+        assert!(
+            !struct_root_is_gcarray_item(
+                fields.as_ref(),
+                "rordereddict_entries::Entry<dictmultiobject::ObjectKey, ()>"
+            ),
+            "a monomorph keeps its ClassDef"
+        );
+
+        let bk = bk();
+        bk.set_struct_fields(Rc::clone(&fields));
+        assert!(
+            struct_root_refuses_classdef_intern(
+                "rordereddict_entries::Entry",
+                Some(fields.as_ref())
+            ),
+            "unsuffixed ITEM must refuse ClassDef intern"
+        );
+        assert!(
+            bk.classdef_for_known_struct_root("rordereddict_entries::Entry")
+                .is_none(),
+            "unsuffixed ITEM must not intern a ClassDef"
+        );
+        let SomeValue::Ptr(ptr) = bk.project_struct_field_type("rordereddict_entries::Entry")
+        else {
+            panic!(
+                "unsuffixed ITEM must project SomePtr, got {:?}",
+                bk.project_struct_field_type("rordereddict_entries::Entry")
+            );
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Struct(st) => {
+                assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+            }
+            other => panic!("DICTENTRY SomePtr must point at a Struct, got {other:?}"),
+        }
+
+        assert_struct_item_gcarray_ptr(
+            &bk.project_struct_field_type("rordereddict_entries::GcEntries"),
+            "production unsuffixed GcEntries",
+        );
+        assert_struct_item_gcarray_ptr(
+            &bk.project_struct_field_type("*mut rordereddict_entries::GcEntries"),
+            "production *mut unsuffixed GcEntries",
+        );
+        let rdict_entries: Vec<(String, String)> = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| {
+                majit_ir::descr::strip_generic_args(owner)
+                    .rsplit("::")
+                    .next()
+                    == Some("RDict")
+            })
+            .filter_map(|(owner, rows)| {
+                rows.iter()
+                    .find(|row| row.name == "entries")
+                    .map(|row| (owner.clone(), row.ty.clone()))
+            })
+            .collect();
+        assert!(
+            !rdict_entries.is_empty(),
+            "production RDict must harvest an entries field\n{}",
+            dump_owner("RDict")
+        );
+        for (owner, ty) in &rdict_entries {
+            assert_struct_item_gcarray_ptr(
+                &bk.project_struct_field_type(ty),
+                &format!("{owner}.entries ({ty})"),
+            );
+        }
+
+        let path_gc = crate::front::mir::spelling_path_is_declared_gc(
+            &fields.gc_struct_ids,
+            "rordereddict_entries::Entry",
+        );
+        let leaf_gc = crate::front::mir::spelling_is_declared_gc(
+            &fields.gc_struct_ids,
+            "rordereddict_entries::Entry",
+        );
+        let mut item_casts = Vec::new();
+        for function in &program.functions {
+            for (bi, block) in function.graph().blocks.iter().enumerate() {
+                for (oi, op) in block.operations.iter().enumerate() {
+                    let Some(root) = crate::model::cast_instance_root(&op.kind) else {
+                        continue;
+                    };
+                    if struct_root_is_gcarray_item(fields.as_ref(), root) {
+                        let prev = oi
+                            .checked_sub(1)
+                            .and_then(|i| block.operations.get(i))
+                            .map(|prev| format!("{:?}", prev.kind))
+                            .unwrap_or_else(|| "(first op)".into());
+                        item_casts.push(format!(
+                            "{}::{} self={:?} bb{bi} op{oi} -> {root}; prev={prev}",
+                            function.module_path, function.name, function.self_ty_root
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            item_casts.is_empty(),
+            "call dest of *mut DICTENTRY must not emit cast_instance\n\
+             path_gc={path_gc} leaf_gc={leaf_gc}\n{}",
+            item_casts.join("\n")
+        );
+    }
+
+    #[test]
     fn project_struct_field_type_object_item_flexible_gcarray_stays_list() {
         // `GcArray(ITEM)` of a GC object pointer (`rlist.py`
         // `FixedSizeListRepr`) stays a list. A primitive-item wrapper
@@ -11226,10 +12885,16 @@ mod tests {
 
         let from_leaf = bk.project_struct_field_type("*mut ItemsBlock");
         let from_ident = bk.project_struct_field_type("*mut object_array::ItemsBlock");
-        let SomeValue::List(_) = &from_leaf else {
+        let SomeValue::List(leaf_list) = &from_leaf else {
             panic!("*mut ItemsBlock must be SomeList, got {from_leaf:?}");
         };
-        assert_eq!(from_leaf, from_ident);
+        let SomeValue::List(ident_list) = &from_ident else {
+            panic!("*mut object_array::ItemsBlock must be SomeList, got {from_ident:?}");
+        };
+        // A GcArray wrapper has no ClassDef (`lltype.py` `GcArray`), so
+        // each projection is its own `ListDef`; both spellings resolve to
+        // the same GcArray root and item annotation.
+        assert_eq!(leaf_list.listdef.s_value(), ident_list.listdef.s_value());
 
         let SomeValue::Tuple(t) = bk.project_struct_field_type("(*mut ItemsBlock,bool)") else {
             panic!("tuple payload must be SomeTuple");
@@ -19702,7 +21367,7 @@ mod tests {
         for root in [
             "header::GCREFOpaque",
             "GCREFOpaque",
-            "gc_hook::GCREFOpaque",
+            "majit_gc::header::GCREFOpaque",
             "GCREF",
         ] {
             reg.fields
@@ -19713,7 +21378,7 @@ mod tests {
             "header::GCREFOpaque",
             "GCREFOpaque",
             "*mut GCREFOpaque",
-            "gc_hook::GCREFOpaque",
+            "majit_gc::header::GCREFOpaque",
             "GCREF",
         ] {
             assert!(
@@ -19731,7 +21396,7 @@ mod tests {
             "GCREFOpaque",
             "*mut GCREFOpaque",
             "*const GCREFOpaque",
-            "gc_hook::GCREFOpaque",
+            "header::GCREFOpaque",
         ] {
             let s = bk.project_struct_field_type(spelling);
             assert!(

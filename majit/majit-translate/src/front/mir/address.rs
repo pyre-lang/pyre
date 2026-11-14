@@ -259,11 +259,15 @@ fn call_substituted_inputs(
 
 /// Declared `&T` / `&mut T` of a residual copy word, or `&TypeVar` that
 /// a residual generic still spells. A raw pointer is the other path.
-fn declared_residual_scalar_ref(declared: &TyRef, llbc: &Llbc) -> bool {
+fn declared_residual_scalar_ref(
+    declared: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
     if tyref_is_raw_pointer(declared, llbc) {
         return false;
     }
-    if tyref_is_ref_of_residual_scalar_word(declared, llbc) {
+    if tyref_is_ref_of_residual_scalar_word(declared, llbc, gc_struct_ids) {
         return true;
     }
     tyref_peel_one_ref_node(declared, llbc)
@@ -273,19 +277,32 @@ fn declared_residual_scalar_ref(declared: &TyRef, llbc: &Llbc) -> bool {
 /// One-word Copy value the residual ABI can store in a `Tuple<i64>`
 /// cell: a Charon primitive, or a `repr(transparent)` handle of one
 /// word. A Charon `&` / `*const` is an address and is not this.
-fn tyref_is_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
-    residual_scalar_word_descr(ty, llbc).is_some()
+fn tyref_is_residual_scalar_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    residual_scalar_word_descr(ty, llbc, gc_struct_ids).is_some()
 }
 
-fn tyref_is_ref_of_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
+fn tyref_is_ref_of_residual_scalar_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
     if tyref_is_raw_pointer(ty, llbc) {
         return false;
     }
-    tyref_peel_one_ref_node(ty, llbc)
-        .is_some_and(|pointee| tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone()), llbc))
+    tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| {
+        tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone()), llbc, gc_struct_ids)
+    })
 }
 
-fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+fn residual_scalar_word_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<(ValueType, usize, bool)> {
     if tyref_is_raw_pointer(ty, llbc) || output_type_is_ref(ty, llbc) {
         return None;
     }
@@ -303,7 +320,7 @@ fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usi
         if let TypeDeclKind::Struct(fields) = &decl.kind
             && let Some(field) = fields.get(index)
         {
-            if let Some(descr) = residual_scalar_word_descr(&field.ty, llbc) {
+            if let Some(descr) = residual_scalar_word_descr(&field.ty, llbc, gc_struct_ids) {
                 return Some(descr);
             }
             let field_node = tyref_node(&field.ty, llbc)?;
@@ -318,9 +335,13 @@ fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usi
     None
 }
 
-fn residual_arg_store_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+fn residual_arg_store_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<(ValueType, usize, bool)> {
     json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc)
-        .or_else(|| residual_scalar_word_descr(ty, llbc))
+        .or_else(|| residual_scalar_word_descr(ty, llbc, gc_struct_ids))
 }
 
 fn residual_scalar_ref_callee(
@@ -335,6 +356,7 @@ fn residual_scalar_ref_callee(
 
 pub(in crate::front::mir) fn collect_cell_scalar_locals(
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     body: &Unstructured,
     arg_count: usize,
     forward: &[bool],
@@ -366,7 +388,8 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             .unwrap_or(fd.signature.inputs.as_slice());
         let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
         for (index, declared) in inputs.iter().enumerate() {
-            let residual_ref = residual_ref_callee && declared_residual_scalar_ref(declared, llbc);
+            let residual_ref =
+                residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
             if raw_scalar_address_value_type(declared, llbc).is_none() && !residual_ref {
                 continue;
             }
@@ -376,8 +399,8 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             let Some(passed) = operand_tyref(arg) else {
                 continue;
             };
-            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc);
-            let passed_value = tyref_is_residual_scalar_word(passed, llbc);
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc, gc_struct_ids);
+            let passed_value = tyref_is_residual_scalar_word(passed, llbc, gc_struct_ids);
             if residual_ref {
                 if !passed_ref && !passed_value {
                     continue;
@@ -405,9 +428,10 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             };
             let param_pointee = TyRef::Other(param_node.clone());
             let arg_pointee = TyRef::Other(arg_node.clone());
-            let arg_store = residual_arg_store_descr(&arg_pointee, llbc);
+            let arg_store = residual_arg_store_descr(&arg_pointee, llbc, gc_struct_ids);
             let Some((_, itemsize, _)) =
-                residual_arg_store_descr(&param_pointee, llbc).or_else(|| arg_store.clone())
+                residual_arg_store_descr(&param_pointee, llbc, gc_struct_ids)
+                    .or_else(|| arg_store.clone())
             else {
                 continue;
             };
@@ -469,6 +493,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
 /// keeps that local's storage scope.
 pub(in crate::front::mir) fn collect_function_scope_spill_cells(
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     body: &Unstructured,
     arg_count: usize,
     forward: &[bool],
@@ -499,7 +524,8 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             .unwrap_or(fd.signature.inputs.as_slice());
         let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
         for (index, declared) in inputs.iter().enumerate() {
-            let residual_ref = residual_ref_callee && declared_residual_scalar_ref(declared, llbc);
+            let residual_ref =
+                residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
             if raw_scalar_address_value_type(declared, llbc).is_none() && !residual_ref {
                 continue;
             }
@@ -509,8 +535,8 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             let Some(passed) = operand_tyref(arg) else {
                 continue;
             };
-            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc);
-            let passed_value = tyref_is_residual_scalar_word(passed, llbc);
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc, gc_struct_ids);
+            let passed_value = tyref_is_residual_scalar_word(passed, llbc, gc_struct_ids);
             if residual_ref {
                 if !passed_ref && !passed_value {
                     continue;
@@ -545,9 +571,10 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             };
             let param_pointee = TyRef::Other(param_node.clone());
             let arg_pointee = TyRef::Other(arg_node.clone());
-            let arg_store = residual_arg_store_descr(&arg_pointee, llbc);
+            let arg_store = residual_arg_store_descr(&arg_pointee, llbc, gc_struct_ids);
             let Some((_, itemsize, _)) =
-                residual_arg_store_descr(&param_pointee, llbc).or_else(|| arg_store.clone())
+                residual_arg_store_descr(&param_pointee, llbc, gc_struct_ids)
+                    .or_else(|| arg_store.clone())
             else {
                 continue;
             };
@@ -1616,16 +1643,17 @@ impl<'a> Lowering<'a> {
             residual_scalar_ref_callee(fd, self.dont_look_inside, &self.oopspec_fns);
         let mut spills = Vec::new();
         for (index, declared) in inputs.iter().enumerate() {
-            let residual_ref =
-                residual_ref_callee && declared_residual_scalar_ref(declared, self.llbc);
+            let residual_ref = residual_ref_callee
+                && declared_residual_scalar_ref(declared, self.llbc, self.gc_struct_ids);
             if raw_scalar_address_value_type(declared, self.llbc).is_none() && !residual_ref {
                 continue;
             }
             let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, self.llbc);
-            let passed_value = tyref_is_residual_scalar_word(passed, self.llbc);
+            let passed_ref =
+                tyref_is_ref_of_residual_scalar_word(passed, self.llbc, self.gc_struct_ids);
+            let passed_value = tyref_is_residual_scalar_word(passed, self.llbc, self.gc_struct_ids);
             // Residual `&T` / `*const T`: the aliased word (a `&i64`
             // parameter banked as Int, a specialized `i64` local, or a
             // one-word Copy ADT) is stored in a cell and the address
@@ -1668,12 +1696,14 @@ impl<'a> Lowering<'a> {
             };
             let param_pointee = TyRef::Other(param_node.clone());
             let arg_pointee = TyRef::Other(arg_node.clone());
-            let arg_descr = self
-                .raw_word_descr(&arg_pointee)
-                .or_else(|| residual_scalar_word_descr(&arg_pointee, self.llbc));
+            let arg_descr = self.raw_word_descr(&arg_pointee).or_else(|| {
+                residual_scalar_word_descr(&arg_pointee, self.llbc, self.gc_struct_ids)
+            });
             let Some((item_ty, itemsize, is_item_signed)) = self
                 .raw_word_descr(&param_pointee)
-                .or_else(|| residual_scalar_word_descr(&param_pointee, self.llbc))
+                .or_else(|| {
+                    residual_scalar_word_descr(&param_pointee, self.llbc, self.gc_struct_ids)
+                })
                 .or_else(|| arg_descr.clone())
             else {
                 continue;

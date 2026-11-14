@@ -1373,7 +1373,8 @@ pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bo
     if alloc_flavor_raw_identity_matches(raw, path) {
         return true;
     }
-    // `MapNode::Terminator` inherits `_alloc_flavor_MapNode`.
+    // An enum variant owner `X::Variant` inherits `_alloc_flavor_` of `X`
+    // (`ClassDesc.get_param` walks the MRO).
     if let Some((enum_owner, _)) = path.rsplit_once("::")
         && !enum_owner.is_empty()
         && alloc_flavor_raw_identity_matches(raw, enum_owner)
@@ -2161,29 +2162,29 @@ mod tests {
 
     #[test]
     fn alloc_flavor_raw_enum_variant_inherits_enum_identity() {
-        let raw = HashSet::from(["mapdict::MapNode".to_string()]);
+        let raw = HashSet::from(["shape::Kind".to_string()]);
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "mapdict::MapNode::Terminator"
+            "shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "pyre_object::mapdict::MapNode::Terminator"
+            "pyre_object::shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "*const pyre_object::mapdict::MapNode::Terminator"
+            "*const pyre_object::shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "&mapdict::MapNode::Terminator"
+            "&shape::Kind::Circle"
         ));
-        assert!(super::alloc_flavor_raw_contains(&raw, "mapdict::MapNode"));
+        assert!(super::alloc_flavor_raw_contains(&raw, "shape::Kind"));
         assert!(!super::alloc_flavor_raw_contains(
             &raw,
-            "mapdict::Other::Terminator"
+            "shape::Other::Circle"
         ));
-        assert!(!super::alloc_flavor_raw_contains(&raw, "Terminator"));
+        assert!(!super::alloc_flavor_raw_contains(&raw, "Circle"));
     }
 
     fn names(variants: &[&str]) -> Vec<String> {

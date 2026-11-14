@@ -23,16 +23,22 @@ pub struct W_IntObject {
 #[repr(C)]
 pub struct W_IntObjectUser {
     pub base: W_IntObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_IntObjectUser, storage)
-            == std::mem::offset_of!(W_IntObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_IntObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_INT_USER_MAPDICT_ACCESS for W_IntObjectUser;
+}
 
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
@@ -296,7 +302,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
             },
             intval: value,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

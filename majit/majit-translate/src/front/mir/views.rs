@@ -908,8 +908,10 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(cast.clone()),
-            kind: if root == "GCREF" {
-                crate::model::cast_instance_call_result(root, value, ValueType::Ref(None))
+            kind: if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
+                // Dest-GCREF (`rerased.py` `_some_erased` / `llmemory.GCREF`):
+                // ByteStr `"GCREF"` + `Ref(Some("GCREF"))`.
+                crate::model::cast_instance_call("GCREF", value)
             } else {
                 crate::model::cast_instance_call(root, value)
             },

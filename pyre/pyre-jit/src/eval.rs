@@ -593,16 +593,29 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             }
         }
         f(std::ptr::from_mut(&mut t.dict).cast());
+        // `W_TypeObject.terminator` (`typeobject.py`) is a GC [`MapRef`].
+        // `Terminator.w_cls` is a fixed GC-pointer offset on that type.
+        f(std::ptr::from_mut(&mut t.terminator).cast());
     }
-    // `Terminator.w_cls` (`mapdict.py`) is a traced `_immutable_field_` on a
-    // GC terminator. pyre's terminator is `malloc_raw`; MiniMark never
-    // visits that immortal sidecar on its own. Forward it from the type
-    // that owns the terminator so a nursery heap type copy rewrites the
-    // slot (`LOAD_ATTR_slowpath` reads `map.terminator.w_cls`).
-    pyre_interpreter::objspace::std::mapdict::walk_type_terminator_w_cls(
-        obj_addr as pyre_object::PyObjectRef,
-        &mut |slot| f(slot as *mut majit_ir::GcRef),
-    );
+}
+
+unsafe fn cache_attrs_gc_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        pyre_object::mapdict::cache_attrs_custom_trace(obj_addr, &mut |slot| {
+            f(slot as *mut majit_ir::GcRef);
+        });
+    }
+}
+
+unsafe fn cached_attribute_holder_gc_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_object::mapdict::cached_attribute_holder_custom_trace(obj_addr, &mut |slot| {
+            f(slot as *mut majit_ir::GcRef);
+        });
+    }
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
@@ -610,8 +623,9 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// storage) reclaimed by its own box tid's drop glue — freeing it here
 /// too would double-free a box swept before its owner. `mro_w` is a GC-managed
 /// `FixedObjectArray` reclaimed by the collector and must not be freed here. The
-/// managed namespace object is also reclaimed by the collector, while the
-/// shared/uncertain `terminator` ownership remains deferred by #528.
+/// managed namespace object is also reclaimed by the collector. The
+/// `terminator` map node is a GC object (`mapdict.py AbstractAttribute`)
+/// traced from this type.
 unsafe fn type_object_destructor(obj_addr: usize) {
     let t = obj_addr as *const pyre_object::typeobject::W_TypeObject;
     let weak_subclasses = unsafe { (*t).weak_subclasses };
@@ -5538,7 +5552,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
     // ExecutionContext is a plain GC object (`GcType`), not a PyObject
     // subclass. Custom trace visits every GC slot it owns; the destructor
-    // runs drop glue for Vec/RefCell/quasi-immut watchers. Absolute tail
+    // runs drop glue for Vec/RefCell/quasi-immut watchers. After weakdict
     // so no hardcoded / `#[pyre_class(type_id = N)]` id moves.
     // `pypy/interpreter/executioncontext.py` `ExecutionContext`.
     let execution_context_tid = gc.register_type(
@@ -5555,6 +5569,59 @@ fn build_gc() -> Box<MiniMarkGC> {
     // for it. Do not force the group: a later force reads this cell.
     pyre_jit_trace::descr::restamp_execution_context_size_descr_if_unresolved(
         execution_context_tid,
+    );
+    // `mapdict.py Terminator` / `PlainAttribute` / `UnboxedPlainAttribute` /
+    // `CachedAttributeHolder`. Auto-id at the tail so established tids do not
+    // shift.
+    {
+        use pyre_object::mapdict::{
+            AbstractAttribute, PlainAttribute, Terminator, UnboxedPlainAttribute,
+        };
+        let mut term_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<Terminator>(),
+            vec![
+                std::mem::offset_of!(Terminator, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(Terminator, w_cls),
+                std::mem::offset_of!(Terminator, devolved_dict_terminator),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::terminator_destructor);
+        term_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(term_info);
+        pyre_object::mapdict::TERMINATOR_GC_TYPE_ID.set(tid);
+        let mut plain_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<PlainAttribute>(),
+            vec![
+                std::mem::offset_of!(PlainAttribute, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(PlainAttribute, back),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::plain_attribute_destructor);
+        plain_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(plain_info);
+        pyre_object::mapdict::PLAIN_ATTRIBUTE_GC_TYPE_ID.set(tid);
+        let mut unboxed_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<UnboxedPlainAttribute>(),
+            vec![
+                std::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + std::mem::offset_of!(PlainAttribute, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + std::mem::offset_of!(PlainAttribute, back),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::unboxed_plain_attribute_destructor);
+        unboxed_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(unboxed_info);
+        pyre_object::mapdict::UNBOXED_PLAIN_ATTRIBUTE_GC_TYPE_ID.set(tid);
+    }
+    register_traced_storage_box::<pyre_object::mapdict::CachedAttributeHolder>(
+        &mut gc,
+        cached_attribute_holder_gc_trace,
+        pyre_object::mapdict::cached_attribute_holder_destructor,
+        |tid| pyre_object::mapdict::CACHED_ATTRIBUTE_HOLDER_GC_TYPE_ID.set(tid),
     );
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
@@ -5823,6 +5890,17 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     });
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::walk_map_attr_cache(&mut |slot| {
+            visit_pyobject_root(&mut *slot, visitor);
+        });
+        pyre_interpreter::objspace::std::mapdict::walk_terminator_for_dicts(&mut |slot| {
+            visit_pyobject_root(&mut *slot, visitor);
+        });
+        pyre_interpreter::objspace::std::mapdict::walk_dead_map_wref(&mut |slot| {
+            visit_pyobject_root(&mut *slot, visitor);
+        });
+    }
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,

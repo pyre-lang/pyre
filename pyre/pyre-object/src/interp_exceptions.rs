@@ -456,16 +456,22 @@ pub struct W_ExceptionExtended {
 #[repr(C)]
 pub struct W_BaseExceptionUser {
     pub base: W_BaseException,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_BaseExceptionUser, storage)
-            == std::mem::offset_of!(W_BaseExceptionUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_BaseExceptionUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BASE_EXCEPTION_USER_MAPDICT_ACCESS for W_BaseExceptionUser;
+}
 
 /// `typedef.py` `_getusercls` of an extra-field realbase (`W_OSError`,
 /// `W_ImportError`, `W_StopIteration`, ...). Same mapdict tail as
@@ -473,30 +479,38 @@ const _: () = {
 #[repr(C)]
 pub struct W_ExceptionExtendedUser {
     pub base: W_ExceptionExtended,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ExceptionExtendedUser, storage)
-            == std::mem::offset_of!(W_ExceptionExtendedUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ExceptionExtendedUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_EXCEPTION_EXTENDED_USER_MAPDICT_ACCESS for W_ExceptionExtendedUser;
+}
+
 /// Slim `_getusercls` typeptr (`typedef.py` `_getusercls(W_BaseException)`).
-pub static BASE_EXCEPTION_USER_TYPE: PyType = new_user_pytype(
+pub static BASE_EXCEPTION_USER_TYPE: PyType = new_user_pytype_with_access(
     "BaseException",
     &EXCEPTION_TYPE,
     std::mem::offset_of!(W_BaseExceptionUser, map),
+    &W_BASE_EXCEPTION_USER_MAPDICT_ACCESS,
 );
 
 /// Extra-field `_getusercls` typeptr. One vtable covers every extended
 /// realbase's user layout; `w_class` names the Python class.
-pub static EXCEPTION_EXTENDED_USER_TYPE: PyType = new_user_pytype(
+pub static EXCEPTION_EXTENDED_USER_TYPE: PyType = new_user_pytype_with_access(
     "BaseException",
     &EXCEPTION_TYPE,
     std::mem::offset_of!(W_ExceptionExtendedUser, map),
+    &W_EXCEPTION_EXTENDED_USER_MAPDICT_ACCESS,
 );
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
@@ -629,7 +643,8 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 5] = [
 ];
 
 /// Slim user layout: the base pointers plus mapdict `storage`.
-/// `map` is a `usize`, not a GC edge.
+/// `map` is a GC [`crate::mapdict::MapRef`] walked by
+/// `instance_walk_boxed_storage`, not this offset table.
 pub const W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS: [usize; 6] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
@@ -1142,17 +1157,23 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// `get_unique_interplevel_subclass` selected (`*_USER_TYPE` for a user
 /// layout). At birth the only live GC child is `w_class`
 /// (`w_exception_base_defaults` / the extended-layout builder leave every
-/// other pointer `PY_NULL`). That word is the rooted slot
+/// other pointer `PY_NULL`; a USER `map` is also NULL until
+/// `_mapdict_init_empty`). That word is the rooted slot
 /// `try_gc_alloc_collecting_rooted` forwards across the minor; the shadow
 /// stack does not stand in for it. The collector rewrites the slot, so the
 /// word is stored back into `value` before `ptr::write`.
+/// A USER terminator stays on the shadow stack across this malloc; after
+/// the write, `_mapdict_init_empty` stores the reloaded map before `pin_root`.
 ///
 /// The nursery shell is uninitialized until that write. `pin_root` publishes
 /// it (`normalize_published_slot`), and a foreign collector can trace it
 /// from then on, so the header is written before the pin. The barrier is a
 /// `gc_op` and can move the shell; the returned word is the one the slot
 /// carries afterwards.
-fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRef {
+fn alloc_exception_nursery<T: crate::lltype::GcType>(
+    mut value: T,
+    map_slot: Option<usize>,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let mut rooted_class = exception_header_w_class(&value);
     let mut needs_write_barrier = true;
@@ -1176,6 +1197,10 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
         unsafe {
             std::ptr::write(raw as *mut T, value);
         }
+        if let Some(map_slot) = map_slot {
+            // Reload the terminator after the collecting malloc (`_mapdict_init_empty`).
+            exception_mapdict_init_empty(raw as PyObjectRef, map_slot);
+        }
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         let raw = crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF;
@@ -1190,7 +1215,28 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
     if crate::gc_hook::gc_alloc_failed_pending() {
         return crate::PY_NULL;
     }
-    crate::lltype::malloc_typed(value) as PyObjectRef
+    let obj = crate::lltype::malloc_typed(value) as PyObjectRef;
+    if let Some(map_slot) = map_slot {
+        exception_mapdict_init_empty(obj, map_slot);
+        // `gct_setfield`: initializing store into a possibly-old object.
+        exception_write_barrier(obj);
+    }
+    obj
+}
+
+/// `mapdict.py _mapdict_init_empty`: `self._set_mapdict_map(map); self.storage = None`.
+/// Writes the USER mixin's `map` word at `ob_type.mapdict_offset` and the
+/// following `storage` word (`MapdictStorageMixin`; same slots
+/// `MapdictCarrier` uses in the interpreter).
+fn exception_mapdict_init_empty(obj: PyObjectRef, map_slot: usize) {
+    let map = crate::gc_roots::shadow_stack_get(map_slot) as crate::mapdict::MapRef;
+    unsafe {
+        let off = (*(*obj).ob_type).mapdict_offset;
+        let map_ptr = (obj as *mut u8).add(off) as *mut crate::mapdict::MapRef;
+        let storage_ptr = map_ptr.add(1) as *mut *mut crate::object_array::ItemsBlock;
+        *map_ptr = map;
+        *storage_ptr = std::ptr::null_mut();
+    }
 }
 
 /// `ob_header.w_class` of a `W_BaseException` or a `W_ExceptionExtended`.
@@ -1276,11 +1322,21 @@ fn extended_payload(base: W_BaseException) -> W_ExceptionExtended {
     }
 }
 
-fn alloc_typed<T: crate::lltype::GcType>(value: T, immortal: bool) -> PyObjectRef {
+fn alloc_typed<T: crate::lltype::GcType>(
+    value: T,
+    immortal: bool,
+    map_slot: Option<usize>,
+) -> PyObjectRef {
     if immortal {
-        crate::lltype::malloc_typed(value) as PyObjectRef
+        let obj = crate::lltype::malloc_typed(value) as PyObjectRef;
+        if let Some(map_slot) = map_slot {
+            exception_mapdict_init_empty(obj, map_slot);
+            // `gct_setfield`: initializing store into a possibly-old object.
+            exception_write_barrier(obj);
+        }
+        obj
     } else {
-        alloc_exception_nursery(value)
+        alloc_exception_nursery(value, map_slot)
     }
 }
 
@@ -1322,7 +1378,7 @@ fn allocate_exception(
     };
     // `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`)
     // only applies to a USER layout. Builtin KeyError/IndexError/ValueError
-    // have `user == false`, so `map == 0` and `layout_header_class` returns
+    // have `user == false`, so the map is null and `layout_header_class` returns
     // `python_class` unchanged — the shadow-stack pins around that identity
     // load are a no-op vs `objspace.py allocate_instance` for an interp-level
     // class, and they sat on every residual raise.
@@ -1331,47 +1387,56 @@ fn allocate_exception(
     } else {
         None
     };
-    let (header_class, map) = if user {
+    let map_slot;
+    let header_class = if user {
         let class_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_class);
         let w_class = crate::gc_roots::shadow_stack_get(class_slot);
         let map = if unsafe { crate::typeobject::is_type(w_class) } {
-            unsafe { crate::typeobject::w_type_get_terminator(w_class) as usize }
+            unsafe { crate::typeobject::w_type_get_terminator(w_class) }
         } else {
-            0
+            std::ptr::null()
         };
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(map as crate::pyobject::PyObjectRef);
+        map_slot = Some(slot);
         let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+        let map = crate::gc_roots::shadow_stack_get(slot) as crate::mapdict::MapRef;
         // A live USER map already holds the Python class on
         // `terminator.w_cls`. The header is `gettypefor(typeptr)`.
         let header_class = unsafe { layout_header_class(ob_type, w_class, map) };
         let header_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(header_class);
-        (crate::gc_roots::shadow_stack_get(header_slot), map)
+        crate::gc_roots::shadow_stack_get(header_slot)
     } else {
-        (w_class, 0)
+        map_slot = None;
+        w_class
     };
     let base = w_exception_base_defaults(kind, ob_type, header_class);
+    // USER `map` is NULL until `_mapdict_init_empty` after malloc (`mapdict.py`).
     let obj = if !extended && !user {
-        alloc_typed(base, immortal)
+        alloc_typed(base, immortal, None)
     } else if !extended {
         alloc_typed(
             W_BaseExceptionUser {
                 base,
-                map,
+                map: std::ptr::null(),
                 storage: std::ptr::null_mut(),
             },
             immortal,
+            map_slot,
         )
     } else if !user {
-        alloc_typed(extended_payload(base), immortal)
+        alloc_typed(extended_payload(base), immortal, None)
     } else {
         alloc_typed(
             W_ExceptionExtendedUser {
                 base: extended_payload(base),
-                map,
+                map: std::ptr::null(),
                 storage: std::ptr::null_mut(),
             },
             immortal,
+            map_slot,
         )
     };
     if user && !immortal {

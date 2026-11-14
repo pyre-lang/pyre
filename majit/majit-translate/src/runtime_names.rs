@@ -136,6 +136,13 @@ pub(crate) mod shims {
     /// `str::as_ptr()`: the front respells `s.as_ptr()` as
     /// `__majit_get_raw_address_of_string(s)`, `rffi.get_raw_address_of_string`.
     pub(crate) const GET_RAW_ADDRESS_OF_STRING: &str = "__majit_get_raw_address_of_string";
+    /// CCHARP → STR (`rffi.py` `charp2str`). The front respells a
+    /// NUL-terminated C string used as `&str` as `__majit_charp2str(cp)`.
+    pub(crate) const CHARP2STR: &str = "__majit_charp2str";
+    /// CCHARP + size → STR (`rffi.py` `charpsize2str`). The front
+    /// respells a window `{data, len}` used as `&str` as
+    /// `__majit_charpsize2str(cp, size)`.
+    pub(crate) const CHARPSIZE2STR: &str = "__majit_charpsize2str";
     /// LIST → window: the front respells a `Vec<u8>` / `&mut [u8]` borrow as
     /// `__majit_nonmoving_raw_ptr_for_resizable_list(lst)`,
     /// `rgc.nonmoving_raw_ptr_for_resizable_list`.

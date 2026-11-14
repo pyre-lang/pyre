@@ -85,6 +85,15 @@ pub(crate) fn load_ullbc(path: &'static str) -> &'static Llbc {
     })
 }
 
+/// `None` when the artefact has not been extracted, so the caller can skip.
+pub(crate) fn load_ullbc_if_present(path: &'static str) -> Option<&'static Llbc> {
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return None;
+    }
+    Some(load_ullbc(path))
+}
+
 const PRODUCTION_ULLBC_PATHS: &[&str] = &[
     artifacts::INTERPRETER_ULLBC,
     artifacts::OBJECT_ULLBC,
@@ -144,9 +153,9 @@ fn cached_lower_context(llbc: &'static Llbc) -> &'static LowerContext<'static> {
         .expect("ensure_link_baseline before reading the cached LowerContext")
 }
 
-/// Publish this artefact's own stack classification and `CodeFlags` once,
-/// then fill the cached [`LowerContext`]. Holds the write lock without
-/// restoring so the published baseline stays.
+/// Publish this artefact's own stack classification and transparent scalar
+/// layouts once, then fill the cached [`LowerContext`]. Holds the write lock
+/// without restoring so the published baseline stays.
 pub(crate) fn ensure_link_baseline(llbc: &'static Llbc) {
     let slot = context_slot_for(llbc);
     if slot.get().is_some() {

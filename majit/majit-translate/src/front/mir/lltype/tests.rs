@@ -17,7 +17,6 @@ use super::{
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
     tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
-
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
@@ -10217,14 +10216,13 @@ fn transparent_gc_ptr_wrapper_peels_unless_wrapper_is_gc_class() {
 /// A by-value store of a `#[repr(transparent)]` GC handle into an
 /// enum-variant payload is one `setfield` of the container field
 /// (`heaptracker.all_fielddescrs` / `Transformer.zero_contents`: a Ptr
-/// is not an inlined STRUCT). The FieldWrite name is `__pos_0`.
+/// is not an inlined STRUCT). The FieldWrite stays `owner = E::Variant`,
+/// `name = __pos_0`.
 #[test]
 fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
     let mut decls = pointer_handle_decls();
     decls.push((6, result_enum(6)));
-    let handle_adt = serde_json::json!({
-        "Adt": {"id": 3, "generics": window_empty_generics()}
-    });
+    let handle_adt = adt_ty_json(3);
     let object_ptr = serde_json::json!({
         "RawPtr": [
             {"Adt": {"id": 1, "generics": window_empty_generics()}},
@@ -10232,67 +10230,17 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
         ]
     });
     let result_ty = result_adt_node(6, object_ptr, handle_adt.clone());
-    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty.clone(), "Mut"]});
-    let unit = serde_json::json!({"Adt": {"builtin": "Tuple", "generics": {"types": []}}});
-    let field_place = window_place(
-        serde_json::json!({"Projection": [
-            window_place(
-                serde_json::json!({"Projection": [
-                    window_place(serde_json::json!({"Local": 1}), &result_ref),
-                    "Deref"
-                ]}),
-                &result_ty
-            ),
-            {"Field": [1, 0]}
-        ]}),
-        &handle_adt,
-    );
-    let caller = serde_json::json!({
-        "def_id": 0,
-        "item_meta": window_meta(&["fixture", "store_handle_into_enum_payload"], true),
-        "signature": {
-            "is_unsafe": true,
-            "inputs": [result_ref.clone(), handle_adt.clone()],
-            "output": unit.clone()
-        },
-        "body": {"Unstructured": {
-            "span": window_span(),
-            "locals": {"arg_count": 2, "locals": [
-                window_local(0, &unit),
-                window_local(1, &result_ref),
-                window_local(2, &handle_adt)
-            ]},
-            "body": [{
-                "statements": [{
-                    "span": window_span(),
-                    "kind": {"Assign": [
-                        field_place,
-                        {"Use": [{"Read": window_place(
-                            serde_json::json!({"Local": 2}),
-                            &handle_adt
-                        )}, "No"]}
-                    ]}
-                }],
-                "kind": "Regular",
-                "terminator": {"span": window_span(), "kind": "Return"}
-            }]
-        }}
-    });
     let trait_impls =
         with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
-    let file = serde_json::json!({
-        "charon_version": "0.1.201",
-        "has_errors": false,
-        "translated": {
-            "crate_name": "fixture",
-            "type_decls": indexed_rows(decls),
-            "fun_decls": [caller],
-            "global_decls": [],
-            "trait_decls": handle_trait_decls(),
-            "trait_impls": trait_impls
-        }
-    });
-    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let (llbc, graph) = lower_variant_payload_store(
+        decls,
+        handle_trait_decls(),
+        trait_impls,
+        result_ty,
+        handle_adt,
+        1,
+        "store_handle_into_enum_payload",
+    );
     let handle_ty = serde_json::from_value::<TyRef>(serde_json::json!({
         "Value": [9003, adt_body(3)]
     }))
@@ -10310,23 +10258,274 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
         .is_none(),
         "a transparent GC handle is a Ptr leaf, not an inlined STRUCT"
     );
-    let graph = crate::test_support::lower_function(&llbc, "store_handle_into_enum_payload")
-        .expect("lower store of a transparent handle into an enum payload");
-    let writes: Vec<&str> = graph
+    assert_variant_payload_store_is_pos0(&graph, "::Err");
+}
+
+/// `lltype.Struct._note_inlined_into` / `heaptracker.all_fielddescrs` do
+/// not treat an enum variant payload as an inlined Struct of the variant
+/// owner. A FieldWrite of a by-value struct into `PayloadShell::Variant`
+/// stays `owner = PayloadShell::Variant`, `name = __pos_0`.
+#[test]
+fn by_value_struct_enum_payload_store_is_one_fieldwrite() {
+    let payload = adt_ty_json(1);
+    let decls = vec![(1, multi_field_struct_decl(1)), (2, payload_shell_enum(2))];
+    let (llbc, graph) = lower_variant_payload_store(
+        decls,
+        serde_json::json!([]),
+        serde_json::json!([]),
+        payload_shell_adt(2, payload.clone()),
+        payload,
+        0,
+        "store_struct_into_enum_payload",
+    );
+    let payload_ty = serde_json::from_value::<TyRef>(serde_json::json!({
+        "Value": [9001, adt_body(1)]
+    }))
+    .expect("MultiFieldStruct TyRef parses");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &payload_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_some(),
+        "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
+    );
+    assert!(
+        super::inline_struct_field_leaves(
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            "PayloadShell::Variant",
+            "__pos_0",
+            &raw_alloc
+        )
+        .is_none(),
+        "an enum-variant owner is not an inlined Struct"
+    );
+    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+}
+
+/// Same FieldWrite shape for a one-word transparent handle in a fixture
+/// enum (`PayloadShell::Variant`), not a production type.
+#[test]
+fn transparent_handle_fixture_enum_payload_store_is_one_fieldwrite() {
+    let mut decls = pointer_handle_decls();
+    decls.push((6, payload_shell_enum(6)));
+    let handle_adt = adt_ty_json(3);
+    let trait_impls =
+        with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
+    let (_llbc, graph) = lower_variant_payload_store(
+        decls,
+        handle_trait_decls(),
+        trait_impls,
+        payload_shell_adt(6, handle_adt.clone()),
+        handle_adt,
+        0,
+        "store_handle_into_fixture_enum_payload",
+    );
+    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+}
+
+/// `Option<MultiFieldStruct>::Some` keeps the payload as `__pos_0` on the
+/// variant owner. Dotted leaves (`__pos_0.left`) belong to the payload
+/// STRUCT, not to `Option::Some`.
+#[test]
+fn option_of_multi_field_struct_some_is_not_expanded_to_dotted_leaves() {
+    let payload = adt_ty_json(1);
+    let decls = vec![(1, multi_field_struct_decl(1)), (2, option_enum(2))];
+    let (llbc, graph) = lower_variant_payload_store(
+        decls,
+        serde_json::json!([]),
+        serde_json::json!([]),
+        option_adt_node(2, payload.clone()),
+        payload,
+        1,
+        "store_struct_into_option_some",
+    );
+    let payload_ty = serde_json::from_value::<TyRef>(serde_json::json!({
+        "Value": [9001, adt_body(1)]
+    }))
+    .expect("MultiFieldStruct TyRef parses");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &payload_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_some(),
+        "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
+    );
+    assert_variant_payload_store_is_pos0(&graph, "::Some");
+}
+
+fn multi_field_struct_decl(def_id: u64) -> serde_json::Value {
+    struct_decl(
+        def_id,
+        ident_path(&["fixture", "MultiFieldStruct"]),
+        serde_json::json!([
+            {
+                "name": "left",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            },
+            {
+                "name": "right",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
+    )
+}
+
+fn payload_shell_enum(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "PayloadShell"])),
+        "kind": {"Enum": [{
+            "name": "Variant",
+            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    })
+}
+
+fn payload_shell_adt(def_id: u64, arg: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": def_id,
+            "generics": {
+                "regions": [],
+                "types": [arg],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn adt_ty_json(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {"id": def_id, "generics": window_empty_generics()}
+    })
+}
+
+fn lower_variant_payload_store(
+    type_decls: Vec<(u64, serde_json::Value)>,
+    trait_decls: serde_json::Value,
+    trait_impls: serde_json::Value,
+    enum_ty: serde_json::Value,
+    payload_ty: serde_json::Value,
+    variant_idx: u64,
+    fn_name: &str,
+) -> (Llbc, FunctionGraph) {
+    let enum_ref = serde_json::json!({"Ref": ["Erased", enum_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Adt": {"builtin": "Tuple", "generics": {"types": []}}});
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &enum_ref),
+                    "Deref"
+                ]}),
+                &enum_ty
+            ),
+            {"Field": [variant_idx, 0]}
+        ]}),
+        &payload_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", fn_name], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [enum_ref.clone(), payload_ty.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &unit),
+                window_local(1, &enum_ref),
+                window_local(2, &payload_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        field_place,
+                        {"Use": [{"Read": window_place(
+                            serde_json::json!({"Local": 2}),
+                            &payload_ty
+                        )}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(type_decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = crate::test_support::lower_function(&llbc, fn_name)
+        .unwrap_or_else(|err| panic!("lower {fn_name}: {err}"));
+    (llbc, graph)
+}
+
+fn assert_variant_payload_store_is_pos0(graph: &FunctionGraph, owner_suffix: &str) {
+    let writes: Vec<(Option<&str>, &str)> = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
         .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+            OpKind::FieldWrite { field, .. } => {
+                Some((field.owner_root.as_deref(), field.name.as_str()))
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(
-        writes,
-        ["__pos_0"],
-        "enum-variant handle payload is one FieldWrite of the container field; graph={}",
+    assert!(
+        writes.iter().any(|(owner, name)| {
+            *name == "__pos_0" && owner.is_some_and(|root| root.ends_with(owner_suffix))
+        }),
+        "expected FieldWrite owner ending {owner_suffix} name __pos_0; writes={writes:?} graph={}",
         graph.dump()
     );
+    for (owner, name) in &writes {
+        if owner.is_some_and(|root| root.ends_with(owner_suffix)) {
+            assert_eq!(
+                *name,
+                "__pos_0",
+                "variant payload on {owner_suffix} must stay __pos_0, not a dotted leaf; writes={writes:?} graph={}",
+                graph.dump()
+            );
+        }
+        assert!(
+            !name.contains('.'),
+            "no FieldWrite may expand to a dotted leaf on the variant owner; writes={writes:?} graph={}",
+            graph.dump()
+        );
+    }
 }
 
 /// `repr(transparent)` construction of a GC-pointer handle is the
@@ -10639,6 +10838,98 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
         paint_handle(gc_int, serde_json::json!([null]), 1),
         ValueType::Ref(None)
     );
+
+    // The bitflags shape is an outer tuple newtype over a transparent
+    // `InternalBitFlags`, which in turn owns the machine integer. The
+    // low-level representation follows the type layout to the bottom word;
+    // neither wrapper becomes a STRUCT/ClassDef.
+    let u32_field = serde_json::json!([{
+        "name": null,
+        "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+        "attr_info": null
+    }]);
+    let nested_field = serde_json::json!([{
+        "name": null,
+        "ty": {"Adt": {"id": 10, "generics": {"types": []}}},
+        "attr_info": null
+    }]);
+    let inner = struct_decl(
+        10,
+        ident_path(&["fixture", "flags", "Internal"]),
+        u32_field,
+        true,
+    );
+    let mut outer = struct_decl(
+        11,
+        ident_path(&["fixture", "flags", "Flags"]),
+        nested_field,
+        false,
+    );
+    outer["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 4,
+            "align": 4,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": false}
+        }
+    }]);
+    let mut nested_decls = pointer_handle_decls();
+    nested_decls.extend([(10, inner), (11, outer)]);
+    let (llbc, flags_ty) = load_handle(nested_decls, serde_json::json!([null]), 11);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        super::tyref_to_value_type(&flags_ty, &llbc),
+        ValueType::Unsigned
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&flags_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        "u32"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &flags_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_none(),
+        "nested integer newtypes are one IntegerRepr word, not an inlined STRUCT"
+    );
+    let discovered = crate::front::mir::discover_transparent_scalar_kinds(&llbc);
+    assert!(discovered.iter().any(|(name, kind)| {
+        name == "fixture::flags::Flags"
+            && *kind == majit_charon_reader::TransparentScalarKind::Unsigned
+    }));
+    llbc.register_transparent_scalar_kinds(discovered);
+    let flags_ref = TyRef::Other(serde_json::json!({
+        "Ref": [
+            "Erased",
+            {"Adt": {"id": 11, "generics": {"types": []}}},
+            "Shared"
+        ]
+    }));
+    assert_eq!(
+        super::tyref_to_value_type(&flags_ref, &llbc),
+        ValueType::Unsigned,
+        "a borrow of the layout-transparent chain is the same integer word"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        let kind = serde_json::json!({
+            "Adt": [11, null, {"types": []}]
+        });
+        assert_eq!(
+            lowering
+                .aggregate_shape(&kind, &flags_ty, 1)
+                .expect("nested integer-newtype aggregate shape"),
+            crate::front::mir::AggregateShape::Operand {
+                index: 0,
+                transparent: true
+            }
+        );
+    });
 }
 
 /// `&self` of a one-integer tuple struct is an address. `self.0` is

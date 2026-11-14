@@ -2401,7 +2401,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     // A raw struct's fields are addresses and scalars. A GC pointer field
     // would be `getfield_raw_r`; `rewrite_op_getfield` raises only for a
     // non-pure `getfield_raw_r`, so an `_immutable_fields_` GC field is
-    // still raw storage (`MapNodeTerminatorView.w_cls`).
+    // still raw storage (an `_immutable_fields_` GCREF on a raw overlay).
     let def_id = adt_node_def_id(node)?;
     let mut stack = Vec::new();
     if !adt_def_is_raw_storage(
@@ -3531,6 +3531,8 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// equality (`rclass.py` `getvtable` / `OBJECT.typeptr`).
     pub(in crate::front::mir) registered_dyn_impl_vtables:
         std::sync::OnceLock<Vec<(String, String)>>,
+    pub(in crate::front::mir) fnptr_field_families:
+        std::sync::OnceLock<Vec<(String, String, String)>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -5221,6 +5223,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     ) {
         return Some(root);
     }
+    // `&T` / `*mut T` of a non-GC `GcArray` ITEM (`rordereddict.py`
+    // `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`). Stamp the
+    // unsuffixed template so residual `"ref"` intern's
+    // `llannotation.py` `lltype_to_annotation` of `Ptr(STRUCT)`
+    // (`declared_return_annotation` / `project_struct_field_type`). A
+    // monomorph `Entry<K, V>` is the same ITEM; intern of the suffix
+    // would mint a ClassDef (`bookkeeper.py` `getuniqueclassdef`).
+    if let Some(root) = gcarray_item_ptr_return_class_root(ty, llbc, gc_struct_ids) {
+        return Some(root);
+    }
     // Intern residual of `*mut T` / `*const T` / `NonNull<T>` onto a
     // declared non-GC ADT. Stamp `*mut {root}` so
     // `declared_return_annotation` intern's `lltype.py` `SomePtr`
@@ -5235,7 +5247,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, tombstoned);
+        let root = adt_node_class_root_with(node, llbc, tombstoned)?;
+        // GCREFOpaque implements GcType so it is a named ADT, but the
+        // residual is `lltype.GCREF` (`SomePtr`), not a ClassDef.
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+            return None;
+        }
+        return Some(root);
     }
     let type_args = adt
         .get("generics")
@@ -5305,6 +5323,96 @@ fn nongc_raw_ptr_return_class_root(
         return None;
     }
     Some(format!("*mut {root}"))
+}
+
+/// Unsuffixed intern key of a non-GC `GcArray` ITEM behind one pointer
+/// word (`rordereddict.py` `get_ll_dict` `DICTENTRY` / `DICTENTRYARRAY`;
+/// `lltype.py` `InteriorPtr` of `Struct` in `GcArray`).
+fn gcarray_item_ptr_return_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    let pointee = type_node_peel_aliases(pointee, llbc)?;
+    let def_id = adt_node_def_id(pointee)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let identity = type_decl_unsuffixed_identity(td);
+    if identity.is_empty() || identity.starts_with("??") || identity.starts_with('[') {
+        return None;
+    }
+    if struct_id_is_declared_gc(gc_struct_ids, struct_id_for_type_decl(td), &identity) {
+        return None;
+    }
+    type_decl_is_gcarray_item(td, llbc, gc_struct_ids).then_some(identity)
+}
+
+fn type_decl_unsuffixed_identity(td: &TypeDecl) -> String {
+    let path = strip_crate_prefix(&td.item_meta.name_path());
+    majit_ir::descr::strip_generic_args(&path).into_owned()
+}
+
+/// True when `td` is the inlined ITEM of a declared-GC `{integer, [T; 0]}`
+/// wrapper (`lltype.py` `GcArray` of `Struct`). Pointer ITEM stays a
+/// list (`FixedSizeListRepr`).
+fn type_decl_is_gcarray_item(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let item_key = type_decl_unsuffixed_identity(td);
+    for wrapper in llbc.iter_type_decls() {
+        let Some(fields) = type_decl_struct_fields(wrapper, llbc) else {
+            continue;
+        };
+        if fields.len() != 2 {
+            continue;
+        }
+        let wrapper_name = strip_crate_prefix(&wrapper.item_meta.name_path());
+        if !struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(wrapper),
+            &wrapper_name,
+        ) {
+            continue;
+        }
+        if !tyref_is_integer_scalar(&fields[0].ty, llbc) {
+            continue;
+        }
+        let Some((item, 0)) = super::views::tyref_raw_array_parts(&fields[1].ty, llbc) else {
+            continue;
+        };
+        let Some(item) = strip_ty_indirections(item, llbc) else {
+            continue;
+        };
+        let Some(item) = type_node_peel_aliases(item, llbc) else {
+            continue;
+        };
+        if one_level_pointer_pointee(item, llbc).is_some() {
+            continue;
+        }
+        let Some(item_td) = adt_node_def_id(item).and_then(|id| llbc.type_by_id(id)) else {
+            continue;
+        };
+        let item_identity = type_decl_unsuffixed_identity(item_td);
+        if struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(item_td),
+            &item_identity,
+        ) {
+            continue;
+        }
+        if item_identity == item_key {
+            return true;
+        }
+    }
+    false
 }
 
 /// A residual returning `*mut` / `Ref` of a registered GC struct is a
@@ -6827,6 +6935,20 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if td.item_meta.name_path_str() == "alloc::boxed::Box" {
         return None;
     }
+    // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested RPython
+    // struct (`nestedscope.py CellFamily.ever_mutated`). Expanding the
+    // payload as `{field}.value` misses fielddescrof.
+    if tyref_is_unsafecell(ty, llbc) || tyref_is_std_cell(ty, llbc) {
+        return None;
+    }
+    let path = td.item_meta.name_path();
+    if path == "cell::Cell"
+        || path == "cell::UnsafeCell"
+        || path.ends_with("::UnsafeCell")
+        || path.ends_with("::cell::Cell")
+    {
+        return None;
+    }
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
@@ -7128,18 +7250,25 @@ pub(in crate::front::mir) fn type_decl_by_owner_root<'l>(
     owner: &str,
 ) -> Option<&'l TypeDecl> {
     let index = struct_decls_by_owner(llbc);
-    let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
-    if let Some((key, pos)) = index.exact.get(start)
+    decl_by_owner_keys(&index.exact, &index.leaf, llbc, owner)
+}
+
+fn decl_by_owner_keys<'l>(
+    exact: &[(String, usize)],
+    leaf: &[(String, usize)],
+    llbc: &'l Llbc,
+    owner: &str,
+) -> Option<&'l TypeDecl> {
+    let start = exact.partition_point(|(k, _)| k.as_str() < owner);
+    if let Some((key, pos)) = exact.get(start)
         && key == owner
     {
         return llbc.type_by_id(*pos as u64);
     }
     let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let start = index.leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
-    let end = index
-        .leaf
-        .partition_point(|(k, _)| k.as_str() <= owner_leaf);
-    match &index.leaf[start..end] {
+    let start = leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
+    let end = leaf.partition_point(|(k, _)| k.as_str() <= owner_leaf);
+    match &leaf[start..end] {
         [(_, pos)] => llbc.type_by_id(*pos as u64),
         _ => None,
     }
@@ -8130,6 +8259,31 @@ pub(in crate::front::mir) fn tyref_one_word_handle_payload_field(
     one_word_handle_payload_field(decl, node, llbc, tombstoned)
 }
 
+/// Low-level pointer spelling of a non-transparent one-word handle.
+///
+/// `one_word_handle_payload_field` performs the representation choice from
+/// the instantiated TypeDecl: it substitutes concrete generic arguments,
+/// drops zero-sized fields, and requires one pointer-sized payload.  The
+/// field row must carry that pointer representation rather than the generic
+/// declaration's symbolic aggregate layout (`rmodel.py` `Repr.lowleveltype`,
+/// `rclass.py` `getinstancerepr`).
+fn one_word_handle_field_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    let (index, _) = one_word_handle_payload_field(decl, node, llbc, tombstoned)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    let concrete =
+        substitute_spill_typevars(&field.ty, node, llbc).unwrap_or_else(|| clone_tyref(&field.ty));
+    Some(format!("*mut {}", tyref_to_ast_string(&concrete, llbc)))
+}
+
 /// Inner struct of a by-value `#[repr(transparent)]` newtype.
 ///
 /// `celldict.py` `erase({})` stores the dicttable itself; `ModuleDictStorage`
@@ -8526,8 +8680,19 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     }) {
         return Some(transparent_scalar_value_type(kind));
     }
+    let path = decl.item_meta.name_path();
     match &decl.kind {
         TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
+            // Whole-input layout discovery links the public wrapper to the
+            // bottom scalar even when Charon marks only an inner carrier as
+            // `repr(transparent)`. This applies through a borrow as well:
+            // construction and field projection have already selected the
+            // same `IntegerRepr.lowleveltype` word.
+            if transparent_integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids).is_some()
+                && let Some(kind) = llbc.transparent_scalar_kind(&path)
+            {
+                return Some(transparent_scalar_value_type(kind));
+            }
             if decl.is_repr_transparent() {
                 let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
                     fields.get(index)?
@@ -8617,22 +8782,56 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     }
 }
 
-/// Unique positional field of a non-GC tuple-struct newtype that is a
-/// one-word integer scalar (`iN` / `uN` / `isize` / `usize`, not
-/// `i128`/`u128`). Named one-field wrappers (`RangeFrom.start`, a
-/// rust-heap `String`'s header word) keep their own type.
-/// Multi-field structs, ZST markers beside a payload, GC instances,
-/// pointers, and floats stay `None` so they keep their own bank.
-fn integer_newtype_inner_field<'a>(
-    decl: &TypeDecl,
+/// Bottom integer field of a non-GC tuple-struct newtype chain.
+///
+/// Each link is the unique non-ZST positional field of its value layout; the walk
+/// stops only at a machine integer (`iN` / `uN` / `isize` / `usize`, not
+/// `i128`/`u128`). This is the lltype RPython's `IntegerRepr.lowleveltype`
+/// carries through construction and field projection. Named one-field
+/// wrappers (`RangeFrom.start`, a rust-heap `String`'s header word), GC
+/// instances, pointers, and floats stay `None`.
+pub(in crate::front::mir) fn integer_newtype_inner_field<'a>(
+    decl: &'a TypeDecl,
     fields: &'a [FieldDecl],
-    llbc: &Llbc,
+    llbc: &'a Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<&'a TyRef> {
     if gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
         return None;
     }
-    integer_newtype_inner_field_structural(decl, fields, llbc)
+    let field = integer_newtype_inner_field_structural(decl, fields, llbc)?;
+    integer_newtype_scalar_field(field, llbc, gc_struct_ids)
+}
+
+/// Bottom integer of a layout chain whose representation is made transparent
+/// by one of its newtype links.
+///
+/// Charon can report the public bitflags wrapper as `repr(Rust)` while its
+/// sole field is the generated `repr(transparent)` carrier. The outer layout
+/// is still that carrier at offset zero. An ordinary Rust tuple newtype whose
+/// field is directly an integer does not satisfy this predicate, so borrowing
+/// it remains an address. This is the distinction RPython's
+/// `IntegerRepr.lowleveltype` makes after the frontend has selected the
+/// integer representation.
+pub(in crate::front::mir) fn transparent_integer_newtype_inner_field<'a>(
+    decl: &'a TypeDecl,
+    fields: &'a [FieldDecl],
+    llbc: &'a Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<&'a TyRef> {
+    if gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
+        return None;
+    }
+    if decl.is_repr_transparent() {
+        return integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids);
+    }
+    let field = integer_newtype_inner_field_structural(decl, fields, llbc)?;
+    let node = tyref_node(field, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let inner = llbc.type_by_id(adt_node_def_id(node)?)?;
+    let TypeDeclKind::Struct(inner_fields) = &inner.kind else {
+        return None;
+    };
+    transparent_integer_newtype_inner_field(inner, inner_fields, llbc, gc_struct_ids)
 }
 
 /// Shape of a by-value one-integer tuple struct, ignoring GC taint.
@@ -8647,7 +8846,10 @@ pub(in crate::front::mir) fn type_decl_is_by_value_integer_newtype(
     let TypeDeclKind::Struct(fields) = &decl.kind else {
         return false;
     };
-    integer_newtype_inner_field_structural(decl, fields, llbc).is_some()
+    let Some(field) = integer_newtype_inner_field_structural(decl, fields, llbc) else {
+        return false;
+    };
+    integer_newtype_scalar_field_structural(field, llbc).is_some()
 }
 
 fn integer_newtype_inner_field_structural<'a>(
@@ -8663,9 +8865,8 @@ fn integer_newtype_inner_field_structural<'a>(
     if !carrier.is_empty() && path == carrier {
         return None;
     }
-    let [field] = fields else {
-        return None;
-    };
+    let (index, _) = unique_nonzst_field(decl, llbc)?;
+    let field = fields.get(index)?;
     // Charon drops a positional `_0` to `name: None`
     // (`ullbc.rs FieldDecl`). A named payload is a real field, not a
     // newtype wrap of the integer (`RangeFrom.start`).
@@ -8675,8 +8876,40 @@ fn integer_newtype_inner_field_structural<'a>(
     if field_is_zst(&field.ty, llbc) {
         return None;
     }
-    one_word_integer_scalar_value_type(&field.ty, llbc)?;
     Some(&field.ty)
+}
+
+fn integer_newtype_scalar_field_structural<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a TyRef> {
+    if one_word_integer_scalar_value_type(ty, llbc).is_some() {
+        return Some(ty);
+    }
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = integer_newtype_inner_field_structural(decl, fields, llbc)?;
+    integer_newtype_scalar_field_structural(field, llbc)
+}
+
+fn integer_newtype_scalar_field<'a>(
+    ty: &'a TyRef,
+    llbc: &'a Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<&'a TyRef> {
+    if one_word_integer_scalar_value_type(ty, llbc).is_some() {
+        return Some(ty);
+    }
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = integer_newtype_inner_field_structural(decl, fields, llbc)?;
+    integer_newtype_scalar_field(field, llbc, gc_struct_ids)
 }
 
 fn integer_newtype_inner_value_type(
@@ -8840,6 +9073,17 @@ pub(in crate::front::mir) fn unique_unsafecell_slice_deref_field_index(
         found = Some(idx);
     }
     found
+}
+
+/// `core::cell::Cell<T>` (not `nestedscope::Cell`).
+pub(in crate::front::mir) fn tyref_is_std_cell(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|p| {
+        p == "core::cell::Cell"
+            || p == "std::cell::Cell"
+            || p == "crate::cell::Cell"
+            || p == "cell::Cell"
+            || p.ends_with("::cell::Cell")
+    })
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -9462,7 +9706,8 @@ pub(in crate::front::mir) fn split_struct_instantiation_suffix(
 /// getkind, `SomePtr`), the node is not a pointer (a by-value
 /// transparent handle keeps its own class), the pointee is a Raw
 /// struct (`&mut S` stays `Ref(None)` with `class_root` on the Input),
-/// or the pointee has no class root (`GCREFOpaque`, `*mut u8`). The
+/// or the pointee is GCREF erasure (`GCREFOpaque`) / has no class root
+/// (`*mut u8`). The
 /// spelling is the same `adt_node_class_root_with` produces
 /// (`"pyobject::PyObject"`), which `Bookkeeper::project_struct_field_type` /
 /// `lltype_for_named_ref` resolve to the classdef.
@@ -9510,7 +9755,11 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     let pointee = one_level_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_wrappers(pointee, llbc)?;
     let sid = declared_adt_struct_id(pointee, llbc)?;
-    if !gc_struct_ids.contains(&sid) {
+    let name = adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .unwrap_or_default();
+    if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -9544,8 +9793,7 @@ pub(in crate::front::mir) fn tyref_is_gcref_spelling(ty: &TyRef, llbc: &Llbc) ->
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path_str();
-            path == "GCREFOpaque" || path.ends_with("::GCREFOpaque")
+            crate::annotator::bookkeeper::is_gcref_type_spelling(td.item_meta.name_path_str())
         })
 }
 
@@ -13422,6 +13670,9 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     ) {
         return spelling;
     }
+    if let Some(spelling) = one_word_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+        return spelling;
+    }
     // An atomic wrapper is layout-transparent over its inner scalar, and the
     // typed side already models a field of one as that inner value
     // (`tyref_atomic_inner_value_type`).  Spell the field with the scalar so
@@ -15056,6 +15307,11 @@ pub(crate) fn fnptr_indirect_enabled() -> bool {
 /// [`render_adt_type_args`] both the construction and the projection derive
 /// from the tuple's `place.ty` node (NOT the element-type-less `AggregateKind`
 /// head), so the `__pos_N` read and write owners agree.
+///
+/// A generic `(&K, &V)` still has two items (`rtuple.py` `TupleRepr`);
+/// the bound TypeVar spelling (`??TypeVar#N`) is part of the owner so
+/// construction FieldWrites are not dropped onto the unit `Tuple`
+/// lattice (`getattr(Tuple, __pos_0)`).
 pub(in crate::front::mir) fn tuple_shape_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
@@ -15064,7 +15320,7 @@ pub(in crate::front::mir) fn tuple_shape_suffix(
         return String::new();
     }
     let args = render_adt_type_args(adt, llbc, 0);
-    if args.is_empty() || args.iter().any(|a| a.contains("??")) {
+    if args.is_empty() {
         return String::new();
     }
     format!("<{}>", args.join(","))
@@ -15833,6 +16089,11 @@ pub(in crate::front::mir) fn field_row_struct_identity(
 /// A pointer ITEM (`FixedSizeListRepr` of a W_Root / instance) stays the
 /// list path. `wrapper` supplies `??TypeVar#N` arguments for harvested
 /// generic rows; the array-of-ADT row already carries the TypeDecl path.
+/// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`),
+/// the same seed [`gcarray_item_struct_ptr_annotation`] uses for the ITEM
+/// pointer. Declared-GC of the ITEM is path identity
+/// ([`spelling_path_is_declared_gc`]): harvest's leaf `StructId` is not
+/// this TypeDecl (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`).
 pub(crate) fn struct_item_flexible_gcarray_block_annotation(
     reg: &crate::front::StructFieldRegistry,
     wrapper: &str,
@@ -15842,20 +16103,17 @@ pub(crate) fn struct_item_flexible_gcarray_block_annotation(
     use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
 
     let items_ty = substitute_typevar_markers(items_ty, &spelling_type_args(wrapper));
-    if items_ty.contains("??") {
-        return None;
-    }
     let (item, 0) = shaped_array_parts(&items_ty)? else {
         return None;
     };
     if crate::front::typestr::peel_pointer_prefix(item).is_some() {
         return None;
     }
-    if spelling_is_declared_gc(&reg.gc_struct_ids, item) {
+    if spelling_path_is_declared_gc(&reg.gc_struct_ids, item) {
         return None;
     }
     let mut visited = std::collections::HashSet::new();
-    let entry = raw_struct_array_item_lltype(reg, item, &mut visited)?;
+    let entry = raw_struct_array_item_lltype_inner(reg, item, &mut visited, true)?;
     Some(lltype_to_annotation(Ptr {
         TO: PtrTarget::Array(Array::gc(entry)),
     }))
@@ -15909,12 +16167,53 @@ fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
     out
 }
 
+/// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
+/// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
+/// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
+/// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`).
+pub(crate) fn gcarray_item_struct_ptr_annotation(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::annotator::model::SomeValue> {
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+
+    let item = crate::front::typestr::peel_pointer_prefix(item).unwrap_or(item);
+    let item = item.trim().trim_start_matches("mut ");
+    // Declared-GC of this ITEM is [`struct_root_is_gcarray_item`]: harvest
+    // also stores the leaf `StructId` (`note_declared_gc_owner`), which is
+    // not this TypeDecl (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`).
+    let mut visited = std::collections::HashSet::new();
+    let entry = raw_struct_array_item_lltype_inner(reg, item, &mut visited, true)?;
+    let LowLevelType::Struct(st) = entry else {
+        return None;
+    };
+    Some(lltype_to_annotation(Ptr {
+        TO: PtrTarget::Struct(*st),
+    }))
+}
+
+fn spelling_is_unsubstituted_typevar(ty: &str) -> bool {
+    let t = crate::front::typestr::peel_pointer_prefix(ty.trim()).unwrap_or(ty.trim());
+    let t = t.trim().trim_start_matches("mut ");
+    t.starts_with("??TypeVar")
+}
+
 fn raw_struct_array_item_lltype(
     reg: &crate::front::StructFieldRegistry,
     item: &str,
     visited: &mut std::collections::HashSet<String>,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+    raw_struct_array_item_lltype_inner(reg, item, visited, false)
+}
+
+fn raw_struct_array_item_lltype_inner(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+    visited: &mut std::collections::HashSet<String>,
+    typevar_as_gcref: bool,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, Struct};
     let name = reg.resolved_owner_key(item)?;
     if !visited.insert(name.clone()) {
         return None;
@@ -15928,7 +16227,14 @@ fn raw_struct_array_item_lltype(
         let mut fields = Vec::with_capacity(rows.len());
         for row in rows {
             let ty = substitute_typevar_markers(&row.ty, &args);
-            fields.push((row.name.clone(), field_row_lltype(reg, &ty, visited)?));
+            let ll = match field_row_lltype(reg, &ty, visited) {
+                Some(ll) => ll,
+                None if typevar_as_gcref && spelling_is_unsubstituted_typevar(&ty) => {
+                    (*GCREF).clone()
+                }
+                None => return None,
+            };
+            fields.push((row.name.clone(), ll));
         }
         // ARRAY.OF is the registry key `field_rows` already resolved for
         // the harvest TypeDecl path stored on the `[ADT; N]` row

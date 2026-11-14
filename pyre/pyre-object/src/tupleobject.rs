@@ -89,16 +89,22 @@ pub struct W_TupleObject {
 #[repr(C)]
 pub struct W_TupleObjectUser {
     pub base: W_TupleObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_TupleObjectUser, storage)
-            == std::mem::offset_of!(W_TupleObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_TupleObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_TUPLE_USER_MAPDICT_ACCESS for W_TupleObjectUser;
+}
 
 /// GC type id assigned to `W_TupleObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
@@ -578,7 +584,7 @@ fn w_tuple_new_array_backed_impl(
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: items_block,
                 },
-                map: 0,
+                map: std::ptr::null(),
                 storage: std::ptr::null_mut(),
             }) as PyObjectRef
         }
@@ -613,7 +619,7 @@ unsafe fn write_tuple_layout(
                         hash: AtomicI64::new(TUPLE_HASH_UNSET),
                         wrappeditems,
                     },
-                    map: 0,
+                    map: std::ptr::null(),
                     storage: std::ptr::null_mut(),
                 },
             )

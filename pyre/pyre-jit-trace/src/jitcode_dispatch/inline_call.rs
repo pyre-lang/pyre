@@ -2339,6 +2339,14 @@ fn blackhole_interprets_inline_callee(fnaddr: i64) -> bool {
 /// a blocker even when the concrete word is unknown.
 fn funcbox_call_blocker(fnaddr: Option<i64>, may_symbolic: bool) -> Option<i64> {
     match fnaddr {
+        Some(addr)
+            if crate::jitcode_runtime::indirectcalltarget_index_for_address(addr as usize)
+                .is_some() =>
+        {
+            // `bytecode_for_address` hits: the blackhole calls the real
+            // fnaddr (`bhimpl_residual_call_*` / `bhimpl_inline_call_*`).
+            None
+        }
         Some(addr) if !majit_jitcode::codewriter::call::is_callable_fnaddr(addr) => Some(addr),
         Some(_) => None,
         None if may_symbolic => Some(0),
@@ -13824,7 +13832,7 @@ fn emit_walker_instance<Sym: WalkSym>(
     let _instance_roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(concrete_instance);
-    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let terminator_const = ctx.trace_ctx.const_ref(terminator as i64);
     // The vtable `alloc_instance_object` stamps for this `w_type`. Exact
     // `object()` is `INSTANCE_TYPE`; every other carrier is
     // `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`).

@@ -740,10 +740,11 @@ pub fn emit_box_long_inline(
 /// rewriter; the plain `suppress_context` byte is stored explicitly.
 ///
 /// `_mapdict_init_empty` stores `w_subtype.terminator` and leaves `storage`
-/// null. `map` is a plain word, so the rewriter does not clear it, and a
-/// virtual force would otherwise publish whatever bits the nursery held.
-/// `storage` is stored too: a virtual read of an unwritten field reloads the
-/// word instead of the null `allocate_exception` wrote.
+/// null. `map` is a GCREF (`MapdictStorageMixin.map`); `clear_gc_fields`
+/// zeros it at malloc. The explicit store still installs the interned
+/// terminator so a compiled NewWithVtable holds the same map `GuardValue`
+/// later promotes. `storage` is stored too: a virtual read of an unwritten
+/// field reloads the word instead of the null `allocate_exception` wrote.
 pub fn emit_exception_new_inline(
     ctx: &mut TraceCtx,
     kind: pyre_object::interp_exceptions::ExcKind,
@@ -759,10 +760,9 @@ pub fn emit_exception_new_inline(
         // `allocate_exception` writes both words. The offsets differ between
         // the slim and extended user structs; the field descr is the one on
         // this kind's user SizeDescr. Store `map` before any later collecting
-        // record: `instance_walk_boxed_storage` loads it, and
-        // `clear_gc_fields` does not reach a Type::Int intern_node word
-        // (`MapdictStorageMixin.map` is a GCREF upstream). The SizeDescr
-        // extra-clear offset is the rewrite-time sibling of this store.
+        // record: `instance_walk_boxed_storage` loads it. `clear_gc_fields`
+        // zeros the GCREF at malloc; this store then writes the interned
+        // terminator (`_mapdict_init_empty`).
         let (map_offset, storage_offset) =
             if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
                 (
@@ -784,12 +784,15 @@ pub fn emit_exception_new_inline(
         // instance already holds.
         let map_word = match ctx.box_value(w_class) {
             Some(Value::Ref(GcRef(p))) => {
-                let term = unsafe {
-                    pyre_object::typeobject::w_type_get_terminator(p as pyre_object::PyObjectRef)
-                };
-                ctx.const_int(term as i64)
+                let obj = p as pyre_object::PyObjectRef;
+                if obj.is_null() || !unsafe { pyre_object::typeobject::is_type(obj) } {
+                    ctx.const_ref(0)
+                } else {
+                    let term = unsafe { pyre_object::typeobject::w_type_get_terminator(obj) };
+                    ctx.const_ref(term as i64)
+                }
             }
-            _ => ctx.const_int(0),
+            _ => ctx.const_ref(0),
         };
         let map_idx = map_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_word], map_descr);
@@ -815,7 +818,13 @@ pub fn emit_exception_new_inline(
             } else {
                 &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE
             };
-        let stamped = unsafe { pyre_object::layout_header_class(layout, std::ptr::null_mut(), 1) };
+        let stamped = unsafe {
+            pyre_object::layout_header_class(
+                layout,
+                std::ptr::null_mut(),
+                1 as pyre_object::mapdict::MapRef,
+            )
+        };
         if stamped.is_null() {
             w_class
         } else {
@@ -1024,8 +1033,8 @@ pub fn emit_instance_inline(
     // (`user_setup` / `_mapdict_init_empty`). `map == 0` keeps the Python
     // class argument so `getclass` still answers until the map exists.
     let header_stamp = match ctx.box_value(map) {
-        Some(Value::Int(0)) => header_w_class,
-        Some(Value::Int(_)) => {
+        Some(Value::Ref(r)) if r.as_usize() == 0 => header_w_class,
+        Some(Value::Ref(_)) => {
             let layout = if user {
                 &pyre_object::pyobject::INSTANCE_USER_TYPE
             } else {

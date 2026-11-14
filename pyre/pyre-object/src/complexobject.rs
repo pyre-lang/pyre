@@ -19,16 +19,22 @@ pub struct W_ComplexObject {
 #[repr(C)]
 pub struct W_ComplexObjectUser {
     pub base: W_ComplexObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ComplexObjectUser, storage)
-            == std::mem::offset_of!(W_ComplexObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ComplexObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_COMPLEX_USER_MAPDICT_ACCESS for W_ComplexObjectUser;
+}
 
 /// Field offset of `real` within `W_ComplexObject`.
 pub const COMPLEX_REAL_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, real);
@@ -118,7 +124,7 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
             real,
             imag,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

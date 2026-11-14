@@ -143,9 +143,10 @@ mod typedef_identity_tests {
                     "typeobject.py W_TypeObject.__init__ installs terminator after layout"
                 );
                 let inst = w_instance_new(child);
-                assert_ne!(
-                    (*(inst as *const pyre_object::objectobject::W_ObjectObject)).map,
-                    0,
+                assert!(
+                    !(*(inst as *const pyre_object::objectobject::W_ObjectObject))
+                        .map
+                        .is_null(),
                     "alloc_instance_object copies w_subtype.terminator"
                 );
                 let parent_layout = w_type_get_layout_ptr(base);

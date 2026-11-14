@@ -2874,7 +2874,7 @@ impl ClassDef {
     ///
     /// The `bookkeeper.update_attr(cdef, attrdef)` call site drives
     /// [`Bookkeeper::update_attr`] for reflow + validation.
-    fn add_source_for_attribute(
+    pub(crate) fn add_source_for_attribute(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
         source: AttrSource,

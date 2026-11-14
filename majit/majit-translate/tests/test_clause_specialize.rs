@@ -337,6 +337,175 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
     }
 }
 
+/// `w_set` storage is `RDict<ObjectKey, ()>`. Its `entries_item_ptr`
+/// spec is still `direct_arrayitems` (`lltype.py`): the items offset as
+/// `cast_int_to_ptr`. A leftover `__cast_instance_intrinsic` onto
+/// unsuffixed `GcEntries` then getattr `items` is the annotator skip
+/// (`Array` has no named `items`).
+#[test]
+fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["setobject", "rordereddict", "rordereddict_entries"],
+        &["key_at"],
+    )
+    .expect("lower setobject key_at");
+
+    let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let unit_ptrs: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("entries_item_ptr__spec_ObjectKey____"))
+        .collect();
+    assert!(
+        !unit_ptrs.is_empty(),
+        "expected ObjectKey+() entries_item_ptr spec, got {names:?}"
+    );
+    for spec in &unit_ptrs {
+        assert!(
+            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
+            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        let has_items_field =
+            spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "items"),
+            );
+        assert!(
+            !has_items_field,
+            "{} must not getattr items, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+    }
+}
+
+/// Identity-key `get_slot` must not recast the inlined `DICTENTRY` onto
+/// `Entry<ObjectKey, …>`. That ClassDef leaking into another-K spec is
+/// `mergeinputargs` UnionError (`lltype.py` `Struct` is not a class).
+#[test]
+fn identitykey_get_slot_does_not_cast_objectkey_entry() {
+    use majit_translate::model::cast_instance_root;
+
+    let llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["identitydict", "rordereddict", "rordereddict_entries"],
+        &["nth_item"],
+    )
+    .expect("lower identitydict nth_item");
+
+    let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let slots: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("get_slot__spec_IdentityKey"))
+        .collect();
+    assert!(
+        !slots.is_empty(),
+        "expected IdentityKey get_slot spec, got {names:?}"
+    );
+    for spec in &slots {
+        let objectkey_casts: Vec<_> = spec
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| {
+                let root = cast_instance_root(&op.kind)?;
+                root.contains("Entry<ObjectKey").then(|| root.to_string())
+            })
+            .collect();
+        assert!(
+            objectkey_casts.is_empty(),
+            "{} must not recast onto ObjectKey Entry, casts {objectkey_casts:?}, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            !graph_calls_leaf(spec.graph(), "entries_item_ptr"),
+            "{} must not bind unspecialized entries_item_ptr, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            !graph_calls_spec_leaf(spec.graph(), "entries_item_ptr__spec_ObjectKey"),
+            "{} must not bind ObjectKey entries_item_ptr, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+    }
+}
+
+/// `rordereddict.py` `_ll_dict_setitem_lookup_done` binds
+/// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY` (`lltype.py`
+/// `Struct` in `GcArray`). A classdef recast onto `Entry<K, V>` is
+/// `mergeinputargs` UnionError of two monomorph ClassDefs at
+/// `RDict::entry_at`.
+#[test]
+fn identitykey_entry_at_does_not_recast_monomorph_entry() {
+    use majit_translate::model::cast_instance_root;
+
+    let llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["identitydict", "rordereddict", "rordereddict_entries"],
+        &["nth_item"],
+    )
+    .expect("lower identitydict nth_item");
+
+    let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let specs: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            f.name.contains("entry_at__spec_IdentityKey")
+                || f.name.contains("entries_item_ptr__spec_IdentityKey")
+        })
+        .collect();
+    assert!(
+        specs
+            .iter()
+            .any(|f| f.name.contains("entry_at__spec_IdentityKey")),
+        "expected IdentityKey entry_at spec, got {names:?}"
+    );
+    for spec in &specs {
+        let entry_casts: Vec<_> = spec
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| {
+                let root = cast_instance_root(&op.kind)?;
+                (root.contains("Entry<") || root.ends_with("::Entry") || root == "Entry")
+                    .then(|| root.to_string())
+            })
+            .collect();
+        assert!(
+            entry_casts.is_empty(),
+            "{} must keep InteriorPtr of DICTENTRY, recasts {entry_casts:?}, return_class_root {:?}, ops {:?}",
+            spec.name,
+            spec.return_class_root,
+            op_kinds(spec.graph())
+        );
+        if spec.name.contains("entry_at__spec_IdentityKey") {
+            assert!(
+                spec.return_class_root.as_deref().is_some_and(|root| {
+                    !root.contains('<') && !root.contains("*mut") && !root.contains("*const")
+                }),
+                "{} return_class_root is the unsuffixed DICTENTRY ITEM, got {:?}",
+                spec.name,
+                spec.return_class_root
+            );
+        }
+    }
+}
+
 /// `ll_dict_lookup` / `_ll_write_indexes` access the mutable GcArray behind
 /// `d.indexes`. They must keep GC array operations rather than escaping to
 /// raw pointer arithmetic or treating the shared integer storage as immutable.

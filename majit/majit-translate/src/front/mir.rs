@@ -474,6 +474,12 @@ pub(crate) fn absorb_semantic_program(
                     .entry(key)
                     .or_insert(kind);
             }
+            acc.struct_fields
+                .option_struct_ids
+                .extend(prog.struct_fields.option_struct_ids);
+            acc.struct_fields
+                .result_struct_ids
+                .extend(prog.struct_fields.result_struct_ids);
             for root in prog.struct_fields.foreign_body_roots {
                 acc.struct_fields.note_foreign_body_crate_root(&root);
             }
@@ -744,6 +750,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+            fnptr_field_families: Vec::new(),
         }),
     )
 }
@@ -1726,6 +1733,29 @@ fn intern_payload_registry_spelling(
         // Unique-leaf remap to the declared tag width so getattr of
         // `Result::Err.__pos_0` is Integer (`tyref_to_value_type`).
         if let Some(int_ty) = fieldless_enum_payload_int_ty(td, llbc) {
+            match resolved.as_ref() {
+                Some(prev) if prev != &int_ty => return spelling.to_string(),
+                Some(_) => {}
+                None => resolved = Some(int_ty),
+            }
+            continue;
+        }
+        // A variant payload naming an outer Rust-layout wrapper over a
+        // transparent integer carrier must use the same bottom lltype as the
+        // live value. Otherwise the payload ClassDef interns the intermediate
+        // wrapper and later emits a getfield on an `IntegerRepr` base
+        // (`rint.py` `IntegerRepr`). A directly transparent newtype keeps its
+        // ordinary field row for enum-payload projection.
+        if !td.is_repr_transparent()
+            && let TypeDeclKind::Struct(fields) = &td.kind
+            && let Some(inner) = transparent_integer_newtype_inner_field(
+                td,
+                fields,
+                llbc,
+                &struct_fields.gc_struct_ids,
+            )
+        {
+            let int_ty = tyref_to_ast_string(inner, llbc);
             match resolved.as_ref() {
                 Some(prev) if prev != &int_ty => return spelling.to_string(),
                 Some(_) => {}
@@ -2942,6 +2972,18 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
+        let len_shadow = pair_len_shadows_of(&locals, self.llbc, &[], &[], &[], &[]);
+        rewrite_exception_transformed_input_ops(
+            &mut graph,
+            &locals,
+            &fd.signature.output,
+            self.llbc,
+            self.static_addrs.error_carrier,
+            &len_shadow,
+            &self.state.tombstoned_leaves,
+            &self.state.gc_struct_ids,
+            &self.state.raw_alloc_flavor_structs,
+        );
         if declared_result_is_unit(
             &fd.signature.output,
             self.llbc,
@@ -3397,6 +3439,7 @@ impl CrateLoweringState {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
+            fnptr_field_families: Vec::new(),
         }
     }
 }
@@ -5285,6 +5328,42 @@ fn exception_class_generalized_owner_row(
     }
 }
 
+/// Record the Charon TypeDecl identity of `core::option::Option` /
+/// `core::result::Result` (`tyref_is_option` / `tyref_is_result`
+/// `adt_path_of`). The intern later refuses a ClassDef for those
+/// declarations; a nullable `Option<P>` is `noneify` of P, and a tagged
+/// Option/Result is a low-level struct value.
+fn note_core_option_or_result_struct(
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    td: &TypeDecl,
+) {
+    let name = td.item_meta.name_path();
+    let ids = match name.as_str() {
+        "core::option::Option" => &mut struct_fields.option_struct_ids,
+        "core::result::Result" => &mut struct_fields.result_struct_ids,
+        _ => return,
+    };
+    let stripped = strip_crate_prefix(&name);
+    ids.insert(struct_id_for_type_decl(td));
+    ids.insert(majit_ir::descr::StructId::from_canonical(&name));
+    if stripped != name {
+        ids.insert(majit_ir::descr::StructId::from_canonical(&stripped));
+    }
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return;
+    };
+    for v in variants {
+        ids.insert(majit_ir::descr::StructId::from_canonical(&format!(
+            "{stripped}::{}",
+            v.name
+        )));
+        ids.insert(majit_ir::descr::StructId::from_canonical(&format!(
+            "{name}::{}",
+            v.name
+        )));
+    }
+}
+
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -5477,6 +5556,9 @@ fn derive_program_metadata(
         if type_decl_is_builtin_adt(td) {
             continue;
         }
+        // TypeDecl identity of core Option/Result is independent of the
+        // copy-vs-original field-row registration below.
+        note_core_option_or_result_struct(&mut struct_fields, td);
         // A copied import is not a second registration of the defining
         // crate's class. First-writer field rows and later exact layouts
         // would otherwise overwrite that class.
@@ -5501,6 +5583,19 @@ fn derive_program_metadata(
         let name = td.item_meta.name_path();
         match &td.kind {
             TypeDeclKind::Struct(fields) => {
+                // Charon can report an outer Rust-layout wrapper whose sole
+                // carrier is a transparent integer newtype. That outer value
+                // has no STRUCT in RPython: `IntegerRepr.lowleveltype` is the
+                // bottom scalar. Omitting only the outer row prevents SROA
+                // from rematerialising it as `New` plus field operations; a
+                // directly transparent newtype keeps its payload-projection
+                // metadata.
+                if !td.is_repr_transparent()
+                    && transparent_integer_newtype_inner_field(td, fields, llbc, gc_struct_ids)
+                        .is_some()
+                {
+                    continue;
+                }
                 // Register the qualified path *and* the bare leaf name
                 // so downstream lookups (`canonical_call_target`'s
                 // bare-leaf fallback) resolve either spelling.
@@ -6602,6 +6697,39 @@ pub(crate) fn spelling_is_declared_gc(
         .any(|cand| gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(cand)))
 }
 
+/// Declared-`Gc` membership of a path spelling, keyed by the declaration's
+/// path identity. Unlike [`spelling_is_declared_gc`], a qualified spelling
+/// does not fall back to its bare leaf: harvest seeds the leaf of every GC
+/// declaration, so a non-GC `Struct` sharing a GC type's leaf would read
+/// as GC through it.
+pub(crate) fn spelling_path_is_declared_gc(
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    spelling: &str,
+) -> bool {
+    let name = crate::front::typestr::peel_pointer_prefix(spelling.trim())
+        .unwrap_or(spelling.trim())
+        .trim();
+    if name.is_empty() {
+        return false;
+    }
+    let sid = majit_ir::descr::StructId::from_canonical_spelling(name);
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
+        return true;
+    }
+    let template = majit_ir::descr::strip_generic_args(name);
+    if gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(
+        template.as_ref(),
+    )) {
+        return true;
+    }
+    // Peel a crate prefix only while a module path remains: the harvest
+    // key of `pyre_object::m::Entry` is `m::Entry`, and peeling that
+    // again would reach the bare leaf.
+    let stripped = strip_crate_prefix(template.as_ref());
+    stripped.contains("::")
+        && gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(&stripped))
+}
+
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(td.item_meta.name_path_str()))
 }
@@ -6858,6 +6986,12 @@ impl DuplicateLeafFacts {
                 .entry(key)
                 .or_insert(kind);
         }
+        self.struct_fields
+            .option_struct_ids
+            .extend(other.struct_fields.option_struct_ids);
+        self.struct_fields
+            .result_struct_ids
+            .extend(other.struct_fields.result_struct_ids);
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)
@@ -7448,10 +7582,10 @@ impl<'a> LowerContext<'a> {
         // `ensure_stack_sensitive_fns` then sees the declared-GC set.
         let _ = value_type_inputs(llbc);
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
-        // Single-function lowering does not run
-        // [`link_transparent_scalar_types`]. Publish the same external
-        // scalar the link pass adds, so a `CodeFlags` borrow is the word.
-        llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
+        // Single-function lowering is its own complete translation input.
+        // Publish scalar kinds discovered from its TypeDecl layouts just as
+        // [`link_transparent_scalar_types`] does for the whole-program path.
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(llbc));
         let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
@@ -7817,13 +7951,21 @@ pub(crate) use self::consteval::{
     harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
     register_foldable_const_lits,
 };
+pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
-    release_declared_vable_array_address,
+    fnptr_field_family_member_fn_ids, fnptr_field_under_use, fnptr_struct_field_target,
+    release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,
     is_core_default_path,
+};
+pub(crate) use self::gcroot::{
+    OWNER_ROOT_DECLARED_PATH, ROOT_SCOPE_CLOSE, RootStackAnalyzer,
+    harvest_root_stack_touching_paths_with, harvest_scope_owning_identities_with,
+    is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
+    is_slice_buffer_free_call, owner_root_type_path,
 };
 pub use self::gcroot::{
     PublishedStructBody, PublishedStructField, RootStackState, apply_published_structs,
@@ -7831,26 +7973,22 @@ pub use self::gcroot::{
     harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
     scope_owner_identity,
 };
-pub(crate) use self::gcroot::{
-    ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
-    harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
-    is_shadow_stack_bracket_close, is_slice_buffer_free_call,
-};
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation,
+    host_rthread_threadlocalref_llop, is_cow_str_family_class_root, is_flattened_storage_leaf,
+    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr,
+    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
+    stamp_fn_ptr_spelling, strip_crate_prefix, struct_item_flexible_gcarray_block_annotation,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -8467,6 +8605,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         ) + toint_map_err_fused;
 
         if result_exc_callee {
+            // `exceptiontransform.py` `ExceptionTransformer.create_exception_handling`:
+            // `graph.exceptiontransformed = self.exc_data_ptr`.
+            lo.graph.exceptiontransformed = true;
             crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 tail_forwarded_returns,
@@ -8474,6 +8615,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
+            lo.rewrite_exception_transformed_formals(output);
             if result_exc_ok_is_unit {
                 // Stamp `FUNC.RESULT = void`.  The exception-link lowering
                 // already returns the unit `()` (the callee no longer

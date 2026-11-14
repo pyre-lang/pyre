@@ -960,20 +960,31 @@ pub(crate) fn discover_transparent_scalar_kinds(
     llbc: &Llbc,
 ) -> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
     let mut discovered = Vec::new();
+    let empty_gc = std::collections::HashSet::new();
     for decl in llbc.iter_type_decls() {
-        if !decl.is_repr_transparent() || decl.published_struct_copy {
+        if decl.published_struct_copy {
             continue;
         }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };
-        let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
-            continue;
+        let field_ty = if let Some(inner) =
+            transparent_integer_newtype_inner_field(decl, fields, llbc, &empty_gc)
+        {
+            inner
+        } else {
+            if !decl.is_repr_transparent() {
+                continue;
+            }
+            let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+                continue;
+            };
+            let Some(field) = fields.get(index) else {
+                continue;
+            };
+            &field.ty
         };
-        let Some(field) = fields.get(index) else {
-            continue;
-        };
-        let kind = match tyref_to_value_type(&field.ty, llbc) {
+        let kind = match tyref_to_value_type(field_ty, llbc) {
             ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
             ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
             ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,

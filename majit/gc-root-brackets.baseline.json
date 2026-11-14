@@ -1,7 +1,7 @@
 {
   "darwin": {
-    "base": "fdf13c34890607c0ec6b42854c1d14100da40faa",
-    "brackets_reaching_no_collection": 133,
+    "base": "829717ff32d6ac4801ad9c59be8b8c0835c8f934",
+    "brackets_reaching_no_collection": 128,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
@@ -22,8 +22,8 @@
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
     "unread_brackets": 371,
-    "unresolved_collecting_calls": 2366,
-    "unresolved_collecting_calls_fns": 1421
+    "unresolved_collecting_calls": 2360,
+    "unresolved_collecting_calls_fns": 1418
   },
   "linux": {
     "base": "b1e01cf4a6085e81f8d685dee7a769ab170100b4",

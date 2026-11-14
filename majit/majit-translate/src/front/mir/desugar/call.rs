@@ -312,6 +312,20 @@ impl<'a> Lowering<'a> {
             ValueType::Ref(None) => tyref_node(dest_class_ty, self.llbc)
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
                 .and_then(|n| raw_ptr_pointee_class_root_with(n, self.llbc, self.tombstoned_leaves))
+                // A `*mut` of a non-GC `GcArray` ITEM (`rordereddict.py`
+                // `DICTENTRY` / `lltype.py` `Struct` inlined in `GcArray`)
+                // stays SomePtr (`llannotation.py` `lltype_to_annotation`).
+                // Recasting onto that ITEM intern's SomeInstance beside
+                // dest's SomePtr (`mergeinputargs` Instance ∪ Ptr on
+                // `RDict::entry_at` after `ptr::add` / `entry_ptr`).
+                // GCREF erasure still recasts (`llmemory.py` `GCREF`).
+                .filter(|root| {
+                    !self.struct_fields.is_some_and(|reg| {
+                        crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(
+                            reg, root,
+                        )
+                    })
+                })
                 // `Option<&mut RegisteredStruct>` is a nullable pointer
                 // niche, not a boxed Option object. RPython represents it as
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
@@ -399,7 +413,11 @@ impl<'a> Lowering<'a> {
             _ => None,
         };
         // The Call dest is already `SomeInstance(root)` when `result_ty`
-        // names that root. Recast only a genuine downcast. Keep
+        // names that root, except `ptr::null_mut` / `null`:
+        // `ptr_null_constant` is classdef-less regardless of `result_ty`
+        // (`lltype.nullptr(T)` still needs the `NoneRepr`→`InstanceRepr`
+        // convert `rnone.py` does). Recast that null onto the pointee;
+        // skip only producers whose dest is already interned. Keep
         // `result_narrow_root` for the ARRAY layout stamp
         // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
         // array-item recast whose getarrayitem dest is still GCREF.
@@ -422,7 +440,17 @@ impl<'a> Lowering<'a> {
                     && narrowed.rsplit("::").next() != Some("ModuleDictStrategy")
                     && !majit_ir::descr::is_list_container_spelling(narrowed) =>
             {
-                None
+                let producer_is_untyped_null = match &call.func {
+                    CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                        .as_deref()
+                        .is_some_and(is_core_ptr_null_fun_path),
+                    _ => false,
+                };
+                if producer_is_untyped_null {
+                    Some(narrowed.clone())
+                } else {
+                    None
+                }
             }
             (_, other) => other.cloned(),
         };
@@ -990,6 +1018,21 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `CStr` / `OsStr` / `Path::to_string_lossy` of a window
+                // pair (`unicodehelper.py str_decode_utf8` replace).
+                if self.is_ffi_to_string_lossy(&reg, &call.dest.ty) {
+                    let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
+                    if self.try_lower_to_string_lossy(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                }
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
@@ -1270,6 +1313,22 @@ impl<'a> Lowering<'a> {
                                 self.graph.set_goto(bb_id, target_bb, link_args);
                                 return Ok(());
                             }
+                            // 1-arg `cast_int_to_ptr` of `Int → Str` is
+                            // `Ptr(MAJIT_REF_OPAQUE)` (`lltype.py`
+                            // `ann_cast_int_to_ptr`). Overlay refuses a
+                            // string dest (`dest_overlay_ptr_lltype`).
+                            if matches!(
+                                tyref_to_value_type(&call.dest.ty, self.llbc),
+                                ValueType::Str
+                            ) {
+                                let header =
+                                    self.emit_int_word_as_rstr_str(mir_bb, args[0].clone());
+                                self.bind_str_view_local(dest_local, header);
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
+                            }
                         }
                         return self.emit_host_cast_llop(
                             mir_bb,
@@ -1528,6 +1587,32 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
+                }
+                // `Cow<str>::into_owned` of a lossy-decode dest is the
+                // produced string (`rstr.py` immutable STR).
+                if args.len() == 1
+                    && self.is_cow_str_into_owned(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                    && first_arg_is_string_byte_view
+                {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Wtf8::to_string_lossy` is already rstr `STR`.
+                if args.len() == 1
+                    && self.is_string_family_to_string_lossy(
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    )
+                {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
                 }
                 // A bodyless `Deref::deref` / `DerefMut::deref_mut` (`Box<T>`,
                 // and a one-word transparent wrapper) whose `&T` is a
@@ -1827,6 +1912,38 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_to_string_lossy(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_unwrap_or_default_string(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_unwrap_or_gcref(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // Blanket `ToString::to_string` (`alloc::string::<Impl>::to_string`)
                 // for a non-string receiver is `str(value)` (`ll_str` /
                 // `ll_chr2str` / `ll_int2dec`). A string-family receiver is
@@ -1924,6 +2041,24 @@ impl<'a> Lowering<'a> {
                     && let Some(zero) = self.emit_zero_constant_of_ty(bb_id, &call.dest.ty)
                 {
                     self.local_var[dest_local] = Some(LocalValue::One(zero));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `String::new` is also a builder-mode ctor
+                // (`is_str_builder_owner` includes `String`). Binding the
+                // accumulator to `__str_const ""` makes the terminal
+                // `build` getattr a SomeString (`name_utf8_mirror`,
+                // `PyError::stop_iteration`).
+                if args.is_empty()
+                    && self.is_string_family_default(&reg, &call.dest.ty)
+                    && !(self.builder_mode
+                        && str_builder_ctor_leaf(self.llbc, &reg).is_some()
+                        && self.accumulator_is_builder_mode(dest_local))
+                    && let Some(empty) = self.emit_default_of_ty(bb_id, &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(LocalValue::One(empty));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3726,31 +3861,34 @@ impl<'a> Lowering<'a> {
                         );
                         self.local_var[dest_local] = Some(LocalValue::One(raw));
                     } else if dest_is_ref
+                        && let Some((base, offset)) =
+                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
+                        && let Some(root) =
+                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                    {
+                        // `addr_of_mut!((*header).items).cast()` is
+                        // `direct_arrayitems` even when dest is the
+                        // inlined ITEM (`lltype.py` `Struct` in
+                        // `GcArray`) and `instance_narrow_for_type`
+                        // declines the classdef recast. A same-root
+                        // `.cast()` used to alias the FieldRead and
+                        // leave getattr `items` on the array pointer.
+                        let res = self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
                             &call.dest.ty,
                             &args[0],
                             src_root.as_deref(),
                         )
                     {
-                        let array_tail =
-                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
-                        let res = if let Some((base, offset)) = array_tail
-                            && let Some(root) = tyref_class_root_with(
-                                &call.dest.ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                            ) {
-                            self.emit_array_tail_item_ptr(bb_id, base, offset, &root)
-                        } else {
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind,
-                            });
-                            res
-                        };
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if self.should_emit_rffi_cast_identity_to_raw_scalar(
                         &call.dest.ty,
@@ -3871,6 +4009,16 @@ impl<'a> Lowering<'a> {
                         self.copy_atomic_slots(src, dest_local);
                     }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `CStr::from_ptr(p)` is the CCHARP itself (`rffi.py` CCHARP).
+                if args.len() == 1 && self.is_cstr_from_ptr(&reg, &call.dest.ty) {
+                    let ptr = self.ensure_window_ccharp(mir_bb, args[0].clone());
+                    stamp_as_ccharp(&ptr);
+                    self.local_var[dest_local] = Some(LocalValue::One(ptr));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -6763,6 +6911,28 @@ impl<'a> Lowering<'a> {
                         )? {
                             return Ok(());
                         }
+                        if self.try_lower_unwrap_or_default_string(
+                            mir_bb,
+                            &reg,
+                            &args,
+                            first_arg_ty.as_ref(),
+                            dest_local,
+                            &call.dest.ty,
+                            target,
+                        )? {
+                            return Ok(());
+                        }
+                        if self.try_lower_unwrap_or_gcref(
+                            mir_bb,
+                            &reg,
+                            &args,
+                            first_arg_ty.as_ref(),
+                            dest_local,
+                            &call.dest.ty,
+                            target,
+                        )? {
+                            return Ok(());
+                        }
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
                         match method_hint {
@@ -6916,6 +7086,7 @@ impl<'a> Lowering<'a> {
                 // type into a temporary and calls the temporary.  The slot
                 // read is that cast's operand.
                 let vtable_slot = vtable_slot_under_fn_ptr_cast(self.llbc, self.body, &dyn_operand)
+                    .or_else(|| fnptr_field_under_use(self.llbc, self.body, &dyn_operand))
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
                 let passes_pairs = !pair_lens.is_empty();
@@ -6965,7 +7136,10 @@ impl<'a> Lowering<'a> {
                             funcptr,
                             args,
                             graphs: None,
-                            family_key: Some((trait_root, method_name)),
+                            family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                                trait_root,
+                                method_name,
+                            )),
                             result_ty,
                         }
                     }
@@ -6986,6 +7160,26 @@ impl<'a> Lowering<'a> {
                         args,
                         graphs: Some(graphs),
                         family_key: None,
+                        result_ty,
+                    }
+                } else if let Some((struct_path, field_name)) =
+                    self.fnptr_struct_field_target(&vtable_slot)
+                {
+                    // `FunctionReprBase.call`: `descs = list(s_pbc.descriptions)`
+                    // then `row_of_graphs = callfamily.calltables[shape][index]`;
+                    // `vfn = hop.inputarg(self, arg=0)` is the already-loaded
+                    // callable. `vtable_slot` (the Field place) names that
+                    // family only; the callee is `dyn_operand`, the loaded
+                    // pointer, matching the `fn_ptr_family` arm.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: None,
+                        family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                            struct_path,
+                            field_name,
+                        )),
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {
@@ -9254,11 +9448,13 @@ impl<'a> Lowering<'a> {
         // callee wrote through the raw out-parameter.
         self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;
         // Narrow a call result whose declared pointee differs from the
-        // target class (`recast_result_root`). Identity at jitcode
+        // target class (`recast_result_root`), and `null_mut` / `null`
+        // of a named pointee (`lltype.nullptr(T)`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
-        // the roots already match, so the Call dest is the value — except
-        // residual `*mut ModuleDictStrategy` and residual `Vec<T>` list
-        // dests, which still intern.
+        // the roots already match on an interned producer, so the Call dest
+        // is the value — except residual `*mut ModuleDictStrategy` and residual
+        // `Vec<T>` list dests, which still intern, and `null_mut` / `null` of
+        // a named pointee (`lltype.nullptr(T)`).
         //
         // The narrowed Variable keeps the Call dest's `concretetype`
         // (`Variable.copy`, `flowspace/model.py`): `do_fixed_newlist`
@@ -9267,6 +9463,11 @@ impl<'a> Lowering<'a> {
         // it the residual `OS_ARRAYCOPY` lands on
         // `WriteAnalyzer.top_result` (`EF_RANDOM_EFFECTS`).
         if !dest_is_cell && let Some(root) = recast_result_root {
+            let root = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+                "GCREF".to_string()
+            } else {
+                root
+            };
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -9478,7 +9679,9 @@ impl<'a> Lowering<'a> {
     /// `annlowlevel.specialize` still names the call `leaf__inst_*`,
     /// and `materialize_residual_inst` keeps the template stub. A
     /// GraphStore header stamped `ref` with a Void call result fails
-    /// `getcalldescr` (`FUNC.RESULT != RESULT`).
+    /// `getcalldescr` (`FUNC.RESULT != RESULT`). `llmemory.GCREF` is a
+    /// distinct residual (`SomePtr`); `specialize_argtype` still mints
+    /// one copy per `T`.
     fn enqueue_residual_inst(&self, fd: &FunDecl, generics: &serde_json::Value, leaf: String) {
         let Some(spec) = self.spec else {
             return;
@@ -9521,7 +9724,9 @@ impl<'a> Lowering<'a> {
         );
         if class_root.is_none()
             && container_root.is_none()
-            && !token.as_deref().is_some_and(|t| t.starts_with("raw:"))
+            && !token.as_deref().is_some_and(|t| {
+                t.starts_with("raw:") || t == crate::translator::rtyper::cutover::GCREF_RETURN_TYPE
+            })
         {
             return;
         }

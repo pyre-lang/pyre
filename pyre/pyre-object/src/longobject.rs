@@ -31,16 +31,22 @@ unsafe impl Sync for W_LongObject {}
 #[repr(C)]
 pub struct W_LongObjectUser {
     pub base: W_LongObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_LongObjectUser, storage)
-            == std::mem::offset_of!(W_LongObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_LongObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_LONG_USER_MAPDICT_ACCESS for W_LongObjectUser;
+}
 
 /// User-subclass big-int layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
@@ -238,7 +244,7 @@ pub fn w_long_subclass_from_raw(value: *mut BigInt) -> PyObjectRef {
             },
             value,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

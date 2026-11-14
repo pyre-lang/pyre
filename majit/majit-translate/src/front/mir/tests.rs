@@ -2746,12 +2746,14 @@ fn identity_registered_gc_ptr_cast_does_not_emit_instance() {
     );
 }
 
-/// `SomePtr.getattr` of a raw-owner GCREF field stays SomePtr
-/// (`lltype.py`). The front end then `cast_base_ptr_to_instance`s onto
-/// the declared class (`CastBasePtrToInstanceEntry`).
+/// The raw-owner recast (`SomePtr.getattr`, `lltype.py`,
+/// `CastBasePtrToInstanceEntry`) applies only to RAW owners, and none
+/// with a GC-pointer field remains in pyre-object. A GC owner's field
+/// is already typed by its declared class (`rclass.py`
+/// `InstanceRepr.getfield`, no `cast_base_ptr_to_instance`).
 #[test]
-fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
-    use crate::model::OpKind;
+fn gc_owner_registered_gc_ptr_field_read_needs_no_cast_instance() {
+    use crate::model::{OpKind, ValueType};
     let graph = lower_object_fn("pyre_object::mapdict::map_terminator_w_cls");
     let ops: Vec<_> = graph
         .blocks
@@ -2759,18 +2761,29 @@ fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
         .flat_map(|block| &block.operations)
         .collect();
     let w_cls = ops.iter().find_map(|op| match &op.kind {
-        OpKind::FieldRead { field, .. } if field.name == "w_cls" => op.result.clone(),
+        OpKind::FieldRead { field, ty, .. } if field.name == "w_cls" => {
+            assert_eq!(
+                field.owner_declared_gc,
+                Some(true),
+                "GC-owner w_cls FieldRead owner_declared_gc; graph={}",
+                graph.dump()
+            );
+            assert!(
+                matches!(ty, ValueType::Ref(_)),
+                "GC-owner w_cls FieldRead is Ref; ty={ty:?} graph={}",
+                graph.dump()
+            );
+            op.result.clone()
+        }
         _ => None,
     });
     let Some(w_cls) = w_cls else {
         panic!("FieldRead w_cls; graph={}", graph.dump());
     };
     assert!(
-        ops.iter().any(|op| {
-            crate::model::cast_instance_of(&op.kind, &w_cls)
-                .is_some_and(|root| root.contains("PyObject"))
-        }),
-        "raw-owner w_cls FieldRead then cast_base_ptr_to_instance; graph={}",
+        ops.iter()
+            .all(|op| crate::model::cast_instance_of(&op.kind, &w_cls).is_none()),
+        "GC-owner w_cls FieldRead is not followed by cast_instance_of; graph={}",
         graph.dump()
     );
 }
@@ -7271,7 +7284,10 @@ fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
         1,
         "one dyn method IndirectCall: {indirect:?}"
     );
-    assert_eq!(indirect[0].1, ("Storage".to_string(), "head".to_string()));
+    assert_eq!(
+        indirect[0].1,
+        crate::model::IndirectFamilyKey::dyn_trait("Storage", "head")
+    );
 
     let producer = |var: &crate::flowspace::model::Variable| {
         graph
@@ -10189,6 +10205,101 @@ fn user_trait_named_default_is_not_integer_zero() {
     assert!(
         call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
         "a user-defined Default stays a residual trait call; ops={ops:?}"
+    );
+}
+
+#[test]
+fn trait_default_of_string_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_trait_call_fixture(
+        "trait_default_string",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph =
+        super::lower_function(&llbc, "trait_default_string").expect("lower Trait Default String");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "<String as Default>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Trait Default of String must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_default_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "default_string",
+        &["alloc", "string", "<Impl>", "default"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "default_string").expect("lower alloc String default");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "alloc String default must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_new_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "new_string",
+        &["alloc", "string", "<Impl>", "new"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "new_string").expect("lower alloc String::new");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::new must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "new"),
+        "alloc String::new must not residualize; ops={ops:?}"
     );
 }
 
@@ -15943,6 +16054,43 @@ pub(in crate::front::mir) fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llb
 }
 
 #[test]
+fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("::unerase"))
+        .expect("unerase");
+    let gcref_ty = fd.signature.inputs.first().expect("unerase takes a GCREF");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let spec = crate::ErrorCarrierSpec::default();
+    let empty = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        super::lltype::dont_look_inside_return_token(
+            gcref_ty,
+            &llbc,
+            spec,
+            &gc_struct_ids,
+            &empty,
+        )
+        .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+        "a *mut GCREFOpaque residual FUNC.RESULT is gcref, not ref"
+    );
+    assert_eq!(
+        super::lltype::dont_look_inside_return_class_root(
+            gcref_ty,
+            &llbc,
+            spec,
+            &empty,
+            &gc_struct_ids,
+            &empty,
+        ),
+        None,
+        "GCREFOpaque must not intern a residual ClassDef"
+    );
+}
+
+#[test]
 fn gcref_cast_to_tuple_of_vecs_emits_cast_instance_marker() {
     let llbc = kwargs_unerase_cast_llbc(true);
     let graph = crate::test_support::lower_function(&llbc, "unerase").expect("lower GCREF unerase");
@@ -18286,10 +18434,10 @@ fn intern_tagged_option_of_opaque_payload_spells_declared_leaf() {
     );
 }
 
-/// Interned `Option<Opaque>::Some.__pos_0` projects to a named Instance
-/// so getattr of that field is not lattice bottom.
+/// `Option<Opaque>` is the noneable payload, not an Option ClassDef.
+/// getattr of that field is the named Instance, not lattice bottom.
 #[test]
-fn interned_option_opaque_some_pos0_is_named_instance() {
+fn interned_option_opaque_payload_is_named_instance() {
     use crate::annotator::model::SomeValue;
     use std::rc::Rc;
 
@@ -18304,21 +18452,23 @@ fn interned_option_opaque_some_pos0_is_named_instance() {
     let llbc = intern_option_from_map_call_llbc(vec![opaque_ty, i64_ty], vec![opaque_decl]);
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
         .expect("build semantic program for interned Option of Opaque");
+    assert!(
+        !program.struct_fields.option_struct_ids.is_empty(),
+        "harvest must record the core Option TypeDecl identity"
+    );
     let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
     bk.set_struct_fields(Rc::new(program.struct_fields));
-    bk.set_enum_variant_by_discriminant(Rc::new(program.enum_variant_by_discriminant));
-    let variant = bk
-        .getuniqueclassdef_for_enum_variant("option::Option<CodePoint>", "Some")
-        .expect("interned Option<CodePoint>::Some classdef");
-    let attr = variant
-        .borrow()
-        .attrs
-        .get("__pos_0")
-        .map(|a| a.s_value.clone());
-    let Some(SomeValue::Instance(payload)) = attr else {
-        panic!("Some.__pos_0 of Opaque intern spelling is named Instance, got {attr:?}")
+    assert!(
+        bk.classdef_for_known_struct_root("option::Option<CodePoint>")
+            .is_none(),
+        "return-stamp harvest must not intern Option of Opaque"
+    );
+    let projected = bk.project_struct_field_type("option::Option<CodePoint>");
+    let SomeValue::Instance(payload) = projected else {
+        panic!("Option of Opaque intern spelling is named Instance, got {projected:?}")
     };
     assert!(payload.classdef.is_some());
+    assert!(payload.can_be_none);
 }
 
 /// Intern of `Result<Arguments, PyError>` spells `Ok.__pos_0` as the
@@ -18744,12 +18894,12 @@ fn interned_result_ok_generic_payload_keeps_leaf_render() {
     );
 }
 
-/// Interned `Option<char>` BASE carries `__discriminant` so rtype
-/// `getclsfield` of a tagged primitive Option succeeds
-/// (`rclass.py` `InstanceRepr._setup_repr`).
+/// Dest intern of tagged `Option<char>` stays off (`classdef_for_known_struct_root`):
+/// a nullable / tagged Option is not a return-stamp ClassDef. First-use New of
+/// the instantiation intern's a per-T ClassDef so `Some.__pos_0` getattr does
+/// not share the TypeDecl template.
 #[test]
-fn interned_option_char_base_projects_discriminant() {
-    use crate::annotator::model::SomeValue;
+fn interned_option_char_base_is_not_a_classdef() {
     use std::rc::Rc;
 
     let char_ty = serde_json::json!({"Scalar": "Char"});
@@ -18757,21 +18907,22 @@ fn interned_option_char_base_projects_discriminant() {
     let llbc = intern_option_from_map_call_llbc(vec![char_ty, i64_ty], vec![]);
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
         .expect("build semantic program for interned Option<char>");
+    assert!(
+        !program.struct_fields.option_struct_ids.is_empty(),
+        "harvest must record the core Option TypeDecl identity"
+    );
     let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
     bk.set_struct_fields(Rc::new(program.struct_fields));
-    let classdef = bk
-        .getuniqueclassdef_for_struct_root("option::Option<char>")
-        .expect("interned Option<char> BASE classdef");
-    let attr = classdef
-        .borrow()
-        .attrs
-        .get("__discriminant")
-        .map(|a| a.s_value.clone());
-    let attr_kind = match attr {
-        Some(SomeValue::Integer(_)) => "Integer",
-        other => panic!("Option<char> BASE intern projects __discriminant, got {other:?}"),
-    };
-    assert_eq!(attr_kind, "Integer");
+    assert!(
+        bk.classdef_for_known_struct_root("option::Option<char>")
+            .is_none(),
+        "return-stamp harvest must not intern Option<char>"
+    );
+    assert!(
+        bk.getuniqueclassdef_for_struct_root("option::Option<char>")
+            .is_ok(),
+        "first-use New of Option<char> intern's a per-T ClassDef"
+    );
 }
 
 /// Recast dest (`resolve_aggregate_adt` variant owner) and field intern
@@ -25570,7 +25721,7 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
         );
         assert_eq!(
             calls[0].1,
-            ("DictStrategy".to_string(), method.to_string()),
+            crate::model::IndirectFamilyKey::dyn_trait("DictStrategy", method),
             "{function}'s MIR vtable slot must name the same PBC family as the trait impls"
         );
         let funcptr = &calls[0].0;
@@ -25612,10 +25763,14 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
                 OpKind::IndirectCall {
                     funcptr,
                     args,
-                    family_key: Some(family_key),
+                    family_key:
+                        Some(crate::model::IndirectFamilyKey::DynTrait {
+                            trait_root,
+                            method_name,
+                        }),
                     ..
-                } if family_key.0 == "DictStrategy" => {
-                    Some((funcptr.clone(), args.clone(), family_key.1.clone()))
+                } if trait_root == "DictStrategy" => {
+                    Some((funcptr.clone(), args.clone(), method_name.clone()))
                 }
                 _ => None,
             })
@@ -30510,10 +30665,32 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
 /// takes `{data, len, "replace"}` (`rutf8.py check_utf8` ABI).
 #[test]
 fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = crate::test_support::load_ullbc(path);
-    let graph = crate::test_support::lower_function(llbc, "oefmt").expect("lower oefmt");
-    let paths = oefmt_call_paths(&graph);
+    let interpreter =
+        crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["error"],
+        &["oefmt"],
+    )
+    .expect("lower oefmt");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "oefmt")
+        .expect("oefmt graph")
+        .graph();
+    let paths = oefmt_call_paths(graph);
     assert!(
         !paths.iter().any(|segments| {
             segments
@@ -30550,10 +30727,95 @@ fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
         "decode_utf8_with_errors takes the window pair plus \"replace\": {graph:#?}"
     );
     assert!(
-        !oefmt_mentions_cow(&graph),
+        !oefmt_mentions_cow(graph),
         "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
     );
-    oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
+    oefmt_decode_utf8_err_arm_is_assert_raise(graph);
+}
+
+/// `CStr::from_ptr(p).to_string_lossy()` is
+/// `decode_utf8_with_errors(data, len, "replace")`, never a residual Cow
+/// or a byte copy (`rffi.charp2str`).
+#[cfg(unix)]
+#[test]
+fn gai_strerror_lowers_cstr_lossy_to_charp2str() {
+    let Some(interpreter) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let Some(object) =
+        crate::test_support::load_ullbc_if_present(crate::runtime_names::artifacts::OBJECT_ULLBC)
+    else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["rsocket_rffi"],
+        &["gai_strerror"],
+    )
+    .expect("lower gai_strerror");
+    let names: Vec<_> = program
+        .functions
+        .iter()
+        .map(|f| format!("{}::{}", f.module_path, f.name))
+        .collect();
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "gai_strerror")
+        .unwrap_or_else(|| panic!("gai_strerror graph; have {names:#?}"))
+        .graph();
+    let paths = oefmt_call_paths(graph);
+    assert!(
+        !paths.iter().any(|segments| {
+            segments
+                .last()
+                .is_some_and(|leaf| leaf == "to_string_lossy" || leaf == "from_utf8_lossy")
+        }),
+        "to_string_lossy / from_utf8_lossy must not remain a residual: {paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|segments| {
+            segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
+        }),
+        "decode_utf8_with_errors must remain in the caller: {paths:#?}"
+    );
+    let decode_argc = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments
+                .ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()]) =>
+            {
+                Some(args.len())
+            }
+            _ => None,
+        });
+    assert_eq!(
+        decode_argc,
+        Some(3),
+        "decode_utf8_with_errors takes the window pair plus \"replace\": {graph:#?}"
+    );
+    assert!(
+        !oefmt_mentions_cow(graph),
+        "to_string_lossy dest is a plain string, not Cow: {graph:#?}"
+    );
 }
 
 /// `decompose_valuefmt` `current: String` is a `StringBuilder`
@@ -34416,7 +34678,7 @@ fn assert_direct_ptradd_not_residual_add(ops: &[&SpaceOperation]) {
     assert!(
         !call_leafs(ops)
             .iter()
-            .any(|leaf| leaf == "add" || leaf == "sub"),
+            .any(|name| matches!(name.as_str(), "add" | "sub")),
         "declined struct offset must not residualize; ops={ops:?}"
     );
 }
@@ -36978,6 +37240,11 @@ fn one_word_handle_by_value_struct_decl_is_none() {
         super::tyref_by_value_struct_decl(&handle_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
             .is_none(),
         "a unique sized pointer plus ZST markers is lltype.Ptr, not an inlined STRUCT"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        "*mut *mut i64",
+        "the enclosing field row must carry the selected pointer repr"
     );
     assert!(
         super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
@@ -40038,5 +40305,90 @@ fn option_take_on_field_lowers_to_read_and_none_store() {
     );
 }
 
+/// `self.state = v` through `&mut Wrapper` (`#[repr(transparent)]` one-u32
+/// word). `IntegerRepr` has no field, so the write is the whole word through
+/// that pointer — the pointer local is not replaced by the integer.
+#[test]
+fn mut_ref_integer_newtype_field_store_reaches_pointee() {
+    let u32_ty = interior_u32();
+    let wrapper = interior_struct(
+        0,
+        &["fixture", "Wrapper"],
+        &[("state", u32_ty.clone())],
+        4,
+        &[0],
+        true,
+    );
+    let adt = interior_adt(0);
+    let mut_self = interior_mut_ref(adt.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "set_state",
+        2,
+        vec![mut_self.clone(), u32_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("self"), &mut_self),
+            interior_local(2, Some("v"), &u32_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &mut_self, &adt, &u32_ty, 0),
+                interior_use(interior_place(2, &u32_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![wrapper], vec![caller]);
+    let graph = super::lower_function(&llbc, "set_state")
+        .unwrap_or_else(|err| panic!("lower set_state: {err:?}"));
+    let ops = graph_ops(&graph);
+    let self_arg = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("self is the first inputarg");
+    let through_self = ops.iter().any(|op| match &op.kind {
+        OpKind::RawStore { base, .. } => base == self_arg,
+        OpKind::FieldWrite { base, .. } => base == self_arg,
+        _ => false,
+    });
+    assert!(
+        through_self,
+        "store must reach the pointee through the &mut pointer; graph={}",
+        graph.dump()
+    );
+}
+
 #[path = "exception_class_use_tests.rs"]
 mod exception_class_use_tests;
+
+#[test]
+fn declared_gc_path_spelling_does_not_borrow_a_colliding_gc_leaf() {
+    // Harvest seeds the leaf of a GC declaration (`counter::Entry` →
+    // `Entry`); the non-GC `rordereddict.py` `DICTENTRY` analogue sharing
+    // that leaf is a `lltype.py` `Struct`, not a `GcStruct`.
+    let mut ids = std::collections::HashSet::new();
+    for spelling in ["counter::Entry", "Entry"] {
+        ids.insert(majit_ir::descr::StructId::from_canonical(spelling));
+    }
+    assert!(super::spelling_is_declared_gc(
+        &ids,
+        "rordereddict_entries::Entry"
+    ));
+    assert!(!super::spelling_path_is_declared_gc(
+        &ids,
+        "rordereddict_entries::Entry"
+    ));
+    assert!(!super::spelling_path_is_declared_gc(
+        &ids,
+        "*mut rordereddict_entries::Entry<K, V>"
+    ));
+    assert!(super::spelling_path_is_declared_gc(&ids, "counter::Entry"));
+    assert!(super::spelling_path_is_declared_gc(
+        &ids,
+        "pyre_x::counter::Entry"
+    ));
+    assert!(super::spelling_path_is_declared_gc(&ids, "Entry"));
+}

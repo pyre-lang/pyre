@@ -48,24 +48,31 @@ pub struct W_Array {
 #[repr(C)]
 pub struct W_ArrayUser {
     pub base: W_Array,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ArrayUser, storage)
-            == std::mem::offset_of!(W_ArrayUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ArrayUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_ARRAY_USER_MAPDICT_ACCESS for W_ArrayUser;
+}
+
 /// User-subclass `array.array` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Array`'s payload and add mapdict `map` / `storage`.
-pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline(
+pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline_access(
     "array.array",
     &ARRAY_TYPE,
     std::mem::offset_of!(W_ArrayUser, map),
     std::mem::offset_of!(W_Array, w_weakreflifeline),
+    &W_ARRAY_USER_MAPDICT_ACCESS,
 );
 
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
@@ -217,7 +224,7 @@ pub fn w_array_user_new(typecode: u8, itemsize: u8, w_class: PyObjectRef) -> PyO
             exports: 0,
             w_weakreflifeline: PY_NULL,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {

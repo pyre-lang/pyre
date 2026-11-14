@@ -125,7 +125,9 @@ pub use jtransform::{
     VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
-pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+pub use model::{
+    Block, BlockId, CallTarget, FunctionGraph, IndirectFamilyKey, OpKind, SpaceOperation, ValueType,
+};
 pub use parse::{CallPath, GraphSpecialization};
 pub use pipeline::{
     CompiledJitDriver, JitDriverSpec, PipelineConfig, PipelineResult, ProgramPipelineResult,
@@ -246,6 +248,7 @@ fn build_semantic_program_via_active_frontend(
             let mut eval_hook_graphs = Vec::new();
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
+            let mut fnptr_field_families = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             // `_exception_class_<Enum>` is a program-wide class property.
@@ -380,6 +383,11 @@ fn build_semantic_program_via_active_frontend(
                         profilefunc_spellings.push(spelling);
                     }
                 }
+                for row in front::mir::discover_fnptr_field_families(&llbc) {
+                    if !fnptr_field_families.contains(&row) {
+                        fnptr_field_families.push(row);
+                    }
+                }
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
@@ -489,6 +497,7 @@ fn build_semantic_program_via_active_frontend(
                 unsafe_fn_stubs: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
+                fnptr_field_families: Vec::new(),
             });
             front::mir::harden_duplicate_leaf_metadata(
                 &mut program.struct_fields,
@@ -500,6 +509,7 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
+            program.fnptr_field_families = fnptr_field_families;
             return (program, gc_struct_ids);
         }
     }
@@ -2333,6 +2343,14 @@ fn analyze_pipeline_from_module_paths(
         call_control.register_trait_family_path(&func.name, trait_leaf, path);
     }
     prof.mark("  register concrete indirect-call families");
+    for (struct_path, field, path) in &program.fnptr_field_families {
+        call_control.register_fnptr_field_family_path(
+            struct_path,
+            field,
+            crate::parse::CallPath::from_segments(path.split("::")),
+        );
+    }
+    prof.mark("  register fnptr-field indirect-call families");
     // Re-register free functions with their RPython-equivalent hints
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
