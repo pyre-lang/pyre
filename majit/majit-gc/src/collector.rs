@@ -50,7 +50,7 @@ use crate::hook::GcHooks;
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::rawrefcount::{self, RrcList};
-use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
+use crate::trace::{ClassTypeLayout, GcTypeKey, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 use crate::{FinalizerQueueTag, FinalizerTriggerFn, GcAllocator};
 
 /// `inspector.py HeapDumper.BUFSIZE` raw signed-word writer. Keeping the
@@ -1828,6 +1828,11 @@ impl MiniMarkGC {
     /// Register a type and return its ID.
     pub fn register_type(&mut self, info: TypeInfo) -> u32 {
         self.types.register(info)
+    }
+
+    /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id`.
+    pub fn get_type_id(&mut self, key: GcTypeKey, info: impl FnOnce() -> TypeInfo) -> u32 {
+        self.types.get_type_id(key, info)
     }
 
     /// Check if an address is in the nursery.
