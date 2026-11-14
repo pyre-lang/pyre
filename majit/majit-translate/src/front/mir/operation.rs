@@ -2110,24 +2110,29 @@ impl<'a> Lowering<'a> {
         // FieldWrite of `Buffer::Sub.parent` must intern the Buffer
         // pointee (`bookkeeper.py` `getuniqueclassdef`), not a
         // classdef-less Box wrapper.
-        if type_node_is_thin_box(node, self.llbc) {
+        let root = if type_node_is_thin_box(node, self.llbc) {
             let pointee = type_node_box_pointee(node, self.llbc)?;
-            return adt_node_class_root_with(
+            adt_node_class_root_with(
                 strip_ty_wrappers(pointee, self.llbc)?,
                 self.llbc,
                 self.tombstoned_leaves,
-            );
-        }
-        if let Some(reference) = node.as_object()?.get("Ref") {
+            )
+        } else if let Some(reference) = node.as_object()?.get("Ref") {
             let pointee = reference.as_array()?.get(1)?;
-            return adt_node_class_root_with(
+            adt_node_class_root_with(
                 strip_ty_indirections(pointee, self.llbc)?,
                 self.llbc,
                 self.tombstoned_leaves,
-            );
-        }
-        raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
-            .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
+            )
+        } else {
+            raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
+                .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
+        };
+        root.filter(|r| {
+            !self.struct_fields.is_some_and(|reg| {
+                crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, r)
+            })
+        })
     }
 
     /// Class root of a registered-GC pointer field (`PyObjectRef` /
@@ -5003,6 +5008,15 @@ impl<'a> Lowering<'a> {
             {
                 return None;
             }
+            // `rordereddict.py` `DICTENTRY` is `lltype.Struct` inlined in
+            // `GcArray`. `llannotation.py` `lltype_to_annotation` of that
+            // Ptr is SomePtr. A classdef recast here is Instance ∪ Ptr
+            // at `RDict::entry_at` (`mergeinputargs`).
+            if self.struct_fields.is_some_and(|reg| {
+                crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, &root)
+            }) {
+                return None;
+            }
             let result_ty = match self.cast_dest_layout_owner(dest_ty) {
                 Some(owner) if owner != root => ValueType::Ref(Some(owner)),
                 _ => ValueType::Ref(Some(root.clone())),
@@ -7231,15 +7245,37 @@ impl<'a> Lowering<'a> {
                                     // the same instance narrow as `*mut Self`;
                                     // leaving it uncast reads `maxlen` /
                                     // `size` / `ptr` off `PyObject`.
-                                    self.registered_gc_ptr_field_root(&pre.ty).or_else(|| {
-                                        stripped.and_then(|n| {
-                                            raw_ptr_pointee_class_root_with(
-                                                n,
-                                                self.llbc,
-                                                self.tombstoned_leaves,
-                                            )
-                                            .or_else(
-                                                || {
+                                    // A RawPtr ADT that is not declared Gc
+                                    // (`rordereddict.py` `DICTENTRY` /
+                                    // `lltype.py` `Struct` inlined in
+                                    // `GcArray`) stays SomePtr
+                                    // (`llannotation.py`
+                                    // `lltype_to_annotation`). Emitting
+                                    // `__cast_instance_intrinsic` onto that
+                                    // ITEM merges Instance ∪ Ptr at
+                                    // `RDict::entry_at`.
+                                    self.registered_gc_ptr_field_root(&pre.ty)
+                                            .filter(|root| {
+                                                !self.struct_fields.is_some_and(|reg| {
+                                                    crate::annotator::bookkeeper::struct_root_is_gcarray_item(
+                                                        reg, root,
+                                                    )
+                                                })
+                                            })
+                                            .or_else(|| {
+                                            stripped.and_then(|n| {
+                                                raw_ptr_pointee_class_root_with(
+                                                    n,
+                                                    self.llbc,
+                                                    self.tombstoned_leaves,
+                                                )
+                                                .filter(|root| {
+                                                    spelling_path_is_declared_gc(
+                                                        self.gc_struct_ids,
+                                                        root,
+                                                    )
+                                                })
+                                                .or_else(|| {
                                                     let root = adt_node_class_root_with(
                                                         n,
                                                         self.llbc,
@@ -7251,10 +7287,9 @@ impl<'a> Lowering<'a> {
                                                     // narrow paints `Tuple` onto values
                                                     // that are already tuples.
                                                     (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
-                                                },
-                                            )
+                                                })
+                                            })
                                         })
-                                    })
                                 }
                             }
                         }
@@ -7411,6 +7446,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.gc_struct_ids,
                                 self.immutable_fields,
+                                &self.raw_alloc_flavor_structs,
                             )
                         })
                         .is_some();

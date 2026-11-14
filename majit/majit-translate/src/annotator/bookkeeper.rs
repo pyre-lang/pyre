@@ -8210,7 +8210,10 @@ fn struct_root_is_gcarray_ptr_wrapper(
 /// (`bookkeeper.py` `getdesc` / `getuniqueclassdef` intern one class
 /// object per instantiation). Only the unsuffixed template is the
 /// inlined `lltype.py` `Struct`.
-fn struct_root_is_gcarray_item(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
+pub(crate) fn struct_root_is_gcarray_item(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+) -> bool {
     let mut spelling = root.trim();
     if let Some(pointee) = crate::front::typestr::peel_pointer_prefix(spelling) {
         spelling = pointee.trim().trim_start_matches("mut ");
@@ -8968,7 +8971,6 @@ fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
         ],
     )
 }
-
 
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
 /// wrapping a pointer is a different constructor and does not match.
@@ -12512,6 +12514,153 @@ mod tests {
                 SomeValue::Instance(ref inst) if inst.classdef.is_some()
             ),
             "a non-GcArray-item Struct still intern's as ClassDef"
+        );
+    }
+
+    #[test]
+    fn production_dictentry_item_is_someptr_not_classdef() {
+        // Production harvest of `rordereddict.py` `DICTENTRY` /
+        // `DICTENTRYARRAY`. The fixture above seeds two-field `GcEntries`
+        // rows by hand; Charon may add a header field, which would make
+        // `flexible_gcarray_wrapper_items_field` miss and intern the
+        // unsuffixed ITEM as SomeInstance beside dest's SomePtr
+        // (`mergeinputargs` Instance ∪ Ptr on `RDict::entry_at`).
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let Some(object) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
+        ) else {
+            return;
+        };
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object],
+            crate::HostStaticAddrs::default(),
+            &[],
+            &["entry_at", "get_slot"],
+        )
+        .expect("lower rordereddict entry_at/get_slot");
+
+        let dump_owner = |needle: &str| -> String {
+            let mut lines: Vec<String> = program
+                .struct_fields
+                .fields
+                .iter()
+                .filter(|(owner, _)| owner.contains(needle))
+                .map(|(owner, rows)| {
+                    let fields = rows
+                        .iter()
+                        .map(|row| format!("{}:{}", row.name, row.ty))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{owner} [{fields}]")
+                })
+                .collect();
+            lines.sort();
+            if lines.is_empty() {
+                format!("(no owner containing {needle})")
+            } else {
+                lines.join("\n")
+            }
+        };
+
+        let gc_entries_rows = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| {
+                majit_ir::descr::strip_generic_args(owner)
+                    .rsplit("::")
+                    .next()
+                    == Some("GcEntries")
+            })
+            .map(|(owner, rows)| (owner.clone(), rows.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            gc_entries_rows
+                .iter()
+                .any(|(_, rows)| { flexible_gcarray_wrapper_items_field(rows).is_some() }),
+            "production GcEntries must be the two-field GcArray wrapper\n{}",
+            dump_owner("GcEntries")
+        );
+
+        let fields = Rc::new(program.struct_fields.clone());
+        assert!(
+            struct_root_is_gcarray_item(fields.as_ref(), "rordereddict_entries::Entry"),
+            "unsuffixed DICTENTRY must be the inlined ITEM\n{}\n{}",
+            dump_owner("GcEntries"),
+            dump_owner("Entry")
+        );
+        assert!(
+            !struct_root_is_gcarray_item(
+                fields.as_ref(),
+                "rordereddict_entries::Entry<dictmultiobject::ObjectKey, ()>"
+            ),
+            "a monomorph keeps its ClassDef"
+        );
+
+        let bk = bk();
+        bk.set_struct_fields(Rc::clone(&fields));
+        assert!(
+            struct_root_refuses_classdef_intern(
+                "rordereddict_entries::Entry",
+                Some(fields.as_ref())
+            ),
+            "unsuffixed ITEM must refuse ClassDef intern"
+        );
+        assert!(
+            bk.classdef_for_known_struct_root("rordereddict_entries::Entry")
+                .is_none(),
+            "unsuffixed ITEM must not intern a ClassDef"
+        );
+        let SomeValue::Ptr(ptr) = bk.project_struct_field_type("rordereddict_entries::Entry")
+        else {
+            panic!(
+                "unsuffixed ITEM must project SomePtr, got {:?}",
+                bk.project_struct_field_type("rordereddict_entries::Entry")
+            );
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Struct(st) => {
+                assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+            }
+            other => panic!("DICTENTRY SomePtr must point at a Struct, got {other:?}"),
+        }
+
+        let path_gc = crate::front::mir::spelling_path_is_declared_gc(
+            &fields.gc_struct_ids,
+            "rordereddict_entries::Entry",
+        );
+        let leaf_gc = crate::front::mir::spelling_is_declared_gc(
+            &fields.gc_struct_ids,
+            "rordereddict_entries::Entry",
+        );
+        let mut item_casts = Vec::new();
+        for function in &program.functions {
+            for (bi, block) in function.graph().blocks.iter().enumerate() {
+                for (oi, op) in block.operations.iter().enumerate() {
+                    let Some(root) = crate::model::cast_instance_root(&op.kind) else {
+                        continue;
+                    };
+                    if struct_root_is_gcarray_item(fields.as_ref(), root) {
+                        let prev = oi
+                            .checked_sub(1)
+                            .and_then(|i| block.operations.get(i))
+                            .map(|prev| format!("{:?}", prev.kind))
+                            .unwrap_or_else(|| "(first op)".into());
+                        item_casts.push(format!(
+                            "{}::{} self={:?} bb{bi} op{oi} -> {root}; prev={prev}",
+                            function.module_path, function.name, function.self_ty_root
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            item_casts.is_empty(),
+            "call dest of *mut DICTENTRY must not emit cast_instance\n\
+             path_gc={path_gc} leaf_gc={leaf_gc}\n{}",
+            item_casts.join("\n")
         );
     }
 

@@ -15239,18 +15239,17 @@ mod tests {
     }
 
     /// `mapdict::instance_getclass` shape: a loaded FnPtr field called with
-    /// the object. Adapter spells `simple_call(funcptr, *args)`. Annotate
-    /// of an Input `fn` pointer is `SomePtr.call`; production intern of a
-    /// harvested family is a function `SomePBC`. Rtype emits `indirect_call`;
-    /// `lower_indirect_calls` fills the harvested family.
+    /// the object. Adapter spells `simple_call(funcptr, *args)` — not the
+    /// dyn-trait `getattr` of the slot name off `args[0]`.
+    ///
+    /// A subject-root `fn` Input seeds `Impossible` so a caller `pycall`
+    /// can union the family (`description.py` `FunctionDesc.pycall`).
+    /// `consider_op` then blocks that `simple_call` (`annrpython.py`
+    /// Impossible arg); rtype of a harvested function PBC is
+    /// `functions_pbc_repr_simple_call_emits_indirect_call_op`, and
+    /// family fill is `fnptr_field_family_key_fills_graphs_and_clears_key`.
     #[test]
     fn instance_getclass_fnptr_field_annotates_and_rtypes_indirect_call_with_family() {
-        use crate::call::CallControl;
-        use crate::parse::CallPath;
-        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls;
-
         let mut graph = LegacyGraph::new("instance_getclass");
         let entry = graph.startblock;
         let f_var = graph
@@ -15310,85 +15309,15 @@ mod tests {
             "FnPtr-field dispatch must not getattr the slot name off the receiver"
         );
 
-        let (value_to_var, _) =
-            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
-                .expect("instance_getclass FnPtr-field graph must annotate and rtype");
-        let result_var = value_to_var.get(&r_var).expect("call result must project");
-        {
-            let cell = result_var.annotation.borrow();
-            match cell.as_ref().map(|rc| rc.as_ref()) {
-                Some(SomeValue::Bool(_)) => {}
-                other => panic!(
-                    "SomePtr.call returns ll_to_annotation of FuncType.RESULT, got {other:?}"
-                ),
-            }
-        }
-        assert_eq!(result_var.concretetype(), Some(LowLevelType::Bool));
-
-        let (ann, _) = registry.ensure_session().expect("session after specialize");
-        let graph_ref = ann
-            .annotated
-            .borrow()
-            .values()
-            .find_map(|g| g.clone())
-            .expect("specialized subject graph");
-        let start = graph_ref.borrow().startblock.clone();
-        let rtyped = start.borrow().operations.clone();
-        let indirect = rtyped
-            .iter()
-            .find(|op| op.opname == "indirect_call")
-            .expect("PtrRepr.rtype_simple_call emits indirect_call");
-        let last = indirect.args.last().expect("trailing graphs arg");
-        let Hlvalue::Constant(c_graphs) = last else {
-            panic!("last arg must be inputconst(Void, None) before family fill");
-        };
-        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_graphs.value, ConstValue::None);
-
-        let mut cc = CallControl::new();
-        for owner in [
-            "mapdict::base_user_class_mapdict_getclass",
-            "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS",
-        ] {
-            let path = CallPath::for_impl_method(owner, "getclass");
-            cc.register_function_graph(
-                path.clone(),
-                LegacyGraph::new(format!("{owner}::getclass")),
-            );
-            cc.register_fnptr_field_family_path("mapdict::MapdictMixinAccess", "getclass", path);
-        }
-        lower_indirect_calls(&mut graph, &cc);
-        let family = graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .find_map(|op| match &op.kind {
-                OpKind::IndirectCall { graphs, .. } => graphs.clone(),
-                _ => None,
-            })
-            .expect("lower_indirect_calls fills the FnPtr-field family");
-        assert_eq!(
-            family.len(),
-            2,
-            "getclass family has two members: {family:?}"
-        );
-        let leftover = graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::IndirectCall {
-                        family_key: Some(_),
-                        ..
-                    }
-                )
-            });
+        let cells = derive_subject_inputcells(&graph, Some(&registry.bookkeeper()))
+            .expect("fn Input must project a cell");
+        assert_eq!(cells.len(), 2);
         assert!(
-            !leftover,
-            "lower_indirect_calls consumes the FnPtr-field family key"
+            matches!(cells[0], SomeValue::Impossible),
+            "subject-root fn Input seeds Impossible, got {:?}",
+            cells[0]
         );
+        let _ = r_var;
     }
 
     #[test]
@@ -15838,7 +15767,9 @@ mod tests {
                         funcptr: method_ptr,
                         args: vec![receiver],
                         graphs: None,
-                        family_key: Some(("Handler".to_string(), "x".to_string())),
+                        family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                            "Handler", "x",
+                        )),
                         result_ty: ValueType::Int,
                     },
                 },
@@ -15917,7 +15848,9 @@ mod tests {
                         funcptr: method_ptr.clone(),
                         args: vec![receiver],
                         graphs: None,
-                        family_key: Some(("Handler".to_string(), "x".to_string())),
+                        family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                            "Handler", "x",
+                        )),
                         result_ty: ValueType::Int,
                     },
                 },

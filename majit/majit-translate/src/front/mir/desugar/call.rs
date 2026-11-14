@@ -312,6 +312,18 @@ impl<'a> Lowering<'a> {
             ValueType::Ref(None) => tyref_node(dest_class_ty, self.llbc)
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
                 .and_then(|n| raw_ptr_pointee_class_root_with(n, self.llbc, self.tombstoned_leaves))
+                // A `*mut` of a non-GC `GcArray` ITEM (`rordereddict.py`
+                // `DICTENTRY` / `lltype.py` `Struct` inlined in `GcArray`)
+                // stays SomePtr (`llannotation.py` `lltype_to_annotation`).
+                // Recasting onto that ITEM intern's SomeInstance beside
+                // dest's SomePtr (`mergeinputargs` Instance ∪ Ptr on
+                // `RDict::entry_at` after `ptr::add` / `entry_ptr`).
+                // GCREF erasure still recasts (`llmemory.py` `GCREF`).
+                .filter(|root| {
+                    !self.struct_fields.is_some_and(|reg| {
+                        crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, root)
+                    })
+                })
                 // `Option<&mut RegisteredStruct>` is a nullable pointer
                 // niche, not a boxed Option object. RPython represents it as
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the

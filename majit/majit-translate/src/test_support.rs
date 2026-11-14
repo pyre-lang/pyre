@@ -85,6 +85,15 @@ pub(crate) fn load_ullbc(path: &'static str) -> &'static Llbc {
     })
 }
 
+/// `None` when the artefact has not been extracted, so the caller can skip.
+pub(crate) fn load_ullbc_if_present(path: &'static str) -> Option<&'static Llbc> {
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return None;
+    }
+    Some(load_ullbc(path))
+}
+
 const PRODUCTION_ULLBC_PATHS: &[&str] = &[
     artifacts::INTERPRETER_ULLBC,
     artifacts::OBJECT_ULLBC,
