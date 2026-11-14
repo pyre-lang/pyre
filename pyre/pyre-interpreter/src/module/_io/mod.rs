@@ -1426,11 +1426,18 @@ fn rawiobase_read(args: &[PyObjectRef]) -> crate::PyResult {
             "readinto returned {length} outside buffer size {size}"
         )));
     }
+    // `space.delslice(w_buffer, w_length, space.len(w_buffer))`: a view that
+    // `readinto` kept on the buffer refuses the resize with `BufferError`.
+    let mut w_start = pyre_object::w_int_new(length);
+    let w_slice = pyre_object::with_roots!(w_start => pyre_object::w_slice_new(
+        w_start,
+        pyre_object::w_none(),
+        pyre_object::w_none(),
+    ));
+    crate::baseobjspace::delitem(pyre_object::gc_roots::shadow_stack_get(sp + 1), w_slice)?;
     let buffer = pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(buffer) };
-    Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-        &data[..length as usize],
-    ))
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(data))
 }
 
 /// `interp_iobase.py:rawiobase_readall_w` — repeatedly invoke the virtual
