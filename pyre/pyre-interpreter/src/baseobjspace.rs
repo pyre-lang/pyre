@@ -252,6 +252,13 @@ pub fn take_pending_set_element_error(item: PyObjectRef) -> PyError {
     take_pending_hash_error_for(item, wrap_set_element_hash_error)
 }
 
+/// The frozendict counterpart of [`take_pending_dict_key_error`]: a
+/// frozendict key names its container in the message it raises.
+#[majit_macros::dont_look_inside]
+pub fn take_pending_frozendict_key_error(key: PyObjectRef) -> PyError {
+    take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
+}
+
 /// Recover the exception a failed hash left pending and give it the calling
 /// container's context.  [`take_pending_hash_error`] is the same recovery
 /// without the context, for a caller with no operand to name.  An error from
@@ -321,7 +328,7 @@ pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) 
         return crate::runtime_ops::fetch_memory_error();
     }
     if container_is_frozendict(container) {
-        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
+        take_pending_frozendict_key_error(key)
     } else {
         take_pending_dict_key_error(key)
     }
