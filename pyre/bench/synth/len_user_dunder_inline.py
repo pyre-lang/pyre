@@ -1,12 +1,16 @@
 # pyre-check: spec-folds=len_user_dunder
 # pyre-check: trace-shape=hot_plain:absent=CallMayForceR
 # pyre-check: jitstats-band=guard_failures=125
-# dynasm guard_failures reads 2026 default / 8M, 2055 at PYPY_GC_NURSERY=64K, 2119-2151 at 256K,
-# 2126 at 1M on one macOS arm64 binary; CI 2102 (cranelift ubuntu + macOS), 2132 (dynasm windows).
-# A map transition in the hot loop allocates the new map young; the failing GUARD_VALUE keys
-# its jitcounter on the raw pointer (`compile.py` `ResumeGuardDescr.must_compile` `cast_ptr_to_int(refval)`),
-# so a minor collection inside the failure burst promotes the map and splits the counter.
-# The count follows nursery traffic; loops and bridges stay exact. The width is the 2026 -> 2151 distance.
+# `hot_plain(Nested(...))` inlines Nested.__len__, which calls len() on the
+# instance list, so the compiled loop GUARD_VALUEs the Nested map. Creating
+# that instance at the print line allocated the map young; a minor collection
+# in the failure burst moved it, and ResumeGuardDescr.must_compile hashed
+# the new pointer (`lltype.cast_ptr_to_int(refval)`), splitting the
+# jitcounter. Throwaway Nested/NestedNeg instances (and a Sized.extra
+# transition) at import share those maps so they are old before the bursts.
+# guard_failures then reads 1825 on dynasm, cranelift and wasm at the 4MiB
+# pin with and without PYRE_STDLIB, and across 1MiB..8MiB nurseries.
+# loops_compiled=12 and bridges_compiled=9 stay exact.
 # `len(obj)` whose receiver resolves `__len__` to a Python function.  Covers
 # the two receiver shapes `descroperation.py _len` dispatches a method for -- a
 # user instance and a builtin subclass overriding `__len__` -- plus the ways
@@ -101,6 +105,17 @@ class NestedNeg:
 
     def __len__(self):
         return -len(self._items)
+
+
+# Throwaway instances take the Nested/_items, NestedNeg/_items, and
+# Sized.extra maps at import. The hot loops then reuse those maps instead
+# of allocating them young. ResumeGuardDescr.must_compile hashes a failing
+# GUARD_VALUE ref as lltype.cast_ptr_to_int(refval), so a nursery collection
+# mid-burst would otherwise split the jitcounter.
+_nested_map = Nested([1, 2, 3])
+_nested_neg_map = NestedNeg([1, 2, 3])
+_sized_extra_map = Sized(0)
+_sized_extra_map.extra = 1
 
 
 def hot_plain(o, n):

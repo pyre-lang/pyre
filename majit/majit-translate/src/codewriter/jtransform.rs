@@ -712,8 +712,11 @@ pub struct Transformer<'a> {
     /// Constant. LinkArg slots become Const; Variable-only slots keep the
     /// result, which `materialize_const_result` defines once at the rename.
     /// Exit `LinkArg`s and `follow_constant_exit` read the same map.
-    /// Cleared at the start of every `optimize_block` (`renamings_constants = {}`):
-    /// a later block sees a fresh inputarg and the Constant already on the link.
+    /// `jtransform.py optimize_block` rebinds this per block. Void None
+    /// (`bind_jit_merge_point_none_result` / `do_rename` of a Void
+    /// variable) is kept: pyre's marker result is a Variable later
+    /// blocks still match, and `_do_renaming_on_link` carries
+    /// `Constant(None, Void)` onto the successor inputarg.
     renamings_constants: std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Constant,
@@ -996,6 +999,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "PyPyJitDriver",
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
+    "TupleHashJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -2155,16 +2159,14 @@ fn rewrite_symmetric(
     }
 }
 
-/// `Constant(None, Void)` after `ConstNone` is erased, or the definition
-/// itself when it is still in the block.  `is_(p, None)` uses it as the
-/// null operand (`rnone.py` `rtype_is_None`).
+/// The `ConstNone` producer of `variable` while it is still in the block.
+/// `is_(p, None)` uses it as the null operand (`rnone.py` `rtype_is_None`).
+/// A Void-typed live value is not None: dual-gate may stamp `Option<fn>` /
+/// `Option<NonNull>` Void while the payload is a pointer.
 fn operand_is_void_none(
     graph: &FunctionGraph,
     variable: &crate::flowspace::model::Variable,
 ) -> bool {
-    if FunctionGraph::concretetype_of(variable) == crate::model::ConcreteType::Void {
-        return true;
-    }
     graph.blocks.iter().any(|block| {
         block
             .operations
@@ -2442,6 +2444,12 @@ pub(crate) fn autodetect_jit_markers_redvars(
             alive_v.remove(result);
         }
         alive_v.extend(crate::inline::op_variable_refs(&op.kind));
+    }
+    // Live vars at the marker exclude its own result: that value is defined
+    // by the marker, not live into it. `support.py autodetect_jit_markers_redvars`
+    // never sees this because upstream `jit_merge_point` returns None.
+    if let Some(result) = &block.operations[marker_index].result {
+        alive_v.remove(result);
     }
     for green in greens {
         alive_v.remove(green);
@@ -3505,8 +3513,15 @@ impl<'a> Transformer<'a> {
             &rewritten,
             self.callcontrol.as_deref(),
         ));
-        for block_idx in 0..rewritten.blocks.len() {
-            self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
+        // `jtransform.py Transformer.transform`: `for block in
+        // list(graph.iterblocks())`. `iterblocks()` is startblock-first
+        // DFS (`FunctionGraph::iterblocks_order`). Storage order is not
+        // that walk: `split_before_jit_merge_point` appends the portal
+        // startblock, so a later match block can sit at a lower index.
+        // Seed of Void None from incoming links needs the predecessor
+        // rewritten first (`_do_renaming_on_link`).
+        for block_id in rewritten.iterblocks_order() {
+            self.optimize_block(&mut rewritten, block_id.0, &graph_name, exceptblock);
         }
         // `jtransform.py optimize_block` / `_handle_list_call` rewrites
         // oopspecs such as `list.int_set_items` to `setfield_gc_r` only
@@ -3536,6 +3551,102 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// Portal continuation of `jit_merge_point`: the hook returned None.
+    ///
+    /// `rlib/jit.py ExtEnterLeaveMarker.compute_result_annotation` returns
+    /// `s_None`; `specialize_call` emits `jit_marker` with
+    /// `resulttype=lltype.Void`; `jtransform.py handle_jit_marker__jit_merge_point`
+    /// builds `SpaceOperation('jit_merge_point', args, None)`. Pyre's source
+    /// marker returns `Option<_>`, and the portal is the arm where that
+    /// Option is None — the same constant-result rewrite
+    /// [`can_enter_jit_false_result`] applies to the boolean carrier.
+    ///
+    /// Stamp the Call result `Void` and rename it to `Constant(None, Void)`
+    /// (`rnone.py` `NoneRepr.lowleveltype`). `do_rename` of a Void
+    /// variable stores [`void_none_constant`] in `renamings_constants`;
+    /// later `if let Some` matching (`FieldRead __discriminant`, `is_`,
+    /// `bool` / `ptr_iszero`) folds to the None arm.
+    fn bind_jit_merge_point_none_result(&mut self, result: &crate::flowspace::model::Variable) {
+        result.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+        ));
+        self.do_rename(result.clone(), RenameTarget::Const(void_none_constant()));
+    }
+
+    /// Successor inputargs fed by the same Constant on every incoming
+    /// link (`jtransform.py` `_do_renaming_on_link`). Flatten skips kind
+    /// `'v'`, so a later `getfield_gc_i` of a Void None Option would read
+    /// an unwritten ref. Bind each such inputarg: Void None like the
+    /// marker result, any other agreeing Constant so an SSI copy of a
+    /// folded `__discriminant` still `follow_constant_exit`s. `optimize_graph`
+    /// walks `iterblocks_order` so the producer rewrites those links first.
+    /// A startblock / dual-gate live Void Option has no such link and is
+    /// left alone.
+    fn seed_inputargs_from_incoming_constants(&mut self, graph: &FunctionGraph, block_idx: usize) {
+        let inputargs = graph.blocks[block_idx].inputargs.clone();
+        if inputargs.is_empty() {
+            return;
+        }
+        let n = inputargs.len();
+        let target = graph.blocks[block_idx].id;
+        let mut incoming: Vec<Option<crate::flowspace::model::Constant>> = vec![None; n];
+        let mut agree = vec![true; n];
+        let mut saw = vec![false; n];
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target != target || link.args.len() != n {
+                    continue;
+                }
+                for (slot, arg) in link.args.iter().enumerate() {
+                    let c = match arg {
+                        crate::model::LinkArg::Const(c) => Some(c.clone()),
+                        crate::model::LinkArg::Value(v) => {
+                            if FunctionGraph::concretetype_of(v) == crate::model::ConcreteType::Void
+                                && self.operand_is_none_constant(graph, v)
+                            {
+                                Some(void_none_constant())
+                            } else {
+                                self.constant_for_rename_target(v)
+                            }
+                        }
+                    };
+                    saw[slot] = true;
+                    match (&incoming[slot], c) {
+                        (None, Some(c)) => incoming[slot] = Some(c),
+                        (Some(prev), Some(c)) if constants_agree(prev, &c) => {}
+                        _ => agree[slot] = false,
+                    }
+                }
+            }
+        }
+        for (slot, var) in inputargs.iter().enumerate() {
+            if saw[slot] && agree[slot] {
+                if let Some(c) = incoming[slot].take() {
+                    if is_void_none_constant(&c) {
+                        self.bind_jit_merge_point_none_result(var);
+                    } else {
+                        self.do_rename(var.clone(), RenameTarget::Const(c));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Constant(None)` via `renamings_constants` (portal
+    /// [`bind_jit_merge_point_none_result`]) or a `ConstNone` producer
+    /// (`rnone.py` `rtype_is_None`). A Void-typed live Option is not None.
+    fn operand_is_none_constant(
+        &self,
+        graph: &FunctionGraph,
+        variable: &crate::flowspace::model::Variable,
+    ) -> bool {
+        if operand_is_void_none(graph, variable) {
+            return true;
+        }
+        self.constant_for_rename_target(variable)
+            .is_some_and(|c| matches!(c.value, crate::flowspace::model::ConstValue::None))
+    }
+
     /// `jtransform.py Transformer.optimize_block.do_rename`.
     fn do_rename(&mut self, var: crate::flowspace::model::Variable, target: RenameTarget) {
         if FunctionGraph::concretetype_of(&var) == crate::model::ConcreteType::Void {
@@ -3555,25 +3666,47 @@ impl<'a> Transformer<'a> {
                 // hold Const, and Call rewrite drops Const args
                 // (`call_arg_vars`).
                 if let Some(c) = self.renamings_constants.get(&v).cloned() {
-                    if let Some(recast) = recast_renamed_constant(&var, c) {
-                        self.renamings_constants.insert(var, recast);
-                    }
+                    self.insert_renamed_constant(var, c);
                     return;
                 }
                 let resolved = resolve_alias(&v, &self.aliases);
                 if let Some(c) = self.renamings_constants.get(&resolved).cloned() {
-                    if let Some(recast) = recast_renamed_constant(&var, c) {
-                        self.renamings_constants.insert(var, recast);
-                    }
+                    self.insert_renamed_constant(var, c);
                     return;
                 }
                 self.aliases.insert(var, resolved);
             }
             RenameTarget::Const(c) => {
-                if let Some(recast) = recast_renamed_constant(&var, c) {
-                    self.renamings_constants.insert(var, recast);
-                }
+                self.insert_renamed_constant(var, c);
             }
+        }
+    }
+
+    /// `pairtype(NoneRepr, Repr).convert_from_to` is `inputconst(r_to, None)`
+    /// (`rnone.py`). `_cast_whatever` has no Void→Ptr, so recast would
+    /// panic. A portal marker None (`Constant(None, Void)` from
+    /// [`bind_jit_merge_point_none_result`]) still has to reach an
+    /// identity/`same_as` dest: `jtransform.py do_rename` stores
+    /// `renamings[var] = Constant(None, Void)` and `_do_renaming` /
+    /// `_do_renaming_on_link` carry that Constant. Bind that dest so
+    /// flatten skips kind `'v'` and a later `__discriminant` getfield
+    /// folds. Typed None (`ConstValue::None` without Void) keeps its
+    /// type: do not record it (`follow_constant_exit` compares
+    /// `link.llexitcase` only).
+    fn insert_renamed_constant(
+        &mut self,
+        var: crate::flowspace::model::Variable,
+        c: crate::flowspace::model::Constant,
+    ) {
+        if is_void_none_constant(&c) {
+            self.bind_jit_merge_point_none_result(&var);
+            return;
+        }
+        if matches!(c.value, crate::flowspace::model::ConstValue::None) {
+            return;
+        }
+        if let Some(recast) = recast_renamed_constant(&var, c) {
+            self.renamings_constants.insert(var, recast);
         }
     }
 
@@ -3596,6 +3729,12 @@ impl<'a> Transformer<'a> {
     ) {
         let is_void = FunctionGraph::concretetype_of(&result) == crate::model::ConcreteType::Void;
         if is_void {
+            self.do_rename(result, RenameTarget::Const(c));
+            return;
+        }
+        if matches!(c.value, crate::flowspace::model::ConstValue::None) {
+            // Typed None stays typed. Do not ConstNone a non-Void result,
+            // and do not stamp Void (`bind_jit_merge_point_none_result`).
             self.do_rename(result, RenameTarget::Const(c));
             return;
         }
@@ -3630,10 +3769,15 @@ impl<'a> Transformer<'a> {
         // only to the block that filled it.
         self.vable_array_vars.clear();
         self.vable_flags.clear();
-        // `renamings_constants` is rebound per block (`optimize_block`).
+        // `jtransform.py optimize_block` rebinds `renamings_constants = {}`.
+        // Keep `Constant(None, Void)` so the marker result is still None
+        // in a later block that names the same Variable. Seed successor
+        // inputargs from those link Constants (`_do_renaming_on_link`).
         // `renamings` (`self.aliases`) stays graph-wide: Variable identity
         // is unique across the graph.
-        self.renamings_constants.clear();
+        self.renamings_constants
+            .retain(|_, c| is_void_none_constant(c));
+        self.seed_inputargs_from_incoming_constants(graph, block_idx);
         #[cfg(test)]
         self.rewrite_input_ops.clear();
 
@@ -5893,15 +6037,40 @@ impl<'a> Transformer<'a> {
             // `None` is a Void constant, so the compare is not an `rr`
             // `ptr_eq`; leaving it spells `int_is_/r>i`, which blackhole
             // cannot dispatch.  Fold the pointer operand to `ptr_iszero`.
+            //
+            // `is_(None, None)`: both operands are the None constant, and
+            // `rnone.py rtype_is_None` of `none_repr` is `Constant(True)`.
+            // A Void-typed live Option is not `none_repr` (dual-gate
+            // `Option<NonNull>` / `Option<fn>`); that compare takes the
+            // XOR arm below (`ptr_iszero`).
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 ..
             } if binop_name == "is_"
-                && (operand_is_void_none(graph, lhs) ^ operand_is_void_none(graph, rhs)) =>
+                && self.operand_is_none_constant(graph, lhs)
+                && self.operand_is_none_constant(graph, rhs) =>
             {
-                let operand = if operand_is_void_none(graph, rhs) {
+                if let Some(result) = &op.result {
+                    result.set_concretetype(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    ));
+                }
+                RewriteResult::Constant(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Bool(true),
+                ))
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "is_"
+                && (self.operand_is_none_constant(graph, lhs)
+                    ^ self.operand_is_none_constant(graph, rhs)) =>
+            {
+                let operand = if self.operand_is_none_constant(graph, rhs) {
                     lhs
                 } else {
                     rhs
@@ -5983,6 +6152,30 @@ impl<'a> Transformer<'a> {
                         result_ty: result_ty.clone(),
                     },
                 }])
+            }
+            // `NoneRepr.rtype_bool` is `Constant(False)`; `rtype_is_None`
+            // of `none_repr` is `Constant(True)` (`rnone.py`). `ptr_iszero`
+            // is how `rtype_is_None` spells a Ptr. Intercept before
+            // `_rewrite_cmp_ptrs` / `rtype_bool` — those `Replace` results
+            // are not re-rewritten.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if matches!(
+                unop_name.as_str(),
+                "bool" | "ptr_nonzero" | "int_is_true" | "ptr_iszero" | "int_is_zero"
+            ) && self.operand_is_none_constant(graph, operand) =>
+            {
+                let none_is_zero = matches!(unop_name.as_str(), "ptr_iszero" | "int_is_zero");
+                if let Some(result) = &op.result {
+                    result.set_concretetype(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    ));
+                }
+                RewriteResult::Constant(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Bool(none_is_zero),
+                ))
             }
             // `jtransform.py`: `rewrite_op_ptr_iszero = _rewrite_cmp_ptrs`,
             // `rewrite_op_ptr_nonzero = _rewrite_cmp_ptrs`.
@@ -9592,6 +9785,41 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::GuardClass { base: base.clone() },
                 },
             ]);
+        }
+        // Portal `if let Some` after `bind_jit_merge_point_none_result`.
+        // The marker result is Void None; a niche Option's None tag is
+        // not knowable here (`option_none_discriminant`). Only that Void
+        // portal base is folded. `__discriminant` becomes the 0-like
+        // `llexitcase` already on the switch, or the 0-like of the unique
+        // Some-arm kind when None is the SwitchInt `"default"`
+        // (`jtransform.py Transformer.follow_constant_exit` compares
+        // `link.llexitcase` and takes default when nothing matches).
+        // Flatten concatenates the marker goto into the match block, so
+        // a missed switch still has to drop this getfield: the Void
+        // Option is never written (kind `'v'`), and `getfield_gc_i` of
+        // that unwritten ref is the runtime panic. Fall back to the
+        // FieldRead result's own 0-like when no related switch is found.
+        // Any other field is a Some-arm extract: bind that result to
+        // None so offset-0 `getsubstruct` Identity does not recast Void
+        // onto a Ptr.
+        if let OpKind::FieldRead { base, .. } = &op.kind
+            && FunctionGraph::concretetype_of(base) == crate::model::ConcreteType::Void
+            && self.operand_is_none_constant(graph, base)
+        {
+            if field.name == "__discriminant" {
+                if let Some(result) = &op.result {
+                    let c = none_switch_zero_like_constant(graph, result)
+                        .unwrap_or_else(|| zero_like_for_disc_result(result));
+                    stamp_switch_constant_type(result, &c);
+                    return RewriteResult::Constant(c);
+                }
+                return RewriteResult::Replace(Vec::new());
+            } else {
+                if let Some(result) = &op.result {
+                    self.bind_jit_merge_point_none_result(result);
+                }
+                return RewriteResult::Replace(Vec::new());
+            }
         }
         // `jtransform.py rewrite_op_getfield`:
         //     RESULT = op.result.concretetype
@@ -15333,6 +15561,10 @@ impl<'a> Transformer<'a> {
                 (JitMarkerKey::CanEnterJit, Some(result)) => {
                     vec![can_enter_jit_false_result(result)]
                 }
+                (JitMarkerKey::JitMergePoint, Some(result)) => {
+                    self.bind_jit_merge_point_none_result(result);
+                    Vec::new()
+                }
                 _ => Vec::new(),
             });
         }
@@ -15477,6 +15709,9 @@ impl<'a> Transformer<'a> {
                     reds_f,
                     red_classes,
                 ));
+                if let Some(result) = result {
+                    self.bind_jit_merge_point_none_result(result);
+                }
                 Some(ops)
             }
         }
@@ -17226,8 +17461,28 @@ fn resolve_alias(
     cur
 }
 
+/// `rnone.py` `NoneRepr.lowleveltype = Void`: `Constant(None, Void)`.
+/// `flatten.py insert_renamings` skips `v.concretetype is lltype.Void`;
+/// a bare `ConstValue::None` would be kind `'r'` and
+/// `assembler.py emit_const` has no None r-pool slot.
 fn void_none_constant() -> crate::flowspace::model::Constant {
-    crate::flowspace::model::Constant::new(crate::flowspace::model::ConstValue::None)
+    crate::flowspace::model::Constant::with_concretetype(
+        crate::flowspace::model::ConstValue::None,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+    )
+}
+
+fn is_void_none_constant(c: &crate::flowspace::model::Constant) -> bool {
+    matches!(c.value, crate::flowspace::model::ConstValue::None)
+        && c.concretetype
+            == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+}
+
+fn constants_agree(
+    a: &crate::flowspace::model::Constant,
+    b: &crate::flowspace::model::Constant,
+) -> bool {
+    a.value == b.value && a.concretetype == b.concretetype
 }
 
 #[expect(
@@ -17320,6 +17575,178 @@ fn materialize_const_result_copy(
     }
 }
 
+/// Zero-like `llexitcase` on the switch that uses `disc`.
+/// `follow_constant_exit` compares that value only; inventing `Int(0)`
+/// misses `UInt(0)` / `Bool(false)` and is wrong when None's tag is not 0.
+///
+/// `if let Some` SwitchInt emits the Some tag and a `"default"` None
+/// arm (`flowcontext.rs` SwitchInt default) — no 0-like `llexitcase`.
+/// `follow_constant_exit` then takes that last default. The 0-like of
+/// the unique explicit-arm kind is the None tag that matches nothing
+/// on that switch.
+///
+/// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)` rewrites a
+/// predecessor-defined discriminant onto the successor inputarg, so the
+/// switch Variable is a `Variable.copy()` of `disc`. Follow that renaming
+/// across links (`_do_renaming_on_link`) and `same_as`.
+fn none_switch_zero_like_constant(
+    graph: &FunctionGraph,
+    disc: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Constant> {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::ExitSwitch;
+    let mut related = vec![disc.clone()];
+    let mut i = 0;
+    while i < related.len() {
+        let v = related[i].clone();
+        i += 1;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                for (slot, arg) in link.args.iter().enumerate() {
+                    if arg.as_variable() != Some(&v) {
+                        continue;
+                    }
+                    if let Some(input) = graph.block(link.target).inputargs.get(slot)
+                        && !related.iter().any(|have| have == input)
+                    {
+                        related.push(input.clone());
+                    }
+                }
+            }
+            for op in &block.operations {
+                let OpKind::UnaryOp {
+                    op: name, operand, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if !is_same_as_identity_unary(name) || operand != &v {
+                    continue;
+                }
+                if let Some(result) = &op.result
+                    && !related.iter().any(|have| have == result)
+                {
+                    related.push(result.clone());
+                }
+            }
+        }
+    }
+    let mut found: Option<ConstValue> = None;
+    let mut default_kind_zero: Option<ConstValue> = None;
+    let mut saw_related_switch = false;
+    let mut all_have_default = true;
+    for block in &graph.blocks {
+        let Some(ExitSwitch::Value(v)) = &block.exitswitch else {
+            continue;
+        };
+        if !related.iter().any(|have| have == v) {
+            continue;
+        }
+        saw_related_switch = true;
+        let mut this_default = false;
+        for link in &block.exits {
+            if switch_link_is_default(link) {
+                this_default = true;
+                continue;
+            }
+            let Some(ll) = &link.llexitcase else {
+                continue;
+            };
+            if llexitcase_is_zero_like(ll) {
+                if let Some(prev) = &found
+                    && prev != ll
+                {
+                    return None;
+                }
+                found = Some(ll.clone());
+                continue;
+            }
+            let Some(z) = zero_like_of_llexitcase_kind(ll) else {
+                return None;
+            };
+            if let Some(prev) = &default_kind_zero
+                && prev != &z
+            {
+                return None;
+            }
+            default_kind_zero = Some(z);
+        }
+        if !this_default {
+            all_have_default = false;
+        }
+    }
+    found
+        .or_else(|| {
+            (saw_related_switch && all_have_default)
+                .then_some(default_kind_zero)
+                .flatten()
+        })
+        .map(crate::flowspace::model::Constant::new)
+}
+
+fn llexitcase_is_zero_like(ll: &crate::flowspace::model::ConstValue) -> bool {
+    matches!(
+        ll,
+        crate::flowspace::model::ConstValue::Int(0)
+            | crate::flowspace::model::ConstValue::UInt(0)
+            | crate::flowspace::model::ConstValue::Bool(false)
+    )
+}
+
+fn zero_like_of_llexitcase_kind(
+    ll: &crate::flowspace::model::ConstValue,
+) -> Option<crate::flowspace::model::ConstValue> {
+    use crate::flowspace::model::ConstValue;
+    match ll {
+        ConstValue::Int(_) => Some(ConstValue::Int(0)),
+        ConstValue::UInt(_) => Some(ConstValue::UInt(0)),
+        ConstValue::Bool(_) => Some(ConstValue::Bool(false)),
+        _ => None,
+    }
+}
+
+/// `follow_constant_exit`'s default-exit predicate.
+fn switch_link_is_default(link: &crate::model::Link) -> bool {
+    use crate::model::ExitCase;
+    match &link.exitcase {
+        Some(ExitCase::Const(v)) if v.string_eq("default") => true,
+        _ => link
+            .llexitcase
+            .as_ref()
+            .is_some_and(|v| v.string_eq("default")),
+    }
+}
+
+/// 0-like of a portal `__discriminant` FieldRead when no related
+/// switch published a kind. Tagged `if let Some` is Signed `Int(0)`;
+/// Unsigned / Bool keep `follow_constant_exit` comparable.
+fn zero_like_for_disc_result(
+    result: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Constant {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let value = match result.concretetype().as_ref() {
+        Some(LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => ConstValue::UInt(0),
+        Some(LowLevelType::Bool) => ConstValue::Bool(false),
+        _ => ConstValue::Int(0),
+    };
+    crate::flowspace::model::Constant::new(value)
+}
+
+fn stamp_switch_constant_type(
+    result: &crate::flowspace::model::Variable,
+    c: &crate::flowspace::model::Constant,
+) {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let ty = match &c.value {
+        ConstValue::UInt(_) => LowLevelType::Unsigned,
+        ConstValue::Bool(_) => LowLevelType::Bool,
+        _ => LowLevelType::Signed,
+    };
+    result.set_concretetype(Some(ty));
+}
+
 /// `jtransform.py Transformer.follow_constant_exit`: when `exitswitch` is
 /// a Constant (here: a Variable in `renamings_constants`) and the block cannot
 /// raise, keep the matching link as the sole unconditional exit.
@@ -17337,7 +17764,7 @@ fn follow_constant_exit(
     >,
     canraise: bool,
 ) -> (Option<crate::model::ExitSwitch>, Vec<crate::model::Link>) {
-    use crate::model::{ExitCase, ExitSwitch};
+    use crate::model::ExitSwitch;
     let Some(ExitSwitch::Value(v)) = &exitswitch else {
         return (exitswitch, exits);
     };
@@ -17355,6 +17782,21 @@ fn follow_constant_exit(
             break;
         }
     }
+    // `Constant(None, Void)` is never an `llexitcase`. A portal marker
+    // Option used as the switch (niche pointer / tagged 0-1) takes the
+    // 0-like None arm; `if let Some` SwitchInt then takes `"default"`.
+    if taken_idx.is_none() && matches!(llvalue, crate::flowspace::model::ConstValue::None) {
+        for (i, link) in exits.iter().enumerate() {
+            if link
+                .llexitcase
+                .as_ref()
+                .is_some_and(llexitcase_is_zero_like)
+            {
+                taken_idx = Some(i);
+                break;
+            }
+        }
+    }
     let idx = match taken_idx {
         Some(i) => i,
         None => {
@@ -17363,13 +17805,7 @@ fn follow_constant_exit(
                 .checked_sub(1)
                 .expect("follow_constant_exit: no exits");
             let last_link = &exits[last];
-            let is_default = match &last_link.exitcase {
-                Some(ExitCase::Const(v)) if v.string_eq("default") => true,
-                _ => last_link
-                    .llexitcase
-                    .as_ref()
-                    .is_some_and(|v| v.string_eq("default")),
-            };
+            let is_default = switch_link_is_default(last_link);
             assert!(
                 is_default,
                 "follow_constant_exit: no matching exit and last is not default"
@@ -30522,6 +30958,35 @@ mod tests {
     }
 
     #[test]
+    fn follow_constant_exit_void_none_takes_zero_like_arm() {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use std::collections::HashMap;
+
+        let mut graph = FunctionGraph::new("void_none_tagged_option_switch");
+        let sw = graph.alloc_value_var();
+        let none_arm = graph.create_block();
+        let some_arm = graph.create_block();
+        let none_link =
+            Link::new_mixed(vec![], none_arm, Some(ExitCase::Const(ConstValue::Int(0))))
+                .with_llexitcase_from_exitcase();
+        let some_link =
+            Link::new_mixed(vec![], some_arm, Some(ExitCase::Const(ConstValue::Int(1))))
+                .with_llexitcase_from_exitcase();
+        let mut aliases = HashMap::new();
+        aliases.insert(sw.clone(), void_none_constant());
+        let (exitswitch, taken) = follow_constant_exit(
+            Some(ExitSwitch::Value(sw)),
+            vec![none_link, some_link],
+            &aliases,
+            false,
+        );
+        assert!(exitswitch.is_none());
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].target, none_arm);
+    }
+
+    #[test]
     fn follow_constant_exit_matches_llexitcase_only() {
         use crate::flowspace::model::ConstValue;
         use crate::model::{ExitCase, ExitSwitch, Link};
@@ -32052,6 +32517,52 @@ mod tests {
     }
 
     #[test]
+    fn autodetect_jit_markers_redvars_excludes_the_marker_result() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::{Link, LinkArg, ValueType};
+
+        let mut graph = FunctionGraph::new("autoreds_marker_result");
+        let receiver = Variable::named("driver");
+        let green = Variable::named("greenkey");
+        let red_i = Variable::named("red_i");
+        let marker_result = Variable::named("marker_result");
+        FunctionGraph::set_concretetype_of_inline(&receiver, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red_i, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&marker_result, ConcreteType::Signed);
+
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(marker_result.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver.clone(), green.clone()]),
+                    result_ty: ValueType::Int,
+                },
+            });
+        let link_args = vec![red_i.clone(), green.clone(), marker_result.clone()];
+        let (target, _) = graph.create_block_with_arg_vars(link_args.len());
+        graph.blocks[graph.startblock.0].exits = vec![Link::new_mixed(
+            link_args.into_iter().map(LinkArg::Value).collect(),
+            target,
+            None,
+        )];
+
+        let reds =
+            autodetect_jit_markers_redvars(&graph, &[green], &default_jitdriver_receiver_roots());
+        assert_eq!(reds, vec![red_i]);
+        assert!(
+            !reds.iter().any(|var| var == &marker_result),
+            "marker result is defined by the marker, not live into it: {reds:?}"
+        );
+    }
+
+    #[test]
     fn jit_marker_key_recognises_allow_listed_jitdriver_methods() {
         let unpack_merge =
             CallTarget::method("jit_merge_point", Some("UnpackIterableJitDriver".into()));
@@ -32063,6 +32574,12 @@ mod tests {
             CallTarget::method("jit_merge_point", Some("GeneratorEntryJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&genentry_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let tuplehash_merge =
+            CallTarget::method("jit_merge_point", Some("TupleHashJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&tuplehash_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 
@@ -32317,6 +32834,1536 @@ mod tests {
         assert_eq!(entry.exits[0].target, if_false);
         assert!(result.graph.blocks[if_true.0].operations.is_empty());
         assert!(!result.graph.blocks[if_false.0].operations.is_empty());
+    }
+
+    /// Autoreds split portal whose marker result is matched
+    /// (`if let Some(r) = marker()`): the portal is the None-continuation,
+    /// so the tagged `Option` discriminant folds to 0 and the Some arm is
+    /// dropped. Post-marker code must not read the Call result register
+    /// (`handle_jit_marker__jit_merge_point` emits `result: None`).
+    #[test]
+    fn autoreds_portal_marker_option_match_folds_to_none_arm() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_option");
+        let entry = graph.startblock;
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::Signed);
+        graph.blocks[entry.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: opt.clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead defines the switch");
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![red.clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::Int(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![red.clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(entry, vec![none_link, some_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: opt.clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_option"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_option"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        let entry_block = rewritten.block(entry);
+        assert!(
+            entry_block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "portal marker must lower to JitMergePoint: {:?}",
+            entry_block.operations
+        );
+        assert!(
+            !rewritten
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "jit_merge_point must not remain a residual call"
+        );
+        assert!(
+            entry_block.exitswitch.is_none(),
+            "None discriminant must fold the switch, exitswitch={:?}",
+            entry_block.exitswitch
+        );
+        assert_eq!(entry_block.exits.len(), 1);
+        assert_eq!(
+            entry_block.exits[0].target, none_body,
+            "portal continuation must take the None arm"
+        );
+
+        let mut undefined = Vec::new();
+        let mut work = vec![rewritten.startblock];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(block_id) = work.pop() {
+            if !seen.insert(block_id.0) {
+                continue;
+            }
+            let block = rewritten.block(block_id);
+            let mut defined = block.inputargs.clone();
+            for op in &block.operations {
+                for used in crate::inline::op_variable_refs(&op.kind) {
+                    if !defined.iter().any(|d| d == &used) {
+                        undefined.push(format!("{:?} uses undefined {used:?}", op.kind));
+                    }
+                }
+                if let Some(result) = &op.result {
+                    defined.push(result.clone());
+                }
+            }
+            if let Some(ExitSwitch::Value(sw)) = &block.exitswitch
+                && !defined.iter().any(|d| d == sw)
+            {
+                undefined.push(format!("exitswitch uses undefined {sw:?}"));
+            }
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let Some(var) = arg.as_variable()
+                        && !defined.iter().any(|d| d == var)
+                    {
+                        undefined.push(format!("link arg uses undefined {var:?}"));
+                    }
+                }
+                work.push(link.target);
+            }
+        }
+        assert!(
+            undefined.is_empty(),
+            "post-marker portal must not read an undefined register: {undefined:?}"
+        );
+    }
+
+    /// Same portal match with unsigned discriminant arms. Inventing
+    /// `Int(0)` would miss `UInt(0)` (`follow_constant_exit` compares
+    /// `link.llexitcase` only).
+    #[test]
+    fn autoreds_portal_marker_option_match_folds_uint_none_arm() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_option_uint");
+        let entry = graph.startblock;
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::Signed);
+        graph.blocks[entry.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: opt,
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead defines the switch");
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![red.clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::UInt(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![red.clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::UInt(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(entry, vec![none_link, some_link]);
+        graph.set_return(some_arm, Some(some_args[0].clone()));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_option_uint"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_option_uint"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let entry_block = result.graph.block(entry);
+        assert!(
+            entry_block.exitswitch.is_none(),
+            "None discriminant must fold the switch, exitswitch={:?}",
+            entry_block.exitswitch
+        );
+        assert_eq!(entry_block.exits.len(), 1);
+        assert_eq!(
+            entry_block.exits[0].target, none_body,
+            "portal continuation must take the None arm"
+        );
+    }
+
+    /// Marker Call and `if let Some` live in different blocks: the
+    /// Option is a Link arg / successor inputarg. `optimize_block`
+    /// rebinds `renamings_constants` per block; without following that
+    /// `Constant(None, Void)` onto the later inputarg, `getfield_gc_i`
+    /// of `__discriminant` reads a ref flatten never wrote (kind `'v'`
+    /// skipped by `insert_renamings`).
+    #[test]
+    fn autoreds_portal_marker_none_folds_across_link_inputarg() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_cross_block");
+        let entry = graph.startblock;
+        let (match_block, match_args) = graph.create_block_with_arg_vars(2);
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&match_args[0], ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&match_args[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[entry.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        graph.closeblock(
+            entry,
+            vec![Link::from_variables(
+                &graph,
+                vec![opt, red.clone()],
+                match_block,
+                None,
+            )],
+        );
+
+        let disc = graph
+            .push_op_var(
+                match_block,
+                OpKind::FieldRead {
+                    base: match_args[0].clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead defines the switch");
+        graph.block_mut(match_block).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![match_args[1].clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::Int(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![match_args[0].clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(match_block, vec![none_link, some_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_cross_block"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_cross_block"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        let entry_block = rewritten.block(entry);
+        assert!(
+            entry_block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "portal marker must lower to JitMergePoint: {:?}",
+            entry_block.operations
+        );
+        assert!(
+            !rewritten
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "jit_merge_point must not remain a residual call"
+        );
+        // The match block may remain as an empty goto, or be jump-threaded
+        // so entry reaches none_body directly (`clear_unreachable_blocks`
+        // then empties the leftover). Follow the unique path.
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after the cross-block None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "cross-block marker None must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must reach the None arm; last={cursor:?}"
+        );
+
+        let mut undefined = Vec::new();
+        let mut work = vec![rewritten.startblock];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(block_id) = work.pop() {
+            if !seen.insert(block_id.0) {
+                continue;
+            }
+            let block = rewritten.block(block_id);
+            let mut defined = block.inputargs.clone();
+            for op in &block.operations {
+                for used in crate::inline::op_variable_refs(&op.kind) {
+                    if !defined.iter().any(|d| d == &used) {
+                        undefined.push(format!("{:?} uses undefined {used:?}", op.kind));
+                    }
+                }
+                if let Some(result) = &op.result {
+                    defined.push(result.clone());
+                }
+            }
+            if let Some(ExitSwitch::Value(sw)) = &block.exitswitch
+                && !defined.iter().any(|d| d == sw)
+            {
+                undefined.push(format!("exitswitch uses undefined {sw:?}"));
+            }
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let Some(var) = arg.as_variable()
+                        && !defined.iter().any(|d| d == var)
+                    {
+                        undefined.push(format!("link arg uses undefined {var:?}"));
+                    }
+                }
+                work.push(link.target);
+            }
+        }
+        assert!(
+            undefined.is_empty(),
+            "post-marker portal must not read an undefined register: {undefined:?}"
+        );
+    }
+
+    /// `split_before_jit_merge_point` appends the portal startblock, so
+    /// its Vec index is higher than the MIR match block. Storage-order
+    /// `optimize_graph` would rewrite the match first, while the incoming
+    /// link still names the unbound Option. `jtransform.py transform`
+    /// walks `graph.iterblocks()` (startblock-first DFS).
+    #[test]
+    fn autoreds_portal_marker_none_folds_when_split_startblock_has_high_index() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_late_startblock");
+        let (match_block, match_args) = graph.create_block_with_arg_vars(2);
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        for _ in 0..3 {
+            let _ = graph.create_block();
+        }
+        let marker = graph.create_block();
+        graph.startblock = marker;
+        assert!(
+            marker.0 > match_block.0,
+            "portal startblock must sit after the match in storage: marker={marker:?} match={match_block:?}"
+        );
+
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&match_args[0], ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&match_args[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[marker.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(marker, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                marker,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        graph.closeblock(
+            marker,
+            vec![Link::from_variables(
+                &graph,
+                vec![opt, red.clone()],
+                match_block,
+                None,
+            )],
+        );
+
+        let disc = graph
+            .push_op_var(
+                match_block,
+                OpKind::FieldRead {
+                    base: match_args[0].clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead defines the switch");
+        graph.block_mut(match_block).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![match_args[1].clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::Int(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![match_args[0].clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(match_block, vec![none_link, some_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_late_startblock"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_late_startblock"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        assert_eq!(rewritten.startblock, marker);
+        let marker_block = rewritten.block(marker);
+        assert!(
+            marker_block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "portal marker must lower to JitMergePoint: {:?}",
+            marker_block.operations
+        );
+        assert!(
+            !rewritten
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "jit_merge_point must not remain a residual call"
+        );
+
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after the late-startblock None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "late-startblock marker None must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must reach the None arm; last={cursor:?}"
+        );
+
+        let mut undefined = Vec::new();
+        let mut work = vec![rewritten.startblock];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(block_id) = work.pop() {
+            if !seen.insert(block_id.0) {
+                continue;
+            }
+            let block = rewritten.block(block_id);
+            let mut defined = block.inputargs.clone();
+            for op in &block.operations {
+                for used in crate::inline::op_variable_refs(&op.kind) {
+                    if !defined.iter().any(|d| d == &used) {
+                        undefined.push(format!("{:?} uses undefined {used:?}", op.kind));
+                    }
+                }
+                if let Some(result) = &op.result {
+                    defined.push(result.clone());
+                }
+            }
+            if let Some(ExitSwitch::Value(sw)) = &block.exitswitch
+                && !defined.iter().any(|d| d == sw)
+            {
+                undefined.push(format!("exitswitch uses undefined {sw:?}"));
+            }
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let Some(var) = arg.as_variable()
+                        && !defined.iter().any(|d| d == var)
+                    {
+                        undefined.push(format!("link arg uses undefined {var:?}"));
+                    }
+                }
+                work.push(link.target);
+            }
+        }
+        assert!(
+            undefined.is_empty(),
+            "post-marker portal must not read an undefined register: {undefined:?}"
+        );
+    }
+
+    /// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: the
+    /// discriminant FieldRead lives in the marker block and the switch
+    /// uses a `Variable.copy()` inputarg. `none_switch_zero_like_constant`
+    /// must follow that link; otherwise the FieldRead stays and flatten
+    /// emits `getfield_gc_i` of the Void marker Option.
+    #[test]
+    fn autoreds_portal_marker_none_folds_ssi_discriminant_copy_switch() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_ssi_disc");
+        let (switch_block, switch_args) = graph.create_block_with_arg_vars(2);
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        for _ in 0..3 {
+            let _ = graph.create_block();
+        }
+        let marker = graph.create_block();
+        graph.startblock = marker;
+        assert!(
+            marker.0 > switch_block.0,
+            "portal startblock must sit after the SSI switch in storage: marker={marker:?} switch={switch_block:?}"
+        );
+
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&switch_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&switch_args[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[marker.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(marker, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                marker,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        let disc = graph
+            .push_op_var(
+                marker,
+                OpKind::FieldRead {
+                    base: opt,
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead in the marker block");
+        graph.closeblock(
+            marker,
+            vec![Link::from_variables(
+                &graph,
+                vec![disc, red.clone()],
+                switch_block,
+                None,
+            )],
+        );
+
+        graph.block_mut(switch_block).exitswitch = Some(ExitSwitch::Value(switch_args[0].clone()));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![switch_args[1].clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::Int(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![switch_args[0].clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(switch_block, vec![none_link, some_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_ssi_disc"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_ssi_disc"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        assert_eq!(rewritten.startblock, marker);
+        let marker_block = rewritten.block(marker);
+        assert!(
+            marker_block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "portal marker must lower to JitMergePoint: {:?}",
+            marker_block.operations
+        );
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after the SSI None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "SSI discriminant copy must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must reach the None arm; last={cursor:?}"
+        );
+    }
+
+    /// Production `if let Some(result) = jit_merge_point(...)`: SwitchInt
+    /// keeps the Some tag (`Int(1)`) and None as `"default"` — no 0-like
+    /// `llexitcase`. Flatten still emitted `getfield_gc_i_pure` of the
+    /// Void marker Option (`tuple_hash_portal_portal` pc 24).
+    #[test]
+    fn autoreds_portal_marker_none_folds_if_let_some_default() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_if_let_some");
+        let (switch_block, switch_args) = graph.create_block_with_arg_vars(2);
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        for _ in 0..3 {
+            let _ = graph.create_block();
+        }
+        let marker = graph.create_block();
+        graph.startblock = marker;
+        assert!(
+            marker.0 > switch_block.0,
+            "portal startblock must sit after the SSI switch in storage: marker={marker:?} switch={switch_block:?}"
+        );
+
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&switch_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&switch_args[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[marker.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(marker, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                marker,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        let disc = graph
+            .push_op_var(
+                marker,
+                OpKind::FieldRead {
+                    base: opt,
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead in the marker block");
+        graph.closeblock(
+            marker,
+            vec![Link::from_variables(
+                &graph,
+                vec![disc, red.clone()],
+                switch_block,
+                None,
+            )],
+        );
+
+        graph.block_mut(switch_block).exitswitch = Some(ExitSwitch::Value(switch_args[0].clone()));
+        let some_link = Link::from_variables(
+            &graph,
+            vec![switch_args[0].clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        let none_link = Link::from_variables(
+            &graph,
+            vec![switch_args[1].clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+        );
+        graph.closeblock(switch_block, vec![some_link, none_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_if_let_some"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_if_let_some"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        assert_eq!(rewritten.startblock, marker);
+        let marker_block = rewritten.block(marker);
+        assert!(
+            marker_block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "portal marker must lower to JitMergePoint: {:?}",
+            marker_block.operations
+        );
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after the if-let None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "if-let Some default must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must take the default None arm; last={cursor:?}"
+        );
+    }
+
+    /// Production `tuple_hash_portal_portal`: flatten concatenates the
+    /// marker's goto into the match block, so the jitcode is
+    /// `jit_merge_point` then `getfield_gc_i_pure` of the Option. The
+    /// Option is a Link / SSI inputarg; the switch is `Int(1)` +
+    /// `"default"`. High-index startblock, FieldRead in the successor.
+    #[test]
+    fn autoreds_portal_marker_none_folds_if_let_some_default_across_link() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_if_let_link");
+        let (match_block, match_args) = graph.create_block_with_arg_vars(2);
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        for _ in 0..3 {
+            let _ = graph.create_block();
+        }
+        let marker = graph.create_block();
+        graph.startblock = marker;
+        assert!(
+            marker.0 > match_block.0,
+            "portal startblock must sit after the match in storage: marker={marker:?} match={match_block:?}"
+        );
+
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&match_args[0], ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&match_args[1], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[marker.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(marker, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                marker,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        graph.closeblock(
+            marker,
+            vec![Link::from_variables(
+                &graph,
+                vec![opt, red.clone()],
+                match_block,
+                None,
+            )],
+        );
+
+        let disc = graph
+            .push_op_var(
+                match_block,
+                OpKind::FieldRead {
+                    base: match_args[0].clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead in the match block");
+        graph.block_mut(match_block).exitswitch = Some(ExitSwitch::Value(disc));
+        let some_link = Link::from_variables(
+            &graph,
+            vec![match_args[0].clone()],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        let none_link = Link::from_variables(
+            &graph,
+            vec![match_args[1].clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+        );
+        graph.closeblock(match_block, vec![some_link, none_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_if_let_link"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_if_let_link"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        assert_eq!(rewritten.startblock, marker);
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after the cross-block if-let None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "cross-block if-let Some default must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must take the default None arm; last={cursor:?}"
+        );
+    }
+
+    /// Production `tuple_hash_portal_portal`: rustc `if let Some` copies
+    /// the marker Option (`same_as` / `cast_pointer`) onto a GcRef dest
+    /// before `Discriminant`. `insert_renamed_constant` used to skip
+    /// `ConstValue::None`, so that dest was neither Void nor in
+    /// `renamings_constants`; flatten assigned it r3 and
+    /// `getfield_gc_i_pure` of `__discriminant` read an unwritten ref
+    /// (`dispatch.rs read_ref_reg`).
+    #[test]
+    fn autoreds_portal_marker_none_folds_identity_copy_if_let_some_default() {
+        use crate::codewriter::call::CallControl;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("autoreds_portal_marker_identity_copy");
+        let entry = graph.startblock;
+        let (none_body, none_args) = graph.create_block_with_arg_vars(1);
+        let (some_arm, some_args) = graph.create_block_with_arg_vars(1);
+        let green = graph.alloc_value_var();
+        let red = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&green, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&red, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&none_args[0], ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&some_args[0], ConcreteType::GcRef);
+        graph.blocks[entry.0].inputargs = vec![green.clone(), red.clone()];
+
+        let receiver = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let opt = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("marker call defines the Option result");
+        let copy = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: opt,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("identity copy of the marker Option");
+        FunctionGraph::set_concretetype_of_inline(&copy, ConcreteType::GcRef);
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: copy.clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead of the identity copy");
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(disc));
+        let some_link = Link::from_variables(
+            &graph,
+            vec![copy],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::Int(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        let none_link = Link::from_variables(
+            &graph,
+            vec![red.clone()],
+            none_body,
+            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+        );
+        graph.closeblock(entry, vec![some_link, none_link]);
+        let payload = graph
+            .push_op_var(
+                some_arm,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("Some-arm payload FieldRead");
+        graph.set_return(some_arm, Some(payload));
+        graph.set_return(none_body, Some(none_args[0].clone()));
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["autoreds_portal_marker_identity_copy"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["autoreds_portal_marker_identity_copy"]),
+        );
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let rewritten = &result.graph;
+        let mut cursor = rewritten.startblock;
+        let mut seen = std::collections::HashSet::new();
+        let mut reached_none = false;
+        while seen.insert(cursor.0) {
+            let block = rewritten.block(cursor);
+            if cursor == some_arm {
+                panic!(
+                    "Some arm must be unreachable after identity-copy None fold; ops={:?}",
+                    block.operations
+                );
+            }
+            if cursor == none_body {
+                reached_none = true;
+                break;
+            }
+            assert!(
+                block.exitswitch.is_none(),
+                "block {cursor:?} still switches: {:?}",
+                block.exitswitch
+            );
+            assert_eq!(
+                block.exits.len(),
+                1,
+                "block {cursor:?} exits={:?} ops={:?}",
+                block.exits,
+                block.operations
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+                "identity copy of marker None must drop getfield_gc_i of the Option: {:?}",
+                block.operations
+            );
+            cursor = block.exits[0].target;
+        }
+        assert!(
+            reached_none,
+            "portal continuation must take the default None arm; last={cursor:?}"
+        );
+    }
+
+    /// A Ptr-typed None is not the portal marker. Folding its
+    /// `__discriminant` to `Int(0)` misses `UInt` arms
+    /// (`follow_constant_exit`).
+    #[test]
+    fn typed_none_option_discriminant_does_not_invent_int_zero() {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("typed_none_option_disc");
+        let entry = graph.startblock;
+        let none_arm = graph.create_block();
+        let some_arm = graph.create_block();
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        none.set_concretetype(Some(LowLevelType::Void));
+        let opt = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: none,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&opt, ConcreteType::GcRef);
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: opt,
+                    field: FieldDescriptor::new("__discriminant", Some("Option".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("discriminant FieldRead");
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(
+            &graph,
+            vec![],
+            none_arm,
+            Some(ExitCase::Const(ConstValue::UInt(0))),
+        )
+        .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(
+            &graph,
+            vec![],
+            some_arm,
+            Some(ExitCase::Const(ConstValue::UInt(1))),
+        )
+        .with_llexitcase_from_exitcase();
+        graph.closeblock(entry, vec![none_link, some_link]);
+        graph.set_return(none_arm, None);
+        graph.set_return(some_arm, None);
+
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let entry_block = result.graph.block(entry);
+        assert!(
+            entry_block.exitswitch.is_some(),
+            "typed None must not fold __discriminant to Int(0) against UInt arms"
+        );
+        assert_eq!(entry_block.exits.len(), 2);
+    }
+
+    /// Dual-gate types a live `Option<NonNull>` / `Option<fn>` argument Void.
+    /// `is_(self, None)` is `rtype_is_None` → `ptr_iszero` (`rnone.py`), not
+    /// `is_(None, None)` `Constant(True)`. That True recasts to Signed
+    /// `Int(1)` (`_cast_whatever`) and misses niche Bool `llexitcase`
+    /// (`jtransform.py Transformer.follow_constant_exit`).
+    #[test]
+    fn live_void_option_is_not_none_constant_against_bool_switch() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("live_void_niche_is_some");
+        let entry = graph.startblock;
+        let none_arm = graph.create_block();
+        let some_arm = graph.create_block();
+        let self_arg = graph.alloc_value_var_with_type(ConcreteType::Void);
+        graph.push_inputarg_var(entry, self_arg.clone());
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        none.set_concretetype(Some(LowLevelType::Void));
+        let is_none = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "is_".into(),
+                    lhs: self_arg,
+                    rhs: none,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let false_var = graph
+            .push_op_var(entry, OpKind::ConstBool(false), true)
+            .unwrap();
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: is_none,
+                    rhs: false_var,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        disc.set_concretetype(Some(LowLevelType::Signed));
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(disc));
+        let none_link = Link::from_variables(&graph, vec![], none_arm, Some(ExitCase::Bool(false)))
+            .with_llexitcase_from_exitcase();
+        let some_link = Link::from_variables(&graph, vec![], some_arm, Some(ExitCase::Bool(true)))
+            .with_llexitcase_from_exitcase();
+        graph.closeblock(entry, vec![none_link, some_link]);
+        graph.set_return(none_arm, None);
+        graph.set_return(some_arm, None);
+
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let entry_block = result.graph.block(entry);
+        assert_eq!(
+            entry_block.exits.len(),
+            2,
+            "live Void Option must not collapse the niche Bool switch, exits={:?}",
+            entry_block.exits
+        );
+    }
+
+    /// `NoneRepr.lowleveltype` is Void (`rnone.py`). A bare
+    /// `ConstValue::None` is kind `'r'` (`flatten.py` `getkind` fallback)
+    /// and `assembler.py emit_const` has no None r-pool slot.
+    #[test]
+    fn void_none_constant_kind_is_void() {
+        use crate::flatten::constant_kind;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let c = void_none_constant();
+        assert_eq!(c.concretetype, Some(LowLevelType::Void));
+        assert_eq!(constant_kind(&c), 'v');
+        assert!(matches!(c.value, crate::flowspace::model::ConstValue::None));
     }
 
     #[test]

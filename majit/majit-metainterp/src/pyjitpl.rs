@@ -13809,15 +13809,26 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> CompileResult {
-        let mut result =
+        let frame =
             self.execute_assembler_at_dispatch_key(token, green_key, live_values, dispatch_key);
+        self.handle_executed_frame_detailed(green_key, frame)
+    }
+
+    /// `warmstate.py execute_assembler` after `func_execute_token`, the
+    /// non-fast-path arm handed to `fail_descr.handle_fail`.
+    ///
+    /// `consume_executed_frame` is that arm's descr dispatch. A guard
+    /// exit then decodes fail-arg slots into `typed_values` for
+    /// `resume_in_blackhole`. A FINISH keeps the values `get_result`
+    /// already wrote: an `exit_frame_with_exception` carries its
+    /// exception there, not in a fail-arg slot.
+    pub fn handle_executed_frame_detailed(
+        &mut self,
+        green_key: u64,
+        frame: majit_backend::DeadFrame,
+    ) -> CompileResult {
+        let mut result = self.consume_executed_frame(green_key, frame);
         if let Some(descr_arc) = &result.descr_arc {
-            // `execute_assembler_at_dispatch_key` decodes no values on a guard
-            // exit; this runner's callers hand a dense list to
-            // `resume_in_blackhole`, so read the fail-arg slots off the
-            // deadframe here. A FINISH keeps the values it was given: an
-            // `exit_frame_with_exception` carries its exception there, not in
-            // a fail-arg slot.
             if !result.is_finish
                 && let (Some(frame), Some(fd)) =
                     (result.deadframe.as_ref(), descr_arc.as_fail_descr())
@@ -13895,10 +13906,11 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `warmstate.py execute_assembler(loop_token, *args)`: the run
-    /// RECEIVES the token whoever decided to enter already resolved, and never
-    /// looks the cell up again. Upstream hands it over the same way —
-    /// `warmstate.py` reads `procedure_token = cell.get_procedure_token()`
+    /// `warmstate.py execute_assembler`'s `func_execute_token(loop_token, *args)`.
+    ///
+    /// The run RECEIVES the token whoever decided to enter already resolved,
+    /// and never looks the cell up again. Upstream hands it over the same
+    /// way — `warmstate.py` reads `procedure_token = cell.get_procedure_token()`
     /// once per `maybe_compile_and_run` and `:509-511` carries it out through
     /// `raise EnterJitAssembler(procedure_token, *execute_args)`.
     ///
@@ -13910,9 +13922,10 @@ impl<M: Clone> MetaInterp<M> {
     /// recompile or redirect has already replaced re-enters invalidated
     /// machine code and fails GUARD_NOT_INVALIDATED on every iteration.
     ///
-    /// `warmstate.py execute_assembler` is a method call: residual
-    /// `assembler_call_helper` compiles a bridge or loop and
-    /// `handle_fail` then resumes. Keep this a call boundary.
+    /// Returns the deadframe. [`Self::handle_executed_frame_detailed`] is
+    /// the `fail_descr.handle_fail` arm after that call. Keep this a call
+    /// boundary: residual `assembler_call_helper` compiles a bridge or loop
+    /// and `handle_fail` then resumes.
     #[inline(never)]
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
@@ -13920,7 +13933,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> CompileResult {
+    ) -> majit_backend::DeadFrame {
         // Read once per run, ahead of every stage, so no stage's difference
         // carries it. See [`ExecuteStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
@@ -13965,7 +13978,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
-        self.consume_executed_frame(green_key, frame)
+        // `func_execute_token` returns this deadframe; the detailed
+        // runner hands it to [`Self::handle_executed_frame_detailed`].
+        frame
     }
 
     /// `warmstate.py execute_assembler` after `func_execute_token` returns.
@@ -15129,8 +15144,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         if fired && crate::majit_log_enabled() {
             eprintln!(
-                "[jit] must_compile FIRED: key={} descr=0x{:x}",
-                owning_key, descr_addr
+                "[jit] must_compile FIRED: key={} descr=0x{:x} jitdriver_sd={}",
+                owning_key, descr_addr, jitdriver_sd
             );
         }
         (fired, owning_key)
@@ -15180,8 +15195,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         if fired && crate::majit_log_enabled() {
             eprintln!(
-                "[jit] must_compile FIRED: key={} descr=0x{:x}",
-                owning_key, descr_addr
+                "[jit] must_compile FIRED: key={} descr=0x{:x} jitdriver_sd={}",
+                owning_key, descr_addr, jitdriver_sd
             );
         }
         (fired, owning_key)

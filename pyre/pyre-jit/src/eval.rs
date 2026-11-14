@@ -6284,6 +6284,27 @@ fn load_genentry_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp:
         .clone()
 }
 
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode` for `hash_driver`
+/// (`TUPLEHASH_PORTAL_KEY`).
+static TUPLEHASH_PORTAL_MAINJITCODE: std::sync::OnceLock<
+    Option<std::sync::Arc<majit_metainterp::JitCode>>,
+> = std::sync::OnceLock::new();
+
+fn load_tuple_hash_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
+    TUPLEHASH_PORTAL_MAINJITCODE
+        .get_or_init(|| {
+            pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+                pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+            )
+            .map(|canonical| {
+                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 fn build_jit_driver_pair() -> JitDriverPair {
     crate::call_jit::publish_pyre_host_hooks();
     // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
@@ -6419,8 +6440,23 @@ fn build_jit_driver_pair() -> JitDriverPair {
         .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX)
         .expect("generatorentry jitdrivers_sd slot")
         .mainjitcode_loader = Some(load_genentry_portal_mainjitcode);
+    // tupleobject.py `hash_driver`: greens `w_type`, reds='auto', no
+    // virtualizable. Registered immediately after jd2 so it is
+    // `jitdrivers_sd[3]`. Always on (no `PYRE_JD1` gate). The portal
+    // returns the xxHash accumulator (`warmspot.py` `result_kind == 'int'`).
+    let mut jd3 =
+        pyre_jit_trace::tuplehash_state::TupleHashJitState::tuple_hash_driver_descriptor();
+    jd3.result_type = majit_ir::Type::Int;
+    jd3.portal_runner_adr = ll_tuple_hash_portal_runner_shim as *const () as i64;
+    jd3.handle_jitexc_from_bh = Some(tuple_hash_portal_runner);
+    d.meta_interp_mut().register_jitdriver_sd(jd3);
+    d.meta_interp_mut()
+        .jitdriver_sd_mut(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX)
+        .expect("tuple.hash jitdrivers_sd slot")
+        .mainjitcode_loader = Some(load_tuple_hash_portal_mainjitcode);
     // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
     // `jitdriver_sd.warmstate`; `PYRE_JIT` below is `set_param(None, ...)`.
+    // `hash_driver` gets no per-driver threshold: it keeps the global one.
     let extra_threshold = i64::from(jd1_trace_threshold());
     for jd_no in [
         pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
@@ -9379,6 +9415,848 @@ fn run_compiled_generatorentry(
     }
 }
 
+/// `tupleobject.py` `get_printable_location`.
+fn get_printable_location_tuple_hash(w_type: pyre_object::PyObjectRef) -> String {
+    let type_name = if w_type.is_null() {
+        "<unknown>"
+    } else {
+        unsafe { pyre_object::w_type_get_name(w_type) }
+    };
+    format!("tuple.hash [{type_name}]")
+}
+
+/// `hash_driver.jit_merge_point` runtime hook.
+///
+/// `warmspot.py` `rewrite_can_enter_jits` inserts `can_enter_jit` at a
+/// portal that has none in source. The interpreter reaches
+/// `_descr_hash_jitdriver` / `tuple_hash_portal` at the marker; this hook
+/// is that enter.
+///
+/// The interpreted path is `warmstate.py maybe_compile_and_run`: cell
+/// lookup + counter tick. `execute_args` (the live reds) are built only
+/// when raising `EnterJitAssembler`. jd0's `pypyjit_confirm_reds` and
+/// `execute_assembler` split is that same split: this hook ticks with
+/// empty reds when `confirm_enter_jit` is not installed, and
+/// `RunCompiled` enters [`run_compiled_tuple_hash`] directly rather than
+/// going through [`drive_tuple_hash_trace`] (`NestedTraceGuard` /
+/// `force_start_tracing` are `bound_reached`, not `EnterJitAssembler`).
+fn tuple_hash_merge_point_jit(
+    w_type: pyre_object::PyObjectRef,
+    w_tuple: pyre_object::PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    if w_type.is_null() || w_tuple.is_null() {
+        return None;
+    }
+    // Green is `w_type` (`tupleobject.py` `greens=['w_type']`).
+    // `warmstate.py maybe_compile_and_run`: one cell-chain walk yields the
+    // procedure token (`EnterJitAssembler`) or falls through to the tick.
+    // jd0's compiled function-entry door is
+    // `resolved_entry_procedure_token` then `poll_raw_int_finish_raw`.
+    let (driver, _) = driver_pair();
+    let jd_no = pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX;
+    let hash = pyre_jit_trace::tuplehash_state::tuple_hash_green_hash(w_type);
+    let greenargs = [w_type as i64];
+    let (cell_key, token) = driver
+        .meta_interp()
+        .resolved_entry_procedure_token_on_driver(
+            jd_no,
+            hash,
+            Some((
+                &greenargs,
+                pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
+            )),
+        );
+    if let Some(token) = token
+        && token.outermost_jitdriver_index == Some(jd_no)
+    {
+        let raw = pyre_jit_trace::tuplehash_state::tuple_hash_raw_reds(
+            len as i64, acc as i64, i as i64, w_tuple,
+        );
+        return enter_compiled_tuple_hash(cell_key, token, &raw, w_tuple, len, acc, i);
+    }
+    // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
+    let hot = driver
+        .meta_interp_mut()
+        .maybe_compile_and_run_step_on_driver(jd_no, cell_key, (0, 0), &[])
+        .0;
+    match hot {
+        majit_metainterp::warmstate::HotResult::StartTracing => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
+            }
+            drive_tuple_hash_trace(cell_key, w_type, w_tuple, len, acc, i)
+        }
+        majit_metainterp::warmstate::HotResult::RunCompiled => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
+            }
+            let live = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+                len as i64, acc as i64, i as i64, w_tuple,
+            );
+            run_compiled_tuple_hash(cell_key, &live)
+        }
+        majit_metainterp::warmstate::HotResult::NotHot
+        | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
+    }
+}
+
+/// Enter the `tuple.hash` portal. The registered main jitcode is
+/// [`pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY`]. `JC_TRACING` on
+/// this cell returns without nesting; a live session on another key parks
+/// via [`NestedTraceGuard`] and may `bound_reached`. The machine walk from
+/// `jit_merge_point` runs the xxHash loop; a `Finish` is the accumulator.
+///
+/// `hash_driver` has a back edge. `CloseLoop` compiles that loop.
+/// `RunCompiled` enters the assembler here (`execute_assembler`);
+/// `StartedTracing` returns the value the walk already produced, if any.
+fn drive_tuple_hash_trace(
+    green_key: u64,
+    w_type: pyre_object::PyObjectRef,
+    w_tuple: pyre_object::PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    use majit_metainterp::BackEdgeAction;
+
+    let _exc_scope =
+        crate::call_jit::ResidualExceptionScope::park(majit_metainterp::majit_log_enabled());
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+    ) {
+        Some(jc) => jc,
+        None => return None,
+    };
+    let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    {
+        let index = jitcode.try_index().unwrap_or(0);
+        let payload = std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(jitcode.clone()),
+            std::ptr::null(),
+            /* has_abort */ false,
+        ));
+        pyre_jit_trace::state::install_build_time_jitcode_at(index, payload);
+    }
+
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[w_type, w_tuple]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
+    let (driver, _) = driver_pair();
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A sibling jitdriver may `bound_reached` a nested
+    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
+    // `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
+    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+        return None;
+    }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
+    let w_type = roots.get(base);
+    let w_tuple = roots.get(base + 1);
+
+    let live_values = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+        len as i64, acc as i64, i as i64, w_tuple,
+    );
+    let gk = pyre_jit_trace::tuplehash_state::tuple_hash_green_key(w_type);
+    let action = {
+        let meta = driver.meta_interp_mut();
+        let mut descriptor =
+            pyre_jit_trace::tuplehash_state::TupleHashJitState::tuple_hash_driver_descriptor();
+        descriptor.index = Some(jd_no);
+        // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
+        // (`w_type`); `(0, 0)` is the no-raw-pair sentinel.
+        // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
+        // so that pair never rebuilds the pypyjit 3-tuple.
+        publish_kind0_descrs_before_trace();
+        install_build_time_liveness_before_trace(meta);
+        meta.force_start_tracing(
+            green_key,
+            (0, 0),
+            Some((&gk.values, &gk.types)),
+            Some(std::sync::Arc::new(descriptor)),
+            &live_values,
+        )
+    };
+    if majit_metainterp::majit_log_enabled() {
+        let name = match action {
+            BackEdgeAction::Interpret => "Interpret",
+            BackEdgeAction::StartedTracing => "StartedTracing",
+            BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[tuple.hash] force_start_tracing -> {name}");
+    }
+    if matches!(action, BackEdgeAction::StartedTracing) {
+        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+        driver.arm_close_on_drop(starting_tracing_key);
+    } else {
+        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
+        // nested MetaInterp. Restore now so the compiled enter below sees
+        // the outer attempt. `compile_and_run_once` returns here and Drop
+        // restores; jd3 still has that arm in this function.
+        driver.restore_parked_outer();
+    }
+    // `maybe_compile_and_run` raises `EnterJitAssembler` once the cell
+    // has a real procedure token. Run that loop and resume its guards
+    // before the portal body.
+    if matches!(action, BackEdgeAction::RunCompiled) {
+        // NestedTraceGuard still holds the driver; drop it before the
+        // compiled runner re-acquires `driver_pair()`.
+        drop(driver);
+        return run_compiled_tuple_hash(green_key, &live_values);
+    }
+    if !matches!(action, BackEdgeAction::StartedTracing) {
+        return None;
+    }
+    let meta = driver.meta_interp_mut();
+    // `JitDriver::force_start_tracing` opens the frontend envelope that
+    // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
+    // only arms the tracer; without this the finish compile hits the
+    // session-absent no-op and the cell keeps its `compile_tmp_callback` token.
+    {
+        use majit_metainterp::JitState;
+        let trace_meta = pyre_jit_trace::tuplehash_state::TupleHashJitState { w_type }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        meta.begin_trace_session(trace_meta);
+    }
+
+    // jd3 is novable and `trace_jitcode_from_merge_point` executes against
+    // the live tuple. An abort mid-body is
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` on the published
+    // framestack (`blackhole.py convert_and_run_from_pyjitpl`). Pin every GC
+    // word this caller reloads after the walk (`shadowstack.py pop_roots`).
+    let _walk_roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_tuple);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let w_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
+    let mut green_args = [(majit_metainterp::JitArgKind::Ref, w_type as usize as i64)];
+    let mut red_args = [
+        (
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+            len as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+            acc as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            i as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
+            w_tuple as usize as i64,
+        ),
+    ];
+    let mut sym = pyre_jit_trace::tuplehash_state::TupleHashSym {
+        w_type,
+        len: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        acc: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        i: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+        obj: majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
+    };
+    let header_pc = {
+        use majit_metainterp::JitCodeSym;
+        sym.loop_header_pc()
+    };
+    let start_cell_key = meta
+        .trace_ctx()
+        .map(|ctx| ctx.root_green_key())
+        .unwrap_or(green_key);
+
+    use majit_metainterp::{JitState, TraceAction};
+    // `pyjitpl.py MetaInterp.reached_loop_header`: a CloseLoop that only
+    // appends a merge point (`cancelled, tracing more...`) RETURNS and
+    // the portal keeps recording. Loop the same `trace_jitcode_from_merge_point`
+    // driver until Compiled / Finish / abort. `NestedTraceGuard` Drop would
+    // abort a live keep-tracing session if this function returned here.
+    loop {
+        let drove = meta.with_trace_ctx_and_token_resolver(
+            |ctx,
+             recursive_target,
+             recursive_decision,
+             recursive_exec,
+             recursive_exec_ref,
+             recursive_exec_float,
+             recursive_exec_void| {
+                let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                    |_pc: usize| 0usize,
+                    recursive_target,
+                    recursive_decision,
+                    recursive_exec,
+                    recursive_exec_ref,
+                    recursive_exec_float,
+                    recursive_exec_void,
+                );
+                majit_metainterp::trace_jitcode_from_merge_point(
+                    ctx,
+                    &mut sym,
+                    &jitcode,
+                    header_pc,
+                    &runtime,
+                    &green_args,
+                    &red_args,
+                )
+            },
+        );
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!("[tuple.hash] trace_jitcode action={drove:?}");
+        }
+
+        // The walk executed the remaining iterations concretely. An Int
+        // FINISH is the accumulator; the portal runner returns it and does
+        // not run the body again. An exception FINISH is `Err`.
+        let produced: Option<Result<u64, pyre_interpreter::error::PyError>> = match &drove {
+            Some(TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            }) => {
+                let value = finish_args
+                    .first()
+                    .and_then(|op| meta.trace_ctx()?.concrete_of_opref(*op));
+                match value {
+                    Some(majit_ir::Value::Int(v)) => Some(Ok(v as u64)),
+                    // A non-int FINISH is a terminal state. `None` would make
+                    // the portal hash this item again.
+                    _ => Some(Err(tuple_hash_invalid_finish())),
+                }
+            }
+            Some(TraceAction::Finish {
+                exit_with_exception: true,
+                exc_value,
+                ..
+            }) => Some(Err(portal_error_from_exc_ref(*exc_value)
+                .unwrap_or_else(tuple_hash_exception_exit_without_exception))),
+            _ => None,
+        };
+        let jump_args = match &drove {
+            Some(TraceAction::CloseLoop) => {
+                Some(pyre_jit_trace::tuplehash_state::TupleHashJitState::collect_jump_args(&sym))
+            }
+            Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
+            _ => None,
+        };
+        if let Some(jump_args) = jump_args {
+            // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+            // `reached_loop_header` `live_arg_boxes` are the merge-point reds
+            // after the recorded iteration (`set_redboxes`); execute_assembler
+            // enters with those same concrete values so the portal does not
+            // hash the traced element again.
+            let (jump_boxes, close_live) = {
+                let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+                let jump_boxes: Vec<Operand> = jump_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.operand_for(r))
+                    .collect();
+                let close_live = jump_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.concrete_of_opref(r))
+                    .collect::<Option<Vec<_>>>();
+                (jump_boxes, close_live)
+            };
+            let outcome = meta.compile_loop(&jump_boxes);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] compile_loop outcome={outcome:?}");
+            }
+            match outcome {
+                majit_metainterp::CompileOutcome::Compiled { .. } => {
+                    if let Some(live) = close_live {
+                        drop(driver);
+                        return run_compiled_tuple_hash(green_key, &live);
+                    }
+                    return produced;
+                }
+                majit_metainterp::CompileOutcome::Cancelled if meta.is_tracing() => {
+                    // `reached_loop_header`: `cancelled, tracing more...`
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] cancelled, tracing more...");
+                    }
+                    let _ = meta.take_keep_tracing_after_close();
+                    if let Some(ctx) = meta.trace_ctx() {
+                        ctx.resume_walk_after_close();
+                    }
+                    if let Some(
+                        [
+                            majit_ir::Value::Int(len),
+                            majit_ir::Value::Int(acc),
+                            majit_ir::Value::Int(i),
+                            majit_ir::Value::Ref(majit_ir::GcRef(obj)),
+                        ],
+                    ) = close_live.as_deref()
+                    {
+                        green_args = [(
+                            majit_metainterp::JitArgKind::Ref,
+                            pyre_object::gc_roots::shadow_stack_get(type_slot) as usize as i64,
+                        )];
+                        red_args = [
+                            (majit_metainterp::JitArgKind::Int, sym.len, *len),
+                            (majit_metainterp::JitArgKind::Int, sym.acc, *acc),
+                            (majit_metainterp::JitArgKind::Int, sym.i, *i),
+                            (majit_metainterp::JitArgKind::Ref, sym.obj, *obj as i64),
+                        ];
+                    }
+                    continue;
+                }
+                majit_metainterp::CompileOutcome::Cancelled => {
+                    // Post-take cancel already finished History
+                    // (`jitdriver.rs compile_and_record_loop`).
+                    let jd_no = meta
+                        .active_jitdriver_sd
+                        .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
+                    meta.warm_state_for_driver(jd_no)
+                        .finish_tracing(start_cell_key);
+                    return produced;
+                }
+                majit_metainterp::CompileOutcome::Aborted => {
+                    meta.abort_trace(false);
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] abort_trace");
+                    }
+                    return None;
+                }
+                majit_metainterp::CompileOutcome::SwitchToBlackhole { reason } => {
+                    meta.stage_abort_reason(reason);
+                    meta.abort_trace(false);
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] abort_trace");
+                    }
+                    return None;
+                }
+            }
+        } else if let Some(TraceAction::Finish {
+            finish_args,
+            finish_arg_types,
+            exit_with_exception,
+            exc_value: _,
+        }) = drove
+        {
+            if exit_with_exception {
+                crate::call_jit::drain_backend_jit_exc();
+            }
+            match meta.compile_finish_from_active_session(
+                &finish_args,
+                finish_arg_types,
+                exit_with_exception,
+            ) {
+                Ok(()) => {
+                    if meta.is_tracing() {
+                        meta.abort_trace(false);
+                    }
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[tuple.hash] compile_finish ok exit_with_exception={exit_with_exception} \
+                             still_tracing={}",
+                            meta.is_tracing(),
+                        );
+                    }
+                }
+                Err(stb) => {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] compile_finish aborted reason={}", stb.reason);
+                    }
+                    meta.aborted_tracing(stb.reason);
+                }
+            }
+            return produced;
+        } else {
+            // `trace_jitcode_from_merge_point` walks a standalone stack.
+            // `publish_walk_abort_handoff` stages it on `aborted_framestack`
+            // unless `symbolic_residual_abort` declined. Adopt before
+            // `abort_trace_live` recycles it.
+            let published = meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.aborted_framestack.take());
+            if let Some(stack) = published.filter(|s| !s.is_empty()) {
+                meta.framestack = stack;
+                let stb = interpret_abort_switch_to_blackhole(meta);
+                let outcome = run_blackhole_interp_to_cancel_tracing(meta, stb);
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[tuple.hash] blackhole outcome={outcome:?}");
+                }
+                return Some(tuple_hash_result_from_blackhole(outcome));
+            }
+            meta.abort_trace(false);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] abort_trace");
+            }
+            // The walk did not finish the hash; the interpreter portal
+            // continues from this merge's `acc`/`i`.
+            return None;
+        }
+    }
+}
+
+fn tuple_hash_invalid_finish() -> pyre_interpreter::error::PyError {
+    pyre_interpreter::error::PyError::runtime_error("tuple.hash finish value is not an int")
+}
+
+fn tuple_hash_exception_exit_without_exception() -> pyre_interpreter::error::PyError {
+    pyre_interpreter::error::PyError::runtime_error(
+        "tuple.hash exception exit carries no exception",
+    )
+}
+
+/// `warmspot.py handle_jitexception` for a cancelled tuple.hash walk.
+/// `bhimpl_jit_merge_point` raises `ContinueRunningNormally` with the
+/// portal greens/reds; a finished hash is `DoneWithThisFrameInt`.
+fn tuple_hash_result_from_blackhole(
+    outcome: majit_metainterp::jitexc::JitException,
+) -> Result<u64, pyre_interpreter::error::PyError> {
+    use majit_metainterp::jitexc::JitException;
+    match outcome {
+        JitException::DoneWithThisFrameInt(value) => Ok(value as u64),
+        JitException::ExitFrameWithExceptionRef(value) => Err(unsafe {
+            pyre_interpreter::error::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+        }),
+        JitException::ContinueRunningNormally(args) => {
+            let w_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+            let len = args.red_int.first().copied().unwrap_or(0) as usize;
+            let acc = args.red_int.get(1).copied().unwrap_or(0) as u64;
+            let i = args.red_int.get(2).copied().unwrap_or(0) as usize;
+            let w_tuple = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+            unsafe { pyre_interpreter::tuple_hash_portal(w_type, w_tuple, len, acc, i) }
+        }
+        other => panic!("incomplete tuple.hash blackhole continuation: {other:?}"),
+    }
+}
+
+/// Reds (`len`, `acc`, `i`, `obj`) of a tuple.hash `ContinueRunningNormally`
+/// payload, for `run_compiled_tuple_hash` re-entry.
+fn tuple_hash_continue_reds(
+    live_args: &[majit_ir::Value],
+) -> Option<(i64, i64, i64, pyre_object::PyObjectRef)> {
+    fn ref_word(value: &majit_ir::Value) -> Option<pyre_object::PyObjectRef> {
+        match value {
+            majit_ir::Value::Ref(majit_ir::GcRef(ptr)) if *ptr != 0 => {
+                Some(*ptr as pyre_object::PyObjectRef)
+            }
+            _ => None,
+        }
+    }
+    match live_args {
+        [
+            majit_ir::Value::Int(len),
+            majit_ir::Value::Int(acc),
+            majit_ir::Value::Int(i),
+            obj,
+        ] => Some((*len, *acc, *i, ref_word(obj)?)),
+        [
+            majit_ir::Value::Ref(_),
+            majit_ir::Value::Int(len),
+            majit_ir::Value::Int(acc),
+            majit_ir::Value::Int(i),
+            obj,
+        ] => Some((*len, *acc, *i, ref_word(obj)?)),
+        _ => None,
+    }
+}
+
+/// `warmstate.py execute_assembler` int fast path for `hash_driver`.
+///
+/// `poll_raw_int_finish_raw` is `DoneWithThisFrameDescrInt.get_result`
+/// (jd0 `enter_compiled_function_entry`). Any other descr is that
+/// `func_execute_token` deadframe, handed to
+/// [`run_compiled_tuple_hash_from_frame`] for `fail_descr.handle_fail`.
+fn enter_compiled_tuple_hash(
+    green_key: u64,
+    token: std::sync::Arc<majit_backend::JitCellToken>,
+    raw_reds: &[i64],
+    w_tuple: pyre_object::PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    let poll = {
+        let (driver, _) = driver_pair();
+        driver
+            .meta_interp_mut()
+            .poll_raw_int_finish_raw(&token, green_key, raw_reds)
+    };
+    match poll {
+        Ok(v) => Some(Ok(v as u64)),
+        Err(frame) => {
+            let live = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+                len as i64, acc as i64, i as i64, w_tuple,
+            );
+            run_compiled_tuple_hash_from_frame(green_key, token, &live, frame)
+        }
+    }
+}
+
+/// `execute_assembler` for a compiled `tuple.hash` cell.
+///
+/// Guard exits tick `must_compile` then `_trace_and_compile_from_bridge`
+/// (`warmstate.py execute_assembler` → `fail_descr.handle_fail`).
+/// `ContinueRunningNormally` re-enters the assembler. A finish int is
+/// the accumulator. `ExitFrameWithExceptionRef` is the portal error.
+fn run_compiled_tuple_hash(
+    green_key: u64,
+    live_values: &[majit_ir::Value],
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    let token = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().entry_procedure_token_on_driver(
+            pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX,
+            green_key,
+        )
+    };
+    let Some(token) = token else {
+        return None;
+    };
+    let raw = tuple_hash_raw_from_live(live_values);
+    let poll = {
+        let (driver, _) = driver_pair();
+        driver
+            .meta_interp_mut()
+            .poll_raw_int_finish_raw(&token, green_key, &raw)
+    };
+    match poll {
+        Ok(v) => Some(Ok(v as u64)),
+        Err(frame) => run_compiled_tuple_hash_from_frame(green_key, token, live_values, frame),
+    }
+}
+
+fn tuple_hash_raw_from_live(live: &[majit_ir::Value]) -> [i64; 4] {
+    let mut raw = [0i64; 4];
+    for (dst, src) in raw.iter_mut().zip(live.iter()) {
+        *dst = match src {
+            majit_ir::Value::Int(v) => *v,
+            majit_ir::Value::Ref(gc) => gc.0 as i64,
+            majit_ir::Value::Float(f) => f.to_bits() as i64,
+            majit_ir::Value::Void => 0,
+        };
+    }
+    raw
+}
+
+fn run_compiled_tuple_hash_from_frame(
+    green_key: u64,
+    token: std::sync::Arc<majit_backend::JitCellToken>,
+    live_values: &[majit_ir::Value],
+    frame: majit_backend::DeadFrame,
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    // `warmstate.py execute_assembler` reuses the reds from
+    // `EnterJitAssembler`. Heap-copy them only on a guard-fail
+    // `ContinueRunningNormally` that rebuilds the bank.
+    let mut live_buf: Option<[majit_ir::Value; 4]> = None;
+    let mut pending_frame = Some(frame);
+    loop {
+        let extracted = {
+            let (driver, _) = driver_pair();
+            let r = if let Some(frame) = pending_frame.take() {
+                // The poll already ran. `warmstate.py execute_assembler`
+                // after `func_execute_token` hands this deadframe to
+                // `fail_descr.handle_fail`.
+                driver
+                    .meta_interp_mut()
+                    .handle_executed_frame_detailed(green_key, frame)
+            } else {
+                let live = live_buf
+                    .as_ref()
+                    .map(|a| a.as_slice())
+                    .unwrap_or(live_values);
+                driver
+                    .meta_interp_mut()
+                    .run_compiled_detailed_with_token_on_driver(green_key, &token, live, 0)
+            };
+            Some((
+                r.is_finish,
+                r.is_exit_frame_with_exception,
+                r.descr_arc
+                    .as_ref()
+                    .and_then(majit_metainterp::resume::get_resumestorage)
+                    .is_some(),
+                majit_metainterp::raw_exit_values(&r.typed_values),
+                r.exception.exc_value,
+                r.descr_arc.clone(),
+                r.guard_value_operand,
+            ))
+        };
+        let Some((
+            is_finish,
+            is_exception_exit,
+            has_storage,
+            mut values,
+            guard_exc,
+            descr_arc,
+            guard_value_operand,
+        )) = extracted
+        else {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] run_compiled: no loop");
+            }
+            return None;
+        };
+        if is_finish {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] run_compiled finish exc={is_exception_exit}");
+            }
+            if is_exception_exit {
+                let word = values.first().copied().unwrap_or(0);
+                if let Some(err) = portal_error_from_exc_ref(word) {
+                    return Some(Err(err));
+                }
+                if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+                    return Some(Err(err));
+                }
+                return Some(Err(tuple_hash_exception_exit_without_exception()));
+            }
+            // A zero accumulator is a valid hash (`DoneWithThisFrameInt(0)`).
+            let word = values.first().copied().unwrap_or(0);
+            return Some(Ok(word as u64));
+        }
+        if !has_storage {
+            if majit_metainterp::majit_log_enabled() {
+                let descr_id = descr_arc
+                    .as_ref()
+                    .map(majit_ir::descr_identity)
+                    .unwrap_or(0);
+                eprintln!("[tuple.hash] run_compiled no resume descr=0x{descr_id:x}");
+            }
+            return None;
+        }
+        // `pyjitpl.py handle_guard_failure` parks the grabbed exception
+        // for the walk; keep it alive through the blackhole fallback so
+        // a moving collection cannot leave a stale word in this local.
+        let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+        // `compile.py AbstractResumeGuardDescr.handle_fail`:
+        // `must_compile` then `_trace_and_compile_from_bridge`.
+        // `warmstate.py execute_assembler` is this driver's WarmEnterState
+        // method and passes that `jitdriver_sd` to `handle_fail`. This
+        // function is that method for `hash_driver`.
+        if let Some(ref descr_arc) = descr_arc {
+            let (must_compile, _) = {
+                let (driver, _) = driver_pair();
+                driver.meta_interp_mut().must_compile_with_values(
+                    descr_arc,
+                    &values,
+                    guard_value_operand,
+                    green_key,
+                    pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX as usize,
+                )
+            };
+            if must_compile && !majit_metainterp::MetaInterp::<()>::stack_almost_full() {
+                let ref_slots: Vec<bool> = descr_arc
+                    .as_fail_descr()
+                    .map(|fd| {
+                        fd.fail_arg_types()
+                            .iter()
+                            .map(|ty| *ty == majit_ir::Type::Ref)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ref_roots = unsafe {
+                    majit_metainterp::resume::DeadFrameRefRoots::enter(&mut values, |index| {
+                        ref_slots.get(index).copied().unwrap_or(false)
+                    })
+                };
+                let _guard = GuardCompilingScope::new(descr_arc);
+                let resolution = crate::call_jit::trace_and_compile_from_bridge(
+                    descr_arc,
+                    None,
+                    &values,
+                    guard_exc_root.get(),
+                    true,
+                );
+                match resolution {
+                    crate::call_jit::BridgeResolution::CompiledContinueLive(live) => {
+                        // `raise_continue_running_normally` ignores the failing
+                        // loop_token and re-enters through the cell
+                        // (`warmspot.py handle_jitexception` → `portal_ptr` →
+                        // `execute_assembler`). `compile_loop` attaches a new
+                        // token (`attach_procedure_to_interp`); the captured
+                        // `token` is the failing FINISH-ending entry.
+                        if tuple_hash_continue_reds(&live).is_some() {
+                            return run_compiled_tuple_hash(green_key, &live);
+                        }
+                    }
+                    crate::call_jit::BridgeResolution::CompiledContinue => {}
+                    crate::call_jit::BridgeResolution::Finished(cv) => {
+                        return Some(tuple_hash_from_concrete(cv));
+                    }
+                    crate::call_jit::BridgeResolution::FinishedException(cv) => {
+                        return Some(Err(finish_concrete_raise_error(cv)));
+                    }
+                    crate::call_jit::BridgeResolution::ResumeBlackhole => {}
+                }
+            }
+        }
+        let bh = resume_in_blackhole(
+            &mut values,
+            descr_arc
+                .as_ref()
+                .expect("a guard exit carrying resume storage carries its descr"),
+            guard_exc_root.get(),
+            true,
+            None,
+        );
+        match bh {
+            crate::call_jit::BlackholeResult::ContinueRunningNormally {
+                red_int, red_ref, ..
+            } => {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[tuple.hash] run_compiled continue");
+                }
+                if red_int.len() >= 3 && !red_ref.is_empty() {
+                    live_buf = Some(pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+                        red_int[0], red_int[1], red_int[2], red_ref[0],
+                    ));
+                }
+                continue;
+            }
+            crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[tuple.hash] run_compiled exc");
+                }
+                return Some(Err(err));
+            }
+            crate::call_jit::BlackholeResult::BailToInterpreter => {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[tuple.hash] run_compiled bail");
+                }
+                return None;
+            }
+            crate::call_jit::BlackholeResult::DoneWithThisFrameInt(v) => {
+                return Some(Ok(v as u64));
+            }
+            crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => {
+                return Some(Err(tuple_hash_invalid_finish()));
+            }
+        }
+    }
+}
+
+fn tuple_hash_from_concrete(
+    value: pyre_jit_trace::state::ConcreteValue,
+) -> Result<u64, pyre_interpreter::error::PyError> {
+    match value {
+        pyre_jit_trace::state::ConcreteValue::Int(v) => Ok(v as u64),
+        pyre_jit_trace::state::ConcreteValue::Null => Ok(0),
+        _ => Err(tuple_hash_invalid_finish()),
+    }
+}
+
 /// The exception a jd1 drain exit escapes with, as a `PyError`, unless it is the
 /// drain's own loop-exit `StopIteration` (which the caller `ln` loop re-derives
 /// on its next `next()`) or the slot is empty.
@@ -10015,6 +10893,7 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
+    pyre_interpreter::call::register_tuple_hash_merge_hook(tuple_hash_merge_point_jit);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -10644,6 +11523,7 @@ fn eval_with_jit_inner(
         pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
         pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
         pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
+        pyre_interpreter::call::register_tuple_hash_merge_hook(tuple_hash_merge_point_jit);
         // The backend-agnostic registrations here — notably the JIT exception
         // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
         // residual-call raises through — are required on every backend; the
@@ -11293,6 +12173,111 @@ fn generatorentry_portal_runner(
         Err(mut err) => Err(PortalRunnerFailure::jit(
             JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
         )),
+    }
+}
+
+/// `warmspot.py ll_portal_runner` for `hash_driver`.
+///
+/// Argument order is the portal calldescr: greens then reds in
+/// `JitDriverStaticData.vars` (`w_type`, `len`, `acc`, `i`, `obj`).
+fn tuple_hash_ll_portal_runner(
+    mut w_type: pyre_object::PyObjectRef,
+    len: i64,
+    acc: i64,
+    i: i64,
+    mut w_tuple: pyre_object::PyObjectRef,
+) -> Result<u64, pyre_interpreter::error::PyError> {
+    // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[w_type, w_tuple]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
+    w_type = roots.get(base);
+    w_tuple = roots.get(base + 1);
+    let len = len as usize;
+    let acc = acc as u64;
+    let i = i as usize;
+
+    if let Some(result) = tuple_hash_merge_point_jit(w_type, w_tuple, len, acc, i) {
+        return result;
+    }
+    w_type = roots.get(base);
+    w_tuple = roots.get(base + 1);
+    unsafe { pyre_interpreter::tuple_hash_portal(w_type, w_tuple, len, acc, i) }
+}
+
+/// C ABI of [`tuple_hash_ll_portal_runner`].
+///
+/// `build_portal_calldescr` lays args out as greens then reds in
+/// descriptor order: `w_type`, `len`, `acc`, `i`, `obj`.
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_tuple_hash_portal_runner_shim(
+    w_type: pyre_object::PyObjectRef,
+    len: i64,
+    acc: i64,
+    i: i64,
+    w_tuple: pyre_object::PyObjectRef,
+) -> i64 {
+    match tuple_hash_ll_portal_runner(w_type, len, acc, i, w_tuple) {
+        Ok(result) => {
+            // `compile_tmp_callback` is `CALL` + `GUARD_NO_EXCEPTION` +
+            // `FINISH`. The caller's loop records the same
+            // `GuardNoException` after `CallAssemblerI` to that token.
+            // An Ok hash must leave the backend exception cell empty; a
+            // stale cell fails that guard on every later hash.
+            crate::call_jit::clear_residual_call_exception();
+            result as i64
+        }
+        Err(mut err) => {
+            // `GUARD_NO_EXCEPTION` after `CALL_ASSEMBLER` reads the backend
+            // exception cells (`publish_residual_call_exception`). Parking
+            // only in the interpreter pending slot leaves that guard green
+            // and the zero result is taken as the hash.
+            let exc = err.to_exc_object();
+            crate::call_jit::publish_residual_call_exception(exc);
+            0
+        }
+    }
+}
+
+/// `warmspot.py handle_jitexception` for `hash_driver`.
+///
+/// Int portal: `DoneWithThisFrameInt(v)` is the accumulator. Returning
+/// `(Void, 0)` for a non-CRN would install 0 as the hash.
+fn tuple_hash_portal_runner(
+    exc: &majit_metainterp::jitexc::JitException,
+) -> Result<
+    (majit_metainterp::blackhole::BhReturnType, i64),
+    majit_metainterp::blackhole::PortalRunnerFailure,
+> {
+    use majit_metainterp::blackhole::{BhReturnType, PortalRunnerFailure};
+    use majit_metainterp::jitexc::JitException;
+
+    match exc {
+        JitException::ContinueRunningNormally(args) => {
+            // Descriptor banks: green_ref[0] `w_type`; red_int `len`,`acc`,`i`;
+            // red_ref[0] `obj`.
+            let w_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+            let len = args.red_int.first().copied().unwrap_or(0) as usize;
+            let acc = args.red_int.get(1).copied().unwrap_or(0) as u64;
+            let i = args.red_int.get(2).copied().unwrap_or(0) as usize;
+            let w_tuple = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+            match unsafe { pyre_interpreter::tuple_hash_portal(w_type, w_tuple, len, acc, i) } {
+                Ok(result) => Ok((BhReturnType::Int, result as i64)),
+                Err(mut err) => Err(PortalRunnerFailure::jit(
+                    JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
+                        err.to_exc_object() as usize
+                    )),
+                )),
+            }
+        }
+        JitException::DoneWithThisFrameInt(v) => Ok((BhReturnType::Int, *v)),
+        JitException::ExitFrameWithExceptionRef(_) => Err(PortalRunnerFailure::jit(exc.clone())),
+        JitException::DoneWithThisFrameVoid
+        | JitException::DoneWithThisFrameRef(_)
+        | JitException::DoneWithThisFrameFloat(_)
+        | JitException::BailToInterpreter => {
+            panic!("tuple.hash handle_jitexception: unhandled {exc:?}")
+        }
     }
 }
 

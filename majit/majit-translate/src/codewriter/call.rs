@@ -9734,6 +9734,22 @@ impl CallControl {
                     todo.push(path.clone());
                 }
             }
+            // PyPy's portal reaches `_trace` → `profilefunc`
+            // (`executioncontext.py` `setllprofile`), whose PBC family
+            // (`app_profile_call`, `lsprof_call`) joins the indirect-call
+            // candidate set. Pyre's opcode walker may not expose that
+            // field call as a BFS Call op, so seed the harvested family
+            // the same way as `builtin_wrapper_indirect_graphs` above.
+            // Each member's AccessDirect path is a candidate too:
+            // `default_specialize` mints those copies after BFS, and
+            // `warmspot.py check_access_directly_sanity` requires the
+            // specialized graph itself to be in `jit_graphs`.
+            for path in self.profilefunc_indirect_graphs() {
+                if self.candidate_graphs.insert(path.clone()) {
+                    todo.push(path.clone());
+                }
+                self.candidate_graphs.insert(access_directly_path(&path));
+            }
             // call.py:59-64 — seed the BFS with builtin oopspec helpers so
             // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
             // are reachable even when the portal does not call them
@@ -11614,6 +11630,23 @@ impl CallControl {
                 })
                 .expect("address bucket holds at least one alias");
             result.push(pick);
+        }
+        result
+    }
+
+    /// Harvested `ProfileFunc` PBC family (`executioncontext.py`
+    /// `setllprofile`): each published path that names a registered
+    /// graph, under that graph's stored spelling (`call.py graphs_from`).
+    pub(crate) fn profilefunc_indirect_graphs(&self) -> Vec<CallPath> {
+        let mut result = Vec::new();
+        for published in crate::profilefunc_family::profilefunc_graphs() {
+            let path = CallPath::from_segments(published.split("::").filter(|s| !s.is_empty()));
+            let Some(resolved) = self.callable_graph_path(&path) else {
+                continue;
+            };
+            if !result.contains(&resolved) {
+                result.push(resolved);
+            }
         }
         result
     }
@@ -18496,6 +18529,43 @@ mod tests {
         assert!(
             cc.is_candidate(&wrapper),
             "a registered __majit_wrap_* graph must be a two-phase candidate"
+        );
+    }
+
+    /// Production BFS (`helper_roots` empty) seeds the harvested
+    /// `ProfileFunc` PBC family into `candidate_graphs`.
+    /// `executioncontext.py` `setllprofile` / `_trace` reaches that
+    /// family from the portal; pyre seeds it explicitly, as
+    /// `builtin_wrapper_indirect_graphs`.
+    #[test]
+    fn find_all_graphs_seeds_a_profilefunc_as_a_candidate() {
+        struct RestoreFamily;
+        impl Drop for RestoreFamily {
+            fn drop(&mut self) {
+                crate::profilefunc_family::register_profilefunc_family(Vec::new(), Vec::new());
+            }
+        }
+        let _restore = RestoreFamily;
+
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "portal"]);
+        let profile = CallPath::from_segments(["fixture", "app_profile_call"]);
+        cc.register_function_graph(portal.clone(), FunctionGraph::new("portal"));
+        cc.register_function_graph(profile.clone(), FunctionGraph::new("app_profile_call"));
+        crate::profilefunc_family::register_profilefunc_family(
+            vec!["fixture::app_profile_call".into()],
+            vec!["ProfileFunc".into()],
+        );
+        cc.mark_portal(portal);
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&profile),
+            "a registered ProfileFunc family graph must be a two-phase candidate"
+        );
+        assert!(
+            cc.is_candidate(&access_directly_path(&profile)),
+            "the family's AccessDirect path must be a candidate for check_access_directly_sanity"
         );
     }
 
