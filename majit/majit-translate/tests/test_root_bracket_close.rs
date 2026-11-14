@@ -69,11 +69,8 @@ fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGra
 /// program (`StructFieldRegistry::foreign_callables`).
 fn extras_for(llbc: &'static Llbc) -> Vec<&'static Llbc> {
     match llbc.crate_name() {
-        "pyre_interpreter" => object_llbc().into_iter().collect(),
-        "pyre_module" => object_llbc()
-            .into_iter()
-            .chain(interpreter_llbc())
-            .collect(),
+        "pyre_interpreter" => vec![object_llbc()],
+        "pyre_module" => vec![object_llbc(), interpreter_llbc()],
         _ => Vec::new(),
     }
 }
@@ -197,7 +194,7 @@ fn bracket_closes_for_each_caller_shape() {
 /// make jtransform insert `cast_int_to_ptr` of a non-GC word.
 #[test]
 fn close_takes_the_guard_word_as_int() {
-    let cases: &[(&str, fn() -> Option<&'static Llbc>, &str)] = &[
+    let cases: &[(&str, fn() -> &'static Llbc, &str)] = &[
         ("owns_guard", object_llbc, "w_tuple_items_copy_as_vec"),
         (
             "imports_guard",
@@ -207,9 +204,7 @@ fn close_takes_the_guard_word_as_int() {
         ("runtime_pin_loop", interpreter_llbc, "tuple_concat"),
     ];
     for (name, load, leaf) in cases {
-        let Some(llbc) = load() else {
-            continue;
-        };
+        let llbc = load();
         let graph = lower_named(llbc, leaf);
         let mut found = 0usize;
         for op in graph.blocks.iter().flat_map(|b| &b.operations) {
@@ -260,7 +255,7 @@ fn close_takes_the_guard_word_as_int() {
 /// A FieldRead would getattr that field on Integer.
 #[test]
 fn wrapper_sized_field_projection_is_the_word() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     with_linked_lowering(llbc, |context| {
         let mut bodies = 0usize;
         for fd in llbc.iter_local_fns() {

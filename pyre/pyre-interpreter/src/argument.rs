@@ -1674,7 +1674,8 @@ impl Arguments {
             if too_many_args {
                 break 'done too_many_args_err(
                     signature,
-                    scope_w,
+                    scope_w.as_ptr(),
+                    scope_w.len(),
                     co_argcount,
                     co_kwonlyargcount,
                     defaults_len,
@@ -1724,25 +1725,30 @@ impl Arguments {
                         missing_kw = true;
                         continue;
                     }
-                    match kwdefaults_storage_lookup_str_at(
+                    // argument.py `_match_signature`:
+                    // `w_def = self.space.finditem_str(w_kw_defs, name)`
+                    // returns None on a miss and raises OperationError
+                    // otherwise. Map that raise onto `MatchOutcome::Py`.
+                    match kwdefaults_finditem_str_at(
                         pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
                         signature,
                         i,
                     ) {
-                        FinditemStrOutcome::Hit(w_def) => {
+                        Ok(Some(w_def)) => {
                             pyre_object::gc_roots::shadow_stack_set(scope_base + i, w_def);
                             scope_w[i] = w_def;
                         }
-                        FinditemStrOutcome::Miss => {
+                        Ok(None) => {
                             missing_kw = true;
                         }
-                        FinditemStrOutcome::Py(e) => break 'done MatchOutcome::Py(e),
+                        Err(err) => break 'done MatchOutcome::Py(err),
                     }
                 }
                 if missing_pos {
                     break 'done match_signature_missing_err(
                         signature,
-                        scope_w,
+                        scope_w.as_ptr(),
+                        scope_w.len(),
                         input_argcount,
                         co_argcount,
                         true,
@@ -1751,7 +1757,8 @@ impl Arguments {
                 if missing_kw {
                     break 'done match_signature_missing_err(
                         signature,
-                        scope_w,
+                        scope_w.as_ptr(),
+                        scope_w.len(),
                         co_argcount,
                         co_argcount + co_kwonlyargcount,
                         false,
@@ -2406,7 +2413,20 @@ pub fn collect_keyword_args(
     let n = unsafe { (*gcarray_from_slot(names_gc_slot)).len() };
     let mut i = 0usize;
     while i < n {
-        if mapping_contains(kwds_mapping, mapping_len, i as i64) {
+        // argument.py `_collect_keyword_args`: `for j in kwds_mapping: if i == j: break`
+        // else setitem. `kwds_mapping` is the parent's `[i64; N]` NewArrayClear
+        // virtual; a residual `as_ptr` scan would read that virtual array as
+        // real memory and miss every bound name.
+        let mut found = false;
+        let mut j = 0usize;
+        while j < mapping_len {
+            if kwds_mapping[j] == i as i64 {
+                found = true;
+                break;
+            }
+            j += 1;
+        }
+        if found {
             i += 1;
             continue;
         }
@@ -2415,13 +2435,22 @@ pub fn collect_keyword_args(
         let pair = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_key);
         let _ = pyre_object::gc_roots::pin_root(w_value);
-        match setitem_kwargs_dict(
-            pyre_object::gc_roots::shadow_stack_get(kwds_slot),
-            pyre_object::gc_roots::shadow_stack_get(pair),
-            pyre_object::gc_roots::shadow_stack_get(pair + 1),
-        ) {
-            CollectKeywordArgsOutcome::Ok => {}
-            CollectKeywordArgsOutcome::Py(e) => return CollectKeywordArgsOutcome::Py(e),
+        let w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
+        let w_key = pyre_object::gc_roots::shadow_stack_get(pair);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(pair + 1);
+        // `kwargsdict.py KwargsDictStrategy.setitem`: exact-str key on
+        // kwargs / empty-kwargs stays on the parallel lists; otherwise
+        // `switch_to_object_strategy` + `w_dict.setitem`.
+        // argument.py `_collect_keyword_args`:
+        // `space.setitem(w_kwds, w_key, keywords_w[i])` raises
+        // OperationError. Map that raise onto `CollectKeywordArgsOutcome::Py`.
+        if unsafe {
+            pyre_object::kwargsdict::w_dict_is_kwargs_or_empty_kwargs(w_kwds)
+                && pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE)
+        } {
+            setitem_kwargs_dict(w_kwds, w_key, w_value);
+        } else if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
+            return CollectKeywordArgsOutcome::Py(err);
         }
         i += 1;
     }
@@ -2446,30 +2475,60 @@ fn collect_keyword_args_vec(
         if kwds_mapping.contains(&(i as isize)) {
             continue;
         }
-        match setitem_kwargs_dict(
-            pyre_object::gc_roots::shadow_stack_get(kwds_slot),
-            pyre_object::gc_roots::shadow_stack_get(names_base + i),
-            pyre_object::gc_roots::shadow_stack_get(values_base + i),
-        ) {
-            CollectKeywordArgsOutcome::Ok => {}
-            CollectKeywordArgsOutcome::Py(e) => return CollectKeywordArgsOutcome::Py(e),
+        let w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
+        let w_key = pyre_object::gc_roots::shadow_stack_get(names_base + i);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(values_base + i);
+        if unsafe {
+            pyre_object::kwargsdict::w_dict_is_kwargs_or_empty_kwargs(w_kwds)
+                && pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE)
+        } {
+            setitem_kwargs_dict(w_kwds, w_key, w_value);
+        } else if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
+            return CollectKeywordArgsOutcome::Py(err);
         }
     }
     CollectKeywordArgsOutcome::Ok
 }
 
-/// `space.setitem(w_kwds, w_key, w_value)` for overflow keywords.
-/// Residual: `W_DictMultiObject.setitem` reads `dstrategy.imp` as a
-/// trait object the annotator types classdef-less, so looking inside
-/// the store aborts `_collect_keyword_args`. A non-virtual dict
-/// setitem is residual the same way. Returns [`CollectKeywordArgsOutcome`]
-/// so the look-inside body never getattr `Result::Err.__pos_0`.
-#[majit_macros::dont_look_inside]
-fn setitem_kwargs_dict(
+/// `argument.py _collect_keyword_args` `space.setitem(w_kwds, w_key,
+/// keywords_w[i])` when `w_kwds` is still kwargs / empty-kwargs and
+/// `w_key` is an exact str (`kwargsdict.py KwargsDictStrategy.setitem`
+/// `is_correct_type` arm / `_setitem_correct_indirection`). Looking
+/// inside `W_DictMultiObject.setitem` still aborts (classdef-less
+/// `dstrategy.imp`); the residual is `dont_look_inside_cannot_raise`
+/// because that store does not re-enter Python (`call.py getcalldescr`
+/// `cannot_raise_effect_info()`). One-word `bool` so the residual ABI
+/// can record the call.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) fn setitem_kwargs_dict(
     w_kwds: PyObjectRef,
     w_key: PyObjectRef,
     w_value: PyObjectRef,
-) -> CollectKeywordArgsOutcome {
+) -> bool {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_kwds, w_key, w_value]);
+        pyre_object::kwargsdict::w_dict_store_kwargs_str(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        );
+        true
+    }
+}
+
+/// `space.setitem(w_kwds, w_key, w_value)` for a key or dict that is not
+/// the kwargs-str fast path (`KwargsDictStrategy.setitem` else-arm
+/// `switch_to_object_strategy` + `w_dict.setitem`). A str-subclass keyword
+/// (`f(**{StrSub('a'): 1})`) takes this residual. A store error is the
+/// `Err` arm, matching `argument.py` `_collect_keyword_args` where
+/// `space.setitem` raises `OperationError`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn setitem_kwargs_dict_general(
+    w_kwds: PyObjectRef,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) -> Result<(), crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[w_kwds, w_key, w_value]);
@@ -2478,20 +2537,36 @@ fn setitem_kwargs_dict(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
             pyre_object::gc_roots::shadow_stack_get(base + 2),
         ) {
-            Ok(()) => CollectKeywordArgsOutcome::Ok,
-            Err(_) => {
-                CollectKeywordArgsOutcome::Py(crate::baseobjspace::take_pending_dict_key_error(
-                    pyre_object::gc_roots::shadow_stack_get(base + 1),
-                ))
-            }
+            Ok(()) => Ok(()),
+            Err(_) => Err(crate::baseobjspace::take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )),
         }
     }
 }
 
-fn mapping_contains(mapping: &[i64; KWDS_MAPPING_CAP], mapping_len: usize, target: i64) -> bool {
+/// One-word residual ABI for [`setitem_kwargs_dict_general`].
+/// `Result<(), PyError>` lowers to void (`call_trace_jit_abi`); `Err`
+/// publishes through [`crate::runtime_ops::jit_publish_residual_error`].
+pub(crate) fn setitem_kwargs_dict_general_jit_abi(
+    w_kwds: PyObjectRef,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) -> i64 {
+    match setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+/// Native scan for `dont_look_inside` error builders (`unknown_kwds_err`).
+/// `collect_keyword_args` inlines the same loop on the virtual `[i64; N]`;
+/// this helper stays a `*const i64` word-ABI residual so Charon does not
+/// type an array-ref as a two-word slice.
+pub(crate) fn mapping_contains(mapping_ptr: *const i64, mapping_len: usize, target: i64) -> bool {
     let mut j = 0usize;
     while j < mapping_len {
-        if mapping[j] == target {
+        if unsafe { *mapping_ptr.add(j) } == target {
             return true;
         }
         j += 1;
@@ -2523,13 +2598,81 @@ fn parse_into_scope_type_error(fnname: &Wtf8, e: ArgErr) -> crate::PyError {
     crate::PyError::type_error(crate::display::wtf8_format!(fnname, "() ", msg))
 }
 
-/// Residual of the keyword-only default storage probe so `_match_signature`
-/// does not read a `Result` in the look-inside loop.
-#[derive(Debug)]
-enum FinditemStrOutcome {
-    Hit(PyObjectRef),
-    Miss,
-    Py(crate::PyError),
+/// `space.finditem_str(w_kw_defs, signature.argnames[i])`
+/// (`argument.py _match_signature`). `&str` is two words, so the look-inside
+/// kwonly loop cannot pass a rustc fat pointer; this wrapper only forwards.
+///
+/// Returns `Ok(Some(v))` on a hit, `Ok(None)` on a miss, `Err` when a
+/// colliding key `__eq__` raises — the same three outcomes as
+/// `baseobjspace::finditem_str` / `finditem_str_named`. `_match_signature`
+/// maps `Err` to `MatchOutcome::Py`, where `space.finditem_str`'s
+/// `OperationError` would leave the caller.
+///
+/// Calls, in order:
+/// - `type_methods::resolve_dict_backing` (`type_methods.rs`)
+/// - `dictmultiobject::is_module_dict` / `w_module_dict_is_object_strategy`
+///   (`dictmultiobject.rs`); else `is_dict` / `is_frozendict` (`pyobject.rs`)
+///   plus `W_DictObject.dstrategy.kind` (`dictmultiobject.rs`)
+/// - object strategy: [`kwdefaults_storage_lookup_str_at`]
+/// - otherwise `Signature::argname_at` (`gateway.rs`) →
+///   `unicodeobject::prebuilt_str_storage`, then identity
+///   `utf8_payload_wtf8` + `as_str_unchecked` into
+///   `baseobjspace::finditem_str` (`baseobjspace.rs`) →
+///   `finditem_str_named` → `ModuleDictStrategy::getitem_str` (`celldict.rs`)
+///   or `w_dict_get_strategy().getitem_str_hashed` (`dictmultiobject.rs`)
+pub(crate) fn kwdefaults_finditem_str_at(
+    w_dict: PyObjectRef,
+    signature: &crate::gateway::Signature,
+    index: usize,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
+    let backing = crate::type_methods::resolve_dict_backing(
+        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+    );
+    if backing.is_null() {
+        return Ok(None);
+    }
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(backing);
+    let backing = pyre_object::gc_roots::shadow_stack_get(backing_slot);
+    let may_eq = unsafe {
+        if pyre_object::dictmultiobject::is_module_dict(backing) {
+            pyre_object::dictmultiobject::w_module_dict_is_object_strategy(backing)
+        } else if pyre_object::is_dict(backing) || pyre_object::is_frozendict(backing) {
+            (*(backing as *const pyre_object::W_DictObject))
+                .dstrategy
+                .kind
+                == pyre_object::StrategyKind::Object
+        } else {
+            false
+        }
+    };
+    if may_eq {
+        return kwdefaults_storage_lookup_str_at(backing, signature, index);
+    }
+    let name = unsafe {
+        pyre_object::unicodeobject::as_str_unchecked(pyre_object::unicodeobject::utf8_payload_wtf8(
+            signature.argname_at(index),
+        ))
+    };
+    crate::baseobjspace::finditem_str(backing, name)
+}
+
+/// One-word residual ABI for [`kwdefaults_finditem_str_at`].
+/// `finditem_str_named_word`: hit is the object, miss is NULL, `Err`
+/// publishes through [`crate::runtime_ops::jit_publish_residual_error_ref`].
+pub(crate) fn kwdefaults_finditem_str_at_jit_abi(
+    w_dict: PyObjectRef,
+    signature: &crate::gateway::Signature,
+    index: usize,
+) -> PyObjectRef {
+    match kwdefaults_finditem_str_at(w_dict, signature, index) {
+        Ok(Some(v)) => v,
+        Ok(None) => pyre_object::PY_NULL,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
 }
 
 /// [3.15-spec] `PyDict_GetItemRef(func->func_kwdefaults, varname, &def)`
@@ -2541,7 +2684,10 @@ enum FinditemStrOutcome {
 /// measured: python3.15t 3.15.2 prints 1 / TypeError for a dict subclass
 /// whose __getitem__ returns 999 / whose __missing__ returns 555; pypy3 prints 999 / 555
 #[majit_macros::dont_look_inside]
-fn kwdefaults_storage_lookup_str(w_dict: PyObjectRef, name: &str) -> FinditemStrOutcome {
+fn kwdefaults_storage_lookup_str(
+    w_dict: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_dict);
@@ -2549,7 +2695,7 @@ fn kwdefaults_storage_lookup_str(w_dict: PyObjectRef, name: &str) -> FinditemStr
         pyre_object::gc_roots::shadow_stack_get(mapping_slot),
     );
     if backing.is_null() {
-        return FinditemStrOutcome::Miss;
+        return Ok(None);
     }
     let backing_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(backing);
@@ -2559,22 +2705,37 @@ fn kwdefaults_storage_lookup_str(w_dict: PyObjectRef, name: &str) -> FinditemStr
             name,
         )
     } {
-        Ok(Some(v)) => FinditemStrOutcome::Hit(v),
-        Ok(None) => FinditemStrOutcome::Miss,
-        Err(_) => FinditemStrOutcome::Py(crate::baseobjspace::take_pending_hash_error()),
+        Ok(Some(v)) => Ok(Some(v)),
+        Ok(None) => Ok(None),
+        Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
     }
 }
 
-/// One-word residual of `kwdefaults_storage_lookup_str(w_dict, argnames[i])`.
+/// Residual of `kwdefaults_storage_lookup_str(w_dict, argnames[i])`.
 /// `&str` is two words; the look-inside kwonly-defaults loop cannot
-/// pass a rustc fat pointer.
+/// pass a rustc fat pointer. Same `Result<Option<PyObjectRef>, PyError>`
+/// as [`crate::baseobjspace::finditem_str_named`].
 #[majit_macros::dont_look_inside]
-fn kwdefaults_storage_lookup_str_at(
+pub(crate) fn kwdefaults_storage_lookup_str_at(
     w_dict: PyObjectRef,
     signature: &crate::gateway::Signature,
     index: usize,
-) -> FinditemStrOutcome {
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     kwdefaults_storage_lookup_str(w_dict, signature.argnames[index].as_ref())
+}
+
+/// One-word residual ABI for [`kwdefaults_storage_lookup_str_at`].
+/// Same mapping as [`kwdefaults_finditem_str_at_jit_abi`].
+pub(crate) fn kwdefaults_storage_lookup_str_at_jit_abi(
+    w_dict: PyObjectRef,
+    signature: &crate::gateway::Signature,
+    index: usize,
+) -> PyObjectRef {
+    match kwdefaults_storage_lookup_str_at(w_dict, signature, index) {
+        Ok(Some(v)) => v,
+        Ok(None) => pyre_object::PY_NULL,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
 }
 
 /// Residual `ArgErrUnknownKwds` builder. `Wtf8Buf::new` / `text_w` stay
@@ -2592,7 +2753,7 @@ fn unknown_kwds_err(
         let mut i = 0usize;
         while i < keyword_names_w.len() {
             let w_n = keyword_names_w[i];
-            if !mapping_contains(mapping, mapping_len, i as i64) {
+            if !mapping_contains(mapping.as_ptr(), mapping_len, i as i64) {
                 if unsafe { pyre_object::is_str(w_n) } {
                     name = unsafe { pyre_object::w_str_get_wtf8(w_n) }.to_wtf8_buf();
                 } else {
@@ -2645,17 +2806,20 @@ fn unknown_kwds_err_vec(
 }
 
 /// Residual `ArgErrTooMany` / `ArgErrTooManyMethod` builder. Signature
-/// field reads stay in rustc layout.
+/// field reads stay in rustc layout. `scope_w` is a thin pointer plus
+/// length so the residual ABI can describe every slot.
 #[majit_macros::dont_look_inside]
 fn too_many_args_err(
     signature: &crate::gateway::Signature,
-    scope_w: &[PyObjectRef],
+    scope_ptr: *const PyObjectRef,
+    scope_len: usize,
     co_argcount: usize,
     co_kwonlyargcount: usize,
     num_defaults: usize,
     given: usize,
     methodcall: bool,
 ) -> MatchOutcome {
+    let scope_w = unsafe { std::slice::from_raw_parts(scope_ptr, scope_len) };
     let mut kwonly_given: usize = 0;
     for i in co_argcount..(co_argcount + co_kwonlyargcount) {
         if !scope_w[i].is_null() {
@@ -2680,14 +2844,17 @@ fn too_many_args_err(
 }
 
 /// Residual `ArgErrMissing` builder. Collects still-null scope slots.
+/// Thin pointer plus length: `&[PyObjectRef]` is two words.
 #[majit_macros::dont_look_inside]
 fn match_signature_missing_err(
     signature: &crate::gateway::Signature,
-    scope_w: &[PyObjectRef],
+    scope_ptr: *const PyObjectRef,
+    scope_len: usize,
     start: usize,
     end: usize,
     positional: bool,
 ) -> MatchOutcome {
+    let scope_w = unsafe { std::slice::from_raw_parts(scope_ptr, scope_len) };
     let mut missing: Vec<String> = Vec::new();
     for i in start..end {
         if scope_w[i].is_null() {
@@ -2698,6 +2865,99 @@ fn match_signature_missing_err(
         missing,
         positional,
     })
+}
+
+/// `parse_into_scope` maps `ArgErr` to `fnname() ` + `getmsg`. Residual
+/// error builders publish the `getmsg` TypeError; the CALL_KW descent
+/// puts the function name on in the same place the try/except around
+/// `_match_signature` would.
+pub fn typeerror_with_binder_fnname(exc: PyObjectRef, fnname: &str) -> PyObjectRef {
+    let msg = match unsafe { crate::display::py_str_wtf8(exc) } {
+        Ok(s) => s,
+        Err(_) => return exc,
+    };
+    let prefix = format!("{fnname}()");
+    let msg_s = crate::display::wtf8_display_string(msg, "");
+    if msg_s.starts_with(&prefix) {
+        return exc;
+    }
+    let mut err = crate::PyError::type_error(format!("{prefix} {msg_s}"));
+    err.to_exc_object()
+}
+
+fn publish_match_outcome_as_residual(outcome: MatchOutcome) -> i64 {
+    match outcome {
+        MatchOutcome::Ok => 0,
+        MatchOutcome::Shape(e) => crate::runtime_ops::jit_publish_residual_error(
+            crate::PyError::type_error(e.getmsg_wtf8()),
+        ),
+        MatchOutcome::Py(e) => crate::runtime_ops::jit_publish_residual_error(e),
+    }
+}
+
+/// One-word residual ABI for [`unknown_kwds_err`]. `MatchOutcome` is a
+/// payload enum; the residual executor records one result word and
+/// `GUARD_NO_EXCEPTION`.
+pub(crate) fn unknown_kwds_err_jit_abi(
+    keyword_names_w_gc: *mut pyre_object::FixedObjectArray,
+    mapping: &[i64; KWDS_MAPPING_CAP],
+    mapping_len: usize,
+    num_remainingkwds: usize,
+) -> i64 {
+    publish_match_outcome_as_residual(unknown_kwds_err(
+        keyword_names_w_gc,
+        mapping,
+        mapping_len,
+        num_remainingkwds,
+    ))
+}
+
+/// One-word residual ABI for [`too_many_args_err`].
+pub(crate) fn too_many_args_err_jit_abi(
+    signature: &crate::gateway::Signature,
+    scope_ptr: *const PyObjectRef,
+    scope_len: usize,
+    co_argcount: usize,
+    co_kwonlyargcount: usize,
+    num_defaults: usize,
+    given: usize,
+    methodcall: bool,
+) -> i64 {
+    publish_match_outcome_as_residual(too_many_args_err(
+        signature,
+        scope_ptr,
+        scope_len,
+        co_argcount,
+        co_kwonlyargcount,
+        num_defaults,
+        given,
+        methodcall,
+    ))
+}
+
+/// One-word residual ABI for [`match_signature_missing_err`].
+pub(crate) fn match_signature_missing_err_jit_abi(
+    signature: &crate::gateway::Signature,
+    scope_ptr: *const PyObjectRef,
+    scope_len: usize,
+    start: usize,
+    end: usize,
+    positional: bool,
+) -> i64 {
+    publish_match_outcome_as_residual(match_signature_missing_err(
+        signature, scope_ptr, scope_len, start, end, positional,
+    ))
+}
+
+/// One-word residual ABI for [`match_keywords_multiple_values_err`].
+pub(crate) fn match_keywords_multiple_values_err_jit_abi(w_name: PyObjectRef) -> i64 {
+    match match_keywords_multiple_values_err(w_name) {
+        MatchKeywordsOutcome::Remaining(_) => 0,
+        MatchKeywordsOutcome::Shape(e) => crate::runtime_ops::jit_publish_residual_error(
+            crate::PyError::type_error(e.getmsg_wtf8()),
+        ),
+        MatchKeywordsOutcome::Py(e) => crate::runtime_ops::jit_publish_residual_error(e),
+    }
 }
 
 /// Copy `n` shadow-stack words starting at `base`. A for-loop, not an
@@ -3369,7 +3629,8 @@ mod tests {
     }
 
     /// Same shape with a str-subclass keyword: `_collect_keyword_args`
-    /// `setitem`s that object, and the kwargs dict promotes to object strategy.
+    /// `setitem`s that object (`KwargsDictStrategy.setitem` else-arm),
+    /// and the kwargs dict promotes to object strategy.
     #[test]
     fn match_signature_str_subclass_kwarg_keeps_key_on_object_strategy() {
         crate::test_hooks::install_hash_hook();
@@ -3524,6 +3785,68 @@ mod tests {
             assert_eq!(pyre_object::w_int_get_value(arguments.arguments_w[0]), 1);
             assert_eq!(pyre_object::w_int_get_value(arguments.arguments_w[1]), 2);
             assert_eq!(pyre_object::w_int_get_value(arguments.arguments_w[2]), 3);
+        }
+    }
+
+    /// `f(**{StrSub('a'): 1})` into `def f(**kw)`: `_combine_starstarargs_wrapped`
+    /// keeps the subclass name, `_collect_keyword_args` stores it
+    /// (`KwargsDictStrategy.setitem` else-arm), and the value lands in `**kw`.
+    #[test]
+    fn match_signature_starstar_str_subclass_key_lands_in_kwarg_dict() {
+        crate::test_hooks::install_hash_hook();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_class = pyre_object::w_type_new("StrSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let w_class = pyre_object::gc_roots::pin_root(w_class);
+        let subclass =
+            pyre_object::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("a"), w_class);
+        let subclass_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(subclass);
+        let value = pyre_object::w_int_new(1);
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let dict = pyre_object::dictmultiobject::w_dict_new();
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(subclass_slot),
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            );
+        }
+        let arguments = Arguments::new(
+            &[],
+            None,
+            None,
+            None,
+            Some(pyre_object::gc_roots::shadow_stack_get(dict_slot)),
+            false,
+            None,
+        )
+        .expect("starstar expansion should succeed");
+        let sig = crate::gateway::Signature::new(vec![], None, Some("kw"), 0, 0);
+        let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
+        assert!(matches!(
+            arguments.match_signature(
+                pyre_object::PY_NULL,
+                &mut scope,
+                &sig,
+                &[],
+                pyre_object::PY_NULL,
+                0,
+            ),
+            MatchOutcome::Ok
+        ));
+        let subclass = pyre_object::gc_roots::shadow_stack_get(subclass_slot);
+        unsafe {
+            assert_eq!(
+                pyre_object::dictmultiobject::w_dict_get_strategy(scope[0]).strategy_kind(),
+                pyre_object::dictmultiobject::StrategyKind::Object
+            );
+            let items = pyre_object::dictmultiobject::w_dict_items(scope[0]);
+            assert_eq!(items.len(), 1);
+            assert!(std::ptr::eq(items[0].0, subclass));
+            assert_eq!(pyre_object::w_int_get_value(items[0].1), 1);
         }
     }
 

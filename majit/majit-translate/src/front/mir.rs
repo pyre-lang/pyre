@@ -8027,6 +8027,7 @@ mod desugar;
 mod flowcontext;
 mod framestate;
 mod gcroot;
+mod host_tag;
 mod lltype;
 mod malloc;
 mod operation;

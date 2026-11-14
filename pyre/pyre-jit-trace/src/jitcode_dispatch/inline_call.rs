@@ -1790,9 +1790,19 @@ pub(crate) fn helper_resume_reaches_blocker(
             &mut callee_fnaddr,
             descr_refs,
         );
-        summary.body_not_walked
+        let blocked = summary.body_not_walked
             || summary.blocker_effect_free.is_some()
-            || summary.blocker_after_effect.is_some()
+            || summary.blocker_after_effect.is_some();
+        if blocked && fbw_debug_abort_enabled() {
+            eprintln!(
+                "[helper-resume-blocker] jitcode={} pc={pc} entry={entry_array_len:?} body_not_walked={} ef={:?} ae={:?}",
+                payload.jitcode.name(),
+                summary.body_not_walked,
+                summary.blocker_effect_free,
+                summary.blocker_after_effect,
+            );
+        }
+        blocked
     };
     // Only the entry without argument-array facts is memoized per pc; a
     // gateway's answer depends on the call site's argument count.
@@ -6225,6 +6235,24 @@ pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
     ctx.trace_ctx.heap_cache_mut().reset();
 }
 
+/// Drop a residual-error publication so the residual Python CALL does not
+/// see it. `jit_publish_residual_error` writes `BH_LAST_EXC_VALUE` and the
+/// backend `_store_exception` cells; `execute_residual_call` /
+/// `take_published_residual_error` consume with get+set 0. Do not call
+/// `take_published_residual_error` when empty (dummy TypeError). The
+/// walker Err arm also drains the backend cells. `binder_can_cut` still
+/// counts the residual as an executed effect.
+fn consume_published_residual_error_for_cut<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let _ = c.get();
+        c.set(0);
+    });
+    if let Some(cb) = crate::callbacks::try_get() {
+        (cb.drain_backend_jit_exc)();
+    }
+    ctx.clear_last_exc_value();
+}
+
 /// The point a builtin descent cuts back to, with the effect state it was
 /// entered with.
 #[derive(Clone, Copy)]
@@ -6358,12 +6386,14 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
 }
 
 /// `argument.py _match_signature` (`@jit.unroll_safe`). Path is
-/// `CallPath::for_impl_method` of `Arguments::match_signature`.
+/// `CallPath::for_impl_method` of `Arguments::match_signature`
+/// (crate-stripped owner). Seeded in `helper_graphs` so
+/// `pathed_jitcode_cached` finds a graph: CALL_KW residualizes to
+/// `bh_call_kw` and the portal never names `parse_into_scope`.
 const MATCH_SIGNATURE_DESCENT: super::specialize::HelperDescent =
     super::specialize::HelperDescent {
         path: "argument::Arguments::match_signature",
         commit_label: "match_signature_commit",
-        call_site_label: "match_signature_call_site",
         decline_tag: "MATCH-SIGNATURE-SUBWALK",
     };
 
@@ -6957,9 +6987,7 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     resolved_callable: pyre_object::PyObjectRef,
@@ -7249,17 +7277,17 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
             pre_base + keywords_w_off + i,
         ));
     }
-    // CALL_KW inside an already-inlined Python callee (`helper_kw` in
-    // `call_star_forms_inlined_callee`) has `inline_subwalk`. The Callee
-    // nested-entry can decline (`NESTED-ENTRY`); `EnclosingHelper` is the
-    // helper-in-helper model (`run_sub_jitcode_walk`) and lets
-    // `match_signature` record instead of leaving a residual CALL_KW.
-    let saved_transparent = ctx.fbw_mode.transparent_helper_subwalk;
-    if ctx.fbw_mode.inline_subwalk {
-        ctx.fbw_mode.transparent_helper_subwalk = true;
-    }
-    let prep = super::specialize::prepare_orthodox_descent(ctx, op.pc, &MATCH_SIGNATURE_DESCENT);
-    ctx.fbw_mode.transparent_helper_subwalk = saved_transparent;
+    // `_match_signature` is `@jit.unroll_safe` ordinary inlined code
+    // (`argument.py`), a real MIFrame (`pyjitpl.py` `perform_call` /
+    // `newframe`). CallResult numbers that section; other root-portal
+    // orthodox descents stay Converted so a `GUARD_CLASS` fail re-runs
+    // the Python CALL.
+    let prep = super::specialize::prepare_orthodox_descent_returning(
+        ctx,
+        op.pc,
+        &MATCH_SIGNATURE_DESCENT,
+        HelperReturn::CallResult,
+    );
     let Some(prep) = prep else {
         return Ok(None);
     };
@@ -7323,15 +7351,8 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     // Pin the callee before any `defs_w` / `w_kw_defs` GETFIELD or the matcher
     // subwalk so a later iteration that rebinds the callable deopts before
     // `finditem_str` / `eq_unwrapped`.
-    if let Some((receiver, concrete_receiver, w_class, version_tag, _)) = instance_call_pin {
-        walker_guard_exception_attr_slot(
-            ctx,
-            op.pc,
-            receiver,
-            concrete_receiver,
-            w_class,
-            version_tag,
-        )?;
+    if let Some((receiver, concrete_receiver, w_class, _, _)) = instance_call_pin {
+        walker_guard_exception_attr_slot(ctx, op.pc, receiver, concrete_receiver, w_class)?;
     }
     let func = pyre_object::gc_roots::shadow_stack_get(pre_base + func_off);
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(func) };
@@ -7592,6 +7613,12 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     // SAFETY: `prepare_orthodox_descent` rejected a null sym.
     let sym = unsafe { &*prep.sym_ptr };
     let binder_can_cut = || binder_rewind.nothing_unrewindable_applied();
+    // CallResult numbered binder is a real `MIFrame`. Nested finditem
+    // inherits via `FbwWalkMode` clone on the Helper arm. Builtin wrappers
+    // share `run_orthodox_helper_subwalk` with `HelperReturn::CallResult`
+    // (`run_codewriter_helper_inline_call`) and keep the frameless refusal.
+    let saved_allow_may_force = ctx.fbw_mode.allow_numbered_may_force;
+    ctx.fbw_mode.allow_numbered_may_force = true;
     let walk = super::specialize::run_orthodox_helper_subwalk(
         ctx,
         op.pc,
@@ -7599,17 +7626,18 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
         &prep.body,
         prep.nested,
         MATCH_SIGNATURE_DESCENT.commit_label,
-        MATCH_SIGNATURE_DESCENT.call_site_label,
         &int_args,
         &int_concretes,
         &ref_args_helper,
         &ref_concretes,
         &float_args,
     );
+    ctx.fbw_mode.allow_numbered_may_force = saved_allow_may_force;
     match walk {
         Ok((DispatchOutcome::SubReturn { result }, _)) => {
             if !match_signature_outcome_is_ok(ctx, result) {
                 if binder_can_cut() {
+                    consume_published_residual_error_for_cut(ctx);
                     cut_declined_subwalk(ctx, saved_pos);
                     return Ok(None);
                 }
@@ -7652,6 +7680,17 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
             drop(args_box);
         }
         Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, _)) => {
+            // Residual `*_jit_abi` error builders publish `TypeError(getmsg)`
+            // and the helper SubRaises before `_match_signature` returns
+            // Shape. Same cut as SubReturn !ok: residual CALL_KW lets
+            // `parse_into_scope` format `fnname() ` + getmsg. Catch is the
+            // can't-cut path; `run_orthodox_helper_subwalk` does not plant
+            // last_exc_value on a bubbling SubRaise.
+            if binder_can_cut() {
+                consume_published_residual_error_for_cut(ctx);
+                cut_declined_subwalk(ctx, saved_pos);
+                return Ok(None);
+            }
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.set_last_exc_value(exc, exc_concrete);
                 return Ok(Some((DispatchOutcome::Continue, target)));
@@ -7963,9 +8002,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             ctx,
             op,
             code,
-            funcptr,
             r_args,
-            call_descr,
             dst_bank,
             dst,
             resolved_callable,

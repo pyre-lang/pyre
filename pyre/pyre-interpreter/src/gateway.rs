@@ -217,6 +217,19 @@ impl Signature {
         }
     }
 
+    /// One-word ABI of `signature.argnames[i]`
+    /// (`signature.py` `_immutable_fields_ = ["argnames[*]"]`).
+    ///
+    /// Host `Vec<Cow<str>>::index` is two words per element, so the
+    /// look-inside kwonly loop cannot read it as `getarrayitem`. This
+    /// elidable only forwards to `unicodeobject::prebuilt_str_storage`
+    /// (`BaseLLStringRepr.convert_const`); the result is the immortal
+    /// rstr `STR` the trace already uses for a `&str` key.
+    #[majit_macros::elidable]
+    pub fn argname_at(&self, index: usize) -> *mut pyre_object::unicodeobject::UnicodeValueStorage {
+        pyre_object::unicodeobject::prebuilt_str_storage(self.argnames[index].as_ref())
+    }
+
     /// pypy/interpreter/signature.py `num_argnames`:
     /// ```python
     /// def num_argnames(self):
@@ -249,8 +262,20 @@ impl Signature {
     /// def has_vararg(self):
     ///     return self.varargname is not None
     /// ```
+    ///
+    /// Host `Option<Cow<str>>` is a 24-byte niche (`None` =
+    /// `usize::MAX - 1`), not a null pointer. A `match` on the field
+    /// keeps `Discriminant` on the field place so the translator emits
+    /// `GETFIELD_RAW_I` of the first word plus the host-tag decode
+    /// (`operation.rs` Cow-option arm). A constant `_immutable_`
+    /// Signature then folds the same way PyPy's `is not None` does.
+    /// `is_some()` residualizes as `is_some__spec_Cow` and never sees
+    /// that field.
     pub fn has_vararg(&self) -> bool {
-        self.varargname.is_some()
+        match &self.varargname {
+            Some(_) => true,
+            None => false,
+        }
     }
 
     /// pypy/interpreter/signature.py `has_kwarg`:
@@ -259,7 +284,10 @@ impl Signature {
     ///     return self.kwargname is not None
     /// ```
     pub fn has_kwarg(&self) -> bool {
-        self.kwargname.is_some()
+        match &self.kwargname {
+            Some(_) => true,
+            None => false,
+        }
     }
 
     /// pypy/interpreter/signature.py `scope_length`:
@@ -3296,5 +3324,43 @@ mod tests {
         assert!(matches!(sig.argnames[0], std::borrow::Cow::Borrowed("a")));
         assert!(sig.varargname.is_none());
         assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
+    }
+
+    /// Host niche of `Option<Cow<str>>`: None's first word is
+    /// `usize::MAX - 1`, Borrowed is `usize::MAX`, Owned empty is `0`.
+    #[test]
+    fn optional_cow_str_niche_first_word_is_none_tag() {
+        let none_tag = usize::MAX - 1;
+        let none: Option<Cow<'static, str>> = None;
+        let borrowed = Some(Cow::Borrowed("kwargs"));
+        let owned_empty = Some(Cow::<str>::Owned(String::new()));
+        unsafe {
+            assert_eq!(std::ptr::from_ref(&none).cast::<usize>().read(), none_tag);
+            assert_eq!(
+                std::ptr::from_ref(&borrowed).cast::<usize>().read(),
+                usize::MAX
+            );
+            assert_eq!(std::ptr::from_ref(&owned_empty).cast::<usize>().read(), 0);
+        }
+        let empty = Signature::new(vec!["a"], None, None, 0, 0);
+        let full = Signature::new(vec!["a"], Some("args"), Some("kwargs"), 0, 0);
+        assert!(!empty.has_vararg());
+        assert!(!empty.has_kwarg());
+        assert!(full.has_vararg());
+        assert!(full.has_kwarg());
+        unsafe {
+            let empty_var = std::ptr::from_ref(&empty)
+                .cast::<u8>()
+                .add(std::mem::offset_of!(Signature, varargname))
+                .cast::<usize>()
+                .read();
+            let full_kw = std::ptr::from_ref(&full)
+                .cast::<u8>()
+                .add(std::mem::offset_of!(Signature, kwargname))
+                .cast::<usize>()
+                .read();
+            assert_eq!(empty_var, none_tag);
+            assert_eq!(full_kw, usize::MAX);
+        }
     }
 }

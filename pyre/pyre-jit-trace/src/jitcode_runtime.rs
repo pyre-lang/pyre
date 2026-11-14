@@ -5308,6 +5308,23 @@ mod tests {
     }
 
     #[test]
+    fn match_signature_index_is_the_regular_binder_helper() {
+        let idx = compute_pathed_jitcode_index("argument::Arguments::match_signature")
+            .expect("generated `match_signature` jitcode must be in the build-time table");
+        let path = jitcode_index().paths[idx]
+            .as_ref()
+            .expect("match_signature is a Regular graph-backed JitCode");
+        assert_eq!(path.canonical_key(), "argument::Arguments::match_signature");
+        assert_eq!(path.specialization, GraphSpecialization::Regular);
+        let jc = get_jitcode_by_index(idx).expect("match_signature body");
+        let classes = jc.calldescr().arg_classes.as_str();
+        assert_eq!(
+            classes, "rrrirri",
+            "MATCH_SIGNATURE_DESCENT zip-splits mixed args by this ABI"
+        );
+    }
+
+    #[test]
     fn pathed_index_keeps_a_regular_access_direct_suffix_name_apart_from_the_access_direct_copy() {
         let regular_suffix = CallPath::from_segments(["owner", "f__AccessDirect_None"]);
         let mut access_direct = CallPath::from_segments(["owner", "f"]);

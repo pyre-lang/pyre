@@ -2334,6 +2334,17 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     semantic_slot_for_reg_color(nlocals, stack_only, pcdep_entries, 1, reg)
 }
 
+/// Exclusive operand-stack depth covering every Ref-bank stack slot the
+/// `pcdep` row names. `0` when the row names no stack slot.
+pub(crate) fn pcdep_ref_stack_span(nlocals: usize, pcdep_entries: &[(u8, u16, u16)]) -> usize {
+    pcdep_entries
+        .iter()
+        .filter(|&&(bank, _, slot)| bank == 1 && (slot as usize) >= nlocals)
+        .map(|&(_, _, slot)| slot as usize - nlocals + 1)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Every live semantic Ref slot owned by one post-regalloc color at this PC.
 /// A COPY/short-circuit shape may deliberately map the same MIFrame register
 /// to more than one semantic stack slot; rebuilding pyre's slot-indexed frame

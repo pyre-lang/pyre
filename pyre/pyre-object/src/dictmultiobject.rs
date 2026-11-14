@@ -359,10 +359,17 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
 }
 
 /// Borrowed probe for a type namespace (`typeobject.py`
-/// `_getdictvalue_no_unwrapping` / `dict_w.get(attr)`).
+/// `_getdictvalue_no_unwrapping` / `dict_w.get(attr)`) and for
+/// `UnicodeDictStrategy.getitem_str`.
 ///
-/// `dict_w` is an interned-str map. The comparison is WTF-8 byte equality of
-/// exact-str keys; it never calls `dict_keys_equal` / `eq_w_hooked`.
+/// `UnicodeDictStrategy` (`dictmultiobject.py`) stores exact-str keys in
+/// `r_dict(unicode_eq, unicode_hash)`; `unicode_eq` is `W_UnicodeObject.eq_w`
+/// (WTF-8 byte equality) and never `space.eq_w`. A non-str key
+/// `switch_to_object_strategy`s (`AbstractTypedStrategy.setitem` /
+/// `getitem`). Type namespaces keep the caller's key objects, including
+/// str-subclass instances (`type(name, bases, ns)`). The comparison is
+/// WTF-8 byte equality of any str instance (`is_str`); it never calls
+/// `dict_keys_equal` / `eq_w_hooked`.
 struct TypeDictLookupKey<'a> {
     hash: i64,
     key: &'a [u8],
@@ -382,7 +389,7 @@ impl crate::rordereddict::Equivalent<ObjectKey> for TypeDictLookupKey<'_> {
             return false;
         }
         unsafe {
-            crate::is_exact_type(k.obj, &crate::STR_TYPE)
+            crate::unicodeobject::is_str(k.obj)
                 && crate::w_str_get_wtf8(k.obj).as_bytes() == self.key
         }
     }
@@ -411,6 +418,50 @@ pub unsafe fn dict_entries_probe_str(
     entries.get(&StrLookupKey { hash, key }).copied()
 }
 
+/// `UnicodeDictStrategy.getitem_str` probe: same hashed `ll_dict_lookup`
+/// residual as [`dict_entries_probe_str`], with [`TypeDictLookupKey`] so the
+/// graph cannot reach `dict_keys_equal`.
+///
+/// `look_inside_iff` does not auto-publish the trampoline; the word-ABI
+/// adapter is the [`HELPER_FNADDRS`](majit_ir::helper_fnaddr::HELPER_FNADDRS)
+/// row below, matching `dict_entries_probe_str_trampoline`.
+#[majit_macros::look_inside_iff(dict_entries_probe_str_iff)]
+pub unsafe fn dict_entries_probe_unicode_str(
+    entries: &ObjectDictStorage,
+    hash: i64,
+    key: &str,
+) -> Option<PyObjectRef> {
+    entries
+        .get(&TypeDictLookupKey {
+            hash,
+            key: key.as_bytes(),
+        })
+        .copied()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static DICT_ENTRIES_PROBE_UNICODE_STR_TRAMPOLINE: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::dictmultiobject::dict_entries_probe_unicode_str_trampoline",
+        __majit_call_target_dict_entries_probe_unicode_str_trampoline as *const (),
+        3,
+        "www>w",
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_dict_entries_probe_unicode_str_trampoline() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::dictmultiobject::dict_entries_probe_unicode_str_trampoline",
+        __majit_call_target_dict_entries_probe_unicode_str_trampoline as *const (),
+        3,
+        "www>w",
+    );
+}
+
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
 /// `ll_dict_lookup` (`rordereddict.py`) for the type-namespace probe.
 fn dict_entries_probe_type_str_iff(entries: &ObjectDictStorage, _hash: i64, key: &[u8]) -> bool {
@@ -426,7 +477,7 @@ unsafe fn dict_entries_probe_type_str(
     entries.get(&TypeDictLookupKey { hash, key }).copied()
 }
 
-unsafe fn type_dict_entries_scan_exact_str(
+unsafe fn type_dict_entries_scan_str(
     entries: &ObjectDictStorage,
     key: &[u8],
 ) -> Option<PyObjectRef> {
@@ -434,7 +485,7 @@ unsafe fn type_dict_entries_scan_exact_str(
         let Some((stored, value)) = entries.get_slot(slot) else {
             continue;
         };
-        if crate::is_exact_type(stored.obj, &crate::STR_TYPE)
+        if crate::unicodeobject::is_str(stored.obj)
             && crate::w_str_get_wtf8(stored.obj).as_bytes() == key
         {
             return Some(*value);
@@ -461,7 +512,7 @@ unsafe fn type_dict_entries_index_of_str(entries: &ObjectDictStorage, key: &[u8]
 /// `typeobject.py _getdictvalue_no_unwrapping`: `self.dict_w.get(attr)`.
 ///
 /// The hashed arm uses the str-hash trampoline (`rstr.py ll_strhash` of the
-/// interned name). The no-hook arm walks exact-str keys by WTF-8 bytes so
+/// interned name). The no-hook arm walks str keys by WTF-8 bytes so
 /// pyre-object tests without the trampoline still answer, and neither arm
 /// reaches `eq_w_hooked`.
 unsafe fn type_dict_entries_get(entries: &ObjectDictStorage, key: &[u8]) -> Option<PyObjectRef> {
@@ -469,7 +520,7 @@ unsafe fn type_dict_entries_get(entries: &ObjectDictStorage, key: &[u8]) -> Opti
         let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key);
         dict_entries_probe_type_str(entries, hash, key)
     } else {
-        type_dict_entries_scan_exact_str(entries, key)
+        type_dict_entries_scan_str(entries, key)
     }
 }
 
@@ -804,6 +855,29 @@ unsafe fn dict_entries_get_str(
     }
 }
 
+/// Borrow-key GET for `UnicodeDictStrategy.getitem_str`.
+///
+/// Both arms stay on str WTF-8 equality (`TypeDictLookupKey` / the
+/// type-dict scan). Neither reaches `dict_keys_equal`, so the residual is
+/// not may-force. `ObjectDictStrategy` keeps [`dict_entries_get_str`].
+#[inline]
+unsafe fn dict_entries_get_unicode_str(
+    entries: &ObjectDictStorage,
+    key: &str,
+    hash: i64,
+) -> Option<PyObjectRef> {
+    if hash != 0 || crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = if hash != 0 {
+            hash
+        } else {
+            crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
+        };
+        dict_entries_probe_unicode_str(entries, hash, key)
+    } else {
+        type_dict_entries_scan_str(entries, key.as_bytes())
+    }
+}
+
 /// `key`'s digest: the one the caller memoized on the string object it borrowed
 /// `key` from, or — when it holds none — a fresh hash of the borrowed bytes.
 /// `None` when no str hash hook is installed, which puts the caller on its
@@ -891,6 +965,7 @@ static DICT_ENTRIES_INDEX_OF_UNICODE_STR_HASHED_TRAMPOLINE: majit_ir::helper_fna
         "pyre_object::dictmultiobject::dict_entries_index_of_unicode_str_hashed_trampoline",
         __majit_call_target_dict_entries_index_of_unicode_str_hashed_trampoline as *const (),
         3,
+        "www>w",
     );
 
 #[cfg(target_arch = "wasm32")]
@@ -900,6 +975,7 @@ fn register_dict_entries_index_of_unicode_str_hashed_trampoline() {
         "pyre_object::dictmultiobject::dict_entries_index_of_unicode_str_hashed_trampoline",
         __majit_call_target_dict_entries_index_of_unicode_str_hashed_trampoline as *const (),
         3,
+        "www>w",
     );
 }
 
@@ -4422,7 +4498,7 @@ pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObject
 /// `self.dict_w[attr]`.
 ///
 /// Both maps are interned-str (`W_TypeObject.dict_w`, `W_LibObject.dict_w`).
-/// The probe reads Unicode/Object storage by exact-str WTF-8 bytes and never
+/// The probe reads Unicode/Object storage by str WTF-8 bytes and never
 /// dispatches through `getitem` / `w_dict_lookup`, so the `@elidable`
 /// `_pure_getdictvalue_no_unwrapping` / `_get_attr_elidable` graphs cannot
 /// reach `eq_w_hooked`.
@@ -4528,6 +4604,37 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
     // str hash and compare on WTF-8 byte equality.  A borrowed `&str` probe
     // avoids the per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
     dict_entries_get_str(entries, key, hash)
+}
+
+/// Internal helper for `UnicodeDictStrategy::getitem_str`. Kept as a free
+/// function so the strategy trait impl can share the borrowed-str lookup.
+///
+/// `UnicodeDictStrategy` (`dictmultiobject.py`) stores exact-str keys only;
+/// this probe uses [`TypeDictLookupKey`] and never `dict_keys_equal`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` whose `dstrategy` is
+/// `UNICODE_DICT_STRATEGY`.
+pub unsafe fn w_dict_getitem_str_unicode_strategy(
+    obj: PyObjectRef,
+    key: &str,
+) -> Option<PyObjectRef> {
+    w_dict_getitem_str_unicode_strategy_hashed(obj, key, 0)
+}
+
+/// [`w_dict_getitem_str_unicode_strategy`] for a caller that already holds
+/// `key`'s digest (`rstr.py ll_strhash`).
+///
+/// # Safety
+/// Same as [`w_dict_getitem_str_unicode_strategy`].
+pub unsafe fn w_dict_getitem_str_unicode_strategy_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> Option<PyObjectRef> {
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const ObjectDictStorage);
+    dict_entries_get_unicode_str(entries, key, hash)
 }
 
 /// `W_DictMultiObject.setitem_str` — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
@@ -8810,14 +8917,16 @@ impl DictStrategy for UnicodeDictStrategy {
 
     /// `dictmultiobject.py UnicodeDictStrategy.getitem_str`.
     /// `StdObjSpace.finditem_str` / `W_DictMultiObject.getitem_str` dispatch
-    /// here. The hashed override is the body the trace descends into: a
-    /// borrowed-str object-table probe rather than wrapping `newtext(key)`.
+    /// here. The hashed override probes with [`TypeDictLookupKey`]: storage
+    /// holds exact-str keys (`is_correct_type` / `switch_to_object_strategy`
+    /// on a non-str key) and `unicode_eq` is `W_UnicodeObject.eq_w`, never
+    /// `space.eq_w`.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
 
     unsafe fn getitem_str_hashed(&self, w_dict: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
-        crate::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(w_dict, key, hash)
+        crate::dictmultiobject::w_dict_getitem_str_unicode_strategy_hashed(w_dict, key, hash)
             .unwrap_or(PY_NULL)
     }
 
@@ -9230,6 +9339,22 @@ mod tests {
         }
     }
 
+    /// `type(name, bases, ns)` keeps the namespace's key objects, so a
+    /// str-subclass instance with content `"x"` is still found by the
+    /// type-dict WTF-8 probe.
+    #[test]
+    fn type_dict_getitem_bytes_reads_str_subclass_keys() {
+        install_test_hash_hook();
+        unsafe {
+            let w_class = crate::w_type_new("S", crate::PY_NULL, std::ptr::null_mut());
+            let key = crate::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("x"), w_class);
+            let dict = w_dict_new();
+            w_dict_store(dict, key, w_int_new(42));
+            let hit = w_type_dict_getitem_bytes(dict, b"x").expect("str-subclass key");
+            assert_eq!(w_int_get_value(hit), 42);
+        }
+    }
+
     #[test]
     fn empty_dict_walk_gc_refs_skips_null_dstorage() {
         unsafe {
@@ -9348,6 +9473,75 @@ mod tests {
                 beta_value,
             );
             assert!(w_dict_unicode_value_at_checked(dict, 0, beta, beta_hash).is_null());
+        }
+    }
+
+    thread_local! {
+        static GETITEM_STR_EQ_HOOK_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe fn counting_eq_never(_a: PyObjectRef, _b: PyObjectRef) -> bool {
+        GETITEM_STR_EQ_HOOK_CALLS.with(|c| c.set(c.get() + 1));
+        false
+    }
+
+    /// `UnicodeDictStrategy.getitem_str` compares exact-str keys by WTF-8
+    /// bytes (`TypeDictLookupKey`); `eq_w` is never invoked.
+    #[test]
+    fn unicode_getitem_str_does_not_call_eq_w_hook() {
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_eq_w_hook(counting_eq_never);
+            let dict = w_dict_new();
+            w_dict_setitem_str(dict, "d", w_int_new(200));
+            assert_eq!(w_dict_strategy_name(dict), "UnicodeDictStrategy");
+            GETITEM_STR_EQ_HOOK_CALLS.with(|c| c.set(0));
+            let hit = w_dict_getitem_str(dict, "d").expect("stored name");
+            assert_eq!(w_int_get_value(hit), 200);
+            assert!(w_dict_getitem_str(dict, "missing").is_none());
+            assert_eq!(GETITEM_STR_EQ_HOOK_CALLS.with(std::cell::Cell::get), 0);
+            crate::dict_eq_hook::clear_eq_w_hook();
+        }
+    }
+
+    /// A non-str key on `UnicodeDictStrategy` switches to `ObjectDictStrategy`
+    /// (`AbstractTypedStrategy.setitem`).
+    #[test]
+    fn unicode_non_str_key_switches_to_object_strategy() {
+        install_test_hash_hook();
+        unsafe {
+            let dict = w_dict_new();
+            w_dict_setitem_str(dict, "d", w_int_new(1));
+            assert_eq!(w_dict_strategy_name(dict), "UnicodeDictStrategy");
+            w_dict_store(dict, w_int_new(7), w_int_new(2));
+            assert_eq!(w_dict_strategy_name(dict), "ObjectDictStrategy");
+            assert_eq!(w_int_get_value(w_dict_getitem_str(dict, "d").unwrap()), 1);
+        }
+    }
+
+    unsafe fn constant_str_hash(_ptr: *const u8, _len: usize) -> i64 {
+        42
+    }
+
+    /// `ObjectDictStrategy.getitem_str` still routes a hash collision through
+    /// `dict_keys_equal` / `eq_w`.
+    #[test]
+    fn object_getitem_str_calls_eq_w_on_non_str_collision() {
+        use crate::longobject::w_long_new;
+        use majit_rlib::rbigint::RBigInt as BigInt;
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);
+            crate::dict_eq_hook::register_hash_str_hook(constant_str_hash);
+            crate::dict_eq_hook::register_eq_w_hook(counting_eq_never);
+            let dict = w_dict_new();
+            let huge = BigInt::from(i64::MAX) * BigInt::from(2);
+            w_dict_store(dict, w_long_new(huge), w_int_new(1));
+            assert_eq!(w_dict_strategy_name(dict), "ObjectDictStrategy");
+            GETITEM_STR_EQ_HOOK_CALLS.with(|c| c.set(0));
+            assert!(w_dict_getitem_str(dict, "d").is_none());
+            assert!(GETITEM_STR_EQ_HOOK_CALLS.with(std::cell::Cell::get) >= 1);
+            crate::dict_eq_hook::clear_eq_w_hook();
         }
     }
 

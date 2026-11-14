@@ -3095,7 +3095,7 @@ unsafe fn tuple_getslice_advanced_array(
 /// reload the tuple after each box. The pin loop is not on the traced
 /// array-tuple arm.
 #[inline(never)]
-unsafe fn tuple_copy_boxed_items(
+pub(crate) unsafe fn tuple_copy_boxed_items(
     obj: PyObjectRef,
     start: i64,
     step: i64,

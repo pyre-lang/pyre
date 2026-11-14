@@ -13539,9 +13539,7 @@ fn concrete_object_key_entry_rows_from_storage_alias() {
 #[test]
 fn concrete_object_key_entry_rows_publish_identity_spelling() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = super::super::build_semantic_program_from_llbc(llbc).expect("lower pyre-object");
     let mut published: Vec<_> = program
         .struct_fields

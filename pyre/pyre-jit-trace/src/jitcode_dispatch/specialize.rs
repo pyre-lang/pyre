@@ -7985,6 +7985,32 @@ pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     op_pc: usize,
     descent: &HelperDescent,
 ) -> Option<OrthodoxDescentPrep<Sym>> {
+    prepare_orthodox_descent_returning(ctx, op_pc, descent, nested_orthodox_helper_return(ctx))
+}
+
+/// Converted at the root portal (no helper level; guards resume at the
+/// Python CALL). CallResult only under a CallResult orthodox chain
+/// (`allow_numbered_may_force`): Converted under a numbered builtin
+/// wrapper is HEAD, and Converted under Numbered is Unresumable
+/// (`helper_subwalk_level`). Nested finditem under `_match_signature`
+/// inherits the flag and keeps a section.
+fn nested_orthodox_helper_return<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> HelperReturn {
+    if ctx.fbw_mode.allow_numbered_may_force {
+        HelperReturn::CallResult
+    } else {
+        HelperReturn::Converted
+    }
+}
+
+/// Same resolve as [`prepare_orthodox_descent`], with an explicit resume
+/// shape. `_match_signature` passes [`HelperReturn::CallResult`] so it is a
+/// real `MIFrame` (`pyjitpl.py` `perform_call` / `newframe`).
+pub(crate) fn prepare_orthodox_descent_returning<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    descent: &HelperDescent,
+    helper_return: HelperReturn,
+) -> Option<OrthodoxDescentPrep<Sym>> {
     let decline = |why: &str| {
         if fbw_debug_abort_enabled() {
             eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
@@ -8005,7 +8031,7 @@ pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, helper_return) else {
         return decline("NESTED-ENTRY");
     };
     Some(OrthodoxDescentPrep {

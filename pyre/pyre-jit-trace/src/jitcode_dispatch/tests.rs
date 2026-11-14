@@ -1813,6 +1813,52 @@ fn a_handler_abort_is_not_a_later_resume_blocker() {
     assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
 }
 
+/// `GUARD_NOT_FORCED` resumes at the live-after the residual (`blackhole.py`
+/// `setposition`). The catch that guarded that call has already been
+/// passed; a symbolic residual in its handler is not a section the
+/// blackhole still runs.
+#[test]
+fn a_handler_before_the_resume_pc_is_not_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = residual_call_with_funcbox(0);
+    let live_and_return_len = live().len() + void_return().len();
+    let handler = code.len() + catch_exception(0).len() + live_and_return_len;
+    code.extend(catch_exception(handler));
+    let resume_pc = code.len();
+    code.extend(live());
+    code.extend(void_return());
+    assert_eq!(
+        code.len(),
+        handler,
+        "the handler follows the success return"
+    );
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 0, &[real, symbolic], |_| None);
+    assert_eq!(
+        whole.blocker_after_effect,
+        Some(symbolic),
+        "whole-body admission still sees the handler"
+    );
+
+    let resume = super::inline_call::summarize_body_blockers_resume(
+        resume_pc,
+        &code,
+        0,
+        &[real, symbolic],
+        |_| None,
+    );
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+    assert!(
+        !resume.body_not_walked,
+        "the success live-after is reachable from entry"
+    );
+}
+
 /// An `inline_call` whose descr does not resolve to a JitCode is the same
 /// condition one level down: a callee the scan holds nothing about.  Falling
 /// through would read it as executing no effect and holding no blocker — the
@@ -20962,6 +21008,215 @@ fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() 
 }
 
 #[test]
+fn residual_call_refused_up_front_may_force_inside_transparent_helper() {
+    // Frameless transparent helper (`helper_chain()` is `NoHelper` with an
+    // empty framestack): `call_opcode.is_call_may_force()` is refused
+    // (`GUARD_NOT_FORCED` would resume at the Python CALL). Extraeffect is
+    // not a second gate. `dont_look_inside_cannot_raise` records because
+    // `select_residual_call_opcode` emits CALL, not CALL_MAY_FORCE
+    // (`call.py getcalldescr` `cannot_raise_effect_info()`). The name
+    // allowlist is not extended.
+    let bindings: std::collections::HashMap<&str, i64> =
+        pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+    let addr = bindings["pyre_interpreter::argument::mapping_contains"];
+    assert!(addr != 0);
+
+    fn refuse(
+        opcode: majit_ir::OpCode,
+        extra: majit_ir::ExtraEffect,
+        addr: i64,
+    ) -> Option<(&'static str, i64, i64)> {
+        let mut tc = fresh_trace_ctx();
+        let func = tc.const_int(addr);
+        let regs_i: Vec<OpRef> = Vec::new();
+        let regs_r: Vec<OpRef> = Vec::new();
+        let descr = call_descr_with_effect(1, extra);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut mode = test_fbw_mode();
+        mode.inline_subwalk = true;
+        mode.transparent_helper_subwalk = true;
+        let wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            fbw_mode: mode,
+            session: &session,
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        super::residual_call::residual_call_refused_up_front(
+            &wc,
+            opcode,
+            &[func],
+            descr.as_call_descr().expect("SimpleCallDescr"),
+        )
+    }
+
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallMayForceR,
+            majit_ir::ExtraEffect::RandomEffects,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        Some("may-force-in-transparent-helper"),
+        "CALL_MAY_FORCE inside a transparent helper is refused"
+    );
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallMayForceR,
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        Some("may-force-in-transparent-helper"),
+    );
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallR,
+            majit_ir::ExtraEffect::CannotRaise,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        None,
+        "harvested cannot_raise is CALL, not CALL_MAY_FORCE"
+    );
+}
+
+#[test]
+fn residual_call_refused_up_front_may_force_inside_numbered_helper_records() {
+    // A numbered helper section is a real `MIFrame` (`capture_resumedata`).
+    // CALL_MAY_FORCE + GUARD_NOT_FORCED resume in that section
+    // (`numbered_helper_guard_resume` / `blackhole.py` `_setup_return_value_*`).
+    // The frameless-transparent refusal does not apply.
+    let bindings: std::collections::HashMap<&str, i64> =
+        pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+    let addr = bindings["pyre_interpreter::argument::mapping_contains"];
+    assert!(addr != 0);
+
+    let mut tc = fresh_trace_ctx();
+    let func = tc.const_int(addr);
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let descr = call_descr_with_effect(1, majit_ir::ExtraEffect::RandomEffects);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: 0,
+        is_being_profiled: false,
+        recursion_greenkey: false,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents: vec![InlineParentFrame {
+            jitcode_index: 1,
+            call_jitcode_pc: Some(0),
+            call_pc: Some(0),
+            resume_pc: Some(0),
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes: Vec::new(),
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Unknown,
+        }],
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::CallerBoundary,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    });
+    let mut mode = test_fbw_mode();
+    mode.inline_subwalk = true;
+    mode.transparent_helper_subwalk = true;
+    mode.allow_numbered_may_force = true;
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(
+        session.borrow().helper_chain(),
+        HelperChain::Numbered,
+        "the pushed level is a numbered helper section"
+    );
+    assert_eq!(
+        super::residual_call::residual_call_refused_up_front(
+            &wc,
+            majit_ir::OpCode::CallMayForceR,
+            &[func],
+            descr.as_call_descr().expect("SimpleCallDescr"),
+        )
+        .map(|(r, _, _)| r),
+        None,
+        "CALL_MAY_FORCE inside a numbered helper records"
+    );
+}
+
+#[test]
 fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
     // EF_CANNOT_RAISE: `pure=False` + `exc=False` — bare CallR,
     // no GUARD_NO_EXCEPTION.
@@ -31193,7 +31448,7 @@ fn mailbox_live_marker_pcdep_matches_the_following_opcode() {
     // Producer-fixed mailbox table: first-emission `-live-` (11373), the
     // jump floor (11376), later unrolled `-live-` (11389). Each assembled
     // `-live-` ships its own colour→slot row equal to the opcode it
-    // precedes; absent no longer means inherit-predecessor.
+    // precedes. An absent coordinate inherits the predecessor row.
     let row = vec![(1u8, 0u16, 19u16)];
     let table = vec![
         (11373, row.clone()),
@@ -31220,15 +31475,15 @@ fn mailbox_live_marker_pcdep_matches_the_following_opcode() {
     ));
     let pred = table[1].1.clone();
     assert_eq!(
-        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11376, false, &pred),
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11376, &pred),
         pred
     );
     assert_eq!(
-        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11389, true, &pred),
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11389, &pred),
         pred
     );
     assert_eq!(
-        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11400, false, &pred),
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11400, &pred),
         pred
     );
 }

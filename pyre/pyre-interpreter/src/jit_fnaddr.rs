@@ -1621,6 +1621,28 @@ macro_rules! pa4 {
         publish_pa4($e, $m, $r, $f, $f);
     };
 }
+macro_rules! pa6 {
+    ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
+        publish_pa6(
+            $e,
+            $m,
+            $r,
+            |a0, a1, a2, a3, a4, a5| $f(a0, a1, a2, a3, a4, a5),
+            $f,
+        );
+    };
+}
+macro_rules! pa8 {
+    ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
+        publish_pa8(
+            $e,
+            $m,
+            $r,
+            |a0, a1, a2, a3, a4, a5, a6, a7| $f(a0, a1, a2, a3, a4, a5, a6, a7),
+            $f,
+        );
+    };
+}
 macro_rules! upa4 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
         publish_upa4(
@@ -2692,6 +2714,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::delitem_slot",
+        "pyre_interpreter::delitem_slot",
+        crate::opcode_ops::jit_baseobjspace_delitem_slot,
     );
     cp1!(
         &mut entries,
@@ -5738,6 +5766,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_object::w_dict_store_identity_strategy_trampoline",
         pyre_object::identitydict::__majit_call_target_w_dict_store_identity_strategy_trampoline,
     );
+    // `kwargsdict.py _getitem_correct_indirection` look_inside_iff trampoline.
+    // Orig adapter is auto-published; the trampoline is not
+    // (`emit_helper_call_target_fn` `register_fnaddr=false`).
+    cpa2!(
+        &mut entries,
+        "pyre_object::kwargsdict::kwargs_getitem_correct_indirection_trampoline",
+        "pyre_object::kwargs_getitem_correct_indirection_trampoline",
+        pyre_object::kwargsdict::__majit_call_target_kwargs_getitem_correct_indirection_trampoline,
+    );
     pa1!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_float_abs",
@@ -6034,6 +6071,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_interpreter::Signature::find_w_argname",
         crate::gateway::Signature::find_w_argname,
     );
+    // `signature.py` `_immutable_fields_ = ["argnames[*]"]`: the one-word
+    // rstr of `argnames[i]`. Same CallPath spellings as `find_w_argname`.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::gateway::Signature::argname_at",
+        "pyre_interpreter::Signature::argname_at",
+        crate::gateway::Signature::argname_at,
+    );
 
     // `_match_signature` residualizes `Option<Vec>` length as one word.
     pa1!(
@@ -6047,6 +6092,70 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_interpreter::argument::arguments_keyword_count",
         "argument::arguments_keyword_count",
         crate::argument::arguments_keyword_count,
+    );
+    // Binder leaves `_match_signature` residual-calls. Hint-less
+    // `mapping_contains` and `dont_look_inside` error/setitem helpers have
+    // no jitcode; publish the word-ABI address so the CALL_KW descent
+    // records `do_residual_call` instead of a `symbolic_fnaddr` hash.
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::argument::mapping_contains",
+        "argument::mapping_contains",
+        crate::argument::mapping_contains,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::argument::setitem_kwargs_dict",
+        "argument::setitem_kwargs_dict",
+        crate::argument::setitem_kwargs_dict,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::argument::setitem_kwargs_dict_general",
+        "argument::setitem_kwargs_dict_general",
+        crate::argument::setitem_kwargs_dict_general_jit_abi,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::argument::kwdefaults_finditem_str_at",
+        "argument::kwdefaults_finditem_str_at",
+        crate::argument::kwdefaults_finditem_str_at_jit_abi,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::argument::kwdefaults_storage_lookup_str_at",
+        "argument::kwdefaults_storage_lookup_str_at",
+        crate::argument::kwdefaults_storage_lookup_str_at_jit_abi,
+    );
+    pa4!(
+        &mut entries,
+        "pyre_interpreter::argument::unknown_kwds_err",
+        "argument::unknown_kwds_err",
+        crate::argument::unknown_kwds_err_jit_abi,
+    );
+    pa8!(
+        &mut entries,
+        "pyre_interpreter::argument::too_many_args_err",
+        "argument::too_many_args_err",
+        crate::argument::too_many_args_err_jit_abi,
+    );
+    pa6!(
+        &mut entries,
+        "pyre_interpreter::argument::match_signature_missing_err",
+        "argument::match_signature_missing_err",
+        crate::argument::match_signature_missing_err_jit_abi,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::argument::match_keywords_multiple_values_err",
+        "argument::match_keywords_multiple_values_err",
+        crate::argument::match_keywords_multiple_values_err_jit_abi,
+    );
+    upa4!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::tuple_copy_boxed_items",
+        "pyre_interpreter::tuple_copy_boxed_items",
+        crate::baseobjspace::tuple_copy_boxed_items,
     );
     // `stack_underflow_error` deliberately remains unpublished: its `&str`
     // argument is a two-word aggregate with no one-word residual-call ABI.
@@ -8161,6 +8270,10 @@ mod tests {
         assert!(!is_abi_unsound_result_residual(
             bindings["pyre_object::kwargsdict::kwargs_getitem_correct_indirection"] as usize
         ));
+        assert!(!is_abi_unsound_result_residual(
+            bindings["pyre_object::kwargsdict::kwargs_getitem_correct_indirection_trampoline"]
+                as usize
+        ));
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
@@ -8944,6 +9057,74 @@ mod tests {
                 bound,
                 Some(raw),
                 "{path} must not publish the raw -> bool target"
+            );
+        }
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_match_signature_binder_leaves() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_interpreter::argument::mapping_contains",
+                crate::argument::mapping_contains as *const () as usize as i64,
+            ),
+            (
+                "argument::mapping_contains",
+                crate::argument::mapping_contains as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::setitem_kwargs_dict",
+                crate::argument::setitem_kwargs_dict as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::setitem_kwargs_dict_general",
+                crate::argument::setitem_kwargs_dict_general_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::gateway::Signature::argname_at",
+                crate::gateway::Signature::argname_at as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::kwdefaults_finditem_str_at",
+                crate::argument::kwdefaults_finditem_str_at_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::kwdefaults_storage_lookup_str_at",
+                crate::argument::kwdefaults_storage_lookup_str_at_jit_abi as *const () as usize
+                    as i64,
+            ),
+            (
+                "pyre_interpreter::argument::unknown_kwds_err",
+                crate::argument::unknown_kwds_err_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::too_many_args_err",
+                crate::argument::too_many_args_err_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::match_signature_missing_err",
+                crate::argument::match_signature_missing_err_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::argument::match_keywords_multiple_values_err",
+                crate::argument::match_keywords_multiple_values_err_jit_abi as *const () as usize
+                    as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::tuple_copy_boxed_items",
+                crate::baseobjspace::tuple_copy_boxed_items as *const () as usize as i64,
+            ),
+        ] {
+            let expected = occupied_published_addr(path, expected);
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert!(
+                !is_abi_unsound_argument_residual(expected as usize),
+                "{path} must be a checked one-word publisher"
+            );
+            assert!(
+                !is_abi_unsound_result_residual(expected as usize),
+                "{path} must be a checked one-word result"
             );
         }
     }

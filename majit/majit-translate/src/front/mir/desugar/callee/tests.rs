@@ -120,11 +120,7 @@ fn operand_is_dict_eq_hook_fn_matches_inlined_fnptr_by_signature() {
 /// `PtrRepr.rtype_simple_call`). The TLS hook must lower the same way.
 #[test]
 fn eq_w_hooked_lowers_the_tls_hook_as_indirect_call_with_unknown_family() {
-    let Some(llbc) =
-        crate::test_support::load_ullbc_if_present(crate::runtime_names::artifacts::OBJECT_ULLBC)
-    else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
     let graph = crate::test_support::lower_function(llbc, "pyre_object::dict_eq_hook::eq_w_hooked")
         .expect("lower eq_w_hooked");
     let mut unknown_family = 0usize;

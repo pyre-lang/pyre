@@ -2347,6 +2347,13 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// When the prologue itself returns, the Python walk's check at the
     /// callee's first step latches the callee-entry multi-frame image.
     pub helper_return: HelperReturn,
+    /// `_match_signature` (and nested finditem) may record `CALL_MAY_FORCE`:
+    /// `GUARD_NOT_FORCED` resumes in that numbered section (`pyjitpl.py`
+    /// `perform_call` / `newframe`). Builtin wrappers also enter
+    /// `run_orthodox_helper_subwalk` with `HelperReturn::CallResult` and
+    /// keep the frameless refusal — recording may-force there miscompiles
+    /// `str_subscr_hot` / exception residual deopt.
+    pub allow_numbered_may_force: bool,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
     /// again so convert vs residualize is per-CALL
@@ -2424,6 +2431,7 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             transparent_helper_subwalk: self.transparent_helper_subwalk,
             transparent_helper_jitcode_index: self.transparent_helper_jitcode_index,
             helper_return: self.helper_return,
+            allow_numbered_may_force: self.allow_numbered_may_force,
             transparent_helper_effects_at_entry: self.transparent_helper_effects_at_entry,
             transparent_helper_journal_at_entry: self.transparent_helper_journal_at_entry,
             transparent_helper_heap_writing_at_entry: self.transparent_helper_heap_writing_at_entry,
@@ -2460,6 +2468,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             helper_return: HelperReturn::CallResult,
+            allow_numbered_may_force: false,
             transparent_helper_effects_at_entry: None,
             transparent_helper_journal_at_entry: None,
             transparent_helper_heap_writing_at_entry: None,
@@ -8488,13 +8497,14 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    // Plain entries use `pcdep_for_snapshot_entry` so a `-live-` that is
-    // absent from the first-offset table does not inherit the previous
-    // opcode's map (`jitcode.py get_live_vars_info`).
+    // Plain entries use `pcdep_for_snapshot_entry`: an exact
+    // `pcdep_by_jit_pc` hit is that coordinate's own row; an absent
+    // coordinate inherits the predecessor row (`pcdep_for_jitcode_pc`,
+    // `jitcode.py get_live_vars_info` walking BACK onto a `-live-`).
     let entry_pcdep_owned: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
-            .pcdep_for_snapshot_entry(entry_jitcode_pc as usize, crate::state::op_live()),
+            .pcdep_for_snapshot_entry(entry_jitcode_pc as usize),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
@@ -8533,7 +8543,7 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     // (`bridge_semantic_maps_at_with_jitcode_pc`) already keys Plain pcdep
     // at the carried word.
     let use_carried_map = carried_jitcode_pc >= 0;
-    let valid_stack_only = if use_carried_map {
+    let mut valid_stack_only = if use_carried_map {
         carried_stack_only
     } else {
         valid_stack_only
@@ -8543,6 +8553,18 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         entry_pcdep_entries
     };
+    // Named stack slots stay inside the color→slot window even when the
+    // predecessor depth twin sits below the row (walker already popped a
+    // TOS the `-live-` still holds in `registers_r`).
+    let carried_stack_only = carried_stack_only.max(crate::state::pcdep_ref_stack_span(
+        nlocals,
+        carried_pcdep_entries,
+    ));
+    valid_stack_only = valid_stack_only.max(crate::state::pcdep_ref_stack_span(
+        nlocals,
+        pcdep_entries_ref,
+    ));
+    let published_vsd = resume_snapshot::published_snapshot_valuestackdepth(trace_ctx);
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
@@ -8641,8 +8663,14 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                         // a typed ConstPtr(NULL) through a reused color would
                         // plant NULL on a live Ref, so skip that overlay.
                         if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
-                            active.push(m);
-                            continue;
+                            // A slot at or above the walk `valuestackdepth`
+                            // is leftover `read_boxes` pad, not the live TOS
+                            // at this `-live-`. Fall through to the register.
+                            let leftover = published_vsd.is_some_and(|vsd| sem >= vsd);
+                            if !leftover {
+                                active.push(m);
+                                continue;
+                            }
                         }
                         if m == OpRef::NONE && carried_owned_slot != Some(sem) {
                             let shadow_sources_slot = trace_ctx
@@ -8758,25 +8786,37 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                             // the traced arm has already popped a slot the guard's
                             // resume target still reads.  The shadow under-reports
                             // that slot; the walk register carries its live box.
-                            let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                            let leftover = published_vsd.is_some_and(|vsd| s_idx >= vsd);
+                            let shadow_is_real =
+                                !leftover && vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                             let walk_real = walk_box
                                 .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-                            let shadow_real =
-                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                            let shadow_real = if leftover {
+                                None
+                            } else {
+                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b))
+                            };
                             let carried_pc_proves_slot = carried_owned_slot == Some(s_idx);
                             // A bridge inputarg left in the color is not the
                             // stack temp. The merge point's loop inputargs are
                             // the shadow boxes; naming the inputarg makes the
                             // loop cut decline it. A NULL shadow still loses to
-                            // the register (`nested_break_not_hot`).
+                            // the register (`nested_break_not_hot`). A leftover
+                            // `read_boxes` InputArg above walk vsd is the same
+                            // stale seed in the shadow; the register is
+                            // `registers_r[index]`.
                             if let (Some(w), Some(s)) = (walk_real, shadow_real) {
                                 if w != s && w.is_input_arg() {
                                     s
+                                } else if w != s && s.is_input_arg() {
+                                    w
                                 } else if carried_pc_proves_slot {
                                     w
                                 } else {
                                     s
                                 }
+                            } else if leftover {
+                                walk_real.unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
                             } else if carried_pc_proves_slot {
                                 walk_real.or(vbox).unwrap_or_else(fallback)
                             } else if shadow_is_real {

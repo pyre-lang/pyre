@@ -4220,6 +4220,7 @@ pub(in crate::front::mir) fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> boo
         .and_then(|n| type_node_peel_aliases(n, llbc))
         .and_then(|n| adt_node_name_path(n, llbc))
         .is_some_and(|path| {
+            let path = path.as_str();
             let leaf = path
                 .split('<')
                 .next()

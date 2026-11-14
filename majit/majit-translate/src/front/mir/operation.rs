@@ -4128,6 +4128,119 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
+                // `Option<Cow<str>>` is a 24-byte host niche: None's first
+                // word is `usize::MAX - 1` (`GcRef::NO_CONCRETE`), not a
+                // null pointer. `tyref_is_niche_option_ptr` would emit
+                // `getfield_raw_r` + `ptr_iszero` and the walk would
+                // abort. The first word as `GETFIELD_RAW_I` of an
+                // `_immutable_fields_` slot folds on a constant
+                // Signature, matching `signature.py` `has_kwarg`
+                // (`self.kwargname is not None`) of `_immutable_ = True`.
+                // Peel `Discriminant(*(&self.kwargname))` to the Field.
+                let cow_field_place: &Place = match &place.kind {
+                    PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
+                        inner.as_ref()
+                    }
+                    _ => &place,
+                };
+                let cow_option_field =
+                    if let PlaceKind::Projection(f_base, ProjectionElem::Tagged(v)) =
+                        &cow_field_place.kind
+                        && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                        && crate::front::result_exc::tyref_option_payload(&place.ty, self.llbc)
+                            .is_some_and(|payload| tyref_is_cow_str(&payload, self.llbc))
+                        && let Some(tag) = self.raw_enum_host_tag(&place.ty)
+                        && let Some((f_owner_root, f_name, _f_ty, f_owner_id, f_host_index)) =
+                            self.resolve_adt_field(&f_base.ty, field_payload)
+                    {
+                        let owner_gc = container_declared_gc(
+                            &f_base.ty,
+                            self.llbc,
+                            self.gc_struct_ids,
+                            self.immutable_fields,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        Some((
+                            f_base.as_ref().clone(),
+                            f_owner_root,
+                            f_name,
+                            f_owner_id,
+                            f_host_index,
+                            owner_gc,
+                            tag,
+                        ))
+                    } else {
+                        None
+                    };
+                if let Some((
+                    f_base,
+                    f_owner_root,
+                    f_name,
+                    f_owner_id,
+                    f_host_index,
+                    owner_gc,
+                    tag,
+                )) = cow_option_field
+                {
+                    let base = self.resolve_place(mir_bb, f_base)?;
+                    let bb_id = self.emit_bb(mir_bb);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(f_name, Some(f_owner_root))
+                                .with_owner_id(f_owner_id)
+                                .with_host_index(f_host_index)
+                                .with_owner_declared_gc(owner_gc),
+                            ty: ValueType::Int,
+                            pure: true,
+                        },
+                    });
+                    return Ok((None, self.emit_host_variant_index(mir_bb, res, &tag)));
+                }
+                // `match &self.kwargname` is `Discriminant(*(&field))`.
+                // The `&field` is a `taken_by_address` FieldRead that
+                // `mark_place_address_of` restamps as `RawEnumField`
+                // (`int_add`). Recover that field so the tag load is
+                // `GETFIELD_RAW_I` of the `_immutable_` slot, which
+                // folds on a constant Signature.
+                let cow_addr_field =
+                    if crate::front::result_exc::tyref_option_payload(&place.ty, self.llbc)
+                        .is_some_and(|payload| tyref_is_cow_str(&payload, self.llbc))
+                        && let Some(tag) = self.raw_enum_host_tag(&place.ty)
+                        && let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) =
+                            &place.kind
+                        && name == "Deref"
+                        && let PlaceKind::Local(i) = &inner.kind
+                        && let Some(addr) = self
+                            .local_var
+                            .get(*i as usize)
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|v| v.one().ok())
+                        && let Some((base, field)) =
+                            Self::address_taken_field_producer(&self.graph, &addr)
+                    {
+                        Some((base, field, tag))
+                    } else {
+                        None
+                    };
+                if let Some((base, mut field, tag)) = cow_addr_field {
+                    field.taken_by_address = false;
+                    if field.owner_declared_gc.is_none() {
+                        field.owner_declared_gc = Some(false);
+                    }
+                    let bb_id = self.emit_bb(mir_bb);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field,
+                            ty: ValueType::Int,
+                            pure: true,
+                        },
+                    });
+                    return Ok((None, self.emit_host_variant_index(mir_bb, res, &tag)));
+                }
                 // A standalone fieldless (C-like) enum is represented
                 // by-value as its discriminant integer, so
                 // `Discriminant(enum)` is the identity on that value — alias
@@ -4371,6 +4484,13 @@ impl<'a> Lowering<'a> {
                     ));
                 }
                 let disc_owner_gc = self.container_owner_declared_gc(&place, true);
+                if self.place_is_raw_pointer_discriminant(&place)
+                    && let Some(reason) = self.raw_enum_layout_unknown(&place.ty)
+                {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: raw Discriminant of a host enum with unknown instantiated layout: {reason}"
+                    )));
+                }
                 let recast_tagged_sum =
                     crate::front::result_exc::tyref_is_option(&place.ty, self.llbc)
                         && disc_owner_gc != Some(false);
@@ -4487,6 +4607,25 @@ impl<'a> Lowering<'a> {
         Ok(Some(self.resolve_place(mir_bb, (**inner).clone())?))
     }
 
+    /// `Rvalue::Ref` of a field that `mark_place_address_of` flagged
+    /// `taken_by_address`. The result Variable is the field address.
+    fn address_taken_field_producer(
+        graph: &crate::model::FunctionGraph,
+        addr: &Variable,
+    ) -> Option<(Variable, FieldDescriptor)> {
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() == Some(addr)
+                    && let OpKind::FieldRead { base, field, .. } = &op.kind
+                    && field.taken_by_address
+                {
+                    return Some((base.clone(), field.clone()));
+                }
+            }
+        }
+        None
+    }
+
     /// `Discriminant(*p)` and `Discriminant((*p).field)` when the enum is
     /// a Raw host layout with a tag. `None` leaves the explicit-shell read.
     pub(in crate::front::mir) fn lower_raw_pointer_discriminant(
@@ -4531,10 +4670,31 @@ impl<'a> Lowering<'a> {
     }
 
     /// Host tag of the enum `ty` names, when it fits in one int-bank load.
+    ///
+    /// A Charon-recorded `Branch` (Direct or Niche) wins. Otherwise a Niche
+    /// computed from the instantiated field types. A computed Direct tag is
+    /// `None` so the explicit-shell `__discriminant` FieldRead stays.
     pub(in crate::front::mir) fn raw_enum_host_tag(
         &self,
         ty: &TyRef,
     ) -> Option<majit_charon_reader::ullbc::TagLayout> {
+        if let Some(tag) = self.charon_enum_host_tag(ty) {
+            return Some(tag);
+        }
+        match super::host_tag::instantiated_enum_host_tag(self.llbc, ty) {
+            Ok(Some(tag))
+                if matches!(
+                    &tag.encoding,
+                    majit_charon_reader::ullbc::TagEncoding::Niche { .. }
+                ) =>
+            {
+                self.loadable_host_tag(tag)
+            }
+            _ => None,
+        }
+    }
+
+    fn charon_enum_host_tag(&self, ty: &TyRef) -> Option<majit_charon_reader::ullbc::TagLayout> {
         let body = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(body)?;
         let td = self.llbc.type_by_id(def_id)?;
@@ -4543,12 +4703,84 @@ impl<'a> Lowering<'a> {
         }
         let target = std::env::var("TARGET").unwrap_or_default();
         let tag = td.layout_for_target(self.llbc, &target)?.tag()?;
+        self.loadable_host_tag(tag)
+    }
+
+    fn loadable_host_tag(
+        &self,
+        tag: majit_charon_reader::ullbc::TagLayout,
+    ) -> Option<majit_charon_reader::ullbc::TagLayout> {
         let word_bits = (crate::layout::target_signed_size() * 8) as u32;
         if tag.bits == 0 || tag.bits > word_bits || tag.bits % 8 != 0 {
             return None;
         }
         i64::try_from(tag.offset).ok()?;
         Some(tag)
+    }
+
+    /// `Some` when `ty` is a host enum whose instantiated tag cannot be
+    /// determined: a raw Discriminant must not fall through to a
+    /// `__discriminant` FieldRead of word 0.
+    fn raw_enum_layout_unknown(&self, ty: &TyRef) -> Option<String> {
+        let body = self.tyref_adt_body(ty)?;
+        let def_id = inline_adt_def_id(body)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        if !matches!(&td.kind, TypeDeclKind::Enum(_)) {
+            return None;
+        }
+        if self.charon_enum_host_tag(ty).is_some() {
+            return None;
+        }
+        match super::host_tag::instantiated_enum_host_tag(self.llbc, ty) {
+            Ok(Some(tag)) => {
+                if self.loadable_host_tag(tag).is_none() {
+                    Some(format!(
+                        "{} host tag width is not an int-bank load",
+                        td.item_meta.name_path()
+                    ))
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(reason) => Some(reason),
+        }
+    }
+
+    fn place_is_raw_pointer_discriminant(&self, place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Projection(inner, ProjectionElem::Atom(elem))
+                if elem == "Deref"
+                    && ty_is_raw_address(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ) =>
+            {
+                true
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if v.as_object().and_then(|m| m.get("Field")).is_some()
+                    && self.raw_deref_address_place(inner) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn raw_deref_address_place(&self, place: &Place) -> bool {
+        let PlaceKind::Projection(inner, ProjectionElem::Atom(elem)) = &place.kind else {
+            return false;
+        };
+        elem == "Deref"
+            && ty_is_raw_address(
+                &inner.ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
     }
 
     pub(in crate::front::mir) fn emit_i64(&mut self, mir_bb: usize, value: i64) -> Variable {

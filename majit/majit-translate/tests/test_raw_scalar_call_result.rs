@@ -3268,6 +3268,8 @@ enum TracedInt {
     FieldOther,
     /// `pair.0` is the literal `0usize`.
     FieldConst,
+    /// The second parameter is an incoming `usize`.
+    Param,
     /// `q = usize_source(); f(&mut word, q)`.
     CallResult,
     /// The second argument is the literal `0usize`.
@@ -3387,6 +3389,23 @@ fn lower_traced_int(
             vec![
                 json!({"Move": place(2, &borrowed)}),
                 json!({"Move": field_place(3, &usize_tuple, 0, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::Param => (
+            2,
+            vec![word.clone(), bits.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("q"), &bits),
+                local(3, None, &borrowed),
+                local(4, None, &ret),
+            ],
+            vec![ref_assign_mut(3, &borrowed, place(1, &word))],
+            vec![
+                json!({"Move": place(3, &borrowed)}),
+                json!({"Read": place(2, &bits)}),
             ],
             bits.clone(),
         ),
