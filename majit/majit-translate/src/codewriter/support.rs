@@ -56,10 +56,11 @@ use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use std::collections::HashSet;
 
 use majit_ir::value::Type;
 
@@ -273,12 +274,19 @@ pub(crate) fn rewrite_jit_merge_point(
 /// Emit one Input per new inputarg, typed from the pre-split producer
 /// and, for reds, the driver's red-type name. Flagged merge-point reds
 /// are bound next by `inherit_split_portal_access_directly`.
+///
+/// `extra_declared` is the original-graph `ValueType` of each startblock
+/// formal (greens then reds) when `red_kinds` does not cover autoreds
+/// extras. Declared-red drivers leave it empty so `green_kinds`/`red_kinds`
+/// stay the seed, matching `warmspot.py split_graph_and_record_jitdriver`
+/// on a driver that already named its reds.
 pub(crate) fn seed_split_portal_input_ops(
     graph: &mut FunctionGraph,
     start: BlockId,
     green_kinds: &[Type],
     red_kinds: &[Type],
     red_types: &[String],
+    extra_declared: &[ValueType],
 ) {
     let inputs = graph.block(start).inputargs.clone();
     let originals = graph.blocks.iter().find_map(|block| {
@@ -311,7 +319,11 @@ pub(crate) fn seed_split_portal_input_ops(
             .and_then(|original| producer_input_type(graph, original));
         let (mut ty, mut class_root) = produced.unwrap_or_else(|| {
             (
-                declared.get(index).cloned().unwrap_or(ValueType::Ref(None)),
+                declared
+                    .get(index)
+                    .cloned()
+                    .or_else(|| extra_declared.get(index).cloned())
+                    .unwrap_or(ValueType::Ref(None)),
                 None,
             )
         });
@@ -351,35 +363,96 @@ fn ir_type_to_valuetype(kind: Type) -> ValueType {
     }
 }
 
-fn producer_input_type(
+/// Type of `var` for a split-portal Input formal.
+///
+/// A producing op (including a function-formal `Input`) yields its result
+/// type. `split_before_jit_merge_point` forcelink vars are often block
+/// inputargs (`split_block` phi copies), so incoming links are followed
+/// until a producer or a `LinkArg::Const` gives a type. `warmspot.py
+/// split_graph_and_record_jitdriver` copies an already-annotated graph
+/// and does not re-seed these formals.
+pub(crate) fn producer_input_type(
     graph: &FunctionGraph,
     var: &Variable,
 ) -> Option<(ValueType, Option<String>)> {
+    let mut visited = HashSet::new();
+    producer_input_type_rec(graph, var, &mut visited)
+}
+
+fn producer_input_type_rec(
+    graph: &FunctionGraph,
+    var: &Variable,
+    visited: &mut HashSet<u64>,
+) -> Option<(ValueType, Option<String>)> {
+    if !visited.insert(var.id()) {
+        return None;
+    }
     for block in &graph.blocks {
         for op in &block.operations {
             if op.result.as_ref() != Some(var) {
                 continue;
             }
-            return match &op.kind {
-                OpKind::Input { ty, class_root, .. } => Some((ty.clone(), class_root.clone())),
-                OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
-                    Some((ty.clone(), None))
+            return op_produced_input_type(op);
+        }
+    }
+    for block in &graph.blocks {
+        let Some(slot) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for exit in &pred.exits {
+                if exit.target != block.id {
+                    continue;
                 }
-                OpKind::Call { result_ty, .. }
-                | OpKind::IndirectCall { result_ty, .. }
-                | OpKind::BinOp { result_ty, .. }
-                | OpKind::UnaryOp { result_ty, .. } => Some((result_ty.clone(), None)),
-                OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => {
-                    Some((ValueType::Int, None))
+                let Some(arg) = exit.args.get(slot) else {
+                    continue;
+                };
+                let found = match arg {
+                    LinkArg::Value(incoming) => producer_input_type_rec(graph, incoming, visited),
+                    LinkArg::Const(constant) => constant_input_type(constant),
+                };
+                if found.is_some() {
+                    return found;
                 }
-                OpKind::ConstUInt(_) => Some((ValueType::Unsigned, None)),
-                OpKind::ConstBool(_) => Some((ValueType::Bool, None)),
-                OpKind::ConstFloat(_) => Some((ValueType::Float, None)),
-                _ => None,
-            };
+            }
         }
     }
     None
+}
+
+fn op_produced_input_type(op: &SpaceOperation) -> Option<(ValueType, Option<String>)> {
+    match &op.kind {
+        OpKind::Input { ty, class_root, .. } => Some((ty.clone(), class_root.clone())),
+        OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
+            Some((ty.clone(), None))
+        }
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => Some((result_ty.clone(), None)),
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstVtable { .. } => {
+            Some((ValueType::Int, None))
+        }
+        OpKind::ConstUInt(_) => Some((ValueType::Unsigned, None)),
+        OpKind::ConstBool(_) => Some((ValueType::Bool, None)),
+        OpKind::ConstFloat(_) => Some((ValueType::Float, None)),
+        _ => None,
+    }
+}
+
+fn constant_input_type(
+    constant: &crate::flowspace::model::Constant,
+) -> Option<(ValueType, Option<String>)> {
+    match &constant.value {
+        ConstValue::Int(_) | ConstValue::Long(_) => Some((ValueType::Int, None)),
+        ConstValue::UInt(_) => Some((ValueType::Unsigned, None)),
+        ConstValue::Int128(_) => Some((ValueType::Int128, None)),
+        ConstValue::UInt128(_) => Some((ValueType::UInt128, None)),
+        ConstValue::Bool(_) => Some((ValueType::Bool, None)),
+        ConstValue::Float(_) => Some((ValueType::Float, None)),
+        ConstValue::SingleFloat(_) => Some((ValueType::SingleFloat, None)),
+        _ => None,
+    }
 }
 
 /// `support.py inline_calls_to`.

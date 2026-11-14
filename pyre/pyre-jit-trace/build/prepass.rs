@@ -1391,6 +1391,30 @@ fn real_main() {
                     split_portal: true,
                     extends: None,
                 },
+                majit_translate::JitDriverSpec {
+                    // `tupleobject.py` `hash_driver = jit.JitDriver(name='tuple.hash',
+                    // greens=['w_type'], reds='auto')`. The portal is the
+                    // source-level cut at `split_before_jit_merge_point`:
+                    // `tuple_hash_portal` starts the loop at the marker;
+                    // `_descr_hash_jitdriver_w` is the prologue that calls it.
+                    portal: majit_translate::CallPath::from_segments([
+                        "builtins",
+                        "tuple_hash_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_tuple_hash_portal_runner_shim",
+                    ])),
+                    greens: vec!["w_type".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    split_portal: true,
+                    extends: None,
+                },
             ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),

@@ -340,6 +340,17 @@ impl CodeWriter {
                 subjects.insert(path.clone());
             }
         }
+        // ProfileFunc family members join `candidate_graphs` in
+        // `find_all_graphs_bfs` when `helper_roots` is empty; union them
+        // here so the two-phase subject set cannot close without that
+        // PBC family, even if a caller ran the prepass against a
+        // narrower candidate set. Each AccessDirect path is a subject
+        // too (`warmspot.py check_access_directly_sanity`): Phase A
+        // `default_specialize` mints those copies after BFS.
+        for path in callcontrol.profilefunc_indirect_graphs() {
+            subjects.insert(path.clone());
+            subjects.insert(crate::call::access_directly_path(&path));
+        }
         let portals: Vec<_> = callcontrol
             .jitdrivers_sd()
             .iter()

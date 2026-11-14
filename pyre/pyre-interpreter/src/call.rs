@@ -575,6 +575,39 @@ pub fn genentry_merge_point(
         .and_then(|f| f(w_gen, w_arg, pycode))
 }
 
+/// `tupleobject.py` `hash_driver` (`JitDriver(name='tuple.hash', greens=['w_type'], reds='auto')`).
+/// pyre-interpreter cannot import pyre-jit, so the JIT registers this at boot and
+/// `TupleHashJitDriver::jit_merge_point` calls through it. `w_type` is the green;
+/// `w_tuple`, `len`, `acc` and `i` are the `reds='auto'` values live at the marker.
+type TupleHashMergeFn = fn(
+    w_type: PyObjectRef,
+    w_tuple: PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, crate::PyError>>;
+majit_gc::oncelock_fn_static!(static TUPLE_HASH_MERGE_HOOK: OnceLock<TupleHashMergeFn>);
+
+pub fn register_tuple_hash_merge_hook(f: TupleHashMergeFn) {
+    let _ = TUPLE_HASH_MERGE_HOOK.set(f);
+}
+
+/// `None` means the warm state stayed in the interpreter (`maybe_compile_and_run`
+/// returned without raising). `Some` is the portal result: the trace or the
+/// compiled loop ran the remaining iterations and returns the accumulator.
+#[inline]
+pub fn tuple_hash_merge_point(
+    w_type: PyObjectRef,
+    w_tuple: PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, crate::PyError>> {
+    TUPLE_HASH_MERGE_HOOK
+        .get()
+        .and_then(|f| f(w_type, w_tuple, len, acc, i))
+}
+
 /// Clear the note and disarm it: a jd2 walk has finished, or its
 /// abort fallback consumed the note.
 pub fn genentry_resume_note_reset() {

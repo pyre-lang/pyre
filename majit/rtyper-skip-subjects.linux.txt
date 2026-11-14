@@ -1772,6 +1772,7 @@ two-phase-annotate-skipped	rordereddict::ll_dict_setitem_lookup_done_orig__spec_
 two-phase-annotate-skipped	rustpython_compiler_core::bytecode::_::<Impl>::intersects
 two-phase-annotate-skipped	shared_opcode::opcode_load_attr__spec_PyFrame_bea5423a2f36110c__AccessDirect_None
 two-phase-annotate-skipped	shared_opcode::opcode_store_attr__spec_PyFrame_f994b4a4dbc39903__AccessDirect_None
+two-phase-annotate-skipped	tuple_hash_portal_portal
 two-phase-divergence	generatorentry_portal_portal
 two-phase-divergence	module::_cffi_backend::cglob::glob_arg::<Impl>::call_once
 two-phase-divergence	module::_csv::derive_config::<Impl>::call_once

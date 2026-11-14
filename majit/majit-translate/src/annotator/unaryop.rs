@@ -2951,6 +2951,35 @@ fn unicodebuilder_method_getlength(
     s_self.method_getlength()
 }
 
+/// Methods `SomeString` / `SomeUnicodeString` expose through
+/// `SomeObject.find_method`. `SomeChar(SomeString)` and
+/// `SomeUnicodeCodePoint(SomeUnicodeString)` inherit this table
+/// (`model.py`).
+fn stringish_find_method(name: &str, unicode: bool) -> Option<&'static str> {
+    Some(match name {
+        "startswith" => "str_method_startswith",
+        "endswith" => "str_method_endswith",
+        "find" => "str_method_find",
+        "rfind" => "str_method_rfind",
+        "count" => "str_method_count",
+        "strip" => "str_method_strip",
+        "lstrip" => "str_method_lstrip",
+        "rstrip" => "str_method_rstrip",
+        "join" => "str_method_join",
+        "split" => "str_method_split",
+        "rsplit" => "str_method_rsplit",
+        "upper" => "str_method_upper",
+        "lower" => "str_method_lower",
+        "isdigit" => "str_method_isdigit",
+        "isalpha" => "str_method_isalpha",
+        "isalnum" => "method_isalnum",
+        "replace" => "str_method_replace",
+        "splitlines" if !unicode => "str_method_splitlines",
+        "format" => "method_format",
+        _ => return None,
+    })
+}
+
 /// RPython `SomeObject.find_method(self, name)` (unaryop.py).
 pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
     let analyser_name = match s_self {
@@ -3001,68 +3030,20 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "is_null" => "ptr_method_is_null",
             _ => return None,
         },
-        SomeValue::String(_) => match name {
-            "startswith" => "str_method_startswith",
-            "endswith" => "str_method_endswith",
-            "find" => "str_method_find",
-            "rfind" => "str_method_rfind",
-            "count" => "str_method_count",
-            "strip" => "str_method_strip",
-            "lstrip" => "str_method_lstrip",
-            "rstrip" => "str_method_rstrip",
-            "join" => "str_method_join",
-            "split" => "str_method_split",
-            "rsplit" => "str_method_rsplit",
-            "upper" => "str_method_upper",
-            "lower" => "str_method_lower",
-            "isdigit" => "str_method_isdigit",
-            "isalpha" => "str_method_isalpha",
-            "isalnum" => "method_isalnum",
-            "replace" => "str_method_replace",
-            "splitlines" => "str_method_splitlines",
-            "format" => "method_format",
-            _ => return None,
-        },
-        SomeValue::UnicodeString(_) => match name {
-            "startswith" => "str_method_startswith",
-            "endswith" => "str_method_endswith",
-            "find" => "str_method_find",
-            "rfind" => "str_method_rfind",
-            "count" => "str_method_count",
-            "strip" => "str_method_strip",
-            "lstrip" => "str_method_lstrip",
-            "rstrip" => "str_method_rstrip",
-            "join" => "str_method_join",
-            "split" => "str_method_split",
-            "rsplit" => "str_method_rsplit",
-            "upper" => "str_method_upper",
-            "lower" => "str_method_lower",
-            "isdigit" => "str_method_isdigit",
-            "isalpha" => "str_method_isalpha",
-            "isalnum" => "method_isalnum",
-            "replace" => "str_method_replace",
-            "format" => "method_format",
-            _ => return None,
-        },
+        SomeValue::String(_) => stringish_find_method(name, false)?,
+        SomeValue::UnicodeString(_) => stringish_find_method(name, true)?,
+        // `class SomeChar(SomeString)` (`model.py`) — `method_startswith`
+        // and the rest of `__extend__(SomeString, SomeUnicodeString)`
+        // (`unaryop.py`) apply; Char-only extras are
+        // `__extend__(SomeChar)` `isspace` / `islower` / `isupper`.
         SomeValue::Char(_) => match name {
-            "upper" => "str_method_upper",
-            "lower" => "str_method_lower",
-            "isdigit" => "str_method_isdigit",
-            "isalpha" => "str_method_isalpha",
-            "isalnum" => "method_isalnum",
             "isspace" => "char_method_isspace",
             "islower" => "char_method_islower",
             "isupper" => "char_method_isupper",
-            _ => return None,
+            other => stringish_find_method(other, false)?,
         },
-        SomeValue::UnicodeCodePoint(_) => match name {
-            "upper" => "str_method_upper",
-            "lower" => "str_method_lower",
-            "isdigit" => "str_method_isdigit",
-            "isalpha" => "str_method_isalpha",
-            "isalnum" => "method_isalnum",
-            _ => return None,
-        },
+        // `class SomeUnicodeCodePoint(SomeUnicodeString)` (`model.py`).
+        SomeValue::UnicodeCodePoint(_) => stringish_find_method(name, true)?,
         // rstring.py — the `StringBuilder` call surface.  Only the
         // methods the rtyper lowers (`StringBuilderRepr::rtype_method`) are
         // exposed here: append/append_slice/build/getlength.
@@ -6879,6 +6860,40 @@ mod tests {
             panic!("str.split must be recognized");
         };
         assert_eq!(str_split.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn find_method_somechar_inherits_somestring_startswith() {
+        // `class SomeChar(SomeString)` (`model.py`) — `method_startswith`
+        // lives on SomeString (`unaryop.py`) and SomeChar inherits it.
+        // A length-1 ByteStr constant is SomeChar (`Bookkeeper.immutablevalue`).
+        let mut ch = super::super::model::SomeChar::new(true);
+        ch.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(vec![b'B'])));
+        let s_char = SomeValue::Char(ch);
+        let SomeValue::BuiltinMethod(bound) = s_char.find_method("startswith").unwrap() else {
+            panic!("SomeChar.startswith must inherit SomeString.method_startswith");
+        };
+        assert_eq!(bound.analyser_name, "str_method_startswith");
+        assert_eq!(bound.methodname, "startswith");
+
+        let ann = mk_ann();
+        let mut frag = SomeString::new(false, true);
+        frag.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(vec![b'@'])));
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![Some(SomeValue::String(frag))],
+            None,
+            None,
+        );
+        let result = call_builtin_method(&ann, &bound, &args).expect("startswith call");
+        match result {
+            Some(SomeValue::Bool(b)) => {
+                assert_eq!(
+                    b.base.const_box.as_ref().map(|c| &c.value),
+                    Some(&ConstValue::Bool(false))
+                );
+            }
+            other => panic!("expected const False, got {other:?}"),
+        }
     }
 
     #[test]

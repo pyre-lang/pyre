@@ -7065,6 +7065,175 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// `core::str::<Impl>::strip_prefix` / `core::str::strip_prefix`.
+    /// Distinct from other `strip_*` owners that have no `str` path
+    /// segment. The haystack place type is not consulted — the same
+    /// Dedup-id caveat as [`Self::is_str_contains_call`].
+    pub(in crate::front::mir) fn is_str_strip_prefix(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path
+            .rsplit("::")
+            .next()
+            .map(crate::front::clause_spec::unspecialized_leaf);
+        leaf == Some("strip_prefix") && path.split("::").any(|seg| seg == "str")
+    }
+
+    /// `str::strip_prefix(s, pat)` is `Some(s[len(pat):])` when
+    /// `s.startswith(pat)`, else `None` (`rstr.py` `ll_startswith` +
+    /// `ll_stringslice_startonly`). A `char` Pattern becomes a
+    /// one-code-point UTF-8 string (`rutf8.py unichr_as_utf8`) so the
+    /// startswith pairtype is String+String and `len(pat)` is
+    /// `pat.len_utf8()`. Any other Pattern keeps the residual
+    /// FunctionPath.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Needle typing and dest Option wiring match the contains / from_bytes_checked intercepts"
+    )]
+    pub(in crate::front::mir) fn try_lower_str_strip_prefix(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        needle_operand: Option<&Operand>,
+        second_arg_ty: Option<&TyRef>,
+        second_const_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 || !self.is_str_strip_prefix(reg) {
+            return Ok(false);
+        }
+        let Some(kind) = self.str_contains_needle_kind(reg, second_arg_ty, second_const_arg_ty)
+        else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let tagged_owners = if niche {
+            None
+        } else {
+            match self.resolve_option_dest_owners(dest_ty) {
+                Some(owners) => Some(owners),
+                None => return Ok(false),
+            }
+        };
+        let needle = match kind {
+            StrContainsNeedleKind::Char => {
+                self.emit_codepoint_as_utf8(mir_bb, &args[1], needle_operand)?
+            }
+            StrContainsNeedleKind::Str => args[1].clone(),
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::method("startswith", Some("str".into())),
+                args: crate::model::call_args(vec![args[0].clone(), needle.clone()]),
+                result_ty: ValueType::Bool,
+            },
+        });
+        let option_owner = tagged_owners.as_ref().map(|(o, _, _)| o.clone());
+        let some_owner = tagged_owners.as_ref().map(|(_, s, _)| s.clone());
+        let payload_ty = tagged_owners
+            .as_ref()
+            .map(|(_, _, t)| t.clone())
+            .unwrap_or(ValueType::Str);
+        let haystack = args[0].clone();
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            niche,
+            false,
+            &[haystack, needle],
+            &[],
+            |this, some_bb, mapped| {
+                let hay = mapped[0].clone();
+                let pat = mapped[1].clone();
+                let plen = this
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                this.graph
+                    .block_mut(some_bb)
+                    .operations
+                    .push(SpaceOperation {
+                        result: Some(plen.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                                fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                            },
+                            args: crate::model::call_args(vec![pat]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                let sliced = this
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                stamp_as_rstr_str(&sliced);
+                this.graph
+                    .block_mut(some_bb)
+                    .operations
+                    .push(SpaceOperation {
+                        result: Some(sliced.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__getslice_rangefrom".to_string()],
+                                fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                            },
+                            args: crate::model::call_args(vec![hay, plen]),
+                            result_ty: ValueType::Str,
+                        },
+                    });
+                if niche {
+                    sliced
+                } else {
+                    crate::front::option_variant::emit_option_variant(
+                        &mut this.graph,
+                        some_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        1,
+                        Some((
+                            some_owner.as_ref().expect("tagged Some owner").as_str(),
+                            sliced,
+                            payload_ty.clone(),
+                        )),
+                    )
+                }
+            },
+            |this, none_bb, _| {
+                if niche {
+                    let cast = this.option_niche_null_cast(dest_ty);
+                    this.graph.push_niche_null(none_bb, cast.as_ref())
+                } else {
+                    crate::front::option_variant::emit_option_variant(
+                        &mut this.graph,
+                        none_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        0,
+                        None,
+                    )
+                }
+            },
+        )?;
+        Ok(true)
+    }
+
     /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
     /// to the `__len` operation so the receiver's list annotation
     /// supplies the length through the rtyper's `len` op, the same

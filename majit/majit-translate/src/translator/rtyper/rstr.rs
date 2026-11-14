@@ -1908,9 +1908,11 @@ impl Repr for CharRepr {
             return char_case_fold_method(hop, llfn_name.to_string(), lo, hi, offset);
         }
 
-        Err(TyperError::message(format!(
-            "missing CharRepr.rtype_method_{method_name}"
-        )))
+        // `class CharRepr(AbstractCharRepr, StringRepr)`
+        // (`lltypesystem/rstr.py`). `rtype_method_startswith` lives on
+        // `AbstractStringRepr` and reads `hop.args_r[0].repr` =
+        // `string_repr`, converting the char through `ll_chr2str`.
+        string_repr().rtype_method(method_name, hop)
     }
 }
 
@@ -2152,9 +2154,9 @@ impl Repr for UniCharRepr {
             );
         }
 
-        Err(TyperError::message(format!(
-            "missing UniCharRepr.rtype_method_{method_name}"
-        )))
+        // `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
+        // (`lltypesystem/rstr.py`) — same MRO inherit as CharRepr.
+        unicode_repr().rtype_method(method_name, hop)
     }
 }
 
@@ -5194,6 +5196,75 @@ mod tests {
         assert!(
             dbg.contains("ll_startswith"),
             "expected 'll_startswith' in {dbg}"
+        );
+    }
+
+    /// `class CharRepr(AbstractCharRepr, StringRepr)` inherits
+    /// `AbstractStringRepr.rtype_method_startswith`. The receiver is
+    /// converted through `hop.args_r[0].repr` (`string_repr`) via
+    /// `ll_chr2str`, then `ll_startswith`.
+    #[test]
+    fn char_repr_rtype_method_startswith_converts_via_chr2str_then_ll_startswith() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_ch = Variable::new();
+        v_ch.set_concretetype(Some(LowLevelType::Char));
+        let v_str = Variable::new();
+        v_str.set_concretetype(Some(STRPTR.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Bool));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "startswith".to_string(),
+                vec![Hlvalue::Variable(v_ch), Hlvalue::Variable(v_str)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            crate::annotator::model::SomeValue::Char(crate::annotator::model::SomeChar::new(false)),
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(char_repr() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = char_repr()
+            .rtype_method("startswith", &hop)
+            .unwrap_or_else(|err| panic!("CharRepr.rtype_method startswith: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_method_startswith must call hop.exception_cannot_occur()"
+        );
+        let dbg: Vec<String> = ops
+            .ops
+            .iter()
+            .map(|op| format!("{} {:?}", op.opname, op.args))
+            .collect();
+        assert!(
+            dbg.iter().any(|s| s.contains("ll_chr2str")),
+            "Char receiver must convert via ll_chr2str: {dbg:?}"
+        );
+        assert!(
+            dbg.iter().any(|s| s.contains("ll_startswith")),
+            "expected ll_startswith after chr2str: {dbg:?}"
         );
     }
 
